@@ -1,0 +1,28 @@
+trace "multi-turn-conversation" {
+    task "turn" {
+        llm "completion" {
+            input = "Hey"
+            output = "Hello!"
+
+            metrics = {
+                latency = 2.9
+                tokens = 4
+            }
+        }
+    }
+
+    task "turn" {
+        llm "completion" {
+            input = "Goodbye"
+            output = "Cya!"
+
+            metrics = {
+                latency = 1.2
+                tokens = 6
+            }
+        }
+    }
+
+    ext = true
+    tags = ["chat", "prod"]
+}
