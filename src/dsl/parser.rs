@@ -44,7 +44,7 @@ pub enum DslErr {
     ExpectedIdentifier { at: usize },
     ExpectedStringLiteral { at: usize },
     ExpectedNumberLiteral { at: usize },
-    ExpectedValueAssignment { at: usize },
+    ExpectedExpressionAssignment { at: usize },
 }
 
 impl From<LexErr> for DslErr {
@@ -74,8 +74,8 @@ impl std::fmt::Display for DslErr {
             DslErr::ExpectedNumberLiteral { at } => {
                 write!(f, "expected number literal at {at}")
             }
-            DslErr::ExpectedValueAssignment { at } => {
-                write!(f, "expected value assignment at {at}")
+            DslErr::ExpectedExpressionAssignment { at } => {
+                write!(f, "expected expression assignment at {at}")
             }
         }
     }
@@ -83,8 +83,8 @@ impl std::fmt::Display for DslErr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parser {
-    tokens: Vec<Token>,
-    cursor: usize,
+    pub tokens: Vec<Token>,
+    pub cursor: usize,
 }
 
 impl Parser {
@@ -159,7 +159,7 @@ impl Parser {
             TokenKind::LBrace => self.parse_object(),
 
             // errors
-            _ => Err(DslErr::ExpectedValueAssignment { at: self.cursor }),
+            _ => Err(DslErr::ExpectedExpressionAssignment { at: self.cursor }),
         }
     }
 

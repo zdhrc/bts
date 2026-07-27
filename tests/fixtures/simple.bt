@@ -23,6 +23,8 @@ trace "multi-turn-conversation" {
         }
     }
 
-    ext = true
+    metadata = {
+        external = true
+    }
     tags = ["chat", "prod"]
 }
