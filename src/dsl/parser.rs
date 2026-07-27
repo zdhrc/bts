@@ -1,36 +1,36 @@
 use crate::dsl::lexer::{LexErr, Token, TokenKind, lex};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Doc {
-    pub items: Vec<Item>,
+pub struct Source {
+    pub decls: Vec<Declaration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Item {
+pub enum Declaration {
     Block(Block),
-    Attr(Attr),
+    Attribute(Attribute),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub kind: String,
     pub name: Option<String>,
-    pub body: Vec<Item>,
+    pub decls: Vec<Declaration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Attr {
+pub struct Attribute {
     pub key: String,
-    pub value: Value,
+    pub value: Expression,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Value {
+pub enum Expression {
     Str(String),
     Num(String),
     Bool(bool),
-    Arr(Vec<Value>),
-    Obj(Vec<Item>),
+    Array(Vec<Expression>),
+    Object(Vec<Attribute>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +40,7 @@ pub enum DslErr {
     UnexpectedToken { at: usize },
 
     // parsing errors
-    ExpectedBlockOrAttr { at: usize },
+    ExpectedDeclaration { at: usize },
     ExpectedIdentifier { at: usize },
     ExpectedStringLiteral { at: usize },
     ExpectedNumberLiteral { at: usize },
@@ -62,8 +62,8 @@ impl std::fmt::Display for DslErr {
             DslErr::UnexpectedToken { at } => {
                 write!(f, "unexpected token at byte {at}")
             }
-            DslErr::ExpectedBlockOrAttr { at } => {
-                write!(f, "expected block or attribute at {at}")
+            DslErr::ExpectedDeclaration { at } => {
+                write!(f, "expected declaration at {at}")
             }
             DslErr::ExpectedIdentifier { at } => {
                 write!(f, "expected identifier at {at}")
@@ -88,29 +88,29 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn parse(&mut self) -> Result<Doc, DslErr> {
-        Ok(self.parse_doc()?)
+    pub fn parse(&mut self) -> Result<Source, DslErr> {
+        Ok(self.parse_source()?)
     }
 
-    fn parse_doc(&mut self) -> Result<Doc, DslErr> {
-        let mut items = Vec::new();
+    fn parse_source(&mut self) -> Result<Source, DslErr> {
+        let mut decls = Vec::new();
 
         while !self.eof() {
-            items.push(self.parse_item()?);
+            decls.push(self.parse_decl()?);
         }
 
-        Ok(Doc { items })
+        Ok(Source { decls })
     }
 
-    fn parse_item(&mut self) -> Result<Item, DslErr> {
+    fn parse_decl(&mut self) -> Result<Declaration, DslErr> {
         let ident = self.expect_ident()?;
 
         match self.peek_kind() {
             TokenKind::StrLit(_) | TokenKind::LBrace => {
-                self.parse_block_after_kind(ident).map(Item::Block)
+                self.parse_block_after_kind(ident).map(Declaration::Block)
             }
-            TokenKind::Equals => self.parse_attr_after_key(ident).map(Item::Attr),
-            _ => Err(DslErr::ExpectedBlockOrAttr { at: self.cursor }),
+            TokenKind::Equals => self.parse_attr_after_key(ident).map(Declaration::Attribute),
+            _ => Err(DslErr::ExpectedDeclaration { at: self.cursor }),
         }
     }
 
@@ -121,37 +121,37 @@ impl Parser {
         };
 
         self.expect_lbrace()?;
-        let mut body = Vec::new();
+        let mut decls = Vec::new();
         while !self.check_rbrace() {
-            body.push(self.parse_item()?);
+            decls.push(self.parse_decl()?);
         }
         self.expect_rbrace()?;
 
-        Ok(Block { kind, name, body })
+        Ok(Block { kind, name, decls })
     }
 
-    fn parse_attr_after_key(&mut self, key: String) -> Result<Attr, DslErr> {
+    fn parse_attr_after_key(&mut self, key: String) -> Result<Attribute, DslErr> {
         self.expect_equals()?;
 
-        let value = self.parse_value()?;
+        let value = self.parse_expr()?;
 
-        Ok(Attr { key, value })
+        Ok(Attribute { key, value })
     }
 
-    fn parse_value(&mut self) -> Result<Value, DslErr> {
+    fn parse_expr(&mut self) -> Result<Expression, DslErr> {
         match self.peek_kind() {
             // literals
-            TokenKind::StrLit(_) => Ok(Value::Str(self.expect_string()?)),
-            TokenKind::NumLit(_) => Ok(Value::Num(self.expect_number()?)),
+            TokenKind::StrLit(_) => Ok(Expression::Str(self.expect_string()?)),
+            TokenKind::NumLit(_) => Ok(Expression::Num(self.expect_number()?)),
 
             // bools
             TokenKind::Ident(s) if s == "true" => {
                 self.advance();
-                Ok(Value::Bool(true))
+                Ok(Expression::Bool(true))
             }
             TokenKind::Ident(s) if s == "false" => {
                 self.advance();
-                Ok(Value::Bool(false))
+                Ok(Expression::Bool(false))
             }
 
             // objects and arrays
@@ -163,12 +163,12 @@ impl Parser {
         }
     }
 
-    fn parse_array(&mut self) -> Result<Value, DslErr> {
+    fn parse_array(&mut self) -> Result<Expression, DslErr> {
         self.expect_lbrack()?;
 
         let mut values = Vec::new();
         while !self.check_rbrack() {
-            values.push(self.parse_value()?);
+            values.push(self.parse_expr()?);
 
             if self.check_comma() {
                 self.advance();
@@ -178,19 +178,20 @@ impl Parser {
         }
         self.expect_rbrack()?;
 
-        Ok(Value::Arr(values))
+        Ok(Expression::Array(values))
     }
 
-    fn parse_object(&mut self) -> Result<Value, DslErr> {
+    fn parse_object(&mut self) -> Result<Expression, DslErr> {
         self.expect_lbrace()?;
 
-        let mut items = Vec::new();
+        let mut attrs = Vec::new();
         while !self.check_rbrace() {
-            items.push(self.parse_item()?);
+            let key = self.expect_ident()?;
+            attrs.push(self.parse_attr_after_key(key)?);
         }
         self.expect_rbrace()?;
 
-        Ok(Value::Obj(items))
+        Ok(Expression::Object(attrs))
     }
 
     // checks
