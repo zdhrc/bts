@@ -1,306 +1,142 @@
-use crate::dsl::lexer::{LexErr, Token, TokenKind, lex};
+use crate::dsl::lexer::{Token, TokenKind};
+use crate::dsl::syntax::{Attribute, Block, Declaration, Expression, Source};
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Source {
-    pub decls: Vec<Declaration>,
-}
+macro_rules! token {
+    ($variant:ident) => {
+        |kind| matches!(kind, TokenKind::$variant).then_some(())
+    };
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Declaration {
-    Block(Block),
-    Attribute(Attribute),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Block {
-    pub kind: String,
-    pub name: Option<String>,
-    pub decls: Vec<Declaration>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Attribute {
-    pub key: String,
-    pub value: Expression,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Expression {
-    Str(String),
-    Num(String),
-    Bool(bool),
-    Array(Vec<Expression>),
-    Object(Vec<Attribute>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DslErr {
-    // lexing errors
-    Lex(LexErr),
-    UnexpectedToken { at: usize },
-
-    // parsing errors
-    ExpectedDeclaration { at: usize },
-    ExpectedIdentifier { at: usize },
-    ExpectedStringLiteral { at: usize },
-    ExpectedNumberLiteral { at: usize },
-    ExpectedExpressionAssignment { at: usize },
-}
-
-impl From<LexErr> for DslErr {
-    fn from(err: LexErr) -> Self {
-        DslErr::Lex(err)
-    }
-}
-
-impl std::fmt::Display for DslErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DslErr::Lex(err) => {
-                write!(f, "{err}")
-            }
-            DslErr::UnexpectedToken { at } => {
-                write!(f, "unexpected token at byte {at}")
-            }
-            DslErr::ExpectedDeclaration { at } => {
-                write!(f, "expected declaration at {at}")
-            }
-            DslErr::ExpectedIdentifier { at } => {
-                write!(f, "expected identifier at {at}")
-            }
-            DslErr::ExpectedStringLiteral { at } => {
-                write!(f, "expected string literal at {at}")
-            }
-            DslErr::ExpectedNumberLiteral { at } => {
-                write!(f, "expected number literal at {at}")
-            }
-            DslErr::ExpectedExpressionAssignment { at } => {
-                write!(f, "expected expression assignment at {at}")
-            }
+    ($variant:ident($value:ident)) => {
+        |kind| match kind {
+            TokenKind::$variant($value) => Some($value.clone()),
+            _ => None,
         }
-    }
+    };
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Parser {
-    pub tokens: Vec<Token>,
-    pub cursor: usize,
+    tokens: Vec<Token>,
+    cursor: usize,
 }
 
 impl Parser {
-    pub fn parse(&mut self) -> Result<Source, DslErr> {
-        Ok(self.parse_source()?)
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens: tokens, cursor: 0 }
     }
 
-    fn parse_source(&mut self) -> Result<Source, DslErr> {
+    pub fn parse(&mut self) -> Result<Source> {
         let mut decls = Vec::new();
 
         while !self.eof() {
-            decls.push(self.parse_decl()?);
+            let ident = self.expect(token!(Ident(value)), |at| Error::ExpectedIdentifier { at })?;
+            let decl = match &self.peek().kind {
+                TokenKind::StrLit(_) | TokenKind::LBrace => Declaration::Block(self.parse_block(ident)?),
+                TokenKind::Equals => Declaration::Attribute(self.parse_attribute(ident)?),
+                _ => return Err(Error::ExpectedDeclaration { at: self.cursor }),
+            };
+            decls.push(decl);
         }
 
         Ok(Source { decls })
     }
 
-    fn parse_decl(&mut self) -> Result<Declaration, DslErr> {
-        let ident = self.expect_ident()?;
+    fn parse_block(&mut self, kind: String) -> Result<Block> {
+        let name = self.consume(token!(StrLit(value)));
+        self.expect(token!(LBrace), |at| Error::UnexpectedToken { at })?;
 
-        match self.peek_kind() {
-            TokenKind::StrLit(_) | TokenKind::LBrace => {
-                self.parse_block_after_kind(ident).map(Declaration::Block)
-            }
-            TokenKind::Equals => self.parse_attr_after_key(ident).map(Declaration::Attribute),
-            _ => Err(DslErr::ExpectedDeclaration { at: self.cursor }),
-        }
-    }
-
-    fn parse_block_after_kind(&mut self, kind: String) -> Result<Block, DslErr> {
-        let name = match self.peek_kind() {
-            TokenKind::StrLit(_) => Some(self.expect_string()?),
-            _ => None,
-        };
-
-        self.expect_lbrace()?;
         let mut decls = Vec::new();
-        while !self.check_rbrace() {
-            decls.push(self.parse_decl()?);
+        while !self.check(token!(RBrace)) {
+            let ident = self.expect(token!(Ident(value)), |at| Error::ExpectedIdentifier { at })?;
+            let decl = match &self.peek().kind {
+                TokenKind::StrLit(_) | TokenKind::LBrace => Declaration::Block(self.parse_block(ident)?),
+                TokenKind::Equals => Declaration::Attribute(self.parse_attribute(ident)?),
+                _ => return Err(Error::ExpectedDeclaration { at: self.cursor }),
+            };
+            decls.push(decl)
         }
-        self.expect_rbrace()?;
+        self.expect(token!(RBrace), |at| Error::UnexpectedToken { at })?;
 
         Ok(Block { kind, name, decls })
     }
 
-    fn parse_attr_after_key(&mut self, key: String) -> Result<Attribute, DslErr> {
-        self.expect_equals()?;
-
-        let value = self.parse_expr()?;
-
+    fn parse_attribute(&mut self, key: String) -> Result<Attribute> {
+        self.expect(token!(Equals), |at| Error::UnexpectedToken { at })?;
+        let value = self.parse_expression()?;
         Ok(Attribute { key, value })
     }
 
-    fn parse_expr(&mut self) -> Result<Expression, DslErr> {
-        match self.peek_kind() {
-            // literals
-            TokenKind::StrLit(_) => Ok(Expression::Str(self.expect_string()?)),
-            TokenKind::NumLit(_) => Ok(Expression::Num(self.expect_number()?)),
-
-            // bools
-            TokenKind::Ident(s) if s == "true" => {
-                self.advance();
-                Ok(Expression::Bool(true))
+    fn parse_expression(&mut self) -> Result<Expression> {
+        match &self.peek().kind {
+            TokenKind::StrLit(_) => {
+                let value = self.expect(token!(StrLit(value)), |at| Error::ExpectedStringLiteral { at })?;
+                Ok(Expression::Str(value))
             }
-            TokenKind::Ident(s) if s == "false" => {
-                self.advance();
-                Ok(Expression::Bool(false))
+            TokenKind::NumLit(_) => {
+                let value = self.expect(token!(NumLit(value)), |at| Error::ExpectedNumberLiteral { at })?;
+                Ok(Expression::Num(value))
             }
-
-            // objects and arrays
-            TokenKind::LBrack => self.parse_array(),
-            TokenKind::LBrace => self.parse_object(),
-
-            // errors
-            _ => Err(DslErr::ExpectedExpressionAssignment { at: self.cursor }),
-        }
-    }
-
-    fn parse_array(&mut self) -> Result<Expression, DslErr> {
-        self.expect_lbrack()?;
-
-        let mut values = Vec::new();
-        while !self.check_rbrack() {
-            values.push(self.parse_expr()?);
-
-            if self.check_comma() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        self.expect_rbrack()?;
-
-        Ok(Expression::Array(values))
-    }
-
-    fn parse_object(&mut self) -> Result<Expression, DslErr> {
-        self.expect_lbrace()?;
-
-        let mut attrs = Vec::new();
-        while !self.check_rbrace() {
-            let key = self.expect_ident()?;
-            attrs.push(self.parse_attr_after_key(key)?);
-        }
-        self.expect_rbrace()?;
-
-        Ok(Expression::Object(attrs))
-    }
-
-    // checks
-    fn check_lbrace(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::LBrace)
-    }
-    fn check_rbrace(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::RBrace)
-    }
-    fn check_lbrack(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::LBrack)
-    }
-    fn check_rbrack(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::RBrack)
-    }
-    fn check_comma(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::Comma)
-    }
-
-    // expects
-    fn expect_lbrace(&mut self) -> Result<(), DslErr> {
-        if matches!(self.peek_kind(), TokenKind::LBrace) {
-            self.advance();
-            Ok(())
-        } else {
-            Err(DslErr::UnexpectedToken { at: self.cursor })
-        }
-    }
-    fn expect_rbrace(&mut self) -> Result<(), DslErr> {
-        if matches!(self.peek_kind(), TokenKind::RBrace) {
-            self.advance();
-            Ok(())
-        } else {
-            Err(DslErr::UnexpectedToken { at: self.cursor })
-        }
-    }
-    fn expect_lbrack(&mut self) -> Result<(), DslErr> {
-        if matches!(self.peek_kind(), TokenKind::LBrack) {
-            self.advance();
-            Ok(())
-        } else {
-            Err(DslErr::UnexpectedToken { at: self.cursor })
-        }
-    }
-    fn expect_rbrack(&mut self) -> Result<(), DslErr> {
-        if matches!(self.peek_kind(), TokenKind::RBrack) {
-            self.advance();
-            Ok(())
-        } else {
-            Err(DslErr::UnexpectedToken { at: self.cursor })
-        }
-    }
-    fn expect_equals(&mut self) -> Result<(), DslErr> {
-        if matches!(self.peek_kind(), TokenKind::Equals) {
-            self.advance();
-            Ok(())
-        } else {
-            Err(DslErr::UnexpectedToken { at: self.cursor })
-        }
-    }
-    fn expect_ident(&mut self) -> Result<String, DslErr> {
-        match self.peek_kind() {
             TokenKind::Ident(value) => {
-                let value = value.clone();
-                self.advance();
-                Ok(value)
+                if value == "true" {
+                    self.next();
+                    Ok(Expression::Bool(true))
+                } else {
+                    self.next();
+                    Ok(Expression::Bool(false))
+                }
             }
-            _ => Err(DslErr::ExpectedIdentifier { at: self.cursor }),
-        }
-    }
-    fn expect_string(&mut self) -> Result<String, DslErr> {
-        match self.peek_kind() {
-            TokenKind::StrLit(value) => {
-                let value = value.clone();
-                self.advance();
-                Ok(value)
+            TokenKind::LBrack => {
+                self.expect(token!(LBrack), |at| Error::UnexpectedToken { at })?;
+
+                let mut values = Vec::new();
+                while !self.check(token!(RBrack)) {
+                    values.push(self.parse_expression()?);
+
+                    if self.consume(token!(Comma)).is_none() {
+                        break;
+                    }
+                }
+                self.expect(token!(RBrack), |at| Error::UnexpectedToken { at })?;
+
+                Ok(Expression::Array(values))
             }
-            _ => Err(DslErr::ExpectedStringLiteral { at: self.cursor }),
-        }
-    }
-    fn expect_number(&mut self) -> Result<String, DslErr> {
-        match self.peek_kind() {
-            TokenKind::NumLit(value) => {
-                let value = value.clone();
-                self.advance();
-                Ok(value)
+            TokenKind::LBrace => {
+                self.expect(token!(LBrace), |at| Error::UnexpectedToken { at })?;
+
+                let mut attrs = Vec::new();
+                while !self.check(token!(RBrace)) {
+                    let key = self.expect(token!(Ident(value)), |at| Error::UnexpectedToken { at })?;
+
+                    attrs.push(self.parse_attribute(key)?);
+                }
+                self.expect(token!(RBrace), |at| Error::UnexpectedToken { at })?;
+
+                Ok(Expression::Object(attrs))
             }
-            _ => Err(DslErr::ExpectedNumberLiteral { at: self.cursor }),
+            _ => Err(Error::ExpectedExpressionAssignment { at: self.cursor }),
         }
     }
 
-    // matches
-    fn match_comma(&mut self) -> bool {
-        if matches!(self.peek_kind(), TokenKind::Comma) {
-            self.advance();
-            true
-        } else {
-            false
-        }
+    fn check<T>(&self, matcher: impl FnOnce(&TokenKind) -> Option<T>) -> bool {
+        matcher(&self.peek().kind).is_some()
+    }
+
+    fn consume<T>(&mut self, matcher: impl FnOnce(&TokenKind) -> Option<T>) -> Option<T> {
+        let value = matcher(&self.peek().kind)?;
+        self.next();
+        Some(value)
+    }
+
+    fn expect<T>(&mut self, matcher: impl FnOnce(&TokenKind) -> Option<T>, err: impl FnOnce(usize) -> Error) -> Result<T> {
+        let at = self.cursor;
+        self.consume(matcher).ok_or_else(|| err(at))
     }
 
     // helpers
     fn peek(&self) -> &Token {
         &self.tokens[self.cursor]
     }
-    fn peek_kind(&self) -> &TokenKind {
-        &self.peek().kind
-    }
-    fn advance(&mut self) -> &Token {
+    fn next(&mut self) -> &Token {
         let token = &self.tokens[self.cursor];
         if token.kind != TokenKind::Eof {
             self.cursor += 1;
@@ -308,21 +144,57 @@ impl Parser {
         token
     }
     fn eof(&self) -> bool {
-        matches!(self.peek_kind(), TokenKind::Eof)
+        matches!(self.peek().kind, TokenKind::Eof)
     }
 }
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Error {
+    UnexpectedToken { at: usize },
+    ExpectedDeclaration { at: usize },
+    ExpectedIdentifier { at: usize },
+    ExpectedStringLiteral { at: usize },
+    ExpectedNumberLiteral { at: usize },
+    ExpectedExpressionAssignment { at: usize },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::UnexpectedToken { at } => {
+                write!(f, "unexpected token at {at}")
+            }
+            Error::ExpectedDeclaration { at } => {
+                write!(f, "expected declaration at {at}")
+            }
+            Error::ExpectedIdentifier { at } => {
+                write!(f, "expected identifier at {at}")
+            }
+            Error::ExpectedStringLiteral { at } => {
+                write!(f, "expected string literal at {at}")
+            }
+            Error::ExpectedNumberLiteral { at } => {
+                write!(f, "expected number literal at {at}")
+            }
+            Error::ExpectedExpressionAssignment { at } => {
+                write!(f, "expected expression assignment at {at}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 #[test]
 fn debug() {
     let src = include_str!("../../tests/fixtures/simple.bt");
-    let tokens = lex(src).unwrap();
+    let tokens = crate::dsl::lexer::Lexer::new(src).lex().unwrap();
 
-    let mut parser = Parser {
-        tokens: tokens,
-        cursor: 0,
-    };
-    let doc = parser.parse().unwrap();
-    dbg!(&doc);
+    let mut parser = Parser { tokens: tokens, cursor: 0 };
+    let source = parser.parse().unwrap();
+    dbg!(&source);
 }
 
 // - parses_empty_doc
