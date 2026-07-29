@@ -1,23 +1,35 @@
 trace "multi-turn-conversation" {
     task "turn" {
-        llm "completion" {
+        llm "gpt-4o-mini" {
             input = "Hey"
             output = "Hello!"
 
+            metadata = {
+                model = "gpt-4o-mini"
+                provider = "openai"
+                temperature = 0.2
+                tool_choice = "auto"
+            }
+
             metrics = {
-                latency = 2.9
                 tokens = 4
             }
         }
     }
 
     task "turn" {
-        llm "completion" {
+        llm "gpt-4o-mini" {
             input = "Goodbye"
             output = "Cya!"
 
+            metadata = {
+                model = "gpt-4o-mini"
+                provider = "openai"
+                temperature = 0.2
+                tool_choice = "auto"
+            }
+
             metrics = {
-                latency = 1.2
                 tokens = 6
             }
         }
