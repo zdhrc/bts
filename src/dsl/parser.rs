@@ -1,5 +1,7 @@
-use crate::dsl::lexer::{Token, TokenKind};
-use crate::dsl::syntax::{Attribute, Block, Declaration, Expression, Source};
+use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
+use crate::dsl::lexer::{Token, TokenKind, Tokens};
+use crate::dsl::syntax::{Ast, Attr, Block, Decl, Expr, ExprKind};
+use thiserror::Error as Err;
 
 macro_rules! token {
     ($variant:ident) => {
@@ -15,105 +17,153 @@ macro_rules! token {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Parser {
-    tokens: Vec<Token>,
-    cursor: usize,
+struct Parser {
+    tokens: Tokens,
+    errors: Errors,
+    index: usize,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens: tokens, cursor: 0 }
+    fn new(tokens: Tokens) -> Self {
+        Self {
+            tokens: tokens,
+            errors: Vec::new(),
+            index: 0,
+        }
     }
 
-    pub fn parse(&mut self) -> Result<Source> {
+    fn parse(mut self) -> Result<Ast, Errors> {
         let mut decls = Vec::new();
 
         while !self.eof() {
-            let ident = self.expect(token!(Ident(value)), |at| Error::ExpectedIdentifier { at })?;
-            let decl = match &self.peek().kind {
-                TokenKind::StrLit(_) | TokenKind::LBrace => Declaration::Block(self.parse_block(ident)?),
-                TokenKind::Equals => Declaration::Attribute(self.parse_attribute(ident)?),
-                _ => return Err(Error::ExpectedDeclaration { at: self.cursor }),
-            };
-            decls.push(decl);
+            if let Some(decl) = self.parse_decl() {
+                decls.push(decl);
+            }
         }
 
-        Ok(Source { decls })
+        if self.errors.is_empty() { Ok(Ast { decls }) } else { Err(self.errors) }
     }
 
-    fn parse_block(&mut self, kind: String) -> Result<Block> {
-        let name = self.consume(token!(StrLit(value)));
-        self.expect(token!(LBrace), |at| Error::UnexpectedToken { at })?;
+    fn parse_decl(&mut self) -> Option<Decl> {
+        let range = self.peek().range;
+        let Some(ident) = self.expect(token!(Ident(value)), ErrorKind::ExpectedIdentifier) else {
+            self.skip_declaration();
+            return None;
+        };
+
+        let decl = match &self.peek().kind {
+            TokenKind::String(_) | TokenKind::LBrace => self.parse_block(ident, range).map(Decl::Block),
+            TokenKind::Equals => self.parse_attr(ident, range).map(Decl::Attr),
+            _ => {
+                self.errors.push(Error::new(ErrorKind::ExpectedDeclaration, self.peek().range.clone()));
+                None
+            }
+        };
+
+        if decl.is_none() {
+            self.skip_declaration();
+        }
+
+        decl
+    }
+
+    fn parse_block(&mut self, kind: String, range: SrcRange) -> Option<Block> {
+        let name = self.consume(token!(String(value)));
+        self.expect(token!(LBrace), ErrorKind::UnexpectedToken)?;
 
         let mut decls = Vec::new();
-        while !self.check(token!(RBrace)) {
-            let ident = self.expect(token!(Ident(value)), |at| Error::ExpectedIdentifier { at })?;
-            let decl = match &self.peek().kind {
-                TokenKind::StrLit(_) | TokenKind::LBrace => Declaration::Block(self.parse_block(ident)?),
-                TokenKind::Equals => Declaration::Attribute(self.parse_attribute(ident)?),
-                _ => return Err(Error::ExpectedDeclaration { at: self.cursor }),
-            };
-            decls.push(decl)
-        }
-        self.expect(token!(RBrace), |at| Error::UnexpectedToken { at })?;
 
-        Ok(Block { kind, name, decls })
-    }
-
-    fn parse_attribute(&mut self, key: String) -> Result<Attribute> {
-        self.expect(token!(Equals), |at| Error::UnexpectedToken { at })?;
-        let value = self.parse_expression()?;
-        Ok(Attribute { key, value })
-    }
-
-    fn parse_expression(&mut self) -> Result<Expression> {
-        match &self.peek().kind {
-            TokenKind::StrLit(_) => {
-                let value = self.expect(token!(StrLit(value)), |at| Error::ExpectedStringLiteral { at })?;
-                Ok(Expression::Str(value))
+        while !self.check(token!(RBrace)) && !self.eof() {
+            if let Some(decl) = self.parse_decl() {
+                decls.push(decl);
             }
-            TokenKind::NumLit(_) => {
-                let value = self.expect(token!(NumLit(value)), |at| Error::ExpectedNumberLiteral { at })?;
-                Ok(Expression::Num(value))
+        }
+
+        self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
+
+        Some(Block { kind, name, decls, range })
+    }
+
+    fn parse_attr(&mut self, key: String, range: SrcRange) -> Option<Attr> {
+        self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
+        let value = self.parse_expr()?;
+
+        Some(Attr { key, value, range })
+    }
+
+    fn parse_expr(&mut self) -> Option<Expr> {
+        match &self.peek().kind {
+            TokenKind::String(_) => {
+                let range = self.peek().range;
+                let value = self.expect(token!(String(value)), ErrorKind::ExpectedStringLiteral)?;
+                Some(Expr::new(ExprKind::Str(value), range))
+            }
+            TokenKind::Number(_) => {
+                let range = self.peek().range;
+                let value = self.expect(token!(Number(value)), ErrorKind::ExpectedNumberLiteral)?;
+                Some(Expr::new(ExprKind::Num(value), range))
             }
             TokenKind::Ident(value) => {
+                let range = self.peek().range;
                 if value == "true" {
                     self.next();
-                    Ok(Expression::Bool(true))
-                } else {
+                    Some(Expr::new(ExprKind::Bool(true), range))
+                } else if value == "false" {
                     self.next();
-                    Ok(Expression::Bool(false))
+                    Some(Expr::new(ExprKind::Bool(false), range))
+                } else {
+                    self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range.clone()));
+                    None
                 }
             }
             TokenKind::LBrack => {
-                self.expect(token!(LBrack), |at| Error::UnexpectedToken { at })?;
+                let start = self.peek().range.start;
+                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
 
                 let mut values = Vec::new();
                 while !self.check(token!(RBrack)) {
-                    values.push(self.parse_expression()?);
+                    values.push(self.parse_expr()?);
 
                     if self.consume(token!(Comma)).is_none() {
                         break;
                     }
                 }
-                self.expect(token!(RBrack), |at| Error::UnexpectedToken { at })?;
+                let end = self.peek().range.end;
+                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
 
-                Ok(Expression::Array(values))
+                Some(Expr::new(ExprKind::Array(values), SrcRange::new(start, end)))
             }
             TokenKind::LBrace => {
-                self.expect(token!(LBrace), |at| Error::UnexpectedToken { at })?;
+                let start = self.peek().range.start;
+                self.expect(token!(LBrace), ErrorKind::UnexpectedToken)?;
 
                 let mut attrs = Vec::new();
                 while !self.check(token!(RBrace)) {
-                    let key = self.expect(token!(Ident(value)), |at| Error::UnexpectedToken { at })?;
+                    let range = self.peek().range;
+                    let key = self.expect(token!(Ident(value)), ErrorKind::UnexpectedToken)?;
 
-                    attrs.push(self.parse_attribute(key)?);
+                    attrs.push(self.parse_attr(key, range)?);
                 }
-                self.expect(token!(RBrace), |at| Error::UnexpectedToken { at })?;
+                let end = self.peek().range.end;
+                self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
 
-                Ok(Expression::Object(attrs))
+                Some(Expr::new(ExprKind::Object(attrs), SrcRange::new(start, end)))
             }
-            _ => Err(Error::ExpectedExpressionAssignment { at: self.cursor }),
+            _ => {
+                self.errors.push(Error::new(ErrorKind::ExpectedExpressionAssignment, self.peek().range.clone()));
+                None
+            }
+        }
+    }
+
+    fn skip_declaration(&mut self) {
+        while !self.eof() {
+            match self.peek().kind {
+                TokenKind::Ident(_) | TokenKind::RBrace => break,
+                _ => {
+                    self.next();
+                }
+            }
         }
     }
 
@@ -127,19 +177,25 @@ impl Parser {
         Some(value)
     }
 
-    fn expect<T>(&mut self, matcher: impl FnOnce(&TokenKind) -> Option<T>, err: impl FnOnce(usize) -> Error) -> Result<T> {
-        let at = self.cursor;
-        self.consume(matcher).ok_or_else(|| err(at))
+    fn expect<T>(&mut self, matcher: impl FnOnce(&TokenKind) -> Option<T>, kind: ErrorKind) -> Option<T> {
+        if let Some(value) = self.consume(matcher) {
+            Some(value)
+        } else {
+            self.errors.push(Error::new(kind, self.peek().range.clone()));
+            None
+        }
+        // let at = self.index;
+        // self.consume(matcher).ok_or_else(|| err(at))
     }
 
     // helpers
     fn peek(&self) -> &Token {
-        &self.tokens[self.cursor]
+        &self.tokens[self.index]
     }
     fn next(&mut self) -> &Token {
-        let token = &self.tokens[self.cursor];
+        let token = &self.tokens[self.index];
         if token.kind != TokenKind::Eof {
-            self.cursor += 1;
+            self.index += 1;
         }
         token
     }
@@ -148,53 +204,70 @@ impl Parser {
     }
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Error {
-    UnexpectedToken { at: usize },
-    ExpectedDeclaration { at: usize },
-    ExpectedIdentifier { at: usize },
-    ExpectedStringLiteral { at: usize },
-    ExpectedNumberLiteral { at: usize },
-    ExpectedExpressionAssignment { at: usize },
+pub(super) fn parse(tokens: Vec<Token>) -> Result<Ast, Diags> {
+    Parser::new(tokens).parse().map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::UnexpectedToken { at } => {
-                write!(f, "unexpected token at {at}")
-            }
-            Error::ExpectedDeclaration { at } => {
-                write!(f, "expected declaration at {at}")
-            }
-            Error::ExpectedIdentifier { at } => {
-                write!(f, "expected identifier at {at}")
-            }
-            Error::ExpectedStringLiteral { at } => {
-                write!(f, "expected string literal at {at}")
-            }
-            Error::ExpectedNumberLiteral { at } => {
-                write!(f, "expected number literal at {at}")
-            }
-            Error::ExpectedExpressionAssignment { at } => {
-                write!(f, "expected expression assignment at {at}")
-            }
+#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+#[error("{kind}")]
+pub(super) struct Error {
+    kind: ErrorKind,
+    range: SrcRange,
+}
+
+pub(super) type Errors = Vec<Error>;
+
+#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+pub(super) enum ErrorKind {
+    #[error("unknown token")]
+    UnexpectedToken,
+    #[error("expected declaration")]
+    ExpectedDeclaration,
+    #[error("expected identifier")]
+    ExpectedIdentifier,
+    #[error("expected string")]
+    ExpectedStringLiteral,
+    #[error("expected number")]
+    ExpectedNumberLiteral,
+    #[error("expected expression assignment")]
+    ExpectedExpressionAssignment,
+}
+
+impl Error {
+    fn new(kind: ErrorKind, range: SrcRange) -> Self {
+        Self { kind, range }
+    }
+    fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+    fn range(&self) -> SrcRange {
+        self.range
+    }
+}
+
+impl From<Error> for Diag {
+    fn from(error: Error) -> Self {
+        let Error { kind, range } = error;
+
+        Diag {
+            when: DiagPhase::Parsing,
+            what: kind.to_string(),
+            r#where: range,
         }
     }
 }
 
-impl std::error::Error for Error {}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn debug() {
-    let src = include_str!("../../tests/fixtures/simple.bt");
-    let tokens = crate::dsl::lexer::Lexer::new(src).lex().unwrap();
-
-    let mut parser = Parser { tokens: tokens, cursor: 0 };
-    let source = parser.parse().unwrap();
-    dbg!(&source);
+    #[test]
+    fn debug() {
+        let src = include_str!("../../tests/fixtures/simple.bt");
+        let tokens = crate::dsl::lexer::lex(src).unwrap();
+        let source = Parser::new(tokens).parse().unwrap();
+        dbg!(&source);
+    }
 }
 
 // - parses_empty_doc

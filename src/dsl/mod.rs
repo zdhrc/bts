@@ -1,3 +1,5 @@
-pub mod lexer;
-pub mod parser;
-pub mod syntax;
+mod diag;
+mod lexer;
+mod modeler;
+mod parser;
+mod syntax;

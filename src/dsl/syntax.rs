@@ -1,32 +1,48 @@
+use crate::dsl::diag::SrcRange;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct Source {
-    pub decls: Vec<Declaration>,
+pub struct Ast {
+    pub decls: Vec<Decl>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Declaration {
+pub enum Decl {
     Block(Block),
-    Attribute(Attribute),
+    Attr(Attr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub kind: String,
     pub name: Option<String>,
-    pub decls: Vec<Declaration>,
+    pub decls: Vec<Decl>,
+    pub range: SrcRange,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Attribute {
+pub struct Attr {
     pub key: String,
-    pub value: Expression,
+    pub value: Expr,
+    pub range: SrcRange,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expression {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub range: SrcRange,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprKind {
     Str(String),
     Num(String),
     Bool(bool),
-    Array(Vec<Expression>),
-    Object(Vec<Attribute>),
+    Array(Vec<Expr>),
+    Object(Vec<Attr>),
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, range: SrcRange) -> Self {
+        Self { kind, range }
+    }
 }

@@ -1,194 +1,171 @@
+use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use std::{iter::Peekable, str::CharIndices};
+use thiserror::Error as Err;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Token {
+pub(super) struct Token {
     pub kind: TokenKind,
-    pub range: TokenRange,
+    pub range: SrcRange,
 }
 
+impl Token {
+    fn new(kind: TokenKind, start: usize, end: usize) -> Self {
+        Self {
+            kind,
+            range: SrcRange { start, end },
+        }
+    }
+}
+
+pub(super) type Tokens = Vec<Token>;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum TokenKind {
-    Ident(String),
-
-    StrLit(String),
-    NumLit(String),
-
+pub(super) enum TokenKind {
     LBrace,
     RBrace,
     LBrack,
     RBrack,
 
-    Equals,
     Comma,
+    Dot,
+    Equals,
+
+    Ident(String),
+    String(String),
+    Number(String),
 
     Eof,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct TokenRange {
-    pub start: usize,
-    pub end: usize,
-}
-
 #[derive(Debug)]
-pub struct Lexer<'src> {
+struct Lexer<'src> {
     src: &'src str,
     chars: Peekable<CharIndices<'src>>,
 }
 
 impl<'src> Lexer<'src> {
-    pub fn new(src: &'src str) -> Self {
+    fn new(src: &'src str) -> Self {
         Self {
             src: src,
             chars: src.char_indices().peekable(),
         }
     }
 
-    pub fn lex(mut self) -> Result<Vec<Token>> {
-        let mut tokens = Vec::new();
+    fn lex(mut self) -> Result<Tokens, Errors> {
+        let mut tokens: Tokens = Vec::new();
+        let mut errors: Errors = Vec::new();
 
         while let Some((idx, ch)) = self.next() {
             match ch {
                 ch if ch.is_whitespace() => {}
+                // parenbraceckets
+                '{' => tokens.push(Token::new(TokenKind::LBrace, idx, idx + ch.len_utf8())),
+                '}' => tokens.push(Token::new(TokenKind::RBrace, idx, idx + ch.len_utf8())),
+                '[' => tokens.push(Token::new(TokenKind::LBrack, idx, idx + ch.len_utf8())),
+                ']' => tokens.push(Token::new(TokenKind::RBrack, idx, idx + ch.len_utf8())),
 
-                // braces
-                '{' => tokens.push(Token {
-                    kind: TokenKind::LBrace,
-                    range: TokenRange {
-                        start: idx,
-                        end: idx + ch.len_utf8(),
-                    },
-                }),
-                '}' => tokens.push(Token {
-                    kind: TokenKind::RBrace,
-                    range: TokenRange {
-                        start: idx,
-                        end: idx + ch.len_utf8(),
-                    },
-                }),
-                '[' => tokens.push(Token {
-                    kind: TokenKind::LBrack,
-                    range: TokenRange {
-                        start: idx,
-                        end: idx + ch.len_utf8(),
-                    },
-                }),
-                ']' => tokens.push(Token {
-                    kind: TokenKind::RBrack,
-                    range: TokenRange {
-                        start: idx,
-                        end: idx + ch.len_utf8(),
-                    },
-                }),
+                // punctuation
+                ',' => tokens.push(Token::new(TokenKind::Comma, idx, idx + ch.len_utf8())),
+                '.' => tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8())),
+                '=' => tokens.push(Token::new(TokenKind::Equals, idx, idx + ch.len_utf8())),
 
-                // ident
+                // ident:
+                // - first char must be alphabetic
+                // - ident chars must be alphanumeric or underscores
+                // - whitespace or punctuation breaks
+                // - all other tokens emit a diag and break
                 ch if ch.is_ascii_alphabetic() => {
                     let start = idx;
                     let mut end = idx + ch.len_utf8();
-                    let mut val = String::new();
-                    val.push(ch);
+                    let mut value = String::new();
+                    value.push(ch);
 
                     while let Some((i_idx, i_ch)) = self.peek() {
-                        if i_ch.is_ascii_alphanumeric() || i_ch == '_' {
-                            val.push(i_ch);
-                            end = i_idx + i_ch.len_utf8();
-                            self.next();
-                        } else {
-                            break;
+                        match i_ch {
+                            c if c.is_ascii_alphanumeric() || c == '_' => {
+                                value.push(i_ch);
+                                end = i_idx + i_ch.len_utf8();
+                                self.next();
+                            }
+                            c if c.is_whitespace() => break,
+                            _ => {
+                                errors.push(Error::new(ErrorKind::InvalidIdentToken, SrcRange::new(start, end)));
+                                self.next();
+                                break;
+                            }
                         }
                     }
-                    tokens.push(Token {
-                        kind: TokenKind::Ident(val),
-                        range: TokenRange { start, end },
-                    });
+                    tokens.push(Token::new(TokenKind::Ident(value), start, end));
                 }
 
-                // equals
-                '=' => tokens.push(Token {
-                    kind: TokenKind::Equals,
-                    range: TokenRange {
-                        start: idx,
-                        end: idx + ch.len_utf8(),
-                    },
-                }),
-
-                // comma
-                ',' => tokens.push(Token {
-                    kind: TokenKind::Comma,
-                    range: TokenRange {
-                        start: idx,
-                        end: idx + ch.len_utf8(),
-                    },
-                }),
-
-                // str lit
+                // strings
                 '"' => {
                     let start = idx;
                     let mut end = idx + ch.len_utf8();
-                    let mut val = String::new();
-                    let mut closed = false;
-                    while let Some((s_idx, s_ch)) = self.peek() {
-                        end = s_idx + s_ch.len_utf8();
-                        if s_ch == '"' {
-                            closed = true;
-                            self.next();
-                            break;
+                    let mut value = String::new();
+
+                    let terminated = loop {
+                        match self.next() {
+                            Some((s_idx, '"')) => {
+                                end = s_idx + '"'.len_utf8();
+                                break true;
+                            }
+                            Some((s_idx, c)) => {
+                                value.push(c);
+                                end = s_idx + c.len_utf8();
+                            }
+                            None => break false,
                         }
-                        val.push(s_ch);
-                        self.next();
+                    };
+
+                    if !terminated {
+                        errors.push(Error::new(ErrorKind::UnterminatedString, SrcRange::new(start, end)));
                     }
-                    if !closed {
-                        return Err(Error::UnterminatedString { at: start });
-                    }
-                    tokens.push(Token {
-                        kind: TokenKind::StrLit(val),
-                        range: TokenRange { start, end },
-                    });
+
+                    tokens.push(Token::new(TokenKind::String(value), start, end));
                 }
 
-                // num lit
+                // numbers
                 ch if ch.is_ascii_digit() => {
                     let start = idx;
                     let mut end = idx + ch.len_utf8();
-                    let mut val = String::new();
-                    let mut dec = 0;
-                    val.push(ch);
+                    let mut value = String::new();
+                    let mut decimals = 0;
+                    value.push(ch);
 
                     while let Some((n_idx, n_ch)) = self.peek() {
-                        if n_ch.is_numeric() {
-                            val.push(n_ch);
-                            end = n_idx + n_ch.len_utf8();
-                            self.next();
-                        } else if n_ch == '.' {
-                            if dec == 1 {
-                                return Err(Error::InvalidNumber { at: start });
+                        match n_ch {
+                            c if c.is_ascii_digit() => {
+                                value.push(c);
+                                end = n_idx + c.len_utf8();
+                                self.next();
                             }
-                            val.push(n_ch);
-                            end = n_idx + n_ch.len_utf8();
-                            dec += 1;
-                            self.next();
-                        } else {
-                            break;
+                            '.' => {
+                                decimals += 1;
+                                value.push(n_ch);
+                                end = n_idx + n_ch.len_utf8();
+                                self.next();
+                            }
+                            _ => break,
                         }
                     }
-                    tokens.push(Token {
-                        kind: TokenKind::NumLit(val),
-                        range: TokenRange { start, end },
-                    })
+
+                    if decimals > 1 || value.ends_with('.') {
+                        errors.push(Error::new(ErrorKind::InvalidNumber, SrcRange::new(start, end)));
+                    }
+
+                    tokens.push(Token::new(TokenKind::Number(value), start, end));
                 }
 
                 // errors
-                _ => return Err(Error::UnknownToken { at: idx, ch }),
+                _ => {
+                    errors.push(Error::new(ErrorKind::UnknownToken, SrcRange::new(idx, idx + ch.len_utf8())));
+                }
             }
         }
-        tokens.push(Token {
-            kind: TokenKind::Eof,
-            range: TokenRange {
-                start: self.src.len(),
-                end: self.src.len(),
-            },
-        });
-        Ok(tokens)
+        tokens.push(Token::new(TokenKind::Eof, self.src.len(), self.src.len()));
+
+        if errors.is_empty() { Ok(tokens) } else { Err(errors) }
     }
 
     fn peek(&mut self) -> Option<(usize, char)> {
@@ -199,52 +176,84 @@ impl<'src> Lexer<'src> {
     }
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Error {
-    UnknownToken { at: usize, ch: char },
-
-    // literals
-    UnterminatedString { at: usize },
-    InvalidNumber { at: usize },
+pub(super) fn lex(src: &str) -> Result<Tokens, Diags> {
+    Lexer::new(src).lex().map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::UnknownToken { ch, at } => {
-                write!(f, "unknown token '{ch}' at byte {at}")
-            }
-            Error::UnterminatedString { at } => {
-                write!(f, "unterminated string at byte {at}")
-            }
-            Error::InvalidNumber { at } => {
-                write!(f, "invalid number at byte {at}")
-            }
+#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+#[error("{kind}")]
+pub(super) struct Error {
+    kind: ErrorKind,
+    range: SrcRange,
+}
+
+pub(super) type Errors = Vec<Error>;
+
+#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+pub(super) enum ErrorKind {
+    #[error("unknown token")]
+    UnknownToken,
+    #[error("invalid ident token")]
+    InvalidIdentToken,
+    #[error("unterminated string")]
+    UnterminatedString,
+    #[error("invalid number")]
+    InvalidNumber,
+}
+
+impl Error {
+    fn new(kind: ErrorKind, range: SrcRange) -> Self {
+        Self { kind, range }
+    }
+    fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+    fn range(&self) -> SrcRange {
+        self.range
+    }
+}
+
+impl From<Error> for Diag {
+    fn from(error: Error) -> Self {
+        let Error { kind, range } = error;
+
+        Diag {
+            when: DiagPhase::Lexing,
+            what: kind.to_string(),
+            r#where: range,
         }
     }
 }
 
-impl std::error::Error for Error {}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[test]
-fn debug() {
-    let src = include_str!("../../tests/fixtures/simple.bt");
-    let tokens = Lexer::new(src).lex();
-    dbg!(&tokens);
-}
+    #[test]
+    fn debug() {
+        let src = include_str!("../../tests/fixtures/simple.bt");
+        let tokens = Lexer::new(src).lex();
+        dbg!(&tokens);
+    }
 
-#[test]
-fn rejects_str_literal_without_termination() {
-    let err = Lexer::new("\"foo").lex().unwrap_err();
-    assert_eq!(err, Error::UnterminatedString { at: 0 });
-}
+    #[track_caller]
+    fn assert_error_kinds(src: &str, want: &[ErrorKind]) {
+        let diags = Lexer::new(src).lex().unwrap_err();
+        let got: Vec<_> = diags.iter().map(Error::kind).collect();
 
-#[test]
-fn rejects_num_literal_with_multiple_dec_points() {
-    let err = Lexer::new("5.6.4.3").lex().unwrap_err();
-    assert_eq!(err, Error::InvalidNumber { at: 0 });
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn rejects_string_without_termination() {
+        assert_error_kinds("\"foo", &[ErrorKind::UnterminatedString]);
+    }
+
+    #[test]
+    fn rejects_numbers_with_multiple_dec_points() {
+        assert_error_kinds("5.6.4.3", &[ErrorKind::InvalidNumber]);
+        assert_error_kinds("1..", &[ErrorKind::InvalidNumber]);
+    }
 }
 
 // - lexes_empty_input_as_eof

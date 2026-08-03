@@ -1,21 +1,27 @@
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct Diag {
-    pub when: Phase,
+    pub when: DiagPhase,
     pub what: String,
-    pub r#where: Range,
+    pub r#where: SrcRange,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) enum Phase {
+pub(super) enum DiagPhase {
     Lexing,
     Parsing,
     Validation,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct Range {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) struct SrcRange {
     pub(super) start: usize,
     pub(super) end: usize,
+}
+
+impl SrcRange {
+    pub(super) fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
 }
 
 pub(super) type Diags = Vec<Diag>;
