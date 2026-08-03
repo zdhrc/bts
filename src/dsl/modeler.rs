@@ -3,37 +3,43 @@ use crate::dsl::syntax;
 use std::collections::HashSet;
 use thiserror::Error as Err;
 
-pub(super) struct Model {
-    traces: Vec<Trace>,
+#[derive(Debug)]
+pub(crate) struct Model {
+    pub(crate) traces: Vec<Trace>,
 }
 
-pub(super) struct Trace {
-    name: String,
-    fields: SpanFields,
-    children: Vec<Span>,
+#[derive(Debug)]
+pub(crate) struct Trace {
+    pub(crate) name: String,
+    pub(crate) fields: SpanFields,
+    pub(crate) children: Vec<Span>,
 }
 
-pub(super) struct Span {
-    name: String,
-    kind: SpanKind,
-    fields: SpanFields,
-    children: Vec<Span>,
+#[derive(Debug)]
+pub(crate) struct Span {
+    pub(crate) name: String,
+    pub(crate) kind: SpanKind,
+    pub(crate) fields: SpanFields,
+    pub(crate) children: Vec<Span>,
 }
 
-pub(super) enum SpanKind {
+#[derive(Debug)]
+pub(crate) enum SpanKind {
     Task,
     Llm,
 }
 
-pub(super) struct SpanFields {
-    input: Option<Value>,
-    output: Option<Value>,
-    metadata: Option<Object>,
-    metrics: Option<Object>,
-    tags: Vec<String>,
+#[derive(Debug)]
+pub(crate) struct SpanFields {
+    pub(crate) input: Option<Value>,
+    pub(crate) output: Option<Value>,
+    pub(crate) metadata: Option<Object>,
+    pub(crate) metrics: Option<Object>,
+    pub(crate) tags: Vec<String>,
 }
 
-pub(super) enum Value {
+#[derive(Debug)]
+pub(crate) enum Value {
     Str(String),
     Num(Number),
     Bool(bool),
@@ -41,22 +47,26 @@ pub(super) enum Value {
     Object(Object),
 }
 
-pub(super) enum Number {
+#[derive(Debug)]
+pub(crate) enum Number {
     Int(i64),
     Float(f64),
 }
 
-pub(super) struct Array {
-    elem: Vec<Value>,
+#[derive(Debug)]
+pub(crate) struct Array {
+    pub(crate) elem: Vec<Value>,
 }
 
-pub(super) struct Object {
-    elem: Vec<ObjectField>,
+#[derive(Debug)]
+pub(crate) struct Object {
+    pub(crate) elem: Vec<ObjectField>,
 }
 
-pub(super) struct ObjectField {
-    key: String,
-    value: Value,
+#[derive(Debug)]
+pub(crate) struct ObjectField {
+    pub(crate) key: String,
+    pub(crate) value: Value,
 }
 
 pub(super) struct Modeler {
@@ -88,7 +98,11 @@ impl Modeler {
             }
         }
 
-        if self.errors.is_empty() { Ok(Model { traces }) } else { Err(self.errors) }
+        if self.errors.is_empty() {
+            Ok(Model { traces })
+        } else {
+            Err(self.errors)
+        }
     }
 
     fn model_trace(&mut self, block: syntax::Block) -> Option<Trace> {

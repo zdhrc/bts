@@ -41,7 +41,11 @@ impl Parser {
             }
         }
 
-        if self.errors.is_empty() { Ok(Ast { decls }) } else { Err(self.errors) }
+        if self.errors.is_empty() {
+            Ok(Ast { decls })
+        } else {
+            Err(self.errors)
+        }
     }
 
     fn parse_decl(&mut self) -> Option<Decl> {

@@ -165,7 +165,11 @@ impl<'src> Lexer<'src> {
         }
         tokens.push(Token::new(TokenKind::Eof, self.src.len(), self.src.len()));
 
-        if errors.is_empty() { Ok(tokens) } else { Err(errors) }
+        if errors.is_empty() {
+            Ok(tokens)
+        } else {
+            Err(errors)
+        }
     }
 
     fn peek(&mut self) -> Option<(usize, char)> {
