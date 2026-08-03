@@ -11,6 +11,7 @@
 //! second source of truth.
 
 use serde::Serialize;
+use std::fmt;
 
 /// The complete public description of a language version.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -27,6 +28,28 @@ pub(crate) struct Spec {
     /// Rules applying to the language as a whole rather than one block.
     pub(crate) rules: &'static [RuleDesc],
     pub(crate) examples: &'static [Example],
+}
+
+impl Spec {
+    pub(crate) fn block(&self, keyword: &str) -> Option<&BlockDesc> {
+        self.blocks.iter().find(|block| block.keyword == keyword)
+    }
+
+    pub(crate) fn block_by_id(&self, id: Id) -> Option<&BlockDesc> {
+        self.blocks.iter().find(|block| block.id == id)
+    }
+
+    pub(crate) fn field(&self, block: Id, field: Id) -> Option<&FieldDesc> {
+        self.block_by_id(block)?.body.fields.iter().find(|desc| desc.id == field)
+    }
+
+    pub(crate) fn rule(&self, id: Id) -> Option<&RuleDesc> {
+        self.rules
+            .iter()
+            .chain(self.blocks.iter().flat_map(|block| block.rules))
+            .chain(self.expressions.iter().flat_map(|expr| expr.rules))
+            .find(|rule| rule.id == id)
+    }
 }
 
 /// A stable identifier used to connect descriptions to implementation code.
@@ -76,6 +99,10 @@ pub(crate) struct ExprForm {
 /// the recursive containers supported by the current expression grammar.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    reason = "the schema supports constraints not used by the current language version"
+)]
 pub(crate) enum ExprDesc {
     Any,
     String,
@@ -85,6 +112,30 @@ pub(crate) enum ExprDesc {
     Object { values: &'static ExprDesc },
     OneOf { variants: &'static [ExprDesc] },
     Named { id: Id },
+}
+
+impl fmt::Display for ExprDesc {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Any => formatter.write_str("any value"),
+            Self::String => formatter.write_str("string"),
+            Self::Number => formatter.write_str("number"),
+            Self::Boolean => formatter.write_str("boolean"),
+            Self::Array { items } => write!(formatter, "array<{items}>"),
+            Self::Object { values } if matches!(**values, Self::Any) => formatter.write_str("object"),
+            Self::Object { values } => write!(formatter, "object<{values}>"),
+            Self::OneOf { variants } => {
+                for (index, variant) in variants.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(" | ")?;
+                    }
+                    variant.fmt(formatter)?;
+                }
+                Ok(())
+            }
+            Self::Named { id } => formatter.write_str(id.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -97,6 +148,16 @@ pub(crate) struct BlockDesc {
     pub(crate) allowed_in: &'static [Place],
     pub(crate) body: BodyDesc,
     pub(crate) rules: &'static [RuleDesc],
+}
+
+impl BlockDesc {
+    pub(crate) fn allows(&self, place: Place) -> bool {
+        self.allowed_in.contains(&place)
+    }
+
+    pub(crate) fn field(&self, keyword: &str) -> Option<&FieldDesc> {
+        self.body.fields.iter().find(|field| field.keyword == keyword)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -120,6 +181,10 @@ pub(crate) struct FieldDesc {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    reason = "the schema supports cardinalities not used by the current language version"
+)]
 pub(crate) enum Cardinality {
     /// Zero or one occurrence.
     Optional,
@@ -131,6 +196,10 @@ pub(crate) enum Cardinality {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(
+    dead_code,
+    reason = "the schema supports name rules not used by the current language version"
+)]
 pub(crate) enum NameDesc {
     Forbidden,
     Optional,
@@ -336,7 +405,7 @@ const EXAMPLES: &[Example] = &[Example {
     valid: true,
 }];
 
-pub(crate) const SPEC: Spec = Spec {
+pub(crate) static SPEC: Spec = Spec {
     schema_version: 1,
     language_version: 1,
     name: "BTS",

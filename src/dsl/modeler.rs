@@ -1,7 +1,7 @@
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
+use crate::dsl::spec::{self, BlockDesc, Cardinality, ExprDesc, Id, NameDesc, Place, SPEC};
 use crate::dsl::syntax;
-use std::collections::HashSet;
-use thiserror::Error as Err;
+use std::{collections::HashSet, fmt};
 
 #[derive(Debug)]
 pub(crate) struct Model {
@@ -69,6 +69,45 @@ pub(crate) struct ObjectField {
     pub(crate) value: Value,
 }
 
+enum FieldValue {
+    Value(Value),
+    Object(Object),
+    Strings(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum ExprType {
+    String,
+    Number,
+    Boolean,
+    Array,
+    Object,
+}
+
+impl ExprType {
+    fn of(expr: &syntax::Expr) -> Self {
+        match expr.kind {
+            syntax::ExprKind::Str(_) => Self::String,
+            syntax::ExprKind::Num(_) => Self::Number,
+            syntax::ExprKind::Bool(_) => Self::Boolean,
+            syntax::ExprKind::Array(_) => Self::Array,
+            syntax::ExprKind::Object(_) => Self::Object,
+        }
+    }
+}
+
+impl fmt::Display for ExprType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::Array => "array",
+            Self::Object => "object",
+        })
+    }
+}
+
 pub(super) struct Modeler {
     ast: syntax::Ast,
     errors: Errors,
@@ -85,15 +124,34 @@ impl Modeler {
         for decl in std::mem::take(&mut self.ast.decls) {
             match decl {
                 syntax::Decl::Attr(attr) => {
-                    self.errors.push(Error::new(ErrorKind::UnexpectedRootAttr, attr.range));
-                }
-                syntax::Decl::Block(block) if block.kind == "trace" => {
-                    if let Some(trace) = self.model_trace(block) {
-                        traces.push(trace);
-                    }
+                    self.errors
+                        .push(Error::new(ErrorKind::RootAttribute { keyword: attr.key }, attr.range));
                 }
                 syntax::Decl::Block(block) => {
-                    self.errors.push(Error::new(ErrorKind::UnexpectedRootBlock, block.range));
+                    let Some(desc) = SPEC.block(&block.kind) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownBlock {
+                                keyword: block.kind,
+                                parent: Place::Root,
+                            },
+                            block.range,
+                        ));
+                        continue;
+                    };
+
+                    if desc.id == spec::ids::TRACE && desc.allows(Place::Root) {
+                        if let Some(trace) = self.model_trace(block, desc) {
+                            traces.push(trace);
+                        }
+                    } else {
+                        self.errors.push(Error::new(
+                            ErrorKind::BlockNotAllowed {
+                                block: desc.id,
+                                parent: Place::Root,
+                            },
+                            block.range,
+                        ));
+                    }
                 }
             }
         }
@@ -105,33 +163,61 @@ impl Modeler {
         }
     }
 
-    fn model_trace(&mut self, block: syntax::Block) -> Option<Trace> {
+    fn model_trace(&mut self, block: syntax::Block, desc: &BlockDesc) -> Option<Trace> {
         let syntax::Block { name, decls, range, .. } = block;
-        let name = self.require_name(name, range);
-        let (fields, blocks) = self.model_body(decls);
-        let children = blocks.into_iter().filter_map(|block| self.model_span(block)).collect();
+        let name = self.model_name(name, range, desc);
+        let (fields, blocks) = self.model_body(decls, desc, range);
+        let children = blocks
+            .into_iter()
+            .filter_map(|block| self.model_span(block, desc.id))
+            .collect();
 
         name.map(|name| Trace { name, fields, children })
     }
 
-    fn model_span(&mut self, block: syntax::Block) -> Option<Span> {
-        let syntax::Block { kind, name, decls, range } = block;
-        let span_kind = match kind.as_str() {
-            "task" => SpanKind::Task,
-            "llm" => SpanKind::Llm,
-            "trace" => {
-                self.errors.push(Error::new(ErrorKind::NestedTrace, range));
-                return None;
-            }
-            _ => {
-                self.errors.push(Error::new(ErrorKind::UnknownSpanKind, range));
-                return None;
-            }
+    fn model_span(&mut self, block: syntax::Block, parent: Id) -> Option<Span> {
+        let syntax::Block {
+            kind,
+            name,
+            decls,
+            range,
+        } = block;
+        let Some(desc) = SPEC.block(&kind) else {
+            self.errors.push(Error::new(
+                ErrorKind::UnknownBlock {
+                    keyword: kind,
+                    parent: Place::Block { id: parent },
+                },
+                range,
+            ));
+            return None;
         };
 
-        let name = self.require_name(name, range);
-        let (fields, blocks) = self.model_body(decls);
-        let children = blocks.into_iter().filter_map(|block| self.model_span(block)).collect();
+        if !desc.allows(Place::Block { id: parent }) {
+            self.errors.push(Error::new(
+                ErrorKind::BlockNotAllowed {
+                    block: desc.id,
+                    parent: Place::Block { id: parent },
+                },
+                range,
+            ));
+            return None;
+        }
+
+        let span_kind = if desc.id == spec::ids::TASK {
+            SpanKind::Task
+        } else if desc.id == spec::ids::LLM {
+            SpanKind::Llm
+        } else {
+            unreachable!("block {} does not have a model lowering", desc.id.as_str());
+        };
+
+        let name = self.model_name(name, range, desc);
+        let (fields, blocks) = self.model_body(decls, desc, range);
+        let children = blocks
+            .into_iter()
+            .filter_map(|block| self.model_span(block, desc.id))
+            .collect();
 
         name.map(|name| Span {
             name,
@@ -141,34 +227,154 @@ impl Modeler {
         })
     }
 
-    fn model_body(&mut self, decls: Vec<syntax::Decl>) -> (SpanFields, Vec<syntax::Block>) {
+    fn model_body(&mut self, decls: Vec<syntax::Decl>, block: &BlockDesc, range: SrcRange) -> (SpanFields, Vec<syntax::Block>) {
         let mut fields = FieldsBuilder::default();
         let mut blocks = Vec::new();
 
         for decl in decls {
             match decl {
                 syntax::Decl::Block(block) => blocks.push(block),
-                syntax::Decl::Attr(attr) => self.model_field(&mut fields, attr),
+                syntax::Decl::Attr(attr) => self.model_field(&mut fields, block, attr),
+            }
+        }
+
+        for field in block.body.fields {
+            if field.cardinality == Cardinality::Required && !fields.seen.contains(&field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::MissingField {
+                        block: block.id,
+                        field: field.id,
+                    },
+                    range,
+                ));
             }
         }
 
         (fields.finish(), blocks)
     }
 
-    fn model_field(&mut self, fields: &mut FieldsBuilder, attr: syntax::Attr) {
+    fn model_field(&mut self, fields: &mut FieldsBuilder, block: &BlockDesc, attr: syntax::Attr) {
         let range = attr.range;
-        if !fields.seen.insert(attr.key.clone()) {
-            self.errors.push(Error::new(ErrorKind::DuplicateAttr, range));
+        let Some(field) = block.field(&attr.key) else {
+            if !block.body.open {
+                self.errors.push(Error::new(
+                    ErrorKind::UnknownField {
+                        block: block.id,
+                        keyword: attr.key,
+                    },
+                    range,
+                ));
+            }
+            return;
+        };
+
+        if field.cardinality != Cardinality::Repeated && !fields.seen.insert(field.id) {
+            self.errors.push(Error::new(
+                ErrorKind::DuplicateField {
+                    block: block.id,
+                    field: field.id,
+                },
+                range,
+            ));
             return;
         }
 
-        match attr.key.as_str() {
-            "input" => fields.input = self.model_value(attr.value),
-            "output" => fields.output = self.model_value(attr.value),
-            "metadata" => fields.metadata = self.require_object(attr.value),
-            "metrics" => fields.metrics = self.require_object(attr.value),
-            "tags" => fields.tags = self.require_tags(attr.value),
-            _ => self.errors.push(Error::new(ErrorKind::UnknownAttr, range)),
+        if !self.validate_expr(&attr.value, block.id, field.id, field.value) {
+            return;
+        }
+
+        let Some(value) = self.model_field_value(attr.value, field.value) else {
+            return;
+        };
+
+        match (field.id, value) {
+            (spec::ids::INPUT, FieldValue::Value(value)) => fields.input = Some(value),
+            (spec::ids::OUTPUT, FieldValue::Value(value)) => fields.output = Some(value),
+            (spec::ids::METADATA, FieldValue::Object(value)) => fields.metadata = Some(value),
+            (spec::ids::METRICS, FieldValue::Object(value)) => fields.metrics = Some(value),
+            (spec::ids::TAGS, FieldValue::Strings(value)) => fields.tags = Some(value),
+            _ => unreachable!("field {} does not match its model lowering", field.id.as_str()),
+        }
+    }
+
+    fn validate_expr(&mut self, expr: &syntax::Expr, block: Id, field: Id, expected: &'static ExprDesc) -> bool {
+        let valid = match expected {
+            ExprDesc::Any => true,
+            ExprDesc::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
+            ExprDesc::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
+            ExprDesc::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
+            ExprDesc::Array { items } => {
+                let syntax::ExprKind::Array(values) = &expr.kind else {
+                    self.push_type_mismatch(expr, block, field, expected);
+                    return false;
+                };
+
+                return values
+                    .iter()
+                    .fold(true, |valid, value| self.validate_expr(value, block, field, items) && valid);
+            }
+            ExprDesc::Object { values } => {
+                let syntax::ExprKind::Object(attrs) = &expr.kind else {
+                    self.push_type_mismatch(expr, block, field, expected);
+                    return false;
+                };
+
+                return attrs.iter().fold(true, |valid, attr| {
+                    self.validate_expr(&attr.value, block, field, values) && valid
+                });
+            }
+            ExprDesc::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
+            ExprDesc::Named { .. } => false,
+        };
+
+        if !valid {
+            self.push_type_mismatch(expr, block, field, expected);
+        }
+
+        valid
+    }
+
+    fn expr_matches(expr: &syntax::Expr, expected: &ExprDesc) -> bool {
+        match expected {
+            ExprDesc::Any => true,
+            ExprDesc::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
+            ExprDesc::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
+            ExprDesc::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
+            ExprDesc::Array { items } => match &expr.kind {
+                syntax::ExprKind::Array(values) => values.iter().all(|value| Self::expr_matches(value, items)),
+                _ => false,
+            },
+            ExprDesc::Object { values } => match &expr.kind {
+                syntax::ExprKind::Object(attrs) => attrs.iter().all(|attr| Self::expr_matches(&attr.value, values)),
+                _ => false,
+            },
+            ExprDesc::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
+            ExprDesc::Named { .. } => false,
+        }
+    }
+
+    fn push_type_mismatch(&mut self, expr: &syntax::Expr, block: Id, field: Id, expected: &'static ExprDesc) {
+        self.errors.push(Error::new(
+            ErrorKind::TypeMismatch {
+                block,
+                field,
+                expected,
+                found: ExprType::of(expr),
+            },
+            expr.range,
+        ));
+    }
+
+    fn model_field_value(&mut self, expr: syntax::Expr, expected: &ExprDesc) -> Option<FieldValue> {
+        match expected {
+            ExprDesc::Any => self.model_value(expr).map(FieldValue::Value),
+            ExprDesc::Object { values } if matches!(**values, ExprDesc::Any) => {
+                self.require_object(expr).map(FieldValue::Object)
+            }
+            ExprDesc::Array { items } if matches!(**items, ExprDesc::String) => {
+                self.require_tags(expr).map(FieldValue::Strings)
+            }
+            _ => unreachable!("expression constraint does not have a model lowering"),
         }
     }
 
@@ -191,7 +397,13 @@ impl Modeler {
 
         for attr in attrs {
             if !seen.insert(attr.key.clone()) {
-                self.errors.push(Error::new(ErrorKind::DuplicateObjectKey, attr.range));
+                self.errors.push(Error::new(
+                    ErrorKind::DuplicateObjectKey {
+                        rule: spec::ids::UNIQUE_OBJECT_KEYS,
+                        key: attr.key,
+                    },
+                    attr.range,
+                ));
             } else if let Some(value) = self.model_value(attr.value) {
                 elem.push(ObjectField { key: attr.key, value });
             }
@@ -201,37 +413,29 @@ impl Modeler {
     }
 
     fn require_object(&mut self, expr: syntax::Expr) -> Option<Object> {
-        let syntax::Expr { kind, range } = expr;
+        let syntax::Expr { kind, .. } = expr;
         match kind {
             syntax::ExprKind::Object(attrs) => Some(self.model_object(attrs)),
-            _ => {
-                self.errors.push(Error::new(ErrorKind::ExpectedObject, range));
-                None
-            }
+            _ => unreachable!("expression was validated as an object"),
         }
     }
 
     fn require_tags(&mut self, expr: syntax::Expr) -> Option<Vec<String>> {
-        let syntax::Expr { kind, range } = expr;
+        let syntax::Expr { kind, .. } = expr;
         let syntax::ExprKind::Array(values) = kind else {
-            self.errors.push(Error::new(ErrorKind::ExpectedStringArray, range));
-            return None;
+            unreachable!("expression was validated as an array of strings");
         };
 
         let mut tags = Vec::new();
-        let mut valid = true;
 
         for value in values {
             match value.kind {
                 syntax::ExprKind::Str(value) => tags.push(value),
-                _ => {
-                    self.errors.push(Error::new(ErrorKind::ExpectedStringArray, value.range));
-                    valid = false;
-                }
+                _ => unreachable!("array item was validated as a string"),
             }
         }
 
-        valid.then_some(tags)
+        Some(tags)
     }
 
     fn model_number(&mut self, raw: String, range: SrcRange) -> Option<Number> {
@@ -242,22 +446,44 @@ impl Modeler {
         };
 
         if number.is_none() {
-            self.errors.push(Error::new(ErrorKind::InvalidNumber, range));
+            self.errors.push(Error::new(
+                ErrorKind::InvalidNumber {
+                    rule: spec::ids::FINITE_NUMBERS,
+                    raw,
+                },
+                range,
+            ));
         }
 
         number
     }
 
-    fn require_name(&mut self, name: Option<String>, range: SrcRange) -> Option<String> {
-        if name.is_none() {
-            self.errors.push(Error::new(ErrorKind::MissingName, range));
+    fn model_name(&mut self, name: Option<String>, range: SrcRange, block: &BlockDesc) -> Option<String> {
+        match block.name {
+            NameDesc::Required => {
+                if name.is_none() {
+                    self.errors
+                        .push(Error::new(ErrorKind::MissingName { block: block.id }, range));
+                }
+                name
+            }
+            NameDesc::Forbidden if name.is_some() => {
+                self.errors
+                    .push(Error::new(ErrorKind::UnexpectedName { block: block.id }, range));
+                None
+            }
+            NameDesc::Optional => name,
+            NameDesc::Forbidden => {
+                unreachable!("the typed model currently requires block names")
+            }
         }
-        name
     }
 }
 
 pub(super) fn model(ast: syntax::Ast) -> Result<Model, Diags> {
-    Modeler::new(ast).model().map_err(|errors| errors.into_iter().map(Diag::from).collect())
+    Modeler::new(ast)
+        .model()
+        .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
 #[derive(Default)]
@@ -267,7 +493,7 @@ struct FieldsBuilder {
     metadata: Option<Object>,
     metrics: Option<Object>,
     tags: Option<Vec<String>>,
-    seen: HashSet<String>,
+    seen: HashSet<Id>,
 }
 
 impl FieldsBuilder {
@@ -282,8 +508,7 @@ impl FieldsBuilder {
     }
 }
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
-#[error("{kind}")]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct Error {
     kind: ErrorKind,
     range: SrcRange,
@@ -291,39 +516,215 @@ pub(super) struct Error {
 
 pub(super) type Errors = Vec<Error>;
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) enum ErrorKind {
-    #[error("attribute is not allowed at the root")]
-    UnexpectedRootAttr,
-    #[error("block is not allowed at the root")]
-    UnexpectedRootBlock,
-    #[error("unknown span kind")]
-    UnknownSpanKind,
-    #[error("trace blocks cannot be nested")]
-    NestedTrace,
-    #[error("block requires a name")]
-    MissingName,
-    #[error("unknown attribute")]
-    UnknownAttr,
-    #[error("duplicate attribute")]
-    DuplicateAttr,
-    #[error("expected object")]
-    ExpectedObject,
-    #[error("expected array of strings")]
-    ExpectedStringArray,
-    #[error("duplicate object key")]
-    DuplicateObjectKey,
-    #[error("invalid number")]
-    InvalidNumber,
+    RootAttribute {
+        keyword: String,
+    },
+    UnknownBlock {
+        keyword: String,
+        parent: Place,
+    },
+    BlockNotAllowed {
+        block: Id,
+        parent: Place,
+    },
+    MissingName {
+        block: Id,
+    },
+    UnexpectedName {
+        block: Id,
+    },
+    UnknownField {
+        block: Id,
+        keyword: String,
+    },
+    MissingField {
+        block: Id,
+        field: Id,
+    },
+    DuplicateField {
+        block: Id,
+        field: Id,
+    },
+    TypeMismatch {
+        block: Id,
+        field: Id,
+        expected: &'static ExprDesc,
+        found: ExprType,
+    },
+    DuplicateObjectKey {
+        rule: Id,
+        key: String,
+    },
+    InvalidNumber {
+        rule: Id,
+        raw: String,
+    },
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootAttribute { keyword } => {
+                write!(
+                    formatter,
+                    "attribute `{keyword}` is not allowed at the root; allowed blocks: "
+                )?;
+                fmt_allowed_blocks(formatter, Place::Root)
+            }
+            Self::UnknownBlock { keyword, parent } => {
+                write!(formatter, "unknown block `{keyword}` ")?;
+                fmt_place(formatter, *parent)?;
+                formatter.write_str("; allowed blocks here: ")?;
+                fmt_allowed_blocks(formatter, *parent)
+            }
+            Self::BlockNotAllowed { block, parent } => {
+                let block = block_desc(*block);
+                write!(formatter, "block `{}` is not allowed ", block.keyword)?;
+                fmt_place(formatter, *parent)?;
+                formatter.write_str("; allowed placements: ")?;
+                fmt_places(formatter, block.allowed_in)
+            }
+            Self::MissingName { block } => {
+                let block = block_desc(*block);
+                write!(
+                    formatter,
+                    "block `{}` requires a name; expected `{}`",
+                    block.keyword, block.syntax
+                )
+            }
+            Self::UnexpectedName { block } => {
+                let block = block_desc(*block);
+                write!(formatter, "block `{}` does not accept a name", block.keyword)
+            }
+            Self::UnknownField { block, keyword } => {
+                let block = block_desc(*block);
+                write!(formatter, "unknown field `{keyword}` in block `{}`", block.keyword)?;
+                if block.body.fields.is_empty() {
+                    formatter.write_str("; this block does not accept fields")
+                } else {
+                    formatter.write_str("; expected one of: ")?;
+                    for (index, field) in block.body.fields.iter().enumerate() {
+                        if index > 0 {
+                            formatter.write_str(", ")?;
+                        }
+                        write!(formatter, "`{}`", field.keyword)?;
+                    }
+                    Ok(())
+                }
+            }
+            Self::MissingField { block, field } => {
+                let block = block_desc(*block);
+                let field = field_desc(block.id, *field);
+                write!(formatter, "block `{}` requires field `{}`", block.keyword, field.keyword)
+            }
+            Self::DuplicateField { block, field } => {
+                let block = block_desc(*block);
+                let field = field_desc(block.id, *field);
+                write!(
+                    formatter,
+                    "field `{}` may appear only once in block `{}`",
+                    field.keyword, block.keyword
+                )
+            }
+            Self::TypeMismatch {
+                block,
+                field,
+                expected,
+                found,
+            } => {
+                let block = block_desc(*block);
+                let field = field_desc(block.id, *field);
+                write!(
+                    formatter,
+                    "field `{}` in block `{}` expects {expected}, but found {found}",
+                    field.keyword, block.keyword
+                )
+            }
+            Self::DuplicateObjectKey { rule, key } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "duplicate object key `{key}`; {}", rule.summary)
+            }
+            Self::InvalidNumber { rule, raw } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "invalid number `{raw}`; {}", rule.summary)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Error {}
+
+fn block_desc(id: Id) -> &'static BlockDesc {
+    SPEC.block_by_id(id)
+        .unwrap_or_else(|| panic!("error references unknown block {}", id.as_str()))
+}
+
+fn field_desc(block: Id, field: Id) -> &'static spec::FieldDesc {
+    SPEC.field(block, field).unwrap_or_else(|| {
+        panic!(
+            "error references unknown field {} in block {}",
+            field.as_str(),
+            block.as_str()
+        )
+    })
+}
+
+fn rule_desc(id: Id) -> &'static spec::RuleDesc {
+    SPEC.rule(id)
+        .unwrap_or_else(|| panic!("error references unknown rule {}", id.as_str()))
+}
+
+fn fmt_place(formatter: &mut fmt::Formatter<'_>, place: Place) -> fmt::Result {
+    match place {
+        Place::Root => formatter.write_str("at the root"),
+        Place::Block { id } => write!(formatter, "inside block `{}`", block_desc(id).keyword),
+    }
+}
+
+fn fmt_places(formatter: &mut fmt::Formatter<'_>, places: &[Place]) -> fmt::Result {
+    for (index, place) in places.iter().enumerate() {
+        if index > 0 {
+            formatter.write_str(", ")?;
+        }
+        fmt_place(formatter, *place)?;
+    }
+    Ok(())
+}
+
+fn fmt_allowed_blocks(formatter: &mut fmt::Formatter<'_>, place: Place) -> fmt::Result {
+    let mut count = 0;
+    for block in SPEC.blocks.iter().filter(|block| block.allows(place)) {
+        if count > 0 {
+            formatter.write_str(", ")?;
+        }
+        write!(formatter, "`{}`", block.keyword)?;
+        count += 1;
+    }
+
+    if count == 0 {
+        formatter.write_str("none")?;
+    }
+
+    Ok(())
 }
 
 impl Error {
     fn new(kind: ErrorKind, range: SrcRange) -> Self {
         Self { kind, range }
     }
-    fn kind(&self) -> ErrorKind {
-        self.kind
+    #[cfg(test)]
+    fn kind(&self) -> &ErrorKind {
+        &self.kind
     }
+    #[cfg(test)]
     fn range(&self) -> SrcRange {
         self.range
     }
@@ -360,8 +761,16 @@ mod tests {
         assert_eq!(trace.name, "multi-turn-conversation");
         assert_eq!(trace.children.len(), 2);
         assert!(trace.children.iter().all(|span| matches!(&span.kind, SpanKind::Task)));
-        assert!(trace.children.iter().all(|span| matches!(span.children.as_slice(), [Span { kind: SpanKind::Llm, .. }])));
-        assert_eq!(trace.fields.tags.iter().map(String::as_str).collect::<Vec<_>>(), ["chat", "prod"]);
+        assert!(
+            trace
+                .children
+                .iter()
+                .all(|span| matches!(span.children.as_slice(), [Span { kind: SpanKind::Llm, .. }]))
+        );
+        assert_eq!(
+            trace.fields.tags.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["chat", "prod"]
+        );
     }
 
     #[test]
@@ -380,9 +789,37 @@ mod tests {
             Ok(_) => panic!("expected semantic errors"),
         };
 
+        let trace = SPEC.block_by_id(spec::ids::TRACE).unwrap();
+        let metadata = trace.field("metadata").unwrap();
+        let tags = trace.field("tags").unwrap();
+        let ExprDesc::Array { items: tag_item } = *tags.value else {
+            panic!("tags must be described as an array");
+        };
+
         assert_eq!(
-            errors.iter().map(Error::kind).collect::<Vec<_>>(),
-            vec![ErrorKind::DuplicateAttr, ErrorKind::ExpectedObject, ErrorKind::ExpectedStringArray,]
+            errors[0].kind(),
+            &ErrorKind::DuplicateField {
+                block: spec::ids::TRACE,
+                field: spec::ids::INPUT,
+            }
+        );
+        assert_eq!(
+            errors[1].kind(),
+            &ErrorKind::TypeMismatch {
+                block: spec::ids::TRACE,
+                field: spec::ids::METADATA,
+                expected: metadata.value,
+                found: ExprType::Boolean,
+            }
+        );
+        assert_eq!(
+            errors[2].kind(),
+            &ErrorKind::TypeMismatch {
+                block: spec::ids::TRACE,
+                field: spec::ids::TAGS,
+                expected: tag_item,
+                found: ExprType::Boolean,
+            }
         );
 
         let range = errors[1].range();
@@ -397,7 +834,106 @@ mod tests {
         };
 
         assert_eq!(errors.len(), 3);
-        assert!(errors.iter().all(|error| error.kind() == ErrorKind::ExpectedStringArray));
+        assert!(errors.iter().all(|error| {
+            matches!(
+                error.kind(),
+                ErrorKind::TypeMismatch {
+                    block: spec::ids::TRACE,
+                    field: spec::ids::TAGS,
+                    expected: ExprDesc::String,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn applies_block_rules_from_the_spec() {
+        let root_errors = model(r#"task "root" {}"#).unwrap_err();
+        assert_eq!(
+            root_errors[0].kind(),
+            &ErrorKind::BlockNotAllowed {
+                block: spec::ids::TASK,
+                parent: Place::Root,
+            }
+        );
+
+        let nested_errors = model(r#"trace "outer" { trace "inner" {} }"#).unwrap_err();
+        assert_eq!(
+            nested_errors[0].kind(),
+            &ErrorKind::BlockNotAllowed {
+                block: spec::ids::TRACE,
+                parent: Place::Block { id: spec::ids::TRACE },
+            }
+        );
+
+        let name_errors = model("trace {}").unwrap_err();
+        assert_eq!(name_errors[0].kind(), &ErrorKind::MissingName { block: spec::ids::TRACE });
+    }
+
+    #[test]
+    fn distinguishes_unknown_blocks_and_root_attributes() {
+        let root_attr = model("input = true").unwrap_err();
+        assert_eq!(
+            root_attr[0].kind(),
+            &ErrorKind::RootAttribute {
+                keyword: "input".to_owned(),
+            }
+        );
+
+        let unknown = model(r#"trace "outer" { custom "inner" {} }"#).unwrap_err();
+        assert_eq!(
+            unknown[0].kind(),
+            &ErrorKind::UnknownBlock {
+                keyword: "custom".to_owned(),
+                parent: Place::Block { id: spec::ids::TRACE },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_fields_absent_from_the_block_spec() {
+        let errors = model(r#"trace "example" { unknown = true }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::UnknownField {
+                block: spec::ids::TRACE,
+                keyword: "unknown".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn associates_custom_validation_with_spec_rules() {
+        let duplicate = model(r#"trace "example" { metadata = { key = 1 key = 2 } }"#).unwrap_err();
+        assert_eq!(
+            duplicate[0].kind(),
+            &ErrorKind::DuplicateObjectKey {
+                rule: spec::ids::UNIQUE_OBJECT_KEYS,
+                key: "key".to_owned(),
+            }
+        );
+        assert!(
+            duplicate[0]
+                .to_string()
+                .contains(SPEC.rule(spec::ids::UNIQUE_OBJECT_KEYS).unwrap().summary)
+        );
+
+        let raw = "999999999999999999999999999999999999";
+        let invalid_number = model(&format!(r#"trace "example" {{ input = {raw} }}"#)).unwrap_err();
+        assert_eq!(
+            invalid_number[0].kind(),
+            &ErrorKind::InvalidNumber {
+                rule: spec::ids::FINITE_NUMBERS,
+                raw: raw.to_owned(),
+            }
+        );
+        assert!(
+            invalid_number[0]
+                .to_string()
+                .contains(SPEC.rule(spec::ids::FINITE_NUMBERS).unwrap().summary)
+        );
     }
 
     #[test]
@@ -415,7 +951,7 @@ mod tests {
             diagnostics,
             vec![Diag {
                 when: DiagPhase::Validation,
-                what: "expected object".to_owned(),
+                what: "field `metadata` in block `trace` expects object, but found boolean".to_owned(),
                 r#where: SrcRange::new(29, 33),
             }]
         );
