@@ -1,12 +1,13 @@
+mod ast;
 mod diag;
 mod lexer;
+mod model;
 mod modeler;
 mod parser;
 pub(crate) mod spec;
-mod syntax;
 
-pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
-pub(crate) use modeler::{Array, Model, Number, Object, ObjectField, Span, SpanFields, SpanKind, Trace, Value};
+pub(crate) use diag::Diags;
+pub(crate) use model::{Array, Model, Number, Object, ObjectField, Span, SpanFields, SpanKind, Trace, Value};
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
 
@@ -18,6 +19,7 @@ pub(crate) fn compile(src: &str) -> Result<Model, Diags> {
 
 #[cfg(test)]
 mod tests {
+    use super::diag::DiagPhase;
     use super::*;
 
     #[test]

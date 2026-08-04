@@ -1,73 +1,8 @@
+use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
+use crate::dsl::model::{Array, Model, Number, Object, ObjectField, Span, SpanFields, SpanKind, Trace, Value};
 use crate::dsl::spec;
-use crate::dsl::syntax;
 use std::{collections::HashSet, fmt};
-
-#[derive(Debug)]
-pub(crate) struct Model {
-    pub(crate) traces: Vec<Trace>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Trace {
-    pub(crate) name: String,
-    pub(crate) fields: SpanFields,
-    pub(crate) children: Vec<Span>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Span {
-    pub(crate) name: String,
-    pub(crate) kind: SpanKind,
-    pub(crate) fields: SpanFields,
-    pub(crate) children: Vec<Span>,
-}
-
-#[derive(Debug)]
-pub(crate) enum SpanKind {
-    Task,
-    Llm,
-}
-
-#[derive(Debug)]
-pub(crate) struct SpanFields {
-    pub(crate) input: Option<Value>,
-    pub(crate) output: Option<Value>,
-    pub(crate) metadata: Option<Object>,
-    pub(crate) metrics: Option<Object>,
-    pub(crate) tags: Vec<String>,
-}
-
-#[derive(Debug)]
-pub(crate) enum Value {
-    Str(String),
-    Num(Number),
-    Bool(bool),
-    Array(Array),
-    Object(Object),
-}
-
-#[derive(Debug)]
-pub(crate) enum Number {
-    Int(i64),
-    Float(f64),
-}
-
-#[derive(Debug)]
-pub(crate) struct Array {
-    pub(crate) elem: Vec<Value>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Object {
-    pub(crate) elem: Vec<ObjectField>,
-}
-
-#[derive(Debug)]
-pub(crate) struct ObjectField {
-    pub(crate) key: String,
-    pub(crate) value: Value,
-}
 
 enum FieldValue {
     Value(Value),
@@ -85,13 +20,13 @@ pub(super) enum ExprType {
 }
 
 impl ExprType {
-    fn of(expr: &syntax::Expr) -> Self {
+    fn of(expr: &ast::Expr) -> Self {
         match expr.kind {
-            syntax::ExprKind::Str(_) => Self::String,
-            syntax::ExprKind::Num(_) => Self::Number,
-            syntax::ExprKind::Bool(_) => Self::Boolean,
-            syntax::ExprKind::Array(_) => Self::Array,
-            syntax::ExprKind::Object(_) => Self::Object,
+            ast::ExprKind::Str(_) => Self::String,
+            ast::ExprKind::Num(_) => Self::Number,
+            ast::ExprKind::Bool(_) => Self::Boolean,
+            ast::ExprKind::Array(_) => Self::Array,
+            ast::ExprKind::Object(_) => Self::Object,
         }
     }
 }
@@ -109,12 +44,12 @@ impl fmt::Display for ExprType {
 }
 
 pub(super) struct Modeler {
-    ast: syntax::Ast,
+    ast: ast::Ast,
     errors: Errors,
 }
 
 impl Modeler {
-    fn new(ast: syntax::Ast) -> Self {
+    fn new(ast: ast::Ast) -> Self {
         Self { ast, errors: Vec::new() }
     }
 
@@ -123,11 +58,11 @@ impl Modeler {
 
         for decl in std::mem::take(&mut self.ast.decls) {
             match decl {
-                syntax::Decl::Attr(attr) => {
+                ast::Decl::Attr(attr) => {
                     self.errors
                         .push(Error::new(ErrorKind::RootAttribute { keyword: attr.key }, attr.range));
                 }
-                syntax::Decl::Block(block) => {
+                ast::Decl::Block(block) => {
                     let Some(desc) = spec::SPEC.block(&block.kind) else {
                         self.errors.push(Error::new(
                             ErrorKind::UnknownBlock {
@@ -156,6 +91,11 @@ impl Modeler {
             }
         }
 
+        if traces.is_empty() && self.errors.is_empty() {
+            self.errors
+                .push(Error::new(ErrorKind::EmptyShape { rule: spec::ids::NONEMPTY_SHAPE }, SrcRange::new(0, 0)));
+        }
+
         if self.errors.is_empty() {
             Ok(Model { traces })
         } else {
@@ -163,8 +103,8 @@ impl Modeler {
         }
     }
 
-    fn model_trace(&mut self, block: syntax::Block, desc: &spec::BlockDesc) -> Option<Trace> {
-        let syntax::Block { name, decls, range, .. } = block;
+    fn model_trace(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Trace> {
+        let ast::Block { name, decls, range, .. } = block;
         let name = self.model_name(name, range, desc);
         let (fields, blocks) = self.model_body(decls, desc, range);
         let children = blocks
@@ -175,8 +115,8 @@ impl Modeler {
         name.map(|name| Trace { name, fields, children })
     }
 
-    fn model_span(&mut self, block: syntax::Block, parent: spec::Id) -> Option<Span> {
-        let syntax::Block {
+    fn model_span(&mut self, block: ast::Block, parent: spec::Id) -> Option<Span> {
+        let ast::Block {
             kind,
             name,
             decls,
@@ -229,17 +169,17 @@ impl Modeler {
 
     fn model_body(
         &mut self,
-        decls: Vec<syntax::Decl>,
+        decls: Vec<ast::Decl>,
         block: &spec::BlockDesc,
         range: SrcRange,
-    ) -> (SpanFields, Vec<syntax::Block>) {
+    ) -> (SpanFields, Vec<ast::Block>) {
         let mut fields = FieldsBuilder::default();
         let mut blocks = Vec::new();
 
         for decl in decls {
             match decl {
-                syntax::Decl::Block(block) => blocks.push(block),
-                syntax::Decl::Attr(attr) => self.model_field(&mut fields, block, attr),
+                ast::Decl::Block(block) => blocks.push(block),
+                ast::Decl::Attr(attr) => self.model_field(&mut fields, block, attr),
             }
         }
 
@@ -258,7 +198,7 @@ impl Modeler {
         (fields.finish(), blocks)
     }
 
-    fn model_field(&mut self, fields: &mut FieldsBuilder, block: &spec::BlockDesc, attr: syntax::Attr) {
+    fn model_field(&mut self, fields: &mut FieldsBuilder, block: &spec::BlockDesc, attr: ast::Attr) {
         let range = attr.range;
         let Some(field) = block.field(&attr.key) else {
             if !block.body.open {
@@ -288,6 +228,10 @@ impl Modeler {
             return;
         }
 
+        if field.id == spec::ids::METRICS && !self.validate_metric_keys(&attr.value) {
+            return;
+        }
+
         let Some(value) = self.model_field_value(attr.value, field.value) else {
             return;
         };
@@ -302,20 +246,45 @@ impl Modeler {
         }
     }
 
+    fn validate_metric_keys(&mut self, expr: &ast::Expr) -> bool {
+        let ast::ExprKind::Object(attrs) = &expr.kind else {
+            unreachable!("expression was validated as an object");
+        };
+
+        let mut valid = true;
+
+        for attr in attrs {
+            if spec::RESERVED_METRIC_KEYS.contains(&attr.key.as_str()) {
+                self.errors.push(Error::new(
+                    ErrorKind::ReservedMetricKey {
+                        rule: spec::ids::RESERVED_METRICS,
+                        key: attr.key.clone(),
+                    },
+                    attr.range,
+                ));
+                valid = false;
+            }
+        }
+
+        valid
+    }
+
+    // fold, not all(): validate every element so each invalid item gets its own diagnostic
+    #[allow(clippy::unnecessary_fold)]
     fn validate_expr(
         &mut self,
-        expr: &syntax::Expr,
+        expr: &ast::Expr,
         block: spec::Id,
         field: spec::Id,
         expected: &'static spec::ExprType,
     ) -> bool {
         let valid = match expected {
             spec::ExprType::Any => true,
-            spec::ExprType::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
-            spec::ExprType::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
-            spec::ExprType::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
+            spec::ExprType::String => matches!(expr.kind, ast::ExprKind::Str(_)),
+            spec::ExprType::Number => matches!(expr.kind, ast::ExprKind::Num(_)),
+            spec::ExprType::Boolean => matches!(expr.kind, ast::ExprKind::Bool(_)),
             spec::ExprType::Array { items } => {
-                let syntax::ExprKind::Array(values) = &expr.kind else {
+                let ast::ExprKind::Array(values) = &expr.kind else {
                     self.push_type_mismatch(expr, block, field, expected);
                     return false;
                 };
@@ -325,7 +294,7 @@ impl Modeler {
                     .fold(true, |valid, value| self.validate_expr(value, block, field, items) && valid);
             }
             spec::ExprType::Object { values } => {
-                let syntax::ExprKind::Object(attrs) = &expr.kind else {
+                let ast::ExprKind::Object(attrs) = &expr.kind else {
                     self.push_type_mismatch(expr, block, field, expected);
                     return false;
                 };
@@ -334,8 +303,6 @@ impl Modeler {
                     self.validate_expr(&attr.value, block, field, values) && valid
                 });
             }
-            spec::ExprType::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
-            spec::ExprType::Named { .. } => false,
         };
 
         if !valid {
@@ -345,26 +312,7 @@ impl Modeler {
         valid
     }
 
-    fn expr_matches(expr: &syntax::Expr, expected: &spec::ExprType) -> bool {
-        match expected {
-            spec::ExprType::Any => true,
-            spec::ExprType::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
-            spec::ExprType::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
-            spec::ExprType::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
-            spec::ExprType::Array { items } => match &expr.kind {
-                syntax::ExprKind::Array(values) => values.iter().all(|value| Self::expr_matches(value, items)),
-                _ => false,
-            },
-            spec::ExprType::Object { values } => match &expr.kind {
-                syntax::ExprKind::Object(attrs) => attrs.iter().all(|attr| Self::expr_matches(&attr.value, values)),
-                _ => false,
-            },
-            spec::ExprType::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
-            spec::ExprType::Named { .. } => false,
-        }
-    }
-
-    fn push_type_mismatch(&mut self, expr: &syntax::Expr, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) {
+    fn push_type_mismatch(&mut self, expr: &ast::Expr, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) {
         self.errors.push(Error::new(
             ErrorKind::TypeMismatch {
                 block,
@@ -376,7 +324,7 @@ impl Modeler {
         ));
     }
 
-    fn model_field_value(&mut self, expr: syntax::Expr, expected: &spec::ExprType) -> Option<FieldValue> {
+    fn model_field_value(&mut self, expr: ast::Expr, expected: &spec::ExprType) -> Option<FieldValue> {
         match expected {
             spec::ExprType::Any => self.model_value(expr).map(FieldValue::Value),
             spec::ExprType::Object { values } if matches!(**values, spec::ExprType::Any) => {
@@ -389,20 +337,20 @@ impl Modeler {
         }
     }
 
-    fn model_value(&mut self, expr: syntax::Expr) -> Option<Value> {
-        let syntax::Expr { kind, range } = expr;
+    fn model_value(&mut self, expr: ast::Expr) -> Option<Value> {
+        let ast::Expr { kind, range } = expr;
         match kind {
-            syntax::ExprKind::Str(value) => Some(Value::Str(value)),
-            syntax::ExprKind::Bool(value) => Some(Value::Bool(value)),
-            syntax::ExprKind::Num(value) => self.model_number(value, range).map(Value::Num),
-            syntax::ExprKind::Array(values) => Some(Value::Array(Array {
+            ast::ExprKind::Str(value) => Some(Value::Str(value)),
+            ast::ExprKind::Bool(value) => Some(Value::Bool(value)),
+            ast::ExprKind::Num(value) => self.model_number(value, range).map(Value::Num),
+            ast::ExprKind::Array(values) => Some(Value::Array(Array {
                 elem: values.into_iter().filter_map(|value| self.model_value(value)).collect(),
             })),
-            syntax::ExprKind::Object(attrs) => Some(Value::Object(self.model_object(attrs))),
+            ast::ExprKind::Object(attrs) => Some(Value::Object(self.model_object(attrs))),
         }
     }
 
-    fn model_object(&mut self, attrs: Vec<syntax::Attr>) -> Object {
+    fn model_object(&mut self, attrs: Vec<ast::Attr>) -> Object {
         let mut seen = HashSet::new();
         let mut elem = Vec::new();
 
@@ -423,17 +371,17 @@ impl Modeler {
         Object { elem }
     }
 
-    fn require_object(&mut self, expr: syntax::Expr) -> Option<Object> {
-        let syntax::Expr { kind, .. } = expr;
+    fn require_object(&mut self, expr: ast::Expr) -> Option<Object> {
+        let ast::Expr { kind, .. } = expr;
         match kind {
-            syntax::ExprKind::Object(attrs) => Some(self.model_object(attrs)),
+            ast::ExprKind::Object(attrs) => Some(self.model_object(attrs)),
             _ => unreachable!("expression was validated as an object"),
         }
     }
 
-    fn require_tags(&mut self, expr: syntax::Expr) -> Option<Vec<String>> {
-        let syntax::Expr { kind, .. } = expr;
-        let syntax::ExprKind::Array(values) = kind else {
+    fn require_tags(&mut self, expr: ast::Expr) -> Option<Vec<String>> {
+        let ast::Expr { kind, .. } = expr;
+        let ast::ExprKind::Array(values) = kind else {
             unreachable!("expression was validated as an array of strings");
         };
 
@@ -441,7 +389,7 @@ impl Modeler {
 
         for value in values {
             match value.kind {
-                syntax::ExprKind::Str(value) => tags.push(value),
+                ast::ExprKind::Str(value) => tags.push(value),
                 _ => unreachable!("array item was validated as a string"),
             }
         }
@@ -491,7 +439,7 @@ impl Modeler {
     }
 }
 
-pub(super) fn model(ast: syntax::Ast) -> Result<Model, Diags> {
+pub(super) fn model(ast: ast::Ast) -> Result<Model, Diags> {
     Modeler::new(ast)
         .model()
         .map_err(|errors| errors.into_iter().map(Diag::from).collect())
@@ -571,6 +519,13 @@ pub(super) enum ErrorKind {
     InvalidNumber {
         rule: spec::Id,
         raw: String,
+    },
+    ReservedMetricKey {
+        rule: spec::Id,
+        key: String,
+    },
+    EmptyShape {
+        rule: spec::Id,
     },
 }
 
@@ -660,6 +615,14 @@ impl fmt::Display for ErrorKind {
             Self::InvalidNumber { rule, raw } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "invalid number `{raw}`; {}", rule.summary)
+            }
+            Self::ReservedMetricKey { rule, key } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "metric key `{key}` is reserved; {}", rule.summary)
+            }
+            Self::EmptyShape { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "shape declares no traces; {}", rule.summary)
             }
         }
     }
@@ -915,6 +878,49 @@ mod tests {
                 keyword: "unknown".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn rejects_reserved_metric_keys() {
+        let source = r#"trace "example" { metrics = { start = 1 tokens = 4 end = 2 } }"#;
+        let errors = model(source).unwrap_err();
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::ReservedMetricKey {
+                rule: spec::ids::RESERVED_METRICS,
+                key: "start".to_owned(),
+            }
+        );
+        assert_eq!(
+            errors[1].kind(),
+            &ErrorKind::ReservedMetricKey {
+                rule: spec::ids::RESERVED_METRICS,
+                key: "end".to_owned(),
+            }
+        );
+
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "start");
+    }
+
+    #[test]
+    fn rejects_shapes_without_traces() {
+        for source in ["", "   \n  "] {
+            let errors = model(source).unwrap_err();
+
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].kind(), &ErrorKind::EmptyShape { rule: spec::ids::NONEMPTY_SHAPE });
+        }
+    }
+
+    #[test]
+    fn does_not_stack_the_empty_shape_error_onto_other_failures() {
+        let errors = model("input = true").unwrap_err();
+
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].kind(), ErrorKind::RootAttribute { .. }));
     }
 
     #[test]

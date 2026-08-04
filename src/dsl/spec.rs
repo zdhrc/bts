@@ -66,6 +66,9 @@ pub(crate) struct ExprDesc {
     pub(crate) rules: &'static [RuleDesc],
 }
 
+// Some variants are spec vocabulary no field descriptor uses yet; they stay so field
+// constraints can adopt them without touching the type system.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ExprType {
@@ -75,8 +78,6 @@ pub(crate) enum ExprType {
     Boolean,
     Array { items: &'static ExprType },
     Object { values: &'static ExprType },
-    OneOf { variants: &'static [ExprType] },
-    Named { id: Id },
 }
 
 impl fmt::Display for ExprType {
@@ -89,16 +90,6 @@ impl fmt::Display for ExprType {
             Self::Array { items } => write!(formatter, "array<{items}>"),
             Self::Object { values } if matches!(**values, Self::Any) => formatter.write_str("object"),
             Self::Object { values } => write!(formatter, "object<{values}>"),
-            Self::OneOf { variants } => {
-                for (index, variant) in variants.iter().enumerate() {
-                    if index > 0 {
-                        formatter.write_str(" | ")?;
-                    }
-                    variant.fmt(formatter)?;
-                }
-                Ok(())
-            }
-            Self::Named { id } => formatter.write_str(id.as_str()),
         }
     }
 }
@@ -148,6 +139,9 @@ pub(crate) enum Cardinality {
     Repeated,
 }
 
+// Some variants are spec vocabulary no block descriptor uses yet; the modeler already
+// enforces all three.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NameDesc {
@@ -198,6 +192,8 @@ pub(crate) mod ids {
 
     pub(crate) const UNIQUE_OBJECT_KEYS: Id = Id::new("rule.unique-object-keys");
     pub(crate) const FINITE_NUMBERS: Id = Id::new("rule.finite-numbers");
+    pub(crate) const NONEMPTY_SHAPE: Id = Id::new("rule.nonempty-shape");
+    pub(crate) const RESERVED_METRICS: Id = Id::new("rule.reserved-metrics");
 
     pub(crate) const COMPLETE_TRACE: Id = Id::new("example.complete-trace");
 }
@@ -342,7 +338,18 @@ const BLOCKS: &[BlockDesc] = &[
     },
 ];
 
-const RULES: &[RuleDesc] = &[];
+pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
+
+const RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::NONEMPTY_SHAPE,
+        summary: "A shape must declare at least one trace block.",
+    },
+    RuleDesc {
+        id: ids::RESERVED_METRICS,
+        summary: "Metric keys `start` and `end` are reserved for generated timestamps.",
+    },
+];
 
 const EXAMPLES: &[Example] = &[Example {
     id: ids::COMPLETE_TRACE,
