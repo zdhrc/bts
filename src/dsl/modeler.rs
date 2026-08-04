@@ -1,5 +1,5 @@
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
-use crate::dsl::spec::{self, BlockDesc, Cardinality, ExprDesc, Id, NameDesc, Place, SPEC};
+use crate::dsl::spec;
 use crate::dsl::syntax;
 use std::{collections::HashSet, fmt};
 
@@ -128,18 +128,18 @@ impl Modeler {
                         .push(Error::new(ErrorKind::RootAttribute { keyword: attr.key }, attr.range));
                 }
                 syntax::Decl::Block(block) => {
-                    let Some(desc) = SPEC.block(&block.kind) else {
+                    let Some(desc) = spec::SPEC.block(&block.kind) else {
                         self.errors.push(Error::new(
                             ErrorKind::UnknownBlock {
                                 keyword: block.kind,
-                                parent: Place::Root,
+                                parent: spec::Place::Root,
                             },
                             block.range,
                         ));
                         continue;
                     };
 
-                    if desc.id == spec::ids::TRACE && desc.allows(Place::Root) {
+                    if desc.id == spec::ids::TRACE && desc.allows(spec::Place::Root) {
                         if let Some(trace) = self.model_trace(block, desc) {
                             traces.push(trace);
                         }
@@ -147,7 +147,7 @@ impl Modeler {
                         self.errors.push(Error::new(
                             ErrorKind::BlockNotAllowed {
                                 block: desc.id,
-                                parent: Place::Root,
+                                parent: spec::Place::Root,
                             },
                             block.range,
                         ));
@@ -163,7 +163,7 @@ impl Modeler {
         }
     }
 
-    fn model_trace(&mut self, block: syntax::Block, desc: &BlockDesc) -> Option<Trace> {
+    fn model_trace(&mut self, block: syntax::Block, desc: &spec::BlockDesc) -> Option<Trace> {
         let syntax::Block { name, decls, range, .. } = block;
         let name = self.model_name(name, range, desc);
         let (fields, blocks) = self.model_body(decls, desc, range);
@@ -175,29 +175,29 @@ impl Modeler {
         name.map(|name| Trace { name, fields, children })
     }
 
-    fn model_span(&mut self, block: syntax::Block, parent: Id) -> Option<Span> {
+    fn model_span(&mut self, block: syntax::Block, parent: spec::Id) -> Option<Span> {
         let syntax::Block {
             kind,
             name,
             decls,
             range,
         } = block;
-        let Some(desc) = SPEC.block(&kind) else {
+        let Some(desc) = spec::SPEC.block(&kind) else {
             self.errors.push(Error::new(
                 ErrorKind::UnknownBlock {
                     keyword: kind,
-                    parent: Place::Block { id: parent },
+                    parent: spec::Place::Block { id: parent },
                 },
                 range,
             ));
             return None;
         };
 
-        if !desc.allows(Place::Block { id: parent }) {
+        if !desc.allows(spec::Place::Block { id: parent }) {
             self.errors.push(Error::new(
                 ErrorKind::BlockNotAllowed {
                     block: desc.id,
-                    parent: Place::Block { id: parent },
+                    parent: spec::Place::Block { id: parent },
                 },
                 range,
             ));
@@ -227,7 +227,12 @@ impl Modeler {
         })
     }
 
-    fn model_body(&mut self, decls: Vec<syntax::Decl>, block: &BlockDesc, range: SrcRange) -> (SpanFields, Vec<syntax::Block>) {
+    fn model_body(
+        &mut self,
+        decls: Vec<syntax::Decl>,
+        block: &spec::BlockDesc,
+        range: SrcRange,
+    ) -> (SpanFields, Vec<syntax::Block>) {
         let mut fields = FieldsBuilder::default();
         let mut blocks = Vec::new();
 
@@ -239,7 +244,7 @@ impl Modeler {
         }
 
         for field in block.body.fields {
-            if field.cardinality == Cardinality::Required && !fields.seen.contains(&field.id) {
+            if field.cardinality == spec::Cardinality::Required && !fields.seen.contains(&field.id) {
                 self.errors.push(Error::new(
                     ErrorKind::MissingField {
                         block: block.id,
@@ -253,7 +258,7 @@ impl Modeler {
         (fields.finish(), blocks)
     }
 
-    fn model_field(&mut self, fields: &mut FieldsBuilder, block: &BlockDesc, attr: syntax::Attr) {
+    fn model_field(&mut self, fields: &mut FieldsBuilder, block: &spec::BlockDesc, attr: syntax::Attr) {
         let range = attr.range;
         let Some(field) = block.field(&attr.key) else {
             if !block.body.open {
@@ -268,7 +273,7 @@ impl Modeler {
             return;
         };
 
-        if field.cardinality != Cardinality::Repeated && !fields.seen.insert(field.id) {
+        if field.cardinality != spec::Cardinality::Repeated && !fields.seen.insert(field.id) {
             self.errors.push(Error::new(
                 ErrorKind::DuplicateField {
                     block: block.id,
@@ -297,13 +302,19 @@ impl Modeler {
         }
     }
 
-    fn validate_expr(&mut self, expr: &syntax::Expr, block: Id, field: Id, expected: &'static ExprDesc) -> bool {
+    fn validate_expr(
+        &mut self,
+        expr: &syntax::Expr,
+        block: spec::Id,
+        field: spec::Id,
+        expected: &'static spec::ExprType,
+    ) -> bool {
         let valid = match expected {
-            ExprDesc::Any => true,
-            ExprDesc::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
-            ExprDesc::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
-            ExprDesc::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
-            ExprDesc::Array { items } => {
+            spec::ExprType::Any => true,
+            spec::ExprType::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
+            spec::ExprType::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
+            spec::ExprType::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
+            spec::ExprType::Array { items } => {
                 let syntax::ExprKind::Array(values) = &expr.kind else {
                     self.push_type_mismatch(expr, block, field, expected);
                     return false;
@@ -313,7 +324,7 @@ impl Modeler {
                     .iter()
                     .fold(true, |valid, value| self.validate_expr(value, block, field, items) && valid);
             }
-            ExprDesc::Object { values } => {
+            spec::ExprType::Object { values } => {
                 let syntax::ExprKind::Object(attrs) = &expr.kind else {
                     self.push_type_mismatch(expr, block, field, expected);
                     return false;
@@ -323,8 +334,8 @@ impl Modeler {
                     self.validate_expr(&attr.value, block, field, values) && valid
                 });
             }
-            ExprDesc::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
-            ExprDesc::Named { .. } => false,
+            spec::ExprType::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
+            spec::ExprType::Named { .. } => false,
         };
 
         if !valid {
@@ -334,26 +345,26 @@ impl Modeler {
         valid
     }
 
-    fn expr_matches(expr: &syntax::Expr, expected: &ExprDesc) -> bool {
+    fn expr_matches(expr: &syntax::Expr, expected: &spec::ExprType) -> bool {
         match expected {
-            ExprDesc::Any => true,
-            ExprDesc::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
-            ExprDesc::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
-            ExprDesc::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
-            ExprDesc::Array { items } => match &expr.kind {
+            spec::ExprType::Any => true,
+            spec::ExprType::String => matches!(expr.kind, syntax::ExprKind::Str(_)),
+            spec::ExprType::Number => matches!(expr.kind, syntax::ExprKind::Num(_)),
+            spec::ExprType::Boolean => matches!(expr.kind, syntax::ExprKind::Bool(_)),
+            spec::ExprType::Array { items } => match &expr.kind {
                 syntax::ExprKind::Array(values) => values.iter().all(|value| Self::expr_matches(value, items)),
                 _ => false,
             },
-            ExprDesc::Object { values } => match &expr.kind {
+            spec::ExprType::Object { values } => match &expr.kind {
                 syntax::ExprKind::Object(attrs) => attrs.iter().all(|attr| Self::expr_matches(&attr.value, values)),
                 _ => false,
             },
-            ExprDesc::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
-            ExprDesc::Named { .. } => false,
+            spec::ExprType::OneOf { variants } => variants.iter().any(|expected| Self::expr_matches(expr, expected)),
+            spec::ExprType::Named { .. } => false,
         }
     }
 
-    fn push_type_mismatch(&mut self, expr: &syntax::Expr, block: Id, field: Id, expected: &'static ExprDesc) {
+    fn push_type_mismatch(&mut self, expr: &syntax::Expr, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) {
         self.errors.push(Error::new(
             ErrorKind::TypeMismatch {
                 block,
@@ -365,13 +376,13 @@ impl Modeler {
         ));
     }
 
-    fn model_field_value(&mut self, expr: syntax::Expr, expected: &ExprDesc) -> Option<FieldValue> {
+    fn model_field_value(&mut self, expr: syntax::Expr, expected: &spec::ExprType) -> Option<FieldValue> {
         match expected {
-            ExprDesc::Any => self.model_value(expr).map(FieldValue::Value),
-            ExprDesc::Object { values } if matches!(**values, ExprDesc::Any) => {
+            spec::ExprType::Any => self.model_value(expr).map(FieldValue::Value),
+            spec::ExprType::Object { values } if matches!(**values, spec::ExprType::Any) => {
                 self.require_object(expr).map(FieldValue::Object)
             }
-            ExprDesc::Array { items } if matches!(**items, ExprDesc::String) => {
+            spec::ExprType::Array { items } if matches!(**items, spec::ExprType::String) => {
                 self.require_tags(expr).map(FieldValue::Strings)
             }
             _ => unreachable!("expression constraint does not have a model lowering"),
@@ -458,22 +469,22 @@ impl Modeler {
         number
     }
 
-    fn model_name(&mut self, name: Option<String>, range: SrcRange, block: &BlockDesc) -> Option<String> {
+    fn model_name(&mut self, name: Option<String>, range: SrcRange, block: &spec::BlockDesc) -> Option<String> {
         match block.name {
-            NameDesc::Required => {
+            spec::NameDesc::Required => {
                 if name.is_none() {
                     self.errors
                         .push(Error::new(ErrorKind::MissingName { block: block.id }, range));
                 }
                 name
             }
-            NameDesc::Forbidden if name.is_some() => {
+            spec::NameDesc::Forbidden if name.is_some() => {
                 self.errors
                     .push(Error::new(ErrorKind::UnexpectedName { block: block.id }, range));
                 None
             }
-            NameDesc::Optional => name,
-            NameDesc::Forbidden => {
+            spec::NameDesc::Optional => name,
+            spec::NameDesc::Forbidden => {
                 unreachable!("the typed model currently requires block names")
             }
         }
@@ -493,7 +504,7 @@ struct FieldsBuilder {
     metadata: Option<Object>,
     metrics: Option<Object>,
     tags: Option<Vec<String>>,
-    seen: HashSet<Id>,
+    seen: HashSet<spec::Id>,
 }
 
 impl FieldsBuilder {
@@ -523,42 +534,42 @@ pub(super) enum ErrorKind {
     },
     UnknownBlock {
         keyword: String,
-        parent: Place,
+        parent: spec::Place,
     },
     BlockNotAllowed {
-        block: Id,
-        parent: Place,
+        block: spec::Id,
+        parent: spec::Place,
     },
     MissingName {
-        block: Id,
+        block: spec::Id,
     },
     UnexpectedName {
-        block: Id,
+        block: spec::Id,
     },
     UnknownField {
-        block: Id,
+        block: spec::Id,
         keyword: String,
     },
     MissingField {
-        block: Id,
-        field: Id,
+        block: spec::Id,
+        field: spec::Id,
     },
     DuplicateField {
-        block: Id,
-        field: Id,
+        block: spec::Id,
+        field: spec::Id,
     },
     TypeMismatch {
-        block: Id,
-        field: Id,
-        expected: &'static ExprDesc,
+        block: spec::Id,
+        field: spec::Id,
+        expected: &'static spec::ExprType,
         found: ExprType,
     },
     DuplicateObjectKey {
-        rule: Id,
+        rule: spec::Id,
         key: String,
     },
     InvalidNumber {
-        rule: Id,
+        rule: spec::Id,
         raw: String,
     },
 }
@@ -571,7 +582,7 @@ impl fmt::Display for ErrorKind {
                     formatter,
                     "attribute `{keyword}` is not allowed at the root; allowed blocks: "
                 )?;
-                fmt_allowed_blocks(formatter, Place::Root)
+                fmt_allowed_blocks(formatter, spec::Place::Root)
             }
             Self::UnknownBlock { keyword, parent } => {
                 write!(formatter, "unknown block `{keyword}` ")?;
@@ -662,13 +673,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-fn block_desc(id: Id) -> &'static BlockDesc {
-    SPEC.block_by_id(id)
+fn block_desc(id: spec::Id) -> &'static spec::BlockDesc {
+    spec::SPEC
+        .block_by_id(id)
         .unwrap_or_else(|| panic!("error references unknown block {}", id.as_str()))
 }
 
-fn field_desc(block: Id, field: Id) -> &'static spec::FieldDesc {
-    SPEC.field(block, field).unwrap_or_else(|| {
+fn field_desc(block: spec::Id, field: spec::Id) -> &'static spec::FieldDesc {
+    spec::SPEC.field(block, field).unwrap_or_else(|| {
         panic!(
             "error references unknown field {} in block {}",
             field.as_str(),
@@ -677,19 +689,20 @@ fn field_desc(block: Id, field: Id) -> &'static spec::FieldDesc {
     })
 }
 
-fn rule_desc(id: Id) -> &'static spec::RuleDesc {
-    SPEC.rule(id)
+fn rule_desc(id: spec::Id) -> &'static spec::RuleDesc {
+    spec::SPEC
+        .rule(id)
         .unwrap_or_else(|| panic!("error references unknown rule {}", id.as_str()))
 }
 
-fn fmt_place(formatter: &mut fmt::Formatter<'_>, place: Place) -> fmt::Result {
+fn fmt_place(formatter: &mut fmt::Formatter<'_>, place: spec::Place) -> fmt::Result {
     match place {
-        Place::Root => formatter.write_str("at the root"),
-        Place::Block { id } => write!(formatter, "inside block `{}`", block_desc(id).keyword),
+        spec::Place::Root => formatter.write_str("at the root"),
+        spec::Place::Block { id } => write!(formatter, "inside block `{}`", block_desc(id).keyword),
     }
 }
 
-fn fmt_places(formatter: &mut fmt::Formatter<'_>, places: &[Place]) -> fmt::Result {
+fn fmt_places(formatter: &mut fmt::Formatter<'_>, places: &[spec::Place]) -> fmt::Result {
     for (index, place) in places.iter().enumerate() {
         if index > 0 {
             formatter.write_str(", ")?;
@@ -699,9 +712,9 @@ fn fmt_places(formatter: &mut fmt::Formatter<'_>, places: &[Place]) -> fmt::Resu
     Ok(())
 }
 
-fn fmt_allowed_blocks(formatter: &mut fmt::Formatter<'_>, place: Place) -> fmt::Result {
+fn fmt_allowed_blocks(formatter: &mut fmt::Formatter<'_>, place: spec::Place) -> fmt::Result {
     let mut count = 0;
-    for block in SPEC.blocks.iter().filter(|block| block.allows(place)) {
+    for block in spec::SPEC.blocks.iter().filter(|block| block.allows(place)) {
         if count > 0 {
             formatter.write_str(", ")?;
         }
@@ -789,10 +802,10 @@ mod tests {
             Ok(_) => panic!("expected semantic errors"),
         };
 
-        let trace = SPEC.block_by_id(spec::ids::TRACE).unwrap();
+        let trace = spec::SPEC.block_by_id(spec::ids::TRACE).unwrap();
         let metadata = trace.field("metadata").unwrap();
         let tags = trace.field("tags").unwrap();
-        let ExprDesc::Array { items: tag_item } = *tags.value else {
+        let spec::ExprType::Array { items: tag_item } = *tags.value else {
             panic!("tags must be described as an array");
         };
 
@@ -840,7 +853,7 @@ mod tests {
                 ErrorKind::TypeMismatch {
                     block: spec::ids::TRACE,
                     field: spec::ids::TAGS,
-                    expected: ExprDesc::String,
+                    expected: spec::ExprType::String,
                     ..
                 }
             )
@@ -854,7 +867,7 @@ mod tests {
             root_errors[0].kind(),
             &ErrorKind::BlockNotAllowed {
                 block: spec::ids::TASK,
-                parent: Place::Root,
+                parent: spec::Place::Root,
             }
         );
 
@@ -863,7 +876,7 @@ mod tests {
             nested_errors[0].kind(),
             &ErrorKind::BlockNotAllowed {
                 block: spec::ids::TRACE,
-                parent: Place::Block { id: spec::ids::TRACE },
+                parent: spec::Place::Block { id: spec::ids::TRACE },
             }
         );
 
@@ -886,7 +899,7 @@ mod tests {
             unknown[0].kind(),
             &ErrorKind::UnknownBlock {
                 keyword: "custom".to_owned(),
-                parent: Place::Block { id: spec::ids::TRACE },
+                parent: spec::Place::Block { id: spec::ids::TRACE },
             }
         );
     }
@@ -917,7 +930,7 @@ mod tests {
         assert!(
             duplicate[0]
                 .to_string()
-                .contains(SPEC.rule(spec::ids::UNIQUE_OBJECT_KEYS).unwrap().summary)
+                .contains(spec::SPEC.rule(spec::ids::UNIQUE_OBJECT_KEYS).unwrap().summary)
         );
 
         let raw = "999999999999999999999999999999999999";
@@ -932,7 +945,7 @@ mod tests {
         assert!(
             invalid_number[0]
                 .to_string()
-                .contains(SPEC.rule(spec::ids::FINITE_NUMBERS).unwrap().summary)
+                .contains(spec::SPEC.rule(spec::ids::FINITE_NUMBERS).unwrap().summary)
         );
     }
 

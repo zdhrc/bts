@@ -1,31 +1,15 @@
-//! Declarative description of the BTS language.
-//!
-//! This module describes the language's public shape: its surface grammar,
-//! expression forms, constructs, placement rules, and documented validation
-//! rules. It deliberately does not implement lexing or parsing. Those layers
-//! decide how source becomes syntax; this specification describes which parsed
-//! declarations are meaningful BTS programs.
-//!
-//! The descriptions use static data so they can be shared by validation,
-//! documentation, editor tooling, and agent setup without allocation or a
-//! second source of truth.
-
 use serde::Serialize;
 use std::fmt;
 
-/// The complete public description of a language version.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct Spec {
-    /// Version of the serialized description shape.
     pub(crate) schema_version: u32,
-    /// Version of the language described by this value.
     pub(crate) language_version: u32,
     pub(crate) name: &'static str,
     pub(crate) summary: &'static str,
     pub(crate) surface: SurfaceDesc,
-    pub(crate) expressions: &'static [ExprForm],
+    pub(crate) expressions: &'static [ExprDesc],
     pub(crate) blocks: &'static [BlockDesc],
-    /// Rules applying to the language as a whole rather than one block.
     pub(crate) rules: &'static [RuleDesc],
     pub(crate) examples: &'static [Example],
 }
@@ -52,10 +36,6 @@ impl Spec {
     }
 }
 
-/// A stable identifier used to connect descriptions to implementation code.
-///
-/// IDs are intended for matching, diagnostics, and serialized output. Display
-/// names and source keywords may change without forcing an ID change.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct Id(&'static str);
@@ -70,11 +50,6 @@ impl Id {
     }
 }
 
-/// Human- and machine-readable information about the concrete syntax.
-///
-/// The grammar is descriptive for now. If BTS later adopts a parser generator,
-/// this field can be generated from its grammar without changing consumers of
-/// the rest of the specification.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct SurfaceDesc {
     pub(crate) notation: &'static str,
@@ -82,9 +57,8 @@ pub(crate) struct SurfaceDesc {
     pub(crate) notes: &'static [&'static str],
 }
 
-/// A concrete expression form recognized by the surface grammar.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-pub(crate) struct ExprForm {
+pub(crate) struct ExprDesc {
     pub(crate) id: Id,
     pub(crate) syntax: &'static str,
     pub(crate) summary: &'static str,
@@ -92,29 +66,20 @@ pub(crate) struct ExprForm {
     pub(crate) rules: &'static [RuleDesc],
 }
 
-/// A constraint on the value accepted by a field.
-///
-/// `Named` leaves room for reusable domain types without embedding those types
-/// in every field. `OneOf` supports unions, while `Array` and `Object` describe
-/// the recursive containers supported by the current expression grammar.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(
-    dead_code,
-    reason = "the schema supports constraints not used by the current language version"
-)]
-pub(crate) enum ExprDesc {
+pub(crate) enum ExprType {
     Any,
     String,
     Number,
     Boolean,
-    Array { items: &'static ExprDesc },
-    Object { values: &'static ExprDesc },
-    OneOf { variants: &'static [ExprDesc] },
+    Array { items: &'static ExprType },
+    Object { values: &'static ExprType },
+    OneOf { variants: &'static [ExprType] },
     Named { id: Id },
 }
 
-impl fmt::Display for ExprDesc {
+impl fmt::Display for ExprType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Any => formatter.write_str("any value"),
@@ -163,10 +128,6 @@ impl BlockDesc {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct BodyDesc {
     pub(crate) fields: &'static [FieldDesc],
-    /// Whether unlisted fields are accepted.
-    ///
-    /// Nested blocks are determined by each block's `allowed_in` placements, so
-    /// the parent-child relationship has only one source of truth.
     pub(crate) open: bool,
 }
 
@@ -175,31 +136,20 @@ pub(crate) struct FieldDesc {
     pub(crate) id: Id,
     pub(crate) keyword: &'static str,
     pub(crate) summary: &'static str,
-    pub(crate) value: &'static ExprDesc,
+    pub(crate) value: &'static ExprType,
     pub(crate) cardinality: Cardinality,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(
-    dead_code,
-    reason = "the schema supports cardinalities not used by the current language version"
-)]
 pub(crate) enum Cardinality {
-    /// Zero or one occurrence.
     Optional,
-    /// Exactly one occurrence.
     Required,
-    /// Zero or more occurrences.
     Repeated,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(
-    dead_code,
-    reason = "the schema supports name rules not used by the current language version"
-)]
 pub(crate) enum NameDesc {
     Forbidden,
     Optional,
@@ -213,10 +163,6 @@ pub(crate) enum Place {
     Block { id: Id },
 }
 
-/// A named validation rule that cannot, or should not, be inferred from shape.
-///
-/// Implementations can associate a validator with the stable ID while renderers
-/// expose the same summary to people and tools.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct RuleDesc {
     pub(crate) id: Id,
@@ -256,10 +202,10 @@ pub(crate) mod ids {
     pub(crate) const COMPLETE_TRACE: Id = Id::new("example.complete-trace");
 }
 
-const ANY: ExprDesc = ExprDesc::Any;
-const STRING: ExprDesc = ExprDesc::String;
-const OBJECT: ExprDesc = ExprDesc::Object { values: &ANY };
-const STRING_ARRAY: ExprDesc = ExprDesc::Array { items: &STRING };
+const ANY: ExprType = ExprType::Any;
+const STRING: ExprType = ExprType::String;
+const OBJECT: ExprType = ExprType::Object { values: &ANY };
+const STRING_ARRAY: ExprType = ExprType::Array { items: &STRING };
 
 const SPAN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
@@ -316,36 +262,36 @@ const UNIQUE_OBJECT_KEYS_RULE: &[RuleDesc] = &[RuleDesc {
     summary: "An object key may appear at most once in an object.",
 }];
 
-const EXPR_FORMS: &[ExprForm] = &[
-    ExprForm {
+const EXPR_TYPES: &[ExprDesc] = &[
+    ExprDesc {
         id: ids::STRING,
         syntax: "\"text\"",
         summary: "A double-quoted string. Escape sequences are not currently supported.",
         examples: &["\"hello\"", "\"gpt-4o-mini\""],
         rules: NO_RULES,
     },
-    ExprForm {
+    ExprDesc {
         id: ids::NUMBER,
         syntax: "digits[.digits]",
         summary: "A non-negative integer or finite decimal number.",
         examples: &["4", "0.2"],
         rules: FINITE_NUMBER_RULE,
     },
-    ExprForm {
+    ExprDesc {
         id: ids::BOOLEAN,
         syntax: "true | false",
         summary: "A boolean literal.",
         examples: &["true", "false"],
         rules: NO_RULES,
     },
-    ExprForm {
+    ExprDesc {
         id: ids::ARRAY,
         syntax: "[value, ...]",
         summary: "A comma-separated sequence of expressions with an optional trailing comma.",
         examples: &["[]", "[\"chat\", \"prod\"]"],
         rules: NO_RULES,
     },
-    ExprForm {
+    ExprDesc {
         id: ids::OBJECT,
         syntax: "{ key = value ... }",
         summary: "An object with unique identifier keys and expression values.",
@@ -408,7 +354,7 @@ const EXAMPLES: &[Example] = &[Example {
 pub(crate) static SPEC: Spec = Spec {
     schema_version: 1,
     language_version: 1,
-    name: "BTS",
+    name: "bts",
     summary: "A declarative language for describing synthetic traces and spans.",
     surface: SurfaceDesc {
         notation: "EBNF",
@@ -431,7 +377,7 @@ string      = '"', { ANY_EXCEPT_DOUBLE_QUOTE }, '"' ;
             "Comments and string escape sequences are not currently supported.",
         ],
     },
-    expressions: EXPR_FORMS,
+    expressions: EXPR_TYPES,
     blocks: BLOCKS,
     rules: RULES,
     examples: EXAMPLES,

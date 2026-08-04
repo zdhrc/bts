@@ -2,7 +2,7 @@ mod diag;
 mod lexer;
 mod modeler;
 mod parser;
-mod spec;
+pub(crate) mod spec;
 mod syntax;
 
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
