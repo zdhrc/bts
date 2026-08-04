@@ -1,6 +1,6 @@
 use crate::dsl::{
-    Array as ModelArray, Model, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Span as ModelSpan, SpanFields as ModelSpanFields,
-    SpanKind as ModelSpanKind, Trace as ModelTrace, Value as ModelValue,
+    Array as ModelArray, Model, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField,
+    Span as ModelSpan, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, Trace as ModelTrace, Value as ModelValue,
 };
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::ops::Range;
@@ -78,7 +78,12 @@ impl Planner {
     fn plan_span(&mut self, span: ModelSpan, root: EventRef, parent: EventRef) {
         let event_ref = EventRef(self.events.len());
 
-        let ModelSpan { name, kind, fields, children } = span;
+        let ModelSpan {
+            name,
+            kind,
+            fields,
+            children,
+        } = span;
 
         self.events.push(EventPlan {
             root,
@@ -133,19 +138,28 @@ fn lower_value(value: ModelValue) -> JsonValue {
 }
 
 fn lower_object(object: ModelObject) -> JsonMap<String, JsonValue> {
-    object.elem.into_iter().map(|ModelObjectField { key, value }| (key, lower_value(value))).collect()
+    object
+        .elem
+        .into_iter()
+        .map(|ModelObjectField { key, value }| (key, lower_value(value)))
+        .collect()
 }
 
-pub(super) fn plan(model: Model) -> Plan {
-    let capacity = model.traces.iter().map(trace_len).sum();
+/// Expands the model into exactly `count` traces; multiple trace templates cycle in source order.
+pub(super) fn plan(model: Model, count: usize) -> Plan {
+    debug_assert!(!model.traces.is_empty());
+
+    let capacity = (0..count)
+        .map(|index| trace_len(&model.traces[index % model.traces.len()]))
+        .sum();
 
     let mut planner = Planner {
         events: Vec::with_capacity(capacity),
-        traces: Vec::with_capacity(model.traces.len()),
+        traces: Vec::with_capacity(count),
     };
 
-    for trace in model.traces {
-        planner.plan_trace(trace);
+    for index in 0..count {
+        planner.plan_trace(model.traces[index % model.traces.len()].clone());
     }
 
     Plan {
@@ -162,8 +176,26 @@ mod tests {
     #[test]
     fn prints_plan() {
         let model = compile(include_str!("../../tests/fixtures/simple.bt")).unwrap();
-        let plan = plan(model);
+        let plan = plan(model, 1);
 
         println!("{plan:#?}");
+    }
+
+    #[test]
+    fn cycles_templates_to_the_requested_trace_count() {
+        let model = compile(
+            r#"
+                trace "first" {}
+                trace "second" {}
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 5);
+
+        assert_eq!(plan.traces.len(), 5);
+        assert_eq!(
+            plan.events.iter().map(|event| event.name.as_str()).collect::<Vec<_>>(),
+            ["first", "second", "first", "second", "first"]
+        );
     }
 }

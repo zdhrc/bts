@@ -1,32 +1,28 @@
-use crate::sdg::materializer::EventBatch;
-use reqwest::{blocking::Client, StatusCode};
+use crate::{conf::Braintrust, sdg::materializer::EventBatch};
+use reqwest::{StatusCode, blocking::Client};
 use serde::Deserialize;
-use std::time::Duration;
 use thiserror::Error as Err;
-use uuid::Uuid;
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub(super) struct Config {
-    pub(super) api_url: String,
-    pub(super) api_key: String,
-    pub(super) project_id: Uuid,
-}
 
 #[derive(Debug, Deserialize)]
-pub(super) struct InsertResponse {
-    pub(super) row_ids: Box<[String]>,
+pub(crate) struct InsertResponse {
+    row_ids: Box<[String]>,
+}
+
+impl InsertResponse {
+    pub(crate) fn row_count(&self) -> usize {
+        self.row_ids.len()
+    }
 }
 
 struct Writer<'config> {
     client: Client,
-    config: &'config Config,
+    config: &'config Braintrust,
 }
 
 impl<'config> Writer<'config> {
-    fn new(config: &'config Config) -> Result<Self, Error> {
+    fn new(config: &'config Braintrust) -> Result<Self, Error> {
         let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(config.request_timeout)
             .build()
             .map_err(|error| Error::new(ErrorKind::BuildClient(error)))?;
 
@@ -34,7 +30,11 @@ impl<'config> Writer<'config> {
     }
 
     fn write(&self, events: &EventBatch) -> Result<InsertResponse, Error> {
-        let url = format!("{}/v1/project_logs/{}/insert", self.config.api_url.trim_end_matches('/'), self.config.project_id,);
+        let url = format!(
+            "{}/v1/project_logs/{}/insert",
+            self.config.api_url.trim_end_matches('/'),
+            self.config.project_id,
+        );
         let response = self
             .client
             .post(url)
@@ -45,21 +45,35 @@ impl<'config> Writer<'config> {
         let status = response.status();
 
         if !status.is_success() {
-            let body = response.text().unwrap_or_else(|error| format!("failed to read response body: {error}"));
+            let body = response
+                .text()
+                .unwrap_or_else(|error| format!("failed to read response body: {error}"));
             return Err(Error::new(ErrorKind::Rejected { status, body }));
         }
 
-        response.json().map_err(|error| Error::new(ErrorKind::DecodeResponse(error)))
+        let inserted: InsertResponse = response
+            .json()
+            .map_err(|error| Error::new(ErrorKind::DecodeResponse(error)))?;
+
+        // A partial acknowledgement means Braintrust dropped events; report failure rather than a fake success.
+        if inserted.row_count() != events.event_count() {
+            return Err(Error::new(ErrorKind::UnexpectedRowCount {
+                expected: events.event_count(),
+                actual: inserted.row_count(),
+            }));
+        }
+
+        Ok(inserted)
     }
 }
 
-pub(super) fn write(config: &Config, events: &EventBatch) -> Result<InsertResponse, Error> {
+pub(super) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, Error> {
     Writer::new(config)?.write(events)
 }
 
 #[derive(Debug, Err)]
 #[error("{kind}")]
-pub(super) struct Error {
+pub(crate) struct Error {
     kind: ErrorKind,
 }
 
@@ -76,6 +90,9 @@ enum ErrorKind {
 
     #[error("failed to decode Braintrust response")]
     DecodeResponse(#[source] reqwest::Error),
+
+    #[error("Braintrust acknowledged {actual} rows, but {expected} events were submitted")]
+    UnexpectedRowCount { expected: usize, actual: usize },
 }
 
 impl Error {
@@ -83,6 +100,7 @@ impl Error {
         Self { kind }
     }
 
+    #[cfg(test)]
     fn kind(&self) -> &ErrorKind {
         &self.kind
     }
@@ -98,19 +116,19 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
+    use std::time::{Duration, SystemTime};
+    use uuid::Uuid;
 
     #[test]
     fn writes_events_to_braintrust() {
         let project_id = Uuid::new_v4();
         let response = serde_json::json!({ "row_ids": ["1", "2", "3", "4", "5"] }).to_string();
         let (api_url, request) = serve_once(StatusCode::OK, response);
-        let config = Config {
-            api_url,
-            api_key: "secret".to_owned(),
-            project_id,
-        };
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(1);
         let model = compile(include_str!("../../tests/fixtures/simple.bt")).unwrap();
-        let events = materialize(plan(model)).unwrap();
+        let events = materialize(plan(model, 1), Duration::from_secs(3_600), SystemTime::now()).unwrap();
 
         let inserted = write(&config, &events).unwrap();
         let request = request.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -127,13 +145,11 @@ mod tests {
     fn preserves_rejected_response_details() {
         let project_id = Uuid::new_v4();
         let (api_url, _request) = serve_once(StatusCode::BAD_REQUEST, r#"{"error":"invalid event"}"#.to_owned());
-        let config = Config {
-            api_url,
-            api_key: "secret".to_owned(),
-            project_id,
-        };
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(1);
         let model = compile(r#"trace "example" {}"#).unwrap();
-        let events = materialize(plan(model)).unwrap();
+        let events = materialize(plan(model, 1), Duration::from_secs(3_600), SystemTime::now()).unwrap();
 
         let error = write(&config, &events).unwrap_err();
 
@@ -185,7 +201,12 @@ mod tests {
             let headers = String::from_utf8_lossy(&request[..header_end]);
             let content_length = headers
                 .lines()
-                .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(str::trim).map(str::to_owned))
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or_default();
 
