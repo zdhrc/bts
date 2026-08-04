@@ -106,17 +106,23 @@ pub fn command() -> Command {
         )
 }
 
-pub fn run(matches: &ArgMatches) {
+pub fn run(matches: &ArgMatches) -> bool {
     let Some(("skill", matches)) = matches.subcommand() else {
-        return;
+        return false;
     };
 
     let agent = Agent::parse(matches.get_one::<String>("agent").expect("clap requires --agent"));
     let scope = Scope::parse(matches.get_one::<String>("scope").expect("clap supplies a default scope"));
 
     match install_skill(agent, scope) {
-        Ok(path) => println!("installed bts skill at {}", path.display()),
-        Err(error) => eprintln!("error: {error}"),
+        Ok(path) => {
+            println!("installed bts skill at {}", path.display());
+            true
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            false
+        }
     }
 }
 
@@ -221,6 +227,16 @@ fn render_skill(spec: &Spec) -> String {
     writeln!(
         output,
         "4. Validate file-based source with `bts check --file <path>` after editing.\n"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "5. Preview generated Braintrust events with `bts generate --from <path> --count <traces> --over <duration> --dry-run`."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "6. When the user requests a live write, set `BRAINTRUST_API_KEY` and `BRAINTRUST_PROJECT_ID`, then rerun without `--dry-run`.\n"
     )
     .unwrap();
     writeln!(
@@ -455,6 +471,7 @@ mod tests {
 
         assert!(skill.starts_with("---\nname: bts\ndescription:"));
         assert!(skill.contains(GENERATED_MARKER));
+        assert!(skill.contains("bts generate --from <path> --count <traces> --over <duration> --dry-run"));
         assert!(skill.contains(SPEC.summary));
         assert!(skill.contains(SPEC.surface.grammar.trim()));
         for expression in SPEC.expressions {
@@ -474,6 +491,10 @@ mod tests {
         for example in SPEC.examples {
             assert!(skill.contains(example.summary));
             assert!(skill.contains(example.source.trim()));
+        }
+        for rule in SPEC.rules {
+            assert!(skill.contains(rule.id.as_str()));
+            assert!(skill.contains(rule.summary));
         }
     }
 
