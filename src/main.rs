@@ -1,6 +1,12 @@
+mod cmd;
+mod conf;
 mod dsl;
-mod r#gen;
+mod sdg;
 
-fn main() {
-    println!("Hello, world!");
+fn main() -> std::process::ExitCode {
+    if cmd::run() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }

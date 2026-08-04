@@ -23,13 +23,13 @@ pub fn command() -> Command {
         .group(ArgGroup::new("input").args(["file", "src"]).required(true).multiple(false))
 }
 
-pub fn run(matches: &ArgMatches) {
+pub fn run(matches: &ArgMatches) -> bool {
     let (source_name, src) = match matches.get_one::<String>("file") {
         Some(path) => match fs::read_to_string(path) {
             Ok(src) => (path.as_str(), src),
             Err(error) => {
                 eprintln!("error: could not read {path}: {error}");
-                return;
+                return false;
             }
         },
         None => {
@@ -41,14 +41,15 @@ pub fn run(matches: &ArgMatches) {
     };
 
     match compile(&src) {
-        Ok(_) => println!("{source_name}: valid"),
+        Ok(_) => {
+            println!("{source_name}: valid");
+            true
+        }
         Err(diags) => {
             for diag in diags {
-                eprintln!(
-                    "{source_name}: {}..{}: {:?}: {}",
-                    diag.r#where.start, diag.r#where.end, diag.when, diag.what
-                );
+                eprintln!("{}", diag.render(source_name, &src));
             }
+            false
         }
     }
 }
