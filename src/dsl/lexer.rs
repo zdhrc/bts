@@ -46,7 +46,7 @@ struct Lexer<'src> {
 impl<'src> Lexer<'src> {
     fn new(src: &'src str) -> Self {
         Self {
-            src: src,
+            src,
             chars: src.char_indices().peekable(),
         }
     }
@@ -89,7 +89,10 @@ impl<'src> Lexer<'src> {
                             }
                             c if c.is_whitespace() => break,
                             _ => {
-                                errors.push(Error::new(ErrorKind::InvalidIdentToken, SrcRange::new(start, end)));
+                                errors.push(Error::new(
+                                    ErrorKind::InvalidIdentToken,
+                                    SrcRange::new(i_idx, i_idx + i_ch.len_utf8()),
+                                ));
                                 self.next();
                                 break;
                             }
@@ -209,9 +212,11 @@ impl Error {
     fn new(kind: ErrorKind, range: SrcRange) -> Self {
         Self { kind, range }
     }
+    #[cfg(test)]
     fn kind(&self) -> ErrorKind {
         self.kind
     }
+    #[cfg(test)]
     fn range(&self) -> SrcRange {
         self.range
     }
@@ -257,6 +262,15 @@ mod tests {
     fn rejects_numbers_with_multiple_dec_points() {
         assert_error_kinds("5.6.4.3", &[ErrorKind::InvalidNumber]);
         assert_error_kinds("1..", &[ErrorKind::InvalidNumber]);
+    }
+
+    #[test]
+    fn points_invalid_ident_diagnostics_at_the_offending_character() {
+        let errors = Lexer::new("foo$bar = 1").lex().unwrap_err();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), ErrorKind::InvalidIdentToken);
+        assert_eq!(errors[0].range(), SrcRange::new(3, 4));
     }
 }
 

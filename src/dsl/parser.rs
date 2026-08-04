@@ -1,6 +1,6 @@
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::lexer::{Token, TokenKind, Tokens};
-use crate::dsl::syntax::{Ast, Attr, Block, Decl, Expr, ExprKind};
+use crate::dsl::ast::{Ast, Attr, Block, Decl, Expr, ExprKind};
 use thiserror::Error as Err;
 
 macro_rules! token {
@@ -26,7 +26,7 @@ struct Parser {
 impl Parser {
     fn new(tokens: Tokens) -> Self {
         Self {
-            tokens: tokens,
+            tokens,
             errors: Vec::new(),
             index: 0,
         }
@@ -36,8 +36,12 @@ impl Parser {
         let mut decls = Vec::new();
 
         while !self.eof() {
+            let before = self.index;
             if let Some(decl) = self.parse_decl() {
                 decls.push(decl);
+            } else if self.index == before {
+                // recovery stopped without consuming (e.g. a stray `}` at the root); force progress
+                self.next();
             }
         }
 
@@ -59,7 +63,7 @@ impl Parser {
             TokenKind::String(_) | TokenKind::LBrace => self.parse_block(ident, range).map(Decl::Block),
             TokenKind::Equals => self.parse_attr(ident, range).map(Decl::Attr),
             _ => {
-                self.errors.push(Error::new(ErrorKind::ExpectedDeclaration, self.peek().range.clone()));
+                self.errors.push(Error::new(ErrorKind::ExpectedDeclaration, self.peek().range));
                 None
             }
         };
@@ -116,7 +120,7 @@ impl Parser {
                     self.next();
                     Some(Expr::new(ExprKind::Bool(false), range))
                 } else {
-                    self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range.clone()));
+                    self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
                     None
                 }
             }
@@ -154,7 +158,7 @@ impl Parser {
                 Some(Expr::new(ExprKind::Object(attrs), SrcRange::new(start, end)))
             }
             _ => {
-                self.errors.push(Error::new(ErrorKind::ExpectedExpressionAssignment, self.peek().range.clone()));
+                self.errors.push(Error::new(ErrorKind::ExpectedExpressionAssignment, self.peek().range));
                 None
             }
         }
@@ -185,11 +189,9 @@ impl Parser {
         if let Some(value) = self.consume(matcher) {
             Some(value)
         } else {
-            self.errors.push(Error::new(kind, self.peek().range.clone()));
+            self.errors.push(Error::new(kind, self.peek().range));
             None
         }
-        // let at = self.index;
-        // self.consume(matcher).ok_or_else(|| err(at))
     }
 
     // helpers
@@ -241,11 +243,9 @@ impl Error {
     fn new(kind: ErrorKind, range: SrcRange) -> Self {
         Self { kind, range }
     }
+    #[cfg(test)]
     fn kind(&self) -> ErrorKind {
         self.kind
-    }
-    fn range(&self) -> SrcRange {
-        self.range
     }
 }
 
@@ -265,32 +265,171 @@ impl From<Error> for Diag {
 mod tests {
     use super::*;
 
+    fn parse(src: &str) -> Result<Ast, Errors> {
+        Parser::new(crate::dsl::lexer::lex(src).unwrap()).parse()
+    }
+
+    #[track_caller]
+    fn assert_error_kinds(src: &str, want: &[ErrorKind]) {
+        let errors = parse(src).unwrap_err();
+        let got: Vec<_> = errors.iter().map(Error::kind).collect();
+
+        assert_eq!(got, want);
+    }
+
+    fn block(decl: &Decl) -> &Block {
+        match decl {
+            Decl::Block(block) => block,
+            Decl::Attr(attr) => panic!("expected a block, found attribute `{}`", attr.key),
+        }
+    }
+
+    fn attr(decl: &Decl) -> &Attr {
+        match decl {
+            Decl::Attr(attr) => attr,
+            Decl::Block(block) => panic!("expected an attribute, found block `{}`", block.kind),
+        }
+    }
+
     #[test]
-    fn debug() {
-        let src = include_str!("../../tests/fixtures/simple.bt");
-        let tokens = crate::dsl::lexer::lex(src).unwrap();
-        let source = Parser::new(tokens).parse().unwrap();
-        dbg!(&source);
+    fn parses_empty_docs() {
+        assert!(parse("").unwrap().decls.is_empty());
+        assert!(parse("  \n\t ").unwrap().decls.is_empty());
+    }
+
+    #[test]
+    fn parses_named_and_unnamed_blocks() {
+        let ast = parse(r#"trace "a" {} group {}"#).unwrap();
+
+        assert_eq!(ast.decls.len(), 2);
+        let named = block(&ast.decls[0]);
+        assert_eq!(named.kind, "trace");
+        assert_eq!(named.name.as_deref(), Some("a"));
+        assert!(named.decls.is_empty());
+        let unnamed = block(&ast.decls[1]);
+        assert_eq!(unnamed.kind, "group");
+        assert_eq!(unnamed.name, None);
+    }
+
+    #[test]
+    fn parses_nested_blocks() {
+        let ast = parse(r#"trace "a" { task "b" { llm "c" {} } }"#).unwrap();
+
+        let trace = block(&ast.decls[0]);
+        let task = block(&trace.decls[0]);
+        let llm = block(&task.decls[0]);
+        assert_eq!((task.kind.as_str(), llm.kind.as_str()), ("task", "llm"));
+        assert!(llm.decls.is_empty());
+    }
+
+    #[test]
+    fn parses_scalar_attrs() {
+        let ast = parse(r#"trace "a" { input = "hi" count = 4.5 flag = true }"#).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        assert!(matches!(&attr(&trace.decls[0]).value.kind, ExprKind::Str(value) if value == "hi"));
+        assert!(matches!(&attr(&trace.decls[1]).value.kind, ExprKind::Num(value) if value == "4.5"));
+        assert!(matches!(attr(&trace.decls[2]).value.kind, ExprKind::Bool(true)));
+    }
+
+    #[test]
+    fn parses_array_attrs_with_optional_trailing_comma() {
+        let ast = parse(r#"trace "a" { empty = [] tags = ["x", "y",] }"#).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        let ExprKind::Array(empty) = &attr(&trace.decls[0]).value.kind else {
+            panic!("expected an array");
+        };
+        assert!(empty.is_empty());
+
+        let ExprKind::Array(tags) = &attr(&trace.decls[1]).value.kind else {
+            panic!("expected an array");
+        };
+        assert_eq!(tags.len(), 2);
+    }
+
+    #[test]
+    fn parses_object_attrs() {
+        let ast = parse(r#"trace "a" { empty = {} meta = { model = "gpt" nested = { x = 1 } } }"#).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        let ExprKind::Object(empty) = &attr(&trace.decls[0]).value.kind else {
+            panic!("expected an object");
+        };
+        assert!(empty.is_empty());
+
+        let ExprKind::Object(meta) = &attr(&trace.decls[1]).value.kind else {
+            panic!("expected an object");
+        };
+        assert_eq!(meta.len(), 2);
+        assert_eq!(meta[0].key, "model");
+        assert!(matches!(&meta[1].value.kind, ExprKind::Object(nested) if nested.len() == 1));
+    }
+
+    #[test]
+    fn parses_the_fixture() {
+        let ast = parse(include_str!("../../tests/fixtures/simple.bt")).unwrap();
+
+        assert_eq!(ast.decls.len(), 1);
+        let trace = block(&ast.decls[0]);
+        assert_eq!(trace.kind, "trace");
+        assert_eq!(trace.name.as_deref(), Some("multi-turn-conversation"));
+        assert_eq!(trace.decls.len(), 4);
+    }
+
+    #[test]
+    fn rejects_a_block_missing_its_open_brace() {
+        assert_error_kinds(r#"trace "a""#, &[ErrorKind::UnexpectedToken]);
+    }
+
+    #[test]
+    fn rejects_a_block_missing_its_close_brace() {
+        assert_error_kinds(r#"trace "a" { input = "x" "#, &[ErrorKind::UnexpectedToken]);
+    }
+
+    #[test]
+    fn rejects_an_attr_missing_its_value() {
+        assert_error_kinds("input =", &[ErrorKind::ExpectedExpressionAssignment]);
+    }
+
+    #[test]
+    fn rejects_values_at_the_top_level() {
+        assert_error_kinds("5", &[ErrorKind::ExpectedIdentifier]);
+        assert_error_kinds(r#""str""#, &[ErrorKind::ExpectedIdentifier]);
+    }
+
+    #[test]
+    fn rejects_declarations_without_a_body_or_value() {
+        assert_error_kinds("foo bar", &[ErrorKind::ExpectedDeclaration, ErrorKind::ExpectedDeclaration]);
+    }
+
+    #[test]
+    fn rejects_unclosed_arrays_and_objects() {
+        assert_error_kinds(r#"trace "a" { tags = ["x" }"#, &[ErrorKind::UnexpectedToken]);
+        assert_error_kinds(
+            r#"trace "a" { meta = { x = 1 "#,
+            &[ErrorKind::UnexpectedToken, ErrorKind::UnexpectedToken],
+        );
+    }
+
+    #[test]
+    fn recovers_from_stray_closing_brace_at_the_root() {
+        let errors = parse("}").unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), ErrorKind::ExpectedIdentifier);
+
+        let errors = parse(r#"trace "a" {} }"#).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].kind(), ErrorKind::ExpectedIdentifier);
+    }
+
+    #[test]
+    fn continues_parsing_declarations_after_a_stray_closing_brace() {
+        let errors = parse(r#"} trace "a" { input = }"#).unwrap_err();
+
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].kind(), ErrorKind::ExpectedIdentifier);
+        assert_eq!(errors[1].kind(), ErrorKind::ExpectedExpressionAssignment);
     }
 }
 
-// - parses_empty_doc
-// - parses_named_block
-// - parses_unnamed_block
-// - parses_nested_blocks
-// - parses_string_attr
-// - parses_number_attr
-// - parses_bool_attr
-// - parses_array_attr
-// - parses_empty_array
-// - parses_object_attr
-// - parses_empty_object
-// - parses_multiple_top_level_items
-// - rejects_missing_block_open_brace
-// - rejects_missing_block_close_brace
-// - rejects_missing_attr_equals
-// - rejects_missing_attr_value
-// - rejects_unexpected_top_level_value
-// - rejects_trailing_comma_in_array
-// - rejects_unclosed_array
-// - rejects_unclosed_object
