@@ -1,4 +1,4 @@
-use crate::dsl::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, UnaryOp};
+use crate::dsl::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, UnaryOp};
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::lexer::{Token, TokenKind, Tokens};
 use thiserror::Error as Err;
@@ -16,11 +16,16 @@ macro_rules! token {
     };
 }
 
+// words with meaning in expression positions, rejected as loop binding names
+const RESERVED_WORDS: &[&str] = &["true", "false", "null", "var", "for", "in", "if"];
+
 #[derive(Debug, Clone, PartialEq)]
 struct Parser {
     tokens: Tokens,
     errors: Errors,
     index: usize,
+    // loop bindings currently in scope, bare idents resolve against these
+    scopes: Vec<String>,
 }
 
 impl Parser {
@@ -29,6 +34,7 @@ impl Parser {
             tokens,
             errors: Vec::new(),
             index: 0,
+            scopes: Vec::new(),
         }
     }
 
@@ -184,7 +190,7 @@ impl Parser {
         ))
     }
 
-    // x[i] and x.f, .f sugars to ["f"]
+    // x[i] and x.f, .f sugars to ["f"], x[a:b] slices
     fn parse_postfix(&mut self) -> Option<Expr> {
         let mut expr = self.parse_primary()?;
 
@@ -192,18 +198,37 @@ impl Parser {
             match &self.peek().kind {
                 TokenKind::LBrack => {
                     self.next();
-                    let index = self.parse_expr()?;
-                    let end = self.peek().range.end;
-                    self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+                    let expr_start = expr.range.start;
 
-                    let range = SrcRange::new(expr.range.start, end);
-                    expr = Expr::new(
+                    let start = if self.check(token!(Colon)) {
+                        None
+                    } else {
+                        Some(self.parse_expr()?)
+                    };
+
+                    let kind = if self.consume(token!(Colon)).is_some() {
+                        let end = if self.check(token!(RBrack)) {
+                            None
+                        } else {
+                            Some(self.parse_expr()?)
+                        };
+                        ExprKind::Slice {
+                            target: Box::new(expr),
+                            start: start.map(Box::new),
+                            end: end.map(Box::new),
+                        }
+                    } else {
+                        let index = start.expect("an index without a colon parsed an expression");
                         ExprKind::Index {
                             target: Box::new(expr),
                             index: Box::new(index),
-                        },
-                        range,
-                    );
+                        }
+                    };
+
+                    let end = self.peek().range.end;
+                    self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+
+                    expr = Expr::new(kind, SrcRange::new(expr_start, end));
                 }
                 TokenKind::Dot => {
                     self.next();
@@ -288,6 +313,10 @@ impl Parser {
                     self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
 
                     Some(Expr::new(ExprKind::Func { name, args }, SrcRange::new(range.start, end)))
+                } else if self.scopes.iter().any(|binding| binding == value) {
+                    let name = value.clone();
+                    self.next();
+                    Some(Expr::new(ExprKind::LoopRef(name), range))
                 } else {
                     self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
                     None
@@ -297,9 +326,20 @@ impl Parser {
                 let start = self.peek().range.start;
                 self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
 
+                if self.at_for_keyword() {
+                    return self.parse_for(start, false);
+                }
+
                 let mut values = Vec::new();
                 while !self.check(token!(RBrack)) {
-                    values.push(self.parse_expr()?);
+                    let range = self.peek().range;
+                    if self.consume(token!(Ellipsis)).is_some() {
+                        let operand = self.parse_expr()?;
+                        let range = SrcRange::new(range.start, operand.range.end);
+                        values.push(Expr::new(ExprKind::Spread(Box::new(operand)), range));
+                    } else {
+                        values.push(self.parse_expr()?);
+                    }
 
                     if self.consume(token!(Comma)).is_none() {
                         break;
@@ -314,17 +354,25 @@ impl Parser {
                 let start = self.peek().range.start;
                 self.expect(token!(LBrace), ErrorKind::UnexpectedToken)?;
 
-                let mut attrs = Vec::new();
-                while !self.check(token!(RBrace)) {
-                    let range = self.peek().range;
-                    let key = self.expect(token!(Ident(value)), ErrorKind::UnexpectedToken)?;
+                if self.at_for_keyword() {
+                    return self.parse_for(start, true);
+                }
 
-                    attrs.push(self.parse_attr(key, range)?);
+                let mut items = Vec::new();
+                while !self.check(token!(RBrace)) {
+                    if self.consume(token!(Ellipsis)).is_some() {
+                        items.push(ObjectItem::Spread(self.parse_expr()?));
+                    } else {
+                        let range = self.peek().range;
+                        let key = self.expect(token!(Ident(value)), ErrorKind::UnexpectedToken)?;
+
+                        items.push(ObjectItem::Attr(self.parse_attr(key, range)?));
+                    }
                 }
                 let end = self.peek().range.end;
                 self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
 
-                Some(Expr::new(ExprKind::Object(attrs), SrcRange::new(start, end)))
+                Some(Expr::new(ExprKind::Object(items), SrcRange::new(start, end)))
             }
             _ => {
                 self.errors
@@ -332,6 +380,93 @@ impl Parser {
                 None
             }
         }
+    }
+
+    // for is only a keyword right after [ or {, and { for = 1 } stays an attr
+    fn at_for_keyword(&self) -> bool {
+        matches!(&self.peek().kind, TokenKind::Ident(value) if value == "for")
+            && !matches!(self.peek_ahead().kind, TokenKind::Equals)
+    }
+
+    // [for x in xs : body if cond] and { for k, v in xs : key => value if cond }
+    fn parse_for(&mut self, start: usize, object: bool) -> Option<Expr> {
+        self.next();
+
+        let mut bindings = vec![self.parse_for_binding()?];
+        if self.consume(token!(Comma)).is_some() {
+            let range = self.peek().range;
+            let binding = self.parse_for_binding()?;
+            if bindings.contains(&binding) {
+                self.errors.push(Error::new(ErrorKind::DuplicateForBinding, range));
+                return None;
+            }
+            bindings.push(binding);
+        }
+
+        if !matches!(&self.peek().kind, TokenKind::Ident(value) if value == "in") {
+            self.errors.push(Error::new(ErrorKind::ExpectedForIn, self.peek().range));
+            return None;
+        }
+        self.next();
+
+        // bindings are not in scope for the collection itself
+        let collection = self.parse_expr()?;
+        self.expect(token!(Colon), ErrorKind::ExpectedForColon)?;
+
+        self.scopes.extend(bindings.iter().cloned());
+        let tail = self.parse_for_tail(object);
+        self.scopes.truncate(self.scopes.len() - bindings.len());
+        let (key, body, cond) = tail?;
+
+        let end = self.peek().range.end;
+        if object {
+            self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
+        } else {
+            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        }
+
+        Some(Expr::new(
+            ExprKind::For {
+                bindings,
+                collection: Box::new(collection),
+                key: key.map(Box::new),
+                body: Box::new(body),
+                cond: cond.map(Box::new),
+            },
+            SrcRange::new(start, end),
+        ))
+    }
+
+    // the part of a for expr with bindings in scope, split out so the caller can pop them
+    fn parse_for_tail(&mut self, object: bool) -> Option<(Option<Expr>, Expr, Option<Expr>)> {
+        let (key, body) = if object {
+            let key = self.parse_expr()?;
+            self.expect(token!(FatArrow), ErrorKind::ExpectedForArrow)?;
+            (Some(key), self.parse_expr()?)
+        } else {
+            (None, self.parse_expr()?)
+        };
+
+        let cond = if matches!(&self.peek().kind, TokenKind::Ident(value) if value == "if") {
+            self.next();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        Some((key, body, cond))
+    }
+
+    fn parse_for_binding(&mut self) -> Option<String> {
+        let range = self.peek().range;
+        let binding = self.expect(token!(Ident(value)), ErrorKind::ExpectedForBinding)?;
+
+        if RESERVED_WORDS.contains(&binding.as_str()) {
+            self.errors.push(Error::new(ErrorKind::ReservedForBinding, range));
+            return None;
+        }
+
+        Some(binding)
     }
 
     fn skip_declaration(&mut self) {
@@ -440,6 +575,18 @@ pub(super) enum ErrorKind {
     ExpectedAccessorField,
     #[error("expected `:` in conditional expression")]
     ExpectedTernaryColon,
+    #[error("expected loop binding name after `for`")]
+    ExpectedForBinding,
+    #[error("loop binding name is reserved")]
+    ReservedForBinding,
+    #[error("loop binding name is already bound")]
+    DuplicateForBinding,
+    #[error("expected `in` in for expression")]
+    ExpectedForIn,
+    #[error("expected `:` in for expression")]
+    ExpectedForColon,
+    #[error("expected `=>` after the key in an object for expression")]
+    ExpectedForArrow,
 }
 
 impl Error {
@@ -491,6 +638,13 @@ mod tests {
         match decl {
             Decl::Attr(attr) => attr,
             Decl::Block(block) => panic!("expected an attribute, found block `{}`", block.kind),
+        }
+    }
+
+    fn item_attr(item: &ObjectItem) -> &Attr {
+        match item {
+            ObjectItem::Attr(attr) => attr,
+            ObjectItem::Spread(_) => panic!("expected an attribute, found a spread"),
         }
     }
 
@@ -761,8 +915,8 @@ mod tests {
             panic!("expected an object");
         };
         assert_eq!(meta.len(), 2);
-        assert_eq!(meta[0].key, "model");
-        assert!(matches!(&meta[1].value.kind, ExprKind::Object(nested) if nested.len() == 1));
+        assert_eq!(item_attr(&meta[0]).key, "model");
+        assert!(matches!(&item_attr(&meta[1]).value.kind, ExprKind::Object(nested) if nested.len() == 1));
     }
 
     #[test]
@@ -1005,11 +1159,11 @@ mod tests {
         assert!(matches!(args[1].kind, ExprKind::Cond { .. }));
 
         let expr = parse_value("{ a = 1 + 2 b = 3 }");
-        let ExprKind::Object(attrs) = &expr.kind else {
+        let ExprKind::Object(items) = &expr.kind else {
             panic!("expected an object");
         };
-        assert_eq!(attrs.len(), 2);
-        assert!(matches!(attrs[0].value.kind, ExprKind::Binary { .. }));
+        assert_eq!(items.len(), 2);
+        assert!(matches!(item_attr(&items[0]).value.kind, ExprKind::Binary { .. }));
     }
 
     #[test]
@@ -1021,6 +1175,214 @@ mod tests {
         };
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0].kind, ExprKind::Binary { op: BinOp::Sub, .. }));
+    }
+
+    #[test]
+    fn parses_slices_with_optional_bounds() {
+        let source = r#"trace "t" { input = var.xs[1:3] }"#;
+        let ast = parse(source).unwrap();
+        let input = attr(&block(&ast.decls[0]).decls[0]);
+
+        let ExprKind::Slice { target, start, end } = &input.value.kind else {
+            panic!("expected a slice expression");
+        };
+        assert!(matches!(&target.kind, ExprKind::VarRef(name) if name == "xs"));
+        assert!(matches!(&start.as_ref().unwrap().kind, ExprKind::Num(value) if value == "1"));
+        assert!(matches!(&end.as_ref().unwrap().kind, ExprKind::Num(value) if value == "3"));
+        let range = input.value.range;
+        assert_eq!(&source[range.start..range.end], "var.xs[1:3]");
+
+        let ExprKind::Slice { start, end, .. } = parse_value("var.xs[:2]").kind else {
+            panic!("expected a slice expression");
+        };
+        assert!(start.is_none() && end.is_some());
+
+        let ExprKind::Slice { start, end, .. } = parse_value("var.xs[1:]").kind else {
+            panic!("expected a slice expression");
+        };
+        assert!(start.is_some() && end.is_none());
+
+        let ExprKind::Slice { start, end, .. } = parse_value("var.xs[:]").kind else {
+            panic!("expected a slice expression");
+        };
+        assert!(start.is_none() && end.is_none());
+    }
+
+    #[test]
+    fn parses_slices_with_expression_bounds_and_chains_them() {
+        let ExprKind::Slice { start, .. } = parse_value("var.xs[1 + 1:]").kind else {
+            panic!("expected a slice expression");
+        };
+        assert!(matches!(start.unwrap().kind, ExprKind::Binary { op: BinOp::Add, .. }));
+
+        // a full ternary in brackets stays an index, its colon belongs to the ternary
+        assert!(matches!(parse_value("var.xs[true ? 0 : 1]").kind, ExprKind::Index { .. }));
+
+        // slices chain like indexes
+        let ExprKind::Slice { target, .. } = parse_value("var.xs[1:][0:2]").kind else {
+            panic!("expected a slice expression");
+        };
+        assert!(matches!(target.kind, ExprKind::Slice { .. }));
+    }
+
+    #[test]
+    fn rejects_unterminated_slices() {
+        assert_error_kinds(
+            r#"trace "t" { input = var.xs[1: }"#,
+            &[ErrorKind::ExpectedExpressionAssignment],
+        );
+        assert_error_kinds(
+            r#"trace "t" { input = var.xs[: }"#,
+            &[ErrorKind::ExpectedExpressionAssignment],
+        );
+    }
+
+    #[test]
+    fn parses_spread_elements_in_arrays() {
+        let source = r#"trace "t" { input = [1, ...var.xs, 2] }"#;
+        let ast = parse(source).unwrap();
+        let input = attr(&block(&ast.decls[0]).decls[0]);
+
+        let ExprKind::Array(values) = &input.value.kind else {
+            panic!("expected an array");
+        };
+        assert_eq!(values.len(), 3);
+        let ExprKind::Spread(operand) = &values[1].kind else {
+            panic!("expected a spread element");
+        };
+        assert!(matches!(&operand.kind, ExprKind::VarRef(name) if name == "xs"));
+        let range = values[1].range;
+        assert_eq!(&source[range.start..range.end], "...var.xs");
+    }
+
+    #[test]
+    fn parses_spread_items_in_objects() {
+        let expr = parse_value(r#"{ a = 1 ...var.meta b = 2 }"#);
+
+        let ExprKind::Object(items) = &expr.kind else {
+            panic!("expected an object");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], ObjectItem::Attr(attr) if attr.key == "a"));
+        assert!(
+            matches!(&items[1], ObjectItem::Spread(operand) if matches!(&operand.kind, ExprKind::VarRef(name) if name == "meta"))
+        );
+        assert!(matches!(&items[2], ObjectItem::Attr(attr) if attr.key == "b"));
+    }
+
+    #[test]
+    fn rejects_spreads_without_an_operand() {
+        assert_error_kinds(r#"trace "t" { input = [...] }"#, &[ErrorKind::ExpectedExpressionAssignment]);
+    }
+
+    #[test]
+    fn parses_array_for_exprs() {
+        let source = r#"trace "t" { input = [for x in var.xs : x * 2] }"#;
+        let ast = parse(source).unwrap();
+        let input = attr(&block(&ast.decls[0]).decls[0]);
+
+        let ExprKind::For {
+            bindings,
+            collection,
+            key,
+            body,
+            cond,
+        } = &input.value.kind
+        else {
+            panic!("expected a for expression");
+        };
+        assert_eq!(bindings, &["x".to_owned()]);
+        assert!(matches!(&collection.kind, ExprKind::VarRef(name) if name == "xs"));
+        assert!(key.is_none() && cond.is_none());
+
+        let ExprKind::Binary { lhs, .. } = &body.kind else {
+            panic!("expected a binary body");
+        };
+        assert!(matches!(&lhs.kind, ExprKind::LoopRef(name) if name == "x"));
+
+        let range = input.value.range;
+        assert_eq!(&source[range.start..range.end], "[for x in var.xs : x * 2]");
+    }
+
+    #[test]
+    fn parses_for_exprs_with_two_bindings_and_a_filter() {
+        let expr = parse_value("[for i, x in var.xs : x if i > 0]");
+
+        let ExprKind::For { bindings, cond, .. } = &expr.kind else {
+            panic!("expected a for expression");
+        };
+        assert_eq!(bindings, &["i".to_owned(), "x".to_owned()]);
+        assert!(matches!(cond.as_ref().unwrap().kind, ExprKind::Binary { op: BinOp::Gt, .. }));
+    }
+
+    #[test]
+    fn parses_object_for_exprs() {
+        let expr = parse_value(r#"{ for k, v in var.meta : k => v }"#);
+
+        let ExprKind::For { bindings, key, body, .. } = &expr.kind else {
+            panic!("expected a for expression");
+        };
+        assert_eq!(bindings, &["k".to_owned(), "v".to_owned()]);
+        assert!(matches!(&key.as_ref().unwrap().kind, ExprKind::LoopRef(name) if name == "k"));
+        assert!(matches!(&body.kind, ExprKind::LoopRef(name) if name == "v"));
+    }
+
+    #[test]
+    fn parses_nested_for_exprs_with_shadowing_scopes() {
+        let expr = parse_value("[for x in var.xs : [for y in x : y]]");
+
+        let ExprKind::For { body, .. } = &expr.kind else {
+            panic!("expected a for expression");
+        };
+        let ExprKind::For { collection, body, .. } = &body.kind else {
+            panic!("expected a nested for expression");
+        };
+        assert!(matches!(&collection.kind, ExprKind::LoopRef(name) if name == "x"));
+        assert!(matches!(&body.kind, ExprKind::LoopRef(name) if name == "y"));
+    }
+
+    #[test]
+    fn keeps_for_as_an_object_key_outside_comprehensions() {
+        let expr = parse_value("{ for = 1 }");
+
+        let ExprKind::Object(items) = &expr.kind else {
+            panic!("expected an object");
+        };
+        assert!(matches!(&items[0], ObjectItem::Attr(attr) if attr.key == "for"));
+    }
+
+    // recovery may add trailing errors, only the first one matters here
+    #[track_caller]
+    fn assert_first_error(src: &str, want: ErrorKind) {
+        let errors = parse(src).unwrap_err();
+        assert_eq!(errors[0].kind(), want);
+    }
+
+    #[test]
+    fn rejects_loop_refs_outside_their_scope() {
+        // x is out of scope in the collection and after the for expr
+        assert_first_error(r#"trace "t" { input = [for x in x : x] }"#, ErrorKind::UnexpectedToken);
+        assert_first_error(
+            r#"trace "t" { input = [[for x in var.xs : x], x] }"#,
+            ErrorKind::UnexpectedToken,
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_for_exprs() {
+        // a missing binding lands on `in`, which reads as a reserved binding name
+        assert_first_error(r#"trace "t" { input = [for in var.xs : 1] }"#, ErrorKind::ReservedForBinding);
+        assert_first_error(r#"trace "t" { input = [for x var.xs : x] }"#, ErrorKind::ExpectedForIn);
+        assert_first_error(r#"trace "t" { input = [for x in var.xs x] }"#, ErrorKind::ExpectedForColon);
+        assert_first_error(r#"trace "t" { input = { for k in var.m : k } }"#, ErrorKind::ExpectedForArrow);
+        assert_first_error(
+            r#"trace "t" { input = [for var in var.xs : 1] }"#,
+            ErrorKind::ReservedForBinding,
+        );
+        assert_first_error(
+            r#"trace "t" { input = [for x, x in var.xs : x] }"#,
+            ErrorKind::DuplicateForBinding,
+        );
     }
 
     #[test]

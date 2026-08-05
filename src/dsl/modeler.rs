@@ -24,7 +24,8 @@ pub(super) enum ExprType {
     Array,
     Object,
     Func,
-    Expr,
+    // a residual expr whose concrete type is only known during generation
+    Abstract,
 }
 
 impl ExprType {
@@ -38,12 +39,16 @@ impl ExprType {
             ast::ExprKind::Array(_) => Self::Array,
             ast::ExprKind::Object(_) => Self::Object,
             ast::ExprKind::Func { .. } => Self::Func,
-            // constant operator and index exprs fold to literals, only dynamic ones get here
+            // constant operator, index, and slice exprs fold to literals, only dynamic ones get here
             ast::ExprKind::Unary { .. }
             | ast::ExprKind::Binary { .. }
             | ast::ExprKind::Cond { .. }
-            | ast::ExprKind::Index { .. } => Self::Expr,
+            | ast::ExprKind::Index { .. }
+            | ast::ExprKind::Slice { .. } => Self::Abstract,
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
+            ast::ExprKind::LoopRef(_) => unreachable!("loop references are substituted before type checks"),
+            ast::ExprKind::Spread(_) => unreachable!("spreads are spliced before type checks"),
+            ast::ExprKind::For { .. } => unreachable!("for expressions are unrolled before type checks"),
         }
     }
 }
@@ -58,7 +63,7 @@ impl fmt::Display for ExprType {
             Self::Array => "array",
             Self::Object => "object",
             Self::Func => "function",
-            Self::Expr => "expression",
+            Self::Abstract => "expression",
         })
     }
 }
@@ -226,12 +231,18 @@ impl Modeler {
                 }
                 ast::ExprKind::Array(resolved)
             }
-            ast::ExprKind::Object(attrs) => {
-                let mut resolved = Vec::with_capacity(attrs.len());
+            ast::ExprKind::Object(items) => {
+                let mut resolved = Vec::with_capacity(items.len());
                 let mut valid = true;
-                for attr in attrs {
-                    match self.resolve_expr(attr.value) {
-                        Some(value) => resolved.push(ast::Attr { value, ..attr }),
+                for item in items {
+                    let item = match item {
+                        ast::ObjectItem::Attr(attr) => self
+                            .resolve_expr(attr.value)
+                            .map(|value| ast::ObjectItem::Attr(ast::Attr { value, ..attr })),
+                        ast::ObjectItem::Spread(operand) => self.resolve_expr(operand).map(ast::ObjectItem::Spread),
+                    };
+                    match item {
+                        Some(item) => resolved.push(item),
                         None => valid = false,
                     }
                 }
@@ -240,6 +251,7 @@ impl Modeler {
                 }
                 ast::ExprKind::Object(resolved)
             }
+            ast::ExprKind::Spread(operand) => ast::ExprKind::Spread(Box::new(self.resolve_expr(*operand)?)),
             ast::ExprKind::Func { name, args } => {
                 let mut resolved = Vec::with_capacity(args.len());
                 let mut valid = true;
@@ -283,6 +295,48 @@ impl Modeler {
                 ast::ExprKind::Index {
                     target: Box::new(target?),
                     index: Box::new(index?),
+                }
+            }
+            ast::ExprKind::Slice { target, start, end } => {
+                let target = self.resolve_expr(*target);
+                let start = start.map(|bound| self.resolve_expr(*bound));
+                let end = end.map(|bound| self.resolve_expr(*bound));
+                ast::ExprKind::Slice {
+                    target: Box::new(target?),
+                    start: match start {
+                        Some(bound) => Some(Box::new(bound?)),
+                        None => None,
+                    },
+                    end: match end {
+                        Some(bound) => Some(Box::new(bound?)),
+                        None => None,
+                    },
+                }
+            }
+            // loop refs stay put, they substitute during unrolling
+            ast::ExprKind::For {
+                bindings,
+                collection,
+                key,
+                body,
+                cond,
+            } => {
+                let collection = self.resolve_expr(*collection);
+                let key = key.map(|key| self.resolve_expr(*key));
+                let body = self.resolve_expr(*body);
+                let cond = cond.map(|cond| self.resolve_expr(*cond));
+                ast::ExprKind::For {
+                    bindings,
+                    collection: Box::new(collection?),
+                    key: match key {
+                        Some(key) => Some(Box::new(key?)),
+                        None => None,
+                    },
+                    body: Box::new(body?),
+                    cond: match cond {
+                        Some(cond) => Some(Box::new(cond?)),
+                        None => None,
+                    },
                 }
             }
             kind => kind,
@@ -346,13 +400,28 @@ impl Modeler {
             ast::ExprKind::Binary { op, lhs, rhs } => return self.fold_binary(op, *lhs, *rhs, range),
             ast::ExprKind::Cond { cond, then, otherwise } => return self.fold_cond(*cond, *then, *otherwise, range),
             ast::ExprKind::Index { target, index } => return self.fold_index(*target, *index, range),
+            ast::ExprKind::Slice { target, start, end } => return self.fold_slice(*target, start, end, range),
+            ast::ExprKind::For {
+                bindings,
+                collection,
+                key,
+                body,
+                cond,
+            } => return self.fold_for(bindings, *collection, key, *body, cond, range),
             ast::ExprKind::Array(values) => {
                 let mut folded = Vec::with_capacity(values.len());
                 let mut valid = true;
                 for value in values {
-                    match self.fold_expr(value) {
-                        Some(value) => folded.push(value),
-                        None => valid = false,
+                    match value.kind {
+                        // constant spreads splice in place
+                        ast::ExprKind::Spread(operand) => match self.fold_array_spread(*operand) {
+                            Some(values) => folded.extend(values),
+                            None => valid = false,
+                        },
+                        _ => match self.fold_expr(value) {
+                            Some(value) => folded.push(value),
+                            None => valid = false,
+                        },
                     }
                 }
                 if !valid {
@@ -360,12 +429,21 @@ impl Modeler {
                 }
                 ast::ExprKind::Array(folded)
             }
-            ast::ExprKind::Object(attrs) => {
-                let mut folded = Vec::with_capacity(attrs.len());
+            ast::ExprKind::Object(items) => {
+                // spreads merge with later keys winning, plain objects keep their
+                // entries so duplicate keys still diagnose in model_object
+                if items.iter().any(|item| matches!(item, ast::ObjectItem::Spread(_))) {
+                    return self.fold_object_merge(items, range);
+                }
+
+                let mut folded = Vec::with_capacity(items.len());
                 let mut valid = true;
-                for attr in attrs {
+                for item in items {
+                    let ast::ObjectItem::Attr(attr) = item else {
+                        unreachable!("spread items take the merging path");
+                    };
                     match self.fold_expr(attr.value) {
-                        Some(value) => folded.push(ast::Attr { value, ..attr }),
+                        Some(value) => folded.push(ast::ObjectItem::Attr(ast::Attr { value, ..attr })),
                         None => valid = false,
                     }
                 }
@@ -374,6 +452,8 @@ impl Modeler {
                 }
                 ast::ExprKind::Object(folded)
             }
+            ast::ExprKind::Spread(_) => unreachable!("spreads only parse inside arrays and objects"),
+            ast::ExprKind::LoopRef(_) => unreachable!("loop references are substituted before folding"),
             ast::ExprKind::Func { name, args } => {
                 let mut folded = Vec::with_capacity(args.len());
                 let mut valid = true;
@@ -580,13 +660,17 @@ impl Modeler {
                     }
                 }
             }
-            ast::ExprKind::Object(attrs) if expr_is_constant(&index) => {
+            ast::ExprKind::Object(items) if expr_is_constant(&index) => {
                 let Const::Str(key) = self.const_scalar(&index)? else {
                     unreachable!("index was type checked as a string");
                 };
 
-                match attrs.into_iter().find(|attr| attr.key == key) {
-                    Some(attr) => Some(ast::Expr::new(attr.value.kind, range)),
+                let selected = items.into_iter().find_map(|item| match item {
+                    ast::ObjectItem::Attr(attr) if attr.key == key => Some(attr.value),
+                    _ => None,
+                });
+                match selected {
+                    Some(value) => Some(ast::Expr::new(value.kind, range)),
                     None => {
                         self.errors.push(Error::new(
                             ErrorKind::UnknownObjectKey {
@@ -607,6 +691,509 @@ impl Modeler {
                 range,
             )),
         }
+    }
+
+    fn fold_array_spread(&mut self, operand: ast::Expr) -> Option<Vec<ast::Expr>> {
+        let operand = self.fold_expr(operand)?;
+        match operand.kind {
+            ast::ExprKind::Array(values) => Some(values),
+            kind => {
+                let operand = ast::Expr::new(kind, operand.range);
+                self.errors.push(Error::new(
+                    ErrorKind::SpreadTypeMismatch {
+                        rule: spec::ids::SPREAD_OPERANDS,
+                        expected: "array",
+                        found: ExprType::of(&operand),
+                    },
+                    operand.range,
+                ));
+                None
+            }
+        }
+    }
+
+    fn fold_object_spread(&mut self, operand: ast::Expr) -> Option<Vec<ast::Attr>> {
+        let operand = self.fold_expr(operand)?;
+        match operand.kind {
+            ast::ExprKind::Object(items) => Some(
+                items
+                    .into_iter()
+                    .map(|item| match item {
+                        ast::ObjectItem::Attr(attr) => attr,
+                        ast::ObjectItem::Spread(_) => unreachable!("folded objects only hold attrs"),
+                    })
+                    .collect(),
+            ),
+            kind => {
+                let operand = ast::Expr::new(kind, operand.range);
+                self.errors.push(Error::new(
+                    ErrorKind::SpreadTypeMismatch {
+                        rule: spec::ids::SPREAD_OPERANDS,
+                        expected: "object",
+                        found: ExprType::of(&operand),
+                    },
+                    operand.range,
+                ));
+                None
+            }
+        }
+    }
+
+    // later entries win over keys a spread introduced, two explicit keys still collide
+    fn fold_object_merge(&mut self, items: Vec<ast::ObjectItem>, range: SrcRange) -> Option<ast::Expr> {
+        let mut merged: Vec<(ast::Attr, bool)> = Vec::new();
+        let mut valid = true;
+
+        for item in items {
+            match item {
+                ast::ObjectItem::Attr(attr) => match self.fold_expr(attr.value) {
+                    Some(value) => {
+                        let attr = ast::Attr { value, ..attr };
+                        match merged.iter_mut().find(|(existing, _)| existing.key == attr.key) {
+                            Some((_, true)) => {
+                                self.errors.push(Error::new(
+                                    ErrorKind::DuplicateObjectKey {
+                                        rule: spec::ids::UNIQUE_OBJECT_KEYS,
+                                        key: attr.key,
+                                    },
+                                    attr.range,
+                                ));
+                                valid = false;
+                            }
+                            Some(slot) => *slot = (attr, true),
+                            None => merged.push((attr, true)),
+                        }
+                    }
+                    None => valid = false,
+                },
+                ast::ObjectItem::Spread(operand) => match self.fold_object_spread(operand) {
+                    Some(attrs) => {
+                        for attr in attrs {
+                            match merged.iter_mut().find(|(existing, _)| existing.key == attr.key) {
+                                Some(slot) => *slot = (attr, false),
+                                None => merged.push((attr, false)),
+                            }
+                        }
+                    }
+                    None => valid = false,
+                },
+            }
+        }
+
+        if !valid {
+            return None;
+        }
+
+        let items = merged.into_iter().map(|(attr, _)| ast::ObjectItem::Attr(attr)).collect();
+        Some(ast::Expr::new(ast::ExprKind::Object(items), range))
+    }
+
+    fn fold_slice(
+        &mut self,
+        target: ast::Expr,
+        start: Option<Box<ast::Expr>>,
+        end: Option<Box<ast::Expr>>,
+        range: SrcRange,
+    ) -> Option<ast::Expr> {
+        // fold every part first so each reports its own diagnostics
+        let target = self.fold_expr(target);
+        let start = start.map(|bound| self.fold_expr(*bound));
+        let end = end.map(|bound| self.fold_expr(*bound));
+        let target = target?;
+        let start = match start {
+            Some(bound) => Some(bound?),
+            None => None,
+        };
+        let end = match end {
+            Some(bound) => Some(bound?),
+            None => None,
+        };
+
+        if static_type(&target) != Some(StaticType::Array) {
+            self.errors.push(Error::new(
+                ErrorKind::NonSliceableTarget {
+                    rule: spec::ids::SLICEABLE_TARGETS,
+                    found: found_type(&target),
+                },
+                target.range,
+            ));
+            return None;
+        }
+
+        let mut valid = true;
+        for bound in [&start, &end].into_iter().flatten() {
+            if static_type(bound) != Some(StaticType::Number) {
+                self.errors.push(Error::new(
+                    ErrorKind::SliceTypeMismatch {
+                        rule: spec::ids::SLICE_BOUNDS,
+                        found: found_type(bound),
+                    },
+                    bound.range,
+                ));
+                valid = false;
+            }
+        }
+        if !valid {
+            return None;
+        }
+
+        // constant bounds must check out even when the target is dynamic
+        let start_const = match &start {
+            Some(bound) => self.check_slice_bound(bound),
+            None => Some(Some(0)),
+        };
+        let end_const = match &end {
+            Some(bound) => self.check_slice_bound(bound),
+            None => Some(None),
+        };
+        let (start_const, end_const) = match (start_const, end_const) {
+            (Some(start), Some(end)) => (start, end),
+            _ => return None,
+        };
+
+        // a constant slice of a literal selects its elements during validation,
+        // the elements themselves may still be dynamic
+        let known = start_const.is_some() && (end_const.is_some() || end.is_none());
+        if known && matches!(target.kind, ast::ExprKind::Array(_)) {
+            let ast::ExprKind::Array(values) = target.kind else {
+                unreachable!("the target was just matched as an array literal");
+            };
+            let len = values.len();
+            let start = start_const.expect("a known slice has a constant start").min(len);
+            let end = end_const.unwrap_or(len).min(len);
+            let selected = if start >= end {
+                Vec::new()
+            } else {
+                values.into_iter().skip(start).take(end - start).collect()
+            };
+            return Some(ast::Expr::new(ast::ExprKind::Array(selected), range));
+        }
+
+        Some(ast::Expr::new(
+            ast::ExprKind::Slice {
+                target: Box::new(target),
+                start: start.map(Box::new),
+                end: end.map(Box::new),
+            },
+            range,
+        ))
+    }
+
+    // some(none) = dynamic, checked during generation; none = diagnostic pushed
+    fn check_slice_bound(&mut self, bound: &ast::Expr) -> Option<Option<usize>> {
+        if !expr_is_constant(bound) {
+            return Some(None);
+        }
+
+        let Const::Num(number) = self.const_scalar(bound)? else {
+            unreachable!("bound was type checked as a number");
+        };
+        let Number::Int(value) = number else {
+            self.errors.push(Error::new(
+                ErrorKind::NonIntegerSliceBound {
+                    rule: spec::ids::SLICE_BOUNDS,
+                },
+                bound.range,
+            ));
+            return None;
+        };
+
+        match usize::try_from(value) {
+            Ok(value) => Some(Some(value)),
+            Err(_) => {
+                self.errors.push(Error::new(
+                    ErrorKind::NegativeSliceBound {
+                        rule: spec::ids::SLICE_BOUNDS,
+                    },
+                    bound.range,
+                ));
+                None
+            }
+        }
+    }
+
+    // unrolls comprehensions during validation, bindings substitute by expression like vars
+    fn fold_for(
+        &mut self,
+        bindings: Vec<String>,
+        collection: ast::Expr,
+        key: Option<Box<ast::Expr>>,
+        body: ast::Expr,
+        cond: Option<Box<ast::Expr>>,
+        range: SrcRange,
+    ) -> Option<ast::Expr> {
+        let collection = self.fold_expr(collection)?;
+
+        // a folded collection carries folded elements, so substituted exprs stay folded
+        let iterations: Vec<HashMap<String, ast::Expr>> = match collection.kind {
+            ast::ExprKind::Array(values) => values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let mut map = HashMap::new();
+                    if bindings.len() == 2 {
+                        let index = ast::Expr::new(ast::ExprKind::Num(index.to_string()), value.range);
+                        map.insert(bindings[0].clone(), index);
+                        map.insert(bindings[1].clone(), value);
+                    } else {
+                        map.insert(bindings[0].clone(), value);
+                    }
+                    map
+                })
+                .collect(),
+            ast::ExprKind::Object(items) => items
+                .into_iter()
+                .map(|item| {
+                    let ast::ObjectItem::Attr(attr) = item else {
+                        unreachable!("folded objects only hold attrs");
+                    };
+                    let mut map = HashMap::new();
+                    let key = ast::Expr::new(ast::ExprKind::Str(attr.key), attr.range);
+                    map.insert(bindings[0].clone(), key);
+                    if bindings.len() == 2 {
+                        map.insert(bindings[1].clone(), attr.value);
+                    }
+                    map
+                })
+                .collect(),
+            kind => {
+                let collection = ast::Expr::new(kind, collection.range);
+                self.errors.push(Error::new(
+                    ErrorKind::ForCollectionMismatch {
+                        rule: spec::ids::FOR_COLLECTIONS,
+                        found: ExprType::of(&collection),
+                    },
+                    collection.range,
+                ));
+                return None;
+            }
+        };
+
+        let object = key.is_some();
+        let mut values = Vec::new();
+        let mut attrs = Vec::new();
+        let mut valid = true;
+
+        for map in iterations {
+            // filter first so skipped elements never fold their bodies
+            if let Some(cond) = &cond {
+                let cond = self.substitute((**cond).clone(), &map).and_then(|cond| self.fold_expr(cond));
+                let Some(cond) = cond else {
+                    valid = false;
+                    continue;
+                };
+                match cond.kind {
+                    ast::ExprKind::Bool(true) => {}
+                    ast::ExprKind::Bool(false) => continue,
+                    kind => {
+                        let cond = ast::Expr::new(kind, cond.range);
+                        self.errors.push(Error::new(
+                            ErrorKind::NonConstantForFilter {
+                                rule: spec::ids::STATIC_FOR,
+                                found: ExprType::of(&cond),
+                            },
+                            cond.range,
+                        ));
+                        valid = false;
+                        continue;
+                    }
+                }
+            }
+
+            let body = self.substitute(body.clone(), &map).and_then(|body| self.fold_expr(body));
+            let Some(body) = body else {
+                valid = false;
+                continue;
+            };
+
+            match &key {
+                Some(key) => {
+                    let key = self.substitute((**key).clone(), &map).and_then(|key| self.fold_expr(key));
+                    let Some(key) = key else {
+                        valid = false;
+                        continue;
+                    };
+                    match const_string(&key) {
+                        Some(text) => attrs.push(ast::ObjectItem::Attr(ast::Attr {
+                            key: text,
+                            value: body,
+                            range: key.range,
+                        })),
+                        None => {
+                            self.errors.push(Error::new(
+                                ErrorKind::NonConstantForKey {
+                                    rule: spec::ids::STATIC_FOR,
+                                    found: ExprType::of(&key),
+                                },
+                                key.range,
+                            ));
+                            valid = false;
+                        }
+                    }
+                }
+                None => values.push(body),
+            }
+        }
+
+        if !valid {
+            return None;
+        }
+
+        let kind = if object {
+            ast::ExprKind::Object(attrs)
+        } else {
+            ast::ExprKind::Array(values)
+        };
+        Some(ast::Expr::new(kind, range))
+    }
+
+    // swaps loop bindings into a for body, per-iteration values are already folded
+    fn substitute(&mut self, expr: ast::Expr, bindings: &HashMap<String, ast::Expr>) -> Option<ast::Expr> {
+        let ast::Expr { kind, range } = expr;
+        let kind = match kind {
+            // use-site range wins so diags point at the ref, not the element
+            ast::ExprKind::LoopRef(name) => match bindings.get(&name) {
+                Some(value) => value.kind.clone(),
+                // an unmatched ref belongs to an inner for, it substitutes later
+                None => ast::ExprKind::LoopRef(name),
+            },
+            ast::ExprKind::Template(parts) => ast::ExprKind::Template(self.substitute_template_parts(parts, bindings)?),
+            ast::ExprKind::Array(values) => {
+                let mut substituted = Vec::with_capacity(values.len());
+                for value in values {
+                    substituted.push(self.substitute(value, bindings)?);
+                }
+                ast::ExprKind::Array(substituted)
+            }
+            ast::ExprKind::Object(items) => {
+                let mut substituted = Vec::with_capacity(items.len());
+                for item in items {
+                    substituted.push(match item {
+                        ast::ObjectItem::Attr(attr) => {
+                            let value = self.substitute(attr.value, bindings)?;
+                            ast::ObjectItem::Attr(ast::Attr { value, ..attr })
+                        }
+                        ast::ObjectItem::Spread(operand) => ast::ObjectItem::Spread(self.substitute(operand, bindings)?),
+                    });
+                }
+                ast::ExprKind::Object(substituted)
+            }
+            ast::ExprKind::Func { name, args } => {
+                let mut substituted = Vec::with_capacity(args.len());
+                for arg in args {
+                    substituted.push(self.substitute(arg, bindings)?);
+                }
+                ast::ExprKind::Func { name, args: substituted }
+            }
+            ast::ExprKind::Spread(operand) => ast::ExprKind::Spread(Box::new(self.substitute(*operand, bindings)?)),
+            ast::ExprKind::Unary { op, operand } => ast::ExprKind::Unary {
+                op,
+                operand: Box::new(self.substitute(*operand, bindings)?),
+            },
+            ast::ExprKind::Binary { op, lhs, rhs } => ast::ExprKind::Binary {
+                op,
+                lhs: Box::new(self.substitute(*lhs, bindings)?),
+                rhs: Box::new(self.substitute(*rhs, bindings)?),
+            },
+            ast::ExprKind::Cond { cond, then, otherwise } => ast::ExprKind::Cond {
+                cond: Box::new(self.substitute(*cond, bindings)?),
+                then: Box::new(self.substitute(*then, bindings)?),
+                otherwise: Box::new(self.substitute(*otherwise, bindings)?),
+            },
+            ast::ExprKind::Index { target, index } => ast::ExprKind::Index {
+                target: Box::new(self.substitute(*target, bindings)?),
+                index: Box::new(self.substitute(*index, bindings)?),
+            },
+            ast::ExprKind::Slice { target, start, end } => ast::ExprKind::Slice {
+                target: Box::new(self.substitute(*target, bindings)?),
+                start: match start {
+                    Some(bound) => Some(Box::new(self.substitute(*bound, bindings)?)),
+                    None => None,
+                },
+                end: match end {
+                    Some(bound) => Some(Box::new(self.substitute(*bound, bindings)?)),
+                    None => None,
+                },
+            },
+            ast::ExprKind::For {
+                bindings: inner,
+                collection,
+                key,
+                body,
+                cond,
+            } => {
+                let collection = Box::new(self.substitute(*collection, bindings)?);
+
+                // inner bindings shadow outer names in the body
+                let visible: HashMap<String, ast::Expr> = bindings
+                    .iter()
+                    .filter(|(name, _)| !inner.contains(name))
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+
+                let key = match key {
+                    Some(key) => Some(Box::new(self.substitute(*key, &visible)?)),
+                    None => None,
+                };
+                let body = Box::new(self.substitute(*body, &visible)?);
+                let cond = match cond {
+                    Some(cond) => Some(Box::new(self.substitute(*cond, &visible)?)),
+                    None => None,
+                };
+
+                ast::ExprKind::For {
+                    bindings: inner,
+                    collection,
+                    key,
+                    body,
+                    cond,
+                }
+            }
+            kind => kind,
+        };
+
+        Some(ast::Expr::new(kind, range))
+    }
+
+    fn substitute_template_parts(
+        &mut self,
+        parts: Vec<ast::TemplatePart>,
+        bindings: &HashMap<String, ast::Expr>,
+    ) -> Option<Vec<ast::TemplatePart>> {
+        let mut substituted = Vec::with_capacity(parts.len());
+        let mut valid = true;
+
+        for part in parts {
+            match part {
+                ast::TemplatePart::Ref { path, range } if path.len() == 1 && bindings.contains_key(&path[0]) => {
+                    let name = path.into_iter().next().expect("path has one segment");
+                    let value = bindings[&name].clone();
+
+                    match value.kind {
+                        ast::ExprKind::Str(text) => substituted.push(ast::TemplatePart::Lit(text)),
+                        ast::ExprKind::Num(raw) => substituted.push(ast::TemplatePart::Lit(raw)),
+                        ast::ExprKind::Bool(value) => {
+                            substituted.push(ast::TemplatePart::Lit(if value { "true" } else { "false" }.to_owned()));
+                        }
+                        // an element thats itself a template splices inline
+                        ast::ExprKind::Template(parts) => substituted.extend(parts),
+                        _ => {
+                            self.errors.push(Error::new(
+                                ErrorKind::NonScalarInterpolation {
+                                    rule: spec::ids::SCALAR_INTERPOLATION,
+                                    name,
+                                },
+                                range,
+                            ));
+                            valid = false;
+                        }
+                    }
+                }
+                part => substituted.push(part),
+            }
+        }
+
+        valid.then_some(substituted)
     }
 
     fn check_operand(&mut self, operand: &ast::Expr, required: StaticType, op: String) -> bool {
@@ -888,13 +1475,16 @@ impl Modeler {
     }
 
     fn validate_metric_keys(&mut self, expr: &ast::Expr) -> bool {
-        let ast::ExprKind::Object(attrs) = &expr.kind else {
+        let ast::ExprKind::Object(items) = &expr.kind else {
             unreachable!("expression was validated as an object");
         };
 
         let mut valid = true;
 
-        for attr in attrs {
+        for item in items {
+            let ast::ObjectItem::Attr(attr) = item else {
+                unreachable!("spreads are spliced before validation");
+            };
             if spec::RESERVED_METRIC_KEYS.contains(&attr.key.as_str()) {
                 self.errors.push(Error::new(
                     ErrorKind::ReservedMetricKey {
@@ -929,12 +1519,15 @@ impl Modeler {
                     .fold(true, |valid, value| self.validate_expr(value, block, field, items) && valid);
             }
             spec::ExprType::Object { values } => {
-                let ast::ExprKind::Object(attrs) = &expr.kind else {
+                let ast::ExprKind::Object(items) = &expr.kind else {
                     self.push_type_mismatch(expr, block, field, expected);
                     return false;
                 };
 
-                return attrs.iter().fold(true, |valid, attr| {
+                return items.iter().fold(true, |valid, item| {
+                    let ast::ObjectItem::Attr(attr) = item else {
+                        unreachable!("spreads are spliced before validation");
+                    };
                     self.validate_expr(&attr.value, block, field, values) && valid
                 });
             }
@@ -983,7 +1576,7 @@ impl Modeler {
             ast::ExprKind::Array(values) => Some(Value::Array(Array {
                 elem: values.into_iter().filter_map(|value| self.model_value(value)).collect(),
             })),
-            ast::ExprKind::Object(attrs) => Some(Value::Object(self.model_object(attrs))),
+            ast::ExprKind::Object(items) => Some(Value::Object(self.model_object(items))),
             ast::ExprKind::Func { name, args } => self.model_func(name, args, range).map(Value::Func),
             // only dynamic operator exprs survive folding
             ast::ExprKind::Unary { op, operand } => {
@@ -1023,7 +1616,27 @@ impl Modeler {
                     range,
                 })
             }
+            ast::ExprKind::Slice { target, start, end } => {
+                let target = self.model_value(*target);
+                let start = start.map(|bound| self.model_value(*bound));
+                let end = end.map(|bound| self.model_value(*bound));
+                Some(Value::Slice {
+                    target: Box::new(target?),
+                    start: match start {
+                        Some(bound) => Some(Box::new(bound?)),
+                        None => None,
+                    },
+                    end: match end {
+                        Some(bound) => Some(Box::new(bound?)),
+                        None => None,
+                    },
+                    range,
+                })
+            }
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before model lowering"),
+            ast::ExprKind::LoopRef(_) => unreachable!("loop references are substituted before model lowering"),
+            ast::ExprKind::Spread(_) => unreachable!("spreads are spliced before model lowering"),
+            ast::ExprKind::For { .. } => unreachable!("for expressions are unrolled before model lowering"),
         }
     }
 
@@ -1120,11 +1733,14 @@ impl Modeler {
         }
     }
 
-    fn model_object(&mut self, attrs: Vec<ast::Attr>) -> Object {
+    fn model_object(&mut self, items: Vec<ast::ObjectItem>) -> Object {
         let mut seen = HashSet::new();
         let mut elem = Vec::new();
 
-        for attr in attrs {
+        for item in items {
+            let ast::ObjectItem::Attr(attr) = item else {
+                unreachable!("spreads are spliced before model lowering");
+            };
             if !seen.insert(attr.key.clone()) {
                 self.errors.push(Error::new(
                     ErrorKind::DuplicateObjectKey {
@@ -1144,7 +1760,7 @@ impl Modeler {
     fn require_object(&mut self, expr: ast::Expr) -> Option<Object> {
         let ast::Expr { kind, .. } = expr;
         match kind {
-            ast::ExprKind::Object(attrs) => Some(self.model_object(attrs)),
+            ast::ExprKind::Object(items) => Some(self.model_object(items)),
             _ => unreachable!("expression was validated as an object"),
         }
     }
@@ -1248,7 +1864,10 @@ fn expr_references_vars(expr: &ast::Expr) -> bool {
             |part| matches!(part, ast::TemplatePart::Ref { path, .. } if path.first().is_some_and(|segment| segment == "var")),
         ),
         ast::ExprKind::Array(values) => values.iter().any(expr_references_vars),
-        ast::ExprKind::Object(attrs) => attrs.iter().any(|attr| expr_references_vars(&attr.value)),
+        ast::ExprKind::Object(items) => items.iter().any(|item| match item {
+            ast::ObjectItem::Attr(attr) => expr_references_vars(&attr.value),
+            ast::ObjectItem::Spread(operand) => expr_references_vars(operand),
+        }),
         ast::ExprKind::Func { args, .. } => args.iter().any(expr_references_vars),
         ast::ExprKind::Unary { operand, .. } => expr_references_vars(operand),
         ast::ExprKind::Binary { lhs, rhs, .. } => expr_references_vars(lhs) || expr_references_vars(rhs),
@@ -1256,6 +1875,24 @@ fn expr_references_vars(expr: &ast::Expr) -> bool {
             expr_references_vars(cond) || expr_references_vars(then) || expr_references_vars(otherwise)
         }
         ast::ExprKind::Index { target, index } => expr_references_vars(target) || expr_references_vars(index),
+        ast::ExprKind::Slice { target, start, end } => {
+            expr_references_vars(target)
+                || start.as_deref().is_some_and(expr_references_vars)
+                || end.as_deref().is_some_and(expr_references_vars)
+        }
+        ast::ExprKind::Spread(operand) => expr_references_vars(operand),
+        ast::ExprKind::For {
+            collection,
+            key,
+            body,
+            cond,
+            ..
+        } => {
+            expr_references_vars(collection)
+                || key.as_deref().is_some_and(expr_references_vars)
+                || expr_references_vars(body)
+                || cond.as_deref().is_some_and(expr_references_vars)
+        }
         _ => false,
     }
 }
@@ -1333,10 +1970,18 @@ fn static_type(expr: &ast::Expr) -> Option<StaticType> {
         // a dynamic index is only typed when the target is a literal with agreeing elements
         ast::ExprKind::Index { target, .. } => match &target.kind {
             ast::ExprKind::Array(values) => unify_static_types(values.iter()),
-            ast::ExprKind::Object(attrs) => unify_static_types(attrs.iter().map(|attr| &attr.value)),
+            ast::ExprKind::Object(items) => unify_static_types(items.iter().map(|item| match item {
+                ast::ObjectItem::Attr(attr) => &attr.value,
+                ast::ObjectItem::Spread(_) => unreachable!("spreads are spliced before type checks"),
+            })),
             _ => None,
         },
+        // a residual slice always selects from an array
+        ast::ExprKind::Slice { .. } => Some(StaticType::Array),
         ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
+        ast::ExprKind::LoopRef(_) => unreachable!("loop references are substituted before type checks"),
+        ast::ExprKind::Spread(_) => unreachable!("spreads are spliced before type checks"),
+        ast::ExprKind::For { .. } => unreachable!("for expressions are unrolled before type checks"),
     }
 }
 
@@ -1384,15 +2029,33 @@ fn expr_is_constant(expr: &ast::Expr) -> bool {
         ast::ExprKind::Func { .. } => false,
         ast::ExprKind::Template(parts) => parts.iter().all(|part| matches!(part, ast::TemplatePart::Lit(_))),
         ast::ExprKind::Array(values) => values.iter().all(expr_is_constant),
-        ast::ExprKind::Object(attrs) => attrs.iter().all(|attr| expr_is_constant(&attr.value)),
+        ast::ExprKind::Object(items) => items.iter().all(|item| match item {
+            ast::ObjectItem::Attr(attr) => expr_is_constant(&attr.value),
+            ast::ObjectItem::Spread(_) => unreachable!("spreads are spliced before constness checks"),
+        }),
         ast::ExprKind::Unary { operand, .. } => expr_is_constant(operand),
         ast::ExprKind::Binary { lhs, rhs, .. } => expr_is_constant(lhs) && expr_is_constant(rhs),
         ast::ExprKind::Cond { cond, then, otherwise } => {
             expr_is_constant(cond) && expr_is_constant(then) && expr_is_constant(otherwise)
         }
-        // constant indexes fold away, a residual one is dynamic
-        ast::ExprKind::Index { .. } => false,
+        // constant indexes and slices fold away, residual ones are dynamic
+        ast::ExprKind::Index { .. } | ast::ExprKind::Slice { .. } => false,
         _ => true,
+    }
+}
+
+// constant string value of a folded expr, none when dynamic or another type
+fn const_string(expr: &ast::Expr) -> Option<String> {
+    match &expr.kind {
+        ast::ExprKind::Str(value) => Some(value.clone()),
+        ast::ExprKind::Template(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ast::TemplatePart::Lit(value) => Some(value.as_str()),
+                ast::TemplatePart::Ref { .. } => None,
+            })
+            .collect(),
+        _ => None,
     }
 }
 
@@ -1642,6 +2305,37 @@ pub(super) enum ErrorKind {
     NonFiniteResult {
         rule: spec::Id,
     },
+    NonSliceableTarget {
+        rule: spec::Id,
+        found: ExprType,
+    },
+    SliceTypeMismatch {
+        rule: spec::Id,
+        found: ExprType,
+    },
+    NonIntegerSliceBound {
+        rule: spec::Id,
+    },
+    NegativeSliceBound {
+        rule: spec::Id,
+    },
+    SpreadTypeMismatch {
+        rule: spec::Id,
+        expected: &'static str,
+        found: ExprType,
+    },
+    ForCollectionMismatch {
+        rule: spec::Id,
+        found: ExprType,
+    },
+    NonConstantForFilter {
+        rule: spec::Id,
+        found: ExprType,
+    },
+    NonConstantForKey {
+        rule: spec::Id,
+        found: ExprType,
+    },
 }
 
 impl fmt::Display for ErrorKind {
@@ -1827,6 +2521,50 @@ impl fmt::Display for ErrorKind {
             Self::NonFiniteResult { rule } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "expression result is not a finite number; {}", rule.summary)
+            }
+            Self::NonSliceableTarget { rule, found } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "cannot slice {found}; {}", rule.summary)
+            }
+            Self::SliceTypeMismatch { rule, found } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "slice bound expects a number, but found {found}; {}", rule.summary)
+            }
+            Self::NonIntegerSliceBound { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "slice bound must be an integer; {}", rule.summary)
+            }
+            Self::NegativeSliceBound { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "slice bound must be non-negative; {}", rule.summary)
+            }
+            Self::SpreadTypeMismatch { rule, expected, found } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "cannot spread {found} into an {expected}; {}", rule.summary)
+            }
+            Self::ForCollectionMismatch { rule, found } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "for expression expects an array or object collection with a shape known before generation, but found {found}; {}",
+                    rule.summary
+                )
+            }
+            Self::NonConstantForFilter { rule, found } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "for filter expects a boolean known before generation, but found {found}; {}",
+                    rule.summary
+                )
+            }
+            Self::NonConstantForKey { rule, found } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "for key expects a string known before generation, but found {found}; {}",
+                    rule.summary
+                )
             }
         }
     }
@@ -2726,7 +3464,7 @@ mod tests {
         assert!(matches!(
             errors[0].kind(),
             ErrorKind::OperandTypeMismatch {
-                found: ExprType::Expr,
+                found: ExprType::Abstract,
                 ..
             }
         ));
@@ -2815,7 +3553,7 @@ mod tests {
         assert!(matches!(
             errors[0].kind(),
             ErrorKind::TypeMismatch {
-                found: ExprType::Expr,
+                found: ExprType::Abstract,
                 ..
             }
         ));
@@ -2825,7 +3563,7 @@ mod tests {
         assert!(matches!(
             errors[0].kind(),
             ErrorKind::TypeMismatch {
-                found: ExprType::Expr,
+                found: ExprType::Abstract,
                 ..
             }
         ));
@@ -3023,7 +3761,7 @@ mod tests {
         assert!(matches!(
             errors[0].kind(),
             ErrorKind::OperandTypeMismatch {
-                found: ExprType::Expr,
+                found: ExprType::Abstract,
                 ..
             }
         ));
@@ -3032,7 +3770,7 @@ mod tests {
         assert!(matches!(
             errors[0].kind(),
             ErrorKind::TypeMismatch {
-                found: ExprType::Expr,
+                found: ExprType::Abstract,
                 ..
             }
         ));
@@ -3041,6 +3779,454 @@ mod tests {
     #[test]
     fn rejects_index_exprs_referencing_vars_in_vars() {
         let errors = model(r#"vars { a = [1] b = var.a[0] } trace "t" { input = 1 }"#).unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
+    }
+
+    fn ints(value: &Value) -> Vec<i64> {
+        let Value::Array(array) = value else {
+            panic!("expected an array");
+        };
+        array
+            .elem
+            .iter()
+            .map(|value| match value {
+                Value::Num(Number::Int(value)) => *value,
+                other => panic!("expected an integer, found {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folds_constant_slices_with_clamped_bounds() {
+        let model = model(
+            r#"
+            vars { xs = [1, 2, 3, 4] }
+            trace "t" {
+                input = var.xs[1:3]
+                output = var.xs[:2]
+                metadata = {
+                    tail = var.xs[2:]
+                    all = var.xs[:]
+                    clamped = var.xs[1:99]
+                    empty = var.xs[3:1]
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let fields = &model.traces[0].fields;
+
+        assert_eq!(ints(fields.input.as_ref().unwrap()), [2, 3]);
+        assert_eq!(ints(fields.output.as_ref().unwrap()), [1, 2]);
+        let metadata = fields.metadata.as_ref().unwrap();
+        assert_eq!(ints(&metadata.elem[0].value), [3, 4]);
+        assert_eq!(ints(&metadata.elem[1].value), [1, 2, 3, 4]);
+        assert_eq!(ints(&metadata.elem[2].value), [2, 3, 4]);
+        assert!(ints(&metadata.elem[3].value).is_empty());
+    }
+
+    #[test]
+    fn folds_slices_into_typed_positions() {
+        let model = model(r#"trace "t" { tags = ["a", "b", "c"][1:] }"#).unwrap();
+
+        assert_eq!(
+            model.traces[0].fields.tags.iter().map(tag_text).collect::<Vec<_>>(),
+            ["b", "c"]
+        );
+    }
+
+    #[test]
+    fn models_dynamic_slice_selections() {
+        let source = r#"trace "t" { input = [1, 2, 3][range(0, 1):] }"#;
+        let model = model(source).unwrap();
+
+        let Some(Value::Slice {
+            target,
+            start,
+            end,
+            range,
+        }) = &model.traces[0].fields.input
+        else {
+            panic!("expected a dynamic slice expression");
+        };
+        assert!(matches!(&**target, Value::Array(array) if array.elem.len() == 3));
+        assert!(matches!(
+            start.as_deref(),
+            Some(Value::Func(Func::Range(Range::Int { min: 0, max: 1 })))
+        ));
+        assert!(end.is_none());
+        assert_eq!(&source[range.start..range.end], "[1, 2, 3][range(0, 1):]");
+    }
+
+    #[test]
+    fn rejects_invalid_slice_targets_and_bounds() {
+        let errors = model(r#"trace "t" { input = 5[0:1] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonSliceableTarget {
+                rule: spec::ids::SLICEABLE_TARGETS,
+                found: ExprType::Number,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = { a = 1 }[0:1] }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::NonSliceableTarget {
+                found: ExprType::Object,
+                ..
+            }
+        ));
+
+        let errors = model(r#"trace "t" { input = [1, 2]["a":] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::SliceTypeMismatch {
+                rule: spec::ids::SLICE_BOUNDS,
+                found: ExprType::String,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = [1, 2][0.5:] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonIntegerSliceBound {
+                rule: spec::ids::SLICE_BOUNDS,
+            }
+        );
+
+        // constant bounds check even when another bound is dynamic
+        let source = r#"trace "t" { input = [1, 2][range(0, 1):-1] }"#;
+        let errors = model(source).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NegativeSliceBound {
+                rule: spec::ids::SLICE_BOUNDS,
+            }
+        );
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "-1");
+    }
+
+    #[test]
+    fn splices_constant_array_spreads() {
+        let model = model(
+            r#"
+            vars { xs = [2, 3] }
+            trace "t" { input = [1, ...var.xs, 4] }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(ints(model.traces[0].fields.input.as_ref().unwrap()), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn splices_spreads_holding_dynamic_elements() {
+        let model = model(r#"vars { xs = [range(1, 5)] } trace "t" { input = [...var.xs] }"#).unwrap();
+
+        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        assert!(matches!(
+            array.elem[0],
+            Value::Func(Func::Range(Range::Int { min: 1, max: 5 }))
+        ));
+    }
+
+    #[test]
+    fn merges_object_spreads_with_later_entries_winning() {
+        let model = model(
+            r#"
+            vars { meta = { model = "gpt" temperature = 0.2 } }
+            trace "t" {
+                metadata = { ...var.meta temperature = 0.9 }
+                metrics = { temperature = 1 ...var.meta }
+            }
+            "#,
+        )
+        .unwrap();
+        let fields = &model.traces[0].fields;
+
+        // the explicit key overrides the spread but keeps its position
+        let metadata = fields.metadata.as_ref().unwrap();
+        assert_eq!(metadata.elem.len(), 2);
+        assert_eq!(metadata.elem[0].key, "model");
+        assert_eq!(metadata.elem[1].key, "temperature");
+        assert!(matches!(metadata.elem[1].value, Value::Num(Number::Float(value)) if value == 0.9));
+
+        // a later spread also overrides an earlier explicit key
+        let metrics = fields.metrics.as_ref().unwrap();
+        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == 0.2));
+    }
+
+    #[test]
+    fn rejects_explicit_duplicate_keys_even_through_a_merge() {
+        let errors = model(r#"trace "t" { metadata = { ...{} a = 1 a = 2 } }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::DuplicateObjectKey {
+                rule: spec::ids::UNIQUE_OBJECT_KEYS,
+                key: "a".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_and_dynamic_spread_operands() {
+        let errors = model(r#"trace "t" { input = [...{ a = 1 }] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::SpreadTypeMismatch {
+                rule: spec::ids::SPREAD_OPERANDS,
+                expected: "array",
+                found: ExprType::Object,
+            }
+        );
+
+        let errors = model(r#"trace "t" { metadata = { ...[1] } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::SpreadTypeMismatch {
+                rule: spec::ids::SPREAD_OPERANDS,
+                expected: "object",
+                found: ExprType::Array,
+            }
+        );
+
+        // a choice of arrays has no constant shape
+        let errors = model(r#"trace "t" { input = [...choice([1], [2])] }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::SpreadTypeMismatch {
+                found: ExprType::Func,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_spreads_referencing_vars_in_vars() {
+        let errors = model(r#"vars { a = [1] b = [...var.a] } trace "t" { input = 1 }"#).unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
+    }
+
+    #[test]
+    fn unrolls_array_for_exprs() {
+        let model = model(r#"trace "t" { input = [for x in [1, 2, 3] : x * 2] }"#).unwrap();
+
+        assert_eq!(ints(model.traces[0].fields.input.as_ref().unwrap()), [2, 4, 6]);
+    }
+
+    #[test]
+    fn unrolls_for_exprs_with_index_bindings_and_template_splices() {
+        let model = model(r#"trace "t" { input = [for i, x in ["a", "b"] : "${i}-${x}"] }"#).unwrap();
+
+        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        assert!(matches!(&array.elem[0], Value::Str(value) if value == "0-a"));
+        assert!(matches!(&array.elem[1], Value::Str(value) if value == "1-b"));
+    }
+
+    #[test]
+    fn unrolls_for_exprs_with_constant_filters() {
+        let model = model(r#"trace "t" { input = [for x in [1, 2, 3, 4] : x if x % 2 == 0] }"#).unwrap();
+
+        assert_eq!(ints(model.traces[0].fields.input.as_ref().unwrap()), [2, 4]);
+    }
+
+    #[test]
+    fn unrolls_for_exprs_over_objects() {
+        let model = model(
+            r#"
+            vars { meta = { a = 1 b = 2 c = 3 } }
+            trace "t" {
+                input = [for k in var.meta : k]
+                metadata = { for k, v in var.meta : k => v if k != "b" }
+            }
+            "#,
+        )
+        .unwrap();
+        let fields = &model.traces[0].fields;
+
+        let Some(Value::Array(keys)) = &fields.input else {
+            panic!("expected an array");
+        };
+        let keys: Vec<_> = keys
+            .elem
+            .iter()
+            .map(|value| match value {
+                Value::Str(value) => value.as_str(),
+                other => panic!("expected a string, found {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+
+        let metadata = fields.metadata.as_ref().unwrap();
+        assert_eq!(metadata.elem.len(), 2);
+        assert_eq!((metadata.elem[0].key.as_str(), metadata.elem[1].key.as_str()), ("a", "c"));
+    }
+
+    #[test]
+    fn unrolls_object_for_exprs_over_arrays() {
+        let model = model(r#"trace "t" { metadata = { for i, x in ["a", "b"] : x => i } }"#).unwrap();
+
+        let metadata = model.traces[0].fields.metadata.as_ref().unwrap();
+        assert_eq!(metadata.elem[0].key, "a");
+        assert!(matches!(metadata.elem[0].value, Value::Num(Number::Int(0))));
+        assert_eq!(metadata.elem[1].key, "b");
+        assert!(matches!(metadata.elem[1].value, Value::Num(Number::Int(1))));
+    }
+
+    #[test]
+    fn unrolls_for_exprs_into_typed_positions() {
+        let model = model(r#"trace "t" { tags = [for x in ["a", "b"] : "t-${x}"] }"#).unwrap();
+
+        // spliced tags stay templates of literal parts, joined during generation
+        let tags: Vec<String> = model.traces[0]
+            .fields
+            .tags
+            .iter()
+            .map(|tag| {
+                tag.parts
+                    .iter()
+                    .map(|part| match part {
+                        Part::Lit(value) => value.as_str(),
+                        Part::Ref(_) => panic!("expected literal parts"),
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(tags, ["t-a", "t-b"]);
+    }
+
+    #[test]
+    fn unrolls_for_exprs_keeping_dynamic_bodies() {
+        let model = model(r#"trace "t" { input = [for x in [1, 2] : x + range(0, 1)] }"#).unwrap();
+
+        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        assert_eq!(array.elem.len(), 2);
+        assert!(array.elem.iter().all(|value| matches!(value, Value::Binary { .. })));
+    }
+
+    #[test]
+    fn unrolls_nested_for_exprs_with_shadowing() {
+        let model = model(r#"trace "t" { input = [for x in [[1, 2], [3]] : [for x in x : x * 10]] }"#).unwrap();
+
+        let Some(Value::Array(outer)) = &model.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        assert_eq!(ints(&outer.elem[0]), [10, 20]);
+        assert_eq!(ints(&outer.elem[1]), [30]);
+    }
+
+    #[test]
+    fn rejects_for_exprs_over_dynamic_or_scalar_collections() {
+        let errors = model(r#"trace "t" { input = [for x in choice([1], [2]) : x] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::ForCollectionMismatch {
+                rule: spec::ids::FOR_COLLECTIONS,
+                found: ExprType::Func,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = [for x in 5 : x] }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::ForCollectionMismatch {
+                found: ExprType::Number,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_for_filters_that_are_not_constant_booleans() {
+        let errors = model(r#"trace "t" { input = [for x in [range(0, 1)] : x if x > 0] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonConstantForFilter {
+                rule: spec::ids::STATIC_FOR,
+                found: ExprType::Abstract,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = [for x in [1] : x if 5] }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::NonConstantForFilter {
+                found: ExprType::Number,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_for_keys_that_are_not_constant_strings() {
+        let errors = model(r#"trace "t" { metadata = { for i, x in [1] : i => x } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonConstantForKey {
+                rule: spec::ids::STATIC_FOR,
+                found: ExprType::Number,
+            }
+        );
+
+        let errors = model(r#"trace "t" { metadata = { for x in [1] : "${trace.index}" => x } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::NonConstantForKey {
+                found: ExprType::String,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_produced_by_unrolling() {
+        let errors = model(r#"trace "t" { metadata = { for x in ["a", "a"] : x => 1 } }"#).unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::DuplicateObjectKey { key, .. } if key == "a"));
+    }
+
+    #[test]
+    fn rejects_interpolating_non_scalar_bindings() {
+        let errors = model(r#"trace "t" { input = [for x in [[1]] : "${x}"] }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonScalarInterpolation {
+                rule: spec::ids::SCALAR_INTERPOLATION,
+                name: "x".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn splices_binding_templates_and_keeps_context_references() {
+        let model = model(r#"trace "t" { input = [for x in ["q ${trace.index}"] : "${x}!"] }"#).unwrap();
+
+        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        let Value::Template(template) = &array.elem[0] else {
+            panic!("expected a template");
+        };
+        assert!(matches!(&template.parts[0], Part::Lit(value) if value == "q "));
+        assert!(matches!(template.parts[1], Part::Ref(CtxRef::TraceIndex)));
+        assert!(matches!(&template.parts[2], Part::Lit(value) if value == "!"));
+    }
+
+    #[test]
+    fn rejects_for_exprs_referencing_vars_in_vars() {
+        let errors = model(r#"vars { a = [1] b = [for x in var.a : x] } trace "t" { input = 1 }"#).unwrap_err();
 
         assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
     }

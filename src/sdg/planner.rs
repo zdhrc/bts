@@ -177,9 +177,55 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
         }
 
         ModelValue::Index { target, index, range } => lower_value(eval_index(*target, *index, range, ctx)?, ctx)?,
+
+        ModelValue::Slice {
+            target,
+            start,
+            end,
+            range,
+        } => lower_value(eval_slice(*target, start, end, range, ctx)?, ctx)?,
     };
 
     Ok(value)
+}
+
+// selects the sliced elements, clamping generous bounds like python
+fn eval_slice(
+    target: ModelValue,
+    start: Option<Box<ModelValue>>,
+    end: Option<Box<ModelValue>>,
+    range: SrcRange,
+    ctx: &mut Ctx,
+) -> Result<ModelValue, Error> {
+    let ModelValue::Array(ModelArray { elem }) = eval_container(target, ctx)? else {
+        unreachable!("modeler validated the slice target as an array");
+    };
+
+    let len = elem.len();
+    let start = match start {
+        Some(bound) => eval_slice_bound(*bound, range, ctx)?.min(len),
+        None => 0,
+    };
+    let end = match end {
+        Some(bound) => eval_slice_bound(*bound, range, ctx)?.min(len),
+        None => len,
+    };
+
+    let elem = if start >= end {
+        Vec::new()
+    } else {
+        elem.into_iter().skip(start).take(end - start).collect()
+    };
+
+    Ok(ModelValue::Array(ModelArray { elem }))
+}
+
+fn eval_slice_bound(bound: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<usize, Error> {
+    match eval_operand(bound, ctx)? {
+        Scalar::Int(value) => usize::try_from(value).map_err(|_| Error::new(ErrorKind::NegativeSliceBound, range)),
+        Scalar::Float(_) => Err(Error::new(ErrorKind::NonIntegerSliceBound, range)),
+        _ => unreachable!("modeler validated slice bounds as numbers"),
+    }
 }
 
 // selects the indexed element, leaving its siblings unevaluated like an untaken branch
@@ -227,6 +273,12 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error>
             eval_container(*taken, ctx)
         }
         ModelValue::Index { target, index, range } => eval_container(eval_index(*target, *index, range, ctx)?, ctx),
+        ModelValue::Slice {
+            target,
+            start,
+            end,
+            range,
+        } => eval_slice(*target, start, end, range, ctx),
         _ => unreachable!("modeler validated the target as an array or object"),
     }
 }
@@ -335,7 +387,8 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
         }
         ModelValue::Index { target, index, range } => eval_operand(eval_index(*target, *index, range, ctx)?, ctx)?,
 
-        ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) => {
+        // a slice is always an array, which is never a scalar operand
+        ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) | ModelValue::Slice { .. } => {
             unreachable!("modeler validated operand types")
         }
     };
@@ -506,6 +559,10 @@ enum ErrorKind {
     NonIntegerIndex,
     #[error("object key is not present")]
     MissingObjectKey,
+    #[error("slice bound is not an integer")]
+    NonIntegerSliceBound,
+    #[error("slice bound is negative")]
+    NegativeSliceBound,
 }
 
 #[cfg(test)]
@@ -752,6 +809,62 @@ mod tests {
         let source = r#"trace "t" { input = { a = 1 }[choice("b")] }"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "object key is not present");
+    }
+
+    #[test]
+    fn evaluates_dynamic_slices_with_clamped_bounds() {
+        let source = r#"
+            trace "t" {
+                input = [1, 2, 3, 4][range(1, 1):range(3, 3)]
+                output = [1, 2][0:range(5, 5)]
+                metadata = { empty = [1, 2][range(1, 1):0] }
+            }
+        "#;
+        let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
+
+        for event in plan_a.events.iter() {
+            assert_eq!(event.fields.input, Some(serde_json::json!([2, 3])));
+            assert_eq!(event.fields.output, Some(serde_json::json!([1, 2])));
+            assert_eq!(event.fields.metadata.as_ref().unwrap()["empty"], serde_json::json!([]));
+        }
+
+        // same seed, same selections
+        let plan_b = plan(compile(source).unwrap(), 3, 7).unwrap();
+        assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn evaluates_indexes_into_sliced_targets() {
+        let model = compile(r#"trace "t" { input = [1, 2, 3][range(1, 1):][0] }"#).unwrap();
+        let planned = plan(model, 1, 0).unwrap();
+
+        assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(2)));
+    }
+
+    #[test]
+    fn fails_on_invalid_dynamic_slice_bounds() {
+        let source = r#"trace "t" { input = [1, 2][0 - range(1, 1):] }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "slice bound is negative");
+        assert_eq!(&source[error.range.start..error.range.end], "[1, 2][0 - range(1, 1):]");
+
+        let source = r#"trace "t" { input = [1, 2][range(0.5, 0.5):] }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "slice bound is not an integer");
+    }
+
+    #[test]
+    fn evaluates_unrolled_for_bodies_per_trace() {
+        let model = compile(r#"trace "t" { input = [for x in [1, 2] : x * range(1, 3)] }"#).unwrap();
+        let plan = plan(model, 20, 7).unwrap();
+
+        for event in plan.events.iter() {
+            let JsonValue::Array(input) = event.fields.input.as_ref().unwrap() else {
+                panic!("expected an array");
+            };
+            assert!((1..=3).contains(&input[0].as_i64().unwrap()));
+            assert!((2..=6).contains(&input[1].as_i64().unwrap()));
+        }
     }
 
     #[test]

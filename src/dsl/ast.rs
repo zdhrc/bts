@@ -41,8 +41,10 @@ pub enum ExprKind {
     Bool(bool),
     Null,
     Array(Vec<Expr>),
-    Object(Vec<Attr>),
+    Object(Vec<ObjectItem>),
     VarRef(String),
+    // a loop binding introduced by an enclosing for expr
+    LoopRef(String),
     Func {
         name: String,
         args: Vec<Expr>,
@@ -50,6 +52,21 @@ pub enum ExprKind {
     Index {
         target: Box<Expr>,
         index: Box<Expr>,
+    },
+    Slice {
+        target: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+    },
+    // only valid as an array element, object spreads are ObjectItem::Spread
+    Spread(Box<Expr>),
+    // key = Some makes an object result, otherwise an array
+    For {
+        bindings: Vec<String>,
+        collection: Box<Expr>,
+        key: Option<Box<Expr>>,
+        body: Box<Expr>,
+        cond: Option<Box<Expr>>,
     },
     Unary {
         op: UnaryOp,
@@ -65,6 +82,12 @@ pub enum ExprKind {
         then: Box<Expr>,
         otherwise: Box<Expr>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectItem {
+    Attr(Attr),
+    Spread(Expr),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

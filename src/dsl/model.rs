@@ -70,6 +70,13 @@ pub(crate) enum Value {
         index: Box<Value>,
         range: SrcRange,
     },
+    // dynamic slice selections, constant ones fold away in the modeler
+    Slice {
+        target: Box<Value>,
+        start: Option<Box<Value>>,
+        end: Option<Box<Value>>,
+        range: SrcRange,
+    },
 }
 
 // already validated by the modeler so evaluating one can't fail

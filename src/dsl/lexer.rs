@@ -31,7 +31,9 @@ pub(super) enum TokenKind {
 
     Comma,
     Dot,
+    Ellipsis,
     Equals,
+    FatArrow,
 
     Plus,
     Minus,
@@ -89,7 +91,21 @@ impl<'src> Lexer<'src> {
 
                 // punctuation
                 ',' => tokens.push(Token::new(TokenKind::Comma, idx, idx + ch.len_utf8())),
-                '.' => tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8())),
+                // ... spreads, a lone .. stays two dots so diagnostics point at real tokens
+                '.' => {
+                    if matches!(self.peek(), Some((_, '.'))) {
+                        let (second, _) = self.next().expect("peeked character is present");
+                        if matches!(self.peek(), Some((_, '.'))) {
+                            let (third, _) = self.next().expect("peeked character is present");
+                            tokens.push(Token::new(TokenKind::Ellipsis, idx, third + '.'.len_utf8()));
+                        } else {
+                            tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8()));
+                            tokens.push(Token::new(TokenKind::Dot, second, second + '.'.len_utf8()));
+                        }
+                    } else {
+                        tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8()));
+                    }
+                }
 
                 // operators, = peeks for == and so on
                 '+' => tokens.push(Token::new(TokenKind::Plus, idx, idx + ch.len_utf8())),
@@ -101,7 +117,10 @@ impl<'src> Lexer<'src> {
                 ':' => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
                 '=' => match self.lex_paired(ch) {
                     Some(end) => tokens.push(Token::new(TokenKind::EqEq, idx, end)),
-                    None => tokens.push(Token::new(TokenKind::Equals, idx, idx + ch.len_utf8())),
+                    None => match self.lex_trailing('>') {
+                        Some(end) => tokens.push(Token::new(TokenKind::FatArrow, idx, end)),
+                        None => tokens.push(Token::new(TokenKind::Equals, idx, idx + ch.len_utf8())),
+                    },
                 },
                 '!' => match self.lex_trailing('=') {
                     Some(end) => tokens.push(Token::new(TokenKind::NotEq, idx, end)),
@@ -516,6 +535,48 @@ mod tests {
         );
         assert_eq!(tokens[0].range, SrcRange::new(0, 2));
         assert_eq!(tokens[5].range, SrcRange::new(15, 17));
+    }
+
+    #[test]
+    fn lexes_ellipses_and_keeps_shorter_dot_runs_as_dots() {
+        let tokens = Lexer::new("...x").lex().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Ellipsis);
+        assert_eq!(tokens[0].range, SrcRange::new(0, 3));
+        assert_eq!(tokens[1].kind, TokenKind::Ident("x".to_owned()));
+
+        let tokens = Lexer::new("a..b").lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Ident("a".to_owned()),
+                TokenKind::Dot,
+                TokenKind::Dot,
+                TokenKind::Ident("b".to_owned()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_fat_arrows_apart_from_equals() {
+        let tokens = Lexer::new("a => b = c == d").lex().unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Ident("a".to_owned()),
+                TokenKind::FatArrow,
+                TokenKind::Ident("b".to_owned()),
+                TokenKind::Equals,
+                TokenKind::Ident("c".to_owned()),
+                TokenKind::EqEq,
+                TokenKind::Ident("d".to_owned()),
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(tokens[1].range, SrcRange::new(2, 4));
     }
 
     #[test]

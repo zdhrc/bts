@@ -211,6 +211,9 @@ pub(crate) mod ids {
     pub(crate) const OBJECT: Id = Id::new("expr.object");
     pub(crate) const FUNC: Id = Id::new("expr.func");
     pub(crate) const INDEX: Id = Id::new("expr.index");
+    pub(crate) const SLICE: Id = Id::new("expr.slice");
+    pub(crate) const SPREAD: Id = Id::new("expr.spread");
+    pub(crate) const FOR: Id = Id::new("expr.for");
     pub(crate) const GROUPING: Id = Id::new("expr.grouping");
     pub(crate) const UNARY: Id = Id::new("expr.unary");
     pub(crate) const ARITHMETIC: Id = Id::new("expr.arithmetic");
@@ -237,6 +240,11 @@ pub(crate) mod ids {
     pub(crate) const OPERAND_TYPES: Id = Id::new("rule.operand-types");
     pub(crate) const INDEXABLE_TARGETS: Id = Id::new("rule.indexable-targets");
     pub(crate) const INDEX_BOUNDS: Id = Id::new("rule.index-bounds");
+    pub(crate) const SLICEABLE_TARGETS: Id = Id::new("rule.sliceable-targets");
+    pub(crate) const SLICE_BOUNDS: Id = Id::new("rule.slice-bounds");
+    pub(crate) const SPREAD_OPERANDS: Id = Id::new("rule.spread-operands");
+    pub(crate) const FOR_COLLECTIONS: Id = Id::new("rule.for-collections");
+    pub(crate) const STATIC_FOR: Id = Id::new("rule.static-for");
     pub(crate) const BOOLEAN_CONDITIONS: Id = Id::new("rule.boolean-conditions");
     pub(crate) const NONZERO_DIVISORS: Id = Id::new("rule.nonzero-divisors");
 
@@ -362,6 +370,30 @@ const INDEX_RULES: &[RuleDesc] = &[
         summary: "An array index must be within bounds and an object key must be present; constant violations are rejected during validation, dynamic ones fail the run during generation.",
     },
 ];
+const SLICE_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::SLICEABLE_TARGETS,
+        summary: "Slicing requires an array target; slice bounds are numbers.",
+    },
+    RuleDesc {
+        id: ids::SLICE_BOUNDS,
+        summary: "Slice bounds are non-negative integers, clamped to the array length; a start at or past the end produces an empty array. Constant violations are rejected during validation, dynamic ones fail the run during generation.",
+    },
+];
+const SPREAD_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::SPREAD_OPERANDS,
+    summary: "A spread operand must be an array (inside arrays) or an object (inside objects) whose shape is known before generation. Later object entries override keys introduced by a spread, but two explicit keys may still not collide.",
+}];
+const FOR_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::FOR_COLLECTIONS,
+        summary: "A for expression iterates an array or object whose shape is known before generation; element values may still be dynamic.",
+    },
+    RuleDesc {
+        id: ids::STATIC_FOR,
+        summary: "For expressions unroll during validation: a filter condition must resolve to a constant boolean and an object key to a constant string.",
+    },
+];
 const VAR_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::DEFINED_VARS,
@@ -448,6 +480,31 @@ const EXPR_TYPES: &[ExprDesc] = &[
             "var.models[choice(0, 1, 2)]",
         ],
         rules: INDEX_RULES,
+    },
+    ExprDesc {
+        id: ids::SLICE,
+        syntax: "value[start:end]",
+        summary: "Selects a sub-range of an array: 0-based, start inclusive, end exclusive. Either bound may be omitted to default to that end of the array, and bounds may be any number expressions, evaluated per generated trace.",
+        examples: &["var.xs[1:3]", "var.xs[:2]", "var.xs[range(0, 2):]"],
+        rules: SLICE_RULES,
+    },
+    ExprDesc {
+        id: ids::SPREAD,
+        syntax: "[...array] | { ...object }",
+        summary: "Splices the elements of an array or the entries of an object into a surrounding literal, resolved during validation. Later object entries override keys a spread introduced.",
+        examples: &["[1, ...var.xs]", "{ ...var.meta temperature = 0.9 }"],
+        rules: SPREAD_RULES,
+    },
+    ExprDesc {
+        id: ids::FOR,
+        syntax: "[for x in collection : body if cond] | { for k, v in collection : key => value if cond }",
+        summary: "Maps and filters a collection into a new array or object, unrolled during validation. One binding names the element (arrays) or key (objects); two name index/element or key/value. A binding referenced twice re-evaluates a dynamic element each time, like variables.",
+        examples: &[
+            "[for x in var.xs : x * 2]",
+            "[for i, x in var.xs : \"${i}-${x}\" if i > 0]",
+            "{ for k, v in var.meta : k => v if k != \"secret\" }",
+        ],
+        rules: FOR_RULES,
     },
     ExprDesc {
         id: ids::GROUPING,
@@ -605,15 +662,22 @@ comparison     = additive, { ( "<" | "<=" | ">" | ">=" ), additive } ;
 additive       = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative = unary, { ( "*" | "/" | "%" ), unary } ;
 unary          = ( "-" | "!" ), unary | postfix ;
-postfix        = primary, { "[", expression, "]" | ".", identifier } ;
-primary        = string | number | boolean | null | array | object | variable | function
+postfix        = primary, { "[", expression, "]" | "[", [ expression ], ":", [ expression ], "]" | ".", identifier } ;
+primary        = string | number | boolean | null | array | object | variable | binding | function
                | "(", expression, ")" ;
 boolean        = "true" | "false" ;
 null           = "null" ;
 variable       = "var", ".", identifier ;
+binding        = identifier (* a loop binding introduced by an enclosing for expression *) ;
 function       = identifier, "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
-array          = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
-object         = "{", { attribute }, "}" ;
+array          = "[", [ array_items | for_array ], "]" ;
+array_items    = array_item, { ",", array_item }, [ "," ] ;
+array_item     = expression | "...", expression ;
+object         = "{", ( { object_item } | for_object ), "}" ;
+object_item    = attribute | "...", expression ;
+for_array      = "for", bindings, "in", expression, ":", expression, [ "if", expression ] ;
+for_object     = "for", bindings, "in", expression, ":", expression, "=>", expression, [ "if", expression ] ;
+bindings       = identifier, [ ",", identifier ] ;
 identifier     = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
 number         = ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
 string         = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | interpolation }, '"' ;
@@ -631,6 +695,8 @@ reference      = identifier, { ".", identifier } ;
             "Interpolations accept references only, not operators or function calls.",
             "A missing comma between numeric items parses as subtraction: `[1 -2]` is the one-element array `[-1]`.",
             "A missing comma before an item starting with `[` parses as an index: `[var.a [0]]` is the one-element array `[var.a[0]]`.",
+            "`for` is a keyword only directly after `[` or `{`; `{ for = 1 }` is still an attribute. `in` and `if` are keywords only inside a for expression, and none of the three can name a loop binding.",
+            "A full ternary inside brackets stays an index: `xs[a ? 0 : 1]` selects one element. Parenthesize a ternary bound to slice from it.",
         ],
     },
     expressions: EXPR_TYPES,
