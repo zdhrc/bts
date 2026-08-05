@@ -36,6 +36,14 @@ pub fn command() -> Command {
                 .required(true),
         )
         .arg(
+            Arg::new("dist")
+                .long("dist")
+                .value_name("SHAPE")
+                .help("how trace volume is distributed over the window: linear or sine")
+                .value_parser(parse_distribution)
+                .default_value("linear"),
+        )
+        .arg(
             Arg::new("seed")
                 .long("seed")
                 .value_name("SEED")
@@ -64,6 +72,7 @@ fn execute(matches: &ArgMatches) -> Result<(), Error> {
     let path = matches.get_one::<PathBuf>("from").expect("clap requires --from");
     let count = matches.get_one::<NonZeroUsize>("count").expect("clap requires --count").get();
     let over = *matches.get_one::<Duration>("over").expect("clap requires --over");
+    let distribution = *matches.get_one::<sdg::Distribution>("dist").expect("clap defaults --dist");
     let source = fs::read_to_string(path).map_err(|source| Error::ReadShape {
         path: path.clone(),
         source,
@@ -79,7 +88,7 @@ fn execute(matches: &ArgMatches) -> Result<(), Error> {
             seed
         }
     };
-    let events = sdg::generate(model, count, over, SystemTime::now(), seed).map_err(|error| match error {
+    let events = sdg::generate(model, count, over, distribution, SystemTime::now(), seed).map_err(|error| match error {
         // expression evaluation failures render like compile diagnostics with line:col
         sdg::GenerateError::Plan(plan_error) => Error::FailedGeneration {
             details: render_diags(
@@ -121,6 +130,14 @@ fn render_diags(path: &Path, src: &str, diags: &dsl::Diags) -> String {
         .map(|diag| diag.render(&source_name, src))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn parse_distribution(value: &str) -> Result<sdg::Distribution, String> {
+    match value {
+        "linear" => Ok(sdg::Distribution::Linear),
+        "sine" => Ok(sdg::Distribution::Sine),
+        _ => Err("distribution must be linear or sine".to_owned()),
+    }
 }
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -189,7 +206,33 @@ mod tests {
         assert_eq!(matches.get_one::<PathBuf>("from").unwrap(), &PathBuf::from("simple.bt"));
         assert_eq!(matches.get_one::<NonZeroUsize>("count").unwrap().get(), 25);
         assert_eq!(*matches.get_one::<Duration>("over").unwrap(), Duration::from_secs(3_600));
+        assert_eq!(
+            *matches.get_one::<sdg::Distribution>("dist").unwrap(),
+            sdg::Distribution::Linear
+        );
         assert!(!matches.get_flag("dry-run"));
+    }
+
+    #[test]
+    fn parses_the_sine_distribution() {
+        let matches = command()
+            .try_get_matches_from([
+                "generate",
+                "--from",
+                "simple.bt",
+                "--count",
+                "25",
+                "--over",
+                "1h",
+                "--dist",
+                "sine",
+            ])
+            .unwrap();
+
+        assert_eq!(
+            *matches.get_one::<sdg::Distribution>("dist").unwrap(),
+            sdg::Distribution::Sine
+        );
     }
 
     #[test]
@@ -202,6 +245,21 @@ mod tests {
         assert!(
             command()
                 .try_get_matches_from(["generate", "--from", "simple.bt", "--count", "1", "--over", "hour"])
+                .is_err()
+        );
+        assert!(
+            command()
+                .try_get_matches_from([
+                    "generate",
+                    "--from",
+                    "simple.bt",
+                    "--count",
+                    "1",
+                    "--over",
+                    "1h",
+                    "--dist",
+                    "cosine",
+                ])
                 .is_err()
         );
     }

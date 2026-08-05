@@ -6,13 +6,14 @@ use crate::{conf::Braintrust, dsl::Model};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
-pub(crate) use materializer::EventBatch;
+pub(crate) use materializer::{Distribution, EventBatch};
 pub(crate) use writer::{Error as WriteError, InsertResponse};
 
 pub(crate) fn generate(
     model: Model,
     count: usize,
     over: Duration,
+    distribution: Distribution,
     now: SystemTime,
     seed: u64,
 ) -> Result<EventBatch, GenerateError> {
@@ -21,7 +22,7 @@ pub(crate) fn generate(
     }
 
     let plan = planner::plan(model, count, seed).map_err(GenerateError::Plan)?;
-    materializer::materialize(plan, over, now).map_err(GenerateError::Materialize)
+    materializer::materialize(plan, over, distribution, now).map_err(GenerateError::Materialize)
 }
 
 pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, writer::Error> {

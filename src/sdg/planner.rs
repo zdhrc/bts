@@ -6,6 +6,7 @@ use crate::dsl::{
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::ops::Range;
 use thiserror::Error as Err;
@@ -120,10 +121,7 @@ impl Planner {
 
             ModelChild::Choice(ModelChoice { children, .. }) => {
                 let pick = ctx.rng.random_range(0..children.len());
-                let child = children
-                    .into_iter()
-                    .nth(pick)
-                    .expect("modeler guarantees choice has a child");
+                let child = children.into_iter().nth(pick).expect("modeler guarantees choice has a child");
 
                 self.plan_child(child, root, parent, ctx)
             }
@@ -246,7 +244,7 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
 
         ModelValue::Object(object) => JsonValue::Object(lower_object(object, ctx)?),
 
-        ModelValue::Func(func) => eval_func(func, ctx)?,
+        ModelValue::Func { func, range } => lower_value(eval_func(func, range, ctx)?, ctx)?,
 
         ModelValue::Unary { op, operand, range } => {
             let operand = eval_operand(*operand, ctx)?;
@@ -344,15 +342,7 @@ fn eval_index(target: ModelValue, index: ModelValue, range: SrcRange, ctx: &mut 
 fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     match value {
         ModelValue::Array(_) | ModelValue::Object(_) => Ok(value),
-        ModelValue::Func(ModelFunc::Choice(options)) => {
-            let pick = ctx.rng.random_range(0..options.len());
-            let option = options
-                .into_iter()
-                .nth(pick)
-                .expect("modeler guarantees choice has an alternative");
-
-            eval_container(option, ctx)
-        }
+        ModelValue::Func { func, range } => eval_container(eval_func(func, range, ctx)?, ctx),
         ModelValue::Cond {
             cond, then, otherwise, ..
         } => {
@@ -374,27 +364,287 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error>
     }
 }
 
-fn eval_func(func: ModelFunc, ctx: &mut Ctx) -> Result<JsonValue, Error> {
+// draws a call down to the value it produces this trace; a choice or weighted
+// pick may itself still be dynamic, so callers recurse on the result
+fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
         ModelFunc::Choice(options) => {
             let pick = ctx.rng.random_range(0..options.len());
-            let option = options
+            options
                 .into_iter()
                 .nth(pick)
-                .expect("modeler guarantees choice has an alternative");
-
-            lower_value(option, ctx)?
+                .expect("modeler guarantees choice has an alternative")
         }
 
-        ModelFunc::Range(ModelRange::Int { min, max }) => JsonValue::Number(ctx.rng.random_range(min..=max).into()),
+        ModelFunc::Weighted(options) => {
+            let total: f64 = options.iter().map(|option| option.weight).sum();
+            let draw = ctx.rng.random_range(0.0..total);
+            let mut acc = 0.0;
+            let mut pick = None;
+            let mut fallback = None;
+            for (index, option) in options.iter().enumerate() {
+                if option.weight > 0.0 {
+                    fallback = Some(index);
+                }
+                acc += option.weight;
+                if pick.is_none() && draw < acc && option.weight > 0.0 {
+                    pick = Some(index);
+                }
+            }
+            // float accumulation can leave the draw past every bucket, fall back
+            // to the last pickable option
+            let pick = pick.or(fallback).expect("modeler guarantees a positive weight");
+            options.into_iter().nth(pick).expect("pick indexes into the options").value
+        }
 
+        ModelFunc::Range(ModelRange::Int { min, max }) => ModelValue::Num(ModelNumber::Int(ctx.rng.random_range(min..=max))),
         ModelFunc::Range(ModelRange::Float { min, max }) => {
-            let number = JsonNumber::from_f64(ctx.rng.random_range(min..=max)).expect("modeler guarantees finite bounds");
-            JsonValue::Number(number)
+            ModelValue::Num(ModelNumber::Float(ctx.rng.random_range(min..=max)))
         }
+
+        ModelFunc::Normal { mean, stddev } => {
+            let sample = ctx.rng.sample(Normal::new(mean, stddev).expect("modeler validated params"));
+            finite_float(sample, range)?
+        }
+        ModelFunc::Lognormal { median, sigma } => {
+            let sample = ctx
+                .rng
+                .sample(LogNormal::new(median.ln(), sigma).expect("modeler validated params"));
+            finite_float(sample, range)?
+        }
+        ModelFunc::Exponential { mean } => {
+            let sample = ctx.rng.sample(Exp::new(1.0 / mean).expect("modeler validated params"));
+            finite_float(sample, range)?
+        }
+        ModelFunc::Pareto { min, shape } => {
+            let sample = ctx.rng.sample(Pareto::new(min, shape).expect("modeler validated params"));
+            finite_float(sample, range)?
+        }
+        ModelFunc::Beta { alpha, beta } => {
+            let sample = ctx.rng.sample(Beta::new(alpha, beta).expect("modeler validated params"));
+            finite_float(sample, range)?
+        }
+        ModelFunc::Poisson { mean } => {
+            let sample: f64 = ctx.rng.sample(Poisson::new(mean).expect("modeler validated params"));
+            ModelValue::Num(ModelNumber::Int(sample as i64))
+        }
+        ModelFunc::Chance { probability } => ModelValue::Bool(ctx.rng.random_bool(probability)),
+
+        ModelFunc::Upper { text } => ModelValue::Str(eval_text(*text, ctx)?.to_uppercase()),
+        ModelFunc::Lower { text } => ModelValue::Str(eval_text(*text, ctx)?.to_lowercase()),
+        ModelFunc::Trim { text } => ModelValue::Str(eval_text(*text, ctx)?.trim().to_owned()),
+        ModelFunc::Replace { text, from, to } => {
+            let text = eval_text(*text, ctx)?;
+            let from = eval_text(*from, ctx)?;
+            let to = eval_text(*to, ctx)?;
+            // replacing an empty pattern would splice `to` between every character
+            ModelValue::Str(if from.is_empty() { text } else { text.replace(&from, &to) })
+        }
+        ModelFunc::Split { text, separator } => {
+            let text = eval_text(*text, ctx)?;
+            let separator = eval_text(*separator, ctx)?;
+            if separator.is_empty() {
+                return Err(Error::new(ErrorKind::EmptySplitSeparator, range));
+            }
+            ModelValue::Array(ModelArray {
+                elem: text.split(&separator).map(|part| ModelValue::Str(part.to_owned())).collect(),
+            })
+        }
+        ModelFunc::Join { array, separator } => {
+            let JsonValue::Array(elems) = lower_value(*array, ctx)? else {
+                unreachable!("modeler validated the argument as an array");
+            };
+            let separator = eval_text(*separator, ctx)?;
+            let parts = elems
+                .iter()
+                .map(|elem| json_text(elem).ok_or(Error::new(ErrorKind::JoinElementNotScalar, range)))
+                .collect::<Result<Vec<_>, _>>()?;
+            ModelValue::Str(parts.join(&separator))
+        }
+        ModelFunc::Contains { target, needle } => match lower_value(*target, ctx)? {
+            JsonValue::String(text) => {
+                let needle = eval_text(*needle, ctx)?;
+                ModelValue::Bool(text.contains(&needle))
+            }
+            JsonValue::Array(elems) => {
+                let needle = eval_operand(*needle, ctx)?;
+                ModelValue::Bool(elems.iter().any(|elem| json_matches_scalar(elem, &needle)))
+            }
+            _ => unreachable!("modeler validated the target as a string or array"),
+        },
+        ModelFunc::StartsWith { text, prefix } => {
+            let text = eval_text(*text, ctx)?;
+            let prefix = eval_text(*prefix, ctx)?;
+            ModelValue::Bool(text.starts_with(&prefix))
+        }
+        ModelFunc::EndsWith { text, suffix } => {
+            let text = eval_text(*text, ctx)?;
+            let suffix = eval_text(*suffix, ctx)?;
+            ModelValue::Bool(text.ends_with(&suffix))
+        }
+        ModelFunc::Len { target } => {
+            let length = match lower_value(*target, ctx)? {
+                JsonValue::String(text) => text.chars().count(),
+                JsonValue::Array(elems) => elems.len(),
+                _ => unreachable!("modeler validated the target as a string or array"),
+            };
+            ModelValue::Num(ModelNumber::Int(length as i64))
+        }
+        ModelFunc::Format { template, args } => {
+            let mut pieces = template.split("{}");
+            let mut text = pieces.next().expect("split yields at least one piece").to_owned();
+            for (arg, piece) in args.into_iter().zip(pieces) {
+                text.push_str(&scalar_text(eval_operand(arg, ctx)?));
+                text.push_str(piece);
+            }
+            ModelValue::Str(text)
+        }
+
+        ModelFunc::Clamp { value, min, max } => {
+            let value = eval_operand(*value, ctx)?;
+            let min = eval_operand(*min, ctx)?;
+            let max = eval_operand(*max, ctx)?;
+            match (value, min, max) {
+                (Scalar::Int(value), Scalar::Int(min), Scalar::Int(max)) => {
+                    if min > max {
+                        return Err(Error::new(ErrorKind::ClampBoundsOutOfOrder, range));
+                    }
+                    ModelValue::Num(ModelNumber::Int(value.clamp(min, max)))
+                }
+                (value, min, max) => {
+                    let (value, min, max) = (value.as_float(), min.as_float(), max.as_float());
+                    if min > max {
+                        return Err(Error::new(ErrorKind::ClampBoundsOutOfOrder, range));
+                    }
+                    ModelValue::Num(ModelNumber::Float(value.clamp(min, max)))
+                }
+            }
+        }
+        ModelFunc::Round { value } => eval_to_int(eval_operand(*value, ctx)?, f64::round, range)?,
+        ModelFunc::Floor { value } => eval_to_int(eval_operand(*value, ctx)?, f64::floor, range)?,
+        ModelFunc::Ceil { value } => eval_to_int(eval_operand(*value, ctx)?, f64::ceil, range)?,
+        ModelFunc::Abs { value } => match eval_operand(*value, ctx)? {
+            Scalar::Int(value) => ModelValue::Num(ModelNumber::Int(
+                value.checked_abs().ok_or(Error::new(ErrorKind::NonFiniteResult, range))?,
+            )),
+            Scalar::Float(value) => ModelValue::Num(ModelNumber::Float(value.abs())),
+            _ => unreachable!("modeler validated the argument as a number"),
+        },
+        ModelFunc::Min(values) => eval_extreme(values, true, ctx)?,
+        ModelFunc::Max(values) => eval_extreme(values, false, ctx)?,
+
+        ModelFunc::Uuid => {
+            let bytes: [u8; 16] = ctx.rng.random();
+            ModelValue::Str(uuid::Builder::from_random_bytes(bytes).into_uuid().to_string())
+        }
+        ModelFunc::Hex { length } => ModelValue::Str(random_text(b"0123456789abcdef", length, ctx)),
+        ModelFunc::Alphanum { length } => ModelValue::Str(random_text(
+            b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            length,
+            ctx,
+        )),
     };
 
     Ok(value)
+}
+
+fn finite_float(value: f64, range: SrcRange) -> Result<ModelValue, Error> {
+    if value.is_finite() {
+        Ok(ModelValue::Num(ModelNumber::Float(value)))
+    } else {
+        Err(Error::new(ErrorKind::NonFiniteResult, range))
+    }
+}
+
+fn eval_text(value: ModelValue, ctx: &mut Ctx) -> Result<String, Error> {
+    match eval_operand(value, ctx)? {
+        Scalar::Str(text) => Ok(text),
+        _ => unreachable!("modeler validated the argument as a string"),
+    }
+}
+
+fn eval_to_int(scalar: Scalar, op: fn(f64) -> f64, range: SrcRange) -> Result<ModelValue, Error> {
+    let value = match scalar {
+        Scalar::Int(value) => value,
+        Scalar::Float(value) => {
+            let value = op(value);
+            if value < i64::MIN as f64 || value > i64::MAX as f64 {
+                return Err(Error::new(ErrorKind::NonFiniteResult, range));
+            }
+            value as i64
+        }
+        _ => unreachable!("modeler validated the argument as a number"),
+    };
+
+    Ok(ModelValue::Num(ModelNumber::Int(value)))
+}
+
+fn eval_extreme(values: Vec<ModelValue>, minimize: bool, ctx: &mut Ctx) -> Result<ModelValue, Error> {
+    let mut scalars = Vec::with_capacity(values.len());
+    for value in values {
+        scalars.push(eval_operand(value, ctx)?);
+    }
+
+    let number = if scalars.iter().any(|scalar| matches!(scalar, Scalar::Float(_))) {
+        let floats = scalars.iter().map(Scalar::as_float);
+        ModelNumber::Float(if minimize {
+            floats.fold(f64::INFINITY, f64::min)
+        } else {
+            floats.fold(f64::NEG_INFINITY, f64::max)
+        })
+    } else {
+        let ints = scalars.iter().map(|scalar| match scalar {
+            Scalar::Int(value) => *value,
+            _ => unreachable!("modeler validated the arguments as numbers"),
+        });
+        ModelNumber::Int(if minimize {
+            ints.min().expect("modeler requires at least two arguments")
+        } else {
+            ints.max().expect("modeler requires at least two arguments")
+        })
+    };
+
+    Ok(ModelValue::Num(number))
+}
+
+fn random_text(charset: &[u8], length: usize, ctx: &mut Ctx) -> String {
+    (0..length)
+        .map(|_| charset[ctx.rng.random_range(0..charset.len())] as char)
+        .collect()
+}
+
+// the stringified form of a scalar element, none for containers and nulls
+fn json_text(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(text) => Some(text.clone()),
+        JsonValue::Number(number) => Some(number.to_string()),
+        JsonValue::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn scalar_text(scalar: Scalar) -> String {
+    match scalar {
+        Scalar::Str(text) => text,
+        Scalar::Int(value) => value.to_string(),
+        // {:?} keeps a .0 so floats stay recognizable
+        Scalar::Float(value) => format!("{value:?}"),
+        Scalar::Bool(value) => value.to_string(),
+    }
+}
+
+// equality between an evaluated element and the needle, ints and floats unify
+fn json_matches_scalar(value: &JsonValue, needle: &Scalar) -> bool {
+    match (value, needle) {
+        (JsonValue::String(value), Scalar::Str(needle)) => value == needle,
+        (JsonValue::Bool(value), Scalar::Bool(needle)) => value == needle,
+        (JsonValue::Number(value), Scalar::Int(needle)) => match value.as_i64() {
+            Some(value) => value == *needle,
+            None => value.as_f64() == Some(*needle as f64),
+        },
+        (JsonValue::Number(value), Scalar::Float(needle)) => value.as_f64() == Some(*needle),
+        _ => false,
+    }
 }
 
 fn lower_object(object: ModelObject, ctx: &mut Ctx) -> Result<JsonMap<String, JsonValue>, Error> {
@@ -449,17 +699,7 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
         ModelValue::Num(ModelNumber::Float(value)) => Scalar::Float(value),
         ModelValue::Bool(value) => Scalar::Bool(value),
 
-        ModelValue::Func(ModelFunc::Choice(options)) => {
-            let pick = ctx.rng.random_range(0..options.len());
-            let option = options
-                .into_iter()
-                .nth(pick)
-                .expect("modeler guarantees choice has an alternative");
-
-            eval_operand(option, ctx)?
-        }
-        ModelValue::Func(ModelFunc::Range(ModelRange::Int { min, max })) => Scalar::Int(ctx.rng.random_range(min..=max)),
-        ModelValue::Func(ModelFunc::Range(ModelRange::Float { min, max })) => Scalar::Float(ctx.rng.random_range(min..=max)),
+        ModelValue::Func { func, range } => eval_operand(eval_func(func, range, ctx)?, ctx)?,
 
         ModelValue::Unary { op, operand, range } => {
             let operand = eval_operand(*operand, ctx)?;
@@ -666,6 +906,12 @@ enum ErrorKind {
     NonIntegerRepeatCount,
     #[error("maybe chance is not between 0 and 1")]
     ChanceOutOfRange,
+    #[error("clamp bounds are out of order")]
+    ClampBoundsOutOfOrder,
+    #[error("split separator is empty")]
+    EmptySplitSeparator,
+    #[error("join element is not a string, number, or boolean")]
+    JoinElementNotScalar,
 }
 
 #[cfg(test)]
@@ -749,6 +995,318 @@ mod tests {
             let temp = metrics["temp"].as_f64().unwrap();
             assert!((0.0..=1.0).contains(&temp));
         }
+    }
+
+    #[test]
+    fn evaluates_weighted_picks_proportionally_to_their_weights() {
+        let model = compile(r#"trace "t" { input = weighted(["common", 9], ["rare", 1], ["never", 0]) }"#).unwrap();
+        let plan = plan(model, 200, 7).unwrap();
+
+        let mut counts = std::collections::HashMap::new();
+        for event in plan.events.iter() {
+            let input = event.fields.input.as_ref().unwrap().as_str().unwrap();
+            *counts.entry(input.to_owned()).or_insert(0) += 1;
+        }
+        assert!(!counts.contains_key("never"), "zero weights must never be picked");
+        assert!(counts["common"] > counts["rare"], "weights must skew the distribution");
+        assert!(counts["rare"] > 0, "positive weights must appear over 200 traces");
+    }
+
+    #[test]
+    fn evaluates_weighted_picks_with_dynamic_values() {
+        let model = compile(r#"trace "t" { input = weighted([range(1, 3), 1], [10, 1]) }"#).unwrap();
+        let plan = plan(model, 40, 7).unwrap();
+
+        for event in plan.events.iter() {
+            let input = event.fields.input.as_ref().unwrap().as_i64().unwrap();
+            assert!((1..=3).contains(&input) || input == 10, "unexpected pick {input}");
+        }
+    }
+
+    #[test]
+    fn evaluates_distributions_within_their_supports() {
+        let model = compile(
+            r#"
+                trace "t" {
+                    metrics = {
+                        normal = normal(100, 10)
+                        lognormal = lognormal(300, 0.5)
+                        exponential = exponential(250)
+                        pareto = pareto(100, 1.5)
+                        beta = beta(2, 5)
+                        poisson = poisson(3)
+                    }
+                    input = chance(0.5)
+                }
+            "#,
+        )
+        .unwrap();
+        let plan_a = plan(model, 50, 7).unwrap();
+
+        for event in plan_a.events.iter() {
+            let metrics = event.fields.metrics.as_ref().unwrap();
+            assert!(metrics["lognormal"].as_f64().unwrap() > 0.0);
+            assert!(metrics["exponential"].as_f64().unwrap() > 0.0);
+            assert!(metrics["pareto"].as_f64().unwrap() >= 100.0);
+            let beta = metrics["beta"].as_f64().unwrap();
+            assert!((0.0..=1.0).contains(&beta));
+            let poisson = metrics["poisson"].as_i64().unwrap();
+            assert!(poisson >= 0, "poisson must be a non-negative integer");
+            assert!(event.fields.input.as_ref().unwrap().is_boolean());
+        }
+
+        // samples vary across traces and reproduce by seed
+        let normals: std::collections::HashSet<_> = plan_a
+            .events
+            .iter()
+            .map(|event| event.fields.metrics.as_ref().unwrap()["normal"].to_string())
+            .collect();
+        assert!(normals.len() > 1, "expected varying samples over 50 traces");
+
+        let model = compile(
+            r#"
+                trace "t" {
+                    metrics = {
+                        normal = normal(100, 10)
+                        lognormal = lognormal(300, 0.5)
+                        exponential = exponential(250)
+                        pareto = pareto(100, 1.5)
+                        beta = beta(2, 5)
+                        poisson = poisson(3)
+                    }
+                    input = chance(0.5)
+                }
+            "#,
+        )
+        .unwrap();
+        let plan_b = plan(model, 50, 7).unwrap();
+        assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn evaluates_chance_bounds_deterministically() {
+        let always = compile(r#"trace "t" { input = chance(1) }"#).unwrap();
+        let plan_a = plan(always, 10, 7).unwrap();
+        assert!(
+            plan_a
+                .events
+                .iter()
+                .all(|event| event.fields.input == Some(JsonValue::Bool(true)))
+        );
+
+        let never = compile(r#"trace "t" { input = chance(0) }"#).unwrap();
+        let plan_b = plan(never, 10, 7).unwrap();
+        assert!(
+            plan_b
+                .events
+                .iter()
+                .all(|event| event.fields.input == Some(JsonValue::Bool(false)))
+        );
+    }
+
+    #[test]
+    fn evaluates_string_funcs() {
+        let model = compile(
+            r#"
+                vars { tags = ["alpha", "beta"] }
+                trace "t" {
+                    input = [
+                        upper("get"),
+                        lower("WARN"),
+                        trim("  padded  "),
+                        replace("a b c", " ", "-"),
+                        replace("keep", "", "x"),
+                        join(var.tags, ", "),
+                        join([1, 2.5, true], "-"),
+                        format("model={} n={}", "gpt", 4),
+                    ]
+                    output = split("a,b,c", ",")
+                    metadata = {
+                        sub = contains("gpt-4o-mini", "mini")
+                        missing = contains("gpt-4o", "mini")
+                        elem = contains(var.tags, "beta")
+                        absent = contains(var.tags, "gamma")
+                        prefix = starts_with("gpt-4o", "gpt")
+                        suffix = ends_with("gpt-4o", "4o")
+                        chars = len("hello")
+                        elems = len(var.tags)
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 0).unwrap();
+
+        let fields = &plan.events[0].fields;
+        assert_eq!(
+            fields.input,
+            Some(serde_json::json!([
+                "GET",
+                "warn",
+                "padded",
+                "a-b-c",
+                "keep",
+                "alpha, beta",
+                "1-2.5-true",
+                "model=gpt n=4",
+            ]))
+        );
+        assert_eq!(fields.output, Some(serde_json::json!(["a", "b", "c"])));
+        assert_eq!(
+            fields.metadata,
+            Some(
+                serde_json::json!({
+                    "sub": true,
+                    "missing": false,
+                    "elem": true,
+                    "absent": false,
+                    "prefix": true,
+                    "suffix": true,
+                    "chars": 5,
+                    "elems": 2,
+                })
+                .as_object()
+                .unwrap()
+                .clone()
+            )
+        );
+    }
+
+    #[test]
+    fn evaluates_string_funcs_over_dynamic_args() {
+        let model = compile(r#"trace "t" { input = upper(choice("get", "post")) }"#).unwrap();
+        let planned = plan(model, 20, 7).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for event in planned.events.iter() {
+            let input = event.fields.input.as_ref().unwrap().as_str().unwrap();
+            assert!(matches!(input, "GET" | "POST"), "unexpected value {input}");
+            seen.insert(input.to_owned());
+        }
+        assert_eq!(seen.len(), 2, "expected both alternatives over 20 traces");
+
+        // split results behave as arrays for indexing and lens
+        let model =
+            compile(r#"trace "t" { input = split("a,b,c", ",")[range(0, 2)] output = len(split("a,b", ",")) }"#).unwrap();
+        let planned = plan(model, 10, 7).unwrap();
+        for event in planned.events.iter() {
+            let input = event.fields.input.as_ref().unwrap().as_str().unwrap();
+            assert!(matches!(input, "a" | "b" | "c"));
+            assert_eq!(event.fields.output, Some(JsonValue::from(2)));
+        }
+    }
+
+    #[test]
+    fn evaluates_format_with_dynamic_args() {
+        let model = compile(r#"trace "t" { input = format("n={} f={} b={}", range(1, 1), 0.5, chance(1)) }"#).unwrap();
+        let plan = plan(model, 1, 0).unwrap();
+
+        assert_eq!(plan.events[0].fields.input, Some(JsonValue::from("n=1 f=0.5 b=true")));
+    }
+
+    #[test]
+    fn evaluates_numeric_funcs() {
+        let model = compile(
+            r#"
+                trace "t" {
+                    metrics = {
+                        low = clamp(1, 5, 10)
+                        high = clamp(50, 5, 10)
+                        inside = clamp(7, 5, 10)
+                        promoted = clamp(7, 5.0, 10)
+                        round = round(2.5)
+                        down = floor(2.9)
+                        up = ceil(2.1)
+                        int = round(3)
+                        abs = abs(0 - 4)
+                        fabs = abs(0.0 - 4.5)
+                        min = min(3, 1, 2)
+                        max = max(3, 1, 2)
+                        fmin = min(3, 1.5)
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 0).unwrap();
+
+        let metrics = plan.events[0].fields.metrics.as_ref().unwrap();
+        assert_eq!(metrics["low"], JsonValue::from(5));
+        assert_eq!(metrics["high"], JsonValue::from(10));
+        assert_eq!(metrics["inside"], JsonValue::from(7));
+        assert_eq!(metrics["promoted"], JsonValue::from(7.0));
+        assert_eq!(metrics["round"], JsonValue::from(3));
+        assert_eq!(metrics["down"], JsonValue::from(2));
+        assert_eq!(metrics["up"], JsonValue::from(3));
+        assert_eq!(metrics["int"], JsonValue::from(3));
+        assert_eq!(metrics["abs"], JsonValue::from(4));
+        assert_eq!(metrics["fabs"], JsonValue::from(4.5));
+        assert_eq!(metrics["min"], JsonValue::from(1));
+        assert_eq!(metrics["max"], JsonValue::from(3));
+        assert_eq!(metrics["fmin"], JsonValue::from(1.5));
+    }
+
+    #[test]
+    fn clamps_distribution_samples_within_bounds() {
+        let model = compile(r#"trace "t" { metrics = { latency = clamp(lognormal(300, 1.5), 20, 1000) } }"#).unwrap();
+        let plan = plan(model, 50, 7).unwrap();
+
+        for event in plan.events.iter() {
+            let latency = event.fields.metrics.as_ref().unwrap()["latency"].as_f64().unwrap();
+            assert!((20.0..=1000.0).contains(&latency), "unexpected latency {latency}");
+        }
+    }
+
+    #[test]
+    fn fails_on_invalid_dynamic_func_values() {
+        let source = r#"trace "t" { input = clamp(1, range(5, 5), 2) }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "clamp bounds are out of order");
+        assert_eq!(&source[error.range.start..error.range.end], "clamp(1, range(5, 5), 2)");
+
+        let source = r#"trace "t" { input = split("a,b", choice(",", "")) }"#;
+        let error = plan(compile(source).unwrap(), 20, 7).unwrap_err();
+        assert_eq!(error.to_string(), "split separator is empty");
+
+        let source = r#"trace "t" { input = join([{}], ",") }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "join element is not a string, number, or boolean");
+
+        let source = r#"trace "t" { input = round(99999999999999999999.0 * range(1.0, 1.0)) }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "expression result overflowed or is not finite");
+    }
+
+    #[test]
+    fn evaluates_id_funcs_reproducibly() {
+        let source = r#"trace "t" { input = [uuid(), hex(16), alphanum(12), hex(0)] }"#;
+        let plan_a = plan(compile(source).unwrap(), 5, 7).unwrap();
+
+        let mut uuids = std::collections::HashSet::new();
+        for event in plan_a.events.iter() {
+            let JsonValue::Array(values) = event.fields.input.as_ref().unwrap() else {
+                panic!("expected an array");
+            };
+
+            let uuid = values[0].as_str().unwrap();
+            assert_eq!(uuid.len(), 36);
+            assert_eq!(uuid.as_bytes()[14], b'4', "expected a version-4 uuid");
+            uuids.insert(uuid.to_owned());
+
+            let hex = values[1].as_str().unwrap();
+            assert_eq!(hex.len(), 16);
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+            let alphanum = values[2].as_str().unwrap();
+            assert_eq!(alphanum.len(), 12);
+            assert!(alphanum.chars().all(|c| c.is_ascii_alphanumeric()));
+
+            assert_eq!(values[3].as_str().unwrap(), "");
+        }
+        assert_eq!(uuids.len(), 5, "each trace draws its own uuid");
+
+        let plan_b = plan(compile(source).unwrap(), 5, 7).unwrap();
+        assert_eq!(plan_a, plan_b);
     }
 
     #[test]
@@ -1079,12 +1637,25 @@ mod tests {
         let plan_a = plan(compile(source).unwrap(), 40, 7).unwrap();
 
         let lengths: Vec<_> = plan_a.traces.iter().map(std::ops::Range::len).collect();
-        assert!(lengths.contains(&1) && lengths.contains(&2), "expected both outcomes over 40 traces");
+        assert!(
+            lengths.contains(&1) && lengths.contains(&2),
+            "expected both outcomes over 40 traces"
+        );
 
         // the bounds always include or always skip
-        let always = plan(compile(r#"trace "t" { maybe { chance = 1 task "extra" {} } }"#).unwrap(), 10, 7).unwrap();
+        let always = plan(
+            compile(r#"trace "t" { maybe { chance = 1 task "extra" {} } }"#).unwrap(),
+            10,
+            7,
+        )
+        .unwrap();
         assert!(always.traces.iter().all(|range| range.len() == 2));
-        let never = plan(compile(r#"trace "t" { maybe { chance = 0 task "extra" {} } }"#).unwrap(), 10, 7).unwrap();
+        let never = plan(
+            compile(r#"trace "t" { maybe { chance = 0 task "extra" {} } }"#).unwrap(),
+            10,
+            7,
+        )
+        .unwrap();
         assert!(never.traces.iter().all(|range| range.len() == 1));
     }
 

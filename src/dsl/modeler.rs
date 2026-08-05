@@ -2,7 +2,7 @@ use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
     Array, Child, Choice, CtxRef, Func, Maybe, Model, Number, Object, ObjectField, Part, Range, Repeat, Span, SpanFields,
-    SpanKind, Template, Trace, Value,
+    SpanKind, Template, Trace, Value, WeightedOption,
 };
 use crate::dsl::spec;
 use std::{
@@ -1386,7 +1386,13 @@ impl Modeler {
         }
     }
 
-    fn model_span(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Span> {
+    fn model_span(
+        &mut self,
+        name: Option<String>,
+        decls: Vec<ast::Decl>,
+        desc: &spec::BlockDesc,
+        range: SrcRange,
+    ) -> Option<Span> {
         let span_kind = if desc.id == spec::ids::TASK {
             SpanKind::Task
         } else if desc.id == spec::ids::LLM {
@@ -1413,7 +1419,13 @@ impl Modeler {
         })
     }
 
-    fn model_repeat(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Repeat> {
+    fn model_repeat(
+        &mut self,
+        name: Option<String>,
+        decls: Vec<ast::Decl>,
+        desc: &spec::BlockDesc,
+        range: SrcRange,
+    ) -> Option<Repeat> {
         let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
 
         self.repeat_depth += 1;
@@ -1459,14 +1471,26 @@ impl Modeler {
         })
     }
 
-    fn model_choice(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Choice> {
+    fn model_choice(
+        &mut self,
+        name: Option<String>,
+        decls: Vec<ast::Decl>,
+        desc: &spec::BlockDesc,
+        range: SrcRange,
+    ) -> Option<Choice> {
         let (_, blocks) = self.model_dynamic_body(decls, desc, range);
         let children = self.model_dynamic_children(blocks, desc, range);
 
         Some(Choice { name, children })
     }
 
-    fn model_maybe(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Maybe> {
+    fn model_maybe(
+        &mut self,
+        name: Option<String>,
+        decls: Vec<ast::Decl>,
+        desc: &spec::BlockDesc,
+        range: SrcRange,
+    ) -> Option<Maybe> {
         let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
         let children = self.model_dynamic_children(blocks, desc, range);
 
@@ -1787,7 +1811,7 @@ impl Modeler {
                 elem: values.into_iter().filter_map(|value| self.model_value(value)).collect(),
             })),
             ast::ExprKind::Object(items) => Some(Value::Object(self.model_object(items))),
-            ast::ExprKind::Func { name, args } => self.model_func(name, args, range).map(Value::Func),
+            ast::ExprKind::Func { name, args } => self.model_func(name, args, range).map(|func| Value::Func { func, range }),
             // only dynamic operator exprs survive folding
             ast::ExprKind::Unary { op, operand } => {
                 let operand = self.model_value(*operand)?;
@@ -1851,7 +1875,8 @@ impl Modeler {
     }
 
     fn model_func(&mut self, name: String, args: Vec<ast::Expr>, range: SrcRange) -> Option<Func> {
-        if spec::SPEC.function(&name).is_none() {
+        // the descriptor's name doubles as the &'static str for diagnostics
+        let Some(func) = spec::SPEC.function(&name).map(|desc| desc.name) else {
             self.errors.push(Error::new(
                 ErrorKind::UnknownFunction {
                     rule: spec::ids::KNOWN_FUNCTIONS,
@@ -1860,9 +1885,9 @@ impl Modeler {
                 range,
             ));
             return None;
-        }
+        };
 
-        match name.as_str() {
+        match func {
             "choice" => {
                 if args.is_empty() {
                     self.errors.push(Error::new(
@@ -1923,7 +1948,498 @@ impl Modeler {
 
                 Some(Func::Range(bounds))
             }
+
+            "weighted" => self.model_weighted(args, range),
+
+            "normal" => {
+                let [mean, stddev] = self.func_args(func, args, "exactly two arguments (mean, stddev)", range)?;
+                let mean = self.model_dist_param(mean, func, "mean", "a finite number", |_| true);
+                let stddev = self.model_dist_param(stddev, func, "stddev", "non-negative", |value| value >= 0.0);
+                Some(Func::Normal {
+                    mean: mean?,
+                    stddev: stddev?,
+                })
+            }
+            "lognormal" => {
+                let [median, sigma] = self.func_args(func, args, "exactly two arguments (median, sigma)", range)?;
+                let median = self.model_dist_param(median, func, "median", "positive", |value| value > 0.0);
+                let sigma = self.model_dist_param(sigma, func, "sigma", "non-negative", |value| value >= 0.0);
+                Some(Func::Lognormal {
+                    median: median?,
+                    sigma: sigma?,
+                })
+            }
+            "exponential" => {
+                let [mean] = self.func_args(func, args, "exactly one argument (mean)", range)?;
+                let mean = self.model_dist_param(mean, func, "mean", "positive", |value| value > 0.0)?;
+                Some(Func::Exponential { mean })
+            }
+            "pareto" => {
+                let [min, shape] = self.func_args(func, args, "exactly two arguments (min, shape)", range)?;
+                let min = self.model_dist_param(min, func, "min", "positive", |value| value > 0.0);
+                let shape = self.model_dist_param(shape, func, "shape", "positive", |value| value > 0.0);
+                Some(Func::Pareto {
+                    min: min?,
+                    shape: shape?,
+                })
+            }
+            "beta" => {
+                let [alpha, beta] = self.func_args(func, args, "exactly two arguments (alpha, beta)", range)?;
+                let alpha = self.model_dist_param(alpha, func, "alpha", "positive", |value| value > 0.0);
+                let beta = self.model_dist_param(beta, func, "beta", "positive", |value| value > 0.0);
+                Some(Func::Beta {
+                    alpha: alpha?,
+                    beta: beta?,
+                })
+            }
+            "poisson" => {
+                let [mean] = self.func_args(func, args, "exactly one argument (mean)", range)?;
+                // the sampler rejects astronomically large means, surface that here
+                let mean = self.model_dist_param(mean, func, "mean", "positive and below 1e15", |value| {
+                    value > 0.0 && value < 1.0e15
+                })?;
+                Some(Func::Poisson { mean })
+            }
+            "chance" => {
+                let [probability] = self.func_args(func, args, "exactly one argument (probability)", range)?;
+                let probability = self.model_dist_param(probability, func, "probability", "between 0 and 1", |value| {
+                    (0.0..=1.0).contains(&value)
+                })?;
+                Some(Func::Chance { probability })
+            }
+
+            "upper" | "lower" | "trim" => {
+                let [text] = self.func_args(func, args, "exactly one argument", range)?;
+                let text = Box::new(self.model_typed_arg(text, func, StaticType::String)?);
+                Some(match func {
+                    "upper" => Func::Upper { text },
+                    "lower" => Func::Lower { text },
+                    _ => Func::Trim { text },
+                })
+            }
+            "replace" => {
+                let [text, from, to] = self.func_args(func, args, "exactly three arguments (text, from, to)", range)?;
+                let text = self.model_typed_arg(text, func, StaticType::String);
+                let from = self.model_typed_arg(from, func, StaticType::String);
+                let to = self.model_typed_arg(to, func, StaticType::String);
+                Some(Func::Replace {
+                    text: Box::new(text?),
+                    from: Box::new(from?),
+                    to: Box::new(to?),
+                })
+            }
+            "split" => {
+                let [text, separator] = self.func_args(func, args, "exactly two arguments (text, separator)", range)?;
+                if const_string(&separator).is_some_and(|separator| separator.is_empty()) {
+                    self.errors.push(Error::new(
+                        ErrorKind::EmptySplitSeparator {
+                            rule: spec::ids::SPLIT_SEPARATOR,
+                        },
+                        separator.range,
+                    ));
+                    return None;
+                }
+                let text = self.model_typed_arg(text, func, StaticType::String);
+                let separator = self.model_typed_arg(separator, func, StaticType::String);
+                Some(Func::Split {
+                    text: Box::new(text?),
+                    separator: Box::new(separator?),
+                })
+            }
+            "join" => {
+                let [array, separator] = self.func_args(func, args, "exactly two arguments (array, separator)", range)?;
+                let array = self.model_typed_arg(array, func, StaticType::Array);
+                let separator = self.model_typed_arg(separator, func, StaticType::String);
+                Some(Func::Join {
+                    array: Box::new(array?),
+                    separator: Box::new(separator?),
+                })
+            }
+            "contains" => {
+                let [target, needle] = self.func_args(func, args, "exactly two arguments (target, needle)", range)?;
+                match static_type(&target) {
+                    Some(StaticType::String) => {
+                        let target = self.model_value(target);
+                        let needle = self.model_typed_arg(needle, func, StaticType::String);
+                        Some(Func::Contains {
+                            target: Box::new(target?),
+                            needle: Box::new(needle?),
+                        })
+                    }
+                    Some(StaticType::Array) => {
+                        let target = self.model_value(target);
+                        let needle = self.model_scalar_arg(needle, func);
+                        Some(Func::Contains {
+                            target: Box::new(target?),
+                            needle: Box::new(needle?),
+                        })
+                    }
+                    _ => {
+                        self.push_func_arg_type(&target, func, "string or array");
+                        None
+                    }
+                }
+            }
+            "starts_with" | "ends_with" => {
+                let [text, affix] = self.func_args(func, args, "exactly two arguments", range)?;
+                let text = self.model_typed_arg(text, func, StaticType::String);
+                let affix = self.model_typed_arg(affix, func, StaticType::String);
+                let (text, affix) = (Box::new(text?), Box::new(affix?));
+                Some(if func == "starts_with" {
+                    Func::StartsWith { text, prefix: affix }
+                } else {
+                    Func::EndsWith { text, suffix: affix }
+                })
+            }
+            "len" => {
+                let [target] = self.func_args(func, args, "exactly one argument", range)?;
+                if !matches!(static_type(&target), Some(StaticType::String | StaticType::Array)) {
+                    self.push_func_arg_type(&target, func, "string or array");
+                    return None;
+                }
+                let target = Box::new(self.model_value(target)?);
+                Some(Func::Len { target })
+            }
+            "format" => self.model_format(args, range),
+
+            "clamp" => {
+                let [value, min, max] = self.func_args(func, args, "exactly three arguments (value, min, max)", range)?;
+                // constant bounds must already be ordered
+                if let (ast::ExprKind::Num(low), ast::ExprKind::Num(high)) = (&min.kind, &max.kind) {
+                    let low = self.model_number(low.clone(), min.range);
+                    let high = self.model_number(high.clone(), max.range);
+                    if let (Some(low), Some(high)) = (low, high)
+                        && float_bound(low) > float_bound(high)
+                    {
+                        self.errors.push(Error::new(
+                            ErrorKind::ClampBoundsOutOfOrder {
+                                rule: spec::ids::CLAMP_BOUNDS,
+                            },
+                            range,
+                        ));
+                        return None;
+                    }
+                }
+                let value = self.model_typed_arg(value, func, StaticType::Number);
+                let min = self.model_typed_arg(min, func, StaticType::Number);
+                let max = self.model_typed_arg(max, func, StaticType::Number);
+                Some(Func::Clamp {
+                    value: Box::new(value?),
+                    min: Box::new(min?),
+                    max: Box::new(max?),
+                })
+            }
+            "round" | "floor" | "ceil" | "abs" => {
+                let [value] = self.func_args(func, args, "exactly one argument", range)?;
+                let value = Box::new(self.model_typed_arg(value, func, StaticType::Number)?);
+                Some(match func {
+                    "round" => Func::Round { value },
+                    "floor" => Func::Floor { value },
+                    "ceil" => Func::Ceil { value },
+                    _ => Func::Abs { value },
+                })
+            }
+            "min" | "max" => {
+                if args.len() < 2 {
+                    self.errors.push(Error::new(
+                        ErrorKind::FuncArity {
+                            rule: spec::ids::FUNC_ARITY,
+                            func,
+                            expected: "at least two arguments",
+                        },
+                        range,
+                    ));
+                    return None;
+                }
+                let mut values = Vec::with_capacity(args.len());
+                let mut valid = true;
+                for arg in args {
+                    match self.model_typed_arg(arg, func, StaticType::Number) {
+                        Some(value) => values.push(value),
+                        None => valid = false,
+                    }
+                }
+                valid.then(|| if func == "min" { Func::Min(values) } else { Func::Max(values) })
+            }
+
+            "uuid" => {
+                if !args.is_empty() {
+                    self.errors.push(Error::new(
+                        ErrorKind::FuncArity {
+                            rule: spec::ids::FUNC_ARITY,
+                            func,
+                            expected: "no arguments",
+                        },
+                        range,
+                    ));
+                    return None;
+                }
+                Some(Func::Uuid)
+            }
+            "hex" | "alphanum" => {
+                let [length] = self.func_args(func, args, "exactly one argument (length)", range)?;
+                let length = self.model_random_length(length, func)?;
+                Some(if func == "hex" {
+                    Func::Hex { length }
+                } else {
+                    Func::Alphanum { length }
+                })
+            }
+
             _ => unreachable!("function {name} does not have a model lowering"),
+        }
+    }
+
+    fn model_weighted(&mut self, args: Vec<ast::Expr>, range: SrcRange) -> Option<Func> {
+        if args.is_empty() {
+            self.errors.push(Error::new(
+                ErrorKind::FuncArity {
+                    rule: spec::ids::FUNC_ARITY,
+                    func: "weighted",
+                    expected: "at least one `[value, weight]` pair",
+                },
+                range,
+            ));
+            return None;
+        }
+
+        let mut options = Vec::with_capacity(args.len());
+        let mut valid = true;
+        for arg in args {
+            let arg_range = arg.range;
+            let ast::ExprKind::Array(mut elems) = arg.kind else {
+                self.push_weighted_option(arg_range);
+                valid = false;
+                continue;
+            };
+            if elems.len() != 2 {
+                self.push_weighted_option(arg_range);
+                valid = false;
+                continue;
+            }
+            let weight_expr = elems.pop().expect("pair has two elements");
+            let value_expr = elems.pop().expect("pair has two elements");
+
+            let weight_range = weight_expr.range;
+            let weight = match weight_expr.kind {
+                ast::ExprKind::Num(raw) => self.model_number(raw, weight_range).map(float_bound),
+                _ => {
+                    self.push_weighted_option(weight_range);
+                    None
+                }
+            };
+            let weight = match weight {
+                Some(weight) if weight >= 0.0 => Some(weight),
+                Some(_) => {
+                    self.push_weighted_option(weight_range);
+                    None
+                }
+                None => None,
+            };
+
+            match (self.model_value(value_expr), weight) {
+                (Some(value), Some(weight)) => options.push(WeightedOption { value, weight }),
+                _ => valid = false,
+            }
+        }
+
+        if !valid {
+            return None;
+        }
+        if options.iter().map(|option| option.weight).sum::<f64>() <= 0.0 {
+            self.errors.push(Error::new(
+                ErrorKind::WeightedTotal {
+                    rule: spec::ids::WEIGHTED_OPTIONS,
+                },
+                range,
+            ));
+            return None;
+        }
+
+        Some(Func::Weighted(options))
+    }
+
+    fn model_format(&mut self, args: Vec<ast::Expr>, range: SrcRange) -> Option<Func> {
+        let mut args = args.into_iter();
+        let Some(template_expr) = args.next() else {
+            self.errors.push(Error::new(
+                ErrorKind::FuncArity {
+                    rule: spec::ids::FUNC_ARITY,
+                    func: "format",
+                    expected: "a constant string template followed by one value per `{}` placeholder",
+                },
+                range,
+            ));
+            return None;
+        };
+
+        let Some(template) = const_string(&template_expr) else {
+            self.push_func_arg_type(&template_expr, "format", "constant string");
+            return None;
+        };
+
+        let rest: Vec<_> = args.collect();
+        let placeholders = template.matches("{}").count();
+        if placeholders != rest.len() {
+            self.errors.push(Error::new(
+                ErrorKind::FormatPlaceholders {
+                    rule: spec::ids::FORMAT_TEMPLATE,
+                    placeholders,
+                    args: rest.len(),
+                },
+                range,
+            ));
+            return None;
+        }
+
+        let mut values = Vec::with_capacity(rest.len());
+        let mut valid = true;
+        for arg in rest {
+            match self.model_scalar_arg(arg, "format") {
+                Some(value) => values.push(value),
+                None => valid = false,
+            }
+        }
+
+        valid.then_some(Func::Format { template, args: values })
+    }
+
+    fn func_args<const N: usize>(
+        &mut self,
+        func: &'static str,
+        args: Vec<ast::Expr>,
+        expected: &'static str,
+        range: SrcRange,
+    ) -> Option<[ast::Expr; N]> {
+        match <[ast::Expr; N]>::try_from(args) {
+            Ok(args) => Some(args),
+            Err(_) => {
+                self.errors.push(Error::new(
+                    ErrorKind::FuncArity {
+                        rule: spec::ids::FUNC_ARITY,
+                        func,
+                        expected,
+                    },
+                    range,
+                ));
+                None
+            }
+        }
+    }
+
+    fn model_typed_arg(&mut self, expr: ast::Expr, func: &'static str, required: StaticType) -> Option<Value> {
+        if static_type(&expr) != Some(required) {
+            self.push_func_arg_type(&expr, func, type_name(required));
+            return None;
+        }
+        self.model_value(expr)
+    }
+
+    fn model_scalar_arg(&mut self, expr: ast::Expr, func: &'static str) -> Option<Value> {
+        if !matches!(
+            static_type(&expr),
+            Some(StaticType::String | StaticType::Number | StaticType::Boolean)
+        ) {
+            self.push_func_arg_type(&expr, func, "string, number, or boolean");
+            return None;
+        }
+        self.model_value(expr)
+    }
+
+    fn push_func_arg_type(&mut self, expr: &ast::Expr, func: &'static str, expected: &'static str) {
+        self.errors.push(Error::new(
+            ErrorKind::FuncArgType {
+                rule: spec::ids::FUNC_ARG_TYPES,
+                func,
+                expected,
+                found: found_type(expr),
+            },
+            expr.range,
+        ));
+    }
+
+    fn push_weighted_option(&mut self, range: SrcRange) {
+        self.errors.push(Error::new(
+            ErrorKind::WeightedOptionShape {
+                rule: spec::ids::WEIGHTED_OPTIONS,
+            },
+            range,
+        ));
+    }
+
+    // constant distribution parameter, already folded to a literal when constant
+    fn model_dist_param(
+        &mut self,
+        expr: ast::Expr,
+        func: &'static str,
+        param: &'static str,
+        expected: &'static str,
+        valid: impl Fn(f64) -> bool,
+    ) -> Option<f64> {
+        let range = expr.range;
+        let number = match expr.kind {
+            ast::ExprKind::Num(raw) => self.model_number(raw, range)?,
+            _ => {
+                self.errors.push(Error::new(
+                    ErrorKind::NonConstantParam {
+                        rule: spec::ids::DIST_PARAMS,
+                        func,
+                        param,
+                    },
+                    range,
+                ));
+                return None;
+            }
+        };
+
+        let value = float_bound(number);
+        if !valid(value) {
+            self.errors.push(Error::new(
+                ErrorKind::ParamOutOfRange {
+                    rule: spec::ids::DIST_PARAMS,
+                    func,
+                    param,
+                    expected,
+                },
+                range,
+            ));
+            return None;
+        }
+
+        Some(value)
+    }
+
+    fn model_random_length(&mut self, expr: ast::Expr, func: &'static str) -> Option<usize> {
+        let range = expr.range;
+        let number = match expr.kind {
+            ast::ExprKind::Num(raw) => self.model_number(raw, range)?,
+            _ => {
+                self.errors.push(Error::new(
+                    ErrorKind::NonConstantParam {
+                        rule: spec::ids::RANDOM_LENGTH,
+                        func,
+                        param: "length",
+                    },
+                    range,
+                ));
+                return None;
+            }
+        };
+
+        match number {
+            Number::Int(value) if value >= 0 => Some(value as usize),
+            _ => {
+                self.errors.push(Error::new(
+                    ErrorKind::ParamOutOfRange {
+                        rule: spec::ids::RANDOM_LENGTH,
+                        func,
+                        param: "length",
+                        expected: "a non-negative integer",
+                    },
+                    range,
+                ));
+                None
+            }
         }
     }
 
@@ -2177,9 +2693,20 @@ fn static_type(expr: &ast::Expr) -> Option<StaticType> {
             (then == otherwise).then_some(then)
         }
         ast::ExprKind::Func { name, args } => match name.as_str() {
-            "range" => Some(StaticType::Number),
+            "range" | "normal" | "lognormal" | "exponential" | "pareto" | "beta" | "poisson" | "len" | "clamp" | "round"
+            | "floor" | "ceil" | "abs" | "min" | "max" => Some(StaticType::Number),
+            "chance" | "contains" | "starts_with" | "ends_with" => Some(StaticType::Boolean),
+            "upper" | "lower" | "trim" | "replace" | "join" | "format" | "uuid" | "hex" | "alphanum" => {
+                Some(StaticType::String)
+            }
+            "split" => Some(StaticType::Array),
             // a choice is only typed when every alternative agrees
             "choice" => unify_static_types(args.iter()),
+            // a weighted pick is typed by its pair values; malformed pairs error later
+            "weighted" => unify_static_types(args.iter().filter_map(|arg| match &arg.kind {
+                ast::ExprKind::Array(elems) if elems.len() == 2 => Some(&elems[0]),
+                _ => None,
+            })),
             _ => None,
         },
         // a dynamic index is only typed when the target is a literal with agreeing elements
@@ -2487,6 +3014,45 @@ pub(super) enum ErrorKind {
     InvalidRangeBounds {
         rule: spec::Id,
     },
+    FuncArity {
+        rule: spec::Id,
+        func: &'static str,
+        expected: &'static str,
+    },
+    FuncArgType {
+        rule: spec::Id,
+        func: &'static str,
+        expected: &'static str,
+        found: ExprType,
+    },
+    NonConstantParam {
+        rule: spec::Id,
+        func: &'static str,
+        param: &'static str,
+    },
+    ParamOutOfRange {
+        rule: spec::Id,
+        func: &'static str,
+        param: &'static str,
+        expected: &'static str,
+    },
+    WeightedOptionShape {
+        rule: spec::Id,
+    },
+    WeightedTotal {
+        rule: spec::Id,
+    },
+    FormatPlaceholders {
+        rule: spec::Id,
+        placeholders: usize,
+        args: usize,
+    },
+    EmptySplitSeparator {
+        rule: spec::Id,
+    },
+    ClampBoundsOutOfOrder {
+        rule: spec::Id,
+    },
     OperandTypeMismatch {
         rule: spec::Id,
         op: String,
@@ -2705,6 +3271,72 @@ impl fmt::Display for ErrorKind {
                 let rule = rule_desc(*rule);
                 write!(formatter, "range bounds are out of order; {}", rule.summary)
             }
+            Self::FuncArity { rule, func, expected } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "function `{func}` expects {expected}; {}", rule.summary)
+            }
+            Self::FuncArgType {
+                rule,
+                func,
+                expected,
+                found,
+            } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "function `{func}` expects a {expected} argument, but found {found}; {}",
+                    rule.summary
+                )
+            }
+            Self::NonConstantParam { rule, func, param } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "function `{func}` {param} must be a constant number; {}",
+                    rule.summary
+                )
+            }
+            Self::ParamOutOfRange {
+                rule,
+                func,
+                param,
+                expected,
+            } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "function `{func}` {param} must be {expected}; {}", rule.summary)
+            }
+            Self::WeightedOptionShape { rule } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "weighted option must be a `[value, weight]` pair with a constant non-negative weight; {}",
+                    rule.summary
+                )
+            }
+            Self::WeightedTotal { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "weighted options have no positive weight; {}", rule.summary)
+            }
+            Self::FormatPlaceholders {
+                rule,
+                placeholders,
+                args,
+            } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "format template has {placeholders} `{{}}` placeholders but {args} arguments; {}",
+                    rule.summary
+                )
+            }
+            Self::EmptySplitSeparator { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "split separator is empty; {}", rule.summary)
+            }
+            Self::ClampBoundsOutOfOrder { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "clamp bounds are out of order; {}", rule.summary)
+            }
             Self::OperandTypeMismatch {
                 rule,
                 op,
@@ -2825,7 +3457,11 @@ impl fmt::Display for ErrorKind {
             }
             Self::RepeatIndexOutsideRepeat { rule } => {
                 let rule = rule_desc(*rule);
-                write!(formatter, "`${{repeat.index}}` is not inside a repeat block; {}", rule.summary)
+                write!(
+                    formatter,
+                    "`${{repeat.index}}` is not inside a repeat block; {}",
+                    rule.summary
+                )
             }
         }
     }
@@ -2953,13 +3589,16 @@ mod tests {
         let trace = &model.traces[0];
         assert_eq!(trace.name, "multi-turn-conversation");
         assert_eq!(trace.children.len(), 2);
-        assert!(trace.children.iter().all(|child| matches!(&as_span(child).kind, SpanKind::Task)));
         assert!(
             trace
                 .children
                 .iter()
-                .all(|child| matches!(as_span(child).children.as_slice(), [Child::Span(Span { kind: SpanKind::Llm, .. })]))
+                .all(|child| matches!(&as_span(child).kind, SpanKind::Task))
         );
+        assert!(trace.children.iter().all(|child| matches!(
+            as_span(child).children.as_slice(),
+            [Child::Span(Span { kind: SpanKind::Llm, .. })]
+        )));
         assert_eq!(trace.fields.tags.iter().map(tag_text).collect::<Vec<_>>(), ["chat", "prod"]);
     }
 
@@ -2997,7 +3636,7 @@ mod tests {
 
         let fields = &as_span(&model.traces[0].children[0]).fields;
         assert!(matches!(&fields.expected, Some(Value::Object(object)) if object.elem[0].key == "answer"));
-        assert!(matches!(&fields.error, Some(Value::Func(Func::Choice(options))) if options.len() == 2));
+        assert!(matches!(&fields.error, Some(Value::Func { func: Func::Choice(options), .. }) if options.len() == 2));
     }
 
     #[test]
@@ -3275,7 +3914,11 @@ mod tests {
         let model = model(r#"trace "t" { input = choice("a", 1) metrics = { n = range(1, 5) x = range(0, 1.5) } }"#).unwrap();
         let fields = &model.traces[0].fields;
 
-        let Some(Value::Func(Func::Choice(options))) = &fields.input else {
+        let Some(Value::Func {
+            func: Func::Choice(options),
+            ..
+        }) = &fields.input
+        else {
             panic!("expected a choice");
         };
         assert!(matches!(&options[0], Value::Str(value) if value == "a"));
@@ -3284,11 +3927,14 @@ mod tests {
         let metrics = fields.metrics.as_ref().unwrap();
         assert!(matches!(
             metrics.elem[0].value,
-            Value::Func(Func::Range(Range::Int { min: 1, max: 5 }))
+            Value::Func {
+                func: Func::Range(Range::Int { min: 1, max: 5 }),
+                ..
+            }
         ));
         assert!(matches!(
             metrics.elem[1].value,
-            Value::Func(Func::Range(Range::Float { min, max })) if min == 0.0 && max == 1.5
+            Value::Func { func: Func::Range(Range::Float { min, max }), .. } if min == 0.0 && max == 1.5
         ));
     }
 
@@ -3296,7 +3942,11 @@ mod tests {
     fn resolves_variables_inside_func_args() {
         let model = model(r#"vars { m = "gpt" } trace "t" { input = choice(var.m, "x") }"#).unwrap();
 
-        let Some(Value::Func(Func::Choice(options))) = &model.traces[0].fields.input else {
+        let Some(Value::Func {
+            func: Func::Choice(options),
+            ..
+        }) = &model.traces[0].fields.input
+        else {
             panic!("expected a choice");
         };
         assert!(matches!(&options[0], Value::Str(value) if value == "gpt"));
@@ -3358,6 +4008,355 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn models_weighted_funcs() {
+        let model = model(r#"trace "t" { input = weighted(["a", 8], [range(1, 3), 2], ["c", 0]) }"#).unwrap();
+
+        let Some(Value::Func {
+            func: Func::Weighted(options),
+            ..
+        }) = &model.traces[0].fields.input
+        else {
+            panic!("expected a weighted pick");
+        };
+        assert_eq!(options.len(), 3);
+        assert!(matches!(&options[0].value, Value::Str(value) if value == "a"));
+        assert!((options[0].weight - 8.0).abs() < f64::EPSILON);
+        assert!(matches!(
+            &options[1].value,
+            Value::Func {
+                func: Func::Range(_),
+                ..
+            }
+        ));
+        assert!(options[2].weight == 0.0);
+    }
+
+    #[test]
+    fn rejects_invalid_weighted_options() {
+        for source in [
+            r#"trace "t" { input = weighted("a") }"#,
+            r#"trace "t" { input = weighted(["a", 1, 2]) }"#,
+            r#"trace "t" { input = weighted(["a", range(1, 2)]) }"#,
+            r#"trace "t" { input = weighted(["a", 0 - 1]) }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert!(
+                matches!(errors[0].kind(), ErrorKind::WeightedOptionShape { .. }),
+                "unexpected error for {source}: {}",
+                errors[0]
+            );
+        }
+
+        let errors = model(r#"trace "t" { input = weighted(["a", 0], ["b", 0]) }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::WeightedTotal { .. }));
+
+        let errors = model(r#"trace "t" { input = weighted() }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "weighted", .. }));
+    }
+
+    #[test]
+    fn models_distribution_funcs() {
+        let model = model(
+            r#"
+                trace "t" {
+                    metrics = {
+                        a = normal(0.5, 0.1)
+                        b = lognormal(300, 0.5)
+                        c = exponential(250)
+                        d = pareto(100, 1.5)
+                        e = beta(2, 5)
+                        f = poisson(3)
+                    }
+                    input = chance(0.25)
+                }
+            "#,
+        )
+        .unwrap();
+        let fields = &model.traces[0].fields;
+
+        let metrics = fields.metrics.as_ref().unwrap();
+        assert!(matches!(
+            metrics.elem[0].value,
+            Value::Func { func: Func::Normal { mean, stddev }, .. } if mean == 0.5 && stddev == 0.1
+        ));
+        assert!(matches!(
+            metrics.elem[1].value,
+            Value::Func { func: Func::Lognormal { median, sigma }, .. } if median == 300.0 && sigma == 0.5
+        ));
+        assert!(matches!(
+            metrics.elem[2].value,
+            Value::Func { func: Func::Exponential { mean }, .. } if mean == 250.0
+        ));
+        assert!(matches!(
+            metrics.elem[3].value,
+            Value::Func { func: Func::Pareto { min, shape }, .. } if min == 100.0 && shape == 1.5
+        ));
+        assert!(matches!(
+            metrics.elem[4].value,
+            Value::Func { func: Func::Beta { alpha, beta }, .. } if alpha == 2.0 && beta == 5.0
+        ));
+        assert!(matches!(
+            metrics.elem[5].value,
+            Value::Func { func: Func::Poisson { mean }, .. } if mean == 3.0
+        ));
+        assert!(matches!(
+            fields.input,
+            Some(Value::Func { func: Func::Chance { probability }, .. }) if probability == 0.25
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_distribution_params() {
+        let errors = model(r#"trace "t" { input = normal(1) }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "normal", .. }));
+
+        let errors = model(r#"trace "t" { input = normal(range(0, 1), 1) }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::NonConstantParam {
+                func: "normal",
+                param: "mean",
+                ..
+            }
+        ));
+
+        for (source, func, param) in [
+            (r#"trace "t" { input = normal(0, 0 - 1) }"#, "normal", "stddev"),
+            (r#"trace "t" { input = lognormal(0, 1) }"#, "lognormal", "median"),
+            (r#"trace "t" { input = exponential(0) }"#, "exponential", "mean"),
+            (r#"trace "t" { input = pareto(0, 1) }"#, "pareto", "min"),
+            (r#"trace "t" { input = beta(1, 0) }"#, "beta", "beta"),
+            (r#"trace "t" { input = poisson(0) }"#, "poisson", "mean"),
+            (r#"trace "t" { input = chance(1.5) }"#, "chance", "probability"),
+        ] {
+            let errors = model(source).unwrap_err();
+            match errors[0].kind() {
+                ErrorKind::ParamOutOfRange {
+                    func: found_func,
+                    param: found_param,
+                    ..
+                } => {
+                    assert_eq!((*found_func, *found_param), (func, param), "wrong param for {source}");
+                }
+                other => panic!("unexpected error for {source}: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn models_string_funcs() {
+        let model = model(
+            r#"
+                vars { tags = ["a", "b"] }
+                trace "t" {
+                    input = upper(choice("get", "post"))
+                    output = format("model={} n={}", "gpt", range(1, 5))
+                    expected = join(var.tags, ", ")
+                    error = contains(var.tags, "a")
+                    metadata = { parts = split("a,b", ",") has = contains("abc", "b") }
+                }
+            "#,
+        )
+        .unwrap();
+        let fields = &model.traces[0].fields;
+
+        assert!(matches!(
+            &fields.input,
+            Some(Value::Func {
+                func: Func::Upper { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            &fields.output,
+            Some(Value::Func { func: Func::Format { template, args }, .. })
+                if template == "model={} n={}" && args.len() == 2
+        ));
+        assert!(matches!(
+            &fields.expected,
+            Some(Value::Func {
+                func: Func::Join { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            &fields.error,
+            Some(Value::Func {
+                func: Func::Contains { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_string_func_args() {
+        for (source, func) in [
+            (r#"trace "t" { input = upper(1) }"#, "upper"),
+            (r#"trace "t" { input = trim(null) }"#, "trim"),
+            (r#"trace "t" { input = split("a", 1) }"#, "split"),
+            (r#"trace "t" { input = join("a", ",") }"#, "join"),
+            (r#"trace "t" { input = contains(1, "x") }"#, "contains"),
+            (r#"trace "t" { input = len(true) }"#, "len"),
+            (r#"trace "t" { input = starts_with("a", 1) }"#, "starts_with"),
+            (r#"trace "t" { input = upper(choice("a", 1)) }"#, "upper"),
+        ] {
+            let errors = model(source).unwrap_err();
+            assert!(
+                matches!(errors[0].kind(), ErrorKind::FuncArgType { func: found, .. } if *found == func),
+                "unexpected error for {source}: {}",
+                errors[0]
+            );
+        }
+
+        let errors = model(r#"trace "t" { input = replace("a", "b") }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "replace", .. }));
+
+        let errors = model(r#"trace "t" { input = split("a,b", "") }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::EmptySplitSeparator { .. }));
+    }
+
+    #[test]
+    fn rejects_invalid_format_calls() {
+        let errors = model(r#"trace "t" { input = format(range(0, 1), 1) }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::FuncArgType {
+                func: "format",
+                expected: "constant string",
+                ..
+            }
+        ));
+
+        let errors = model(r#"trace "t" { input = format("{} {}", 1) }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::FormatPlaceholders {
+                rule: spec::ids::FORMAT_TEMPLATE,
+                placeholders: 2,
+                args: 1,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = format("{}", [1]) }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "format", .. }));
+    }
+
+    #[test]
+    fn models_numeric_funcs() {
+        let model = model(
+            r#"
+                trace "t" {
+                    metrics = {
+                        a = clamp(lognormal(300, 0.5), 20, 30000)
+                        b = round(normal(0, 1))
+                        c = min(range(1, 10), 5)
+                        d = abs(0 - range(1, 5))
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
+
+        assert!(matches!(
+            &metrics.elem[0].value,
+            Value::Func {
+                func: Func::Clamp { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &metrics.elem[1].value,
+            Value::Func {
+                func: Func::Round { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &metrics.elem[2].value,
+            Value::Func { func: Func::Min(values), .. } if values.len() == 2
+        ));
+        assert!(matches!(
+            &metrics.elem[3].value,
+            Value::Func {
+                func: Func::Abs { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_numeric_func_args() {
+        let errors = model(r#"trace "t" { input = clamp(range(1, 5), 10, 2) }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::ClampBoundsOutOfOrder { .. }));
+
+        let errors = model(r#"trace "t" { input = round("x") }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "round", .. }));
+
+        let errors = model(r#"trace "t" { input = min(1) }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "min", .. }));
+
+        let errors = model(r#"trace "t" { input = max(1, "x") }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "max", .. }));
+    }
+
+    #[test]
+    fn models_id_funcs_and_rejects_invalid_lengths() {
+        let model_ok = model(r#"vars { n = 8 } trace "t" { input = [uuid(), hex(16), alphanum(var.n)] }"#).unwrap();
+        let Some(Value::Array(array)) = &model_ok.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        assert!(matches!(array.elem[0], Value::Func { func: Func::Uuid, .. }));
+        assert!(matches!(
+            array.elem[1],
+            Value::Func {
+                func: Func::Hex { length: 16 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            array.elem[2],
+            Value::Func {
+                func: Func::Alphanum { length: 8 },
+                ..
+            }
+        ));
+
+        let errors = model(r#"trace "t" { input = uuid(1) }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "uuid", .. }));
+
+        let errors = model(r#"trace "t" { input = hex(range(1, 4)) }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::NonConstantParam {
+                func: "hex",
+                param: "length",
+                ..
+            }
+        ));
+
+        for source in [
+            r#"trace "t" { input = hex(0 - 1) }"#,
+            r#"trace "t" { input = alphanum(1.5) }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert!(matches!(errors[0].kind(), ErrorKind::ParamOutOfRange { param: "length", .. }));
+        }
+    }
+
+    #[test]
+    fn types_func_results_for_operator_and_arg_checks() {
+        // string and number results compose with operators and other funcs
+        model(r#"trace "t" { input = upper("a") == "A" ? 1 : 2 }"#).unwrap();
+        model(r#"trace "t" { input = len("abc") + poisson(2) }"#).unwrap();
+        model(r#"trace "t" { input = lower(format("{}", weighted(["A", 1], ["B", 3]))) }"#).unwrap();
+
+        // a mixed weighted pick has no static type, so typed args reject it
+        let errors = model(r#"trace "t" { input = upper(weighted(["a", 1], [2, 1])) }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "upper", .. }));
     }
 
     #[test]
@@ -3884,7 +4883,13 @@ mod tests {
         };
         assert_eq!(*op, ast::BinOp::Add);
         assert!(matches!(**lhs, Value::Num(Number::Int(1))));
-        assert!(matches!(**rhs, Value::Func(Func::Range(Range::Int { min: 0, max: 1 }))));
+        assert!(matches!(
+            **rhs,
+            Value::Func {
+                func: Func::Range(Range::Int { min: 0, max: 1 }),
+                ..
+            }
+        ));
         assert_eq!(&source[range.start..range.end], "1 + range(0, 1)");
     }
 
@@ -3936,7 +4941,10 @@ mod tests {
 
         assert!(matches!(
             model.traces[0].fields.input,
-            Some(Value::Func(Func::Range(Range::Int { min: 1, max: 5 })))
+            Some(Value::Func {
+                func: Func::Range(Range::Int { min: 1, max: 5 }),
+                ..
+            })
         ));
     }
 
@@ -4048,7 +5056,13 @@ mod tests {
             panic!("expected a dynamic index expression");
         };
         assert!(matches!(&**target, Value::Array(array) if array.elem.len() == 2));
-        assert!(matches!(**index, Value::Func(Func::Range(Range::Int { min: 0, max: 1 }))));
+        assert!(matches!(
+            **index,
+            Value::Func {
+                func: Func::Range(Range::Int { min: 0, max: 1 }),
+                ..
+            }
+        ));
         assert_eq!(&source[range.start..range.end], "[1, 2][range(0, 1)]");
     }
 
@@ -4158,7 +5172,10 @@ mod tests {
         assert!(matches!(&**target, Value::Array(array) if array.elem.len() == 3));
         assert!(matches!(
             start.as_deref(),
-            Some(Value::Func(Func::Range(Range::Int { min: 0, max: 1 })))
+            Some(Value::Func {
+                func: Func::Range(Range::Int { min: 0, max: 1 }),
+                ..
+            })
         ));
         assert!(end.is_none());
         assert_eq!(&source[range.start..range.end], "[1, 2, 3][range(0, 1):]");
@@ -4236,7 +5253,10 @@ mod tests {
         };
         assert!(matches!(
             array.elem[0],
-            Value::Func(Func::Range(Range::Int { min: 1, max: 5 }))
+            Value::Func {
+                func: Func::Range(Range::Int { min: 1, max: 5 }),
+                ..
+            }
         ));
     }
 
@@ -4569,8 +5589,20 @@ mod tests {
             panic!("expected a repeat child");
         };
         assert_eq!(repeat.name.as_deref(), Some("turns"));
-        assert!(matches!(repeat.count, Value::Func(Func::Range(_))));
-        assert!(matches!(repeat.children.as_slice(), [Child::Span(Span { kind: SpanKind::Task, .. })]));
+        assert!(matches!(
+            repeat.count,
+            Value::Func {
+                func: Func::Range(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            repeat.children.as_slice(),
+            [Child::Span(Span {
+                kind: SpanKind::Task,
+                ..
+            })]
+        ));
 
         let Child::Choice(choice) = &children[1] else {
             panic!("expected a choice child");

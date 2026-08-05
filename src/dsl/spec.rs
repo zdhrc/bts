@@ -234,6 +234,35 @@ pub(crate) mod ids {
 
     pub(crate) const FUNC_CHOICE: Id = Id::new("func.choice");
     pub(crate) const FUNC_RANGE: Id = Id::new("func.range");
+    pub(crate) const FUNC_WEIGHTED: Id = Id::new("func.weighted");
+    pub(crate) const FUNC_NORMAL: Id = Id::new("func.normal");
+    pub(crate) const FUNC_LOGNORMAL: Id = Id::new("func.lognormal");
+    pub(crate) const FUNC_EXPONENTIAL: Id = Id::new("func.exponential");
+    pub(crate) const FUNC_PARETO: Id = Id::new("func.pareto");
+    pub(crate) const FUNC_BETA: Id = Id::new("func.beta");
+    pub(crate) const FUNC_POISSON: Id = Id::new("func.poisson");
+    pub(crate) const FUNC_CHANCE: Id = Id::new("func.chance");
+    pub(crate) const FUNC_UPPER: Id = Id::new("func.upper");
+    pub(crate) const FUNC_LOWER: Id = Id::new("func.lower");
+    pub(crate) const FUNC_TRIM: Id = Id::new("func.trim");
+    pub(crate) const FUNC_REPLACE: Id = Id::new("func.replace");
+    pub(crate) const FUNC_SPLIT: Id = Id::new("func.split");
+    pub(crate) const FUNC_JOIN: Id = Id::new("func.join");
+    pub(crate) const FUNC_CONTAINS: Id = Id::new("func.contains");
+    pub(crate) const FUNC_STARTS_WITH: Id = Id::new("func.starts_with");
+    pub(crate) const FUNC_ENDS_WITH: Id = Id::new("func.ends_with");
+    pub(crate) const FUNC_LEN: Id = Id::new("func.len");
+    pub(crate) const FUNC_FORMAT: Id = Id::new("func.format");
+    pub(crate) const FUNC_CLAMP: Id = Id::new("func.clamp");
+    pub(crate) const FUNC_ROUND: Id = Id::new("func.round");
+    pub(crate) const FUNC_FLOOR: Id = Id::new("func.floor");
+    pub(crate) const FUNC_CEIL: Id = Id::new("func.ceil");
+    pub(crate) const FUNC_ABS: Id = Id::new("func.abs");
+    pub(crate) const FUNC_MIN: Id = Id::new("func.min");
+    pub(crate) const FUNC_MAX: Id = Id::new("func.max");
+    pub(crate) const FUNC_UUID: Id = Id::new("func.uuid");
+    pub(crate) const FUNC_HEX: Id = Id::new("func.hex");
+    pub(crate) const FUNC_ALPHANUM: Id = Id::new("func.alphanum");
 
     pub(crate) const MULTILINE_DELIMITERS: Id = Id::new("rule.multiline-delimiters");
     pub(crate) const MULTILINE_INDENT: Id = Id::new("rule.multiline-indentation");
@@ -252,6 +281,16 @@ pub(crate) mod ids {
     pub(crate) const FUNC_POSITIONS: Id = Id::new("rule.function-positions");
     pub(crate) const CHOICE_ALTERNATIVES: Id = Id::new("rule.choice-alternatives");
     pub(crate) const RANGE_BOUNDS: Id = Id::new("rule.range-bounds");
+    pub(crate) const FUNC_ARITY: Id = Id::new("rule.function-arity");
+    pub(crate) const FUNC_ARG_TYPES: Id = Id::new("rule.function-argument-types");
+    pub(crate) const WEIGHTED_OPTIONS: Id = Id::new("rule.weighted-options");
+    pub(crate) const DIST_PARAMS: Id = Id::new("rule.distribution-params");
+    pub(crate) const FORMAT_TEMPLATE: Id = Id::new("rule.format-template");
+    pub(crate) const SPLIT_SEPARATOR: Id = Id::new("rule.split-separator");
+    pub(crate) const JOIN_ELEMENTS: Id = Id::new("rule.join-elements");
+    pub(crate) const CLAMP_BOUNDS: Id = Id::new("rule.clamp-bounds");
+    pub(crate) const INTEGER_RESULTS: Id = Id::new("rule.integer-results");
+    pub(crate) const RANDOM_LENGTH: Id = Id::new("rule.random-string-length");
     pub(crate) const OPERAND_TYPES: Id = Id::new("rule.operand-types");
     pub(crate) const INDEXABLE_TARGETS: Id = Id::new("rule.indexable-targets");
     pub(crate) const INDEX_BOUNDS: Id = Id::new("rule.index-bounds");
@@ -383,7 +422,7 @@ const VARS_RULES: &[RuleDesc] = &[
 const FUNC_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::KNOWN_FUNCTIONS,
-        summary: "A function call may only use documented functions; currently `choice` and `range`.",
+        summary: "A function call may only use the documented functions listed in this spec.",
     },
     RuleDesc {
         id: ids::FUNC_POSITIONS,
@@ -415,6 +454,76 @@ const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::RANGE_BOUNDS,
     summary: "`range` takes exactly two finite numbers with min <= max.",
 }];
+const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
+    id: ids::FUNC_ARITY,
+    summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number.",
+};
+const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
+    id: ids::FUNC_ARG_TYPES,
+    summary: "A function argument must have the documented type, known before generation; an argument whose type is only known during generation (eg a `choice` with mixed alternatives) is rejected.",
+};
+const DIST_PARAMS_RULE: RuleDesc = RuleDesc {
+    id: ids::DIST_PARAMS,
+    summary: "Distribution parameters are constant finite numbers: `normal` takes stddev >= 0, `lognormal` takes median > 0 and sigma >= 0, `exponential` and `poisson` take mean > 0, `pareto` takes min > 0 and shape > 0, `beta` takes alpha > 0 and beta > 0, and `chance` takes a probability between 0 and 1.",
+};
+const SAMPLING_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, DIST_PARAMS_RULE, FINITE_NUMBERS_RULE];
+const WEIGHTED_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    RuleDesc {
+        id: ids::WEIGHTED_OPTIONS,
+        summary: "`weighted` takes at least one `[value, weight]` pair; weights are constant non-negative finite numbers, at least one of them positive.",
+    },
+];
+const TEXT_FUNC_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, FUNC_ARG_TYPES_RULE];
+const SPLIT_FUNC_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    FUNC_ARG_TYPES_RULE,
+    RuleDesc {
+        id: ids::SPLIT_SEPARATOR,
+        summary: "`split` requires a non-empty separator; a constant empty separator is rejected during validation, and a dynamic one fails the run during generation.",
+    },
+];
+const JOIN_FUNC_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    FUNC_ARG_TYPES_RULE,
+    RuleDesc {
+        id: ids::JOIN_ELEMENTS,
+        summary: "`join` stringifies string, number, and boolean elements; any other element fails the run during generation.",
+    },
+];
+const FORMAT_FUNC_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    FUNC_ARG_TYPES_RULE,
+    RuleDesc {
+        id: ids::FORMAT_TEMPLATE,
+        summary: "`format` takes a constant string template with exactly one `{}` placeholder per remaining argument, replaced in order.",
+    },
+];
+const NUMERIC_FUNC_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, FUNC_ARG_TYPES_RULE, FINITE_NUMBERS_RULE];
+const CLAMP_FUNC_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    FUNC_ARG_TYPES_RULE,
+    RuleDesc {
+        id: ids::CLAMP_BOUNDS,
+        summary: "`clamp` bounds must satisfy min <= max; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+    },
+];
+const ROUNDING_FUNC_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    FUNC_ARG_TYPES_RULE,
+    RuleDesc {
+        id: ids::INTEGER_RESULTS,
+        summary: "`round`, `floor`, and `ceil` produce integers; a result outside the 64-bit integer range fails the run during generation.",
+    },
+];
+const RANDOM_STRING_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    RuleDesc {
+        id: ids::RANDOM_LENGTH,
+        summary: "`hex` and `alphanum` take a constant non-negative integer length.",
+    },
+];
+const UUID_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE];
 const INDEX_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::INDEXABLE_TARGETS,
@@ -670,6 +779,241 @@ const FUNCS: &[FuncDesc] = &[
         examples: &["range(80, 400)", "range(0.0, 1.0)"],
         rules: RANGE_RULES,
     },
+    FuncDesc {
+        id: ids::FUNC_WEIGHTED,
+        name: "weighted",
+        syntax: "weighted([value, weight], ...)",
+        summary: "Picks one of its `[value, weight]` pairs at random for each generated trace, with probability proportional to its weight. Values may be any value, including nested functions; weights are constant non-negative numbers that need not sum to 1.",
+        examples: &[
+            "weighted([\"gpt-4o\", 8], [\"gpt-4o-mini\", 2])",
+            "weighted([range(1, 3), 0.9], [10, 0.1])",
+        ],
+        rules: WEIGHTED_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_NORMAL,
+        name: "normal",
+        syntax: "normal(mean, stddev)",
+        summary: "Samples a float from a normal (Gaussian) distribution with the given mean and standard deviation for each generated trace.",
+        examples: &["normal(0.7, 0.1)", "clamp(normal(100, 15), 0, 200)"],
+        rules: SAMPLING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_LOGNORMAL,
+        name: "lognormal",
+        syntax: "lognormal(median, sigma)",
+        summary: "Samples a positive float from a log-normal distribution for each generated trace, parameterized by its median and the sigma of the underlying normal; `lognormal(300, 0.5)` centers near 300 with a long right tail.",
+        examples: &["lognormal(300, 0.5)", "clamp(lognormal(120, 0.8), 10, 30000)"],
+        rules: SAMPLING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_EXPONENTIAL,
+        name: "exponential",
+        syntax: "exponential(mean)",
+        summary: "Samples a positive float from an exponential distribution with the given mean for each generated trace.",
+        examples: &["exponential(250)", "round(exponential(30))"],
+        rules: SAMPLING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_PARETO,
+        name: "pareto",
+        syntax: "pareto(min, shape)",
+        summary: "Samples a heavy-tailed float at least min from a Pareto distribution for each generated trace; smaller shapes produce heavier tails.",
+        examples: &["pareto(100, 1.5)", "round(pareto(50, 2))"],
+        rules: SAMPLING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_BETA,
+        name: "beta",
+        syntax: "beta(alpha, beta)",
+        summary: "Samples a float between 0 and 1 from a beta distribution with the given shape parameters for each generated trace.",
+        examples: &["beta(2, 5)", "round(beta(8, 2) * 100)"],
+        rules: SAMPLING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_POISSON,
+        name: "poisson",
+        syntax: "poisson(mean)",
+        summary: "Samples a non-negative integer count from a Poisson distribution with the given mean for each generated trace.",
+        examples: &["poisson(3)", "poisson(0.4)"],
+        rules: SAMPLING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_CHANCE,
+        name: "chance",
+        syntax: "chance(probability)",
+        summary: "Produces true with the given probability for each generated trace, false otherwise.",
+        examples: &["chance(0.1)", "chance(0.9) ? \"hit\" : \"miss\""],
+        rules: SAMPLING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_UPPER,
+        name: "upper",
+        syntax: "upper(text)",
+        summary: "Uppercases a string for each generated trace.",
+        examples: &["upper(\"info\")", "upper(choice(\"get\", \"post\"))"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_LOWER,
+        name: "lower",
+        syntax: "lower(text)",
+        summary: "Lowercases a string for each generated trace.",
+        examples: &["lower(var.model)", "lower(\"WARN\")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_TRIM,
+        name: "trim",
+        syntax: "trim(text)",
+        summary: "Removes leading and trailing whitespace from a string for each generated trace.",
+        examples: &["trim(\"  padded  \")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_REPLACE,
+        name: "replace",
+        syntax: "replace(text, from, to)",
+        summary: "Replaces every occurrence of from with to in a string for each generated trace; an empty from leaves the string unchanged.",
+        examples: &["replace(var.model, \"gpt-\", \"\")", "replace(\"a b c\", \" \", \"-\")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_SPLIT,
+        name: "split",
+        syntax: "split(text, separator)",
+        summary: "Splits a string around each occurrence of the non-empty separator for each generated trace, producing an array of strings.",
+        examples: &["split(\"a,b,c\", \",\")", "split(var.path, \"/\")[0]"],
+        rules: SPLIT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_JOIN,
+        name: "join",
+        syntax: "join(array, separator)",
+        summary: "Joins the elements of an array into one string with the separator between them for each generated trace; string, number, and boolean elements are stringified.",
+        examples: &["join(var.tags, \", \")", "join([1, 2, 3], \"-\")"],
+        rules: JOIN_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_CONTAINS,
+        name: "contains",
+        syntax: "contains(target, needle)",
+        summary: "True when a string target contains needle as a substring, or an array target contains needle as an element, for each generated trace.",
+        examples: &["contains(var.model, \"mini\")", "contains(var.tags, \"prod\")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_STARTS_WITH,
+        name: "starts_with",
+        syntax: "starts_with(text, prefix)",
+        summary: "True when a string starts with the given prefix, for each generated trace.",
+        examples: &["starts_with(var.model, \"gpt\")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_ENDS_WITH,
+        name: "ends_with",
+        syntax: "ends_with(text, suffix)",
+        summary: "True when a string ends with the given suffix, for each generated trace.",
+        examples: &["ends_with(var.model, \"-mini\")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_LEN,
+        name: "len",
+        syntax: "len(value)",
+        summary: "The number of characters in a string or elements in an array, as an integer, for each generated trace.",
+        examples: &["len(var.models)", "len(\"hello\")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_FORMAT,
+        name: "format",
+        syntax: "format(template, value, ...)",
+        summary: "Replaces each `{}` placeholder in a constant string template with the corresponding argument, stringified, in order, for each generated trace. Unlike `${...}` interpolation, arguments may be any expression, including functions.",
+        examples: &["format(\"model={} tokens={}\", var.model, range(80, 400))"],
+        rules: FORMAT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_CLAMP,
+        name: "clamp",
+        syntax: "clamp(value, min, max)",
+        summary: "Limits a number to the inclusive range [min, max] for each generated trace. Three integers produce an integer; otherwise a float.",
+        examples: &["clamp(lognormal(300, 0.7), 20, 30000)", "clamp(var.temperature, 0.0, 1.0)"],
+        rules: CLAMP_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_ROUND,
+        name: "round",
+        syntax: "round(value)",
+        summary: "Rounds a number to the nearest integer for each generated trace; integers pass through unchanged.",
+        examples: &["round(lognormal(120, 0.5))", "round(var.score * 100)"],
+        rules: ROUNDING_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_FLOOR,
+        name: "floor",
+        syntax: "floor(value)",
+        summary: "Rounds a number down to the nearest integer for each generated trace; integers pass through unchanged.",
+        examples: &["floor(exponential(4))"],
+        rules: ROUNDING_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_CEIL,
+        name: "ceil",
+        syntax: "ceil(value)",
+        summary: "Rounds a number up to the nearest integer for each generated trace; integers pass through unchanged.",
+        examples: &["ceil(range(0.1, 4.9))"],
+        rules: ROUNDING_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_ABS,
+        name: "abs",
+        syntax: "abs(value)",
+        summary: "The absolute value of a number, for each generated trace. An integer produces an integer; a float produces a float.",
+        examples: &["abs(normal(0, 5))"],
+        rules: NUMERIC_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_MIN,
+        name: "min",
+        syntax: "min(value, value, ...)",
+        summary: "The smallest of two or more numbers, for each generated trace. All integers produce an integer; otherwise a float.",
+        examples: &["min(range(1, 10), 5)", "min(var.limit, poisson(6), 100)"],
+        rules: NUMERIC_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_MAX,
+        name: "max",
+        syntax: "max(value, value, ...)",
+        summary: "The largest of two or more numbers, for each generated trace. All integers produce an integer; otherwise a float.",
+        examples: &["max(normal(50, 20), 0)"],
+        rules: NUMERIC_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_UUID,
+        name: "uuid",
+        syntax: "uuid()",
+        summary: "A random version-4 UUID string for each generated trace, drawn from the seeded generator so runs stay reproducible.",
+        examples: &["uuid()"],
+        rules: UUID_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_HEX,
+        name: "hex",
+        syntax: "hex(length)",
+        summary: "A random lowercase hexadecimal string of the given constant length, for each generated trace.",
+        examples: &["hex(16)", "format(\"req_{}\", hex(8))"],
+        rules: RANDOM_STRING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_ALPHANUM,
+        name: "alphanum",
+        syntax: "alphanum(length)",
+        summary: "A random alphanumeric string (0-9, A-Z, a-z) of the given constant length, for each generated trace.",
+        examples: &["alphanum(12)"],
+        rules: RANDOM_STRING_RULES,
+    },
 ];
 
 const BLOCKS: &[BlockDesc] = &[
@@ -768,7 +1112,10 @@ const BLOCKS: &[BlockDesc] = &[
         syntax: "choice [\"<name>\"] { ... }",
         name: NameDesc::Optional,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc { fields: &[], open: false },
+        body: BodyDesc {
+            fields: &[],
+            open: false,
+        },
         rules: NO_RULES,
     },
     BlockDesc {

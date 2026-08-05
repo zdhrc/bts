@@ -8,6 +8,26 @@ use uuid::Uuid;
 
 const EVENT_SLOT: Duration = Duration::from_millis(100);
 
+// how trace volume spreads across the window; each variant maps an even 0..=1
+// ratio through its inverse cdf so placement stays deterministic
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum Distribution {
+    #[default]
+    Linear,
+    Sine,
+}
+
+impl Distribution {
+    fn position(self, ratio: f64) -> f64 {
+        match self {
+            Self::Linear => ratio,
+            // density is a half sine wave peaking mid-window: f(t) = (pi/2)sin(pi t),
+            // cdf F(t) = (1 - cos(pi t))/2, inverted here
+            Self::Sine => (1.0 - 2.0 * ratio).clamp(-1.0, 1.0).acos() / std::f64::consts::PI,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct EventBatch {
     pub(super) events: Box<[Event]>,
@@ -77,7 +97,7 @@ struct Materializer {
 
 impl Materializer {
     // anchors spread traces across the past window, leaving room for the longest trace to finish by now
-    fn new(plan: Plan, over: Duration, now: SystemTime) -> Result<Self, Error> {
+    fn new(plan: Plan, over: Duration, distribution: Distribution, now: SystemTime) -> Result<Self, Error> {
         let span_ids = (0..plan.events.len()).map(|_| Uuid::new_v4().to_string()).collect();
         let max_slots = plan.traces.iter().map(|trace| trace.len()).max().unwrap_or_default();
         let max_slots = u32::try_from(max_slots).map_err(|_| Error::new(ErrorKind::TimestampOutOfRange, EventRef(0)))?;
@@ -101,7 +121,7 @@ impl Materializer {
                 index as f64 / last_index as f64
             };
             let anchor = window_start
-                .checked_add(available.mul_f64(ratio))
+                .checked_add(available.mul_f64(distribution.position(ratio)))
                 .ok_or_else(|| Error::new(ErrorKind::TimestampOutOfRange, EventRef(trace.start)))?;
 
             trace_starts.extend(std::iter::repeat_n(trace.start, trace.len()));
@@ -228,8 +248,13 @@ fn format_timestamp(timestamp: SystemTime) -> String {
     DateTime::<Utc>::from(timestamp).to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-pub(super) fn materialize(plan: Plan, over: Duration, now: SystemTime) -> Result<EventBatch, Error> {
-    Materializer::new(plan, over, now)?.materialize()
+pub(super) fn materialize(
+    plan: Plan,
+    over: Duration,
+    distribution: Distribution,
+    now: SystemTime,
+) -> Result<EventBatch, Error> {
+    Materializer::new(plan, over, distribution, now)?.materialize()
 }
 
 #[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
@@ -277,7 +302,13 @@ mod tests {
     fn materializes_fixture() {
         let model = compile(include_str!("../../tests/fixtures/simple.bt")).unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
-        let events = materialize(plan(model, 1, 0).unwrap(), Duration::from_secs(3_600), now).unwrap();
+        let events = materialize(
+            plan(model, 1, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            now,
+        )
+        .unwrap();
 
         println!("{}", serde_json::to_string_pretty(&events).unwrap());
 
@@ -334,7 +365,13 @@ mod tests {
             }
         "#;
         let model = compile(source).unwrap();
-        let events = materialize(plan(model, 1, 0).unwrap(), Duration::from_secs(3_600), SystemTime::now()).unwrap();
+        let events = materialize(
+            plan(model, 1, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            SystemTime::now(),
+        )
+        .unwrap();
 
         let json = serde_json::to_value(events).unwrap();
         assert_eq!(json["events"][0]["expected"], "4");
@@ -367,7 +404,7 @@ mod tests {
             }]),
             traces: Box::new([0..1]),
         };
-        let error = materialize(plan, Duration::from_secs(3_600), SystemTime::now()).unwrap_err();
+        let error = materialize(plan, Duration::from_secs(3_600), Distribution::Linear, SystemTime::now()).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::ReservedMetric("start"));
         assert_eq!(error.event(), EventRef(0));
@@ -377,7 +414,13 @@ mod tests {
     fn spreads_generated_traces_across_the_window() {
         let model = compile(r#"trace "example" {}"#).unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
-        let events = materialize(plan(model, 3, 0).unwrap(), Duration::from_secs(3_600), now).unwrap();
+        let events = materialize(
+            plan(model, 3, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            now,
+        )
+        .unwrap();
         let starts = events
             .events
             .iter()
@@ -389,5 +432,32 @@ mod tests {
         assert!(starts[1] > starts[0]);
         assert!(starts[2] > starts[1]);
         assert_eq!(events.events[2].metrics["end"].as_f64().unwrap(), 7_200.0);
+    }
+
+    #[test]
+    fn sine_distribution_clusters_traces_mid_window() {
+        let model = compile(r#"trace "example" {}"#).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(7_200);
+        let events = materialize(
+            plan(model, 5, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Sine,
+            now,
+        )
+        .unwrap();
+        let starts = events
+            .events
+            .iter()
+            .map(|event| event.metrics["start"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        let gaps = starts.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>();
+
+        // endpoints match the linear spread, density peaks mid-window
+        assert_eq!(starts[0], 3_600.0);
+        assert_eq!(events.events[4].metrics["end"].as_f64().unwrap(), 7_200.0);
+        assert!(gaps[0] > gaps[1]);
+        assert!(gaps[3] > gaps[2]);
+        assert!((gaps[0] - gaps[3]).abs() < 1e-3);
+        assert!((gaps[1] - gaps[2]).abs() < 1e-3);
     }
 }

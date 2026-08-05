@@ -86,7 +86,11 @@ pub(crate) enum Value {
     Null,
     Array(Array),
     Object(Object),
-    Func(Func),
+    // range points at the call site so generation failures have a location
+    Func {
+        func: Func,
+        range: SrcRange,
+    },
     // dynamic operator exprs, constant ones fold away in the modeler
     Unary {
         op: UnaryOp,
@@ -120,11 +124,111 @@ pub(crate) enum Value {
     },
 }
 
-// already validated by the modeler so evaluating one can't fail
+// structure and argument types are validated by the modeler; evaluation can
+// still fail on values only known during generation (bounds, overflow, elements)
 #[derive(Debug, Clone)]
 pub(crate) enum Func {
     Choice(Vec<Value>),
     Range(Range),
+    Weighted(Vec<WeightedOption>),
+    Normal {
+        mean: f64,
+        stddev: f64,
+    },
+    Lognormal {
+        median: f64,
+        sigma: f64,
+    },
+    Exponential {
+        mean: f64,
+    },
+    Pareto {
+        min: f64,
+        shape: f64,
+    },
+    Beta {
+        alpha: f64,
+        beta: f64,
+    },
+    Poisson {
+        mean: f64,
+    },
+    Chance {
+        probability: f64,
+    },
+    Upper {
+        text: Box<Value>,
+    },
+    Lower {
+        text: Box<Value>,
+    },
+    Trim {
+        text: Box<Value>,
+    },
+    Replace {
+        text: Box<Value>,
+        from: Box<Value>,
+        to: Box<Value>,
+    },
+    Split {
+        text: Box<Value>,
+        separator: Box<Value>,
+    },
+    Join {
+        array: Box<Value>,
+        separator: Box<Value>,
+    },
+    Contains {
+        target: Box<Value>,
+        needle: Box<Value>,
+    },
+    StartsWith {
+        text: Box<Value>,
+        prefix: Box<Value>,
+    },
+    EndsWith {
+        text: Box<Value>,
+        suffix: Box<Value>,
+    },
+    Len {
+        target: Box<Value>,
+    },
+    Format {
+        template: String,
+        args: Vec<Value>,
+    },
+    Clamp {
+        value: Box<Value>,
+        min: Box<Value>,
+        max: Box<Value>,
+    },
+    Round {
+        value: Box<Value>,
+    },
+    Floor {
+        value: Box<Value>,
+    },
+    Ceil {
+        value: Box<Value>,
+    },
+    Abs {
+        value: Box<Value>,
+    },
+    Min(Vec<Value>),
+    Max(Vec<Value>),
+    Uuid,
+    Hex {
+        length: usize,
+    },
+    Alphanum {
+        length: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WeightedOption {
+    pub(crate) value: Value,
+    pub(crate) weight: f64,
 }
 
 #[derive(Debug, Clone, Copy)]

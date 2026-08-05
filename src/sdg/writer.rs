@@ -110,7 +110,10 @@ impl Error {
 mod tests {
     use super::*;
     use crate::dsl::compile;
-    use crate::sdg::{materializer::materialize, planner::plan};
+    use crate::sdg::{
+        materializer::{Distribution, materialize},
+        planner::plan,
+    };
     use serde_json::Value as JsonValue;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -128,7 +131,13 @@ mod tests {
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(1);
         let model = compile(include_str!("../../tests/fixtures/simple.bt")).unwrap();
-        let events = materialize(plan(model, 1, 0).unwrap(), Duration::from_secs(3_600), SystemTime::now()).unwrap();
+        let events = materialize(
+            plan(model, 1, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            SystemTime::now(),
+        )
+        .unwrap();
 
         let inserted = write(&config, &events).unwrap();
         let request = request.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -149,7 +158,13 @@ mod tests {
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(1);
         let model = compile(r#"trace "example" {}"#).unwrap();
-        let events = materialize(plan(model, 1, 0).unwrap(), Duration::from_secs(3_600), SystemTime::now()).unwrap();
+        let events = materialize(
+            plan(model, 1, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            SystemTime::now(),
+        )
+        .unwrap();
 
         let error = write(&config, &events).unwrap_err();
 
