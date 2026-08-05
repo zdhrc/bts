@@ -24,6 +24,7 @@ pub(super) enum ExprType {
     Array,
     Object,
     Func,
+    Expr,
 }
 
 impl ExprType {
@@ -37,6 +38,8 @@ impl ExprType {
             ast::ExprKind::Array(_) => Self::Array,
             ast::ExprKind::Object(_) => Self::Object,
             ast::ExprKind::Func { .. } => Self::Func,
+            // constant operator exprs fold to literals, only dynamic ones get here
+            ast::ExprKind::Unary { .. } | ast::ExprKind::Binary { .. } | ast::ExprKind::Cond { .. } => Self::Expr,
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
         }
     }
@@ -52,6 +55,7 @@ impl fmt::Display for ExprType {
             Self::Array => "array",
             Self::Object => "object",
             Self::Func => "function",
+            Self::Expr => "expression",
         })
     }
 }
@@ -247,6 +251,29 @@ impl Modeler {
                 }
                 ast::ExprKind::Func { name, args: resolved }
             }
+            ast::ExprKind::Unary { op, operand } => ast::ExprKind::Unary {
+                op,
+                operand: Box::new(self.resolve_expr(*operand)?),
+            },
+            ast::ExprKind::Binary { op, lhs, rhs } => {
+                let lhs = self.resolve_expr(*lhs);
+                let rhs = self.resolve_expr(*rhs);
+                ast::ExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs?),
+                    rhs: Box::new(rhs?),
+                }
+            }
+            ast::ExprKind::Cond { cond, then, otherwise } => {
+                let cond = self.resolve_expr(*cond);
+                let then = self.resolve_expr(*then);
+                let otherwise = self.resolve_expr(*otherwise);
+                ast::ExprKind::Cond {
+                    cond: Box::new(cond?),
+                    then: Box::new(then?),
+                    otherwise: Box::new(otherwise?),
+                }
+            }
             kind => kind,
         };
 
@@ -262,6 +289,12 @@ impl Modeler {
                 ast::TemplatePart::Ref { path, range } if path.len() == 2 && path[0] == "var" => {
                     let name = path.into_iter().nth(1).expect("path has two segments");
                     let Some(value) = self.lookup_var(name.clone(), range) else {
+                        valid = false;
+                        continue;
+                    };
+
+                    // constant exprs interpolate as their folded literal
+                    let Some(value) = self.fold_expr(value) else {
                         valid = false;
                         continue;
                     };
@@ -291,6 +324,308 @@ impl Modeler {
         }
 
         valid.then_some(resolved)
+    }
+
+    // folds constant operator exprs to literals after var resolution, dynamic
+    // ones keep folded operands and lower to residual model values
+    fn fold_expr(&mut self, expr: ast::Expr) -> Option<ast::Expr> {
+        let ast::Expr { kind, range } = expr;
+        let kind = match kind {
+            ast::ExprKind::Unary { op, operand } => return self.fold_unary(op, *operand, range),
+            ast::ExprKind::Binary { op, lhs, rhs } => return self.fold_binary(op, *lhs, *rhs, range),
+            ast::ExprKind::Cond { cond, then, otherwise } => return self.fold_cond(*cond, *then, *otherwise, range),
+            ast::ExprKind::Array(values) => {
+                let mut folded = Vec::with_capacity(values.len());
+                let mut valid = true;
+                for value in values {
+                    match self.fold_expr(value) {
+                        Some(value) => folded.push(value),
+                        None => valid = false,
+                    }
+                }
+                if !valid {
+                    return None;
+                }
+                ast::ExprKind::Array(folded)
+            }
+            ast::ExprKind::Object(attrs) => {
+                let mut folded = Vec::with_capacity(attrs.len());
+                let mut valid = true;
+                for attr in attrs {
+                    match self.fold_expr(attr.value) {
+                        Some(value) => folded.push(ast::Attr { value, ..attr }),
+                        None => valid = false,
+                    }
+                }
+                if !valid {
+                    return None;
+                }
+                ast::ExprKind::Object(folded)
+            }
+            ast::ExprKind::Func { name, args } => {
+                let mut folded = Vec::with_capacity(args.len());
+                let mut valid = true;
+                for arg in args {
+                    match self.fold_expr(arg) {
+                        Some(arg) => folded.push(arg),
+                        None => valid = false,
+                    }
+                }
+                if !valid {
+                    return None;
+                }
+                ast::ExprKind::Func { name, args: folded }
+            }
+            kind => kind,
+        };
+
+        Some(ast::Expr::new(kind, range))
+    }
+
+    fn fold_unary(&mut self, op: ast::UnaryOp, operand: ast::Expr, range: SrcRange) -> Option<ast::Expr> {
+        let operand = self.fold_expr(operand)?;
+
+        // negating a number literal happens textually so i64::MIN stays representable
+        if op == ast::UnaryOp::Neg
+            && let ast::ExprKind::Num(raw) = operand.kind
+        {
+            return Some(ast::Expr::new(ast::ExprKind::Num(negate_literal(&raw)), range));
+        }
+
+        let required = match op {
+            ast::UnaryOp::Neg => StaticType::Number,
+            ast::UnaryOp::Not => StaticType::Boolean,
+        };
+        if !self.check_operand(&operand, required, op.to_string()) {
+            return None;
+        }
+
+        match operand.kind {
+            // a constant not folds, neg of a literal already returned above
+            ast::ExprKind::Bool(value) if op == ast::UnaryOp::Not => Some(ast::Expr::new(ast::ExprKind::Bool(!value), range)),
+            kind => Some(ast::Expr::new(
+                ast::ExprKind::Unary {
+                    op,
+                    operand: Box::new(ast::Expr::new(kind, operand.range)),
+                },
+                range,
+            )),
+        }
+    }
+
+    fn fold_binary(&mut self, op: ast::BinOp, lhs: ast::Expr, rhs: ast::Expr, range: SrcRange) -> Option<ast::Expr> {
+        // fold both sides first so each reports its own diagnostics
+        let lhs = self.fold_expr(lhs);
+        let rhs = self.fold_expr(rhs);
+        let (lhs, rhs) = (lhs?, rhs?);
+
+        let valid = match op_class(op) {
+            OpClass::Arith | OpClass::Cmp => {
+                let left = self.check_operand(&lhs, StaticType::Number, op.to_string());
+                self.check_operand(&rhs, StaticType::Number, op.to_string()) && left
+            }
+            OpClass::Logic => {
+                let left = self.check_operand(&lhs, StaticType::Boolean, op.to_string());
+                self.check_operand(&rhs, StaticType::Boolean, op.to_string()) && left
+            }
+            OpClass::Eq => self.check_equality_operands(&lhs, &rhs, op),
+        };
+        if !valid {
+            return None;
+        }
+
+        // a constant zero divisor is always an error, even with a dynamic lhs
+        if matches!(op, ast::BinOp::Div | ast::BinOp::Rem)
+            && let ast::ExprKind::Num(raw) = &rhs.kind
+            && raw.parse::<f64>().is_ok_and(|value| value == 0.0)
+        {
+            self.errors.push(Error::new(
+                ErrorKind::DivisionByZero {
+                    rule: spec::ids::NONZERO_DIVISORS,
+                    op: op.to_string(),
+                },
+                rhs.range,
+            ));
+            return None;
+        }
+
+        if expr_is_constant(&lhs) && expr_is_constant(&rhs) {
+            let left = self.const_scalar(&lhs);
+            let right = self.const_scalar(&rhs)?;
+            return self
+                .eval_binary(op, left?, right, range)
+                .map(|kind| ast::Expr::new(kind, range));
+        }
+
+        Some(ast::Expr::new(
+            ast::ExprKind::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            range,
+        ))
+    }
+
+    fn fold_cond(&mut self, cond: ast::Expr, then: ast::Expr, otherwise: ast::Expr, range: SrcRange) -> Option<ast::Expr> {
+        let cond = self.fold_expr(cond);
+        let then = self.fold_expr(then);
+        let otherwise = self.fold_expr(otherwise);
+        let (cond, then, otherwise) = (cond?, then?, otherwise?);
+
+        if static_type(&cond) != Some(StaticType::Boolean) {
+            self.errors.push(Error::new(
+                ErrorKind::NonBooleanCondition {
+                    rule: spec::ids::BOOLEAN_CONDITIONS,
+                    found: found_type(&cond),
+                },
+                cond.range,
+            ));
+            return None;
+        }
+
+        // a constant condition picks its branch during validation
+        if let ast::ExprKind::Bool(value) = cond.kind {
+            let taken = if value { then } else { otherwise };
+            return Some(ast::Expr::new(taken.kind, range));
+        }
+
+        Some(ast::Expr::new(
+            ast::ExprKind::Cond {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                otherwise: Box::new(otherwise),
+            },
+            range,
+        ))
+    }
+
+    fn check_operand(&mut self, operand: &ast::Expr, required: StaticType, op: String) -> bool {
+        if static_type(operand) == Some(required) {
+            return true;
+        }
+
+        self.errors.push(Error::new(
+            ErrorKind::OperandTypeMismatch {
+                rule: spec::ids::OPERAND_TYPES,
+                op,
+                expected: type_name(required),
+                found: found_type(operand),
+            },
+            operand.range,
+        ));
+        false
+    }
+
+    fn check_equality_operands(&mut self, lhs: &ast::Expr, rhs: &ast::Expr, op: ast::BinOp) -> bool {
+        const SCALARS: &str = "string, number, or boolean";
+        fn scalar(found: Option<StaticType>) -> bool {
+            matches!(found, Some(StaticType::String | StaticType::Number | StaticType::Boolean))
+        }
+
+        let lhs_type = static_type(lhs);
+        let rhs_type = static_type(rhs);
+        let mut valid = true;
+
+        for (side, side_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
+            if !scalar(side_type) {
+                self.errors.push(Error::new(
+                    ErrorKind::OperandTypeMismatch {
+                        rule: spec::ids::OPERAND_TYPES,
+                        op: op.to_string(),
+                        expected: SCALARS,
+                        found: found_type(side),
+                    },
+                    side.range,
+                ));
+                valid = false;
+            }
+        }
+
+        // the left operand fixes the comparison type
+        if valid && lhs_type != rhs_type {
+            self.errors.push(Error::new(
+                ErrorKind::OperandTypeMismatch {
+                    rule: spec::ids::OPERAND_TYPES,
+                    op: op.to_string(),
+                    expected: type_name(lhs_type.expect("scalar operands have a static type")),
+                    found: found_type(rhs),
+                },
+                rhs.range,
+            ));
+            valid = false;
+        }
+
+        valid
+    }
+
+    fn eval_binary(&mut self, op: ast::BinOp, lhs: Const, rhs: Const, range: SrcRange) -> Option<ast::ExprKind> {
+        let kind = match op_class(op) {
+            OpClass::Arith => {
+                let (Const::Num(lhs), Const::Num(rhs)) = (lhs, rhs) else {
+                    unreachable!("operands were type checked as numbers");
+                };
+                match eval_arith(op, lhs, rhs) {
+                    Some(number) => ast::ExprKind::Num(num_literal(number)),
+                    None => {
+                        self.errors.push(Error::new(
+                            ErrorKind::NonFiniteResult {
+                                rule: spec::ids::FINITE_NUMBERS,
+                            },
+                            range,
+                        ));
+                        return None;
+                    }
+                }
+            }
+            OpClass::Cmp => {
+                let (Const::Num(lhs), Const::Num(rhs)) = (lhs, rhs) else {
+                    unreachable!("operands were type checked as numbers");
+                };
+                ast::ExprKind::Bool(eval_cmp(op, lhs, rhs))
+            }
+            OpClass::Eq => {
+                let equal = match (lhs, rhs) {
+                    (Const::Str(lhs), Const::Str(rhs)) => lhs == rhs,
+                    (Const::Bool(lhs), Const::Bool(rhs)) => lhs == rhs,
+                    (Const::Num(Number::Int(lhs)), Const::Num(Number::Int(rhs))) => lhs == rhs,
+                    (Const::Num(lhs), Const::Num(rhs)) => float_bound(lhs) == float_bound(rhs),
+                    _ => unreachable!("operands were type checked as matching scalars"),
+                };
+                ast::ExprKind::Bool(if op == ast::BinOp::Eq { equal } else { !equal })
+            }
+            OpClass::Logic => {
+                let (Const::Bool(lhs), Const::Bool(rhs)) = (lhs, rhs) else {
+                    unreachable!("operands were type checked as booleans");
+                };
+                ast::ExprKind::Bool(match op {
+                    ast::BinOp::And => lhs && rhs,
+                    ast::BinOp::Or => lhs || rhs,
+                    _ => unreachable!("operator is logical"),
+                })
+            }
+        };
+
+        Some(kind)
+    }
+
+    fn const_scalar(&mut self, expr: &ast::Expr) -> Option<Const> {
+        match &expr.kind {
+            ast::ExprKind::Str(value) => Some(Const::Str(value.clone())),
+            ast::ExprKind::Template(parts) => {
+                let joined = parts
+                    .iter()
+                    .map(|part| match part {
+                        ast::TemplatePart::Lit(value) => value.as_str(),
+                        ast::TemplatePart::Ref { .. } => unreachable!("constant templates only hold literal parts"),
+                    })
+                    .collect();
+                Some(Const::Str(joined))
+            }
+            ast::ExprKind::Num(raw) => self.model_number(raw.clone(), expr.range).map(Const::Num),
+            ast::ExprKind::Bool(value) => Some(Const::Bool(*value)),
+            _ => unreachable!("constant operands are scalar literals"),
+        }
     }
 
     fn lookup_var(&mut self, name: String, range: SrcRange) -> Option<ast::Expr> {
@@ -417,6 +752,10 @@ impl Modeler {
             return;
         };
 
+        let Some(value) = self.fold_expr(value) else {
+            return;
+        };
+
         if !self.validate_expr(&value, block.id, field.id, field.value) {
             return;
         }
@@ -537,6 +876,35 @@ impl Modeler {
             })),
             ast::ExprKind::Object(attrs) => Some(Value::Object(self.model_object(attrs))),
             ast::ExprKind::Func { name, args } => self.model_func(name, args, range).map(Value::Func),
+            // only dynamic operator exprs survive folding
+            ast::ExprKind::Unary { op, operand } => {
+                let operand = self.model_value(*operand)?;
+                Some(Value::Unary {
+                    op,
+                    operand: Box::new(operand),
+                    range,
+                })
+            }
+            ast::ExprKind::Binary { op, lhs, rhs } => {
+                let lhs = self.model_value(*lhs);
+                let rhs = self.model_value(*rhs);
+                Some(Value::Binary {
+                    op,
+                    lhs: Box::new(lhs?),
+                    rhs: Box::new(rhs?),
+                    range,
+                })
+            }
+            ast::ExprKind::Cond { cond, then, otherwise } => {
+                let cond = self.model_value(*cond);
+                let then = self.model_value(*then);
+                let otherwise = self.model_value(*otherwise);
+                Some(Value::Cond {
+                    cond: Box::new(cond?),
+                    then: Box::new(then?),
+                    otherwise: Box::new(otherwise?),
+                })
+            }
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before model lowering"),
         }
     }
@@ -715,7 +1083,8 @@ impl Modeler {
     }
 
     fn model_number(&mut self, raw: String, range: SrcRange) -> Option<Number> {
-        let number = if raw.contains('.') {
+        // folded float literals may carry exponent notation, source literals never do
+        let number = if raw.contains(['.', 'e', 'E']) {
             raw.parse::<f64>().ok().filter(|number| number.is_finite()).map(Number::Float)
         } else {
             raw.parse::<i64>().ok().map(Number::Int)
@@ -763,6 +1132,11 @@ fn expr_references_vars(expr: &ast::Expr) -> bool {
         ast::ExprKind::Array(values) => values.iter().any(expr_references_vars),
         ast::ExprKind::Object(attrs) => attrs.iter().any(|attr| expr_references_vars(&attr.value)),
         ast::ExprKind::Func { args, .. } => args.iter().any(expr_references_vars),
+        ast::ExprKind::Unary { operand, .. } => expr_references_vars(operand),
+        ast::ExprKind::Binary { lhs, rhs, .. } => expr_references_vars(lhs) || expr_references_vars(rhs),
+        ast::ExprKind::Cond { cond, then, otherwise } => {
+            expr_references_vars(cond) || expr_references_vars(then) || expr_references_vars(otherwise)
+        }
         _ => false,
     }
 }
@@ -771,6 +1145,186 @@ fn float_bound(number: Number) -> f64 {
     match number {
         Number::Int(value) => value as f64,
         Number::Float(value) => value,
+    }
+}
+
+// statically known result type of an expr, none = unknown (eg heterogeneous choice)
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum StaticType {
+    String,
+    Number,
+    Boolean,
+    Null,
+    Array,
+    Object,
+}
+
+// constant scalar operand pulled out of a folded literal
+enum Const {
+    Str(String),
+    Num(Number),
+    Bool(bool),
+}
+
+enum OpClass {
+    Arith,
+    Cmp,
+    Eq,
+    Logic,
+}
+
+fn op_class(op: ast::BinOp) -> OpClass {
+    match op {
+        ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div | ast::BinOp::Rem => OpClass::Arith,
+        ast::BinOp::Lt | ast::BinOp::Le | ast::BinOp::Gt | ast::BinOp::Ge => OpClass::Cmp,
+        ast::BinOp::Eq | ast::BinOp::Ne => OpClass::Eq,
+        ast::BinOp::And | ast::BinOp::Or => OpClass::Logic,
+    }
+}
+
+fn static_type(expr: &ast::Expr) -> Option<StaticType> {
+    match &expr.kind {
+        ast::ExprKind::Str(_) | ast::ExprKind::Template(_) => Some(StaticType::String),
+        ast::ExprKind::Num(_) => Some(StaticType::Number),
+        ast::ExprKind::Bool(_) => Some(StaticType::Boolean),
+        ast::ExprKind::Null => Some(StaticType::Null),
+        ast::ExprKind::Array(_) => Some(StaticType::Array),
+        ast::ExprKind::Object(_) => Some(StaticType::Object),
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Neg, ..
+        } => Some(StaticType::Number),
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Not, ..
+        } => Some(StaticType::Boolean),
+        ast::ExprKind::Binary { op, .. } => Some(match op_class(*op) {
+            OpClass::Arith => StaticType::Number,
+            _ => StaticType::Boolean,
+        }),
+        ast::ExprKind::Cond { then, otherwise, .. } => {
+            let then = static_type(then)?;
+            let otherwise = static_type(otherwise)?;
+            (then == otherwise).then_some(then)
+        }
+        ast::ExprKind::Func { name, args } => match name.as_str() {
+            "range" => Some(StaticType::Number),
+            // a choice is only typed when every alternative agrees
+            "choice" => {
+                let mut unified = None;
+                for arg in args {
+                    let arg = static_type(arg)?;
+                    match unified {
+                        None => unified = Some(arg),
+                        Some(previous) if previous == arg => {}
+                        Some(_) => return None,
+                    }
+                }
+                unified
+            }
+            _ => None,
+        },
+        ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
+    }
+}
+
+// the found side of operand diagnostics, prefers the static type over the expr shape
+fn found_type(expr: &ast::Expr) -> ExprType {
+    match static_type(expr) {
+        Some(StaticType::String) => ExprType::String,
+        Some(StaticType::Number) => ExprType::Number,
+        Some(StaticType::Boolean) => ExprType::Boolean,
+        Some(StaticType::Null) => ExprType::Null,
+        Some(StaticType::Array) => ExprType::Array,
+        Some(StaticType::Object) => ExprType::Object,
+        None => ExprType::of(expr),
+    }
+}
+
+fn type_name(required: StaticType) -> &'static str {
+    match required {
+        StaticType::String => "string",
+        StaticType::Number => "number",
+        StaticType::Boolean => "boolean",
+        StaticType::Null => "null",
+        StaticType::Array => "array",
+        StaticType::Object => "object",
+    }
+}
+
+// no funcs or per-trace template refs anywhere beneath
+fn expr_is_constant(expr: &ast::Expr) -> bool {
+    match &expr.kind {
+        ast::ExprKind::Func { .. } => false,
+        ast::ExprKind::Template(parts) => parts.iter().all(|part| matches!(part, ast::TemplatePart::Lit(_))),
+        ast::ExprKind::Array(values) => values.iter().all(expr_is_constant),
+        ast::ExprKind::Object(attrs) => attrs.iter().all(|attr| expr_is_constant(&attr.value)),
+        ast::ExprKind::Unary { operand, .. } => expr_is_constant(operand),
+        ast::ExprKind::Binary { lhs, rhs, .. } => expr_is_constant(lhs) && expr_is_constant(rhs),
+        ast::ExprKind::Cond { cond, then, otherwise } => {
+            expr_is_constant(cond) && expr_is_constant(then) && expr_is_constant(otherwise)
+        }
+        _ => true,
+    }
+}
+
+fn negate_literal(raw: &str) -> String {
+    match raw.strip_prefix('-') {
+        Some(stripped) => stripped.to_owned(),
+        None => format!("-{raw}"),
+    }
+}
+
+// {:?} keeps a .0 on floats so the literal reparses as a float
+fn num_literal(number: Number) -> String {
+    match number {
+        Number::Int(value) => value.to_string(),
+        Number::Float(value) => format!("{value:?}"),
+    }
+}
+
+// none = overflow or a non-finite float result, zero divisors are caught before eval
+fn eval_arith(op: ast::BinOp, lhs: Number, rhs: Number) -> Option<Number> {
+    match (lhs, rhs) {
+        (Number::Int(lhs), Number::Int(rhs)) => {
+            let result = match op {
+                ast::BinOp::Add => lhs.checked_add(rhs),
+                ast::BinOp::Sub => lhs.checked_sub(rhs),
+                ast::BinOp::Mul => lhs.checked_mul(rhs),
+                // checked catches i64::MIN / -1
+                ast::BinOp::Div => lhs.checked_div(rhs),
+                ast::BinOp::Rem => lhs.checked_rem(rhs),
+                _ => unreachable!("operator is arithmetic"),
+            };
+            result.map(Number::Int)
+        }
+        (lhs, rhs) => {
+            let (lhs, rhs) = (float_bound(lhs), float_bound(rhs));
+            let result = match op {
+                ast::BinOp::Add => lhs + rhs,
+                ast::BinOp::Sub => lhs - rhs,
+                ast::BinOp::Mul => lhs * rhs,
+                ast::BinOp::Div => lhs / rhs,
+                ast::BinOp::Rem => lhs % rhs,
+                _ => unreachable!("operator is arithmetic"),
+            };
+            result.is_finite().then_some(Number::Float(result))
+        }
+    }
+}
+
+fn eval_cmp(op: ast::BinOp, lhs: Number, rhs: Number) -> bool {
+    fn compare<T: PartialOrd>(op: ast::BinOp, lhs: T, rhs: T) -> bool {
+        match op {
+            ast::BinOp::Lt => lhs < rhs,
+            ast::BinOp::Le => lhs <= rhs,
+            ast::BinOp::Gt => lhs > rhs,
+            ast::BinOp::Ge => lhs >= rhs,
+            _ => unreachable!("operator is a comparison"),
+        }
+    }
+
+    match (lhs, rhs) {
+        (Number::Int(lhs), Number::Int(rhs)) => compare(op, lhs, rhs),
+        (lhs, rhs) => compare(op, float_bound(lhs), float_bound(rhs)),
     }
 }
 
@@ -920,6 +1474,23 @@ pub(super) enum ErrorKind {
     InvalidRangeBounds {
         rule: spec::Id,
     },
+    OperandTypeMismatch {
+        rule: spec::Id,
+        op: String,
+        expected: &'static str,
+        found: ExprType,
+    },
+    NonBooleanCondition {
+        rule: spec::Id,
+        found: ExprType,
+    },
+    DivisionByZero {
+        rule: spec::Id,
+        op: String,
+    },
+    NonFiniteResult {
+        rule: spec::Id,
+    },
 }
 
 impl fmt::Display for ErrorKind {
@@ -1052,6 +1623,35 @@ impl fmt::Display for ErrorKind {
             Self::InvalidRangeBounds { rule } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "range bounds are out of order; {}", rule.summary)
+            }
+            Self::OperandTypeMismatch {
+                rule,
+                op,
+                expected,
+                found,
+            } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "operator `{op}` expects {expected} operands, but found {found}; {}",
+                    rule.summary
+                )
+            }
+            Self::NonBooleanCondition { rule, found } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "conditional expects a boolean condition, but found {found}; {}",
+                    rule.summary
+                )
+            }
+            Self::DivisionByZero { rule, op } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "operator `{op}` divides by a constant zero; {}", rule.summary)
+            }
+            Self::NonFiniteResult { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "expression result is not a finite number; {}", rule.summary)
             }
         }
     }
@@ -1784,6 +2384,328 @@ mod tests {
                 what: "field `metadata` in block `trace` expects object, but found boolean".to_owned(),
                 r#where: SrcRange::new(29, 33),
             }]
+        );
+    }
+
+    #[test]
+    fn folds_constant_arithmetic() {
+        let model = model(r#"trace "t" { metrics = { a = 1 + 2 * 3 b = 7 / 2 c = 7 % 2 d = 10 - 12 } }"#).unwrap();
+        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
+
+        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Int(7))));
+        // integer division truncates toward zero
+        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Int(3))));
+        assert!(matches!(metrics.elem[2].value, Value::Num(Number::Int(1))));
+        assert!(matches!(metrics.elem[3].value, Value::Num(Number::Int(-2))));
+    }
+
+    #[test]
+    fn folds_float_promotion_and_keeps_floats_float() {
+        let model = model(r#"trace "t" { metrics = { a = 1 + 0.5 b = 3.0 / 2 c = 1.5 + 1.5 } }"#).unwrap();
+        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
+
+        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == 1.5));
+        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Float(value)) if value == 1.5));
+        // a whole float result stays a float through re-literalization
+        assert!(matches!(metrics.elem[2].value, Value::Num(Number::Float(value)) if value == 3.0));
+    }
+
+    #[test]
+    fn folds_comparisons_equality_and_logic() {
+        let source = r#"trace "t" { metrics = {
+            a = 1 < 2
+            b = "x" == "x"
+            c = 1.0 == 1
+            d = true && false
+            e = !(1 > 2)
+            f = 1 != 2
+        } }"#;
+        let model = model(source).unwrap();
+        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
+
+        let expected = [true, true, true, false, true, true];
+        for (field, want) in metrics.elem.iter().zip(expected) {
+            assert!(
+                matches!(field.value, Value::Bool(value) if value == want),
+                "field {}",
+                field.key
+            );
+        }
+    }
+
+    #[test]
+    fn folds_constant_ternaries_into_typed_positions() {
+        let model = model(r#"trace "t" { tags = [true ? "a" : "b", false ? "c" : "d"] }"#).unwrap();
+        let tags = &model.traces[0].fields.tags;
+
+        assert!(matches!(&tags[0].parts[0], Part::Lit(value) if value == "a"));
+        assert!(matches!(&tags[1].parts[0], Part::Lit(value) if value == "d"));
+    }
+
+    #[test]
+    fn folds_negation_textually() {
+        let model = model(r#"trace "t" { metrics = { a = -9223372036854775808 b = --5 c = -1.5 } }"#).unwrap();
+        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
+
+        // i64::MIN only exists via textual negation, the bare literal overflows
+        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Int(i64::MIN))));
+        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Int(5))));
+        assert!(matches!(metrics.elem[2].value, Value::Num(Number::Float(value)) if value == -1.5));
+    }
+
+    #[test]
+    fn folds_grouped_expressions() {
+        let model = model(r#"trace "t" { input = (1 + 2) * 3 }"#).unwrap();
+
+        assert!(matches!(model.traces[0].fields.input, Some(Value::Num(Number::Int(9)))));
+    }
+
+    #[test]
+    fn rejects_mismatched_operand_types() {
+        let source = r#"trace "t" { input = 1 + "a" }"#;
+        let errors = model(source).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::OperandTypeMismatch {
+                rule: spec::ids::OPERAND_TYPES,
+                op: "+".to_owned(),
+                expected: "number",
+                found: ExprType::String,
+            }
+        );
+        assert_eq!(&source[errors[0].range().start..errors[0].range().end], "\"a\"");
+
+        let errors = model(r#"trace "t" { input = 1 && true }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::OperandTypeMismatch {
+                rule: spec::ids::OPERAND_TYPES,
+                op: "&&".to_owned(),
+                expected: "boolean",
+                found: ExprType::Number,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = !5 }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::OperandTypeMismatch {
+                rule: spec::ids::OPERAND_TYPES,
+                op: "!".to_owned(),
+                expected: "boolean",
+                found: ExprType::Number,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = [1] + 1 }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::OperandTypeMismatch {
+                found: ExprType::Array,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_null_and_cross_type_equality() {
+        // null is not comparable, both sides report
+        let errors = model(r#"trace "t" { input = null == null }"#).unwrap_err();
+        assert_eq!(errors.len(), 2);
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::OperandTypeMismatch {
+                expected: "string, number, or boolean",
+                found: ExprType::Null,
+                ..
+            }
+        ));
+
+        // the left operand fixes the comparison type
+        let errors = model(r#"trace "t" { input = "a" == 1 }"#).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::OperandTypeMismatch {
+                expected: "string",
+                found: ExprType::Number,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_operands_without_a_static_type() {
+        // heterogeneous choice has no unified type
+        let errors = model(r#"trace "t" { input = choice("a", 1) + 1 }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::OperandTypeMismatch {
+                found: ExprType::Func,
+                ..
+            }
+        ));
+
+        // a dynamic ternary with mixed branch types is untyped as an operand
+        let errors = model(r#"trace "t" { input = (range(0, 1) == 1 ? 1 : "x") + 1 }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::OperandTypeMismatch {
+                found: ExprType::Expr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_non_boolean_conditions() {
+        let errors = model(r#"trace "t" { input = 1 ? 2 : 3 }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonBooleanCondition {
+                rule: spec::ids::BOOLEAN_CONDITIONS,
+                found: ExprType::Number,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_constant_zero_divisors() {
+        for source in [
+            r#"trace "t" { input = 1 / 0 }"#,
+            r#"trace "t" { input = 1 % 0 }"#,
+            r#"trace "t" { input = 1 / 0.0 }"#,
+            // static even with a dynamic lhs
+            r#"trace "t" { input = range(1, 2) / 0 }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert!(
+                matches!(errors[0].kind(), ErrorKind::DivisionByZero { .. }),
+                "source: {source}"
+            );
+        }
+
+        // the diagnostic points at the zero
+        let source = r#"trace "t" { input = 1 / 0 }"#;
+        let errors = model(source).unwrap_err();
+        assert_eq!(&source[errors[0].range().start..errors[0].range().end], "0");
+    }
+
+    #[test]
+    fn rejects_non_finite_constant_results() {
+        let errors = model(r#"trace "t" { input = 9223372036854775807 + 1 }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonFiniteResult {
+                rule: spec::ids::FINITE_NUMBERS,
+            }
+        );
+
+        let big = format!("{}.0", "9".repeat(200));
+        let errors = model(&format!(r#"trace "t" {{ input = {big} * {big} }}"#)).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::NonFiniteResult { .. }));
+    }
+
+    #[test]
+    fn folds_variables_in_operator_exprs() {
+        let model = model(r#"vars { n = 2 } trace "t" { input = var.n + 1 }"#).unwrap();
+
+        assert!(matches!(model.traces[0].fields.input, Some(Value::Num(Number::Int(3)))));
+    }
+
+    #[test]
+    fn rejects_operator_exprs_referencing_vars_in_vars() {
+        let errors = model(r#"vars { a = 1 b = 1 + var.a } trace "t" { input = 1 }"#).unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
+    }
+
+    #[test]
+    fn interpolates_folded_constant_vars() {
+        let model = model(r#"vars { n = 1 + 2 } trace "t" { output = "n ${var.n}" }"#).unwrap();
+
+        assert!(matches!(&model.traces[0].fields.output, Some(Value::Str(value)) if value == "n 3"));
+    }
+
+    #[test]
+    fn rejects_interpolating_dynamic_vars() {
+        let errors = model(r#"vars { d = 1 + range(1, 2) } trace "t" { output = "${var.d}" }"#).unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::NonScalarInterpolation { .. }));
+    }
+
+    #[test]
+    fn rejects_dynamic_exprs_for_typed_fields() {
+        let errors = model(r#"trace "t" { tags = [range(1, 2) > 1 ? "a" : "b"] }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::TypeMismatch {
+                found: ExprType::Expr,
+                ..
+            }
+        ));
+        assert!(errors[0].to_string().contains("found expression"));
+
+        let errors = model(r#"trace "t" { metadata = 1 + range(0, 1) }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::TypeMismatch {
+                found: ExprType::Expr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn models_dynamic_operator_exprs() {
+        let source = r#"trace "t" { input = 1 + range(0, 1) }"#;
+        let model = model(source).unwrap();
+
+        let Some(Value::Binary { op, lhs, rhs, range }) = &model.traces[0].fields.input else {
+            panic!("expected a dynamic binary expression");
+        };
+        assert_eq!(*op, ast::BinOp::Add);
+        assert!(matches!(**lhs, Value::Num(Number::Int(1))));
+        assert!(matches!(**rhs, Value::Func(Func::Range(Range::Int { min: 0, max: 1 }))));
+        assert_eq!(&source[range.start..range.end], "1 + range(0, 1)");
+    }
+
+    #[test]
+    fn models_dynamic_ternaries() {
+        let model = model(r#"trace "t" { input = range(0, 1) == 0 ? "a" : "b" }"#).unwrap();
+
+        let Some(Value::Cond {
+            cond, then, otherwise, ..
+        }) = &model.traces[0].fields.input
+        else {
+            panic!("expected a dynamic conditional");
+        };
+        assert!(matches!(**cond, Value::Binary { op: ast::BinOp::Eq, .. }));
+        assert!(matches!(&**then, Value::Str(value) if value == "a"));
+        assert!(matches!(&**otherwise, Value::Str(value) if value == "b"));
+    }
+
+    #[test]
+    fn associates_operator_errors_with_spec_rules() {
+        let errors = model(r#"trace "t" { input = 1 + "a" }"#).unwrap_err();
+        assert!(
+            errors[0]
+                .to_string()
+                .contains(spec::SPEC.rule(spec::ids::OPERAND_TYPES).unwrap().summary)
+        );
+
+        let errors = model(r#"trace "t" { input = 1 / 0 }"#).unwrap_err();
+        assert!(
+            errors[0]
+                .to_string()
+                .contains(spec::SPEC.rule(spec::ids::NONZERO_DIVISORS).unwrap().summary)
+        );
+
+        let errors = model(r#"trace "t" { input = 1 ? 2 : 3 }"#).unwrap_err();
+        assert!(
+            errors[0]
+                .to_string()
+                .contains(spec::SPEC.rule(spec::ids::BOOLEAN_CONDITIONS).unwrap().summary)
         );
     }
 }

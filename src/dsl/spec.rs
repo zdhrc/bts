@@ -210,6 +210,12 @@ pub(crate) mod ids {
     pub(crate) const ARRAY: Id = Id::new("expr.array");
     pub(crate) const OBJECT: Id = Id::new("expr.object");
     pub(crate) const FUNC: Id = Id::new("expr.func");
+    pub(crate) const GROUPING: Id = Id::new("expr.grouping");
+    pub(crate) const UNARY: Id = Id::new("expr.unary");
+    pub(crate) const ARITHMETIC: Id = Id::new("expr.arithmetic");
+    pub(crate) const COMPARISON: Id = Id::new("expr.comparison");
+    pub(crate) const LOGICAL: Id = Id::new("expr.logical");
+    pub(crate) const CONDITIONAL: Id = Id::new("expr.conditional");
 
     pub(crate) const FUNC_CHOICE: Id = Id::new("func.choice");
     pub(crate) const FUNC_RANGE: Id = Id::new("func.range");
@@ -227,6 +233,9 @@ pub(crate) mod ids {
     pub(crate) const FUNC_POSITIONS: Id = Id::new("rule.function-positions");
     pub(crate) const CHOICE_ALTERNATIVES: Id = Id::new("rule.choice-alternatives");
     pub(crate) const RANGE_BOUNDS: Id = Id::new("rule.range-bounds");
+    pub(crate) const OPERAND_TYPES: Id = Id::new("rule.operand-types");
+    pub(crate) const BOOLEAN_CONDITIONS: Id = Id::new("rule.boolean-conditions");
+    pub(crate) const NONZERO_DIVISORS: Id = Id::new("rule.nonzero-divisors");
 
     pub(crate) const COMPLETE_TRACE: Id = Id::new("example.complete-trace");
 }
@@ -282,10 +291,11 @@ const IN_TRACE_OR_SPAN: &[Place] = &[
 ];
 
 const NO_RULES: &[RuleDesc] = &[];
-const FINITE_NUMBER_RULE: &[RuleDesc] = &[RuleDesc {
+const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
     id: ids::FINITE_NUMBERS,
     summary: "Every number must be representable as a finite integer or floating-point value.",
-}];
+};
+const FINITE_NUMBER_RULE: &[RuleDesc] = &[FINITE_NUMBERS_RULE];
 const UNIQUE_OBJECT_KEYS_RULE: &[RuleDesc] = &[RuleDesc {
     id: ids::UNIQUE_OBJECT_KEYS,
     summary: "An object key may appear at most once in an object.",
@@ -311,9 +321,26 @@ const FUNC_RULES: &[RuleDesc] = &[
     },
     RuleDesc {
         id: ids::FUNC_POSITIONS,
-        summary: "A function may only appear where any value is accepted; fields with a specific type and interpolations must use literals.",
+        summary: "A non-constant expression (a function call, or an operator expression containing one) may only appear where any value is accepted; fields with a specific type and interpolations must use values known before generation.",
     },
 ];
+const OPERAND_TYPES_RULE: RuleDesc = RuleDesc {
+    id: ids::OPERAND_TYPES,
+    summary: "Operator operands must have a known type: `+ - * / %` and `< <= > >=` take numbers, `== !=` compare two strings, two numbers, or two booleans, and `&& || !` take booleans.",
+};
+const NONZERO_DIVISORS_RULE: RuleDesc = RuleDesc {
+    id: ids::NONZERO_DIVISORS,
+    summary: "Division and remainder require a nonzero divisor; a constant zero divisor is rejected during validation, and a divisor that evaluates to zero fails generation.",
+};
+const BOOLEAN_CONDITIONS_RULE: RuleDesc = RuleDesc {
+    id: ids::BOOLEAN_CONDITIONS,
+    summary: "The condition of `?:` must be a boolean.",
+};
+const UNARY_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
+const ARITHMETIC_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE, NONZERO_DIVISORS_RULE, FINITE_NUMBERS_RULE];
+const COMPARISON_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
+const LOGICAL_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
+const CONDITIONAL_RULES: &[RuleDesc] = &[BOOLEAN_CONDITIONS_RULE];
 const CHOICE_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::CHOICE_ALTERNATIVES,
     summary: "`choice` takes at least one alternative.",
@@ -357,8 +384,8 @@ const EXPR_TYPES: &[ExprDesc] = &[
     },
     ExprDesc {
         id: ids::NUMBER,
-        syntax: "[-]digits[.digits]",
-        summary: "An integer or finite decimal number, optionally negative. The sign must be adjacent to the digits.",
+        syntax: "digits[.digits]",
+        summary: "An integer or finite decimal number. A leading `-` is unary negation, not part of the literal.",
         examples: &["4", "0.2", "-1.5"],
         rules: FINITE_NUMBER_RULE,
     },
@@ -396,6 +423,48 @@ const EXPR_TYPES: &[ExprDesc] = &[
         summary: "A call to a documented function, evaluated once per generated trace.",
         examples: &["choice(\"clear\", \"vague\")", "range(80, 400)"],
         rules: FUNC_RULES,
+    },
+    ExprDesc {
+        id: ids::GROUPING,
+        syntax: "(expression)",
+        summary: "Parentheses group a sub-expression to override operator precedence.",
+        examples: &["(1 + 2) * 3"],
+        rules: NO_RULES,
+    },
+    ExprDesc {
+        id: ids::UNARY,
+        syntax: "-value | !value",
+        summary: "Negates a number or inverts a boolean.",
+        examples: &["-4", "!var.cached"],
+        rules: UNARY_RULES,
+    },
+    ExprDesc {
+        id: ids::ARITHMETIC,
+        syntax: "a + b | a - b | a * b | a / b | a % b",
+        summary: "Arithmetic over numbers. Two integer operands produce an integer (`/` truncates toward zero); any float operand produces a float. Constant expressions are evaluated during validation; a divisor that evaluates to zero during generation fails the run.",
+        examples: &["7 / 2", "var.total * 0.5", "range(1, 5) * 100"],
+        rules: ARITHMETIC_RULES,
+    },
+    ExprDesc {
+        id: ids::COMPARISON,
+        syntax: "a == b | a != b | a < b | a <= b | a > b | a >= b",
+        summary: "Equality over two strings, two numbers, or two booleans; ordering over numbers. Produces a boolean.",
+        examples: &["var.model == \"gpt-4o\"", "range(1, 10) > 5"],
+        rules: COMPARISON_RULES,
+    },
+    ExprDesc {
+        id: ids::LOGICAL,
+        syntax: "a && b | a || b",
+        summary: "Boolean and/or. Short-circuits: the right operand is only evaluated when the left doesn't decide the result.",
+        examples: &["var.prod && !var.cached"],
+        rules: LOGICAL_RULES,
+    },
+    ExprDesc {
+        id: ids::CONDITIONAL,
+        syntax: "cond ? then : else",
+        summary: "Picks `then` when the condition is true, `else` otherwise. Right-associative; only the taken branch is evaluated for each generated trace.",
+        examples: &["var.tier == \"pro\" ? range(20, 80) : range(200, 800)"],
+        rules: CONDITIONAL_RULES,
     },
 ];
 
@@ -498,23 +567,33 @@ pub(crate) static SPEC: Spec = Spec {
     surface: SurfaceDesc {
         notation: "EBNF",
         grammar: r#"
-document    = { declaration } ;
-declaration = block | attribute ;
-block       = identifier, [ string ], "{", { declaration }, "}" ;
-attribute   = identifier, "=", expression ;
-expression  = string | number | boolean | null | array | object | variable | function ;
-boolean     = "true" | "false" ;
-null        = "null" ;
-variable    = "var", ".", identifier ;
-function    = identifier, "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
-array       = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
-object      = "{", { attribute }, "}" ;
-identifier  = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
-number      = [ "-" ], ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
-string      = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | interpolation }, '"' ;
-escape      = "$${" ;
-interpolation = "${", reference, "}" ;
-reference   = identifier, { ".", identifier } ;
+document       = { declaration } ;
+declaration    = block | attribute ;
+block          = identifier, [ string ], "{", { declaration }, "}" ;
+attribute      = identifier, "=", expression ;
+expression     = conditional ;
+conditional    = logical_or, [ "?", expression, ":", conditional ] ;
+logical_or     = logical_and, { "||", logical_and } ;
+logical_and    = equality, { "&&", equality } ;
+equality       = comparison, { ( "==" | "!=" ), comparison } ;
+comparison     = additive, { ( "<" | "<=" | ">" | ">=" ), additive } ;
+additive       = multiplicative, { ( "+" | "-" ), multiplicative } ;
+multiplicative = unary, { ( "*" | "/" | "%" ), unary } ;
+unary          = ( "-" | "!" ), unary | primary ;
+primary        = string | number | boolean | null | array | object | variable | function
+               | "(", expression, ")" ;
+boolean        = "true" | "false" ;
+null           = "null" ;
+variable       = "var", ".", identifier ;
+function       = identifier, "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
+array          = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
+object         = "{", { attribute }, "}" ;
+identifier     = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
+number         = ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
+string         = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | interpolation }, '"' ;
+escape         = "$${" ;
+interpolation  = "${", reference, "}" ;
+reference      = identifier, { ".", identifier } ;
 "#,
         notes: &[
             "Whitespace separates tokens and is otherwise insignificant.",
@@ -522,6 +601,9 @@ reference   = identifier, { ".", identifier } ;
             "Comments are not currently supported.",
             "Inside strings, `$${` escapes a literal `${`; any other `$` is literal.",
             "Block names are plain strings; interpolation is not allowed in them.",
+            "Binary operators are left-associative; `?:` is right-associative.",
+            "Interpolations accept references only, not operators or function calls.",
+            "A missing comma between numeric items parses as subtraction: `[1 -2]` is the one-element array `[-1]`.",
         ],
     },
     expressions: EXPR_TYPES,

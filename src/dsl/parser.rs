@@ -1,4 +1,4 @@
-use crate::dsl::ast::{Ast, Attr, Block, Decl, Expr, ExprKind};
+use crate::dsl::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, UnaryOp};
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::lexer::{Token, TokenKind, Tokens};
 use thiserror::Error as Err;
@@ -113,7 +113,90 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Option<Expr> {
+        self.parse_conditional()
+    }
+
+    // cond ? then : otherwise, right associative
+    fn parse_conditional(&mut self) -> Option<Expr> {
+        let cond = self.parse_binary(1)?;
+
+        if self.consume(token!(Question)).is_none() {
+            return Some(cond);
+        }
+
+        let then = self.parse_expr()?;
+        self.expect(token!(Colon), ErrorKind::ExpectedTernaryColon)?;
+        let otherwise = self.parse_conditional()?;
+
+        let range = SrcRange::new(cond.range.start, otherwise.range.end);
+        Some(Expr::new(
+            ExprKind::Cond {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                otherwise: Box::new(otherwise),
+            },
+            range,
+        ))
+    }
+
+    // left associative binary operators via precedence climbing
+    fn parse_binary(&mut self, min_level: u8) -> Option<Expr> {
+        let mut lhs = self.parse_unary()?;
+
+        while let Some((op, level)) = bin_op(&self.peek().kind) {
+            if level < min_level {
+                break;
+            }
+            self.next();
+
+            let rhs = self.parse_binary(level + 1)?;
+            let range = SrcRange::new(lhs.range.start, rhs.range.end);
+            lhs = Expr::new(
+                ExprKind::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                range,
+            );
+        }
+
+        Some(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Option<Expr> {
+        let range = self.peek().range;
+        let op = match &self.peek().kind {
+            TokenKind::Minus => UnaryOp::Neg,
+            TokenKind::Bang => UnaryOp::Not,
+            _ => return self.parse_primary(),
+        };
+        self.next();
+
+        let operand = self.parse_unary()?;
+        let range = SrcRange::new(range.start, operand.range.end);
+        Some(Expr::new(
+            ExprKind::Unary {
+                op,
+                operand: Box::new(operand),
+            },
+            range,
+        ))
+    }
+
+    fn parse_primary(&mut self) -> Option<Expr> {
         match &self.peek().kind {
+            TokenKind::LParen => {
+                let start = self.peek().range.start;
+                self.next();
+
+                let inner = self.parse_expr()?;
+                let end = self.peek().range.end;
+                self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
+
+                // no ast node for grouping, the widened range keeps diagnostics on the parens
+                Some(Expr::new(inner.kind, SrcRange::new(start, end)))
+            }
             TokenKind::String(_) => {
                 let range = self.peek().range;
                 let value = self.expect(token!(String(value)), ErrorKind::ExpectedStringLiteral)?;
@@ -258,6 +341,26 @@ impl Parser {
     }
 }
 
+// binding levels, higher binds tighter; unary and primary sit above all of these
+fn bin_op(kind: &TokenKind) -> Option<(BinOp, u8)> {
+    match kind {
+        TokenKind::PipePipe => Some((BinOp::Or, 1)),
+        TokenKind::AmpAmp => Some((BinOp::And, 2)),
+        TokenKind::EqEq => Some((BinOp::Eq, 3)),
+        TokenKind::NotEq => Some((BinOp::Ne, 3)),
+        TokenKind::Lt => Some((BinOp::Lt, 4)),
+        TokenKind::LtEq => Some((BinOp::Le, 4)),
+        TokenKind::Gt => Some((BinOp::Gt, 4)),
+        TokenKind::GtEq => Some((BinOp::Ge, 4)),
+        TokenKind::Plus => Some((BinOp::Add, 5)),
+        TokenKind::Minus => Some((BinOp::Sub, 5)),
+        TokenKind::Star => Some((BinOp::Mul, 6)),
+        TokenKind::Slash => Some((BinOp::Div, 6)),
+        TokenKind::Percent => Some((BinOp::Rem, 6)),
+        _ => None,
+    }
+}
+
 pub(super) fn parse(tokens: Vec<Token>) -> Result<Ast, Diags> {
     Parser::new(tokens)
         .parse()
@@ -291,6 +394,8 @@ pub(super) enum ErrorKind {
     InterpolatedName,
     #[error("expected variable name")]
     ExpectedVariableName,
+    #[error("expected `:` in conditional expression")]
+    ExpectedTernaryColon,
 }
 
 impl Error {
@@ -392,13 +497,29 @@ mod tests {
         let trace = block(&ast.decls[0]);
 
         assert!(matches!(attr(&trace.decls[0]).value.kind, ExprKind::Null));
-        assert!(matches!(&attr(&trace.decls[1]).value.kind, ExprKind::Num(value) if value == "-0.5"));
+
+        // a negative literal is unary negation now
+        let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = &attr(&trace.decls[1]).value.kind
+        else {
+            panic!("expected unary negation");
+        };
+        assert!(matches!(&operand.kind, ExprKind::Num(value) if value == "0.5"));
 
         let ExprKind::Array(items) = &attr(&trace.decls[2]).value.kind else {
             panic!("expected an array");
         };
         assert!(matches!(items[0].kind, ExprKind::Null));
-        assert!(matches!(&items[1].kind, ExprKind::Num(value) if value == "-1"));
+        let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = &items[1].kind
+        else {
+            panic!("expected unary negation");
+        };
+        assert!(matches!(&operand.kind, ExprKind::Num(value) if value == "1"));
     }
 
     #[test]
@@ -598,5 +719,215 @@ mod tests {
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].kind(), ErrorKind::ExpectedIdentifier);
         assert_eq!(errors[1].kind(), ErrorKind::ExpectedExpressionAssignment);
+    }
+
+    #[track_caller]
+    fn parse_value(source: &str) -> Expr {
+        let source = format!(r#"trace "t" {{ input = {source} }}"#);
+        let ast = parse(&source).unwrap();
+        attr(&block(&ast.decls[0]).decls[0]).value.clone()
+    }
+
+    fn binary(expr: &Expr) -> (BinOp, &Expr, &Expr) {
+        let ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
+            panic!("expected a binary expression");
+        };
+        (*op, lhs, rhs)
+    }
+
+    fn num(expr: &Expr) -> &str {
+        let ExprKind::Num(raw) = &expr.kind else {
+            panic!("expected a number literal");
+        };
+        raw
+    }
+
+    #[test]
+    fn parses_multiplication_tighter_than_addition() {
+        let expr = parse_value("1 + 2 * 3");
+
+        let (op, lhs, rhs) = binary(&expr);
+        assert_eq!(op, BinOp::Add);
+        assert_eq!(num(lhs), "1");
+        let (op, lhs, rhs) = binary(rhs);
+        assert_eq!(op, BinOp::Mul);
+        assert_eq!((num(lhs), num(rhs)), ("2", "3"));
+    }
+
+    #[test]
+    fn parses_parens_over_precedence_and_widens_the_range() {
+        let source = r#"trace "t" { input = (1 + 2) * 3 }"#;
+        let ast = parse(source).unwrap();
+        let expr = &attr(&block(&ast.decls[0]).decls[0]).value;
+
+        let (op, lhs, rhs) = binary(expr);
+        assert_eq!(op, BinOp::Mul);
+        assert_eq!(num(rhs), "3");
+        let (op, _, _) = binary(lhs);
+        assert_eq!(op, BinOp::Add);
+        // grouped expr keeps the parens in its range
+        assert_eq!(&source[lhs.range.start..lhs.range.end], "(1 + 2)");
+    }
+
+    #[test]
+    fn parses_left_associative_chains() {
+        let expr = parse_value("10 - 2 - 3");
+
+        let (op, lhs, rhs) = binary(&expr);
+        assert_eq!(op, BinOp::Sub);
+        assert_eq!(num(rhs), "3");
+        let (op, lhs, rhs) = binary(lhs);
+        assert_eq!(op, BinOp::Sub);
+        assert_eq!((num(lhs), num(rhs)), ("10", "2"));
+    }
+
+    #[test]
+    fn parses_comparisons_left_associative() {
+        let expr = parse_value("1 < 2 < 3");
+
+        let (op, lhs, rhs) = binary(&expr);
+        assert_eq!(op, BinOp::Lt);
+        assert_eq!(num(rhs), "3");
+        let (op, _, _) = binary(lhs);
+        assert_eq!(op, BinOp::Lt);
+    }
+
+    #[test]
+    fn parses_logical_looser_than_comparison() {
+        let expr = parse_value("1 < 2 && true || false");
+
+        let (op, lhs, _) = binary(&expr);
+        assert_eq!(op, BinOp::Or);
+        let (op, lhs, rhs) = binary(lhs);
+        assert_eq!(op, BinOp::And);
+        assert!(matches!(rhs.kind, ExprKind::Bool(true)));
+        let (op, _, _) = binary(lhs);
+        assert_eq!(op, BinOp::Lt);
+    }
+
+    #[test]
+    fn parses_unary_binding_tighter_than_binary() {
+        let expr = parse_value("-1 + 2");
+
+        let (op, lhs, rhs) = binary(&expr);
+        assert_eq!(op, BinOp::Add);
+        assert_eq!(num(rhs), "2");
+        let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = &lhs.kind
+        else {
+            panic!("expected unary negation");
+        };
+        assert_eq!(num(operand), "1");
+
+        let expr = parse_value("!true && false");
+        let (op, lhs, _) = binary(&expr);
+        assert_eq!(op, BinOp::And);
+        assert!(matches!(lhs.kind, ExprKind::Unary { op: UnaryOp::Not, .. }));
+    }
+
+    #[test]
+    fn parses_stacked_unary_operators() {
+        let expr = parse_value("--5");
+        let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = &expr.kind
+        else {
+            panic!("expected unary negation");
+        };
+        assert!(matches!(operand.kind, ExprKind::Unary { op: UnaryOp::Neg, .. }));
+
+        let expr = parse_value("!!true");
+        let ExprKind::Unary {
+            op: UnaryOp::Not,
+            operand,
+        } = &expr.kind
+        else {
+            panic!("expected unary not");
+        };
+        assert!(matches!(operand.kind, ExprKind::Unary { op: UnaryOp::Not, .. }));
+    }
+
+    #[test]
+    fn parses_ternaries_right_associative() {
+        let expr = parse_value("true ? 1 : false ? 2 : 3");
+
+        let ExprKind::Cond { cond, then, otherwise } = &expr.kind else {
+            panic!("expected a conditional");
+        };
+        assert!(matches!(cond.kind, ExprKind::Bool(true)));
+        assert_eq!(num(then), "1");
+        assert!(matches!(otherwise.kind, ExprKind::Cond { .. }));
+    }
+
+    #[test]
+    fn parses_a_ternary_nested_in_the_then_branch() {
+        let expr = parse_value("true ? false ? 1 : 2 : 3");
+
+        let ExprKind::Cond { then, otherwise, .. } = &expr.kind else {
+            panic!("expected a conditional");
+        };
+        assert!(matches!(then.kind, ExprKind::Cond { .. }));
+        assert_eq!(num(otherwise), "3");
+    }
+
+    #[test]
+    fn parses_operators_inside_arrays_args_and_objects() {
+        let expr = parse_value("[1 + 2]");
+        let ExprKind::Array(items) = &expr.kind else {
+            panic!("expected an array");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].kind, ExprKind::Binary { op: BinOp::Add, .. }));
+
+        let expr = parse_value("choice(1 + 2, true ? 1 : 2)");
+        let ExprKind::Func { args, .. } = &expr.kind else {
+            panic!("expected a function call");
+        };
+        assert_eq!(args.len(), 2);
+        assert!(matches!(args[0].kind, ExprKind::Binary { .. }));
+        assert!(matches!(args[1].kind, ExprKind::Cond { .. }));
+
+        let expr = parse_value("{ a = 1 + 2 b = 3 }");
+        let ExprKind::Object(attrs) = &expr.kind else {
+            panic!("expected an object");
+        };
+        assert_eq!(attrs.len(), 2);
+        assert!(matches!(attrs[0].value.kind, ExprKind::Binary { .. }));
+    }
+
+    #[test]
+    fn parses_a_missing_comma_between_numbers_as_subtraction() {
+        // documented behavior change: [1 -2] is subtraction, not two items
+        let expr = parse_value("[1 -2]");
+        let ExprKind::Array(items) = &expr.kind else {
+            panic!("expected an array");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0].kind, ExprKind::Binary { op: BinOp::Sub, .. }));
+    }
+
+    #[test]
+    fn rejects_a_binary_missing_its_right_operand() {
+        assert_error_kinds(r#"trace "t" { input = 1 + }"#, &[ErrorKind::ExpectedExpressionAssignment]);
+    }
+
+    #[test]
+    fn rejects_a_ternary_missing_its_colon() {
+        assert_error_kinds(r#"trace "t" { input = true ? 1 }"#, &[ErrorKind::ExpectedTernaryColon]);
+    }
+
+    #[test]
+    fn rejects_an_unclosed_group() {
+        // the missing rparen errors once, then recovery syncs on the closing brace
+        assert_error_kinds(r#"trace "t" { input = (1 + 2 }"#, &[ErrorKind::UnexpectedToken]);
+    }
+
+    #[test]
+    fn recovers_to_the_next_declaration_after_an_operator_error() {
+        // the dangling + errors once, output = 2 still parses as the next decl
+        assert_error_kinds(r#"trace "t" { input = 1 + output = 2 }"#, &[ErrorKind::UnexpectedToken]);
     }
 }

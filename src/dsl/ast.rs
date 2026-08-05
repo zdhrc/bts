@@ -1,4 +1,5 @@
 use crate::dsl::diag::SrcRange;
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ast {
@@ -42,7 +43,76 @@ pub enum ExprKind {
     Array(Vec<Expr>),
     Object(Vec<Attr>),
     VarRef(String),
-    Func { name: String, args: Vec<Expr> },
+    Func {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Unary {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Cond {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        otherwise: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+impl fmt::Display for UnaryOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Neg => "-",
+            Self::Not => "!",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+}
+
+impl fmt::Display for BinOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::Rem => "%",
+            Self::Eq => "==",
+            Self::Ne => "!=",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::And => "&&",
+            Self::Or => "||",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

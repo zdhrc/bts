@@ -6,7 +6,8 @@ mod modeler;
 mod parser;
 pub(crate) mod spec;
 
-pub(crate) use diag::Diags;
+pub(crate) use ast::{BinOp, UnaryOp};
+pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use model::{
     Array, CtxRef, Func, Model, Number, Object, ObjectField, Part, Range, Span, SpanFields, SpanKind, Template, Trace, Value,
 };

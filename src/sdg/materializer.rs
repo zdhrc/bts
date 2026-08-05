@@ -267,7 +267,7 @@ mod tests {
     fn materializes_fixture() {
         let model = compile(include_str!("../../tests/fixtures/simple.bt")).unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
-        let events = materialize(plan(model, 1, 0), Duration::from_secs(3_600), now).unwrap();
+        let events = materialize(plan(model, 1, 0).unwrap(), Duration::from_secs(3_600), now).unwrap();
 
         println!("{}", serde_json::to_string_pretty(&events).unwrap());
 
@@ -341,7 +341,7 @@ mod tests {
     fn spreads_generated_traces_across_the_window() {
         let model = compile(r#"trace "example" {}"#).unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
-        let events = materialize(plan(model, 3, 0), Duration::from_secs(3_600), now).unwrap();
+        let events = materialize(plan(model, 3, 0).unwrap(), Duration::from_secs(3_600), now).unwrap();
         let starts = events
             .events
             .iter()

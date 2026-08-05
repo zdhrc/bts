@@ -79,7 +79,21 @@ fn execute(matches: &ArgMatches) -> Result<(), Error> {
             seed
         }
     };
-    let events = sdg::generate(model, count, over, SystemTime::now(), seed)?;
+    let events = sdg::generate(model, count, over, SystemTime::now(), seed).map_err(|error| match error {
+        // expression evaluation failures render like compile diagnostics with line:col
+        sdg::GenerateError::Plan(plan_error) => Error::FailedGeneration {
+            details: render_diags(
+                path,
+                &source,
+                &vec![dsl::Diag {
+                    when: dsl::DiagPhase::Generation,
+                    what: plan_error.to_string(),
+                    r#where: plan_error.range,
+                }],
+            ),
+        },
+        other => Error::Generate(other),
+    })?;
 
     if matches.get_flag("dry-run") {
         println!("{}", serde_json::to_string_pretty(&events)?);
@@ -145,6 +159,9 @@ enum Error {
 
     #[error("shape is invalid:\n{details}")]
     InvalidShape { details: String },
+
+    #[error("generation failed:\n{details}")]
+    FailedGeneration { details: String },
 
     #[error(transparent)]
     Generate(#[from] sdg::GenerateError),

@@ -20,7 +20,8 @@ pub(crate) fn generate(
         return Err(GenerateError::EmptyShape);
     }
 
-    materializer::materialize(planner::plan(model, count, seed), over, now).map_err(GenerateError::Materialize)
+    let plan = planner::plan(model, count, seed).map_err(GenerateError::Plan)?;
+    materializer::materialize(plan, over, now).map_err(GenerateError::Materialize)
 }
 
 pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, writer::Error> {
@@ -31,6 +32,9 @@ pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertRe
 pub(crate) enum GenerateError {
     #[error("shape must contain at least one trace")]
     EmptyShape,
+
+    #[error("failed to evaluate an expression: {0}")]
+    Plan(#[source] planner::Error),
 
     #[error("failed to materialize traces: {0}")]
     Materialize(#[source] materializer::Error),

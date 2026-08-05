@@ -27,6 +27,7 @@ pub(crate) enum DiagPhase {
     Lexing,
     Parsing,
     Validation,
+    Generation,
 }
 
 impl fmt::Display for DiagPhase {
@@ -35,6 +36,7 @@ impl fmt::Display for DiagPhase {
             Self::Lexing => "lexing",
             Self::Parsing => "parsing",
             Self::Validation => "validation",
+            Self::Generation => "generation",
         })
     }
 }

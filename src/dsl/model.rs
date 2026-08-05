@@ -1,3 +1,6 @@
+use crate::dsl::ast::{BinOp, UnaryOp};
+use crate::dsl::diag::SrcRange;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Model {
     pub(crate) traces: Vec<Trace>,
@@ -43,6 +46,24 @@ pub(crate) enum Value {
     Array(Array),
     Object(Object),
     Func(Func),
+    // dynamic operator exprs, constant ones fold away in the modeler
+    Unary {
+        op: UnaryOp,
+        operand: Box<Value>,
+        range: SrcRange,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Value>,
+        rhs: Box<Value>,
+        range: SrcRange,
+    },
+    // no range, a conditional itself can't fail, only its operands can
+    Cond {
+        cond: Box<Value>,
+        then: Box<Value>,
+        otherwise: Box<Value>,
+    },
 }
 
 // already validated by the modeler so evaluating one can't fail

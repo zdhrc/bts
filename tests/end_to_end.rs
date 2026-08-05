@@ -15,8 +15,8 @@ trace "conversation" {
     task "turn" {
         llm "gpt-4o-mini" {
             input = "Hello ${trace.index}"
-            output = "Hi!"
-            metrics = { tokens = 4 }
+            output = choice(true, false) ? "Hi!" : "Hey!"
+            metrics = { tokens = 2 * 2 latency = range(1, 5) * 100 }
         }
     }
 }
@@ -24,7 +24,7 @@ trace "conversation" {
 
 #[test]
 fn dry_run_expands_a_shape_into_the_requested_window() {
-    let shape = write_shape();
+    let shape = write_shape(SIMPLE_SHAPE);
     let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
     let output = Command::new(env!("CARGO_BIN_EXE_bts"))
         .args(["generate", "--from"])
@@ -59,11 +59,39 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
     assert_eq!(inputs.len(), 25);
     assert!(inputs.contains("Hello 0"));
     assert!(inputs.contains("Hello 24"));
+
+    // operator exprs evaluate per event, constants fold and dynamics stay in range
+    for event in events.iter().filter(|event| event["metrics"]["tokens"].is_number()) {
+        assert_eq!(event["metrics"]["tokens"].as_i64().unwrap(), 4);
+        let latency = event["metrics"]["latency"].as_i64().unwrap();
+        assert!((100..=500).contains(&latency) && latency % 100 == 0);
+        assert!(matches!(event["output"].as_str().unwrap(), "Hi!" | "Hey!"));
+    }
+}
+
+#[test]
+fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
+    let shape = write_shape(r#"trace "t" { input = 100 / range(0, 0) }"#);
+    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+        .args(["generate", "--from"])
+        .arg(&shape)
+        .args(["--count", "1", "--over", "1h", "--dry-run", "--seed", "0"])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("generation failed:"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(":1:21: generation error: expression divides by zero"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
 fn writes_generated_events_to_the_configured_endpoint() {
-    let shape = write_shape();
+    let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
     let (api_url, request) = serve_insert(6);
     let output = Command::new(env!("CARGO_BIN_EXE_bts"))
@@ -87,9 +115,9 @@ fn writes_generated_events_to_the_configured_endpoint() {
     assert_eq!(payload["events"].as_array().unwrap().len(), 6);
 }
 
-fn write_shape() -> std::path::PathBuf {
+fn write_shape(source: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("bts-generate-{}.bt", Uuid::new_v4()));
-    fs::write(&path, SIMPLE_SHAPE).unwrap();
+    fs::write(&path, source).unwrap();
     path
 }
 

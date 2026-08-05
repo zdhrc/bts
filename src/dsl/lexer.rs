@@ -33,6 +33,23 @@ pub(super) enum TokenKind {
     Dot,
     Equals,
 
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    EqEq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    AmpAmp,
+    PipePipe,
+    Bang,
+    Question,
+    Colon,
+
     Ident(String),
     String(String),
     Template(Vec<TemplatePart>),
@@ -73,7 +90,51 @@ impl<'src> Lexer<'src> {
                 // punctuation
                 ',' => tokens.push(Token::new(TokenKind::Comma, idx, idx + ch.len_utf8())),
                 '.' => tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8())),
-                '=' => tokens.push(Token::new(TokenKind::Equals, idx, idx + ch.len_utf8())),
+
+                // operators, = peeks for == and so on
+                '+' => tokens.push(Token::new(TokenKind::Plus, idx, idx + ch.len_utf8())),
+                '-' => tokens.push(Token::new(TokenKind::Minus, idx, idx + ch.len_utf8())),
+                '*' => tokens.push(Token::new(TokenKind::Star, idx, idx + ch.len_utf8())),
+                '/' => tokens.push(Token::new(TokenKind::Slash, idx, idx + ch.len_utf8())),
+                '%' => tokens.push(Token::new(TokenKind::Percent, idx, idx + ch.len_utf8())),
+                '?' => tokens.push(Token::new(TokenKind::Question, idx, idx + ch.len_utf8())),
+                ':' => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
+                '=' => match self.lex_paired(ch) {
+                    Some(end) => tokens.push(Token::new(TokenKind::EqEq, idx, end)),
+                    None => tokens.push(Token::new(TokenKind::Equals, idx, idx + ch.len_utf8())),
+                },
+                '!' => match self.lex_trailing('=') {
+                    Some(end) => tokens.push(Token::new(TokenKind::NotEq, idx, end)),
+                    None => tokens.push(Token::new(TokenKind::Bang, idx, idx + ch.len_utf8())),
+                },
+                '<' => match self.lex_trailing('=') {
+                    Some(end) => tokens.push(Token::new(TokenKind::LtEq, idx, end)),
+                    None => tokens.push(Token::new(TokenKind::Lt, idx, idx + ch.len_utf8())),
+                },
+                '>' => match self.lex_trailing('=') {
+                    Some(end) => tokens.push(Token::new(TokenKind::GtEq, idx, end)),
+                    None => tokens.push(Token::new(TokenKind::Gt, idx, idx + ch.len_utf8())),
+                },
+
+                // & and | only exist doubled
+                '&' => match self.lex_paired(ch) {
+                    Some(end) => tokens.push(Token::new(TokenKind::AmpAmp, idx, end)),
+                    None => {
+                        errors.push(Error::new(
+                            ErrorKind::UnpairedOperator(ch),
+                            SrcRange::new(idx, idx + ch.len_utf8()),
+                        ));
+                    }
+                },
+                '|' => match self.lex_paired(ch) {
+                    Some(end) => tokens.push(Token::new(TokenKind::PipePipe, idx, end)),
+                    None => {
+                        errors.push(Error::new(
+                            ErrorKind::UnpairedOperator(ch),
+                            SrcRange::new(idx, idx + ch.len_utf8()),
+                        ));
+                    }
+                },
 
                 // ident:
                 // - first char must be alphabetic
@@ -94,7 +155,8 @@ impl<'src> Lexer<'src> {
                                 self.next();
                             }
                             c if c.is_whitespace() => break,
-                            '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' => break,
+                            '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' | '+' | '*' | '/' | '%' | '<'
+                            | '>' | '!' | '&' | '|' | '?' | ':' => break,
                             _ => {
                                 errors.push(Error::new(
                                     ErrorKind::InvalidIdentToken,
@@ -121,17 +183,6 @@ impl<'src> Lexer<'src> {
                     let token = self.lex_number(idx, ch, &mut errors);
                     tokens.push(token);
                 }
-
-                // a minus sign is only valid immediately before a digit
-                '-' => match self.peek() {
-                    Some((_, next)) if next.is_ascii_digit() => {
-                        let token = self.lex_number(idx, ch, &mut errors);
-                        tokens.push(token);
-                    }
-                    _ => {
-                        errors.push(Error::new(ErrorKind::UnknownToken, SrcRange::new(idx, idx + ch.len_utf8())));
-                    }
-                },
 
                 // errors
                 _ => {
@@ -286,6 +337,21 @@ impl<'src> Lexer<'src> {
     fn next(&mut self) -> Option<(usize, char)> {
         self.chars.next()
     }
+
+    // consumes the trailing char of a two-char operator, returns its end
+    fn lex_trailing(&mut self, trailing: char) -> Option<usize> {
+        match self.peek() {
+            Some((idx, ch)) if ch == trailing => {
+                self.next();
+                Some(idx + ch.len_utf8())
+            }
+            _ => None,
+        }
+    }
+
+    fn lex_paired(&mut self, ch: char) -> Option<usize> {
+        self.lex_trailing(ch)
+    }
 }
 
 // a reference is a dotted ident path, whitespace around segments is fine
@@ -332,6 +398,8 @@ pub(super) enum ErrorKind {
     InvalidReference,
     #[error("invalid number")]
     InvalidNumber,
+    #[error("stray `{0}`; did you mean `{0}{0}`?")]
+    UnpairedOperator(char),
 }
 
 impl Error {
@@ -388,17 +456,126 @@ mod tests {
     fn rejects_numbers_with_multiple_dec_points() {
         assert_error_kinds("5.6.4.3", &[ErrorKind::InvalidNumber]);
         assert_error_kinds("1..", &[ErrorKind::InvalidNumber]);
-        assert_error_kinds("-5.6.4", &[ErrorKind::InvalidNumber]);
     }
 
     #[test]
-    fn lexes_negative_numbers_as_single_tokens() {
-        let tokens = Lexer::new("-5 -0.25").lex().unwrap();
+    fn lexes_minus_as_an_operator_token() {
+        for src in ["-5", "- 5"] {
+            let tokens = Lexer::new(src).lex().unwrap();
+            let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
 
-        assert_eq!(tokens[0].kind, TokenKind::Number("-5".to_owned()));
+            assert_eq!(kinds, [TokenKind::Minus, TokenKind::Number("5".to_owned()), TokenKind::Eof]);
+        }
+
+        let tokens = Lexer::new("-x").lex().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Minus);
+        assert_eq!(tokens[1].kind, TokenKind::Ident("x".to_owned()));
+    }
+
+    #[test]
+    fn lexes_single_char_operators_with_ranges() {
+        let tokens = Lexer::new("+ - * / % ? : ! < >").lex().unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+                TokenKind::Percent,
+                TokenKind::Question,
+                TokenKind::Colon,
+                TokenKind::Bang,
+                TokenKind::Lt,
+                TokenKind::Gt,
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(tokens[0].range, SrcRange::new(0, 1));
+        assert_eq!(tokens[9].range, SrcRange::new(18, 19));
+    }
+
+    #[test]
+    fn lexes_two_char_operators_over_their_full_range() {
+        let tokens = Lexer::new("== != <= >= && ||").lex().unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::EqEq,
+                TokenKind::NotEq,
+                TokenKind::LtEq,
+                TokenKind::GtEq,
+                TokenKind::AmpAmp,
+                TokenKind::PipePipe,
+                TokenKind::Eof,
+            ]
+        );
         assert_eq!(tokens[0].range, SrcRange::new(0, 2));
-        assert_eq!(tokens[1].kind, TokenKind::Number("-0.25".to_owned()));
-        assert_eq!(tokens[1].range, SrcRange::new(3, 8));
+        assert_eq!(tokens[5].range, SrcRange::new(15, 17));
+    }
+
+    #[test]
+    fn distinguishes_adjacent_operators_without_whitespace() {
+        let tokens = Lexer::new("a==b a=b !x x!=y").lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Ident("a".to_owned()),
+                TokenKind::EqEq,
+                TokenKind::Ident("b".to_owned()),
+                TokenKind::Ident("a".to_owned()),
+                TokenKind::Equals,
+                TokenKind::Ident("b".to_owned()),
+                TokenKind::Bang,
+                TokenKind::Ident("x".to_owned()),
+                TokenKind::Ident("x".to_owned()),
+                TokenKind::NotEq,
+                TokenKind::Ident("y".to_owned()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn breaks_idents_at_operator_characters() {
+        let tokens = Lexer::new("foo+bar cond?x:y").lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Ident("foo".to_owned()),
+                TokenKind::Plus,
+                TokenKind::Ident("bar".to_owned()),
+                TokenKind::Ident("cond".to_owned()),
+                TokenKind::Question,
+                TokenKind::Ident("x".to_owned()),
+                TokenKind::Colon,
+                TokenKind::Ident("y".to_owned()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unpaired_logical_operators() {
+        assert_error_kinds("a & b", &[ErrorKind::UnpairedOperator('&')]);
+        assert_error_kinds("a | b", &[ErrorKind::UnpairedOperator('|')]);
+
+        let errors = Lexer::new("a & b").lex().unwrap_err();
+        assert_eq!(errors[0].range(), SrcRange::new(2, 3));
+    }
+
+    #[test]
+    fn keeps_operators_inside_interpolations_invalid() {
+        assert_error_kinds(r#""${a + b}""#, &[ErrorKind::InvalidReference]);
+        assert_error_kinds(r#""${x?y:z}""#, &[ErrorKind::InvalidReference]);
     }
 
     #[test]
@@ -489,13 +666,6 @@ mod tests {
         for src in [r#""${}""#, r#""${1x}""#, r#""${tr ace}""#, r#""${trace.}""#, r#""${.index}""#] {
             assert_error_kinds(src, &[ErrorKind::InvalidReference]);
         }
-    }
-
-    #[test]
-    fn rejects_a_minus_without_an_adjacent_digit() {
-        assert_error_kinds("- 5", &[ErrorKind::UnknownToken]);
-        assert_error_kinds("-x", &[ErrorKind::UnknownToken]);
-        assert_error_kinds("-.5", &[ErrorKind::UnknownToken]);
     }
 
     #[test]
