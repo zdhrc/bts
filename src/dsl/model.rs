@@ -64,6 +64,12 @@ pub(crate) enum Value {
         then: Box<Value>,
         otherwise: Box<Value>,
     },
+    // dynamic index selections, constant ones fold away in the modeler
+    Index {
+        target: Box<Value>,
+        index: Box<Value>,
+        range: SrcRange,
+    },
 }
 
 // already validated by the modeler so evaluating one can't fail

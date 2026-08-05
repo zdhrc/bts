@@ -38,8 +38,11 @@ impl ExprType {
             ast::ExprKind::Array(_) => Self::Array,
             ast::ExprKind::Object(_) => Self::Object,
             ast::ExprKind::Func { .. } => Self::Func,
-            // constant operator exprs fold to literals, only dynamic ones get here
-            ast::ExprKind::Unary { .. } | ast::ExprKind::Binary { .. } | ast::ExprKind::Cond { .. } => Self::Expr,
+            // constant operator and index exprs fold to literals, only dynamic ones get here
+            ast::ExprKind::Unary { .. }
+            | ast::ExprKind::Binary { .. }
+            | ast::ExprKind::Cond { .. }
+            | ast::ExprKind::Index { .. } => Self::Expr,
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
         }
     }
@@ -274,6 +277,14 @@ impl Modeler {
                     otherwise: Box::new(otherwise?),
                 }
             }
+            ast::ExprKind::Index { target, index } => {
+                let target = self.resolve_expr(*target);
+                let index = self.resolve_expr(*index);
+                ast::ExprKind::Index {
+                    target: Box::new(target?),
+                    index: Box::new(index?),
+                }
+            }
             kind => kind,
         };
 
@@ -334,6 +345,7 @@ impl Modeler {
             ast::ExprKind::Unary { op, operand } => return self.fold_unary(op, *operand, range),
             ast::ExprKind::Binary { op, lhs, rhs } => return self.fold_binary(op, *lhs, *rhs, range),
             ast::ExprKind::Cond { cond, then, otherwise } => return self.fold_cond(*cond, *then, *otherwise, range),
+            ast::ExprKind::Index { target, index } => return self.fold_index(*target, *index, range),
             ast::ExprKind::Array(values) => {
                 let mut folded = Vec::with_capacity(values.len());
                 let mut valid = true;
@@ -498,6 +510,103 @@ impl Modeler {
             },
             range,
         ))
+    }
+
+    fn fold_index(&mut self, target: ast::Expr, index: ast::Expr, range: SrcRange) -> Option<ast::Expr> {
+        // fold both sides first so each reports its own diagnostics
+        let target = self.fold_expr(target);
+        let index = self.fold_expr(index);
+        let (target, index) = (target?, index?);
+
+        let expected = match static_type(&target) {
+            Some(StaticType::Array) => StaticType::Number,
+            Some(StaticType::Object) => StaticType::String,
+            _ => {
+                self.errors.push(Error::new(
+                    ErrorKind::NonIndexableTarget {
+                        rule: spec::ids::INDEXABLE_TARGETS,
+                        found: found_type(&target),
+                    },
+                    target.range,
+                ));
+                return None;
+            }
+        };
+
+        if static_type(&index) != Some(expected) {
+            self.errors.push(Error::new(
+                ErrorKind::IndexTypeMismatch {
+                    rule: spec::ids::INDEXABLE_TARGETS,
+                    expected: type_name(expected),
+                    found: found_type(&index),
+                },
+                index.range,
+            ));
+            return None;
+        }
+
+        // a constant index into a container literal selects its element during
+        // validation, the element itself may still be dynamic
+        match target.kind {
+            ast::ExprKind::Array(values) if expr_is_constant(&index) => {
+                let Const::Num(number) = self.const_scalar(&index)? else {
+                    unreachable!("index was type checked as a number");
+                };
+                let Number::Int(position) = number else {
+                    self.errors.push(Error::new(
+                        ErrorKind::NonIntegerIndex {
+                            rule: spec::ids::INDEXABLE_TARGETS,
+                        },
+                        index.range,
+                    ));
+                    return None;
+                };
+
+                match usize::try_from(position).ok().filter(|&position| position < values.len()) {
+                    Some(position) => {
+                        let selected = values.into_iter().nth(position).expect("position is in bounds");
+                        Some(ast::Expr::new(selected.kind, range))
+                    }
+                    None => {
+                        self.errors.push(Error::new(
+                            ErrorKind::IndexOutOfBounds {
+                                rule: spec::ids::INDEX_BOUNDS,
+                                index: position,
+                                len: values.len(),
+                            },
+                            index.range,
+                        ));
+                        None
+                    }
+                }
+            }
+            ast::ExprKind::Object(attrs) if expr_is_constant(&index) => {
+                let Const::Str(key) = self.const_scalar(&index)? else {
+                    unreachable!("index was type checked as a string");
+                };
+
+                match attrs.into_iter().find(|attr| attr.key == key) {
+                    Some(attr) => Some(ast::Expr::new(attr.value.kind, range)),
+                    None => {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownObjectKey {
+                                rule: spec::ids::INDEX_BOUNDS,
+                                key,
+                            },
+                            index.range,
+                        ));
+                        None
+                    }
+                }
+            }
+            kind => Some(ast::Expr::new(
+                ast::ExprKind::Index {
+                    target: Box::new(ast::Expr::new(kind, target.range)),
+                    index: Box::new(index),
+                },
+                range,
+            )),
+        }
     }
 
     fn check_operand(&mut self, operand: &ast::Expr, required: StaticType, op: String) -> bool {
@@ -905,6 +1014,15 @@ impl Modeler {
                     otherwise: Box::new(otherwise?),
                 })
             }
+            ast::ExprKind::Index { target, index } => {
+                let target = self.model_value(*target);
+                let index = self.model_value(*index);
+                Some(Value::Index {
+                    target: Box::new(target?),
+                    index: Box::new(index?),
+                    range,
+                })
+            }
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before model lowering"),
         }
     }
@@ -1137,6 +1255,7 @@ fn expr_references_vars(expr: &ast::Expr) -> bool {
         ast::ExprKind::Cond { cond, then, otherwise } => {
             expr_references_vars(cond) || expr_references_vars(then) || expr_references_vars(otherwise)
         }
+        ast::ExprKind::Index { target, index } => expr_references_vars(target) || expr_references_vars(index),
         _ => false,
     }
 }
@@ -1208,22 +1327,31 @@ fn static_type(expr: &ast::Expr) -> Option<StaticType> {
         ast::ExprKind::Func { name, args } => match name.as_str() {
             "range" => Some(StaticType::Number),
             // a choice is only typed when every alternative agrees
-            "choice" => {
-                let mut unified = None;
-                for arg in args {
-                    let arg = static_type(arg)?;
-                    match unified {
-                        None => unified = Some(arg),
-                        Some(previous) if previous == arg => {}
-                        Some(_) => return None,
-                    }
-                }
-                unified
-            }
+            "choice" => unify_static_types(args.iter()),
+            _ => None,
+        },
+        // a dynamic index is only typed when the target is a literal with agreeing elements
+        ast::ExprKind::Index { target, .. } => match &target.kind {
+            ast::ExprKind::Array(values) => unify_static_types(values.iter()),
+            ast::ExprKind::Object(attrs) => unify_static_types(attrs.iter().map(|attr| &attr.value)),
             _ => None,
         },
         ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
     }
+}
+
+// none when empty or the types disagree
+fn unify_static_types<'a>(exprs: impl Iterator<Item = &'a ast::Expr>) -> Option<StaticType> {
+    let mut unified = None;
+    for expr in exprs {
+        let expr = static_type(expr)?;
+        match unified {
+            None => unified = Some(expr),
+            Some(previous) if previous == expr => {}
+            Some(_) => return None,
+        }
+    }
+    unified
 }
 
 // the found side of operand diagnostics, prefers the static type over the expr shape
@@ -1262,6 +1390,8 @@ fn expr_is_constant(expr: &ast::Expr) -> bool {
         ast::ExprKind::Cond { cond, then, otherwise } => {
             expr_is_constant(cond) && expr_is_constant(then) && expr_is_constant(otherwise)
         }
+        // constant indexes fold away, a residual one is dynamic
+        ast::ExprKind::Index { .. } => false,
         _ => true,
     }
 }
@@ -1484,6 +1614,27 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
         found: ExprType,
     },
+    NonIndexableTarget {
+        rule: spec::Id,
+        found: ExprType,
+    },
+    IndexTypeMismatch {
+        rule: spec::Id,
+        expected: &'static str,
+        found: ExprType,
+    },
+    NonIntegerIndex {
+        rule: spec::Id,
+    },
+    IndexOutOfBounds {
+        rule: spec::Id,
+        index: i64,
+        len: usize,
+    },
+    UnknownObjectKey {
+        rule: spec::Id,
+        key: String,
+    },
     DivisionByZero {
         rule: spec::Id,
         op: String,
@@ -1644,6 +1795,30 @@ impl fmt::Display for ErrorKind {
                     "conditional expects a boolean condition, but found {found}; {}",
                     rule.summary
                 )
+            }
+            Self::NonIndexableTarget { rule, found } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "cannot index into {found}; {}", rule.summary)
+            }
+            Self::IndexTypeMismatch { rule, expected, found } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "index expects {expected}, but found {found}; {}", rule.summary)
+            }
+            Self::NonIntegerIndex { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "array index must be an integer; {}", rule.summary)
+            }
+            Self::IndexOutOfBounds { rule, index, len } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "index {index} is out of bounds for an array of {len} elements; {}",
+                    rule.summary
+                )
+            }
+            Self::UnknownObjectKey { rule, key } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "object has no key `{key}`; {}", rule.summary)
             }
             Self::DivisionByZero { rule, op } => {
                 let rule = rule_desc(*rule);
@@ -2683,6 +2858,191 @@ mod tests {
         assert!(matches!(**cond, Value::Binary { op: ast::BinOp::Eq, .. }));
         assert!(matches!(&**then, Value::Str(value) if value == "a"));
         assert!(matches!(&**otherwise, Value::Str(value) if value == "b"));
+    }
+
+    #[test]
+    fn folds_constant_indexes_into_literal_containers() {
+        let model = model(
+            r#"
+            vars {
+                xs = [10, 20, 30]
+                user = { name = "ada" langs = ["en", "fr"] }
+            }
+            trace "t" {
+                input = var.xs[1 + 1]
+                output = var.user["name"]
+                metrics = { pick = [{ n = 1 }, { n = 2 }][0].n }
+                tags = [var.user.langs[1]]
+            }
+            "#,
+        )
+        .unwrap();
+        let fields = &model.traces[0].fields;
+
+        assert!(matches!(fields.input, Some(Value::Num(Number::Int(30)))));
+        assert!(matches!(&fields.output, Some(Value::Str(value)) if value == "ada"));
+        let metrics = fields.metrics.as_ref().unwrap();
+        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Int(1))));
+        assert_eq!(tag_text(&fields.tags[0]), "fr");
+    }
+
+    #[test]
+    fn folds_a_constant_index_selecting_a_dynamic_element() {
+        // selection is static even though the selected element is not
+        let model = model(r#"trace "t" { input = [range(1, 5), "x"][0] }"#).unwrap();
+
+        assert!(matches!(
+            model.traces[0].fields.input,
+            Some(Value::Func(Func::Range(Range::Int { min: 1, max: 5 })))
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_constant_indexes() {
+        let source = r#"trace "t" { input = [1, 2][2] }"#;
+        let errors = model(source).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::IndexOutOfBounds {
+                rule: spec::ids::INDEX_BOUNDS,
+                index: 2,
+                len: 2,
+            }
+        );
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "2");
+
+        let errors = model(r#"trace "t" { input = [1, 2][-1] }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::IndexOutOfBounds { index: -1, .. }));
+    }
+
+    #[test]
+    fn rejects_unknown_constant_object_keys() {
+        let errors = model(r#"trace "t" { input = { a = 1 }.b }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::UnknownObjectKey {
+                rule: spec::ids::INDEX_BOUNDS,
+                key: "b".to_owned(),
+            }
+        );
+        assert!(errors[0].to_string().contains("object has no key `b`"));
+    }
+
+    #[test]
+    fn rejects_non_integer_constant_indexes() {
+        let errors = model(r#"trace "t" { input = [1, 2][0.5] }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonIntegerIndex {
+                rule: spec::ids::INDEXABLE_TARGETS,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_indexing_non_containers() {
+        for (source, found) in [
+            (r#"trace "t" { input = 5[0] }"#, ExprType::Number),
+            (r#"trace "t" { input = "x"[0] }"#, ExprType::String),
+            (r#"trace "t" { input = true.a }"#, ExprType::Boolean),
+            (r#"trace "t" { input = null[0] }"#, ExprType::Null),
+            (r#"trace "t" { input = range(1, 2)[0] }"#, ExprType::Number),
+        ] {
+            let errors = model(source).unwrap_err();
+            assert_eq!(
+                errors[0].kind(),
+                &ErrorKind::NonIndexableTarget {
+                    rule: spec::ids::INDEXABLE_TARGETS,
+                    found,
+                },
+                "source: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mismatched_index_types() {
+        let errors = model(r#"trace "t" { input = [1, 2]["a"] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::IndexTypeMismatch {
+                rule: spec::ids::INDEXABLE_TARGETS,
+                expected: "number",
+                found: ExprType::String,
+            }
+        );
+
+        let errors = model(r#"trace "t" { input = { a = 1 }[0] }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::IndexTypeMismatch {
+                rule: spec::ids::INDEXABLE_TARGETS,
+                expected: "string",
+                found: ExprType::Number,
+            }
+        );
+
+        // a heterogeneous choice has no static type, so it can't index
+        let errors = model(r#"trace "t" { input = [1, 2][choice(0, "a")] }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::IndexTypeMismatch {
+                found: ExprType::Func,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn models_dynamic_index_selections() {
+        let source = r#"trace "t" { input = [1, 2][range(0, 1)] }"#;
+        let model = model(source).unwrap();
+
+        let Some(Value::Index { target, index, range }) = &model.traces[0].fields.input else {
+            panic!("expected a dynamic index expression");
+        };
+        assert!(matches!(&**target, Value::Array(array) if array.elem.len() == 2));
+        assert!(matches!(**index, Value::Func(Func::Range(Range::Int { min: 0, max: 1 }))));
+        assert_eq!(&source[range.start..range.end], "[1, 2][range(0, 1)]");
+    }
+
+    #[test]
+    fn types_dynamic_indexes_by_their_unified_element_type() {
+        // homogeneous elements type the index, so it can be an operand
+        let model = model(r#"trace "t" { metrics = { n = [1, 2][range(0, 1)] * 10 } }"#).unwrap();
+        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
+        assert!(matches!(metrics.elem[0].value, Value::Binary { .. }));
+    }
+
+    #[test]
+    fn rejects_untyped_dynamic_indexes_as_operands_and_typed_fields() {
+        let errors = model(r#"trace "t" { input = [1, "a"][range(0, 1)] + 1 }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::OperandTypeMismatch {
+                found: ExprType::Expr,
+                ..
+            }
+        ));
+
+        let errors = model(r#"trace "t" { tags = [["a", "b"][range(0, 1)]] }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::TypeMismatch {
+                found: ExprType::Expr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_index_exprs_referencing_vars_in_vars() {
+        let errors = model(r#"vars { a = [1] b = var.a[0] } trace "t" { input = 1 }"#).unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
     }
 
     #[test]

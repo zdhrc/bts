@@ -210,6 +210,7 @@ pub(crate) mod ids {
     pub(crate) const ARRAY: Id = Id::new("expr.array");
     pub(crate) const OBJECT: Id = Id::new("expr.object");
     pub(crate) const FUNC: Id = Id::new("expr.func");
+    pub(crate) const INDEX: Id = Id::new("expr.index");
     pub(crate) const GROUPING: Id = Id::new("expr.grouping");
     pub(crate) const UNARY: Id = Id::new("expr.unary");
     pub(crate) const ARITHMETIC: Id = Id::new("expr.arithmetic");
@@ -234,6 +235,8 @@ pub(crate) mod ids {
     pub(crate) const CHOICE_ALTERNATIVES: Id = Id::new("rule.choice-alternatives");
     pub(crate) const RANGE_BOUNDS: Id = Id::new("rule.range-bounds");
     pub(crate) const OPERAND_TYPES: Id = Id::new("rule.operand-types");
+    pub(crate) const INDEXABLE_TARGETS: Id = Id::new("rule.indexable-targets");
+    pub(crate) const INDEX_BOUNDS: Id = Id::new("rule.index-bounds");
     pub(crate) const BOOLEAN_CONDITIONS: Id = Id::new("rule.boolean-conditions");
     pub(crate) const NONZERO_DIVISORS: Id = Id::new("rule.nonzero-divisors");
 
@@ -349,6 +352,16 @@ const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::RANGE_BOUNDS,
     summary: "`range` takes exactly two finite numbers with min <= max.",
 }];
+const INDEX_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::INDEXABLE_TARGETS,
+        summary: "Indexing requires an array or object target: arrays take an integer index, objects take a string key.",
+    },
+    RuleDesc {
+        id: ids::INDEX_BOUNDS,
+        summary: "An array index must be within bounds and an object key must be present; constant violations are rejected during validation, dynamic ones fail the run during generation.",
+    },
+];
 const VAR_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::DEFINED_VARS,
@@ -423,6 +436,18 @@ const EXPR_TYPES: &[ExprDesc] = &[
         summary: "A call to a documented function, evaluated once per generated trace.",
         examples: &["choice(\"clear\", \"vague\")", "range(80, 400)"],
         rules: FUNC_RULES,
+    },
+    ExprDesc {
+        id: ids::INDEX,
+        syntax: "value[index] | value.field",
+        summary: "Selects an array element by 0-based integer index or an object value by string key. `value.field` is shorthand for `value[\"field\"]`; the bracketed index may be any expression, evaluated per generated trace.",
+        examples: &[
+            "var.models[0]",
+            "var.user[\"name\"]",
+            "var.user.name",
+            "var.models[choice(0, 1, 2)]",
+        ],
+        rules: INDEX_RULES,
     },
     ExprDesc {
         id: ids::GROUPING,
@@ -579,7 +604,8 @@ equality       = comparison, { ( "==" | "!=" ), comparison } ;
 comparison     = additive, { ( "<" | "<=" | ">" | ">=" ), additive } ;
 additive       = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative = unary, { ( "*" | "/" | "%" ), unary } ;
-unary          = ( "-" | "!" ), unary | primary ;
+unary          = ( "-" | "!" ), unary | postfix ;
+postfix        = primary, { "[", expression, "]" | ".", identifier } ;
 primary        = string | number | boolean | null | array | object | variable | function
                | "(", expression, ")" ;
 boolean        = "true" | "false" ;
@@ -604,6 +630,7 @@ reference      = identifier, { ".", identifier } ;
             "Binary operators are left-associative; `?:` is right-associative.",
             "Interpolations accept references only, not operators or function calls.",
             "A missing comma between numeric items parses as subtraction: `[1 -2]` is the one-element array `[-1]`.",
+            "A missing comma before an item starting with `[` parses as an index: `[var.a [0]]` is the one-element array `[var.a[0]]`.",
         ],
     },
     expressions: EXPR_TYPES,

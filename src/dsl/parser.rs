@@ -169,7 +169,7 @@ impl Parser {
         let op = match &self.peek().kind {
             TokenKind::Minus => UnaryOp::Neg,
             TokenKind::Bang => UnaryOp::Not,
-            _ => return self.parse_primary(),
+            _ => return self.parse_postfix(),
         };
         self.next();
 
@@ -182,6 +182,48 @@ impl Parser {
             },
             range,
         ))
+    }
+
+    // x[i] and x.f, .f sugars to ["f"]
+    fn parse_postfix(&mut self) -> Option<Expr> {
+        let mut expr = self.parse_primary()?;
+
+        loop {
+            match &self.peek().kind {
+                TokenKind::LBrack => {
+                    self.next();
+                    let index = self.parse_expr()?;
+                    let end = self.peek().range.end;
+                    self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+
+                    let range = SrcRange::new(expr.range.start, end);
+                    expr = Expr::new(
+                        ExprKind::Index {
+                            target: Box::new(expr),
+                            index: Box::new(index),
+                        },
+                        range,
+                    );
+                }
+                TokenKind::Dot => {
+                    self.next();
+                    let name_range = self.peek().range;
+                    let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedAccessorField)?;
+
+                    let range = SrcRange::new(expr.range.start, name_range.end);
+                    expr = Expr::new(
+                        ExprKind::Index {
+                            target: Box::new(expr),
+                            index: Box::new(Expr::new(ExprKind::Str(name), name_range)),
+                        },
+                        range,
+                    );
+                }
+                _ => break,
+            }
+        }
+
+        Some(expr)
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
@@ -394,6 +436,8 @@ pub(super) enum ErrorKind {
     InterpolatedName,
     #[error("expected variable name")]
     ExpectedVariableName,
+    #[error("expected field name after `.`")]
+    ExpectedAccessorField,
     #[error("expected `:` in conditional expression")]
     ExpectedTernaryColon,
 }
@@ -615,6 +659,76 @@ mod tests {
     fn rejects_incomplete_variable_references() {
         assert_error_kinds(r#"trace "a" { metadata = var }"#, &[ErrorKind::ExpectedVariableName]);
         assert_error_kinds(r#"trace "a" { metadata = var. }"#, &[ErrorKind::ExpectedVariableName]);
+    }
+
+    #[test]
+    fn parses_chained_index_and_accessor_exprs() {
+        let source = r#"trace "a" { input = var.xs[0]["k"].name }"#;
+        let ast = parse(source).unwrap();
+        let input = attr(&block(&ast.decls[0]).decls[0]);
+
+        // .name is the outermost selection
+        let ExprKind::Index { target, index } = &input.value.kind else {
+            panic!("expected an index expression");
+        };
+        assert!(matches!(&index.kind, ExprKind::Str(value) if value == "name"));
+
+        let ExprKind::Index { target, index } = &target.kind else {
+            panic!("expected a nested index expression");
+        };
+        assert!(matches!(&index.kind, ExprKind::Str(value) if value == "k"));
+
+        let ExprKind::Index { target, index } = &target.kind else {
+            panic!("expected a nested index expression");
+        };
+        assert!(matches!(&index.kind, ExprKind::Num(value) if value == "0"));
+        assert!(matches!(&target.kind, ExprKind::VarRef(name) if name == "xs"));
+
+        let range = input.value.range;
+        assert_eq!(&source[range.start..range.end], r#"var.xs[0]["k"].name"#);
+    }
+
+    #[test]
+    fn parses_expressions_as_indexes() {
+        let expr = parse_value("var.xs[choice(0, 1) + 1]");
+
+        let ExprKind::Index { index, .. } = &expr.kind else {
+            panic!("expected an index expression");
+        };
+        assert!(matches!(index.kind, ExprKind::Binary { op: BinOp::Add, .. }));
+    }
+
+    #[test]
+    fn parses_postfix_tighter_than_unary() {
+        let expr = parse_value("-var.xs[0]");
+
+        let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = &expr.kind
+        else {
+            panic!("expected unary negation");
+        };
+        assert!(matches!(operand.kind, ExprKind::Index { .. }));
+    }
+
+    #[test]
+    fn parses_indexes_on_literals_and_calls() {
+        assert!(matches!(parse_value("[1, 2][0]").kind, ExprKind::Index { .. }));
+        assert!(matches!(parse_value("{ a = 1 }.a").kind, ExprKind::Index { .. }));
+        assert!(matches!(parse_value("choice([1], [2])[0]").kind, ExprKind::Index { .. }));
+        assert!(matches!(parse_value("(var.xs)[0]").kind, ExprKind::Index { .. }));
+    }
+
+    #[test]
+    fn rejects_unterminated_index_exprs() {
+        assert_error_kinds(r#"trace "a" { input = var.xs[0 }"#, &[ErrorKind::UnexpectedToken]);
+    }
+
+    #[test]
+    fn rejects_accessors_without_a_field_name() {
+        assert_error_kinds(r#"trace "a" { input = var.xs. }"#, &[ErrorKind::ExpectedAccessorField]);
+        assert_error_kinds(r#"trace "a" { input = var.xs.[0] }"#, &[ErrorKind::ExpectedAccessorField]);
     }
 
     #[test]

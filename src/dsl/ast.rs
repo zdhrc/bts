@@ -47,6 +47,10 @@ pub enum ExprKind {
         name: String,
         args: Vec<Expr>,
     },
+    Index {
+        target: Box<Expr>,
+        index: Box<Expr>,
+    },
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,

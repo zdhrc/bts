@@ -175,9 +175,60 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
             };
             lower_value(*taken, ctx)?
         }
+
+        ModelValue::Index { target, index, range } => lower_value(eval_index(*target, *index, range, ctx)?, ctx)?,
     };
 
     Ok(value)
+}
+
+// selects the indexed element, leaving its siblings unevaluated like an untaken branch
+fn eval_index(target: ModelValue, index: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
+    let target = eval_container(target, ctx)?;
+    let index = eval_operand(index, ctx)?;
+
+    match (target, index) {
+        (ModelValue::Array(ModelArray { elem }), Scalar::Int(position)) => usize::try_from(position)
+            .ok()
+            .filter(|&position| position < elem.len())
+            .map(|position| elem.into_iter().nth(position).expect("position is in bounds"))
+            .ok_or(Error::new(ErrorKind::IndexOutOfBounds, range)),
+        (ModelValue::Array(_), Scalar::Float(_)) => Err(Error::new(ErrorKind::NonIntegerIndex, range)),
+        (ModelValue::Object(ModelObject { elem }), Scalar::Str(key)) => elem
+            .into_iter()
+            .find(|field| field.key == key)
+            .map(|field| field.value)
+            .ok_or(Error::new(ErrorKind::MissingObjectKey, range)),
+        _ => unreachable!("modeler validated index types"),
+    }
+}
+
+// reduces a dynamic target down to its container literal
+fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
+    match value {
+        ModelValue::Array(_) | ModelValue::Object(_) => Ok(value),
+        ModelValue::Func(ModelFunc::Choice(options)) => {
+            let pick = ctx.rng.random_range(0..options.len());
+            let option = options
+                .into_iter()
+                .nth(pick)
+                .expect("modeler guarantees choice has an alternative");
+
+            eval_container(option, ctx)
+        }
+        ModelValue::Cond {
+            cond, then, otherwise, ..
+        } => {
+            let taken = if eval_operand(*cond, ctx)?.into_bool() {
+                then
+            } else {
+                otherwise
+            };
+            eval_container(*taken, ctx)
+        }
+        ModelValue::Index { target, index, range } => eval_container(eval_index(*target, *index, range, ctx)?, ctx),
+        _ => unreachable!("modeler validated the target as an array or object"),
+    }
 }
 
 fn eval_func(func: ModelFunc, ctx: &mut Ctx) -> Result<JsonValue, Error> {
@@ -282,6 +333,7 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
             };
             eval_operand(*taken, ctx)?
         }
+        ModelValue::Index { target, index, range } => eval_operand(eval_index(*target, *index, range, ctx)?, ctx)?,
 
         ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) => {
             unreachable!("modeler validated operand types")
@@ -448,6 +500,12 @@ enum ErrorKind {
     DivisionByZero,
     #[error("expression result overflowed or is not finite")]
     NonFiniteResult,
+    #[error("array index is out of bounds")]
+    IndexOutOfBounds,
+    #[error("array index is not an integer")]
+    NonIntegerIndex,
+    #[error("object key is not present")]
+    MissingObjectKey,
 }
 
 #[cfg(test)]
@@ -629,6 +687,71 @@ mod tests {
         let model = compile(r#"trace "t" { input = range(0, 0) != 0 && 100 / range(0, 0) > 1 }"#).unwrap();
         let planned = plan(model, 5, 7).unwrap();
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(false)));
+    }
+
+    #[test]
+    fn evaluates_dynamic_indexes_within_their_containers() {
+        let source = r#"
+            vars { user = { a = 1 b = 2 } }
+            trace "t" {
+                input = ["a", "b", "c"][range(0, 2)]
+                output = var.user[choice("a", "b")]
+            }
+        "#;
+        let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
+
+        let mut inputs = std::collections::HashSet::new();
+        for event in plan_a.events.iter() {
+            let input = event.fields.input.as_ref().unwrap().as_str().unwrap();
+            assert!(matches!(input, "a" | "b" | "c"), "unexpected element {input}");
+            inputs.insert(input.to_owned());
+            let output = event.fields.output.as_ref().unwrap().as_i64().unwrap();
+            assert!(matches!(output, 1 | 2), "unexpected value {output}");
+        }
+        assert!(inputs.len() > 1, "expected multiple elements over 20 traces");
+
+        // same seed, same selections
+        let plan_b = plan(compile(source).unwrap(), 20, 7).unwrap();
+        assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn evaluates_nested_dynamic_indexes() {
+        let source = r#"
+            vars { matrix = [[1, 2], [3, 4]] }
+            trace "t" { input = var.matrix[range(0, 1)][range(0, 1)] }
+        "#;
+        let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
+
+        for event in plan.events.iter() {
+            let input = event.fields.input.as_ref().unwrap().as_i64().unwrap();
+            assert!((1..=4).contains(&input), "unexpected element {input}");
+        }
+    }
+
+    #[test]
+    fn evaluates_only_the_selected_element() {
+        // the division by zero sits in an unselected element, so nothing fails
+        let model = compile(r#"trace "t" { input = [0, 100 / range(0, 0)][range(0, 0)] }"#).unwrap();
+        let planned = plan(model, 5, 7).unwrap();
+
+        assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(0)));
+    }
+
+    #[test]
+    fn fails_on_invalid_dynamic_indexes() {
+        let source = r#"trace "t" { input = [1][range(1, 1)] }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "array index is out of bounds");
+        assert_eq!(&source[error.range.start..error.range.end], "[1][range(1, 1)]");
+
+        let source = r#"trace "t" { input = [1, 2][range(0.0, 0.0)] }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "array index is not an integer");
+
+        let source = r#"trace "t" { input = { a = 1 }[choice("b")] }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "object key is not present");
     }
 
     #[test]
