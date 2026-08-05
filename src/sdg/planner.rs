@@ -1,6 +1,7 @@
 use crate::dsl::{
-    Array as ModelArray, BinOp, CtxRef as ModelCtxRef, Func as ModelFunc, Model, Number as ModelNumber, Object as ModelObject,
-    ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange, Span as ModelSpan, SpanFields as ModelSpanFields,
+    Array as ModelArray, BinOp, Child as ModelChild, Choice as ModelChoice, CtxRef as ModelCtxRef, Func as ModelFunc,
+    Maybe as ModelMaybe, Model, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField,
+    Part as ModelPart, Range as ModelRange, Repeat as ModelRepeat, Span as ModelSpan, SpanFields as ModelSpanFields,
     SpanKind as ModelSpanKind, SrcRange, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
 };
 use rand::rngs::SmallRng;
@@ -68,6 +69,8 @@ pub(super) struct Planner {
 struct Ctx {
     trace_index: usize,
     rng: SmallRng,
+    // iteration indexes of the enclosing repeats, innermost last
+    repeat_indices: Vec<usize>,
 }
 
 impl Planner {
@@ -86,11 +89,60 @@ impl Planner {
         });
 
         for child in children {
-            self.plan_span(child, root, root, ctx)?;
+            self.plan_child(child, root, root, ctx)?;
         }
 
         self.traces.push(start..self.events.len());
         Ok(())
+    }
+
+    // expands dynamic blocks, drawing their structural decisions before any child is planned
+    fn plan_child(&mut self, child: ModelChild, root: EventRef, parent: EventRef, ctx: &mut Ctx) -> Result<(), Error> {
+        match child {
+            ModelChild::Span(span) => self.plan_span(span, root, parent, ctx),
+
+            ModelChild::Repeat(ModelRepeat {
+                count,
+                count_range,
+                children,
+                ..
+            }) => {
+                let count = eval_count(count, count_range, ctx)?;
+                for index in 0..count {
+                    ctx.repeat_indices.push(index);
+                    for child in &children {
+                        self.plan_child(child.clone(), root, parent, ctx)?;
+                    }
+                    ctx.repeat_indices.pop();
+                }
+                Ok(())
+            }
+
+            ModelChild::Choice(ModelChoice { children, .. }) => {
+                let pick = ctx.rng.random_range(0..children.len());
+                let child = children
+                    .into_iter()
+                    .nth(pick)
+                    .expect("modeler guarantees choice has a child");
+
+                self.plan_child(child, root, parent, ctx)
+            }
+
+            ModelChild::Maybe(ModelMaybe {
+                chance,
+                chance_range,
+                children,
+                ..
+            }) => {
+                let chance = eval_chance(chance, chance_range, ctx)?;
+                if ctx.rng.random_bool(chance) {
+                    for child in children {
+                        self.plan_child(child, root, parent, ctx)?;
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     fn plan_span(&mut self, span: ModelSpan, root: EventRef, parent: EventRef, ctx: &mut Ctx) -> Result<(), Error> {
@@ -117,18 +169,47 @@ impl Planner {
         });
 
         for child in children {
-            self.plan_span(child, root, event_ref, ctx)?;
+            self.plan_child(child, root, event_ref, ctx)?;
         }
 
         Ok(())
     }
 }
 
-fn trace_len(trace: &ModelTrace) -> usize {
-    1 + trace.children.iter().map(span_len).sum::<usize>()
+fn eval_count(count: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<usize, Error> {
+    match eval_operand(count, ctx)? {
+        Scalar::Int(value) => usize::try_from(value).map_err(|_| Error::new(ErrorKind::NegativeRepeatCount, range)),
+        Scalar::Float(_) => Err(Error::new(ErrorKind::NonIntegerRepeatCount, range)),
+        _ => unreachable!("modeler validated the count as a number"),
+    }
 }
-fn span_len(span: &ModelSpan) -> usize {
-    1 + span.children.iter().map(span_len).sum::<usize>()
+
+fn eval_chance(chance: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<f64, Error> {
+    let value = match eval_operand(chance, ctx)? {
+        Scalar::Int(value) => value as f64,
+        Scalar::Float(value) => value,
+        _ => unreachable!("modeler validated the chance as a number"),
+    };
+
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(Error::new(ErrorKind::ChanceOutOfRange, range))
+    }
+}
+
+// dynamic blocks make these estimates, only used as allocation hints
+fn trace_len(trace: &ModelTrace) -> usize {
+    1 + trace.children.iter().map(child_len).sum::<usize>()
+}
+fn child_len(child: &ModelChild) -> usize {
+    match child {
+        ModelChild::Span(span) => 1 + span.children.iter().map(child_len).sum::<usize>(),
+        // one iteration or inclusion
+        ModelChild::Repeat(repeat) => repeat.children.iter().map(child_len).sum(),
+        ModelChild::Maybe(maybe) => maybe.children.iter().map(child_len).sum(),
+        ModelChild::Choice(choice) => choice.children.iter().map(child_len).max().unwrap_or(0),
+    }
 }
 
 fn lower_fields(fields: ModelSpanFields, ctx: &mut Ctx) -> Result<EventFields, Error> {
@@ -512,6 +593,11 @@ fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> String {
         .map(|part| match part {
             ModelPart::Lit(value) => value,
             ModelPart::Ref(ModelCtxRef::TraceIndex) => ctx.trace_index.to_string(),
+            ModelPart::Ref(ModelCtxRef::RepeatIndex) => ctx
+                .repeat_indices
+                .last()
+                .expect("modeler validated repeat.index is inside a repeat")
+                .to_string(),
         })
         .collect()
 }
@@ -534,6 +620,7 @@ pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
         let mut ctx = Ctx {
             trace_index: index,
             rng: SmallRng::seed_from_u64(seed.wrapping_add(index as u64)),
+            repeat_indices: Vec::new(),
         };
         planner.plan_trace(model.traces[index % model.traces.len()].clone(), &mut ctx)?;
     }
@@ -573,6 +660,12 @@ enum ErrorKind {
     NonIntegerSliceBound,
     #[error("slice bound is negative")]
     NegativeSliceBound,
+    #[error("repeat count is negative")]
+    NegativeRepeatCount,
+    #[error("repeat count is not an integer")]
+    NonIntegerRepeatCount,
+    #[error("maybe chance is not between 0 and 1")]
+    ChanceOutOfRange,
 }
 
 #[cfg(test)]
@@ -897,5 +990,159 @@ mod tests {
         let source = format!(r#"trace "t" {{ input = {big} * range(2.0, 2.0) }}"#);
         let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
+    }
+
+    #[test]
+    fn repeats_children_a_constant_number_of_times() {
+        let model = compile(r#"trace "t" { repeat { count = 3 task "turn" { llm "reply" {} } } }"#).unwrap();
+        let plan = plan(model, 2, 0).unwrap();
+
+        // per trace: root + 3 * (task + llm)
+        assert_eq!(plan.events.len(), 14);
+        for range in plan.traces.iter() {
+            let root = EventRef(range.start);
+            let events = &plan.events[range.clone()];
+            assert_eq!(events.len(), 7);
+            assert_eq!(events.iter().filter(|event| event.kind == EventKind::Llm).count(), 3);
+            assert!(events.iter().skip(1).all(|event| event.root == root));
+        }
+    }
+
+    #[test]
+    fn skips_repeats_with_a_zero_count() {
+        let model = compile(r#"trace "t" { repeat { count = 0 task "turn" {} } }"#).unwrap();
+        let plan = plan(model, 3, 0).unwrap();
+
+        assert_eq!(plan.events.len(), 3);
+    }
+
+    #[test]
+    fn varies_repeat_counts_per_trace_and_reproduces_them_by_seed() {
+        let source = r#"trace "t" { repeat { count = range(1, 4) task "turn" {} } }"#;
+        let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
+
+        let mut lengths = std::collections::HashSet::new();
+        for range in plan_a.traces.iter() {
+            let turns = range.len() - 1;
+            assert!((1..=4).contains(&turns), "unexpected turn count {turns}");
+            lengths.insert(turns);
+        }
+        assert!(lengths.len() > 1, "expected varying trace shapes over 20 traces");
+
+        let plan_b = plan(compile(source).unwrap(), 20, 7).unwrap();
+        assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn resolves_repeat_index_per_iteration_with_the_innermost_repeat_winning() {
+        let source = r#"
+            trace "t" {
+                repeat {
+                    count = 2
+                    task "outer" {
+                        input = "o ${repeat.index}"
+                        repeat {
+                            count = 2
+                            task "inner" { input = "i ${repeat.index}" }
+                        }
+                    }
+                }
+            }
+        "#;
+        let plan = plan(compile(source).unwrap(), 1, 0).unwrap();
+
+        let inputs: Vec<_> = plan
+            .events
+            .iter()
+            .filter_map(|event| event.fields.input.as_ref().and_then(|input| input.as_str()))
+            .collect();
+        assert_eq!(inputs, ["o 0", "i 0", "i 1", "o 1", "i 0", "i 1"]);
+    }
+
+    #[test]
+    fn plans_exactly_one_choice_child() {
+        let source = r#"trace "t" { choice { tool "a" {} function "b" {} } }"#;
+        let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
+
+        let mut picked = std::collections::HashSet::new();
+        for range in plan.traces.iter() {
+            let events = &plan.events[range.clone()];
+            assert_eq!(events.len(), 2, "choice must plan exactly one child");
+            picked.insert(events[1].name.clone());
+        }
+        assert_eq!(picked.len(), 2, "expected both alternatives over 20 traces");
+    }
+
+    #[test]
+    fn includes_maybe_children_probabilistically() {
+        let source = r#"trace "t" { maybe { task "extra" {} } }"#;
+        let plan_a = plan(compile(source).unwrap(), 40, 7).unwrap();
+
+        let lengths: Vec<_> = plan_a.traces.iter().map(std::ops::Range::len).collect();
+        assert!(lengths.contains(&1) && lengths.contains(&2), "expected both outcomes over 40 traces");
+
+        // the bounds always include or always skip
+        let always = plan(compile(r#"trace "t" { maybe { chance = 1 task "extra" {} } }"#).unwrap(), 10, 7).unwrap();
+        assert!(always.traces.iter().all(|range| range.len() == 2));
+        let never = plan(compile(r#"trace "t" { maybe { chance = 0 task "extra" {} } }"#).unwrap(), 10, 7).unwrap();
+        assert!(never.traces.iter().all(|range| range.len() == 1));
+    }
+
+    #[test]
+    fn redraws_nested_dynamic_blocks_per_iteration() {
+        let source = r#"
+            trace "t" {
+                repeat {
+                    count = 8
+                    choice { tool "a" {} function "b" {} }
+                }
+            }
+        "#;
+        let plan = plan(compile(source).unwrap(), 5, 7).unwrap();
+
+        let names: std::collections::HashSet<_> = plan
+            .events
+            .iter()
+            .filter(|event| event.parent.is_some())
+            .map(|event| event.name.clone())
+            .collect();
+        assert_eq!(names.len(), 2, "expected the choice to redraw across iterations");
+    }
+
+    #[test]
+    fn fails_on_invalid_dynamic_counts_and_chances() {
+        let source = r#"trace "t" { repeat { count = 0 - range(2, 2) task "turn" {} } }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "repeat count is negative");
+        assert_eq!(&source[error.range.start..error.range.end], "0 - range(2, 2)");
+
+        let source = r#"trace "t" { repeat { count = range(0.5, 0.5) task "turn" {} } }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "repeat count is not an integer");
+
+        let source = r#"trace "t" { maybe { chance = range(2.0, 2.0) task "turn" {} } }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "maybe chance is not between 0 and 1");
+    }
+
+    #[test]
+    fn plans_the_dynamic_fixture() {
+        let model = compile(include_str!("../../tests/fixtures/dynamic.bt")).unwrap();
+        let plan_a = plan(model, 10, 42).unwrap();
+
+        for range in plan_a.traces.iter() {
+            let events = &plan_a.events[range.clone()];
+            // root + 1..4 turns of (task + llm) + one choice pick + maybe an escalation
+            assert!((4..=11).contains(&events.len()), "unexpected trace size {}", events.len());
+            let picks = events
+                .iter()
+                .filter(|event| matches!(event.name.as_str(), "search" | "fallback"))
+                .count();
+            assert_eq!(picks, 1);
+        }
+
+        let model = compile(include_str!("../../tests/fixtures/dynamic.bt")).unwrap();
+        let plan_b = plan(model, 10, 42).unwrap();
+        assert_eq!(plan_a, plan_b);
     }
 }

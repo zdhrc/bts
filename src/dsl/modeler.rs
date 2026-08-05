@@ -1,7 +1,8 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Array, CtxRef, Func, Model, Number, Object, ObjectField, Part, Range, Span, SpanFields, SpanKind, Template, Trace, Value,
+    Array, Child, Choice, CtxRef, Func, Maybe, Model, Number, Object, ObjectField, Part, Range, Repeat, Span, SpanFields,
+    SpanKind, Template, Trace, Value,
 };
 use crate::dsl::spec;
 use std::{
@@ -72,6 +73,8 @@ pub(super) struct Modeler {
     ast: ast::Ast,
     vars: HashMap<String, ast::Expr>,
     errors: Errors,
+    // how many repeat blocks enclose the decl being lowered, gates repeat.index
+    repeat_depth: usize,
 }
 
 impl Modeler {
@@ -80,6 +83,7 @@ impl Modeler {
             ast,
             vars: HashMap::new(),
             errors: Vec::new(),
+            repeat_depth: 0,
         }
     }
 
@@ -154,7 +158,7 @@ impl Modeler {
         let (fields, blocks) = self.model_body(decls, desc, range);
         let children = blocks
             .into_iter()
-            .filter_map(|block| self.model_span(block, desc.id))
+            .filter_map(|block| self.model_child(block, desc.id))
             .collect();
 
         name.map(|name| Trace { name, fields, children })
@@ -1340,7 +1344,7 @@ impl Modeler {
         }
     }
 
-    fn model_span(&mut self, block: ast::Block, parent: spec::Id) -> Option<Span> {
+    fn model_child(&mut self, block: ast::Block, parent: spec::Id) -> Option<Child> {
         let ast::Block {
             kind,
             name,
@@ -1369,6 +1373,20 @@ impl Modeler {
             return None;
         }
 
+        let name = self.model_name(name, range, desc);
+
+        if desc.id == spec::ids::REPEAT {
+            self.model_repeat(name, decls, desc, range).map(Child::Repeat)
+        } else if desc.id == spec::ids::CHOICE {
+            self.model_choice(name, decls, desc, range).map(Child::Choice)
+        } else if desc.id == spec::ids::MAYBE {
+            self.model_maybe(name, decls, desc, range).map(Child::Maybe)
+        } else {
+            self.model_span(name, decls, desc, range).map(Child::Span)
+        }
+    }
+
+    fn model_span(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Span> {
         let span_kind = if desc.id == spec::ids::TASK {
             SpanKind::Task
         } else if desc.id == spec::ids::LLM {
@@ -1381,11 +1399,10 @@ impl Modeler {
             unreachable!("block {} does not have a model lowering", desc.id.as_str());
         };
 
-        let name = self.model_name(name, range, desc);
         let (fields, blocks) = self.model_body(decls, desc, range);
         let children = blocks
             .into_iter()
-            .filter_map(|block| self.model_span(block, desc.id))
+            .filter_map(|block| self.model_child(block, desc.id))
             .collect();
 
         name.map(|name| Span {
@@ -1394,6 +1411,193 @@ impl Modeler {
             fields,
             children,
         })
+    }
+
+    fn model_repeat(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Repeat> {
+        let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
+
+        self.repeat_depth += 1;
+        let children = self.model_dynamic_children(blocks, desc, range);
+        self.repeat_depth -= 1;
+
+        let (count, count_range) = fields.remove(&spec::ids::COUNT)?;
+
+        // constant counts validate now, dynamic ones fail the run during generation
+        if let Value::Num(number) = &count {
+            let valid = match number {
+                Number::Int(value) => {
+                    if *value < 0 {
+                        self.errors.push(Error::new(
+                            ErrorKind::NegativeRepeatCount {
+                                rule: spec::ids::REPEAT_COUNT,
+                            },
+                            count_range,
+                        ));
+                    }
+                    *value >= 0
+                }
+                Number::Float(_) => {
+                    self.errors.push(Error::new(
+                        ErrorKind::NonIntegerRepeatCount {
+                            rule: spec::ids::REPEAT_COUNT,
+                        },
+                        count_range,
+                    ));
+                    false
+                }
+            };
+            if !valid {
+                return None;
+            }
+        }
+
+        Some(Repeat {
+            name,
+            count,
+            count_range,
+            children,
+        })
+    }
+
+    fn model_choice(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Choice> {
+        let (_, blocks) = self.model_dynamic_body(decls, desc, range);
+        let children = self.model_dynamic_children(blocks, desc, range);
+
+        Some(Choice { name, children })
+    }
+
+    fn model_maybe(&mut self, name: Option<String>, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<Maybe> {
+        let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
+        let children = self.model_dynamic_children(blocks, desc, range);
+
+        let (chance, chance_range) = fields
+            .remove(&spec::ids::CHANCE)
+            .unwrap_or((Value::Num(Number::Float(0.5)), range));
+
+        // constant chances validate now, dynamic ones fail the run during generation
+        if let Value::Num(number) = &chance {
+            let value = match number {
+                Number::Int(value) => *value as f64,
+                Number::Float(value) => *value,
+            };
+            if !(0.0..=1.0).contains(&value) {
+                self.errors.push(Error::new(
+                    ErrorKind::ChanceOutOfRange {
+                        rule: spec::ids::MAYBE_CHANCE,
+                    },
+                    chance_range,
+                ));
+                return None;
+            }
+        }
+
+        Some(Maybe {
+            name,
+            chance,
+            chance_range,
+            children,
+        })
+    }
+
+    // mirrors model_body for dynamic blocks: config attrs must be numbers but may
+    // stay dynamic, child blocks come back for the caller to recurse
+    fn model_dynamic_body(
+        &mut self,
+        decls: Vec<ast::Decl>,
+        block: &spec::BlockDesc,
+        range: SrcRange,
+    ) -> (HashMap<spec::Id, (Value, SrcRange)>, Vec<ast::Block>) {
+        let mut fields = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut blocks = Vec::new();
+
+        for decl in decls {
+            match decl {
+                ast::Decl::Block(inner) => blocks.push(inner),
+                ast::Decl::Attr(attr) => {
+                    let attr_range = attr.range;
+                    let Some(field) = block.field(&attr.key) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownField {
+                                block: block.id,
+                                keyword: attr.key,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    };
+                    let field_id = field.id;
+
+                    if !seen.insert(field_id) {
+                        self.errors.push(Error::new(
+                            ErrorKind::DuplicateField {
+                                block: block.id,
+                                field: field_id,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    }
+
+                    let Some(expr) = self.resolve_expr(attr.value) else {
+                        continue;
+                    };
+                    let Some(expr) = self.fold_expr(expr) else {
+                        continue;
+                    };
+
+                    if static_type(&expr) != Some(StaticType::Number) {
+                        self.errors.push(Error::new(
+                            ErrorKind::TypeMismatch {
+                                block: block.id,
+                                field: field_id,
+                                expected: &spec::ExprType::Number,
+                                found: found_type(&expr),
+                            },
+                            expr.range,
+                        ));
+                        continue;
+                    }
+
+                    // diagnostics for bad values point at the value, not the key
+                    let value_range = expr.range;
+                    if let Some(value) = self.model_value(expr) {
+                        fields.insert(field_id, (value, value_range));
+                    }
+                }
+            }
+        }
+
+        for field in block.body.fields {
+            if field.cardinality == spec::Cardinality::Required && !seen.contains(&field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::MissingField {
+                        block: block.id,
+                        field: field.id,
+                    },
+                    range,
+                ));
+            }
+        }
+
+        (fields, blocks)
+    }
+
+    fn model_dynamic_children(&mut self, blocks: Vec<ast::Block>, block: &spec::BlockDesc, range: SrcRange) -> Vec<Child> {
+        if blocks.is_empty() {
+            self.errors.push(Error::new(
+                ErrorKind::EmptyDynamicBlock {
+                    rule: spec::ids::DYNAMIC_CHILDREN,
+                    block: block.id,
+                },
+                range,
+            ));
+        }
+
+        blocks
+            .into_iter()
+            .filter_map(|inner| self.model_child(inner, block.id))
+            .collect()
     }
 
     fn model_body(&mut self, decls: Vec<ast::Decl>, block: &spec::BlockDesc, range: SrcRange) -> (SpanFields, Vec<ast::Block>) {
@@ -1803,16 +2007,21 @@ impl Modeler {
         for part in parts {
             match part {
                 ast::TemplatePart::Lit(value) => modeled.push(Part::Lit(value)),
-                ast::TemplatePart::Ref { path, range } => match model_ctx_ref(&path) {
+                ast::TemplatePart::Ref { path, range } => match model_ctx_ref(&path, self.repeat_depth) {
                     Some(ctx_ref) => modeled.push(Part::Ref(ctx_ref)),
                     None => {
-                        self.errors.push(Error::new(
+                        // a known reference in the wrong place gets its own diagnostic
+                        let kind = if matches!(path.as_slice(), [first, second] if first == "repeat" && second == "index") {
+                            ErrorKind::RepeatIndexOutsideRepeat {
+                                rule: spec::ids::REPEAT_INDEX,
+                            }
+                        } else {
                             ErrorKind::UnknownReference {
                                 rule: spec::ids::KNOWN_REFERENCES,
                                 path: path.join("."),
-                            },
-                            range,
-                        ));
+                            }
+                        };
+                        self.errors.push(Error::new(kind, range));
                         valid = false;
                     }
                 },
@@ -2127,9 +2336,10 @@ fn eval_cmp(op: ast::BinOp, lhs: Number, rhs: Number) -> bool {
     }
 }
 
-fn model_ctx_ref(path: &[String]) -> Option<CtxRef> {
+fn model_ctx_ref(path: &[String], repeat_depth: usize) -> Option<CtxRef> {
     match path {
         [first, second] if first == "trace" && second == "index" => Some(CtxRef::TraceIndex),
+        [first, second] if first == "repeat" && second == "index" && repeat_depth > 0 => Some(CtxRef::RepeatIndex),
         _ => None,
     }
 }
@@ -2345,6 +2555,22 @@ pub(super) enum ErrorKind {
     NonConstantForKey {
         rule: spec::Id,
         found: ExprType,
+    },
+    EmptyDynamicBlock {
+        rule: spec::Id,
+        block: spec::Id,
+    },
+    NegativeRepeatCount {
+        rule: spec::Id,
+    },
+    NonIntegerRepeatCount {
+        rule: spec::Id,
+    },
+    ChanceOutOfRange {
+        rule: spec::Id,
+    },
+    RepeatIndexOutsideRepeat {
+        rule: spec::Id,
     },
 }
 
@@ -2576,6 +2802,31 @@ impl fmt::Display for ErrorKind {
                     rule.summary
                 )
             }
+            Self::EmptyDynamicBlock { rule, block } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "block `{}` has no child blocks; {}",
+                    block_desc(*block).keyword,
+                    rule.summary
+                )
+            }
+            Self::NegativeRepeatCount { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "repeat count is negative; {}", rule.summary)
+            }
+            Self::NonIntegerRepeatCount { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "repeat count is not an integer; {}", rule.summary)
+            }
+            Self::ChanceOutOfRange { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "maybe chance is not between 0 and 1; {}", rule.summary)
+            }
+            Self::RepeatIndexOutsideRepeat { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "`${{repeat.index}}` is not inside a repeat block; {}", rule.summary)
+            }
         }
     }
 }
@@ -2687,6 +2938,13 @@ mod tests {
         }
     }
 
+    fn as_span(child: &Child) -> &Span {
+        match child {
+            Child::Span(span) => span,
+            other => panic!("expected a span child, found {other:?}"),
+        }
+    }
+
     #[test]
     fn models_fixture_as_typed_domain() {
         let model = model(include_str!("../../tests/fixtures/simple.bt")).unwrap();
@@ -2695,12 +2953,12 @@ mod tests {
         let trace = &model.traces[0];
         assert_eq!(trace.name, "multi-turn-conversation");
         assert_eq!(trace.children.len(), 2);
-        assert!(trace.children.iter().all(|span| matches!(&span.kind, SpanKind::Task)));
+        assert!(trace.children.iter().all(|child| matches!(&as_span(child).kind, SpanKind::Task)));
         assert!(
             trace
                 .children
                 .iter()
-                .all(|span| matches!(span.children.as_slice(), [Span { kind: SpanKind::Llm, .. }]))
+                .all(|child| matches!(as_span(child).children.as_slice(), [Child::Span(Span { kind: SpanKind::Llm, .. })]))
         );
         assert_eq!(trace.fields.tags.iter().map(tag_text).collect::<Vec<_>>(), ["chat", "prod"]);
     }
@@ -2718,11 +2976,11 @@ mod tests {
         "#;
         let model = model(source).unwrap();
 
-        let function = &model.traces[0].children[0];
+        let function = as_span(&model.traces[0].children[0]);
         assert!(matches!(function.kind, SpanKind::Function));
-        let tool = &function.children[0];
+        let tool = as_span(&function.children[0]);
         assert!(matches!(tool.kind, SpanKind::Tool));
-        assert!(matches!(tool.children[0].kind, SpanKind::Llm));
+        assert!(matches!(as_span(&tool.children[0]).kind, SpanKind::Llm));
     }
 
     #[test]
@@ -2737,7 +2995,7 @@ mod tests {
         "#;
         let model = model(source).unwrap();
 
-        let fields = &model.traces[0].children[0].fields;
+        let fields = &as_span(&model.traces[0].children[0]).fields;
         assert!(matches!(&fields.expected, Some(Value::Object(object)) if object.elem[0].key == "answer"));
         assert!(matches!(&fields.error, Some(Value::Func(Func::Choice(options))) if options.len() == 2));
     }
@@ -4300,5 +4558,199 @@ mod tests {
                 .to_string()
                 .contains(spec::SPEC.rule(spec::ids::BOOLEAN_CONDITIONS).unwrap().summary)
         );
+    }
+
+    #[test]
+    fn models_dynamic_blocks_with_optional_names() {
+        let model = model(include_str!("../../tests/fixtures/dynamic.bt")).unwrap();
+
+        let children = &model.traces[0].children;
+        let Child::Repeat(repeat) = &children[0] else {
+            panic!("expected a repeat child");
+        };
+        assert_eq!(repeat.name.as_deref(), Some("turns"));
+        assert!(matches!(repeat.count, Value::Func(Func::Range(_))));
+        assert!(matches!(repeat.children.as_slice(), [Child::Span(Span { kind: SpanKind::Task, .. })]));
+
+        let Child::Choice(choice) = &children[1] else {
+            panic!("expected a choice child");
+        };
+        assert_eq!(choice.name, None);
+        assert_eq!(choice.children.len(), 2);
+
+        let Child::Maybe(maybe) = &children[2] else {
+            panic!("expected a maybe child");
+        };
+        assert!(matches!(maybe.chance, Value::Num(Number::Float(value)) if value == 0.25));
+    }
+
+    #[test]
+    fn defaults_a_maybe_without_a_chance_to_a_coin_flip() {
+        let model = model(r#"trace "t" { maybe { task "extra" {} } }"#).unwrap();
+
+        let Child::Maybe(maybe) = &model.traces[0].children[0] else {
+            panic!("expected a maybe child");
+        };
+        assert!(matches!(maybe.chance, Value::Num(Number::Float(value)) if value == 0.5));
+    }
+
+    #[test]
+    fn rejects_dynamic_blocks_at_the_root_and_span_blocks_they_forbid() {
+        let errors = model(r#"repeat { count = 1 task "turn" {} }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::BlockNotAllowed {
+                block: spec::ids::REPEAT,
+                parent: spec::Place::Root,
+            }
+        );
+
+        let errors = model(r#"trace "t" { choice { vars { a = 1 } task "turn" {} } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::BlockNotAllowed {
+                block: spec::ids::VARS,
+                parent: spec::Place::Block { id: spec::ids::CHOICE },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dynamic_bodies() {
+        let errors = model(r#"trace "t" { repeat { task "turn" {} } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::MissingField {
+                block: spec::ids::REPEAT,
+                field: spec::ids::COUNT,
+            }
+        );
+
+        let errors = model(r#"trace "t" { repeat { count = 1 count = 2 task "turn" {} } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::DuplicateField {
+                block: spec::ids::REPEAT,
+                field: spec::ids::COUNT,
+            }
+        );
+
+        // span fields don't leak into dynamic bodies
+        let errors = model(r#"trace "t" { maybe { input = "hi" task "turn" {} } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::UnknownField {
+                block: spec::ids::MAYBE,
+                keyword: "input".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_counts_and_chances() {
+        let source = r#"trace "t" { repeat { count = "three" task "turn" {} } }"#;
+        let errors = model(source).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::TypeMismatch {
+                block: spec::ids::REPEAT,
+                field: spec::ids::COUNT,
+                expected: &spec::ExprType::Number,
+                found: ExprType::String,
+            }
+        );
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "\"three\"");
+
+        let errors = model(r#"trace "t" { repeat { count = 0 - 2 task "turn" {} } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NegativeRepeatCount {
+                rule: spec::ids::REPEAT_COUNT,
+            }
+        );
+
+        let errors = model(r#"trace "t" { repeat { count = 1.5 task "turn" {} } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonIntegerRepeatCount {
+                rule: spec::ids::REPEAT_COUNT,
+            }
+        );
+
+        let errors = model(r#"trace "t" { maybe { chance = 1.5 task "turn" {} } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::ChanceOutOfRange {
+                rule: spec::ids::MAYBE_CHANCE,
+            }
+        );
+    }
+
+    #[test]
+    fn allows_zero_counts_and_dynamic_bounds() {
+        let model = model(
+            r#"
+            trace "t" {
+                repeat { count = 0 task "turn" {} }
+                maybe { chance = range(0.0, 1.0) task "extra" {} }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
+            panic!("expected a repeat child");
+        };
+        assert!(matches!(repeat.count, Value::Num(Number::Int(0))));
+    }
+
+    #[test]
+    fn rejects_empty_dynamic_blocks() {
+        let errors = model(r#"trace "t" { choice {} }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::EmptyDynamicBlock {
+                rule: spec::ids::DYNAMIC_CHILDREN,
+                block: spec::ids::CHOICE,
+            }
+        );
+    }
+
+    #[test]
+    fn scopes_repeat_index_to_repeat_blocks() {
+        let source = r#"trace "t" { input = "turn ${repeat.index}" }"#;
+        let errors = model(source).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::RepeatIndexOutsideRepeat {
+                rule: spec::ids::REPEAT_INDEX,
+            }
+        );
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "${repeat.index}");
+
+        // valid inside a repeat, including through nested dynamic blocks
+        let model = model(
+            r#"
+            trace "t" {
+                repeat {
+                    count = 2
+                    maybe { task "turn" { input = "turn ${repeat.index}" } }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
+            panic!("expected a repeat child");
+        };
+        let Child::Maybe(maybe) = &repeat.children[0] else {
+            panic!("expected a maybe child");
+        };
+        let Some(Value::Template(template)) = &as_span(&maybe.children[0]).fields.input else {
+            panic!("expected a template input");
+        };
+        assert!(matches!(template.parts[1], Part::Ref(CtxRef::RepeatIndex)));
     }
 }

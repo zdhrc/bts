@@ -70,6 +70,47 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
 }
 
 #[test]
+fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
+    let shape = write_shape(include_str!("fixtures/dynamic.bt"));
+    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+        .args(["generate", "--from"])
+        .arg(&shape)
+        .args(["--count", "20", "--over", "1h", "--dry-run", "--seed", "42"])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let events = payload["events"].as_array().unwrap();
+
+    let mut sizes = std::collections::HashSet::new();
+    let mut picks = std::collections::HashMap::new();
+    for event in events {
+        let root = event["root_span_id"].as_str().unwrap();
+        *picks.entry(root.to_owned()).or_insert(0) += match event["span_attributes"]["name"].as_str().unwrap() {
+            "search" | "fallback" => 1,
+            _ => 0,
+        };
+    }
+    for (root, count) in &picks {
+        assert_eq!(*count, 1, "trace {root} planned {count} choice children");
+        sizes.insert(events.iter().filter(|event| event["root_span_id"] == *root).count());
+    }
+
+    assert_eq!(picks.len(), 20);
+    assert!(sizes.len() > 1, "expected varying trace shapes, got sizes {sizes:?}");
+
+    // repeat iterations resolve their own index
+    let inputs = events
+        .iter()
+        .filter_map(|event| event["input"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(inputs.contains("message 0"));
+    assert!(inputs.contains("message 1"));
+}
+
+#[test]
 fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     let shape = write_shape(r#"trace "t" { input = 100 / range(0, 0) }"#);
     let output = Command::new(env!("CARGO_BIN_EXE_bts"))

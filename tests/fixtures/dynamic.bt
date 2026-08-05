@@ -1,0 +1,38 @@
+# dynamic blocks vary the shape of each generated trace
+vars {
+    model = "gpt-4o-mini"
+}
+
+trace "support-conversation" {
+    repeat "turns" {
+        count = range(1, 4)
+
+        task "turn" {
+            llm "completion" {
+                input = "message ${repeat.index}"
+                output = "reply ${repeat.index}"
+                metadata = { model = var.model }
+            }
+        }
+    }
+
+    choice {
+        tool "search" {
+            input = "lookup"
+        }
+
+        function "fallback" {
+            input = "noop"
+        }
+    }
+
+    maybe {
+        chance = 0.25
+
+        task "escalation" {
+            output = "escalated"
+        }
+    }
+
+    tags = ["support"]
+}

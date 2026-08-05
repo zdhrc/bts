@@ -196,6 +196,9 @@ pub(crate) mod ids {
     pub(crate) const LLM: Id = Id::new("block.llm");
     pub(crate) const TOOL: Id = Id::new("block.tool");
     pub(crate) const FUNCTION: Id = Id::new("block.function");
+    pub(crate) const REPEAT: Id = Id::new("block.repeat");
+    pub(crate) const CHOICE: Id = Id::new("block.choice");
+    pub(crate) const MAYBE: Id = Id::new("block.maybe");
 
     pub(crate) const INPUT: Id = Id::new("field.input");
     pub(crate) const OUTPUT: Id = Id::new("field.output");
@@ -204,6 +207,8 @@ pub(crate) mod ids {
     pub(crate) const METADATA: Id = Id::new("field.metadata");
     pub(crate) const METRICS: Id = Id::new("field.metrics");
     pub(crate) const TAGS: Id = Id::new("field.tags");
+    pub(crate) const COUNT: Id = Id::new("field.count");
+    pub(crate) const CHANCE: Id = Id::new("field.chance");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
@@ -257,8 +262,13 @@ pub(crate) mod ids {
     pub(crate) const STATIC_FOR: Id = Id::new("rule.static-for");
     pub(crate) const BOOLEAN_CONDITIONS: Id = Id::new("rule.boolean-conditions");
     pub(crate) const NONZERO_DIVISORS: Id = Id::new("rule.nonzero-divisors");
+    pub(crate) const REPEAT_COUNT: Id = Id::new("rule.repeat-count");
+    pub(crate) const REPEAT_INDEX: Id = Id::new("rule.repeat-index");
+    pub(crate) const MAYBE_CHANCE: Id = Id::new("rule.maybe-chance");
+    pub(crate) const DYNAMIC_CHILDREN: Id = Id::new("rule.dynamic-children");
 
     pub(crate) const COMPLETE_TRACE: Id = Id::new("example.complete-trace");
+    pub(crate) const DYNAMIC_TRACE: Id = Id::new("example.dynamic-trace");
 }
 
 const ANY: ExprType = ExprType::Any;
@@ -319,13 +329,32 @@ const SPAN_FIELDS: &[FieldDesc] = &[
 ];
 
 const ROOT_ONLY: &[Place] = &[Place::Root];
-const IN_TRACE_OR_SPAN: &[Place] = &[
+const IN_TRACE_SPAN_OR_DYNAMIC: &[Place] = &[
     Place::Block { id: ids::TRACE },
     Place::Block { id: ids::TASK },
     Place::Block { id: ids::LLM },
     Place::Block { id: ids::TOOL },
     Place::Block { id: ids::FUNCTION },
+    Place::Block { id: ids::REPEAT },
+    Place::Block { id: ids::CHOICE },
+    Place::Block { id: ids::MAYBE },
 ];
+
+const REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
+    id: ids::COUNT,
+    keyword: "count",
+    summary: "Number of times the child blocks are stamped out, evaluated per generated trace.",
+    value: &ANY,
+    cardinality: Cardinality::Required,
+}];
+
+const MAYBE_FIELDS: &[FieldDesc] = &[FieldDesc {
+    id: ids::CHANCE,
+    keyword: "chance",
+    summary: "Probability between 0 and 1 that the child blocks are included, evaluated per generated trace; defaults to 0.5.",
+    value: &ANY,
+    cardinality: Cardinality::Optional,
+}];
 
 const NO_RULES: &[RuleDesc] = &[];
 const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
@@ -339,7 +368,7 @@ const UNIQUE_OBJECT_KEYS_RULE: &[RuleDesc] = &[RuleDesc {
 }];
 const KNOWN_REFERENCES_RULE: &[RuleDesc] = &[RuleDesc {
     id: ids::KNOWN_REFERENCES,
-    summary: "An interpolation may only use documented references; currently `trace.index`, the 0-based index of the generated trace, and `var.<name>` for a defined variable.",
+    summary: "An interpolation may only use documented references; currently `trace.index`, the 0-based index of the generated trace, `repeat.index`, the 0-based iteration of the innermost enclosing repeat block, and `var.<name>` for a defined variable.",
 }];
 const VARS_RULES: &[RuleDesc] = &[
     RuleDesc {
@@ -440,6 +469,20 @@ const HEREDOC_RULES: &[RuleDesc] = &[
         summary: "`<<` keeps every content line verbatim; `<<-` strips the longest whitespace prefix shared by the non-blank content lines, and blank lines keep only their newline.",
     },
 ];
+const REPEAT_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::REPEAT_COUNT,
+        summary: "`count` must evaluate to a non-negative integer; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+    },
+    RuleDesc {
+        id: ids::REPEAT_INDEX,
+        summary: "`repeat.index` interpolates the 0-based iteration of the innermost enclosing repeat block and is only valid inside one.",
+    },
+];
+const MAYBE_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::MAYBE_CHANCE,
+    summary: "`chance` must evaluate to a number between 0 and 1 inclusive; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+}];
 const VAR_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::DEFINED_VARS,
@@ -659,7 +702,7 @@ const BLOCKS: &[BlockDesc] = &[
         summary: "A named task span containing fields and nested spans.",
         syntax: "task \"<name>\" { ... }",
         name: NameDesc::Required,
-        allowed_in: IN_TRACE_OR_SPAN,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
             open: false,
@@ -672,7 +715,7 @@ const BLOCKS: &[BlockDesc] = &[
         summary: "A named LLM span containing fields and nested spans.",
         syntax: "llm \"<name>\" { ... }",
         name: NameDesc::Required,
-        allowed_in: IN_TRACE_OR_SPAN,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
             open: false,
@@ -685,7 +728,7 @@ const BLOCKS: &[BlockDesc] = &[
         summary: "A named tool span containing fields and nested spans.",
         syntax: "tool \"<name>\" { ... }",
         name: NameDesc::Required,
-        allowed_in: IN_TRACE_OR_SPAN,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
             open: false,
@@ -698,12 +741,48 @@ const BLOCKS: &[BlockDesc] = &[
         summary: "A named function span containing fields and nested spans.",
         syntax: "function \"<name>\" { ... }",
         name: NameDesc::Required,
-        allowed_in: IN_TRACE_OR_SPAN,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
             open: false,
         },
         rules: NO_RULES,
+    },
+    BlockDesc {
+        id: ids::REPEAT,
+        keyword: "repeat",
+        summary: "A dynamic block that stamps out its child blocks `count` times for each generated trace.",
+        syntax: "repeat [\"<name>\"] { count = <number> ... }",
+        name: NameDesc::Optional,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
+        body: BodyDesc {
+            fields: REPEAT_FIELDS,
+            open: false,
+        },
+        rules: REPEAT_RULES,
+    },
+    BlockDesc {
+        id: ids::CHOICE,
+        keyword: "choice",
+        summary: "A dynamic block that includes exactly one of its child blocks, picked uniformly at random for each generated trace.",
+        syntax: "choice [\"<name>\"] { ... }",
+        name: NameDesc::Optional,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
+        body: BodyDesc { fields: &[], open: false },
+        rules: NO_RULES,
+    },
+    BlockDesc {
+        id: ids::MAYBE,
+        keyword: "maybe",
+        summary: "A dynamic block that includes its child blocks with probability `chance` for each generated trace.",
+        syntax: "maybe [\"<name>\"] { [chance = <number>] ... }",
+        name: NameDesc::Optional,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
+        body: BodyDesc {
+            fields: MAYBE_FIELDS,
+            open: false,
+        },
+        rules: MAYBE_RULES,
     },
 ];
 
@@ -718,14 +797,26 @@ const RULES: &[RuleDesc] = &[
         id: ids::RESERVED_METRICS,
         summary: "Metric keys `start` and `end` are reserved for generated timestamps.",
     },
+    RuleDesc {
+        id: ids::DYNAMIC_CHILDREN,
+        summary: "A dynamic block (`repeat`, `choice`, or `maybe`) must contain at least one child block.",
+    },
 ];
 
-const EXAMPLES: &[Example] = &[Example {
-    id: ids::COMPLETE_TRACE,
-    summary: "A multi-turn trace containing task and LLM spans.",
-    source: include_str!("../../tests/fixtures/simple.bt"),
-    valid: true,
-}];
+const EXAMPLES: &[Example] = &[
+    Example {
+        id: ids::COMPLETE_TRACE,
+        summary: "A multi-turn trace containing task and LLM spans.",
+        source: include_str!("../../tests/fixtures/simple.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::DYNAMIC_TRACE,
+        summary: "A trace whose shape varies per generation via repeat, choice, and maybe blocks.",
+        source: include_str!("../../tests/fixtures/dynamic.bt"),
+        valid: true,
+    },
+];
 
 pub(crate) static SPEC: Spec = Spec {
     schema_version: 1,

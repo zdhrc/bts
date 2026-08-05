@@ -10,7 +10,18 @@ pub(crate) struct Model {
 pub(crate) struct Trace {
     pub(crate) name: String,
     pub(crate) fields: SpanFields,
-    pub(crate) children: Vec<Span>,
+    pub(crate) children: Vec<Child>,
+}
+
+// a span or a dynamic block whose expansion the planner decides per trace;
+// spans are the common child so boxing them away buys nothing
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub(crate) enum Child {
+    Span(Span),
+    Repeat(Repeat),
+    Choice(Choice),
+    Maybe(Maybe),
 }
 
 #[derive(Debug, Clone)]
@@ -18,7 +29,33 @@ pub(crate) struct Span {
     pub(crate) name: String,
     pub(crate) kind: SpanKind,
     pub(crate) fields: SpanFields,
-    pub(crate) children: Vec<Span>,
+    pub(crate) children: Vec<Child>,
+}
+
+// names on dynamic blocks are inert for now, kept for future traversal
+#[derive(Debug, Clone)]
+pub(crate) struct Repeat {
+    #[allow(dead_code)]
+    pub(crate) name: Option<String>,
+    pub(crate) count: Value,
+    pub(crate) count_range: SrcRange,
+    pub(crate) children: Vec<Child>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Choice {
+    #[allow(dead_code)]
+    pub(crate) name: Option<String>,
+    pub(crate) children: Vec<Child>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Maybe {
+    #[allow(dead_code)]
+    pub(crate) name: Option<String>,
+    pub(crate) chance: Value,
+    pub(crate) chance_range: SrcRange,
+    pub(crate) children: Vec<Child>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +148,7 @@ pub(crate) enum Part {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CtxRef {
     TraceIndex,
+    RepeatIndex,
 }
 
 #[derive(Debug, Clone)]
