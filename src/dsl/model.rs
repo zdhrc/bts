@@ -40,6 +40,7 @@ pub(crate) enum Value {
     Str(String),
     Num(Number),
     Bool(bool),
+    Null,
     Array(Array),
     Object(Object),
 }

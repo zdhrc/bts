@@ -37,6 +37,7 @@ pub enum ExprKind {
     Str(String),
     Num(String),
     Bool(bool),
+    Null,
     Array(Vec<Expr>),
     Object(Vec<Attr>),
 }

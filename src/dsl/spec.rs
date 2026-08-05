@@ -187,6 +187,7 @@ pub(crate) mod ids {
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const NUMBER: Id = Id::new("expr.number");
     pub(crate) const BOOLEAN: Id = Id::new("expr.boolean");
+    pub(crate) const NULL: Id = Id::new("expr.null");
     pub(crate) const ARRAY: Id = Id::new("expr.array");
     pub(crate) const OBJECT: Id = Id::new("expr.object");
 
@@ -268,9 +269,9 @@ const EXPR_TYPES: &[ExprDesc] = &[
     },
     ExprDesc {
         id: ids::NUMBER,
-        syntax: "digits[.digits]",
-        summary: "A non-negative integer or finite decimal number.",
-        examples: &["4", "0.2"],
+        syntax: "[-]digits[.digits]",
+        summary: "An integer or finite decimal number, optionally negative. The sign must be adjacent to the digits.",
+        examples: &["4", "0.2", "-1.5"],
         rules: FINITE_NUMBER_RULE,
     },
     ExprDesc {
@@ -278,6 +279,13 @@ const EXPR_TYPES: &[ExprDesc] = &[
         syntax: "true | false",
         summary: "A boolean literal.",
         examples: &["true", "false"],
+        rules: NO_RULES,
+    },
+    ExprDesc {
+        id: ids::NULL,
+        syntax: "null",
+        summary: "A null literal representing an explicitly absent value.",
+        examples: &["null"],
         rules: NO_RULES,
     },
     ExprDesc {
@@ -370,12 +378,13 @@ document    = { declaration } ;
 declaration = block | attribute ;
 block       = identifier, [ string ], "{", { declaration }, "}" ;
 attribute   = identifier, "=", expression ;
-expression  = string | number | boolean | array | object ;
+expression  = string | number | boolean | null | array | object ;
 boolean     = "true" | "false" ;
+null        = "null" ;
 array       = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 object      = "{", { attribute }, "}" ;
 identifier  = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
-number      = ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
+number      = [ "-" ], ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
 string      = '"', { ANY_EXCEPT_DOUBLE_QUOTE }, '"' ;
 "#,
         notes: &[

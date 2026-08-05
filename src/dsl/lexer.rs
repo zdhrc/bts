@@ -72,8 +72,8 @@ impl<'src> Lexer<'src> {
                 // ident:
                 // - first char must be alphabetic
                 // - ident chars must be alphanumeric or underscores
-                // - whitespace or punctuation breaks
-                // - all other tokens emit a diag and break
+                // - whitespace or the start of another token breaks
+                // - all other chars emit a diag and break
                 ch if ch.is_ascii_alphabetic() => {
                     let start = idx;
                     let mut end = idx + ch.len_utf8();
@@ -88,6 +88,7 @@ impl<'src> Lexer<'src> {
                                 self.next();
                             }
                             c if c.is_whitespace() => break,
+                            '{' | '}' | '[' | ']' | ',' | '.' | '=' | '"' | '-' => break,
                             _ => {
                                 errors.push(Error::new(
                                     ErrorKind::InvalidIdentToken,
@@ -130,35 +131,20 @@ impl<'src> Lexer<'src> {
 
                 // numbers
                 ch if ch.is_ascii_digit() => {
-                    let start = idx;
-                    let mut end = idx + ch.len_utf8();
-                    let mut value = String::new();
-                    let mut decimals = 0;
-                    value.push(ch);
-
-                    while let Some((n_idx, n_ch)) = self.peek() {
-                        match n_ch {
-                            c if c.is_ascii_digit() => {
-                                value.push(c);
-                                end = n_idx + c.len_utf8();
-                                self.next();
-                            }
-                            '.' => {
-                                decimals += 1;
-                                value.push(n_ch);
-                                end = n_idx + n_ch.len_utf8();
-                                self.next();
-                            }
-                            _ => break,
-                        }
-                    }
-
-                    if decimals > 1 || value.ends_with('.') {
-                        errors.push(Error::new(ErrorKind::InvalidNumber, SrcRange::new(start, end)));
-                    }
-
-                    tokens.push(Token::new(TokenKind::Number(value), start, end));
+                    let token = self.lex_number(idx, ch, &mut errors);
+                    tokens.push(token);
                 }
+
+                // a minus sign is only valid immediately before a digit
+                '-' => match self.peek() {
+                    Some((_, next)) if next.is_ascii_digit() => {
+                        let token = self.lex_number(idx, ch, &mut errors);
+                        tokens.push(token);
+                    }
+                    _ => {
+                        errors.push(Error::new(ErrorKind::UnknownToken, SrcRange::new(idx, idx + ch.len_utf8())));
+                    }
+                },
 
                 // errors
                 _ => {
@@ -168,11 +154,37 @@ impl<'src> Lexer<'src> {
         }
         tokens.push(Token::new(TokenKind::Eof, self.src.len(), self.src.len()));
 
-        if errors.is_empty() {
-            Ok(tokens)
-        } else {
-            Err(errors)
+        if errors.is_empty() { Ok(tokens) } else { Err(errors) }
+    }
+
+    fn lex_number(&mut self, start: usize, first: char, errors: &mut Errors) -> Token {
+        let mut end = start + first.len_utf8();
+        let mut value = String::new();
+        let mut decimals = 0;
+        value.push(first);
+
+        while let Some((n_idx, n_ch)) = self.peek() {
+            match n_ch {
+                c if c.is_ascii_digit() => {
+                    value.push(c);
+                    end = n_idx + c.len_utf8();
+                    self.next();
+                }
+                '.' => {
+                    decimals += 1;
+                    value.push(n_ch);
+                    end = n_idx + n_ch.len_utf8();
+                    self.next();
+                }
+                _ => break,
+            }
         }
+
+        if decimals > 1 || value.ends_with('.') {
+            errors.push(Error::new(ErrorKind::InvalidNumber, SrcRange::new(start, end)));
+        }
+
+        Token::new(TokenKind::Number(value), start, end)
     }
 
     fn peek(&mut self) -> Option<(usize, char)> {
@@ -184,7 +196,9 @@ impl<'src> Lexer<'src> {
 }
 
 pub(super) fn lex(src: &str) -> Result<Tokens, Diags> {
-    Lexer::new(src).lex().map_err(|errors| errors.into_iter().map(Diag::from).collect())
+    Lexer::new(src)
+        .lex()
+        .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
 #[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
@@ -262,6 +276,42 @@ mod tests {
     fn rejects_numbers_with_multiple_dec_points() {
         assert_error_kinds("5.6.4.3", &[ErrorKind::InvalidNumber]);
         assert_error_kinds("1..", &[ErrorKind::InvalidNumber]);
+        assert_error_kinds("-5.6.4", &[ErrorKind::InvalidNumber]);
+    }
+
+    #[test]
+    fn lexes_negative_numbers_as_single_tokens() {
+        let tokens = Lexer::new("-5 -0.25").lex().unwrap();
+
+        assert_eq!(tokens[0].kind, TokenKind::Number("-5".to_owned()));
+        assert_eq!(tokens[0].range, SrcRange::new(0, 2));
+        assert_eq!(tokens[1].kind, TokenKind::Number("-0.25".to_owned()));
+        assert_eq!(tokens[1].range, SrcRange::new(3, 8));
+    }
+
+    #[test]
+    fn breaks_idents_at_the_start_of_another_token() {
+        let tokens = Lexer::new("[true,null]").lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::LBrack,
+                TokenKind::Ident("true".to_owned()),
+                TokenKind::Comma,
+                TokenKind::Ident("null".to_owned()),
+                TokenKind::RBrack,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_a_minus_without_an_adjacent_digit() {
+        assert_error_kinds("- 5", &[ErrorKind::UnknownToken]);
+        assert_error_kinds("-x", &[ErrorKind::UnknownToken]);
+        assert_error_kinds("-.5", &[ErrorKind::UnknownToken]);
     }
 
     #[test]

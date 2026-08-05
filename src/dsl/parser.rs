@@ -1,6 +1,6 @@
+use crate::dsl::ast::{Ast, Attr, Block, Decl, Expr, ExprKind};
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::lexer::{Token, TokenKind, Tokens};
-use crate::dsl::ast::{Ast, Attr, Block, Decl, Expr, ExprKind};
 use thiserror::Error as Err;
 
 macro_rules! token {
@@ -63,7 +63,8 @@ impl Parser {
             TokenKind::String(_) | TokenKind::LBrace => self.parse_block(ident, range).map(Decl::Block),
             TokenKind::Equals => self.parse_attr(ident, range).map(Decl::Attr),
             _ => {
-                self.errors.push(Error::new(ErrorKind::ExpectedDeclaration, self.peek().range));
+                self.errors
+                    .push(Error::new(ErrorKind::ExpectedDeclaration, self.peek().range));
                 None
             }
         };
@@ -89,7 +90,12 @@ impl Parser {
 
         self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
 
-        Some(Block { kind, name, decls, range })
+        Some(Block {
+            kind,
+            name,
+            decls,
+            range,
+        })
     }
 
     fn parse_attr(&mut self, key: String, range: SrcRange) -> Option<Attr> {
@@ -119,6 +125,9 @@ impl Parser {
                 } else if value == "false" {
                     self.next();
                     Some(Expr::new(ExprKind::Bool(false), range))
+                } else if value == "null" {
+                    self.next();
+                    Some(Expr::new(ExprKind::Null, range))
                 } else {
                     self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
                     None
@@ -158,7 +167,8 @@ impl Parser {
                 Some(Expr::new(ExprKind::Object(attrs), SrcRange::new(start, end)))
             }
             _ => {
-                self.errors.push(Error::new(ErrorKind::ExpectedExpressionAssignment, self.peek().range));
+                self.errors
+                    .push(Error::new(ErrorKind::ExpectedExpressionAssignment, self.peek().range));
                 None
             }
         }
@@ -211,7 +221,9 @@ impl Parser {
 }
 
 pub(super) fn parse(tokens: Vec<Token>) -> Result<Ast, Diags> {
-    Parser::new(tokens).parse().map_err(|errors| errors.into_iter().map(Diag::from).collect())
+    Parser::new(tokens)
+        .parse()
+        .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
 #[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
@@ -333,6 +345,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_null_and_negative_number_attrs() {
+        let ast = parse(r#"trace "a" { output = null delta = -0.5 items = [null, -1] }"#).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        assert!(matches!(attr(&trace.decls[0]).value.kind, ExprKind::Null));
+        assert!(matches!(&attr(&trace.decls[1]).value.kind, ExprKind::Num(value) if value == "-0.5"));
+
+        let ExprKind::Array(items) = &attr(&trace.decls[2]).value.kind else {
+            panic!("expected an array");
+        };
+        assert!(matches!(items[0].kind, ExprKind::Null));
+        assert!(matches!(&items[1].kind, ExprKind::Num(value) if value == "-1"));
+    }
+
+    #[test]
+    fn rejects_bare_identifiers_that_are_not_keyword_literals() {
+        // the stray `nil` is re-scanned as a declaration during recovery, adding a second error
+        assert_error_kinds(
+            r#"trace "a" { output = nil }"#,
+            &[ErrorKind::UnexpectedToken, ErrorKind::ExpectedDeclaration],
+        );
+    }
+
+    #[test]
     fn parses_array_attrs_with_optional_trailing_comma() {
         let ast = parse(r#"trace "a" { empty = [] tags = ["x", "y",] }"#).unwrap();
         let trace = block(&ast.decls[0]);
@@ -432,4 +468,3 @@ mod tests {
         assert_eq!(errors[1].kind(), ErrorKind::ExpectedExpressionAssignment);
     }
 }
-

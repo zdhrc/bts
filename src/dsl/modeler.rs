@@ -15,6 +15,7 @@ pub(super) enum ExprType {
     String,
     Number,
     Boolean,
+    Null,
     Array,
     Object,
 }
@@ -25,6 +26,7 @@ impl ExprType {
             ast::ExprKind::Str(_) => Self::String,
             ast::ExprKind::Num(_) => Self::Number,
             ast::ExprKind::Bool(_) => Self::Boolean,
+            ast::ExprKind::Null => Self::Null,
             ast::ExprKind::Array(_) => Self::Array,
             ast::ExprKind::Object(_) => Self::Object,
         }
@@ -37,6 +39,7 @@ impl fmt::Display for ExprType {
             Self::String => "string",
             Self::Number => "number",
             Self::Boolean => "boolean",
+            Self::Null => "null",
             Self::Array => "array",
             Self::Object => "object",
         })
@@ -92,8 +95,12 @@ impl Modeler {
         }
 
         if traces.is_empty() && self.errors.is_empty() {
-            self.errors
-                .push(Error::new(ErrorKind::EmptyShape { rule: spec::ids::NONEMPTY_SHAPE }, SrcRange::new(0, 0)));
+            self.errors.push(Error::new(
+                ErrorKind::EmptyShape {
+                    rule: spec::ids::NONEMPTY_SHAPE,
+                },
+                SrcRange::new(0, 0),
+            ));
         }
 
         if self.errors.is_empty() {
@@ -167,12 +174,7 @@ impl Modeler {
         })
     }
 
-    fn model_body(
-        &mut self,
-        decls: Vec<ast::Decl>,
-        block: &spec::BlockDesc,
-        range: SrcRange,
-    ) -> (SpanFields, Vec<ast::Block>) {
+    fn model_body(&mut self, decls: Vec<ast::Decl>, block: &spec::BlockDesc, range: SrcRange) -> (SpanFields, Vec<ast::Block>) {
         let mut fields = FieldsBuilder::default();
         let mut blocks = Vec::new();
 
@@ -271,13 +273,7 @@ impl Modeler {
 
     // fold, not all(): validate every element so each invalid item gets its own diagnostic
     #[allow(clippy::unnecessary_fold)]
-    fn validate_expr(
-        &mut self,
-        expr: &ast::Expr,
-        block: spec::Id,
-        field: spec::Id,
-        expected: &'static spec::ExprType,
-    ) -> bool {
+    fn validate_expr(&mut self, expr: &ast::Expr, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) -> bool {
         let valid = match expected {
             spec::ExprType::Any => true,
             spec::ExprType::String => matches!(expr.kind, ast::ExprKind::Str(_)),
@@ -342,6 +338,7 @@ impl Modeler {
         match kind {
             ast::ExprKind::Str(value) => Some(Value::Str(value)),
             ast::ExprKind::Bool(value) => Some(Value::Bool(value)),
+            ast::ExprKind::Null => Some(Value::Null),
             ast::ExprKind::Num(value) => self.model_number(value, range).map(Value::Num),
             ast::ExprKind::Array(values) => Some(Value::Array(Array {
                 elem: values.into_iter().filter_map(|value| self.model_value(value)).collect(),
@@ -803,6 +800,34 @@ mod tests {
     }
 
     #[test]
+    fn models_null_and_negative_numbers() {
+        let model = model(r#"trace "example" { input = null metrics = { delta = -0.5 offset = -3 } }"#).unwrap();
+
+        let fields = &model.traces[0].fields;
+        assert!(matches!(fields.input, Some(Value::Null)));
+
+        let metrics = fields.metrics.as_ref().unwrap();
+        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == -0.5));
+        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Int(-3))));
+    }
+
+    #[test]
+    fn rejects_null_where_a_specific_type_is_expected() {
+        let errors = model(r#"trace "example" { tags = [null] }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::TypeMismatch {
+                block: spec::ids::TRACE,
+                field: spec::ids::TAGS,
+                expected: &spec::ExprType::String,
+                found: ExprType::Null,
+            }
+        );
+        assert!(errors[0].to_string().contains("expects string, but found null"));
+    }
+
+    #[test]
     fn collects_an_error_for_each_invalid_tag() {
         let errors = match model(r#"trace "example" { tags = [true , false , 1] }"#) {
             Err(errors) => errors,
@@ -911,7 +936,12 @@ mod tests {
             let errors = model(source).unwrap_err();
 
             assert_eq!(errors.len(), 1);
-            assert_eq!(errors[0].kind(), &ErrorKind::EmptyShape { rule: spec::ids::NONEMPTY_SHAPE });
+            assert_eq!(
+                errors[0].kind(),
+                &ErrorKind::EmptyShape {
+                    rule: spec::ids::NONEMPTY_SHAPE
+                }
+            );
         }
     }
 

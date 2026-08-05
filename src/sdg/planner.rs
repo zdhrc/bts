@@ -123,6 +123,7 @@ fn lower_value(value: ModelValue) -> JsonValue {
     match value {
         ModelValue::Str(value) => JsonValue::String(value),
         ModelValue::Bool(value) => JsonValue::Bool(value),
+        ModelValue::Null => JsonValue::Null,
 
         ModelValue::Num(ModelNumber::Int(value)) => JsonValue::Number(value.into()),
 
@@ -179,6 +180,16 @@ mod tests {
         let plan = plan(model, 1);
 
         println!("{plan:#?}");
+    }
+
+    #[test]
+    fn lowers_null_and_negative_numbers_to_json() {
+        let model = compile(r#"trace "t" { input = null metrics = { delta = -0.5 } }"#).unwrap();
+        let plan = plan(model, 1);
+
+        let fields = &plan.events[0].fields;
+        assert_eq!(fields.input, Some(JsonValue::Null));
+        assert_eq!(fields.metrics.as_ref().unwrap()["delta"], JsonValue::from(-0.5));
     }
 
     #[test]
