@@ -36,6 +36,13 @@ pub fn command() -> Command {
                 .required(true),
         )
         .arg(
+            Arg::new("seed")
+                .long("seed")
+                .value_name("SEED")
+                .help("seed for random value functions; a random seed is chosen and printed when omitted")
+                .value_parser(clap::value_parser!(u64)),
+        )
+        .arg(
             Arg::new("dry-run")
                 .long("dry-run")
                 .help("print the Braintrust payload without writing it")
@@ -64,7 +71,15 @@ fn execute(matches: &ArgMatches) -> Result<(), Error> {
     let model = dsl::compile(&source).map_err(|diags| Error::InvalidShape {
         details: render_diags(path, &source, &diags),
     })?;
-    let events = sdg::generate(model, count, over, SystemTime::now())?;
+    let seed = match matches.get_one::<u64>("seed") {
+        Some(seed) => *seed,
+        None => {
+            let seed = rand::random();
+            eprintln!("seed: {seed} (pass --seed {seed} to reproduce)");
+            seed
+        }
+    };
+    let events = sdg::generate(model, count, over, SystemTime::now(), seed)?;
 
     if matches.get_flag("dry-run") {
         println!("{}", serde_json::to_string_pretty(&events)?);

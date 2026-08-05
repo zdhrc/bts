@@ -42,6 +42,7 @@ pub enum ExprKind {
     Array(Vec<Expr>),
     Object(Vec<Attr>),
     VarRef(String),
+    Func { name: String, args: Vec<Expr> },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

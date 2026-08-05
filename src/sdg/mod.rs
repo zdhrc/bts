@@ -9,12 +9,18 @@ use thiserror::Error;
 pub(crate) use materializer::EventBatch;
 pub(crate) use writer::{Error as WriteError, InsertResponse};
 
-pub(crate) fn generate(model: Model, count: usize, over: Duration, now: SystemTime) -> Result<EventBatch, GenerateError> {
+pub(crate) fn generate(
+    model: Model,
+    count: usize,
+    over: Duration,
+    now: SystemTime,
+    seed: u64,
+) -> Result<EventBatch, GenerateError> {
     if model.traces.is_empty() {
         return Err(GenerateError::EmptyShape);
     }
 
-    materializer::materialize(planner::plan(model, count), over, now).map_err(GenerateError::Materialize)
+    materializer::materialize(planner::plan(model, count, seed), over, now).map_err(GenerateError::Materialize)
 }
 
 pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, writer::Error> {

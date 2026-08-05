@@ -9,6 +9,7 @@ pub(crate) struct Spec {
     pub(crate) summary: &'static str,
     pub(crate) surface: SurfaceDesc,
     pub(crate) expressions: &'static [ExprDesc],
+    pub(crate) functions: &'static [FuncDesc],
     pub(crate) blocks: &'static [BlockDesc],
     pub(crate) rules: &'static [RuleDesc],
     pub(crate) examples: &'static [Example],
@@ -32,7 +33,12 @@ impl Spec {
             .iter()
             .chain(self.blocks.iter().flat_map(|block| block.rules))
             .chain(self.expressions.iter().flat_map(|expr| expr.rules))
+            .chain(self.functions.iter().flat_map(|func| func.rules))
             .find(|rule| rule.id == id)
+    }
+
+    pub(crate) fn function(&self, name: &str) -> Option<&FuncDesc> {
+        self.functions.iter().find(|func| func.name == name)
     }
 }
 
@@ -60,6 +66,16 @@ pub(crate) struct SurfaceDesc {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct ExprDesc {
     pub(crate) id: Id,
+    pub(crate) syntax: &'static str,
+    pub(crate) summary: &'static str,
+    pub(crate) examples: &'static [&'static str],
+    pub(crate) rules: &'static [RuleDesc],
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub(crate) struct FuncDesc {
+    pub(crate) id: Id,
+    pub(crate) name: &'static str,
     pub(crate) syntax: &'static str,
     pub(crate) summary: &'static str,
     pub(crate) examples: &'static [&'static str],
@@ -193,6 +209,10 @@ pub(crate) mod ids {
     pub(crate) const NULL: Id = Id::new("expr.null");
     pub(crate) const ARRAY: Id = Id::new("expr.array");
     pub(crate) const OBJECT: Id = Id::new("expr.object");
+    pub(crate) const FUNC: Id = Id::new("expr.func");
+
+    pub(crate) const FUNC_CHOICE: Id = Id::new("func.choice");
+    pub(crate) const FUNC_RANGE: Id = Id::new("func.range");
 
     pub(crate) const KNOWN_REFERENCES: Id = Id::new("rule.known-references");
     pub(crate) const UNIQUE_VARS: Id = Id::new("rule.unique-vars");
@@ -203,6 +223,10 @@ pub(crate) mod ids {
     pub(crate) const FINITE_NUMBERS: Id = Id::new("rule.finite-numbers");
     pub(crate) const NONEMPTY_SHAPE: Id = Id::new("rule.nonempty-shape");
     pub(crate) const RESERVED_METRICS: Id = Id::new("rule.reserved-metrics");
+    pub(crate) const KNOWN_FUNCTIONS: Id = Id::new("rule.known-functions");
+    pub(crate) const FUNC_POSITIONS: Id = Id::new("rule.function-positions");
+    pub(crate) const CHOICE_ALTERNATIVES: Id = Id::new("rule.choice-alternatives");
+    pub(crate) const RANGE_BOUNDS: Id = Id::new("rule.range-bounds");
 
     pub(crate) const COMPLETE_TRACE: Id = Id::new("example.complete-trace");
 }
@@ -280,6 +304,24 @@ const VARS_RULES: &[RuleDesc] = &[
         summary: "A variable value may not reference other variables.",
     },
 ];
+const FUNC_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::KNOWN_FUNCTIONS,
+        summary: "A function call may only use documented functions; currently `choice` and `range`.",
+    },
+    RuleDesc {
+        id: ids::FUNC_POSITIONS,
+        summary: "A function may only appear where any value is accepted; fields with a specific type and interpolations must use literals.",
+    },
+];
+const CHOICE_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::CHOICE_ALTERNATIVES,
+    summary: "`choice` takes at least one alternative.",
+}];
+const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::RANGE_BOUNDS,
+    summary: "`range` takes exactly two finite numbers with min <= max.",
+}];
 const VAR_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::DEFINED_VARS,
@@ -347,6 +389,32 @@ const EXPR_TYPES: &[ExprDesc] = &[
         summary: "An object with unique identifier keys and expression values.",
         examples: &["{}", "{ tokens = 4 cached = false }"],
         rules: UNIQUE_OBJECT_KEYS_RULE,
+    },
+    ExprDesc {
+        id: ids::FUNC,
+        syntax: "name(arg, ...)",
+        summary: "A call to a documented function, evaluated once per generated trace.",
+        examples: &["choice(\"clear\", \"vague\")", "range(80, 400)"],
+        rules: FUNC_RULES,
+    },
+];
+
+const FUNCS: &[FuncDesc] = &[
+    FuncDesc {
+        id: ids::FUNC_CHOICE,
+        name: "choice",
+        syntax: "choice(value, ...)",
+        summary: "Picks one of its alternatives uniformly at random for each generated trace. Alternatives may be any value, including nested functions.",
+        examples: &["choice(\"gpt-4o\", \"gpt-4o-mini\")", "choice(1, 2, range(5, 9))"],
+        rules: CHOICE_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_RANGE,
+        name: "range",
+        syntax: "range(min, max)",
+        summary: "Samples a number uniformly between min and max (inclusive) for each generated trace. Two integer bounds sample an integer; otherwise a float.",
+        examples: &["range(80, 400)", "range(0.0, 1.0)"],
+        rules: RANGE_RULES,
     },
 ];
 
@@ -434,10 +502,11 @@ document    = { declaration } ;
 declaration = block | attribute ;
 block       = identifier, [ string ], "{", { declaration }, "}" ;
 attribute   = identifier, "=", expression ;
-expression  = string | number | boolean | null | array | object | variable ;
+expression  = string | number | boolean | null | array | object | variable | function ;
 boolean     = "true" | "false" ;
 null        = "null" ;
 variable    = "var", ".", identifier ;
+function    = identifier, "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
 array       = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 object      = "{", { attribute }, "}" ;
 identifier  = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
@@ -456,6 +525,7 @@ reference   = identifier, { ".", identifier } ;
         ],
     },
     expressions: EXPR_TYPES,
+    functions: FUNCS,
     blocks: BLOCKS,
     rules: RULES,
     examples: EXAMPLES,

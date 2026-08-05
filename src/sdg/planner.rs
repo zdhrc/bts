@@ -1,8 +1,10 @@
 use crate::dsl::{
-    Array as ModelArray, CtxRef as ModelCtxRef, Model, Number as ModelNumber, Object as ModelObject,
-    ObjectField as ModelObjectField, Part as ModelPart, Span as ModelSpan, SpanFields as ModelSpanFields,
+    Array as ModelArray, CtxRef as ModelCtxRef, Func as ModelFunc, Model, Number as ModelNumber, Object as ModelObject,
+    ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange, Span as ModelSpan, SpanFields as ModelSpanFields,
     SpanKind as ModelSpanKind, Template as ModelTemplate, Trace as ModelTrace, Value as ModelValue,
 };
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::ops::Range;
 
@@ -54,14 +56,15 @@ pub(super) struct Planner {
     traces: Vec<Range<usize>>,
 }
 
-// per-trace generation context that templates resolve against
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// per-trace generation context that templates and functions resolve against
+#[derive(Debug)]
 struct Ctx {
     trace_index: usize,
+    rng: SmallRng,
 }
 
 impl Planner {
-    fn plan_trace(&mut self, trace: ModelTrace, ctx: Ctx) {
+    fn plan_trace(&mut self, trace: ModelTrace, ctx: &mut Ctx) {
         let start = self.events.len();
         let root = EventRef(start);
 
@@ -82,7 +85,7 @@ impl Planner {
         self.traces.push(start..self.events.len());
     }
 
-    fn plan_span(&mut self, span: ModelSpan, root: EventRef, parent: EventRef, ctx: Ctx) {
+    fn plan_span(&mut self, span: ModelSpan, root: EventRef, parent: EventRef, ctx: &mut Ctx) {
         let event_ref = EventRef(self.events.len());
 
         let ModelSpan {
@@ -116,7 +119,7 @@ fn span_len(span: &ModelSpan) -> usize {
     1 + span.children.iter().map(span_len).sum::<usize>()
 }
 
-fn lower_fields(fields: ModelSpanFields, ctx: Ctx) -> EventFields {
+fn lower_fields(fields: ModelSpanFields, ctx: &mut Ctx) -> EventFields {
     EventFields {
         input: fields.input.map(|value| lower_value(value, ctx)),
         output: fields.output.map(|value| lower_value(value, ctx)),
@@ -126,7 +129,7 @@ fn lower_fields(fields: ModelSpanFields, ctx: Ctx) -> EventFields {
     }
 }
 
-fn lower_value(value: ModelValue, ctx: Ctx) -> JsonValue {
+fn lower_value(value: ModelValue, ctx: &mut Ctx) -> JsonValue {
     match value {
         ModelValue::Str(value) => JsonValue::String(value),
         ModelValue::Template(template) => JsonValue::String(resolve_template(template, ctx)),
@@ -145,10 +148,33 @@ fn lower_value(value: ModelValue, ctx: Ctx) -> JsonValue {
         }
 
         ModelValue::Object(object) => JsonValue::Object(lower_object(object, ctx)),
+
+        ModelValue::Func(func) => eval_func(func, ctx),
     }
 }
 
-fn lower_object(object: ModelObject, ctx: Ctx) -> JsonMap<String, JsonValue> {
+fn eval_func(func: ModelFunc, ctx: &mut Ctx) -> JsonValue {
+    match func {
+        ModelFunc::Choice(options) => {
+            let pick = ctx.rng.random_range(0..options.len());
+            let option = options
+                .into_iter()
+                .nth(pick)
+                .expect("modeler guarantees choice has an alternative");
+
+            lower_value(option, ctx)
+        }
+
+        ModelFunc::Range(ModelRange::Int { min, max }) => JsonValue::Number(ctx.rng.random_range(min..=max).into()),
+
+        ModelFunc::Range(ModelRange::Float { min, max }) => {
+            let number = JsonNumber::from_f64(ctx.rng.random_range(min..=max)).expect("modeler guarantees finite bounds");
+            JsonValue::Number(number)
+        }
+    }
+}
+
+fn lower_object(object: ModelObject, ctx: &mut Ctx) -> JsonMap<String, JsonValue> {
     object
         .elem
         .into_iter()
@@ -156,7 +182,7 @@ fn lower_object(object: ModelObject, ctx: Ctx) -> JsonMap<String, JsonValue> {
         .collect()
 }
 
-fn resolve_template(template: ModelTemplate, ctx: Ctx) -> String {
+fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> String {
     template
         .parts
         .into_iter()
@@ -168,7 +194,7 @@ fn resolve_template(template: ModelTemplate, ctx: Ctx) -> String {
 }
 
 // expands into exactly count traces, multiple trace templates cycle in source order
-pub(super) fn plan(model: Model, count: usize) -> Plan {
+pub(super) fn plan(model: Model, count: usize, seed: u64) -> Plan {
     debug_assert!(!model.traces.is_empty());
 
     let capacity = (0..count)
@@ -181,7 +207,12 @@ pub(super) fn plan(model: Model, count: usize) -> Plan {
     };
 
     for index in 0..count {
-        planner.plan_trace(model.traces[index % model.traces.len()].clone(), Ctx { trace_index: index });
+        // each trace gets its own rng so its values don't depend on the traces planned before it
+        let mut ctx = Ctx {
+            trace_index: index,
+            rng: SmallRng::seed_from_u64(seed.wrapping_add(index as u64)),
+        };
+        planner.plan_trace(model.traces[index % model.traces.len()].clone(), &mut ctx);
     }
 
     Plan {
@@ -198,7 +229,7 @@ mod tests {
     #[test]
     fn prints_plan() {
         let model = compile(include_str!("../../tests/fixtures/simple.bt")).unwrap();
-        let plan = plan(model, 1);
+        let plan = plan(model, 1, 0);
 
         println!("{plan:#?}");
     }
@@ -206,7 +237,7 @@ mod tests {
     #[test]
     fn lowers_null_and_negative_numbers_to_json() {
         let model = compile(r#"trace "t" { input = null metrics = { delta = -0.5 } }"#).unwrap();
-        let plan = plan(model, 1);
+        let plan = plan(model, 1, 0);
 
         let fields = &plan.events[0].fields;
         assert_eq!(fields.input, Some(JsonValue::Null));
@@ -216,7 +247,7 @@ mod tests {
     #[test]
     fn resolves_trace_index_per_generated_trace() {
         let model = compile(r#"trace "t" { input = "q ${trace.index}" tags = ["t-${trace.index}"] }"#).unwrap();
-        let plan = plan(model, 3);
+        let plan = plan(model, 3, 0);
 
         let inputs = plan
             .events
@@ -239,12 +270,80 @@ mod tests {
             "#,
         )
         .unwrap();
-        let plan = plan(model, 5);
+        let plan = plan(model, 5, 0);
 
         assert_eq!(plan.traces.len(), 5);
         assert_eq!(
             plan.events.iter().map(|event| event.name.as_str()).collect::<Vec<_>>(),
             ["first", "second", "first", "second", "first"]
         );
+    }
+
+    #[test]
+    fn evaluates_choice_within_its_alternatives() {
+        let model = compile(r#"trace "t" { input = choice("a", "b") }"#).unwrap();
+        let plan = plan(model, 20, 7);
+
+        for event in plan.events.iter() {
+            let input = event.fields.input.as_ref().unwrap().as_str().unwrap();
+            assert!(matches!(input, "a" | "b"), "unexpected choice {input}");
+        }
+    }
+
+    #[test]
+    fn evaluates_ranges_within_bounds_and_keeps_integer_bounds_integral() {
+        let model = compile(r#"trace "t" { metrics = { tokens = range(80, 400) temp = range(0.0, 1.0) } }"#).unwrap();
+        let plan = plan(model, 20, 7);
+
+        for event in plan.events.iter() {
+            let metrics = event.fields.metrics.as_ref().unwrap();
+            let tokens = metrics["tokens"].as_i64().unwrap();
+            assert!((80..=400).contains(&tokens));
+            let temp = metrics["temp"].as_f64().unwrap();
+            assert!((0.0..=1.0).contains(&temp));
+        }
+    }
+
+    #[test]
+    fn evaluates_nested_funcs_and_funcs_from_vars() {
+        let model = compile(
+            r#"
+                vars { style = choice("clear", "vague") }
+                trace "t" { input = [choice(range(1, 3), "x"), var.style] }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 20, 7);
+
+        for event in plan.events.iter() {
+            let JsonValue::Array(input) = event.fields.input.as_ref().unwrap() else {
+                panic!("expected an array");
+            };
+            match &input[0] {
+                JsonValue::Number(number) => assert!((1..=3).contains(&number.as_i64().unwrap())),
+                JsonValue::String(value) => assert_eq!(value, "x"),
+                other => panic!("unexpected value {other}"),
+            }
+            assert!(matches!(input[1].as_str().unwrap(), "clear" | "vague"));
+        }
+    }
+
+    #[test]
+    fn reproduces_the_same_plan_for_the_same_seed() {
+        let source = r#"trace "t" { input = choice("a", "b", "c") metrics = { n = range(0, 1000000) } }"#;
+        let first = plan(compile(source).unwrap(), 10, 42);
+        let second = plan(compile(source).unwrap(), 10, 42);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn samples_traces_independently_of_earlier_traces() {
+        // trace 3 of a 5-trace run must match trace 3 of a 4-trace run
+        let source = r#"trace "t" { metrics = { n = range(0, 1000000) } }"#;
+        let longer = plan(compile(source).unwrap(), 5, 42);
+        let shorter = plan(compile(source).unwrap(), 4, 42);
+
+        assert_eq!(longer.events[3], shorter.events[3]);
     }
 }

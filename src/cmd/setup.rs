@@ -273,6 +273,23 @@ fn render_skill(spec: &Spec) -> String {
         render_rules(&mut output, expression.rules);
     }
 
+    if !spec.functions.is_empty() {
+        writeln!(output, "## Functions\n").unwrap();
+        for function in spec.functions {
+            writeln!(output, "### {}\n", inline_code(function.name)).unwrap();
+            writeln!(output, "{}\n", function.summary).unwrap();
+            writeln!(output, "Syntax: {}\n", inline_code(function.syntax)).unwrap();
+            if !function.examples.is_empty() {
+                writeln!(output, "Examples:").unwrap();
+                for example in function.examples {
+                    writeln!(output, "- {}", inline_code(example)).unwrap();
+                }
+                writeln!(output).unwrap();
+            }
+            render_rules(&mut output, function.rules);
+        }
+    }
+
     writeln!(output, "## Blocks\n").unwrap();
     for block in spec.blocks {
         writeln!(output, "### {}\n", inline_code(block.keyword)).unwrap();
@@ -478,6 +495,11 @@ mod tests {
             assert!(skill.contains(expression.id.as_str()));
             assert!(skill.contains(expression.syntax));
             assert!(skill.contains(expression.summary));
+        }
+        for function in SPEC.functions {
+            assert!(skill.contains(function.name));
+            assert!(skill.contains(function.syntax));
+            assert!(skill.contains(function.summary));
         }
         for block in SPEC.blocks {
             assert!(skill.contains(block.keyword));

@@ -26,6 +26,8 @@ pub(super) enum TokenKind {
     RBrace,
     LBrack,
     RBrack,
+    LParen,
+    RParen,
 
     Comma,
     Dot,
@@ -65,6 +67,8 @@ impl<'src> Lexer<'src> {
                 '}' => tokens.push(Token::new(TokenKind::RBrace, idx, idx + ch.len_utf8())),
                 '[' => tokens.push(Token::new(TokenKind::LBrack, idx, idx + ch.len_utf8())),
                 ']' => tokens.push(Token::new(TokenKind::RBrack, idx, idx + ch.len_utf8())),
+                '(' => tokens.push(Token::new(TokenKind::LParen, idx, idx + ch.len_utf8())),
+                ')' => tokens.push(Token::new(TokenKind::RParen, idx, idx + ch.len_utf8())),
 
                 // punctuation
                 ',' => tokens.push(Token::new(TokenKind::Comma, idx, idx + ch.len_utf8())),
@@ -90,7 +94,7 @@ impl<'src> Lexer<'src> {
                                 self.next();
                             }
                             c if c.is_whitespace() => break,
-                            '{' | '}' | '[' | ']' | ',' | '.' | '=' | '"' | '-' => break,
+                            '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' => break,
                             _ => {
                                 errors.push(Error::new(
                                     ErrorKind::InvalidIdentToken,
@@ -410,6 +414,23 @@ mod tests {
                 TokenKind::Comma,
                 TokenKind::Ident("null".to_owned()),
                 TokenKind::RBrack,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_parens_and_breaks_idents_before_them() {
+        let tokens = Lexer::new("choice(1)").lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Ident("choice".to_owned()),
+                TokenKind::LParen,
+                TokenKind::Number("1".to_owned()),
+                TokenKind::RParen,
                 TokenKind::Eof,
             ]
         );

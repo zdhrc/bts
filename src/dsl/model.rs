@@ -42,6 +42,20 @@ pub(crate) enum Value {
     Null,
     Array(Array),
     Object(Object),
+    Func(Func),
+}
+
+// already validated by the modeler so evaluating one can't fail
+#[derive(Debug, Clone)]
+pub(crate) enum Func {
+    Choice(Vec<Value>),
+    Range(Range),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Range {
+    Int { min: i64, max: i64 },
+    Float { min: f64, max: f64 },
 }
 
 #[derive(Debug, Clone)]

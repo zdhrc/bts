@@ -146,6 +146,23 @@ impl Parser {
                     let name_range = self.peek().range;
                     let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedVariableName)?;
                     Some(Expr::new(ExprKind::VarRef(name), SrcRange::new(range.start, name_range.end)))
+                } else if matches!(self.peek_ahead().kind, TokenKind::LParen) {
+                    let name = value.clone();
+                    self.next();
+                    self.next();
+
+                    let mut args = Vec::new();
+                    while !self.check(token!(RParen)) {
+                        args.push(self.parse_expr()?);
+
+                        if self.consume(token!(Comma)).is_none() {
+                            break;
+                        }
+                    }
+                    let end = self.peek().range.end;
+                    self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
+
+                    Some(Expr::new(ExprKind::Func { name, args }, SrcRange::new(range.start, end)))
                 } else {
                     self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
                     None
@@ -225,6 +242,9 @@ impl Parser {
     // helpers
     fn peek(&self) -> &Token {
         &self.tokens[self.index]
+    }
+    fn peek_ahead(&self) -> &Token {
+        self.tokens.get(self.index + 1).unwrap_or(&self.tokens[self.tokens.len() - 1])
     }
     fn next(&mut self) -> &Token {
         let token = &self.tokens[self.index];
@@ -430,6 +450,44 @@ mod tests {
             panic!("expected an array");
         };
         assert!(matches!(&items[0].kind, ExprKind::VarRef(name) if name == "x"));
+    }
+
+    #[test]
+    fn parses_func_exprs() {
+        let source = r#"trace "a" { input = choice("x", range(1, 2),) }"#;
+        let ast = parse(source).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        let input = attr(&trace.decls[0]);
+        let ExprKind::Func { name, args } = &input.value.kind else {
+            panic!("expected a func");
+        };
+        assert_eq!(name, "choice");
+        assert!(matches!(&args[0].kind, ExprKind::Str(value) if value == "x"));
+        let ExprKind::Func { name, args } = &args[1].kind else {
+            panic!("expected a nested func");
+        };
+        assert_eq!(name, "range");
+        assert_eq!(args.len(), 2);
+
+        let range = input.value.range;
+        assert_eq!(&source[range.start..range.end], r#"choice("x", range(1, 2),)"#);
+    }
+
+    #[test]
+    fn parses_funcs_without_args() {
+        let ast = parse(r#"trace "a" { input = uuid() }"#).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        assert!(matches!(
+            &attr(&trace.decls[0]).value.kind,
+            ExprKind::Func { name, args } if name == "uuid" && args.is_empty()
+        ));
+    }
+
+    #[test]
+    fn rejects_unclosed_func_args() {
+        assert_error_kinds(r#"trace "a" { input = choice("x" }"#, &[ErrorKind::UnexpectedToken]);
     }
 
     #[test]

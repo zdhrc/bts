@@ -1,7 +1,7 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Array, CtxRef, Model, Number, Object, ObjectField, Part, Span, SpanFields, SpanKind, Template, Trace, Value,
+    Array, CtxRef, Func, Model, Number, Object, ObjectField, Part, Range, Span, SpanFields, SpanKind, Template, Trace, Value,
 };
 use crate::dsl::spec;
 use std::{
@@ -23,6 +23,7 @@ pub(super) enum ExprType {
     Null,
     Array,
     Object,
+    Func,
 }
 
 impl ExprType {
@@ -35,6 +36,7 @@ impl ExprType {
             ast::ExprKind::Null => Self::Null,
             ast::ExprKind::Array(_) => Self::Array,
             ast::ExprKind::Object(_) => Self::Object,
+            ast::ExprKind::Func { .. } => Self::Func,
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
         }
     }
@@ -49,6 +51,7 @@ impl fmt::Display for ExprType {
             Self::Null => "null",
             Self::Array => "array",
             Self::Object => "object",
+            Self::Func => "function",
         })
     }
 }
@@ -229,6 +232,20 @@ impl Modeler {
                     return None;
                 }
                 ast::ExprKind::Object(resolved)
+            }
+            ast::ExprKind::Func { name, args } => {
+                let mut resolved = Vec::with_capacity(args.len());
+                let mut valid = true;
+                for arg in args {
+                    match self.resolve_expr(arg) {
+                        Some(arg) => resolved.push(arg),
+                        None => valid = false,
+                    }
+                }
+                if !valid {
+                    return None;
+                }
+                ast::ExprKind::Func { name, args: resolved }
             }
             kind => kind,
         };
@@ -519,7 +536,101 @@ impl Modeler {
                 elem: values.into_iter().filter_map(|value| self.model_value(value)).collect(),
             })),
             ast::ExprKind::Object(attrs) => Some(Value::Object(self.model_object(attrs))),
+            ast::ExprKind::Func { name, args } => self.model_func(name, args, range).map(Value::Func),
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before model lowering"),
+        }
+    }
+
+    fn model_func(&mut self, name: String, args: Vec<ast::Expr>, range: SrcRange) -> Option<Func> {
+        if spec::SPEC.function(&name).is_none() {
+            self.errors.push(Error::new(
+                ErrorKind::UnknownFunction {
+                    rule: spec::ids::KNOWN_FUNCTIONS,
+                    name,
+                },
+                range,
+            ));
+            return None;
+        }
+
+        match name.as_str() {
+            "choice" => {
+                if args.is_empty() {
+                    self.errors.push(Error::new(
+                        ErrorKind::EmptyChoice {
+                            rule: spec::ids::CHOICE_ALTERNATIVES,
+                        },
+                        range,
+                    ));
+                    return None;
+                }
+
+                let mut options = Vec::with_capacity(args.len());
+                let mut valid = true;
+                for arg in args {
+                    match self.model_value(arg) {
+                        Some(value) => options.push(value),
+                        None => valid = false,
+                    }
+                }
+
+                valid.then_some(Func::Choice(options))
+            }
+            "range" => {
+                let Ok([min, max]) = <[ast::Expr; 2]>::try_from(args) else {
+                    self.errors.push(Error::new(
+                        ErrorKind::InvalidRangeArgs {
+                            rule: spec::ids::RANGE_BOUNDS,
+                        },
+                        range,
+                    ));
+                    return None;
+                };
+                let min = self.model_range_bound(min);
+                let max = self.model_range_bound(max)?;
+                let min = min?;
+
+                let bounds = match (min, max) {
+                    (Number::Int(min), Number::Int(max)) => Range::Int { min, max },
+                    (min, max) => Range::Float {
+                        min: float_bound(min),
+                        max: float_bound(max),
+                    },
+                };
+                let ordered = match bounds {
+                    Range::Int { min, max } => min <= max,
+                    Range::Float { min, max } => min <= max,
+                };
+
+                if !ordered {
+                    self.errors.push(Error::new(
+                        ErrorKind::InvalidRangeBounds {
+                            rule: spec::ids::RANGE_BOUNDS,
+                        },
+                        range,
+                    ));
+                    return None;
+                }
+
+                Some(Func::Range(bounds))
+            }
+            _ => unreachable!("function {name} does not have a model lowering"),
+        }
+    }
+
+    fn model_range_bound(&mut self, expr: ast::Expr) -> Option<Number> {
+        let ast::Expr { kind, range } = expr;
+        match kind {
+            ast::ExprKind::Num(raw) => self.model_number(raw, range),
+            _ => {
+                self.errors.push(Error::new(
+                    ErrorKind::InvalidRangeArgs {
+                        rule: spec::ids::RANGE_BOUNDS,
+                    },
+                    range,
+                ));
+                None
+            }
         }
     }
 
@@ -651,7 +762,15 @@ fn expr_references_vars(expr: &ast::Expr) -> bool {
         ),
         ast::ExprKind::Array(values) => values.iter().any(expr_references_vars),
         ast::ExprKind::Object(attrs) => attrs.iter().any(|attr| expr_references_vars(&attr.value)),
+        ast::ExprKind::Func { args, .. } => args.iter().any(expr_references_vars),
         _ => false,
+    }
+}
+
+fn float_bound(number: Number) -> f64 {
+    match number {
+        Number::Int(value) => value as f64,
+        Number::Float(value) => value,
     }
 }
 
@@ -788,6 +907,19 @@ pub(super) enum ErrorKind {
     EmptyShape {
         rule: spec::Id,
     },
+    UnknownFunction {
+        rule: spec::Id,
+        name: String,
+    },
+    EmptyChoice {
+        rule: spec::Id,
+    },
+    InvalidRangeArgs {
+        rule: spec::Id,
+    },
+    InvalidRangeBounds {
+        rule: spec::Id,
+    },
 }
 
 impl fmt::Display for ErrorKind {
@@ -904,6 +1036,22 @@ impl fmt::Display for ErrorKind {
             Self::EmptyShape { rule } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "shape declares no traces; {}", rule.summary)
+            }
+            Self::UnknownFunction { rule, name } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "unknown function `{name}`; {}", rule.summary)
+            }
+            Self::EmptyChoice { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "function `choice` has no alternatives; {}", rule.summary)
+            }
+            Self::InvalidRangeArgs { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "function `range` expects two number arguments; {}", rule.summary)
+            }
+            Self::InvalidRangeBounds { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "range bounds are out of order; {}", rule.summary)
             }
         }
     }
@@ -1275,6 +1423,7 @@ mod tests {
             r#"vars { a = 1 b = var.a } trace "example" {}"#,
             r#"vars { a = 1 b = "${var.a}" } trace "example" {}"#,
             r#"vars { a = 1 b = { c = var.a } } trace "example" {}"#,
+            r#"vars { a = 1 b = choice(var.a, 2) } trace "example" {}"#,
         ] {
             let errors = model(source).unwrap_err();
             assert_eq!(
@@ -1301,6 +1450,131 @@ mod tests {
         );
         let range = errors[0].range();
         assert_eq!(&source[range.start..range.end], "${var.m}");
+    }
+
+    #[test]
+    fn models_choice_and_range_funcs() {
+        let model = model(r#"trace "t" { input = choice("a", 1) metrics = { n = range(1, 5) x = range(0, 1.5) } }"#).unwrap();
+        let fields = &model.traces[0].fields;
+
+        let Some(Value::Func(Func::Choice(options))) = &fields.input else {
+            panic!("expected a choice");
+        };
+        assert!(matches!(&options[0], Value::Str(value) if value == "a"));
+        assert!(matches!(options[1], Value::Num(Number::Int(1))));
+
+        let metrics = fields.metrics.as_ref().unwrap();
+        assert!(matches!(
+            metrics.elem[0].value,
+            Value::Func(Func::Range(Range::Int { min: 1, max: 5 }))
+        ));
+        assert!(matches!(
+            metrics.elem[1].value,
+            Value::Func(Func::Range(Range::Float { min, max })) if min == 0.0 && max == 1.5
+        ));
+    }
+
+    #[test]
+    fn resolves_variables_inside_func_args() {
+        let model = model(r#"vars { m = "gpt" } trace "t" { input = choice(var.m, "x") }"#).unwrap();
+
+        let Some(Value::Func(Func::Choice(options))) = &model.traces[0].fields.input else {
+            panic!("expected a choice");
+        };
+        assert!(matches!(&options[0], Value::Str(value) if value == "gpt"));
+    }
+
+    #[test]
+    fn rejects_unknown_functions() {
+        let source = r#"trace "t" { input = shuffle(1, 2) }"#;
+        let errors = model(source).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::UnknownFunction {
+                rule: spec::ids::KNOWN_FUNCTIONS,
+                name: "shuffle".to_owned(),
+            }
+        );
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "shuffle(1, 2)");
+    }
+
+    #[test]
+    fn rejects_choices_without_alternatives() {
+        let errors = model(r#"trace "t" { input = choice() }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::EmptyChoice {
+                rule: spec::ids::CHOICE_ALTERNATIVES,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_range_args_and_bounds() {
+        for source in [
+            r#"trace "t" { input = range(1) }"#,
+            r#"trace "t" { input = range(1, 2, 3) }"#,
+            r#"trace "t" { input = range(1, "x") }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert_eq!(
+                errors[0].kind(),
+                &ErrorKind::InvalidRangeArgs {
+                    rule: spec::ids::RANGE_BOUNDS,
+                }
+            );
+        }
+
+        for source in [
+            r#"trace "t" { input = range(5, 1) }"#,
+            r#"trace "t" { input = range(1.5, 0.5) }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert_eq!(
+                errors[0].kind(),
+                &ErrorKind::InvalidRangeBounds {
+                    rule: spec::ids::RANGE_BOUNDS,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_funcs_where_a_specific_type_is_expected() {
+        let tags = model(r#"trace "t" { tags = [choice("a", "b")] }"#).unwrap_err();
+        assert!(matches!(
+            tags[0].kind(),
+            ErrorKind::TypeMismatch {
+                found: ExprType::Func,
+                ..
+            }
+        ));
+        assert!(tags[0].to_string().contains("expects string, but found function"));
+
+        let metadata = model(r#"trace "t" { metadata = choice({}, {}) }"#).unwrap_err();
+        assert!(matches!(
+            metadata[0].kind(),
+            ErrorKind::TypeMismatch {
+                found: ExprType::Func,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_interpolating_func_variables() {
+        let errors = model(r#"vars { s = choice("a", "b") } trace "t" { input = "${var.s}" }"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonScalarInterpolation {
+                rule: spec::ids::SCALAR_INTERPOLATION,
+                name: "s".to_owned(),
+            }
+        );
     }
 
     #[test]
