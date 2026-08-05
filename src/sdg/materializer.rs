@@ -70,7 +70,7 @@ struct Materializer {
 }
 
 impl Materializer {
-    // Anchors spread traces across the past window, reserving room for the longest trace to finish by `now`.
+    // anchors spread traces across the past window, leaving room for the longest trace to finish by now
     fn new(plan: Plan, over: Duration, now: SystemTime) -> Result<Self, Error> {
         let span_ids = (0..plan.events.len()).map(|_| Uuid::new_v4().to_string()).collect();
         let max_slots = plan.traces.iter().map(|trace| trace.len()).max().unwrap_or_default();
@@ -290,7 +290,9 @@ mod tests {
         assert_eq!(first_llm.span_attributes.name, "gpt-4o-mini");
         assert_eq!(first_llm.span_attributes.kind, "llm");
         assert_eq!(first_llm.input, Some(JsonValue::String("Hey".to_owned())));
-        assert_eq!(first_llm.output, Some(JsonValue::String("Hello!".to_owned())));
+        assert_eq!(first_llm.output, Some(JsonValue::String("Hello! I'm Eugene.".to_owned())));
+        assert_eq!(first_llm.metadata.as_ref().unwrap()["model"], "gpt-4o-mini");
+        assert_eq!(second_llm.metadata.as_ref().unwrap()["temperature"], 0.2);
         assert_eq!(first_llm.metrics["tokens"], 4);
 
         for event in &events.events {
@@ -310,7 +312,7 @@ mod tests {
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // one trace spanning events 0..1 is the intent
     fn fails_on_reserved_metrics_that_bypass_compilation() {
-        // The modeler rejects reserved metric keys, so a plan carrying one can only be built by hand.
+        // modeler rejects reserved metric keys so a plan carrying one can only be built by hand
         let mut metrics = JsonMap::new();
         metrics.insert("start".to_owned(), JsonValue::from(1));
         let plan = Plan {

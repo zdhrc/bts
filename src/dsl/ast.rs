@@ -35,11 +35,19 @@ pub struct Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
     Str(String),
+    Template(Vec<TemplatePart>),
     Num(String),
     Bool(bool),
     Null,
     Array(Vec<Expr>),
     Object(Vec<Attr>),
+    VarRef(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TemplatePart {
+    Lit(String),
+    Ref { path: Vec<String>, range: SrcRange },
 }
 
 impl Expr {

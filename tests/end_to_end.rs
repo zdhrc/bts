@@ -1,6 +1,3 @@
-//! End-to-end tests for the compiled `bts` binary: the process exit contract, dry-run JSON
-//! output, and environment-based configuration flowing through to a live HTTP endpoint.
-
 use serde_json::Value as JsonValue;
 use std::{
     fs,
@@ -17,7 +14,7 @@ const SIMPLE_SHAPE: &str = r#"
 trace "conversation" {
     task "turn" {
         llm "gpt-4o-mini" {
-            input = "Hello"
+            input = "Hello ${trace.index}"
             output = "Hi!"
             metrics = { tokens = 4 }
         }
@@ -53,6 +50,15 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
     assert_eq!(events.len(), 75);
     assert_eq!(roots, 25);
     assert!(starts.iter().all(|start| *start >= before - 3_600.0 && *start <= after));
+
+    // interpolation makes each trace unique
+    let inputs = events
+        .iter()
+        .filter_map(|event| event["input"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(inputs.len(), 25);
+    assert!(inputs.contains("Hello 0"));
+    assert!(inputs.contains("Hello 24"));
 }
 
 #[test]

@@ -1,5 +1,3 @@
-//! The typed domain model produced by compiling a shape: traces, spans, and their field values.
-
 #[derive(Debug, Clone)]
 pub(crate) struct Model {
     pub(crate) traces: Vec<Trace>,
@@ -32,17 +30,35 @@ pub(crate) struct SpanFields {
     pub(crate) output: Option<Value>,
     pub(crate) metadata: Option<Object>,
     pub(crate) metrics: Option<Object>,
-    pub(crate) tags: Vec<String>,
+    pub(crate) tags: Vec<Template>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
     Str(String),
+    Template(Template),
     Num(Number),
     Bool(bool),
     Null,
     Array(Array),
     Object(Object),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Template {
+    pub(crate) parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Part {
+    Lit(String),
+    Ref(CtxRef),
+}
+
+// already validated by the modeler so resolving one can't fail
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CtxRef {
+    TraceIndex,
 }
 
 #[derive(Debug, Clone)]

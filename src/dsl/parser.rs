@@ -40,7 +40,7 @@ impl Parser {
             if let Some(decl) = self.parse_decl() {
                 decls.push(decl);
             } else if self.index == before {
-                // recovery stopped without consuming (e.g. a stray `}` at the root); force progress
+                // recovery stopped without consuming (eg a stray } at the root), force progress
                 self.next();
             }
         }
@@ -60,7 +60,9 @@ impl Parser {
         };
 
         let decl = match &self.peek().kind {
-            TokenKind::String(_) | TokenKind::LBrace => self.parse_block(ident, range).map(Decl::Block),
+            TokenKind::String(_) | TokenKind::Template(_) | TokenKind::LBrace => {
+                self.parse_block(ident, range).map(Decl::Block)
+            }
             TokenKind::Equals => self.parse_attr(ident, range).map(Decl::Attr),
             _ => {
                 self.errors
@@ -77,6 +79,11 @@ impl Parser {
     }
 
     fn parse_block(&mut self, kind: String, range: SrcRange) -> Option<Block> {
+        if self.check(token!(Template(value))) {
+            self.errors.push(Error::new(ErrorKind::InterpolatedName, self.peek().range));
+            self.next();
+        }
+
         let name = self.consume(token!(String(value)));
         self.expect(token!(LBrace), ErrorKind::UnexpectedToken)?;
 
@@ -112,6 +119,11 @@ impl Parser {
                 let value = self.expect(token!(String(value)), ErrorKind::ExpectedStringLiteral)?;
                 Some(Expr::new(ExprKind::Str(value), range))
             }
+            TokenKind::Template(_) => {
+                let range = self.peek().range;
+                let value = self.expect(token!(Template(value)), ErrorKind::ExpectedStringLiteral)?;
+                Some(Expr::new(ExprKind::Template(value), range))
+            }
             TokenKind::Number(_) => {
                 let range = self.peek().range;
                 let value = self.expect(token!(Number(value)), ErrorKind::ExpectedNumberLiteral)?;
@@ -128,6 +140,12 @@ impl Parser {
                 } else if value == "null" {
                     self.next();
                     Some(Expr::new(ExprKind::Null, range))
+                } else if value == "var" {
+                    self.next();
+                    self.expect(token!(Dot), ErrorKind::ExpectedVariableName)?;
+                    let name_range = self.peek().range;
+                    let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedVariableName)?;
+                    Some(Expr::new(ExprKind::VarRef(name), SrcRange::new(range.start, name_range.end)))
                 } else {
                     self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
                     None
@@ -249,6 +267,10 @@ pub(super) enum ErrorKind {
     ExpectedNumberLiteral,
     #[error("expected expression assignment")]
     ExpectedExpressionAssignment,
+    #[error("block names do not support interpolation")]
+    InterpolatedName,
+    #[error("expected variable name")]
+    ExpectedVariableName,
 }
 
 impl Error {
@@ -369,6 +391,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_template_expressions() {
+        use crate::dsl::ast::TemplatePart;
+
+        let ast = parse(r#"trace "a" { input = "q ${trace.index}" tags = ["t-${trace.index}"] }"#).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        let ExprKind::Template(parts) = &attr(&trace.decls[0]).value.kind else {
+            panic!("expected a template");
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], TemplatePart::Lit(value) if value == "q "));
+        assert!(matches!(&parts[1], TemplatePart::Ref { path, .. } if path == &["trace", "index"]));
+
+        let ExprKind::Array(tags) = &attr(&trace.decls[1]).value.kind else {
+            panic!("expected an array");
+        };
+        assert!(matches!(&tags[0].kind, ExprKind::Template(parts) if parts.len() == 2));
+    }
+
+    #[test]
+    fn rejects_interpolated_block_names() {
+        assert_error_kinds(r#"trace "${trace.index}" {}"#, &[ErrorKind::InterpolatedName]);
+    }
+
+    #[test]
+    fn parses_variable_references() {
+        let source = r#"trace "a" { metadata = var.meta output = [var.x, 1] }"#;
+        let ast = parse(source).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        let metadata = attr(&trace.decls[0]);
+        assert!(matches!(&metadata.value.kind, ExprKind::VarRef(name) if name == "meta"));
+        let range = metadata.value.range;
+        assert_eq!(&source[range.start..range.end], "var.meta");
+
+        let ExprKind::Array(items) = &attr(&trace.decls[1]).value.kind else {
+            panic!("expected an array");
+        };
+        assert!(matches!(&items[0].kind, ExprKind::VarRef(name) if name == "x"));
+    }
+
+    #[test]
+    fn rejects_incomplete_variable_references() {
+        assert_error_kinds(r#"trace "a" { metadata = var }"#, &[ErrorKind::ExpectedVariableName]);
+        assert_error_kinds(r#"trace "a" { metadata = var. }"#, &[ErrorKind::ExpectedVariableName]);
+    }
+
+    #[test]
     fn parses_array_attrs_with_optional_trailing_comma() {
         let ast = parse(r#"trace "a" { empty = [] tags = ["x", "y",] }"#).unwrap();
         let trace = block(&ast.decls[0]);
@@ -406,8 +476,12 @@ mod tests {
     fn parses_the_fixture() {
         let ast = parse(include_str!("../../tests/fixtures/simple.bt")).unwrap();
 
-        assert_eq!(ast.decls.len(), 1);
-        let trace = block(&ast.decls[0]);
+        assert_eq!(ast.decls.len(), 2);
+        let vars = block(&ast.decls[0]);
+        assert_eq!(vars.kind, "vars");
+        assert_eq!(vars.name, None);
+        assert_eq!(vars.decls.len(), 2);
+        let trace = block(&ast.decls[1]);
         assert_eq!(trace.kind, "trace");
         assert_eq!(trace.name.as_deref(), Some("multi-turn-conversation"));
         assert_eq!(trace.decls.len(), 4);

@@ -55,7 +55,7 @@ impl<'config> Writer<'config> {
             .json()
             .map_err(|error| Error::new(ErrorKind::DecodeResponse(error)))?;
 
-        // A partial acknowledgement means Braintrust dropped events; report failure rather than a fake success.
+        // partial ack means braintrust dropped events, report failure not a fake success
         if inserted.row_count() != events.event_count() {
             return Err(Error::new(ErrorKind::UnexpectedRowCount {
                 expected: events.event_count(),

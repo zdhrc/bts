@@ -7,7 +7,9 @@ mod parser;
 pub(crate) mod spec;
 
 pub(crate) use diag::Diags;
-pub(crate) use model::{Array, Model, Number, Object, ObjectField, Span, SpanFields, SpanKind, Trace, Value};
+pub(crate) use model::{
+    Array, CtxRef, Model, Number, Object, ObjectField, Part, Span, SpanFields, SpanKind, Template, Trace, Value,
+};
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
 

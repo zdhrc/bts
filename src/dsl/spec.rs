@@ -66,8 +66,8 @@ pub(crate) struct ExprDesc {
     pub(crate) rules: &'static [RuleDesc],
 }
 
-// Some variants are spec vocabulary no field descriptor uses yet; they stay so field
-// constraints can adopt them without touching the type system.
+// some variants are spec vocab no field descriptor uses yet, kept so field
+// constraints can adopt them without touching the type system
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -139,8 +139,8 @@ pub(crate) enum Cardinality {
     Repeated,
 }
 
-// Some variants are spec vocabulary no block descriptor uses yet; the modeler already
-// enforces all three.
+// some variants are spec vocab no block descriptor uses yet, the modeler already
+// enforces all three
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +174,7 @@ pub(crate) struct Example {
 pub(crate) mod ids {
     use super::Id;
 
+    pub(crate) const VARS: Id = Id::new("block.vars");
     pub(crate) const TRACE: Id = Id::new("block.trace");
     pub(crate) const TASK: Id = Id::new("block.task");
     pub(crate) const LLM: Id = Id::new("block.llm");
@@ -185,12 +186,19 @@ pub(crate) mod ids {
     pub(crate) const TAGS: Id = Id::new("field.tags");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
+    pub(crate) const TEMPLATE: Id = Id::new("expr.template");
+    pub(crate) const VAR_REF: Id = Id::new("expr.variable-reference");
     pub(crate) const NUMBER: Id = Id::new("expr.number");
     pub(crate) const BOOLEAN: Id = Id::new("expr.boolean");
     pub(crate) const NULL: Id = Id::new("expr.null");
     pub(crate) const ARRAY: Id = Id::new("expr.array");
     pub(crate) const OBJECT: Id = Id::new("expr.object");
 
+    pub(crate) const KNOWN_REFERENCES: Id = Id::new("rule.known-references");
+    pub(crate) const UNIQUE_VARS: Id = Id::new("rule.unique-vars");
+    pub(crate) const STATIC_VARS: Id = Id::new("rule.static-vars");
+    pub(crate) const DEFINED_VARS: Id = Id::new("rule.defined-vars");
+    pub(crate) const SCALAR_INTERPOLATION: Id = Id::new("rule.scalar-interpolation");
     pub(crate) const UNIQUE_OBJECT_KEYS: Id = Id::new("rule.unique-object-keys");
     pub(crate) const FINITE_NUMBERS: Id = Id::new("rule.finite-numbers");
     pub(crate) const NONEMPTY_SHAPE: Id = Id::new("rule.nonempty-shape");
@@ -258,14 +266,52 @@ const UNIQUE_OBJECT_KEYS_RULE: &[RuleDesc] = &[RuleDesc {
     id: ids::UNIQUE_OBJECT_KEYS,
     summary: "An object key may appear at most once in an object.",
 }];
+const KNOWN_REFERENCES_RULE: &[RuleDesc] = &[RuleDesc {
+    id: ids::KNOWN_REFERENCES,
+    summary: "An interpolation may only use documented references; currently `trace.index`, the 0-based index of the generated trace, and `var.<name>` for a defined variable.",
+}];
+const VARS_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::UNIQUE_VARS,
+        summary: "A variable name may be defined at most once across all vars blocks.",
+    },
+    RuleDesc {
+        id: ids::STATIC_VARS,
+        summary: "A variable value may not reference other variables.",
+    },
+];
+const VAR_REF_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::DEFINED_VARS,
+        summary: "A variable reference must name a variable defined in a vars block.",
+    },
+    RuleDesc {
+        id: ids::SCALAR_INTERPOLATION,
+        summary: "An interpolated variable must be a string, number, or boolean.",
+    },
+];
 
 const EXPR_TYPES: &[ExprDesc] = &[
     ExprDesc {
         id: ids::STRING,
         syntax: "\"text\"",
-        summary: "A double-quoted string. Escape sequences are not currently supported.",
+        summary: "A double-quoted string. `$${` escapes a literal `${`; other escape sequences are not currently supported.",
         examples: &["\"hello\"", "\"gpt-4o-mini\""],
         rules: NO_RULES,
+    },
+    ExprDesc {
+        id: ids::TEMPLATE,
+        syntax: "\"text ${reference} text\"",
+        summary: "A string containing `${...}` interpolations resolved for each generated trace. Valid anywhere a string is, except block names.",
+        examples: &["\"question #${trace.index}\""],
+        rules: KNOWN_REFERENCES_RULE,
+    },
+    ExprDesc {
+        id: ids::VAR_REF,
+        syntax: "var.<name>",
+        summary: "A reference to a variable defined in a vars block, resolved before generation. Usable as any value, or interpolated with `${var.<name>}`.",
+        examples: &["var.temperature", "\"model: ${var.model}\""],
+        rules: VAR_REF_RULES,
     },
     ExprDesc {
         id: ids::NUMBER,
@@ -305,6 +351,16 @@ const EXPR_TYPES: &[ExprDesc] = &[
 ];
 
 const BLOCKS: &[BlockDesc] = &[
+    BlockDesc {
+        id: ids::VARS,
+        keyword: "vars",
+        summary: "A block of named values shared across the shape via `var.<name>` references.",
+        syntax: "vars { <name> = <value> ... }",
+        name: NameDesc::Forbidden,
+        allowed_in: ROOT_ONLY,
+        body: BodyDesc { fields: &[], open: true },
+        rules: VARS_RULES,
+    },
     BlockDesc {
         id: ids::TRACE,
         keyword: "trace",
@@ -378,19 +434,25 @@ document    = { declaration } ;
 declaration = block | attribute ;
 block       = identifier, [ string ], "{", { declaration }, "}" ;
 attribute   = identifier, "=", expression ;
-expression  = string | number | boolean | null | array | object ;
+expression  = string | number | boolean | null | array | object | variable ;
 boolean     = "true" | "false" ;
 null        = "null" ;
+variable    = "var", ".", identifier ;
 array       = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 object      = "{", { attribute }, "}" ;
 identifier  = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
 number      = [ "-" ], ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
-string      = '"', { ANY_EXCEPT_DOUBLE_QUOTE }, '"' ;
+string      = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | interpolation }, '"' ;
+escape      = "$${" ;
+interpolation = "${", reference, "}" ;
+reference   = identifier, { ".", identifier } ;
 "#,
         notes: &[
             "Whitespace separates tokens and is otherwise insignificant.",
             "The surface grammar accepts declarations generically; block placement and field types are semantic rules.",
-            "Comments and string escape sequences are not currently supported.",
+            "Comments are not currently supported.",
+            "Inside strings, `$${` escapes a literal `${`; any other `$` is literal.",
+            "Block names are plain strings; interpolation is not allowed in them.",
         ],
     },
     expressions: EXPR_TYPES,

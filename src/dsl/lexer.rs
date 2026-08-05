@@ -1,3 +1,4 @@
+use crate::dsl::ast::TemplatePart;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use std::{iter::Peekable, str::CharIndices};
 use thiserror::Error as Err;
@@ -32,6 +33,7 @@ pub(super) enum TokenKind {
 
     Ident(String),
     String(String),
+    Template(Vec<TemplatePart>),
     Number(String),
 
     Eof,
@@ -102,31 +104,12 @@ impl<'src> Lexer<'src> {
                     tokens.push(Token::new(TokenKind::Ident(value), start, end));
                 }
 
-                // strings
+                // strings:
+                // - ${reference} interpolations split them into template parts
+                // - plain strings stay a single String token
                 '"' => {
-                    let start = idx;
-                    let mut end = idx + ch.len_utf8();
-                    let mut value = String::new();
-
-                    let terminated = loop {
-                        match self.next() {
-                            Some((s_idx, '"')) => {
-                                end = s_idx + '"'.len_utf8();
-                                break true;
-                            }
-                            Some((s_idx, c)) => {
-                                value.push(c);
-                                end = s_idx + c.len_utf8();
-                            }
-                            None => break false,
-                        }
-                    };
-
-                    if !terminated {
-                        errors.push(Error::new(ErrorKind::UnterminatedString, SrcRange::new(start, end)));
-                    }
-
-                    tokens.push(Token::new(TokenKind::String(value), start, end));
+                    let token = self.lex_string(idx, &mut errors);
+                    tokens.push(token);
                 }
 
                 // numbers
@@ -155,6 +138,112 @@ impl<'src> Lexer<'src> {
         tokens.push(Token::new(TokenKind::Eof, self.src.len(), self.src.len()));
 
         if errors.is_empty() { Ok(tokens) } else { Err(errors) }
+    }
+
+    fn lex_string(&mut self, start: usize, errors: &mut Errors) -> Token {
+        let mut end = start + '"'.len_utf8();
+        let mut parts: Vec<TemplatePart> = Vec::new();
+        let mut lit = String::new();
+        let mut interpolated = false;
+
+        fn flush(lit: &mut String, parts: &mut Vec<TemplatePart>) {
+            if !lit.is_empty() {
+                parts.push(TemplatePart::Lit(std::mem::take(lit)));
+            }
+        }
+
+        loop {
+            match self.next() {
+                Some((s_idx, '"')) => {
+                    end = s_idx + '"'.len_utf8();
+                    break;
+                }
+                Some((s_idx, '$')) => {
+                    end = s_idx + '$'.len_utf8();
+                    match self.peek() {
+                        // $${ escapes a literal ${, any other $ stays literal
+                        Some((_, '$')) => {
+                            let (d_idx, _) = self.next().expect("peeked character is present");
+                            end = d_idx + '$'.len_utf8();
+                            if matches!(self.peek(), Some((_, '{'))) {
+                                let (b_idx, _) = self.next().expect("peeked character is present");
+                                end = b_idx + '{'.len_utf8();
+                                lit.push_str("${");
+                            } else {
+                                lit.push_str("$$");
+                            }
+                        }
+                        Some((_, '{')) => {
+                            self.next();
+                            interpolated = true;
+                            flush(&mut lit, &mut parts);
+
+                            let (part, ref_end) = self.lex_reference(s_idx, errors);
+                            end = ref_end;
+                            if let Some(part) = part {
+                                parts.push(part);
+                            }
+                        }
+                        _ => lit.push('$'),
+                    }
+                }
+                Some((s_idx, c)) => {
+                    lit.push(c);
+                    end = s_idx + c.len_utf8();
+                }
+                None => {
+                    errors.push(Error::new(ErrorKind::UnterminatedString, SrcRange::new(start, end)));
+                    break;
+                }
+            }
+        }
+
+        let kind = if interpolated {
+            flush(&mut lit, &mut parts);
+            TokenKind::Template(parts)
+        } else {
+            TokenKind::String(lit)
+        };
+
+        Token::new(kind, start, end)
+    }
+
+    // scans ${reference} contents, open = idx of $ and ${ is already eaten
+    // leaves a " unconsumed so the enclosing string still terminates on it
+    fn lex_reference(&mut self, open: usize, errors: &mut Errors) -> (Option<TemplatePart>, usize) {
+        let mut end = open + "${".len();
+        let mut content = String::new();
+
+        let closed = loop {
+            match self.peek() {
+                Some((i_idx, '}')) => {
+                    self.next();
+                    end = i_idx + '}'.len_utf8();
+                    break true;
+                }
+                Some((_, '"')) | None => break false,
+                Some((i_idx, c)) => {
+                    content.push(c);
+                    end = i_idx + c.len_utf8();
+                    self.next();
+                }
+            }
+        };
+
+        let range = SrcRange::new(open, end);
+
+        if !closed {
+            errors.push(Error::new(ErrorKind::UnterminatedInterpolation, range));
+            return (None, end);
+        }
+
+        match lex_reference_path(&content) {
+            Some(path) => (Some(TemplatePart::Ref { path, range }), end),
+            None => {
+                errors.push(Error::new(ErrorKind::InvalidReference, range));
+                (None, end)
+            }
+        }
     }
 
     fn lex_number(&mut self, start: usize, first: char, errors: &mut Errors) -> Token {
@@ -195,6 +284,21 @@ impl<'src> Lexer<'src> {
     }
 }
 
+// a reference is a dotted ident path, whitespace around segments is fine
+fn lex_reference_path(content: &str) -> Option<Vec<String>> {
+    content
+        .split('.')
+        .map(str::trim)
+        .map(|segment| {
+            let mut chars = segment.chars();
+            let first = chars.next()?;
+            let valid = first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+            valid.then(|| segment.to_owned())
+        })
+        .collect()
+}
+
 pub(super) fn lex(src: &str) -> Result<Tokens, Diags> {
     Lexer::new(src)
         .lex()
@@ -218,6 +322,10 @@ pub(super) enum ErrorKind {
     InvalidIdentToken,
     #[error("unterminated string")]
     UnterminatedString,
+    #[error("unterminated interpolation")]
+    UnterminatedInterpolation,
+    #[error("invalid reference")]
+    InvalidReference,
     #[error("invalid number")]
     InvalidNumber,
 }
@@ -305,6 +413,61 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn lexes_interpolated_strings_into_template_parts() {
+        let tokens = Lexer::new(r#""a ${trace.index} b""#).lex().unwrap();
+
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::Template(vec![
+                TemplatePart::Lit("a ".to_owned()),
+                TemplatePart::Ref {
+                    path: vec!["trace".to_owned(), "index".to_owned()],
+                    range: SrcRange::new(3, 17),
+                },
+                TemplatePart::Lit(" b".to_owned()),
+            ])
+        );
+        assert_eq!(tokens[0].range, SrcRange::new(0, 20));
+    }
+
+    #[test]
+    fn lexes_a_lone_interpolation_and_tolerates_padding() {
+        let tokens = Lexer::new(r#""${ index }""#).lex().unwrap();
+
+        assert_eq!(
+            tokens[0].kind,
+            TokenKind::Template(vec![TemplatePart::Ref {
+                path: vec!["index".to_owned()],
+                range: SrcRange::new(1, 11),
+            }])
+        );
+    }
+
+    #[test]
+    fn keeps_dollar_signs_and_escapes_literal() {
+        let tokens = Lexer::new(r#""a$b $$c $${d}""#).lex().unwrap();
+
+        assert_eq!(tokens[0].kind, TokenKind::String("a$b $$c ${d}".to_owned()));
+    }
+
+    #[test]
+    fn rejects_unterminated_interpolations() {
+        // closing quote still ends the string so no double error
+        assert_error_kinds(r#""${trace""#, &[ErrorKind::UnterminatedInterpolation]);
+        assert_error_kinds(
+            r#""${trace"#,
+            &[ErrorKind::UnterminatedInterpolation, ErrorKind::UnterminatedString],
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_reference_paths() {
+        for src in [r#""${}""#, r#""${1x}""#, r#""${tr ace}""#, r#""${trace.}""#, r#""${.index}""#] {
+            assert_error_kinds(src, &[ErrorKind::InvalidReference]);
+        }
     }
 
     #[test]

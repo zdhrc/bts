@@ -1,15 +1,20 @@
+vars {
+    assistant = "Eugene"
+    meta = {
+        model = "gpt-4o-mini"
+        provider = "openai"
+        temperature = 0.2
+        tool_choice = "auto"
+    }
+}
+
 trace "multi-turn-conversation" {
     task "turn" {
         llm "gpt-4o-mini" {
             input = "Hey"
-            output = "Hello!"
+            output = "Hello! I'm ${var.assistant}."
 
-            metadata = {
-                model = "gpt-4o-mini"
-                provider = "openai"
-                temperature = 0.2
-                tool_choice = "auto"
-            }
+            metadata = var.meta
 
             metrics = {
                 tokens = 4
@@ -22,12 +27,7 @@ trace "multi-turn-conversation" {
             input = "Goodbye"
             output = "Cya!"
 
-            metadata = {
-                model = "gpt-4o-mini"
-                provider = "openai"
-                temperature = 0.2
-                tool_choice = "auto"
-            }
+            metadata = var.meta
 
             metrics = {
                 tokens = 6

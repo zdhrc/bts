@@ -1,13 +1,18 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
-use crate::dsl::model::{Array, Model, Number, Object, ObjectField, Span, SpanFields, SpanKind, Trace, Value};
+use crate::dsl::model::{
+    Array, CtxRef, Model, Number, Object, ObjectField, Part, Span, SpanFields, SpanKind, Template, Trace, Value,
+};
 use crate::dsl::spec;
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet, hash_map::Entry},
+    fmt,
+};
 
 enum FieldValue {
     Value(Value),
     Object(Object),
-    Strings(Vec<String>),
+    Tags(Vec<Template>),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -24,11 +29,13 @@ impl ExprType {
     fn of(expr: &ast::Expr) -> Self {
         match expr.kind {
             ast::ExprKind::Str(_) => Self::String,
+            ast::ExprKind::Template(_) => Self::String,
             ast::ExprKind::Num(_) => Self::Number,
             ast::ExprKind::Bool(_) => Self::Boolean,
             ast::ExprKind::Null => Self::Null,
             ast::ExprKind::Array(_) => Self::Array,
             ast::ExprKind::Object(_) => Self::Object,
+            ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
         }
     }
 }
@@ -48,18 +55,34 @@ impl fmt::Display for ExprType {
 
 pub(super) struct Modeler {
     ast: ast::Ast,
+    vars: HashMap<String, ast::Expr>,
     errors: Errors,
 }
 
 impl Modeler {
     fn new(ast: ast::Ast) -> Self {
-        Self { ast, errors: Vec::new() }
+        Self {
+            ast,
+            vars: HashMap::new(),
+            errors: Vec::new(),
+        }
     }
 
     fn model(mut self) -> Result<Model, Errors> {
         let mut traces = Vec::new();
 
+        // collect vars first so refs work no matter the decl order
+        let mut rest = Vec::with_capacity(self.ast.decls.len());
         for decl in std::mem::take(&mut self.ast.decls) {
+            match decl {
+                ast::Decl::Block(block) if spec::SPEC.block(&block.kind).is_some_and(|desc| desc.id == spec::ids::VARS) => {
+                    self.collect_vars(block);
+                }
+                decl => rest.push(decl),
+            }
+        }
+
+        for decl in rest {
             match decl {
                 ast::Decl::Attr(attr) => {
                     self.errors
@@ -120,6 +143,153 @@ impl Modeler {
             .collect();
 
         name.map(|name| Trace { name, fields, children })
+    }
+
+    fn collect_vars(&mut self, block: ast::Block) {
+        let desc = spec::SPEC
+            .block_by_id(spec::ids::VARS)
+            .expect("the spec describes the vars block");
+        let ast::Block { name, decls, range, .. } = block;
+        self.model_name(name, range, desc);
+
+        for decl in decls {
+            match decl {
+                ast::Decl::Block(inner) => {
+                    let parent = spec::Place::Block { id: spec::ids::VARS };
+                    let error = match spec::SPEC.block(&inner.kind) {
+                        Some(desc) => ErrorKind::BlockNotAllowed { block: desc.id, parent },
+                        None => ErrorKind::UnknownBlock {
+                            keyword: inner.kind,
+                            parent,
+                        },
+                    };
+                    self.errors.push(Error::new(error, inner.range));
+                }
+                ast::Decl::Attr(attr) => {
+                    if expr_references_vars(&attr.value) {
+                        self.errors.push(Error::new(
+                            ErrorKind::VarInVar {
+                                rule: spec::ids::STATIC_VARS,
+                                name: attr.key,
+                            },
+                            attr.range,
+                        ));
+                    } else {
+                        match self.vars.entry(attr.key) {
+                            Entry::Occupied(entry) => {
+                                self.errors.push(Error::new(
+                                    ErrorKind::DuplicateVar {
+                                        rule: spec::ids::UNIQUE_VARS,
+                                        name: entry.key().clone(),
+                                    },
+                                    attr.range,
+                                ));
+                            }
+                            Entry::Vacant(entry) => {
+                                entry.insert(attr.value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // swaps var.<name> refs in before validation so all the usual checks hit the substituted value
+    fn resolve_expr(&mut self, expr: ast::Expr) -> Option<ast::Expr> {
+        let ast::Expr { kind, range } = expr;
+        let kind = match kind {
+            // use-site range wins so diags point at the ref, not the definition
+            ast::ExprKind::VarRef(name) => self.lookup_var(name, range)?.kind,
+            ast::ExprKind::Template(parts) => ast::ExprKind::Template(self.resolve_template_parts(parts)?),
+            ast::ExprKind::Array(values) => {
+                let mut resolved = Vec::with_capacity(values.len());
+                let mut valid = true;
+                for value in values {
+                    match self.resolve_expr(value) {
+                        Some(value) => resolved.push(value),
+                        None => valid = false,
+                    }
+                }
+                if !valid {
+                    return None;
+                }
+                ast::ExprKind::Array(resolved)
+            }
+            ast::ExprKind::Object(attrs) => {
+                let mut resolved = Vec::with_capacity(attrs.len());
+                let mut valid = true;
+                for attr in attrs {
+                    match self.resolve_expr(attr.value) {
+                        Some(value) => resolved.push(ast::Attr { value, ..attr }),
+                        None => valid = false,
+                    }
+                }
+                if !valid {
+                    return None;
+                }
+                ast::ExprKind::Object(resolved)
+            }
+            kind => kind,
+        };
+
+        Some(ast::Expr::new(kind, range))
+    }
+
+    fn resolve_template_parts(&mut self, parts: Vec<ast::TemplatePart>) -> Option<Vec<ast::TemplatePart>> {
+        let mut resolved = Vec::with_capacity(parts.len());
+        let mut valid = true;
+
+        for part in parts {
+            match part {
+                ast::TemplatePart::Ref { path, range } if path.len() == 2 && path[0] == "var" => {
+                    let name = path.into_iter().nth(1).expect("path has two segments");
+                    let Some(value) = self.lookup_var(name.clone(), range) else {
+                        valid = false;
+                        continue;
+                    };
+
+                    match value.kind {
+                        ast::ExprKind::Str(text) => resolved.push(ast::TemplatePart::Lit(text)),
+                        ast::ExprKind::Num(raw) => resolved.push(ast::TemplatePart::Lit(raw)),
+                        ast::ExprKind::Bool(value) => {
+                            resolved.push(ast::TemplatePart::Lit(if value { "true" } else { "false" }.to_owned()));
+                        }
+                        // a var thats itself a template splices inline
+                        ast::ExprKind::Template(parts) => resolved.extend(parts),
+                        _ => {
+                            self.errors.push(Error::new(
+                                ErrorKind::NonScalarInterpolation {
+                                    rule: spec::ids::SCALAR_INTERPOLATION,
+                                    name,
+                                },
+                                range,
+                            ));
+                            valid = false;
+                        }
+                    }
+                }
+                part => resolved.push(part),
+            }
+        }
+
+        valid.then_some(resolved)
+    }
+
+    fn lookup_var(&mut self, name: String, range: SrcRange) -> Option<ast::Expr> {
+        match self.vars.get(&name) {
+            Some(value) => Some(value.clone()),
+            None => {
+                self.errors.push(Error::new(
+                    ErrorKind::UnknownVariable {
+                        rule: spec::ids::DEFINED_VARS,
+                        name,
+                    },
+                    range,
+                ));
+                None
+            }
+        }
     }
 
     fn model_span(&mut self, block: ast::Block, parent: spec::Id) -> Option<Span> {
@@ -226,15 +396,19 @@ impl Modeler {
             return;
         }
 
-        if !self.validate_expr(&attr.value, block.id, field.id, field.value) {
+        let Some(value) = self.resolve_expr(attr.value) else {
+            return;
+        };
+
+        if !self.validate_expr(&value, block.id, field.id, field.value) {
             return;
         }
 
-        if field.id == spec::ids::METRICS && !self.validate_metric_keys(&attr.value) {
+        if field.id == spec::ids::METRICS && !self.validate_metric_keys(&value) {
             return;
         }
 
-        let Some(value) = self.model_field_value(attr.value, field.value) else {
+        let Some(value) = self.model_field_value(value, field.value) else {
             return;
         };
 
@@ -243,7 +417,7 @@ impl Modeler {
             (spec::ids::OUTPUT, FieldValue::Value(value)) => fields.output = Some(value),
             (spec::ids::METADATA, FieldValue::Object(value)) => fields.metadata = Some(value),
             (spec::ids::METRICS, FieldValue::Object(value)) => fields.metrics = Some(value),
-            (spec::ids::TAGS, FieldValue::Strings(value)) => fields.tags = Some(value),
+            (spec::ids::TAGS, FieldValue::Tags(value)) => fields.tags = Some(value),
             _ => unreachable!("field {} does not match its model lowering", field.id.as_str()),
         }
     }
@@ -276,7 +450,7 @@ impl Modeler {
     fn validate_expr(&mut self, expr: &ast::Expr, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) -> bool {
         let valid = match expected {
             spec::ExprType::Any => true,
-            spec::ExprType::String => matches!(expr.kind, ast::ExprKind::Str(_)),
+            spec::ExprType::String => matches!(expr.kind, ast::ExprKind::Str(_) | ast::ExprKind::Template(_)),
             spec::ExprType::Number => matches!(expr.kind, ast::ExprKind::Num(_)),
             spec::ExprType::Boolean => matches!(expr.kind, ast::ExprKind::Bool(_)),
             spec::ExprType::Array { items } => {
@@ -327,7 +501,7 @@ impl Modeler {
                 self.require_object(expr).map(FieldValue::Object)
             }
             spec::ExprType::Array { items } if matches!(**items, spec::ExprType::String) => {
-                self.require_tags(expr).map(FieldValue::Strings)
+                self.require_tags(expr).map(FieldValue::Tags)
             }
             _ => unreachable!("expression constraint does not have a model lowering"),
         }
@@ -337,6 +511,7 @@ impl Modeler {
         let ast::Expr { kind, range } = expr;
         match kind {
             ast::ExprKind::Str(value) => Some(Value::Str(value)),
+            ast::ExprKind::Template(parts) => self.model_template(parts).map(collapse_template),
             ast::ExprKind::Bool(value) => Some(Value::Bool(value)),
             ast::ExprKind::Null => Some(Value::Null),
             ast::ExprKind::Num(value) => self.model_number(value, range).map(Value::Num),
@@ -344,6 +519,7 @@ impl Modeler {
                 elem: values.into_iter().filter_map(|value| self.model_value(value)).collect(),
             })),
             ast::ExprKind::Object(attrs) => Some(Value::Object(self.model_object(attrs))),
+            ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before model lowering"),
         }
     }
 
@@ -376,22 +552,55 @@ impl Modeler {
         }
     }
 
-    fn require_tags(&mut self, expr: ast::Expr) -> Option<Vec<String>> {
+    fn require_tags(&mut self, expr: ast::Expr) -> Option<Vec<Template>> {
         let ast::Expr { kind, .. } = expr;
         let ast::ExprKind::Array(values) = kind else {
             unreachable!("expression was validated as an array of strings");
         };
 
         let mut tags = Vec::new();
+        let mut valid = true;
 
         for value in values {
             match value.kind {
-                ast::ExprKind::Str(value) => tags.push(value),
+                ast::ExprKind::Str(value) => tags.push(Template {
+                    parts: vec![Part::Lit(value)],
+                }),
+                ast::ExprKind::Template(parts) => match self.model_template(parts) {
+                    Some(template) => tags.push(template),
+                    None => valid = false,
+                },
                 _ => unreachable!("array item was validated as a string"),
             }
         }
 
-        Some(tags)
+        valid.then_some(tags)
+    }
+
+    fn model_template(&mut self, parts: Vec<ast::TemplatePart>) -> Option<Template> {
+        let mut modeled = Vec::with_capacity(parts.len());
+        let mut valid = true;
+
+        for part in parts {
+            match part {
+                ast::TemplatePart::Lit(value) => modeled.push(Part::Lit(value)),
+                ast::TemplatePart::Ref { path, range } => match model_ctx_ref(&path) {
+                    Some(ctx_ref) => modeled.push(Part::Ref(ctx_ref)),
+                    None => {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownReference {
+                                rule: spec::ids::KNOWN_REFERENCES,
+                                path: path.join("."),
+                            },
+                            range,
+                        ));
+                        valid = false;
+                    }
+                },
+            }
+        }
+
+        valid.then_some(Template { parts: modeled })
     }
 
     fn model_number(&mut self, raw: String, range: SrcRange) -> Option<Number> {
@@ -429,10 +638,45 @@ impl Modeler {
                 None
             }
             spec::NameDesc::Optional => name,
-            spec::NameDesc::Forbidden => {
-                unreachable!("the typed model currently requires block names")
-            }
+            spec::NameDesc::Forbidden => None,
         }
+    }
+}
+
+fn expr_references_vars(expr: &ast::Expr) -> bool {
+    match &expr.kind {
+        ast::ExprKind::VarRef(_) => true,
+        ast::ExprKind::Template(parts) => parts.iter().any(
+            |part| matches!(part, ast::TemplatePart::Ref { path, .. } if path.first().is_some_and(|segment| segment == "var")),
+        ),
+        ast::ExprKind::Array(values) => values.iter().any(expr_references_vars),
+        ast::ExprKind::Object(attrs) => attrs.iter().any(|attr| expr_references_vars(&attr.value)),
+        _ => false,
+    }
+}
+
+fn model_ctx_ref(path: &[String]) -> Option<CtxRef> {
+    match path {
+        [first, second] if first == "trace" && second == "index" => Some(CtxRef::TraceIndex),
+        _ => None,
+    }
+}
+
+// splicing can leave a template all lits, fold those back into a plain string so
+// downstream only sees templates that actually resolve
+fn collapse_template(template: Template) -> Value {
+    if template.parts.iter().all(|part| matches!(part, Part::Lit(_))) {
+        let joined = template
+            .parts
+            .into_iter()
+            .map(|part| match part {
+                Part::Lit(value) => value,
+                Part::Ref(_) => unreachable!("all parts are literal"),
+            })
+            .collect();
+        Value::Str(joined)
+    } else {
+        Value::Template(template)
     }
 }
 
@@ -448,7 +692,7 @@ struct FieldsBuilder {
     output: Option<Value>,
     metadata: Option<Object>,
     metrics: Option<Object>,
-    tags: Option<Vec<String>>,
+    tags: Option<Vec<Template>>,
     seen: HashSet<spec::Id>,
 }
 
@@ -520,6 +764,26 @@ pub(super) enum ErrorKind {
     ReservedMetricKey {
         rule: spec::Id,
         key: String,
+    },
+    UnknownReference {
+        rule: spec::Id,
+        path: String,
+    },
+    DuplicateVar {
+        rule: spec::Id,
+        name: String,
+    },
+    VarInVar {
+        rule: spec::Id,
+        name: String,
+    },
+    UnknownVariable {
+        rule: spec::Id,
+        name: String,
+    },
+    NonScalarInterpolation {
+        rule: spec::Id,
+        name: String,
     },
     EmptyShape {
         rule: spec::Id,
@@ -616,6 +880,26 @@ impl fmt::Display for ErrorKind {
             Self::ReservedMetricKey { rule, key } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "metric key `{key}` is reserved; {}", rule.summary)
+            }
+            Self::UnknownReference { rule, path } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "unknown reference `${{{path}}}`; {}", rule.summary)
+            }
+            Self::DuplicateVar { rule, name } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "variable `{name}` is defined more than once; {}", rule.summary)
+            }
+            Self::VarInVar { rule, name } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "variable `{name}` references another variable; {}", rule.summary)
+            }
+            Self::UnknownVariable { rule, name } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "unknown variable `{name}`; {}", rule.summary)
+            }
+            Self::NonScalarInterpolation { rule, name } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "variable `{name}` cannot be interpolated; {}", rule.summary)
             }
             Self::EmptyShape { rule } => {
                 let rule = rule_desc(*rule);
@@ -725,6 +1009,13 @@ mod tests {
         Modeler::new(ast).model()
     }
 
+    fn tag_text(tag: &Template) -> &str {
+        match tag.parts.as_slice() {
+            [Part::Lit(value)] => value,
+            _ => panic!("expected a literal tag"),
+        }
+    }
+
     #[test]
     fn models_fixture_as_typed_domain() {
         let model = model(include_str!("../../tests/fixtures/simple.bt")).unwrap();
@@ -740,10 +1031,7 @@ mod tests {
                 .iter()
                 .all(|span| matches!(span.children.as_slice(), [Span { kind: SpanKind::Llm, .. }]))
         );
-        assert_eq!(
-            trace.fields.tags.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["chat", "prod"]
-        );
+        assert_eq!(trace.fields.tags.iter().map(tag_text).collect::<Vec<_>>(), ["chat", "prod"]);
     }
 
     #[test]
@@ -809,6 +1097,225 @@ mod tests {
         let metrics = fields.metrics.as_ref().unwrap();
         assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == -0.5));
         assert!(matches!(metrics.elem[1].value, Value::Num(Number::Int(-3))));
+    }
+
+    #[test]
+    fn models_templates_with_known_references() {
+        let model = model(r#"trace "example" { input = "q ${trace.index}" tags = ["t-${trace.index}"] }"#).unwrap();
+        let fields = &model.traces[0].fields;
+
+        let Some(Value::Template(template)) = &fields.input else {
+            panic!("expected a template");
+        };
+        assert!(matches!(&template.parts[0], Part::Lit(value) if value == "q "));
+        assert!(matches!(template.parts[1], Part::Ref(CtxRef::TraceIndex)));
+
+        assert_eq!(fields.tags.len(), 1);
+        assert!(matches!(fields.tags[0].parts[1], Part::Ref(CtxRef::TraceIndex)));
+    }
+
+    #[test]
+    fn rejects_unknown_references() {
+        let source = r#"trace "example" { input = "${trace.idx}" }"#;
+        let errors = model(source).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::UnknownReference {
+                rule: spec::ids::KNOWN_REFERENCES,
+                path: "trace.idx".to_owned(),
+            }
+        );
+        assert!(errors[0].to_string().contains("unknown reference `${trace.idx}`"));
+
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "${trace.idx}");
+    }
+
+    #[test]
+    fn treats_templates_as_strings_in_type_checks() {
+        let errors = model(r#"trace "example" { metadata = "${trace.index}" }"#).unwrap_err();
+
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::TypeMismatch {
+                found: ExprType::String,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolves_variables_in_scalar_object_and_array_positions() {
+        let model = model(
+            r#"
+            vars {
+                greeting = "hey"
+                meta = { model = "gpt" }
+                n = 4
+            }
+            trace "example" {
+                input = var.greeting
+                output = [var.n, var.n]
+                metadata = var.meta
+            }
+            "#,
+        )
+        .unwrap();
+        let fields = &model.traces[0].fields;
+
+        assert!(matches!(&fields.input, Some(Value::Str(value)) if value == "hey"));
+
+        let Some(Value::Array(output)) = &fields.output else {
+            panic!("expected an array");
+        };
+        assert!(matches!(output.elem[1], Value::Num(Number::Int(4))));
+
+        let metadata = fields.metadata.as_ref().unwrap();
+        assert_eq!(metadata.elem[0].key, "model");
+        assert!(matches!(&metadata.elem[0].value, Value::Str(value) if value == "gpt"));
+    }
+
+    #[test]
+    fn interpolates_scalar_variables_and_collapses_static_templates() {
+        let model = model(
+            r#"
+            vars { m = "gpt" t = 0.2 f = false }
+            trace "example" { input = "m=${var.m} t=${var.t} f=${var.f}" }
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &model.traces[0].fields.input,
+            Some(Value::Str(value)) if value == "m=gpt t=0.2 f=false"
+        ));
+    }
+
+    #[test]
+    fn splices_template_variables_and_keeps_context_references() {
+        let model = model(
+            r#"
+            vars { q = "q ${trace.index}" }
+            trace "example" { input = "${var.q}!" }
+            "#,
+        )
+        .unwrap();
+
+        let Some(Value::Template(template)) = &model.traces[0].fields.input else {
+            panic!("expected a template");
+        };
+        assert!(matches!(&template.parts[0], Part::Lit(value) if value == "q "));
+        assert!(matches!(template.parts[1], Part::Ref(CtxRef::TraceIndex)));
+        assert!(matches!(&template.parts[2], Part::Lit(value) if value == "!"));
+    }
+
+    #[test]
+    fn resolves_variables_defined_after_their_use() {
+        let model = model(
+            r#"
+            trace "example" { input = var.greeting }
+            vars { greeting = "hey" }
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(&model.traces[0].fields.input, Some(Value::Str(value)) if value == "hey"));
+    }
+
+    #[test]
+    fn reports_variable_type_mismatches_at_the_use_site() {
+        let source = r#"vars { m = true } trace "example" { metadata = var.m }"#;
+        let errors = model(source).unwrap_err();
+
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::TypeMismatch {
+                found: ExprType::Boolean,
+                ..
+            }
+        ));
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "var.m");
+    }
+
+    #[test]
+    fn rejects_unknown_variables() {
+        for source in [
+            r#"trace "example" { input = var.missing }"#,
+            r#"trace "example" { input = "${var.missing}" }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert_eq!(
+                errors[0].kind(),
+                &ErrorKind::UnknownVariable {
+                    rule: spec::ids::DEFINED_VARS,
+                    name: "missing".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_variables_across_vars_blocks() {
+        let errors = model(r#"vars { a = 1 } vars { a = 2 } trace "example" {}"#).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::DuplicateVar {
+                rule: spec::ids::UNIQUE_VARS,
+                name: "a".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_variables_referencing_other_variables() {
+        for source in [
+            r#"vars { a = 1 b = var.a } trace "example" {}"#,
+            r#"vars { a = 1 b = "${var.a}" } trace "example" {}"#,
+            r#"vars { a = 1 b = { c = var.a } } trace "example" {}"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert_eq!(
+                errors[0].kind(),
+                &ErrorKind::VarInVar {
+                    rule: spec::ids::STATIC_VARS,
+                    name: "b".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_interpolating_non_scalar_variables() {
+        let source = r#"vars { m = { x = 1 } } trace "example" { input = "${var.m}" }"#;
+        let errors = model(source).unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::NonScalarInterpolation {
+                rule: spec::ids::SCALAR_INTERPOLATION,
+                name: "m".to_owned(),
+            }
+        );
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "${var.m}");
+    }
+
+    #[test]
+    fn rejects_named_vars_blocks_and_nested_blocks_in_vars() {
+        let named = model(r#"vars "named" {} trace "example" {}"#).unwrap_err();
+        assert_eq!(named[0].kind(), &ErrorKind::UnexpectedName { block: spec::ids::VARS });
+
+        let nested = model(r#"vars { task "t" {} } trace "example" {}"#).unwrap_err();
+        assert_eq!(
+            nested[0].kind(),
+            &ErrorKind::BlockNotAllowed {
+                block: spec::ids::TASK,
+                parent: spec::Place::Block { id: spec::ids::VARS },
+            }
+        );
     }
 
     #[test]
