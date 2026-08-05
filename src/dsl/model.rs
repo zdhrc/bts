@@ -25,6 +25,8 @@ pub(crate) struct Span {
 pub(crate) enum SpanKind {
     Task,
     Llm,
+    Tool,
+    Function,
 }
 
 #[derive(Debug, Clone)]

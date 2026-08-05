@@ -194,6 +194,8 @@ pub(crate) mod ids {
     pub(crate) const TRACE: Id = Id::new("block.trace");
     pub(crate) const TASK: Id = Id::new("block.task");
     pub(crate) const LLM: Id = Id::new("block.llm");
+    pub(crate) const TOOL: Id = Id::new("block.tool");
+    pub(crate) const FUNCTION: Id = Id::new("block.function");
 
     pub(crate) const INPUT: Id = Id::new("field.input");
     pub(crate) const OUTPUT: Id = Id::new("field.output");
@@ -299,6 +301,8 @@ const IN_TRACE_OR_SPAN: &[Place] = &[
     Place::Block { id: ids::TRACE },
     Place::Block { id: ids::TASK },
     Place::Block { id: ids::LLM },
+    Place::Block { id: ids::TOOL },
+    Place::Block { id: ids::FUNCTION },
 ];
 
 const NO_RULES: &[RuleDesc] = &[];
@@ -611,6 +615,32 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "llm",
         summary: "A named LLM span containing fields and nested spans.",
         syntax: "llm \"<name>\" { ... }",
+        name: NameDesc::Required,
+        allowed_in: IN_TRACE_OR_SPAN,
+        body: BodyDesc {
+            fields: SPAN_FIELDS,
+            open: false,
+        },
+        rules: NO_RULES,
+    },
+    BlockDesc {
+        id: ids::TOOL,
+        keyword: "tool",
+        summary: "A named tool span containing fields and nested spans.",
+        syntax: "tool \"<name>\" { ... }",
+        name: NameDesc::Required,
+        allowed_in: IN_TRACE_OR_SPAN,
+        body: BodyDesc {
+            fields: SPAN_FIELDS,
+            open: false,
+        },
+        rules: NO_RULES,
+    },
+    BlockDesc {
+        id: ids::FUNCTION,
+        keyword: "function",
+        summary: "A named function span containing fields and nested spans.",
+        syntax: "function \"<name>\" { ... }",
         name: NameDesc::Required,
         allowed_in: IN_TRACE_OR_SPAN,
         body: BodyDesc {

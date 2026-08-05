@@ -31,6 +31,8 @@ pub(super) struct EventPlan {
 pub(super) enum EventKind {
     Task,
     Llm,
+    Tool,
+    Function,
 }
 
 impl EventKind {
@@ -38,6 +40,8 @@ impl EventKind {
         match self {
             EventKind::Task => "task",
             EventKind::Llm => "llm",
+            EventKind::Tool => "tool",
+            EventKind::Function => "function",
         }
     }
 }
@@ -104,6 +108,8 @@ impl Planner {
             kind: match kind {
                 ModelSpanKind::Task => EventKind::Task,
                 ModelSpanKind::Llm => EventKind::Llm,
+                ModelSpanKind::Tool => EventKind::Tool,
+                ModelSpanKind::Function => EventKind::Function,
             },
             fields: lower_fields(fields, ctx)?,
         });

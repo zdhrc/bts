@@ -1373,6 +1373,10 @@ impl Modeler {
             SpanKind::Task
         } else if desc.id == spec::ids::LLM {
             SpanKind::Llm
+        } else if desc.id == spec::ids::TOOL {
+            SpanKind::Tool
+        } else if desc.id == spec::ids::FUNCTION {
+            SpanKind::Function
         } else {
             unreachable!("block {} does not have a model lowering", desc.id.as_str());
         };
@@ -2693,6 +2697,26 @@ mod tests {
                 .all(|span| matches!(span.children.as_slice(), [Span { kind: SpanKind::Llm, .. }]))
         );
         assert_eq!(trace.fields.tags.iter().map(tag_text).collect::<Vec<_>>(), ["chat", "prod"]);
+    }
+
+    #[test]
+    fn models_tool_and_function_spans() {
+        let source = r#"
+            trace "example" {
+                function "handle_request" {
+                    tool "search" {
+                        llm "rerank" {}
+                    }
+                }
+            }
+        "#;
+        let model = model(source).unwrap();
+
+        let function = &model.traces[0].children[0];
+        assert!(matches!(function.kind, SpanKind::Function));
+        let tool = &function.children[0];
+        assert!(matches!(tool.kind, SpanKind::Tool));
+        assert!(matches!(tool.children[0].kind, SpanKind::Llm));
     }
 
     #[test]
