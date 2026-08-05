@@ -50,6 +50,8 @@ impl EventKind {
 pub(super) struct EventFields {
     pub(super) input: Option<JsonValue>,
     pub(super) output: Option<JsonValue>,
+    pub(super) expected: Option<JsonValue>,
+    pub(super) error: Option<JsonValue>,
     pub(super) metadata: Option<JsonMap<String, JsonValue>>,
     pub(super) metrics: Option<JsonMap<String, JsonValue>>,
     pub(super) tags: Box<[String]>,
@@ -133,6 +135,8 @@ fn lower_fields(fields: ModelSpanFields, ctx: &mut Ctx) -> Result<EventFields, E
     Ok(EventFields {
         input: fields.input.map(|value| lower_value(value, ctx)).transpose()?,
         output: fields.output.map(|value| lower_value(value, ctx)).transpose()?,
+        expected: fields.expected.map(|value| lower_value(value, ctx)).transpose()?,
+        error: fields.error.map(|value| lower_value(value, ctx)).transpose()?,
         metadata: fields.metadata.map(|object| lower_object(object, ctx)).transpose()?,
         metrics: fields.metrics.map(|object| lower_object(object, ctx)).transpose()?,
         tags: fields.tags.into_iter().map(|tag| resolve_template(tag, ctx)).collect(),

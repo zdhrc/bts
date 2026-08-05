@@ -42,6 +42,12 @@ pub(super) struct Event {
     pub(super) output: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) expected: Option<JsonValue>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<JsonValue>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) metadata: Option<JsonMap<String, JsonValue>>,
 
     pub(super) metrics: JsonMap<String, JsonValue>,
@@ -126,6 +132,8 @@ impl Materializer {
                 let EventFields {
                     input,
                     output,
+                    expected,
+                    error,
                     metadata,
                     metrics,
                     tags,
@@ -151,6 +159,8 @@ impl Materializer {
                     },
                     input,
                     output,
+                    expected,
+                    error,
                     metadata,
                     metrics,
                     tags,
@@ -289,7 +299,12 @@ mod tests {
 
         assert_eq!(first_llm.span_attributes.name, "gpt-4o-mini");
         assert_eq!(first_llm.span_attributes.kind, "llm");
-        assert_eq!(first_llm.input, Some(JsonValue::String("Hey".to_owned())));
+        assert_eq!(
+            first_llm.input,
+            Some(JsonValue::String(
+                "Hey! Please introduce yourself:\n- briefly\n- politely".to_owned()
+            ))
+        );
         assert_eq!(first_llm.output, Some(JsonValue::String("Hello! I'm Eugene.".to_owned())));
         assert_eq!(first_llm.metadata.as_ref().unwrap()["model"], "gpt-4o-mini");
         assert_eq!(second_llm.metadata.as_ref().unwrap()["temperature"], 0.2);
@@ -310,6 +325,25 @@ mod tests {
     }
 
     #[test]
+    fn serializes_expected_and_error_fields_only_when_set() {
+        let source = r#"
+            trace "example" {
+                expected = "4"
+                error = { message = "timeout" }
+                task "step" {}
+            }
+        "#;
+        let model = compile(source).unwrap();
+        let events = materialize(plan(model, 1, 0).unwrap(), Duration::from_secs(3_600), SystemTime::now()).unwrap();
+
+        let json = serde_json::to_value(events).unwrap();
+        assert_eq!(json["events"][0]["expected"], "4");
+        assert_eq!(json["events"][0]["error"]["message"], "timeout");
+        assert!(json["events"][1].get("expected").is_none());
+        assert!(json["events"][1].get("error").is_none());
+    }
+
+    #[test]
     #[allow(clippy::single_range_in_vec_init)] // one trace spanning events 0..1 is the intent
     fn fails_on_reserved_metrics_that_bypass_compilation() {
         // modeler rejects reserved metric keys so a plan carrying one can only be built by hand
@@ -324,6 +358,8 @@ mod tests {
                 fields: EventFields {
                     input: None,
                     output: None,
+                    expected: None,
+                    error: None,
                     metadata: None,
                     metrics: Some(metrics),
                     tags: Box::new([]),

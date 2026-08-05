@@ -33,6 +33,8 @@ pub(crate) enum SpanKind {
 pub(crate) struct SpanFields {
     pub(crate) input: Option<Value>,
     pub(crate) output: Option<Value>,
+    pub(crate) expected: Option<Value>,
+    pub(crate) error: Option<Value>,
     pub(crate) metadata: Option<Object>,
     pub(crate) metrics: Option<Object>,
     pub(crate) tags: Vec<Template>,

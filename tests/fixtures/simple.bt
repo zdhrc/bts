@@ -1,3 +1,4 @@
+# shared values, referenced as var.<name>
 vars {
     assistant = "Eugene"
     meta = {
@@ -11,8 +12,12 @@ vars {
 trace "multi-turn-conversation" {
     task "turn" {
         llm "gpt-4o-mini" {
-            input = "Hey"
-            output = "Hello! I'm ${var.assistant}."
+            input = """
+                Hey! Please introduce yourself:
+                - briefly
+                - politely
+                """
+            output = "Hello! I'm ${var.assistant}." // interpolated per trace
 
             metadata = var.meta
 

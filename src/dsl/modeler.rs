@@ -1471,6 +1471,8 @@ impl Modeler {
         match (field.id, value) {
             (spec::ids::INPUT, FieldValue::Value(value)) => fields.input = Some(value),
             (spec::ids::OUTPUT, FieldValue::Value(value)) => fields.output = Some(value),
+            (spec::ids::EXPECTED, FieldValue::Value(value)) => fields.expected = Some(value),
+            (spec::ids::ERROR, FieldValue::Value(value)) => fields.error = Some(value),
             (spec::ids::METADATA, FieldValue::Object(value)) => fields.metadata = Some(value),
             (spec::ids::METRICS, FieldValue::Object(value)) => fields.metrics = Some(value),
             (spec::ids::TAGS, FieldValue::Tags(value)) => fields.tags = Some(value),
@@ -2160,6 +2162,8 @@ pub(super) fn model(ast: ast::Ast) -> Result<Model, Diags> {
 struct FieldsBuilder {
     input: Option<Value>,
     output: Option<Value>,
+    expected: Option<Value>,
+    error: Option<Value>,
     metadata: Option<Object>,
     metrics: Option<Object>,
     tags: Option<Vec<Template>>,
@@ -2171,6 +2175,8 @@ impl FieldsBuilder {
         SpanFields {
             input: self.input,
             output: self.output,
+            expected: self.expected,
+            error: self.error,
             metadata: self.metadata,
             metrics: self.metrics,
             tags: self.tags.unwrap_or_default(),
@@ -2717,6 +2723,23 @@ mod tests {
         let tool = &function.children[0];
         assert!(matches!(tool.kind, SpanKind::Tool));
         assert!(matches!(tool.children[0].kind, SpanKind::Llm));
+    }
+
+    #[test]
+    fn models_expected_and_error_fields() {
+        let source = r#"
+            trace "example" {
+                llm "answer" {
+                    expected = { answer = "4" }
+                    error = choice(null, "timeout")
+                }
+            }
+        "#;
+        let model = model(source).unwrap();
+
+        let fields = &model.traces[0].children[0].fields;
+        assert!(matches!(&fields.expected, Some(Value::Object(object)) if object.elem[0].key == "answer"));
+        assert!(matches!(&fields.error, Some(Value::Func(Func::Choice(options))) if options.len() == 2));
     }
 
     #[test]

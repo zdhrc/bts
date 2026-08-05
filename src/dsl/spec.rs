@@ -199,12 +199,16 @@ pub(crate) mod ids {
 
     pub(crate) const INPUT: Id = Id::new("field.input");
     pub(crate) const OUTPUT: Id = Id::new("field.output");
+    pub(crate) const EXPECTED: Id = Id::new("field.expected");
+    pub(crate) const ERROR: Id = Id::new("field.error");
     pub(crate) const METADATA: Id = Id::new("field.metadata");
     pub(crate) const METRICS: Id = Id::new("field.metrics");
     pub(crate) const TAGS: Id = Id::new("field.tags");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
+    pub(crate) const MULTILINE: Id = Id::new("expr.multiline-string");
+    pub(crate) const HEREDOC: Id = Id::new("expr.heredoc");
     pub(crate) const VAR_REF: Id = Id::new("expr.variable-reference");
     pub(crate) const NUMBER: Id = Id::new("expr.number");
     pub(crate) const BOOLEAN: Id = Id::new("expr.boolean");
@@ -226,6 +230,10 @@ pub(crate) mod ids {
     pub(crate) const FUNC_CHOICE: Id = Id::new("func.choice");
     pub(crate) const FUNC_RANGE: Id = Id::new("func.range");
 
+    pub(crate) const MULTILINE_DELIMITERS: Id = Id::new("rule.multiline-delimiters");
+    pub(crate) const MULTILINE_INDENT: Id = Id::new("rule.multiline-indentation");
+    pub(crate) const HEREDOC_DELIMITERS: Id = Id::new("rule.heredoc-delimiters");
+    pub(crate) const HEREDOC_INDENT: Id = Id::new("rule.heredoc-indentation");
     pub(crate) const KNOWN_REFERENCES: Id = Id::new("rule.known-references");
     pub(crate) const UNIQUE_VARS: Id = Id::new("rule.unique-vars");
     pub(crate) const STATIC_VARS: Id = Id::new("rule.static-vars");
@@ -270,6 +278,20 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         id: ids::OUTPUT,
         keyword: "output",
         summary: "Output associated with the trace or span.",
+        value: &ANY,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::EXPECTED,
+        keyword: "expected",
+        summary: "Expected output associated with the trace or span.",
+        value: &ANY,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::ERROR,
+        keyword: "error",
+        summary: "Error associated with the trace or span.",
         value: &ANY,
         cardinality: Cardinality::Optional,
     },
@@ -398,6 +420,26 @@ const FOR_RULES: &[RuleDesc] = &[
         summary: "For expressions unroll during validation: a filter condition must resolve to a constant boolean and an object key to a constant string.",
     },
 ];
+const MULTILINE_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::MULTILINE_DELIMITERS,
+        summary: "Multi-line content starts on the line after the opening `\"\"\"` and ends on the line before the closing `\"\"\"`, which sits alone on its own line; the final newline is not part of the value, so leave a blank line to keep one.",
+    },
+    RuleDesc {
+        id: ids::MULTILINE_INDENT,
+        summary: "The closing delimiter's leading whitespace is stripped from every content line; blank lines are exempt, and no other line may be indented less.",
+    },
+];
+const HEREDOC_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::HEREDOC_DELIMITERS,
+        summary: "Heredoc content starts on the line after the introducer and ends at the first line holding only the delimiter word (surrounding whitespace allowed); unlike `\"\"\"` strings, the newline ending the last content line is part of the value.",
+    },
+    RuleDesc {
+        id: ids::HEREDOC_INDENT,
+        summary: "`<<` keeps every content line verbatim; `<<-` strips the longest whitespace prefix shared by the non-blank content lines, and blank lines keep only their newline.",
+    },
+];
 const VAR_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::DEFINED_VARS,
@@ -423,6 +465,20 @@ const EXPR_TYPES: &[ExprDesc] = &[
         summary: "A string containing `${...}` interpolations resolved for each generated trace. Valid anywhere a string is, except block names.",
         examples: &["\"question #${trace.index}\""],
         rules: KNOWN_REFERENCES_RULE,
+    },
+    ExprDesc {
+        id: ids::MULTILINE,
+        syntax: "\"\"\"\ntext\n\"\"\"",
+        summary: "A triple-quoted string spanning multiple lines. Quotes are literal inside it, and `$${` and `${...}` interpolation work as in single-line strings. Valid anywhere a string is.",
+        examples: &["\"\"\"\n    You are ${var.assistant}.\n    Answer briefly.\n    \"\"\""],
+        rules: MULTILINE_RULES,
+    },
+    ExprDesc {
+        id: ids::HEREDOC,
+        syntax: "<<DELIM\ntext\nDELIM | <<-DELIM\ntext\nDELIM",
+        summary: "A heredoc string closed by a line holding only its delimiter word. Quotes are literal inside it, and `$${` and `${...}` interpolation work as in single-line strings. Valid anywhere a string is.",
+        examples: &["<<-PROMPT\n    You are ${var.assistant}.\n    Answer briefly.\nPROMPT"],
+        rules: HEREDOC_RULES,
     },
     ExprDesc {
         id: ids::VAR_REF,
@@ -678,7 +734,7 @@ pub(crate) static SPEC: Spec = Spec {
     summary: "A declarative language for describing synthetic traces and spans.",
     surface: SurfaceDesc {
         notation: "EBNF",
-        grammar: r#"
+        grammar: r##"
 document       = { declaration } ;
 declaration    = block | attribute ;
 block          = identifier, [ string ], "{", { declaration }, "}" ;
@@ -710,15 +766,20 @@ for_object     = "for", bindings, "in", expression, ":", expression, "=>", expre
 bindings       = identifier, [ ",", identifier ] ;
 identifier     = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
 number         = ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
-string         = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | interpolation }, '"' ;
+string         = quoted | multiline | heredoc ;
+quoted         = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | interpolation }, '"' ;
+multiline      = '"""', NEWLINE, { ANY_EXCEPT_TRIPLE_QUOTE | escape | interpolation }, '"""' ;
+heredoc        = "<<", [ "-" ], identifier, NEWLINE, { ANY | escape | interpolation }, NEWLINE, [ WHITESPACE ], identifier ;
 escape         = "$${" ;
 interpolation  = "${", reference, "}" ;
 reference      = identifier, { ".", identifier } ;
-"#,
+comment        = ( "#" | "//" ), { ANY_EXCEPT_NEWLINE } ;
+"##,
         notes: &[
             "Whitespace separates tokens and is otherwise insignificant.",
             "The surface grammar accepts declarations generically; block placement and field types are semantic rules.",
-            "Comments are not currently supported.",
+            "`#` and `//` start a comment running to the end of the line; comments behave as whitespace and are literal text inside strings. There are no block comments.",
+            "`<<` opens a heredoc only when its delimiter word (optionally after `-`) follows directly; anything else lexes as comparison operators.",
             "Inside strings, `$${` escapes a literal `${`; any other `$` is literal.",
             "Block names are plain strings; interpolation is not allowed in them.",
             "Binary operators are left-associative; `?:` is right-associative.",
