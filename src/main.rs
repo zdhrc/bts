@@ -3,10 +3,14 @@ mod conf;
 mod dsl;
 mod sdg;
 
+use clap::Parser as _;
+
 fn main() -> std::process::ExitCode {
-    if cmd::run() {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
+    match cmd::Cli::parse().run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }

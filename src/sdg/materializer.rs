@@ -10,7 +10,7 @@ const EVENT_SLOT: Duration = Duration::from_millis(100);
 
 // how trace volume spreads across the window; each variant maps an even 0..=1
 // ratio through its inverse cdf so placement stays deterministic
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
 pub(crate) enum Distribution {
     #[default]
     Linear,

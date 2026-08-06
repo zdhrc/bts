@@ -1,55 +1,58 @@
-use std::fs;
-
+use crate::cmd::render_diags;
 use crate::dsl::compile;
-use clap::{Arg, ArgGroup, ArgMatches, Command};
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
-pub fn command() -> Command {
-    Command::new("check")
-        .about("check source, file, etc for valid syntax")
-        .arg(
-            Arg::new("file")
-                .short('f')
-                .long("file")
-                .value_name("PATH")
-                .help("path to a source file to check"),
-        )
-        .arg(
-            Arg::new("src")
-                .short('s')
-                .long("src")
-                .value_name("SOURCE")
-                .help("raw source text to check"),
-        )
-        .group(ArgGroup::new("input").args(["file", "src"]).required(true).multiple(false))
+#[derive(Debug, clap::Args)]
+#[command(about = "check bts source for valid syntax")]
+pub struct Args {
+    /// path to a source file to check, or - to read stdin
+    #[arg(value_name = "PATH")]
+    path: PathBuf,
 }
 
-pub fn run(matches: &ArgMatches) -> bool {
-    let (source_name, src) = match matches.get_one::<String>("file") {
-        Some(path) => match fs::read_to_string(path) {
-            Ok(src) => (path.as_str(), src),
-            Err(error) => {
-                eprintln!("error: could not read {path}: {error}");
-                return false;
-            }
-        },
-        None => {
-            let src = matches
-                .get_one::<String>("src")
-                .expect("clap requires either --file or --src");
-            ("<src>", src.clone())
-        }
-    };
+impl Args {
+    pub fn run(self) -> Result<(), Error> {
+        let (source_name, src) = if self.path == Path::new("-") {
+            let src = io::read_to_string(io::stdin()).map_err(Error::ReadStdin)?;
+            ("<stdin>".to_owned(), src)
+        } else {
+            let src = fs::read_to_string(&self.path).map_err(|source| Error::Read {
+                path: self.path.clone(),
+                source,
+            })?;
+            (self.path.display().to_string(), src)
+        };
 
-    match compile(&src) {
-        Ok(_) => {
-            println!("{source_name}: valid");
-            true
-        }
-        Err(diags) => {
-            for diag in diags {
-                eprintln!("{}", diag.render(source_name, &src));
+        match compile(&src) {
+            Ok(_) => {
+                println!("{source_name}: valid");
+                Ok(())
             }
-            false
+            Err(diags) => Err(Error::Invalid {
+                details: render_diags(&source_name, &src, &diags),
+            }),
         }
     }
 }
+
+#[derive(Debug)]
+pub enum Error {
+    Read { path: PathBuf, source: io::Error },
+    ReadStdin(io::Error),
+    Invalid { details: String },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(formatter, "could not read {}: {source}", path.display()),
+            Self::ReadStdin(source) => write!(formatter, "could not read stdin: {source}"),
+            Self::Invalid { details } => write!(formatter, "source is invalid:\n{details}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
