@@ -1,2 +1,13 @@
 /target
+
+# local working notes
 term-bank.md
+plan-bank.md
+
+# editor and agent local config
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# os cruft
+.DS_Store
