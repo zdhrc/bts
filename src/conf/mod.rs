@@ -1,5 +1,4 @@
-use std::{env, time::Duration};
-use thiserror::Error;
+use std::{env, fmt, time::Duration};
 use uuid::Uuid;
 
 const BRAINTRUST_API_URL: &str = "https://api.braintrust.dev";
@@ -44,14 +43,19 @@ fn required_env(name: &'static str) -> Result<String, Error> {
         .ok_or(Error::MissingVariable(name))
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub(crate) enum Error {
-    #[error("environment variable {0} is required")]
     MissingVariable(&'static str),
-
-    #[error("BRAINTRUST_PROJECT_ID must be a UUID")]
-    InvalidProjectId {
-        #[source]
-        source: uuid::Error,
-    },
+    InvalidProjectId { source: uuid::Error },
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingVariable(name) => write!(formatter, "environment variable {name} is required"),
+            Self::InvalidProjectId { source } => write!(formatter, "BRAINTRUST_PROJECT_ID must be a UUID: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}

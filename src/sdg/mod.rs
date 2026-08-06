@@ -1,13 +1,13 @@
 mod materializer;
 mod planner;
-mod writer;
+pub(crate) mod writer;
 
 use crate::{conf::Braintrust, dsl::Model};
+use std::fmt;
 use std::time::{Duration, SystemTime};
-use thiserror::Error;
 
 pub(crate) use materializer::{Distribution, EventBatch};
-pub(crate) use writer::{Error as WriteError, InsertResponse};
+pub(crate) use writer::InsertResponse;
 
 pub(crate) fn generate(
     model: Model,
@@ -16,27 +16,34 @@ pub(crate) fn generate(
     distribution: Distribution,
     now: SystemTime,
     seed: u64,
-) -> Result<EventBatch, GenerateError> {
+) -> Result<EventBatch, Error> {
     if model.traces.is_empty() {
-        return Err(GenerateError::EmptyShape);
+        return Err(Error::EmptyShape);
     }
 
-    let plan = planner::plan(model, count, seed).map_err(GenerateError::Plan)?;
-    materializer::materialize(plan, over, distribution, now).map_err(GenerateError::Materialize)
+    let plan = planner::plan(model, count, seed).map_err(Error::Plan)?;
+    materializer::materialize(plan, over, distribution, now).map_err(Error::Materialize)
 }
 
 pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, writer::Error> {
     writer::write(config, events)
 }
 
-#[derive(Debug, Error)]
-pub(crate) enum GenerateError {
-    #[error("shape must contain at least one trace")]
+#[derive(Debug)]
+pub(crate) enum Error {
     EmptyShape,
-
-    #[error("failed to evaluate an expression: {0}")]
-    Plan(#[source] planner::Error),
-
-    #[error("failed to materialize traces: {0}")]
-    Materialize(#[source] materializer::Error),
+    Plan(planner::Error),
+    Materialize(materializer::Error),
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyShape => formatter.write_str("shape must contain at least one trace"),
+            Self::Plan(source) => write!(formatter, "failed to evaluate an expression: {source}"),
+            Self::Materialize(source) => write!(formatter, "failed to materialize traces: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}

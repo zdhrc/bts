@@ -1,7 +1,6 @@
 use crate::dsl::ast::TemplatePart;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
-use std::{iter::Peekable, str::CharIndices};
-use thiserror::Error as Err;
+use std::{fmt, iter::Peekable, str::CharIndices};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Token {
@@ -715,8 +714,7 @@ pub(super) fn lex(src: &str) -> Result<Tokens, Diags> {
         .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
-#[error("{kind}")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) struct Error {
     kind: ErrorKind,
     range: SrcRange,
@@ -724,29 +722,48 @@ pub(super) struct Error {
 
 pub(super) type Errors = Vec<Error>;
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum ErrorKind {
-    #[error("unknown token")]
     UnknownToken,
-    #[error("invalid ident token")]
     InvalidIdentToken,
-    #[error("unterminated string")]
     UnterminatedString,
-    #[error("multi-line string content must start on the line after the opening \"\"\"")]
     ContentAfterMultilineOpener,
-    #[error("the closing \"\"\" of a multi-line string must sit on its own line")]
     ContentBeforeMultilineCloser,
-    #[error("line is indented less than the closing \"\"\"")]
     UnderindentedMultilineLine,
-    #[error("unterminated interpolation")]
     UnterminatedInterpolation,
-    #[error("invalid reference")]
     InvalidReference,
-    #[error("invalid number")]
     InvalidNumber,
-    #[error("stray `{0}`; did you mean `{0}{0}`?")]
     UnpairedOperator(char),
 }
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownToken => formatter.write_str("unknown token"),
+            Self::InvalidIdentToken => formatter.write_str("invalid ident token"),
+            Self::UnterminatedString => formatter.write_str("unterminated string"),
+            Self::ContentAfterMultilineOpener => {
+                formatter.write_str("multi-line string content must start on the line after the opening \"\"\"")
+            }
+            Self::ContentBeforeMultilineCloser => {
+                formatter.write_str("the closing \"\"\" of a multi-line string must sit on its own line")
+            }
+            Self::UnderindentedMultilineLine => formatter.write_str("line is indented less than the closing \"\"\""),
+            Self::UnterminatedInterpolation => formatter.write_str("unterminated interpolation"),
+            Self::InvalidReference => formatter.write_str("invalid reference"),
+            Self::InvalidNumber => formatter.write_str("invalid number"),
+            Self::UnpairedOperator(op) => write!(formatter, "stray `{op}`; did you mean `{op}{op}`?"),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl Error {
     fn new(kind: ErrorKind, range: SrcRange) -> Self {

@@ -8,8 +8,8 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
+use std::fmt;
 use std::ops::Range;
-use thiserror::Error as Err;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct Plan {
@@ -871,8 +871,7 @@ pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
     })
 }
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
-#[error("{kind}")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct Error {
     kind: ErrorKind,
     pub(crate) range: SrcRange,
@@ -884,35 +883,50 @@ impl Error {
     }
 }
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ErrorKind {
-    #[error("expression divides by zero")]
     DivisionByZero,
-    #[error("expression result overflowed or is not finite")]
     NonFiniteResult,
-    #[error("array index is out of bounds")]
     IndexOutOfBounds,
-    #[error("array index is not an integer")]
     NonIntegerIndex,
-    #[error("object key is not present")]
     MissingObjectKey,
-    #[error("slice bound is not an integer")]
     NonIntegerSliceBound,
-    #[error("slice bound is negative")]
     NegativeSliceBound,
-    #[error("repeat count is negative")]
     NegativeRepeatCount,
-    #[error("repeat count is not an integer")]
     NonIntegerRepeatCount,
-    #[error("maybe chance is not between 0 and 1")]
     ChanceOutOfRange,
-    #[error("clamp bounds are out of order")]
     ClampBoundsOutOfOrder,
-    #[error("split separator is empty")]
     EmptySplitSeparator,
-    #[error("join element is not a string, number, or boolean")]
     JoinElementNotScalar,
 }
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DivisionByZero => "expression divides by zero",
+            Self::NonFiniteResult => "expression result overflowed or is not finite",
+            Self::IndexOutOfBounds => "array index is out of bounds",
+            Self::NonIntegerIndex => "array index is not an integer",
+            Self::MissingObjectKey => "object key is not present",
+            Self::NonIntegerSliceBound => "slice bound is not an integer",
+            Self::NegativeSliceBound => "slice bound is negative",
+            Self::NegativeRepeatCount => "repeat count is negative",
+            Self::NonIntegerRepeatCount => "repeat count is not an integer",
+            Self::ChanceOutOfRange => "maybe chance is not between 0 and 1",
+            Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
+            Self::EmptySplitSeparator => "split separator is empty",
+            Self::JoinElementNotScalar => "join element is not a string, number, or boolean",
+        })
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

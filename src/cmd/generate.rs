@@ -1,12 +1,11 @@
 use crate::{conf::Braintrust, dsl, sdg};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::{
-    fs,
+    fmt, fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
-use thiserror::Error as Err;
 
 pub fn command() -> Command {
     Command::new("generate")
@@ -90,7 +89,7 @@ fn execute(matches: &ArgMatches) -> Result<(), Error> {
     };
     let events = sdg::generate(model, count, over, distribution, SystemTime::now(), seed).map_err(|error| match error {
         // expression evaluation failures render like compile diagnostics with line:col
-        sdg::GenerateError::Plan(plan_error) => Error::FailedGeneration {
+        sdg::Error::Plan(plan_error) => Error::FailedGeneration {
             details: render_diags(
                 path,
                 &source,
@@ -165,32 +164,57 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_millis(milliseconds))
 }
 
-#[derive(Debug, Err)]
+#[derive(Debug)]
 enum Error {
-    #[error("could not read shape {}: {source}", path.display())]
-    ReadShape {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("shape is invalid:\n{details}")]
+    ReadShape { path: PathBuf, source: std::io::Error },
     InvalidShape { details: String },
-
-    #[error("generation failed:\n{details}")]
     FailedGeneration { details: String },
+    Generate(sdg::Error),
+    Config(crate::conf::Error),
+    Write(sdg::writer::Error),
+    Encode(serde_json::Error),
+}
 
-    #[error(transparent)]
-    Generate(#[from] sdg::GenerateError),
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadShape { path, source } => {
+                write!(formatter, "could not read shape {}: {source}", path.display())
+            }
+            Self::InvalidShape { details } => write!(formatter, "shape is invalid:\n{details}"),
+            Self::FailedGeneration { details } => write!(formatter, "generation failed:\n{details}"),
+            Self::Generate(source) => source.fmt(formatter),
+            Self::Config(source) => source.fmt(formatter),
+            Self::Write(source) => source.fmt(formatter),
+            Self::Encode(source) => write!(formatter, "failed to encode generated events as JSON: {source}"),
+        }
+    }
+}
 
-    #[error(transparent)]
-    Config(#[from] crate::conf::Error),
+impl std::error::Error for Error {}
 
-    #[error(transparent)]
-    Write(#[from] sdg::WriteError),
+impl From<sdg::Error> for Error {
+    fn from(source: sdg::Error) -> Self {
+        Self::Generate(source)
+    }
+}
 
-    #[error("failed to encode generated events as JSON")]
-    Encode(#[from] serde_json::Error),
+impl From<crate::conf::Error> for Error {
+    fn from(source: crate::conf::Error) -> Self {
+        Self::Config(source)
+    }
+}
+
+impl From<sdg::writer::Error> for Error {
+    fn from(source: sdg::writer::Error) -> Self {
+        Self::Write(source)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(source: serde_json::Error) -> Self {
+        Self::Encode(source)
+    }
 }
 
 #[cfg(test)]

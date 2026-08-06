@@ -2,8 +2,8 @@ use crate::sdg::planner::{EventFields, EventRef, Plan};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use thiserror::Error as Err;
 use uuid::Uuid;
 
 const EVENT_SLOT: Duration = Duration::from_millis(100);
@@ -257,24 +257,36 @@ pub(super) fn materialize(
     Materializer::new(plan, over, distribution, now)?.materialize()
 }
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
-#[error("{kind}")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct Error {
     kind: ErrorKind,
     event: EventRef,
 }
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum ErrorKind {
-    #[error("metric `{0}` is reserved")]
     ReservedMetric(&'static str),
-
-    #[error("generation window is shorter than the longest trace")]
     WindowTooShort,
-
-    #[error("timestamp is out of range")]
     TimestampOutOfRange,
 }
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReservedMetric(name) => write!(formatter, "metric `{name}` is reserved"),
+            Self::WindowTooShort => formatter.write_str("generation window is shorter than the longest trace"),
+            Self::TimestampOutOfRange => formatter.write_str("timestamp is out of range"),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl Error {
     fn new(kind: ErrorKind, event: EventRef) -> Self {

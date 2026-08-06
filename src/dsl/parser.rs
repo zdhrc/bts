@@ -1,7 +1,7 @@
 use crate::dsl::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, UnaryOp};
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::lexer::{Token, TokenKind, Tokens};
-use thiserror::Error as Err;
+use std::fmt;
 
 macro_rules! token {
     ($variant:ident) => {
@@ -544,8 +544,7 @@ pub(super) fn parse(tokens: Vec<Token>) -> Result<Ast, Diags> {
         .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
-#[error("{kind}")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) struct Error {
     kind: ErrorKind,
     range: SrcRange,
@@ -553,41 +552,56 @@ pub(super) struct Error {
 
 pub(super) type Errors = Vec<Error>;
 
-#[derive(Debug, Clone, Copy, Err, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum ErrorKind {
-    #[error("unknown token")]
     UnexpectedToken,
-    #[error("expected declaration")]
     ExpectedDeclaration,
-    #[error("expected identifier")]
     ExpectedIdentifier,
-    #[error("expected string")]
     ExpectedStringLiteral,
-    #[error("expected number")]
     ExpectedNumberLiteral,
-    #[error("expected expression assignment")]
     ExpectedExpressionAssignment,
-    #[error("block names do not support interpolation")]
     InterpolatedName,
-    #[error("expected variable name")]
     ExpectedVariableName,
-    #[error("expected field name after `.`")]
     ExpectedAccessorField,
-    #[error("expected `:` in conditional expression")]
     ExpectedTernaryColon,
-    #[error("expected loop binding name after `for`")]
     ExpectedForBinding,
-    #[error("loop binding name is reserved")]
     ReservedForBinding,
-    #[error("loop binding name is already bound")]
     DuplicateForBinding,
-    #[error("expected `in` in for expression")]
     ExpectedForIn,
-    #[error("expected `:` in for expression")]
     ExpectedForColon,
-    #[error("expected `=>` after the key in an object for expression")]
     ExpectedForArrow,
 }
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnexpectedToken => "unknown token",
+            Self::ExpectedDeclaration => "expected declaration",
+            Self::ExpectedIdentifier => "expected identifier",
+            Self::ExpectedStringLiteral => "expected string",
+            Self::ExpectedNumberLiteral => "expected number",
+            Self::ExpectedExpressionAssignment => "expected expression assignment",
+            Self::InterpolatedName => "block names do not support interpolation",
+            Self::ExpectedVariableName => "expected variable name",
+            Self::ExpectedAccessorField => "expected field name after `.`",
+            Self::ExpectedTernaryColon => "expected `:` in conditional expression",
+            Self::ExpectedForBinding => "expected loop binding name after `for`",
+            Self::ReservedForBinding => "loop binding name is reserved",
+            Self::DuplicateForBinding => "loop binding name is already bound",
+            Self::ExpectedForIn => "expected `in` in for expression",
+            Self::ExpectedForColon => "expected `:` in for expression",
+            Self::ExpectedForArrow => "expected `=>` after the key in an object for expression",
+        })
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl Error {
     fn new(kind: ErrorKind, range: SrcRange) -> Self {

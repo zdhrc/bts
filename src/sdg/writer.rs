@@ -1,7 +1,7 @@
 use crate::{conf::Braintrust, sdg::materializer::EventBatch};
 use reqwest::{StatusCode, blocking::Client, header::CONTENT_TYPE};
 use serde::Deserialize;
-use thiserror::Error as Err;
+use std::fmt;
 
 // braintrust's lambda-backed api caps request bodies; advertised as logs3_payload_max_bytes on GET /version
 const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
@@ -154,35 +154,55 @@ pub(super) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertRe
     Writer::new(config)?.write(events)
 }
 
-#[derive(Debug, Err)]
-#[error("{kind}")]
+#[derive(Debug)]
 pub(crate) struct Error {
     kind: ErrorKind,
 }
 
-#[derive(Debug, Err)]
+#[derive(Debug)]
 enum ErrorKind {
-    #[error("failed to build HTTP client")]
-    BuildClient(#[source] reqwest::Error),
-
-    #[error("failed to encode an event as JSON")]
-    EncodeEvent(#[source] serde_json::Error),
-
-    #[error("a single event of {size} bytes exceeds the {limit} byte payload limit")]
+    BuildClient(reqwest::Error),
+    EncodeEvent(serde_json::Error),
     EventTooLarge { size: usize, limit: usize },
-
-    #[error("failed to send request")]
-    SendRequest(#[source] reqwest::Error),
-
-    #[error("Braintrust rejected the request with {status}: {body}")]
+    SendRequest(reqwest::Error),
     Rejected { status: StatusCode, body: String },
-
-    #[error("failed to decode Braintrust response")]
-    DecodeResponse(#[source] reqwest::Error),
-
-    #[error("Braintrust acknowledged {actual} rows, but {expected} events were submitted")]
+    DecodeResponse(reqwest::Error),
     UnexpectedRowCount { expected: usize, actual: usize },
 }
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BuildClient(source) => write!(formatter, "failed to build HTTP client: {source}"),
+            Self::EncodeEvent(source) => write!(formatter, "failed to encode an event as JSON: {source}"),
+            Self::EventTooLarge { size, limit } => {
+                write!(
+                    formatter,
+                    "a single event of {size} bytes exceeds the {limit} byte payload limit"
+                )
+            }
+            Self::SendRequest(source) => write!(formatter, "failed to send request: {source}"),
+            Self::Rejected { status, body } => {
+                write!(formatter, "Braintrust rejected the request with {status}: {body}")
+            }
+            Self::DecodeResponse(source) => write!(formatter, "failed to decode Braintrust response: {source}"),
+            Self::UnexpectedRowCount { expected, actual } => {
+                write!(
+                    formatter,
+                    "Braintrust acknowledged {actual} rows, but {expected} events were submitted"
+                )
+            }
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl Error {
     fn new(kind: ErrorKind) -> Self {
