@@ -16,7 +16,7 @@ trace "conversation" {
         llm "gpt-4o-mini" {
             input = "Hello ${trace.index}"
             output = choice(true, false) ? "Hi!" : "Hey!"
-            metrics = { tokens = 2 * 2 latency = range(1, 5) * 100 }
+            metrics = { tokens = 2 * 2, latency = range(1, 5) * 100 }
         }
     }
 }

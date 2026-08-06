@@ -3563,7 +3563,7 @@ mod tests {
 
     fn model(source: &str) -> Result<Model, Errors> {
         let tokens = crate::dsl::lexer::lex(source).unwrap();
-        let ast = crate::dsl::parser::parse(tokens).unwrap();
+        let ast = crate::dsl::parser::parse(tokens, source).unwrap();
         Modeler::new(ast).model()
     }
 
@@ -3694,7 +3694,7 @@ mod tests {
 
     #[test]
     fn models_null_and_negative_numbers() {
-        let model = model(r#"trace "example" { input = null metrics = { delta = -0.5 offset = -3 } }"#).unwrap();
+        let model = model(r#"trace "example" { input = null metrics = { delta = -0.5, offset = -3 } }"#).unwrap();
 
         let fields = &model.traces[0].fields;
         assert!(matches!(fields.input, Some(Value::Null)));
@@ -3911,7 +3911,7 @@ mod tests {
 
     #[test]
     fn models_choice_and_range_funcs() {
-        let model = model(r#"trace "t" { input = choice("a", 1) metrics = { n = range(1, 5) x = range(0, 1.5) } }"#).unwrap();
+        let model = model(r#"trace "t" { input = choice("a", 1) metrics = { n = range(1, 5), x = range(0, 1.5) } }"#).unwrap();
         let fields = &model.traces[0].fields;
 
         let Some(Value::Func {
@@ -4156,7 +4156,7 @@ mod tests {
                     output = format("model={} n={}", "gpt", range(1, 5))
                     expected = join(var.tags, ", ")
                     error = contains(var.tags, "a")
-                    metadata = { parts = split("a,b", ",") has = contains("abc", "b") }
+                    metadata = { parts = split("a,b", ","), has = contains("abc", "b") }
                 }
             "#,
         )
@@ -4505,7 +4505,7 @@ mod tests {
 
     #[test]
     fn rejects_reserved_metric_keys() {
-        let source = r#"trace "example" { metrics = { start = 1 tokens = 4 end = 2 } }"#;
+        let source = r#"trace "example" { metrics = { start = 1, tokens = 4, end = 2 } }"#;
         let errors = model(source).unwrap_err();
 
         assert_eq!(errors.len(), 2);
@@ -4553,7 +4553,7 @@ mod tests {
 
     #[test]
     fn associates_custom_validation_with_spec_rules() {
-        let duplicate = model(r#"trace "example" { metadata = { key = 1 key = 2 } }"#).unwrap_err();
+        let duplicate = model(r#"trace "example" { metadata = { key = 1, key = 2 } }"#).unwrap_err();
         assert_eq!(
             duplicate[0].kind(),
             &ErrorKind::DuplicateObjectKey {
@@ -4587,7 +4587,7 @@ mod tests {
     fn reports_validation_diagnostics_at_the_invalid_source() {
         let source = r#"trace "example" { metadata = true }"#;
         let tokens = crate::dsl::lexer::lex(source).unwrap();
-        let ast = crate::dsl::parser::parse(tokens).unwrap();
+        let ast = crate::dsl::parser::parse(tokens, source).unwrap();
 
         let diagnostics = match super::model(ast) {
             Err(diagnostics) => diagnostics,
@@ -4606,7 +4606,7 @@ mod tests {
 
     #[test]
     fn folds_constant_arithmetic() {
-        let model = model(r#"trace "t" { metrics = { a = 1 + 2 * 3 b = 7 / 2 c = 7 % 2 d = 10 - 12 } }"#).unwrap();
+        let model = model(r#"trace "t" { metrics = { a = 1 + 2 * 3, b = 7 / 2, c = 7 % 2, d = 10 - 12 } }"#).unwrap();
         let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
 
         assert!(matches!(metrics.elem[0].value, Value::Num(Number::Int(7))));
@@ -4618,7 +4618,7 @@ mod tests {
 
     #[test]
     fn folds_float_promotion_and_keeps_floats_float() {
-        let model = model(r#"trace "t" { metrics = { a = 1 + 0.5 b = 3.0 / 2 c = 1.5 + 1.5 } }"#).unwrap();
+        let model = model(r#"trace "t" { metrics = { a = 1 + 0.5, b = 3.0 / 2, c = 1.5 + 1.5 } }"#).unwrap();
         let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
 
         assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == 1.5));
@@ -4661,7 +4661,7 @@ mod tests {
 
     #[test]
     fn folds_negation_textually() {
-        let model = model(r#"trace "t" { metrics = { a = -9223372036854775808 b = --5 c = -1.5 } }"#).unwrap();
+        let model = model(r#"trace "t" { metrics = { a = -9223372036854775808, b = --5, c = -1.5 } }"#).unwrap();
         let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
 
         // i64::MIN only exists via textual negation, the bare literal overflows
@@ -4914,7 +4914,7 @@ mod tests {
             r#"
             vars {
                 xs = [10, 20, 30]
-                user = { name = "ada" langs = ["en", "fr"] }
+                user = { name = "ada", langs = ["en", "fr"] }
             }
             trace "t" {
                 input = var.xs[1 + 1]
@@ -5264,10 +5264,10 @@ mod tests {
     fn merges_object_spreads_with_later_entries_winning() {
         let model = model(
             r#"
-            vars { meta = { model = "gpt" temperature = 0.2 } }
+            vars { meta = { model = "gpt", temperature = 0.2 } }
             trace "t" {
-                metadata = { ...var.meta temperature = 0.9 }
-                metrics = { temperature = 1 ...var.meta }
+                metadata = { ...var.meta, temperature = 0.9 }
+                metrics = { temperature = 1, ...var.meta }
             }
             "#,
         )
@@ -5288,7 +5288,7 @@ mod tests {
 
     #[test]
     fn rejects_explicit_duplicate_keys_even_through_a_merge() {
-        let errors = model(r#"trace "t" { metadata = { ...{} a = 1 a = 2 } }"#).unwrap_err();
+        let errors = model(r#"trace "t" { metadata = { ...{}, a = 1, a = 2 } }"#).unwrap_err();
 
         assert_eq!(
             errors[0].kind(),
@@ -5368,7 +5368,7 @@ mod tests {
     fn unrolls_for_exprs_over_objects() {
         let model = model(
             r#"
-            vars { meta = { a = 1 b = 2 c = 3 } }
+            vars { meta = { a = 1, b = 2, c = 3 } }
             trace "t" {
                 input = [for k in var.meta : k]
                 metadata = { for k, v in var.meta : k => v if k != "b" }

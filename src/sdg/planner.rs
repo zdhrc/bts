@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn evaluates_ranges_within_bounds_and_keeps_integer_bounds_integral() {
-        let model = compile(r#"trace "t" { metrics = { tokens = range(80, 400) temp = range(0.0, 1.0) } }"#).unwrap();
+        let model = compile(r#"trace "t" { metrics = { tokens = range(80, 400), temp = range(0.0, 1.0) } }"#).unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn evaluates_dynamic_arithmetic_within_bounds() {
-        let source = r#"trace "t" { metrics = { n = range(1, 5) * 100 m = -range(1, 5) } }"#;
+        let source = r#"trace "t" { metrics = { n = range(1, 5) * 100, m = -range(1, 5) } }"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         for event in plan_a.events.iter() {
@@ -1419,7 +1419,7 @@ mod tests {
     #[test]
     fn evaluates_dynamic_indexes_within_their_containers() {
         let source = r#"
-            vars { user = { a = 1 b = 2 } }
+            vars { user = { a = 1, b = 2 } }
             trace "t" {
                 input = ["a", "b", "c"][range(0, 2)]
                 output = var.user[choice("a", "b")]

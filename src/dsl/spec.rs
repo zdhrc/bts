@@ -669,9 +669,9 @@ const EXPR_TYPES: &[ExprDesc] = &[
     },
     ExprDesc {
         id: ids::OBJECT,
-        syntax: "{ key = value ... }",
-        summary: "An object with unique identifier keys and expression values.",
-        examples: &["{}", "{ tokens = 4 cached = false }"],
+        syntax: "{ key = value, ... }",
+        summary: "An object with unique identifier keys and expression values. Items on the same line are separated by commas, with an optional trailing comma; a line break also separates items.",
+        examples: &["{}", "{ tokens = 4, cached = false }"],
         rules: UNIQUE_OBJECT_KEYS_RULE,
     },
     ExprDesc {
@@ -704,7 +704,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         id: ids::SPREAD,
         syntax: "[...array] | { ...object }",
         summary: "Splices the elements of an array or the entries of an object into a surrounding literal, resolved during validation. Later object entries override keys a spread introduced.",
-        examples: &["[1, ...var.xs]", "{ ...var.meta temperature = 0.9 }"],
+        examples: &["[1, ...var.xs]", "{ ...var.meta, temperature = 0.9 }"],
         rules: SPREAD_RULES,
     },
     ExprDesc {
@@ -1197,7 +1197,8 @@ function       = identifier, "(", [ expression, { ",", expression }, [ "," ] ], 
 array          = "[", [ array_items | for_array ], "]" ;
 array_items    = array_item, { ",", array_item }, [ "," ] ;
 array_item     = expression | "...", expression ;
-object         = "{", ( { object_item } | for_object ), "}" ;
+object         = "{", [ object_items | for_object ], "}" ;
+object_items   = object_item, { ( "," | NEWLINE ), object_item }, [ "," ] ;
 object_item    = attribute | "...", expression ;
 for_array      = "for", bindings, "in", expression, ":", expression, [ "if", expression ] ;
 for_object     = "for", bindings, "in", expression, ":", expression, "=>", expression, [ "if", expression ] ;
@@ -1214,7 +1215,7 @@ reference      = identifier, { ".", identifier } ;
 comment        = ( "#" | "//" ), { ANY_EXCEPT_NEWLINE } ;
 "##,
         notes: &[
-            "Whitespace separates tokens and is otherwise insignificant.",
+            "Whitespace separates tokens and is otherwise insignificant, except that a line break can separate object items in place of a comma.",
             "The surface grammar accepts declarations generically; block placement and field types are semantic rules.",
             "`#` and `//` start a comment running to the end of the line; comments behave as whitespace and are literal text inside strings. There are no block comments.",
             "`<<` opens a heredoc only when its delimiter word (optionally after `-`) follows directly; anything else lexes as comparison operators.",

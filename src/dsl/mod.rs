@@ -17,7 +17,7 @@ use crate::dsl::{lexer::lex, modeler::model, parser::parse};
 
 pub(crate) fn compile(src: &str) -> Result<Model, Diags> {
     let tokens = lex(src)?;
-    let ast = parse(tokens)?;
+    let ast = parse(tokens, src)?;
     model(ast)
 }
 

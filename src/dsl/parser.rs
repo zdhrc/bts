@@ -20,18 +20,20 @@ macro_rules! token {
 const RESERVED_WORDS: &[&str] = &["true", "false", "null", "var", "for", "in", "if"];
 
 #[derive(Debug, Clone, PartialEq)]
-struct Parser {
+struct Parser<'src> {
     tokens: Tokens,
+    src: &'src str,
     errors: Errors,
     index: usize,
     // loop bindings currently in scope, bare idents resolve against these
     scopes: Vec<String>,
 }
 
-impl Parser {
-    fn new(tokens: Tokens) -> Self {
+impl<'src> Parser<'src> {
+    fn new(tokens: Tokens, src: &'src str) -> Self {
         Self {
             tokens,
+            src,
             errors: Vec::new(),
             index: 0,
             scopes: Vec::new(),
@@ -368,6 +370,17 @@ impl Parser {
 
                         items.push(ObjectItem::Attr(self.parse_attr(key, range)?));
                     }
+
+                    // items on one line need a comma between them; a line
+                    // break separates on its own, and a trailing comma is fine
+                    if self.consume(token!(Comma)).is_none()
+                        && !self.check(token!(RBrace))
+                        && !self.eof()
+                        && !self.newline_before_peek()
+                    {
+                        self.errors
+                            .push(Error::new(ErrorKind::ExpectedObjectComma, self.peek().range));
+                    }
                 }
                 let end = self.peek().range.end;
                 self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
@@ -515,6 +528,11 @@ impl Parser {
     fn eof(&self) -> bool {
         matches!(self.peek().kind, TokenKind::Eof)
     }
+    // only whitespace and comments sit between tokens and comments never span
+    // lines, so any \n in the gap before the current token is a line break
+    fn newline_before_peek(&self) -> bool {
+        self.index > 0 && self.src[self.tokens[self.index - 1].range.end..self.peek().range.start].contains('\n')
+    }
 }
 
 // binding levels, higher binds tighter; unary and primary sit above all of these
@@ -537,8 +555,8 @@ fn bin_op(kind: &TokenKind) -> Option<(BinOp, u8)> {
     }
 }
 
-pub(super) fn parse(tokens: Vec<Token>) -> Result<Ast, Diags> {
-    Parser::new(tokens)
+pub(super) fn parse(tokens: Vec<Token>, src: &str) -> Result<Ast, Diags> {
+    Parser::new(tokens, src)
         .parse()
         .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
@@ -569,6 +587,7 @@ pub(super) enum ErrorKind {
     ExpectedForIn,
     ExpectedForColon,
     ExpectedForArrow,
+    ExpectedObjectComma,
 }
 
 impl fmt::Display for ErrorKind {
@@ -590,6 +609,7 @@ impl fmt::Display for ErrorKind {
             Self::ExpectedForIn => "expected `in` in for expression",
             Self::ExpectedForColon => "expected `:` in for expression",
             Self::ExpectedForArrow => "expected `=>` after the key in an object for expression",
+            Self::ExpectedObjectComma => "expected `,` between object items on the same line",
         })
     }
 }
@@ -629,7 +649,7 @@ mod tests {
     use super::*;
 
     fn parse(src: &str) -> Result<Ast, Errors> {
-        Parser::new(crate::dsl::lexer::lex(src).unwrap()).parse()
+        Parser::new(crate::dsl::lexer::lex(src).unwrap(), src).parse()
     }
 
     #[track_caller]
@@ -916,7 +936,7 @@ mod tests {
 
     #[test]
     fn parses_object_attrs() {
-        let ast = parse(r#"trace "a" { empty = {} meta = { model = "gpt" nested = { x = 1 } } }"#).unwrap();
+        let ast = parse(r#"trace "a" { empty = {} meta = { model = "gpt", nested = { x = 1 } } }"#).unwrap();
         let trace = block(&ast.decls[0]);
 
         let ExprKind::Object(empty) = &attr(&trace.decls[0]).value.kind else {
@@ -930,6 +950,31 @@ mod tests {
         assert_eq!(meta.len(), 2);
         assert_eq!(item_attr(&meta[0]).key, "model");
         assert!(matches!(&item_attr(&meta[1]).value.kind, ExprKind::Object(nested) if nested.len() == 1));
+    }
+
+    #[test]
+    fn separates_object_items_with_commas_or_newlines() {
+        for source in [
+            "{ a = 1, b = 2 }",
+            "{ a = 1, b = 2, }",
+            "{\n a = 1\n b = 2\n}",
+            "{\n a = 1,\n b = 2\n}",
+        ] {
+            let expr = parse_value(source);
+            let ExprKind::Object(items) = &expr.kind else {
+                panic!("expected an object");
+            };
+            assert_eq!(items.len(), 2, "source: {source}");
+        }
+    }
+
+    #[test]
+    fn rejects_same_line_object_items_without_a_comma() {
+        assert_error_kinds(r#"trace "t" { input = { a = 1 b = 2 } }"#, &[ErrorKind::ExpectedObjectComma]);
+        assert_error_kinds(
+            r#"trace "t" { input = { ...var.meta b = 2 } }"#,
+            &[ErrorKind::ExpectedObjectComma],
+        );
     }
 
     #[test]
@@ -1171,7 +1216,7 @@ mod tests {
         assert!(matches!(args[0].kind, ExprKind::Binary { .. }));
         assert!(matches!(args[1].kind, ExprKind::Cond { .. }));
 
-        let expr = parse_value("{ a = 1 + 2 b = 3 }");
+        let expr = parse_value("{ a = 1 + 2, b = 3 }");
         let ExprKind::Object(items) = &expr.kind else {
             panic!("expected an object");
         };
@@ -1264,7 +1309,7 @@ mod tests {
 
     #[test]
     fn parses_spread_items_in_objects() {
-        let expr = parse_value(r#"{ a = 1 ...var.meta b = 2 }"#);
+        let expr = parse_value(r#"{ a = 1, ...var.meta, b = 2 }"#);
 
         let ExprKind::Object(items) = &expr.kind else {
             panic!("expected an object");
