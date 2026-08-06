@@ -65,7 +65,6 @@ pub(super) struct Planner {
     traces: Vec<Range<usize>>,
 }
 
-// per-trace generation context that templates and functions resolve against
 #[derive(Debug)]
 struct Ctx {
     trace_index: usize,
@@ -97,7 +96,7 @@ impl Planner {
         Ok(())
     }
 
-    // expands dynamic blocks, drawing their structural decisions before any child is planned
+    // dynamic blocks draw their structural decisions before any child is planned
     fn plan_child(&mut self, child: ModelChild, root: EventRef, parent: EventRef, ctx: &mut Ctx) -> Result<(), Error> {
         match child {
             ModelChild::Span(span) => self.plan_span(span, root, parent, ctx),
@@ -278,7 +277,7 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
     Ok(value)
 }
 
-// selects the sliced elements, clamping generous bounds like python
+// generous bounds clamp like python
 fn eval_slice(
     target: ModelValue,
     start: Option<Box<ModelValue>>,
@@ -317,7 +316,7 @@ fn eval_slice_bound(bound: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result
     }
 }
 
-// selects the indexed element, leaving its siblings unevaluated like an untaken branch
+// siblings of the picked element stay unevaluated like an untaken branch
 fn eval_index(target: ModelValue, index: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let target = eval_container(target, ctx)?;
     let index = eval_operand(index, ctx)?;
@@ -338,7 +337,6 @@ fn eval_index(target: ModelValue, index: ModelValue, range: SrcRange, ctx: &mut 
     }
 }
 
-// reduces a dynamic target down to its container literal
 fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     match value {
         ModelValue::Array(_) | ModelValue::Object(_) => Ok(value),
@@ -364,8 +362,7 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error>
     }
 }
 
-// draws a call down to the value it produces this trace; a choice or weighted
-// pick may itself still be dynamic, so callers recurse on the result
+// a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
         ModelFunc::Choice(options) => {
@@ -580,10 +577,10 @@ fn eval_to_int(scalar: Scalar, op: fn(f64) -> f64, range: SrcRange) -> Result<Mo
 }
 
 fn eval_extreme(values: Vec<ModelValue>, minimize: bool, ctx: &mut Ctx) -> Result<ModelValue, Error> {
-    let mut scalars = Vec::with_capacity(values.len());
-    for value in values {
-        scalars.push(eval_operand(value, ctx)?);
-    }
+    let scalars = values
+        .into_iter()
+        .map(|value| eval_operand(value, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let number = if scalars.iter().any(|scalar| matches!(scalar, Scalar::Float(_))) {
         let floats = scalars.iter().map(Scalar::as_float);
@@ -613,7 +610,6 @@ fn random_text(charset: &[u8], length: usize, ctx: &mut Ctx) -> String {
         .collect()
 }
 
-// the stringified form of a scalar element, none for containers and nulls
 fn json_text(value: &JsonValue) -> Option<String> {
     match value {
         JsonValue::String(text) => Some(text.clone()),
@@ -655,7 +651,6 @@ fn lower_object(object: ModelObject, ctx: &mut Ctx) -> Result<JsonMap<String, Js
         .collect()
 }
 
-// scalar operand of an operator expr, the modeler validated the types
 #[derive(Debug, Clone, PartialEq)]
 enum Scalar {
     Int(i64),
@@ -842,7 +837,7 @@ fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> String {
         .collect()
 }
 
-// expands into exactly count traces, multiple trace templates cycle in source order
+// multiple trace templates cycle in source order
 pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error> {
     debug_assert!(!model.traces.is_empty());
 

@@ -8,9 +8,9 @@ use std::{
 };
 
 #[derive(Debug, clap::Args)]
-#[command(about = "generate synthetic traces from a BTS shape and write them to Braintrust")]
+#[command(about = "generate synthetic traces from a bts shape and write them to Braintrust")]
 pub struct Args {
-    /// BTS shape file to generate from
+    /// bts shape file to generate from
     #[arg(long, value_name = "PATH")]
     from: PathBuf,
 

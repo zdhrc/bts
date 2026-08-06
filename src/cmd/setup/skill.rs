@@ -1,4 +1,4 @@
-use crate::dsl::spec::{Cardinality, NameDesc, Place, RuleDesc, SPEC, Spec};
+use crate::dsl::spec::{Cardinality, NamePolicy, Place, RuleDesc, SPEC, Spec};
 use std::env;
 use std::fmt::{self, Write as _};
 use std::fs;
@@ -181,17 +181,17 @@ fn render_skill(spec: &Spec) -> String {
     writeln!(output, "name: {SKILL_NAME}").unwrap();
     writeln!(
         output,
-        "description: Write, review, explain, and debug bts language source. Use when working with bts files, synthetic trace definitions, or bts syntax and validation errors."
+        "description: Write, review, explain, and debug `bts` language source. Use when working with `bts` files, synthetic trace definitions, or `bts` syntax and validation errors."
     )
     .unwrap();
     writeln!(output, "---\n").unwrap();
     writeln!(output, "{GENERATED_MARKER}\n").unwrap();
-    writeln!(output, "# {} language\n", spec.name).unwrap();
+    writeln!(output, "# `{}` language\n", spec.name).unwrap();
     writeln!(output, "{}\n", spec.summary).unwrap();
     writeln!(output, "## Workflow\n").unwrap();
     writeln!(
         output,
-        "1. Read the language reference below before creating or changing bts source."
+        "1. Read the language reference below before creating or changing `bts` source."
     )
     .unwrap();
     writeln!(
@@ -221,7 +221,7 @@ fn render_skill(spec: &Spec) -> String {
     .unwrap();
     writeln!(
         output,
-        "Treat this generated reference as authoritative for BTS language version {} (specification schema version {}).\n",
+        "Treat this generated reference as authoritative for `bts` language version {} (specification schema version {}).\n",
         spec.language_version, spec.schema_version
     )
     .unwrap();
@@ -335,11 +335,11 @@ fn render_rules(output: &mut String, rules: &[RuleDesc]) {
     writeln!(output).unwrap();
 }
 
-fn name_requirement(name: NameDesc) -> &'static str {
+fn name_requirement(name: NamePolicy) -> &'static str {
     match name {
-        NameDesc::Forbidden => "forbidden",
-        NameDesc::Optional => "optional",
-        NameDesc::Required => "required",
+        NamePolicy::Forbidden => "forbidden",
+        NamePolicy::Optional => "optional",
+        NamePolicy::Required => "required",
     }
 }
 

@@ -92,13 +92,13 @@ mod tests {
         let src = "trace \"a\" {\n    input = }\n}";
         let diag = Diag {
             when: DiagPhase::Parsing,
-            what: "expected expression assignment".to_owned(),
+            what: "expected expression".to_owned(),
             r#where: SrcRange::new(24, 25),
         };
 
         assert_eq!(
             diag.render("simple.bt", src),
-            "simple.bt:2:13: parsing error: expected expression assignment\n  \
+            "simple.bt:2:13: parsing error: expected expression\n  \
              |\n\
              2 |     input = }\n  \
              |             ^ (byte 24)"

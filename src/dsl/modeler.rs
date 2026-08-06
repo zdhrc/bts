@@ -883,7 +883,7 @@ impl Modeler {
         ))
     }
 
-    // some(none) = dynamic, checked during generation; none = diagnostic pushed
+    // some(none) = dynamic, checked during generation, none = diagnostic pushed
     fn check_slice_bound(&mut self, bound: &ast::Expr) -> Option<Option<usize>> {
         if !expr_is_constant(bound) {
             return Some(None);
@@ -2570,20 +2570,20 @@ impl Modeler {
 
     fn model_name(&mut self, name: Option<String>, range: SrcRange, block: &spec::BlockDesc) -> Option<String> {
         match block.name {
-            spec::NameDesc::Required => {
+            spec::NamePolicy::Required => {
                 if name.is_none() {
                     self.errors
                         .push(Error::new(ErrorKind::MissingName { block: block.id }, range));
                 }
                 name
             }
-            spec::NameDesc::Forbidden if name.is_some() => {
+            spec::NamePolicy::Forbidden if name.is_some() => {
                 self.errors
                     .push(Error::new(ErrorKind::UnexpectedName { block: block.id }, range));
                 None
             }
-            spec::NameDesc::Optional => name,
-            spec::NameDesc::Forbidden => None,
+            spec::NamePolicy::Optional => name,
+            spec::NamePolicy::Forbidden => None,
         }
     }
 }

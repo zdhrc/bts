@@ -375,8 +375,7 @@ impl Parser {
                 Some(Expr::new(ExprKind::Object(items), SrcRange::new(start, end)))
             }
             _ => {
-                self.errors
-                    .push(Error::new(ErrorKind::ExpectedExpressionAssignment, self.peek().range));
+                self.errors.push(Error::new(ErrorKind::ExpectedExpression, self.peek().range));
                 None
             }
         }
@@ -504,7 +503,7 @@ impl Parser {
         &self.tokens[self.index]
     }
     fn peek_ahead(&self) -> &Token {
-        self.tokens.get(self.index + 1).unwrap_or(&self.tokens[self.tokens.len() - 1])
+        &self.tokens[(self.index + 1).min(self.tokens.len() - 1)]
     }
     fn next(&mut self) -> &Token {
         let token = &self.tokens[self.index];
@@ -559,7 +558,7 @@ pub(super) enum ErrorKind {
     ExpectedIdentifier,
     ExpectedStringLiteral,
     ExpectedNumberLiteral,
-    ExpectedExpressionAssignment,
+    ExpectedExpression,
     InterpolatedName,
     ExpectedVariableName,
     ExpectedAccessorField,
@@ -575,12 +574,12 @@ pub(super) enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::UnexpectedToken => "unknown token",
+            Self::UnexpectedToken => "unexpected token",
             Self::ExpectedDeclaration => "expected declaration",
             Self::ExpectedIdentifier => "expected identifier",
             Self::ExpectedStringLiteral => "expected string",
             Self::ExpectedNumberLiteral => "expected number",
-            Self::ExpectedExpressionAssignment => "expected expression assignment",
+            Self::ExpectedExpression => "expected expression",
             Self::InterpolatedName => "block names do not support interpolation",
             Self::ExpectedVariableName => "expected variable name",
             Self::ExpectedAccessorField => "expected field name after `.`",
@@ -960,7 +959,7 @@ mod tests {
 
     #[test]
     fn rejects_an_attr_missing_its_value() {
-        assert_error_kinds("input =", &[ErrorKind::ExpectedExpressionAssignment]);
+        assert_error_kinds("input =", &[ErrorKind::ExpectedExpression]);
     }
 
     #[test]
@@ -1000,7 +999,7 @@ mod tests {
 
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].kind(), ErrorKind::ExpectedIdentifier);
-        assert_eq!(errors[1].kind(), ErrorKind::ExpectedExpressionAssignment);
+        assert_eq!(errors[1].kind(), ErrorKind::ExpectedExpression);
     }
 
     #[track_caller]
@@ -1241,14 +1240,8 @@ mod tests {
 
     #[test]
     fn rejects_unterminated_slices() {
-        assert_error_kinds(
-            r#"trace "t" { input = var.xs[1: }"#,
-            &[ErrorKind::ExpectedExpressionAssignment],
-        );
-        assert_error_kinds(
-            r#"trace "t" { input = var.xs[: }"#,
-            &[ErrorKind::ExpectedExpressionAssignment],
-        );
+        assert_error_kinds(r#"trace "t" { input = var.xs[1: }"#, &[ErrorKind::ExpectedExpression]);
+        assert_error_kinds(r#"trace "t" { input = var.xs[: }"#, &[ErrorKind::ExpectedExpression]);
     }
 
     #[test]
@@ -1286,7 +1279,7 @@ mod tests {
 
     #[test]
     fn rejects_spreads_without_an_operand() {
-        assert_error_kinds(r#"trace "t" { input = [...] }"#, &[ErrorKind::ExpectedExpressionAssignment]);
+        assert_error_kinds(r#"trace "t" { input = [...] }"#, &[ErrorKind::ExpectedExpression]);
     }
 
     #[test]
@@ -1401,7 +1394,7 @@ mod tests {
 
     #[test]
     fn rejects_a_binary_missing_its_right_operand() {
-        assert_error_kinds(r#"trace "t" { input = 1 + }"#, &[ErrorKind::ExpectedExpressionAssignment]);
+        assert_error_kinds(r#"trace "t" { input = 1 + }"#, &[ErrorKind::ExpectedExpression]);
     }
 
     #[test]

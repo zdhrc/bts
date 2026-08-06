@@ -116,7 +116,7 @@ pub(crate) struct BlockDesc {
     pub(crate) keyword: &'static str,
     pub(crate) summary: &'static str,
     pub(crate) syntax: &'static str,
-    pub(crate) name: NameDesc,
+    pub(crate) name: NamePolicy,
     pub(crate) allowed_in: &'static [Place],
     pub(crate) body: BodyDesc,
     pub(crate) rules: &'static [RuleDesc],
@@ -160,7 +160,7 @@ pub(crate) enum Cardinality {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum NameDesc {
+pub(crate) enum NamePolicy {
     Forbidden,
     Optional,
     Required,
@@ -460,7 +460,7 @@ const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
 };
 const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
     id: ids::FUNC_ARG_TYPES,
-    summary: "A function argument must have the documented type, known before generation; an argument whose type is only known during generation (eg a `choice` with mixed alternatives) is rejected.",
+    summary: "A function argument must have the documented type, known before generation; an argument whose type is only known during generation (e.g. a `choice` with mixed alternatives) is rejected.",
 };
 const DIST_PARAMS_RULE: RuleDesc = RuleDesc {
     id: ids::DIST_PARAMS,
@@ -1022,7 +1022,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "vars",
         summary: "A block of named values shared across the shape via `var.<name>` references.",
         syntax: "vars { <name> = <value> ... }",
-        name: NameDesc::Forbidden,
+        name: NamePolicy::Forbidden,
         allowed_in: ROOT_ONLY,
         body: BodyDesc { fields: &[], open: true },
         rules: VARS_RULES,
@@ -1032,7 +1032,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "trace",
         summary: "A named root trace containing fields and nested spans.",
         syntax: "trace \"<name>\" { ... }",
-        name: NameDesc::Required,
+        name: NamePolicy::Required,
         allowed_in: ROOT_ONLY,
         body: BodyDesc {
             fields: SPAN_FIELDS,
@@ -1045,7 +1045,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "task",
         summary: "A named task span containing fields and nested spans.",
         syntax: "task \"<name>\" { ... }",
-        name: NameDesc::Required,
+        name: NamePolicy::Required,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
@@ -1058,7 +1058,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "llm",
         summary: "A named LLM span containing fields and nested spans.",
         syntax: "llm \"<name>\" { ... }",
-        name: NameDesc::Required,
+        name: NamePolicy::Required,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
@@ -1071,7 +1071,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "tool",
         summary: "A named tool span containing fields and nested spans.",
         syntax: "tool \"<name>\" { ... }",
-        name: NameDesc::Required,
+        name: NamePolicy::Required,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
@@ -1084,7 +1084,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "function",
         summary: "A named function span containing fields and nested spans.",
         syntax: "function \"<name>\" { ... }",
-        name: NameDesc::Required,
+        name: NamePolicy::Required,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: SPAN_FIELDS,
@@ -1097,7 +1097,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "repeat",
         summary: "A dynamic block that stamps out its child blocks `count` times for each generated trace.",
         syntax: "repeat [\"<name>\"] { count = <number> ... }",
-        name: NameDesc::Optional,
+        name: NamePolicy::Optional,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: REPEAT_FIELDS,
@@ -1110,7 +1110,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "choice",
         summary: "A dynamic block that includes exactly one of its child blocks, picked uniformly at random for each generated trace.",
         syntax: "choice [\"<name>\"] { ... }",
-        name: NameDesc::Optional,
+        name: NamePolicy::Optional,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: &[],
@@ -1123,7 +1123,7 @@ const BLOCKS: &[BlockDesc] = &[
         keyword: "maybe",
         summary: "A dynamic block that includes its child blocks with probability `chance` for each generated trace.",
         syntax: "maybe [\"<name>\"] { [chance = <number>] ... }",
-        name: NameDesc::Optional,
+        name: NamePolicy::Optional,
         allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
         body: BodyDesc {
             fields: MAYBE_FIELDS,
