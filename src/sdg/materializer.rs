@@ -33,7 +33,7 @@ pub(crate) struct EventBatch {
     pub(super) events: Box<[Event]>,
 
     #[serde(skip)]
-    trace_count: usize,
+    pub(super) trace_count: usize,
 }
 
 impl EventBatch {
