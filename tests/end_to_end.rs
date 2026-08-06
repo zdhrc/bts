@@ -89,7 +89,7 @@ fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     for event in events {
         let root = event["root_span_id"].as_str().unwrap();
         *picks.entry(root.to_owned()).or_insert(0) += match event["span_attributes"]["name"].as_str().unwrap() {
-            "search" | "fallback" => 1,
+            "get_order_status" | "summarize_session" => 1,
             _ => 0,
         };
     }
@@ -106,8 +106,8 @@ fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
         .iter()
         .filter_map(|event| event["input"].as_str())
         .collect::<std::collections::HashSet<_>>();
-    assert!(inputs.contains("message 0"));
-    assert!(inputs.contains("message 1"));
+    assert!(inputs.contains("question 0"));
+    assert!(inputs.contains("question 1"));
 }
 
 #[test]

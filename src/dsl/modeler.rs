@@ -3587,7 +3587,7 @@ mod tests {
 
         assert_eq!(model.traces.len(), 1);
         let trace = &model.traces[0];
-        assert_eq!(trace.name, "multi-turn-conversation");
+        assert_eq!(trace.name, "support-sessions");
         assert_eq!(trace.children.len(), 2);
         assert!(
             trace

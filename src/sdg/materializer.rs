@@ -340,18 +340,25 @@ mod tests {
         assert_eq!(second_turn.span_parents.as_ref(), std::slice::from_ref(&trace.span_id));
         assert_eq!(second_llm.span_parents.as_ref(), std::slice::from_ref(&second_turn.span_id));
 
-        assert_eq!(first_llm.span_attributes.name, "gpt-4o-mini");
+        assert_eq!(first_llm.span_attributes.name, "Chat Completion");
         assert_eq!(first_llm.span_attributes.kind, "llm");
+        let messages = first_llm.input.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
         assert_eq!(
-            first_llm.input,
-            Some(JsonValue::String(
-                "Hey! Please introduce yourself:\n- briefly\n- politely".to_owned()
-            ))
+            messages[0]["content"],
+            "You are a concise personal finance assistant.\nAnswer briefly."
         );
-        assert_eq!(first_llm.output, Some(JsonValue::String("Hello! I'm Eugene.".to_owned())));
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "How did NVDA do today?");
+        assert_eq!(
+            first_llm.output,
+            Some(serde_json::json!({ "role": "assistant", "content": "NVDA closed down 1.4% at $207.40." }))
+        );
         assert_eq!(first_llm.metadata.as_ref().unwrap()["model"], "gpt-4o-mini");
         assert_eq!(second_llm.metadata.as_ref().unwrap()["temperature"], 0.2);
-        assert_eq!(first_llm.metrics["tokens"], 4);
+        assert_eq!(first_llm.metrics["prompt_tokens"], 612);
+        assert_eq!(first_llm.metrics["completion_tokens"], 24);
+        assert_eq!(first_llm.metrics["tokens"], 636);
 
         for event in &events.events {
             assert_eq!(Uuid::parse_str(&event.id).unwrap().get_version_num(), 4);
@@ -363,7 +370,7 @@ mod tests {
         assert!(trace.metrics["end"].as_f64().unwrap() >= second_llm.metrics["end"].as_f64().unwrap());
 
         let json = serde_json::to_value(events).unwrap();
-        assert!(json["events"][1].get("input").is_none());
+        assert_eq!(json["events"][1]["input"], "How did NVDA do today?");
         assert_eq!(json["events"][0]["tags"], serde_json::json!(["chat", "prod"]));
     }
 

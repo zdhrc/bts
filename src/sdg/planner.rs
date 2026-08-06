@@ -1716,7 +1716,7 @@ mod tests {
             assert!((4..=11).contains(&events.len()), "unexpected trace size {}", events.len());
             let picks = events
                 .iter()
-                .filter(|event| matches!(event.name.as_str(), "search" | "fallback"))
+                .filter(|event| matches!(event.name.as_str(), "get_order_status" | "summarize_session"))
                 .count();
             assert_eq!(picks, 1);
         }

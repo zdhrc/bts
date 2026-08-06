@@ -3,26 +3,39 @@ vars {
     model = "gpt-4o-mini"
 }
 
-trace "support-conversation" {
+trace "support-sessions" {
     repeat "turns" {
         count = range(1, 4)
 
         task "turn" {
-            llm "completion" {
-                input = "message ${repeat.index}"
-                output = "reply ${repeat.index}"
-                metadata = { model = var.model }
+            input = "question ${repeat.index}"
+            output = "answer ${repeat.index}"
+
+            llm "Chat Completion" {
+                input = [
+                    { role = "system", content = "You are a support agent." },
+                    { role = "user", content = "question ${repeat.index}" },
+                ]
+                output = { role = "assistant", content = "answer ${repeat.index}" }
+                metadata = { model = var.model, provider = "openai" }
+                metrics = {
+                    prompt_tokens = 512
+                    completion_tokens = 96
+                    tokens = 608
+                }
             }
         }
     }
 
     choice {
-        tool "search" {
-            input = "lookup"
+        tool "get_order_status" {
+            input = { order_id = format("ord_{}", hex(8)) }
+            output = { status = choice("shipped", "processing", "delayed") }
         }
 
-        function "fallback" {
-            input = "noop"
+        function "summarize_session" {
+            input = { turns = range(1, 4) }
+            output = { summary = "customer asked about an order" }
         }
     }
 
@@ -30,7 +43,8 @@ trace "support-conversation" {
         chance = 0.25
 
         task "escalation" {
-            output = "escalated"
+            input = "customer requested a human agent"
+            output = "escalated to tier 2"
         }
     }
 

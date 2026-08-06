@@ -1,6 +1,9 @@
 # shared values, referenced as var.<name>
 vars {
-    assistant = "Eugene"
+    system = """
+        You are a concise personal finance assistant.
+        Answer briefly.
+        """
     meta = {
         model = "gpt-4o-mini"
         provider = "openai"
@@ -9,39 +12,62 @@ vars {
     }
 }
 
-trace "multi-turn-conversation" {
-    task "turn" {
-        llm "gpt-4o-mini" {
-            input = """
-                Hey! Please introduce yourself:
-                - briefly
-                - politely
-                """
-            output = "Hello! I'm ${var.assistant}." // interpolated per trace
+trace "support-sessions" {
+    input = [
+        { role = "user", content = "How did NVDA do today?" },
+        { role = "user", content = "And over the last year?" },
+    ]
+    output = "Up 20.4% over the past twelve months."
+
+    task "turn_0" {
+        input = "How did NVDA do today?"
+        output = "NVDA closed down 1.4% at $207.40."
+
+        llm "Chat Completion" {
+            input = [
+                { role = "system", content = var.system },
+                { role = "user", content = "How did NVDA do today?" },
+            ]
+            output = { role = "assistant", content = "NVDA closed down 1.4% at $207.40." }
 
             metadata = var.meta
 
             metrics = {
-                tokens = 4
+                prompt_tokens = 612
+                completion_tokens = 24
+                tokens = 636
+                time_to_first_token = 0.4
             }
         }
     }
 
-    task "turn" {
-        llm "gpt-4o-mini" {
-            input = "Goodbye"
-            output = "Cya!"
+    task "turn_1" {
+        input = "And over the last year?"
+        output = "Up 20.4% over the past twelve months."
+
+        llm "Chat Completion" {
+            input = [
+                { role = "system", content = var.system },
+                { role = "user", content = "How did NVDA do today?" },
+                { role = "assistant", content = "NVDA closed down 1.4% at $207.40." },
+                { role = "user", content = "And over the last year?" },
+            ]
+            output = { role = "assistant", content = "Up 20.4% over the past twelve months." }
 
             metadata = var.meta
 
             metrics = {
-                tokens = 6
+                prompt_tokens = 648
+                completion_tokens = 18
+                tokens = 666
+                time_to_first_token = 0.3
             }
         }
     }
 
     metadata = {
-        external = true
+        entrypoint = "streamlit"
+        conversation_id = uuid()
     }
     tags = ["chat", "prod"]
 }

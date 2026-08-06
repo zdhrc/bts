@@ -62,15 +62,16 @@ vars {
     model = "gpt-4o-mini"
 }
 
-trace "support-conversation" {
+trace "support-sessions" {
     repeat "turns" {
         count = range(1, 4)
 
         task "turn" {
-            llm "completion" {
-                input = "message ${repeat.index}"
-                output = "reply ${repeat.index}"
-                metadata = { model = var.model }
+            llm "Chat Completion" {
+                input = [{ role = "user", content = "question ${repeat.index}" }]
+                output = { role = "assistant", content = "answer ${repeat.index}" }
+                metadata = { model = var.model, provider = "openai" }
+                metrics = { prompt_tokens = 512, completion_tokens = 96, tokens = 608 }
             }
         }
     }
@@ -79,7 +80,7 @@ trace "support-conversation" {
         chance = 0.25
 
         task "escalation" {
-            output = "escalated"
+            output = "escalated to tier 2"
         }
     }
 

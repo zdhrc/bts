@@ -301,6 +301,14 @@ fn render_skill(spec: &Spec) -> String {
             writeln!(output).unwrap();
         }
 
+        if !block.conventions.is_empty() {
+            writeln!(output, "Conventions:").unwrap();
+            for convention in block.conventions {
+                writeln!(output, "- {convention}").unwrap();
+            }
+            writeln!(output).unwrap();
+        }
+
         render_rules(&mut output, block.rules);
     }
 
@@ -496,6 +504,9 @@ mod tests {
             for field in block.body.fields {
                 assert!(skill.contains(field.keyword));
                 assert!(skill.contains(field.summary));
+            }
+            for convention in block.conventions {
+                assert!(skill.contains(convention));
             }
         }
         for example in SPEC.examples {

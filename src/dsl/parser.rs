@@ -988,8 +988,8 @@ mod tests {
         assert_eq!(vars.decls.len(), 2);
         let trace = block(&ast.decls[1]);
         assert_eq!(trace.kind, "trace");
-        assert_eq!(trace.name.as_deref(), Some("multi-turn-conversation"));
-        assert_eq!(trace.decls.len(), 4);
+        assert_eq!(trace.name.as_deref(), Some("support-sessions"));
+        assert_eq!(trace.decls.len(), 6);
     }
 
     #[test]

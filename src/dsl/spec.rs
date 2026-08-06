@@ -120,6 +120,7 @@ pub(crate) struct BlockDesc {
     pub(crate) allowed_in: &'static [Place],
     pub(crate) body: BodyDesc,
     pub(crate) rules: &'static [RuleDesc],
+    pub(crate) conventions: &'static [&'static str],
 }
 
 impl BlockDesc {
@@ -396,6 +397,38 @@ const MAYBE_FIELDS: &[FieldDesc] = &[FieldDesc {
 }];
 
 const NO_RULES: &[RuleDesc] = &[];
+const NO_CONVENTIONS: &[&str] = &[];
+
+// conventions mirror what braintrust's own sdk wrappers emit, so generated
+// traces render in the ui like traces from real instrumentation
+const TRACE_CONVENTIONS: &[&str] = &[
+    "Name the root span after the application, session, or entrypoint (e.g. `support-sessions`), the way a top-level traced function would be named; never a prose description.",
+    "The root usually carries the user-facing exchange: the user message(s) as `input`, the final answer as `output`.",
+    "`tags` belong on the trace root, not on child spans.",
+];
+const TASK_CONVENTIONS: &[&str] = &[
+    "Name task spans like the function or pipeline step real instrumentation would trace (`turn_0`, `agent_node`, `retrieve_context`).",
+    "Input and output are free-form: typically the text or values the step consumed and produced.",
+    "Task spans usually carry no metrics; timestamps are generated.",
+];
+const LLM_CONVENTIONS: &[&str] = &[
+    "Name LLM spans the way SDK wrappers do: `Chat Completion` for OpenAI-style chat calls, `anthropic.messages.create` for Anthropic. Real instrumentation never uses the model name or an action description as the span name.",
+    "`input` is an OpenAI-format message array, system message included: `[{ role = \"system\", content = \"...\" }, { role = \"user\", content = \"...\" }]`. This is what the Braintrust UI renders as a chat transcript and what enables the Try prompt button.",
+    "`output` is an assistant message object: `{ role = \"assistant\", content = \"...\" }`.",
+    "`metadata` holds the request parameters at the top level: `model`, `provider` (e.g. `openai`, `anthropic`), and settings like `temperature`, `max_tokens`, or `tool_choice`. Use a real registered model id so Braintrust can compute cost from token counts.",
+    "`metrics` uses Braintrust's exact field names: `prompt_tokens`, `completion_tokens`, and `tokens` (their sum). These power the token and cost columns in the UI.",
+    "Optional metrics, same exact names: `prompt_cached_tokens` (cache reads) and `prompt_cache_creation_tokens` (cache writes), both already included in `prompt_tokens`; `time_to_first_token` in seconds, smaller than the span duration; `estimated_cost` to override the computed cost.",
+    "Metric values cannot reference sibling fields, so a sampled `prompt_tokens` cannot feed an exact `tokens` sum. Write token metrics as constants that sum correctly; to vary them per trace, put alternative `llm` blocks differing only in metrics inside a `choice` block.",
+];
+const TOOL_CONVENTIONS: &[&str] = &[
+    "Name tool spans exactly the tool's function name (`get_stock_performance`), never a description of what it does.",
+    "`input` is the arguments object (`{ ticker = \"NVDA\" }`); `output` is the result object.",
+    "Tool spans typically carry no metadata or metrics.",
+];
+const FUNCTION_CONVENTIONS: &[&str] = &[
+    "Name function spans after the invoked function, like tool spans.",
+    "`input` is the arguments object; `output` is the return value.",
+];
 const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
     id: ids::FINITE_NUMBERS,
     summary: "Every number must be representable as a finite integer or floating-point value.",
@@ -1026,6 +1059,7 @@ const BLOCKS: &[BlockDesc] = &[
         allowed_in: ROOT_ONLY,
         body: BodyDesc { fields: &[], open: true },
         rules: VARS_RULES,
+        conventions: NO_CONVENTIONS,
     },
     BlockDesc {
         id: ids::TRACE,
@@ -1039,6 +1073,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: NO_RULES,
+        conventions: TRACE_CONVENTIONS,
     },
     BlockDesc {
         id: ids::TASK,
@@ -1052,6 +1087,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: NO_RULES,
+        conventions: TASK_CONVENTIONS,
     },
     BlockDesc {
         id: ids::LLM,
@@ -1065,6 +1101,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: NO_RULES,
+        conventions: LLM_CONVENTIONS,
     },
     BlockDesc {
         id: ids::TOOL,
@@ -1078,6 +1115,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: NO_RULES,
+        conventions: TOOL_CONVENTIONS,
     },
     BlockDesc {
         id: ids::FUNCTION,
@@ -1091,6 +1129,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: NO_RULES,
+        conventions: FUNCTION_CONVENTIONS,
     },
     BlockDesc {
         id: ids::REPEAT,
@@ -1104,6 +1143,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: REPEAT_RULES,
+        conventions: NO_CONVENTIONS,
     },
     BlockDesc {
         id: ids::CHOICE,
@@ -1117,6 +1157,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: NO_RULES,
+        conventions: NO_CONVENTIONS,
     },
     BlockDesc {
         id: ids::MAYBE,
@@ -1130,6 +1171,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: MAYBE_RULES,
+        conventions: NO_CONVENTIONS,
     },
 ];
 
