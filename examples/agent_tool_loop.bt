@@ -1,0 +1,54 @@
+# agent loop with tool calls -- variance axes: how many rounds run and which
+# tool each round calls. each round is an independent stamp: rounds cannot see
+# each other's results, so keep per-round content self-contained.
+
+vars {
+    system = "You are an ops agent. Inspect the cluster with tools before answering."
+    meta = { model = "claude-sonnet-4-5", provider = "anthropic", max_tokens = 1024 }
+}
+
+trace "ops-agent" {
+    input = "Why is checkout-api throwing 502s?"
+    output = "checkout-api is crash-looping on a bad config value; rolling back now."
+    metadata = { run_id = uuid() }
+    tags = ["agent", "ops"]
+
+    repeat "rounds" {
+        # most runs settle in one or two rounds, with a long tail
+        count = weighted([1, 5], [2, 3], [3, 1.5], [4, 0.5])
+
+        llm "anthropic.messages.create" {
+            input = [
+                { role = "system", content = var.system },
+                { role = "user", content = "Why is checkout-api throwing 502s?" },
+            ]
+            output = { role = "assistant", content = "Let me inspect the pods and recent logs." }
+            metadata = var.meta
+            metrics = { prompt_tokens = 934, completion_tokens = 41, tokens = 975, time_to_first_token = 0.62 }
+        }
+
+        choice "tool_call" {
+            tool "get_pod_status" {
+                input = { namespace = "prod", selector = "app=checkout-api" }
+                output = { ready = choice("1/3", "2/3", "3/3"), restarts = poisson(2) }
+            }
+
+            tool "get_recent_logs" {
+                input = { service = "checkout-api", lines = 200 }
+                output = { error_count = poisson(6), sample = "upstream connect error or disconnect before headers" }
+            }
+        }
+    }
+
+    # the closing answer sits outside the loop
+    llm "anthropic.messages.create" {
+        input = [
+            { role = "system", content = var.system },
+            { role = "user", content = "Why is checkout-api throwing 502s?" },
+            { role = "assistant", content = "Tool results show crash-looping pods and config parse errors." },
+        ]
+        output = { role = "assistant", content = "checkout-api is crash-looping on a bad config value; rolling back now." }
+        metadata = var.meta
+        metrics = { prompt_tokens = 1418, completion_tokens = 58, tokens = 1476, time_to_first_token = 0.71 }
+    }
+}

@@ -1,0 +1,45 @@
+# rag pipeline -- variance axes: how many documents come back, retrieval
+# quality (hit vs miss), and extra stages (query rewrite, guardrails).
+
+vars {
+    system = "Answer using only the provided documents. Cite doc ids."
+    meta = { model = "gpt-4o-mini", provider = "openai" }
+}
+
+trace "docs-qa" {
+    input = "How do I rotate API keys?"
+    output = "Rotate keys under Settings > API; the old key stays valid for 24 hours. [doc_112]"
+    metadata = { request_id = uuid() }
+    tags = ["rag"]
+
+    tool "search_docs" {
+        input = { query = "rotate API keys", top_k = 8 }
+        output = {
+            doc_ids = ["doc_112", "doc_089", "doc_331"]
+            scores = [0.91, 0.63, 0.44]
+        }
+    }
+
+    task "rerank" {
+        input = { candidates = 3 }
+        output = { kept = ["doc_112", "doc_089"] }
+    }
+
+    llm "Chat Completion" {
+        input = [
+            { role = "system", content = var.system },
+            {
+                role = "user"
+                content = <<-CTX
+                    [doc_112] API keys: rotation and expiry
+                    [doc_089] Service accounts and scopes
+
+                    Question: How do I rotate API keys?
+                CTX
+            },
+        ]
+        output = { role = "assistant", content = "Rotate keys under Settings > API; the old key stays valid for 24 hours. [doc_112]" }
+        metadata = var.meta
+        metrics = { prompt_tokens = 883, completion_tokens = 43, tokens = 926, time_to_first_token = 0.47 }
+    }
+}

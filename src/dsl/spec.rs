@@ -184,6 +184,7 @@ pub(crate) struct RuleDesc {
 pub(crate) struct Example {
     pub(crate) id: Id,
     pub(crate) summary: &'static str,
+    pub(crate) note: &'static str,
     pub(crate) source: &'static str,
     pub(crate) valid: bool,
 }
@@ -307,8 +308,13 @@ pub(crate) mod ids {
     pub(crate) const MAYBE_CHANCE: Id = Id::new("rule.maybe-chance");
     pub(crate) const DYNAMIC_CHILDREN: Id = Id::new("rule.dynamic-children");
 
-    pub(crate) const COMPLETE_TRACE: Id = Id::new("example.complete-trace");
-    pub(crate) const DYNAMIC_TRACE: Id = Id::new("example.dynamic-trace");
+    pub(crate) const MULTI_TURN_CONVERSATION: Id = Id::new("example.multi-turn-conversation");
+    pub(crate) const AGENT_TOOL_LOOP: Id = Id::new("example.agent-tool-loop");
+    pub(crate) const SUPERVISOR_AND_SUBAGENTS: Id = Id::new("example.supervisor-and-subagents");
+    pub(crate) const FANOUT_PARALLEL_WORKERS: Id = Id::new("example.fanout-parallel-workers");
+    pub(crate) const WINDOWED_SESSION: Id = Id::new("example.windowed-session");
+    pub(crate) const RAG_PIPELINE: Id = Id::new("example.rag-pipeline");
+    pub(crate) const ERROR_AND_ESCALATION: Id = Id::new("example.error-and-escalation");
 }
 
 const ANY: ExprType = ExprType::Any;
@@ -428,6 +434,19 @@ const TOOL_CONVENTIONS: &[&str] = &[
 const FUNCTION_CONVENTIONS: &[&str] = &[
     "Name function spans after the invoked function, like tool spans.",
     "`input` is the arguments object; `output` is the return value.",
+];
+const REPEAT_CONVENTIONS: &[&str] = &[
+    "Sample `count` (`weighted`, `poisson`, `range`) so structure differs per trace; a constant count belongs only in a grouping repeat.",
+    "Every iteration stamps identical content except `${repeat.index}`, so repeat suits structurally similar steps (tool rounds, workers) — not conversation turns, which must carry history coherently.",
+    "`repeat` with `count = 1` stamps its children once and adds no span, which groups several blocks into a single `choice` alternative.",
+];
+const CHOICE_CONVENTIONS: &[&str] = &[
+    "The primary tool for varying content coherently: wrap whole alternative subtrees (a full conversation, a full tool round) so every field of the picked branch agrees.",
+    "A handful of fully authored alternatives beats one parameterized template; add alternatives to widen the pool.",
+];
+const MAYBE_CONVENTIONS: &[&str] = &[
+    "Model rare paths — errors, escalations, retries — at realistic single-digit chances.",
+    "Children are included together or not at all, so one maybe block holds a whole correlated failure; nest maybe inside choice branches to give paths different failure rates.",
 ];
 const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
     id: ids::FINITE_NUMBERS,
@@ -1143,7 +1162,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: REPEAT_RULES,
-        conventions: NO_CONVENTIONS,
+        conventions: REPEAT_CONVENTIONS,
     },
     BlockDesc {
         id: ids::CHOICE,
@@ -1157,7 +1176,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: NO_RULES,
-        conventions: NO_CONVENTIONS,
+        conventions: CHOICE_CONVENTIONS,
     },
     BlockDesc {
         id: ids::MAYBE,
@@ -1171,7 +1190,7 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: MAYBE_RULES,
-        conventions: NO_CONVENTIONS,
+        conventions: MAYBE_CONVENTIONS,
     },
 ];
 
@@ -1194,15 +1213,52 @@ const RULES: &[RuleDesc] = &[
 
 const EXAMPLES: &[Example] = &[
     Example {
-        id: ids::COMPLETE_TRACE,
-        summary: "A multi-turn trace containing task and LLM spans.",
-        source: include_str!("../../tests/fixtures/simple.bt"),
+        id: ids::MULTI_TURN_CONVERSATION,
+        summary: "A multi-turn conversation drawn from a pool of authored alternatives.",
+        note: "A starting point, not a template: widen the pool with more choice alternatives and let their lengths differ — real sessions cluster short with a long tail of long ones.",
+        source: include_str!("../../examples/multi_turn_conversation.bt"),
         valid: true,
     },
     Example {
-        id: ids::DYNAMIC_TRACE,
-        summary: "A trace whose shape varies per generation via repeat, choice, and maybe blocks.",
-        source: include_str!("../../tests/fixtures/dynamic.bt"),
+        id: ids::AGENT_TOOL_LOOP,
+        summary: "An agent loop running a sampled number of think-then-tool rounds.",
+        note: "Expand along loop iterations and the set of tools; every tool the agent could realistically call deserves an alternative in the choice.",
+        source: include_str!("../../examples/agent_tool_loop.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::SUPERVISOR_AND_SUBAGENTS,
+        summary: "A supervisor delegating to subagent task spans and synthesizing their results.",
+        note: "Expand along the number of subagents and the delegation depth — a subagent can nest task, tool, and llm spans of its own.",
+        source: include_str!("../../examples/supervisor_and_subagents.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::FANOUT_PARALLEL_WORKERS,
+        summary: "A fanout stamping a sampled number of parallel workers, then reducing.",
+        note: "Expand along fan width and worker heterogeneity; add choice alternatives so stamped workers stop being clones of each other.",
+        source: include_str!("../../examples/fanout_parallel_workers.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::WINDOWED_SESSION,
+        summary: "One window of a longer session, with earlier windows summarized into context.",
+        note: "Expand along window position and carried context: more window variants, richer summaries, sessions that reference older windows.",
+        source: include_str!("../../examples/windowed_session.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::RAG_PIPELINE,
+        summary: "A retrieve, rerank, and generate pipeline grounding an answer in documents.",
+        note: "Expand along retrieved document count, hit-versus-miss retrieval quality, and extra stages like query rewriting or guardrails.",
+        source: include_str!("../../examples/rag_pipeline.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::ERROR_AND_ESCALATION,
+        summary: "A happy path with a maybe-gated failure, retry, and human escalation.",
+        note: "Expand along failure rate and failure variety — declines, timeouts, empty outputs — keeping each correlated failure inside one maybe block.",
+        source: include_str!("../../examples/error_and_escalation.bt"),
         valid: true,
     },
 ];

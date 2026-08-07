@@ -1,0 +1,83 @@
+# supervisor delegating to subagents -- variance axes: how many subagents run
+# and how deep delegation goes (a subagent can nest task spans of its own).
+
+vars {
+    meta = { model = "gpt-4o", provider = "openai" }
+}
+
+trace "research-supervisor" {
+    input = "Compare our checkout latency to the last two releases."
+    output = "p95 latency regressed 18% in v42, traced to the new fraud check."
+    metadata = { run_id = uuid() }
+    tags = ["multi-agent"]
+
+    llm "Chat Completion" {
+        input = [
+            { role = "system", content = "You are a supervisor. Split the request into subtasks and delegate." },
+            { role = "user", content = "Compare our checkout latency to the last two releases." },
+        ]
+        output = { role = "assistant", content = "Delegating: (1) pull latency metrics, (2) diff the releases." }
+        metadata = var.meta
+        metrics = { prompt_tokens = 322, completion_tokens = 45, tokens = 367, time_to_first_token = 0.41 }
+    }
+
+    task "metrics_agent" {
+        input = "Pull p50/p95 checkout latency for v40 through v42."
+        output = "v40 p95 412ms, v41 p95 418ms, v42 p95 493ms."
+
+        llm "Chat Completion" {
+            input = [
+                { role = "system", content = "You query the metrics warehouse and report numbers plainly." },
+                { role = "user", content = "Pull p50/p95 checkout latency for v40 through v42." },
+            ]
+            output = { role = "assistant", content = "v40 p95 412ms, v41 p95 418ms, v42 p95 493ms." }
+            metadata = var.meta
+            metrics = { prompt_tokens = 288, completion_tokens = 39, tokens = 327, time_to_first_token = 0.38 }
+        }
+    }
+
+    task "diff_agent" {
+        input = "Diff v41..v42 for checkout-path changes."
+        output = "A synchronous fraud check was added to the checkout path in v42."
+
+        llm "Chat Completion" {
+            input = [
+                { role = "system", content = "You read release diffs and summarize behavioral changes." },
+                { role = "user", content = "Diff v41..v42 for checkout-path changes." },
+            ]
+            output = { role = "assistant", content = "A synchronous fraud check was added to the checkout path in v42." }
+            metadata = var.meta
+            metrics = { prompt_tokens = 301, completion_tokens = 33, tokens = 334, time_to_first_token = 0.44 }
+        }
+    }
+
+    # a third specialist joins only for some runs
+    maybe {
+        chance = 0.4
+
+        task "profiler_agent" {
+            input = "Profile the fraud check under load."
+            output = "The fraud check adds 70-90ms per call at p95."
+
+            llm "Chat Completion" {
+                input = [
+                    { role = "system", content = "You run profiles and report hot paths." },
+                    { role = "user", content = "Profile the fraud check under load." },
+                ]
+                output = { role = "assistant", content = "The fraud check adds 70-90ms per call at p95." }
+                metadata = var.meta
+                metrics = { prompt_tokens = 296, completion_tokens = 31, tokens = 327, time_to_first_token = 0.4 }
+            }
+        }
+    }
+
+    llm "Chat Completion" {
+        input = [
+            { role = "system", content = "You are a supervisor. Synthesize your subagents' findings." },
+            { role = "user", content = "Metrics: v42 p95 493ms vs 418ms. Diff: new synchronous fraud check." },
+        ]
+        output = { role = "assistant", content = "p95 latency regressed 18% in v42, traced to the new fraud check." }
+        metadata = var.meta
+        metrics = { prompt_tokens = 402, completion_tokens = 36, tokens = 438, time_to_first_token = 0.43 }
+    }
+}

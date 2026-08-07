@@ -1,0 +1,48 @@
+# error and escalation paths -- variance axis: failure rate. real populations
+# fail a few percent of the time; maybe gates the whole correlated failure, so
+# the error and the escalation land together or not at all.
+
+vars {
+    meta = { model = "gpt-4o-mini", provider = "openai" }
+}
+
+trace "payments-agent" {
+    input = "Charge the June invoice for acct_9W31."
+    output = "Charged $1,240.00 against the card on file."
+    metadata = { run_id = uuid() }
+    # tags are static per shape: they cannot follow the maybe branch, so tag
+    # the population, not the outcome
+    tags = ["payments"]
+
+    llm "Chat Completion" {
+        input = [
+            { role = "system", content = "You are a payments agent. Confirm the invoice before charging." },
+            { role = "user", content = "Charge the June invoice for acct_9W31." },
+        ]
+        output = { role = "assistant", content = "June invoice is $1,240.00; charging the card on file." }
+        metadata = var.meta
+        metrics = { prompt_tokens = 356, completion_tokens = 29, tokens = 385, time_to_first_token = 0.32 }
+    }
+
+    # 7% of traces show a failed first attempt and a human escalation before
+    # the charge finally succeeds
+    maybe "failure" {
+        chance = 0.07
+
+        tool "charge_customer" {
+            input = { account = "acct_9W31", amount_usd = 1240.0 }
+            output = null
+            error = "card_declined: insufficient_funds"
+        }
+
+        task "escalate_to_human" {
+            input = "charge declined; needs manual review before retry"
+            output = "ticket PAY-4411 approved a retry against the backup card"
+        }
+    }
+
+    tool "charge_customer" {
+        input = { account = "acct_9W31", amount_usd = 1240.0 }
+        output = { status = "succeeded", charge_id = format("ch_{}", alphanum(14)) }
+    }
+}

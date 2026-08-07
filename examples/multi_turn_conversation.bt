@@ -1,0 +1,95 @@
+# multi-turn conversation -- variance axes: which conversation runs and how
+# many turns it has. length comes from authoring alternatives of different
+# lengths, not from stamping a template turn.
+
+vars {
+    system = """
+        You are a support assistant for a billing product.
+        Be concise; cite the relevant policy when you refuse.
+        """
+    meta = { model = "gpt-4o-mini", provider = "openai", temperature = 0.3 }
+}
+
+trace "billing-support" {
+    # root input/output are omitted: they are fixed per shape, so they cannot
+    # follow whichever conversation the choice picks
+    metadata = { conversation_id = uuid(), entrypoint = "web-chat" }
+    tags = ["support", "billing"]
+
+    # add alternatives to widen the pool; each one is a complete conversation
+    choice "conversation" {
+        # one-turn conversation: quick answer, user leaves
+        task "turn_0" {
+            input = "Can I get invoices with our VAT number on them?"
+            output = "Yes -- add it under Billing Settings > Tax IDs and future invoices will include it."
+
+            llm "Chat Completion" {
+                input = [
+                    { role = "system", content = var.system },
+                    { role = "user", content = "Can I get invoices with our VAT number on them?" },
+                ]
+                output = { role = "assistant", content = "Yes -- add it under Billing Settings > Tax IDs and future invoices will include it." }
+                metadata = var.meta
+                metrics = { prompt_tokens = 412, completion_tokens = 37, tokens = 449, time_to_first_token = 0.34 }
+            }
+        }
+
+        # three-turn conversation: a repeat with count = 1 stamps its children
+        # once and adds no span, so it groups the turns into one alternative
+        repeat "refund_dispute" {
+            count = 1
+
+            task "turn_0" {
+                input = "I was charged twice this month."
+                output = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added."
+
+                llm "Chat Completion" {
+                    input = [
+                        { role = "system", content = var.system },
+                        { role = "user", content = "I was charged twice this month." },
+                    ]
+                    output = { role = "assistant", content = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added." }
+                    metadata = var.meta
+                    metrics = { prompt_tokens = 401, completion_tokens = 52, tokens = 453, time_to_first_token = 0.29 }
+                }
+            }
+
+            task "turn_1" {
+                input = "We didn't add any seats."
+                output = "The seat was added by jordan@ on the 4th; I can remove it and refund the difference."
+
+                llm "Chat Completion" {
+                    # later turns carry the authored history forward by hand
+                    input = [
+                        { role = "system", content = var.system },
+                        { role = "user", content = "I was charged twice this month." },
+                        { role = "assistant", content = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added." },
+                        { role = "user", content = "We didn't add any seats." },
+                    ]
+                    output = { role = "assistant", content = "The seat was added by jordan@ on the 4th; I can remove it and refund the difference." }
+                    metadata = var.meta
+                    metrics = { prompt_tokens = 476, completion_tokens = 61, tokens = 537, time_to_first_token = 0.31 }
+                }
+            }
+
+            task "turn_2" {
+                input = "Yes, please refund it."
+                output = "Done -- the refund lands in 3-5 business days."
+
+                llm "Chat Completion" {
+                    input = [
+                        { role = "system", content = var.system },
+                        { role = "user", content = "I was charged twice this month." },
+                        { role = "assistant", content = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added." },
+                        { role = "user", content = "We didn't add any seats." },
+                        { role = "assistant", content = "The seat was added by jordan@ on the 4th; I can remove it and refund the difference." },
+                        { role = "user", content = "Yes, please refund it." },
+                    ]
+                    output = { role = "assistant", content = "Done -- the refund lands in 3-5 business days." }
+                    metadata = var.meta
+                    metrics = { prompt_tokens = 549, completion_tokens = 24, tokens = 573, time_to_first_token = 0.27 }
+                }
+            }
+        }
+    }
+}

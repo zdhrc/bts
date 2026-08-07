@@ -1,0 +1,52 @@
+# windowed session -- one trace is one window of a longer conversation.
+# variance axes: window position and how much carried context the summary
+# holds. real instrumentation ties windows together with a shared session id.
+
+vars {
+    system = "You are a coding copilot. Prior context arrives as a summary message."
+    meta = { model = "gpt-4o-mini", provider = "openai" }
+}
+
+trace "copilot-window" {
+    # each generated trace gets its own session id; in a real population,
+    # several windows would share one
+    metadata = { session_id = format("sess_{}", hex(10)) }
+    tags = ["copilot"]
+
+    choice "window_position" {
+        # opening window: no carried context yet
+        task "turn" {
+            input = "Why does my worker pool deadlock on shutdown?"
+            output = "Your workers block on the results channel; close it before joining."
+            metadata = { window = 0 }
+
+            llm "Chat Completion" {
+                input = [
+                    { role = "system", content = var.system },
+                    { role = "user", content = "Why does my worker pool deadlock on shutdown?" },
+                ]
+                output = { role = "assistant", content = "Your workers block on the results channel; close it before joining." }
+                metadata = var.meta
+                metrics = { prompt_tokens = 364, completion_tokens = 41, tokens = 405, time_to_first_token = 0.36 }
+            }
+        }
+
+        # later window: earlier windows ride in as a summary message
+        task "turn" {
+            input = "Now the shutdown races with the metrics flush."
+            output = "Flush from the same goroutine that closes the channel, after the join."
+            metadata = { window = 3 }
+
+            llm "Chat Completion" {
+                input = [
+                    { role = "system", content = var.system },
+                    { role = "system", content = "Summary of windows 0-2: user is fixing a worker-pool deadlock; channel close was moved before join; a data race in shutdown remains." },
+                    { role = "user", content = "Now the shutdown races with the metrics flush." },
+                ]
+                output = { role = "assistant", content = "Flush from the same goroutine that closes the channel, after the join." }
+                metadata = var.meta
+                metrics = { prompt_tokens = 512, completion_tokens = 38, tokens = 550, time_to_first_token = 0.42 }
+            }
+        }
+    }
+}

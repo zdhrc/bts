@@ -1,0 +1,60 @@
+# fanout over parallel workers -- variance axes: fan width and worker
+# heterogeneity. a choice inside the repeat gives each stamped worker its own
+# coherent authored content. generated timestamps are sequential slots, so the
+# fanout is structural: workers read as siblings, not as temporally
+# overlapping spans.
+
+vars {
+    system = "Summarize the incident report in one sentence."
+    meta = { model = "gpt-4o-mini", provider = "openai" }
+}
+
+trace "incident-digest" {
+    input = "Summarize last week's incident reports."
+    output = "7 incidents, 2 sev-1s; the common cause was connection pool exhaustion."
+    metadata = { batch_id = format("batch_{}", hex(8)) }
+    tags = ["batch"]
+
+    repeat "workers" {
+        count = range(2, 6)
+
+        # each stamp picks one worker variant; repeat.index labels the shard
+        # but never stands in for content
+        choice "worker" {
+            task "summarize_report" {
+                input = { report_id = "inc_${repeat.index}" }
+                output = { summary = "connection pool exhausted during peak traffic" }
+
+                llm "Chat Completion" {
+                    input = [
+                        { role = "system", content = var.system },
+                        { role = "user", content = "Sev-1: checkout errors spiked at 09:14; db connections pinned at max until the pool was resized." },
+                    ]
+                    output = { role = "assistant", content = "connection pool exhausted during peak traffic" }
+                    metadata = var.meta
+                    metrics = { prompt_tokens = 641, completion_tokens = 24, tokens = 665, time_to_first_token = 0.33 }
+                }
+            }
+
+            task "summarize_report" {
+                input = { report_id = "inc_${repeat.index}" }
+                output = { summary = "retry storm after the tuesday deploy" }
+
+                llm "Chat Completion" {
+                    input = [
+                        { role = "system", content = var.system },
+                        { role = "user", content = "Sev-2: 5xx rate climbed after the 14:00 deploy; clients retried aggressively and amplified the load." },
+                    ]
+                    output = { role = "assistant", content = "retry storm after the tuesday deploy" }
+                    metadata = var.meta
+                    metrics = { prompt_tokens = 588, completion_tokens = 21, tokens = 609, time_to_first_token = 0.29 }
+                }
+            }
+        }
+    }
+
+    task "reduce" {
+        input = "merge worker summaries"
+        output = "7 incidents, 2 sev-1s; the common cause was connection pool exhaustion."
+    }
+}

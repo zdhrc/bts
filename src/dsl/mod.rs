@@ -34,6 +34,14 @@ mod tests {
     }
 
     #[test]
+    fn compiles_every_spec_example() {
+        for example in spec::SPEC.examples {
+            let result = compile(example.source);
+            assert_eq!(result.is_ok(), example.valid, "example {}", example.id.as_str());
+        }
+    }
+
+    #[test]
     fn returns_diagnostics_from_the_first_failing_phase() {
         let diags = match compile("trace \"unterminated") {
             Ok(_) => panic!("expected lexing diagnostics"),
