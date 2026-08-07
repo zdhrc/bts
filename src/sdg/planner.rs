@@ -10,6 +10,11 @@ use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::fmt;
 use std::ops::Range;
+use std::sync::LazyLock;
+use tiktoken_rs::CoreBPE;
+
+// building the encoder parses the embedded vocab, do it once
+static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expect("the embedded vocab parses"));
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct Plan {
@@ -486,6 +491,14 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
                 _ => unreachable!("modeler validated the target as a string or array"),
             };
             ModelValue::Num(ModelNumber::Int(length as i64))
+        }
+        ModelFunc::Tokens { value } => {
+            // containers count their compact json serialization
+            let text = match lower_value(*value, ctx)? {
+                JsonValue::String(text) => text,
+                value => value.to_string(),
+            };
+            ModelValue::Num(ModelNumber::Int(BPE.encode_ordinary(&text).len() as i64))
         }
         ModelFunc::Format { template, args } => {
             let mut pieces = template.split("{}");
@@ -1179,6 +1192,30 @@ mod tests {
                 .clone()
             )
         );
+    }
+
+    #[test]
+    fn evaluates_token_counts() {
+        let model = compile(
+            r#"
+                trace "t" {
+                    metrics = {
+                        text = tokens("What is the weather in Tokyo?")
+                        empty = tokens("")
+                        messages = tokens([{ role = "user", content = "hi" }])
+                    }
+                }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 0).unwrap();
+
+        let metrics = plan.events[0].fields.metrics.as_ref().unwrap();
+        assert_eq!(metrics["text"], JsonValue::from(7));
+        assert_eq!(metrics["empty"], JsonValue::from(0));
+        // containers count their compact json serialization
+        let serialized = r#"[{"content":"hi","role":"user"}]"#;
+        assert_eq!(metrics["messages"], JsonValue::from(BPE.encode_ordinary(serialized).len()));
     }
 
     #[test]

@@ -2100,6 +2100,18 @@ impl Modeler {
                 let target = Box::new(self.model_value(target)?);
                 Some(Func::Len { target })
             }
+            "tokens" => {
+                let [value] = self.func_args(func, args, "exactly one argument", range)?;
+                if !matches!(
+                    static_type(&value),
+                    Some(StaticType::String | StaticType::Array | StaticType::Object)
+                ) {
+                    self.push_func_arg_type(&value, func, "string, array, or object");
+                    return None;
+                }
+                let value = Box::new(self.model_value(value)?);
+                Some(Func::Tokens { value })
+            }
             "format" => self.model_format(args, range),
 
             "clamp" => {
@@ -2693,8 +2705,8 @@ fn static_type(expr: &ast::Expr) -> Option<StaticType> {
             (then == otherwise).then_some(then)
         }
         ast::ExprKind::Func { name, args } => match name.as_str() {
-            "range" | "normal" | "lognormal" | "exponential" | "pareto" | "beta" | "poisson" | "len" | "clamp" | "round"
-            | "floor" | "ceil" | "abs" | "min" | "max" => Some(StaticType::Number),
+            "range" | "normal" | "lognormal" | "exponential" | "pareto" | "beta" | "poisson" | "len" | "tokens" | "clamp"
+            | "round" | "floor" | "ceil" | "abs" | "min" | "max" => Some(StaticType::Number),
             "chance" | "contains" | "starts_with" | "ends_with" => Some(StaticType::Boolean),
             "upper" | "lower" | "trim" | "replace" | "join" | "format" | "uuid" | "hex" | "alphanum" => {
                 Some(StaticType::String)
@@ -4200,6 +4212,7 @@ mod tests {
             (r#"trace "t" { input = join("a", ",") }"#, "join"),
             (r#"trace "t" { input = contains(1, "x") }"#, "contains"),
             (r#"trace "t" { input = len(true) }"#, "len"),
+            (r#"trace "t" { input = tokens(1) }"#, "tokens"),
             (r#"trace "t" { input = starts_with("a", 1) }"#, "starts_with"),
             (r#"trace "t" { input = upper(choice("a", 1)) }"#, "upper"),
         ] {

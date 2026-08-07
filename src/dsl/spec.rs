@@ -253,6 +253,7 @@ pub(crate) mod ids {
     pub(crate) const FUNC_STARTS_WITH: Id = Id::new("func.starts_with");
     pub(crate) const FUNC_ENDS_WITH: Id = Id::new("func.ends_with");
     pub(crate) const FUNC_LEN: Id = Id::new("func.len");
+    pub(crate) const FUNC_TOKENS: Id = Id::new("func.tokens");
     pub(crate) const FUNC_FORMAT: Id = Id::new("func.format");
     pub(crate) const FUNC_CLAMP: Id = Id::new("func.clamp");
     pub(crate) const FUNC_ROUND: Id = Id::new("func.round");
@@ -957,6 +958,14 @@ const FUNCS: &[FuncDesc] = &[
         syntax: "len(value)",
         summary: "The number of characters in a string or elements in an array, as an integer, for each generated trace.",
         examples: &["len(var.models)", "len(\"hello\")"],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_TOKENS,
+        name: "tokens",
+        syntax: "tokens(value)",
+        summary: "The exact number of tokens in a string, or in the JSON serialization of an array or object, as an integer, for each generated trace. Counts with the o200k_base encoding used by current OpenAI models.",
+        examples: &["tokens(\"What is the weather in Tokyo?\")", "tokens(var.prompt)"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
