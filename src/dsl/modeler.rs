@@ -1,12 +1,12 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Array, Child, Choice, CtxRef, Func, Maybe, Model, Number, Object, ObjectField, Part, Range, Repeat, Span, SpanFields,
-    SpanKind, Template, Trace, Value, WeightedOption,
+    Array, Binding, Child, Choice, CtxRef, Func, Maybe, Model, Number, Object, ObjectField, Part, Range, Repeat, Span,
+    SpanFields, SpanKind, Template, Trace, Value, WeightedOption,
 };
 use crate::dsl::spec;
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet},
     fmt,
 };
 
@@ -45,7 +45,8 @@ impl ExprType {
             | ast::ExprKind::Binary { .. }
             | ast::ExprKind::Cond { .. }
             | ast::ExprKind::Index { .. }
-            | ast::ExprKind::Slice { .. } => Self::Abstract,
+            | ast::ExprKind::Slice { .. }
+            | ast::ExprKind::Bound { .. } => Self::Abstract,
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
             ast::ExprKind::LoopRef(_) => unreachable!("loop references are substituted before type checks"),
             ast::ExprKind::Spread(_) => unreachable!("spreads are spliced before type checks"),
@@ -69,9 +70,20 @@ impl fmt::Display for ExprType {
     }
 }
 
+// a resolved and folded var definition; constant values substitute at each
+// reference, dynamic ones become scope bindings referenced by name
+#[derive(Debug, Clone)]
+struct VarDef {
+    value: ast::Expr,
+    constant: bool,
+}
+
 pub(super) struct Modeler {
     ast: ast::Ast,
-    vars: HashMap<String, ast::Expr>,
+    // none = the definition was invalid and already diagnosed
+    vars: HashMap<String, Option<VarDef>>,
+    // names visible at the decl being lowered, one frame per enclosing block
+    scopes: Vec<Vec<String>>,
     errors: Errors,
     // how many repeat blocks enclose the decl being lowered, gates repeat.index
     repeat_depth: usize,
@@ -82,6 +94,7 @@ impl Modeler {
         Self {
             ast,
             vars: HashMap::new(),
+            scopes: Vec::new(),
             errors: Vec::new(),
             repeat_depth: 0,
         }
@@ -91,15 +104,13 @@ impl Modeler {
         let mut traces = Vec::new();
 
         // collect vars first so refs work no matter the decl order
-        let mut rest = Vec::with_capacity(self.ast.decls.len());
-        for decl in std::mem::take(&mut self.ast.decls) {
-            match decl {
-                ast::Decl::Block(block) if spec::SPEC.block(&block.kind).is_some_and(|desc| desc.id == spec::ids::VARS) => {
-                    self.collect_vars(block);
-                }
-                decl => rest.push(decl),
-            }
+        let (vars_blocks, rest) = split_vars(std::mem::take(&mut self.ast.decls));
+        let mut names = Vec::new();
+        let mut bindings = Vec::new();
+        for block in vars_blocks {
+            self.collect_vars(block, &mut names, &mut bindings);
         }
+        self.scopes.push(names);
 
         for decl in rest {
             match decl {
@@ -146,7 +157,7 @@ impl Modeler {
         }
 
         if self.errors.is_empty() {
-            Ok(Model { traces })
+            Ok(Model { traces, bindings })
         } else {
             Err(self.errors)
         }
@@ -155,16 +166,35 @@ impl Modeler {
     fn model_trace(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Trace> {
         let ast::Block { name, decls, range, .. } = block;
         let name = self.model_name(name, range, desc);
+        let (decls, bindings) = self.enter_scope(decls);
         let (fields, blocks) = self.model_body(decls, desc, range);
         let children = blocks
             .into_iter()
             .filter_map(|block| self.model_child(block, desc.id))
             .collect();
+        self.scopes.pop();
 
-        name.map(|name| Trace { name, fields, children })
+        name.map(|name| Trace {
+            name,
+            fields,
+            bindings,
+            children,
+        })
     }
 
-    fn collect_vars(&mut self, block: ast::Block) {
+    // collects a block's vars and pushes their scope frame; the caller pops it
+    fn enter_scope(&mut self, decls: Vec<ast::Decl>) -> (Vec<ast::Decl>, Vec<Binding>) {
+        let (vars_blocks, rest) = split_vars(decls);
+        let mut names = Vec::new();
+        let mut bindings = Vec::new();
+        for block in vars_blocks {
+            self.collect_vars(block, &mut names, &mut bindings);
+        }
+        self.scopes.push(names);
+        (rest, bindings)
+    }
+
+    fn collect_vars(&mut self, block: ast::Block, names: &mut Vec<String>, bindings: &mut Vec<Binding>) {
         let desc = spec::SPEC
             .block_by_id(spec::ids::VARS)
             .expect("the spec describes the vars block");
@@ -185,30 +215,45 @@ impl Modeler {
                     self.errors.push(Error::new(error, inner.range));
                 }
                 ast::Decl::Attr(attr) => {
-                    if expr_references_vars(&attr.value) {
+                    if self.vars.contains_key(&attr.key) {
                         self.errors.push(Error::new(
-                            ErrorKind::VarInVar {
-                                rule: spec::ids::STATIC_VARS,
+                            ErrorKind::DuplicateVar {
+                                rule: spec::ids::UNIQUE_VARS,
                                 name: attr.key,
                             },
                             attr.range,
                         ));
-                    } else {
-                        match self.vars.entry(attr.key) {
-                            Entry::Occupied(entry) => {
-                                self.errors.push(Error::new(
-                                    ErrorKind::DuplicateVar {
-                                        rule: spec::ids::UNIQUE_VARS,
-                                        name: entry.key().clone(),
-                                    },
-                                    attr.range,
-                                ));
-                            }
-                            Entry::Vacant(entry) => {
-                                entry.insert(attr.value);
-                            }
-                        }
+                        continue;
                     }
+
+                    // the value resolves against the enclosing scopes only: the
+                    // frame for the block being entered is not pushed yet, so
+                    // same-scope references diagnose as not in scope
+                    let def = self
+                        .resolve_expr(attr.value)
+                        .and_then(|value| self.fold_expr(value))
+                        .map(|value| VarDef {
+                            constant: expr_is_constant(&value),
+                            value,
+                        });
+
+                    // dynamic defs lower once here; references share the binding
+                    let def = match def {
+                        Some(def) if !def.constant => match self.model_value(def.value.clone()) {
+                            Some(value) => {
+                                bindings.push(Binding {
+                                    name: attr.key.clone(),
+                                    value,
+                                });
+                                Some(def)
+                            }
+                            None => None,
+                        },
+                        def => def,
+                    };
+
+                    names.push(attr.key.clone());
+                    self.vars.insert(attr.key, def);
                 }
             }
         }
@@ -218,8 +263,19 @@ impl Modeler {
     fn resolve_expr(&mut self, expr: ast::Expr) -> Option<ast::Expr> {
         let ast::Expr { kind, range } = expr;
         let kind = match kind {
-            // use-site range wins so diags point at the ref, not the definition
-            ast::ExprKind::VarRef(name) => self.lookup_var(name, range)?.kind,
+            // use-site range wins so diags point at the ref, not the definition;
+            // constant defs substitute, dynamic ones stay a reference to the binding
+            ast::ExprKind::VarRef(name) => {
+                let def = self.lookup_var(name.clone(), range)?;
+                if def.constant {
+                    def.value.kind
+                } else {
+                    ast::ExprKind::Bound {
+                        name,
+                        expr: Box::new(def.value),
+                    }
+                }
+            }
             ast::ExprKind::Template(parts) => ast::ExprKind::Template(self.resolve_template_parts(parts)?),
             ast::ExprKind::Array(values) => {
                 let mut resolved = Vec::with_capacity(values.len());
@@ -357,34 +413,52 @@ impl Modeler {
             match part {
                 ast::TemplatePart::Ref { path, range } if path.len() == 2 && path[0] == "var" => {
                     let name = path.into_iter().nth(1).expect("path has two segments");
-                    let Some(value) = self.lookup_var(name.clone(), range) else {
+                    let Some(def) = self.lookup_var(name.clone(), range) else {
                         valid = false;
                         continue;
                     };
 
-                    // constant exprs interpolate as their folded literal
-                    let Some(value) = self.fold_expr(value) else {
-                        valid = false;
-                        continue;
-                    };
-
-                    match value.kind {
-                        ast::ExprKind::Str(text) => resolved.push(ast::TemplatePart::Lit(text)),
-                        ast::ExprKind::Num(raw) => resolved.push(ast::TemplatePart::Lit(raw)),
-                        ast::ExprKind::Bool(value) => {
-                            resolved.push(ast::TemplatePart::Lit(if value { "true" } else { "false" }.to_owned()));
+                    if def.constant {
+                        // constant defs interpolate as their folded literal
+                        match def.value.kind {
+                            ast::ExprKind::Str(text) => resolved.push(ast::TemplatePart::Lit(text)),
+                            ast::ExprKind::Num(raw) => resolved.push(ast::TemplatePart::Lit(raw)),
+                            ast::ExprKind::Bool(value) => {
+                                resolved.push(ast::TemplatePart::Lit(if value { "true" } else { "false" }.to_owned()));
+                            }
+                            // a var thats itself a template splices inline
+                            ast::ExprKind::Template(parts) => resolved.extend(parts),
+                            _ => {
+                                self.errors.push(Error::new(
+                                    ErrorKind::NonScalarInterpolation {
+                                        rule: spec::ids::SCALAR_INTERPOLATION,
+                                        name,
+                                    },
+                                    range,
+                                ));
+                                valid = false;
+                            }
                         }
-                        // a var thats itself a template splices inline
-                        ast::ExprKind::Template(parts) => resolved.extend(parts),
-                        _ => {
-                            self.errors.push(Error::new(
-                                ErrorKind::NonScalarInterpolation {
-                                    rule: spec::ids::SCALAR_INTERPOLATION,
-                                    name,
-                                },
-                                range,
-                            ));
-                            valid = false;
+                    } else {
+                        // dynamic defs resolve per scope instantiation; the part
+                        // survives for model_template to lower to a binding ref
+                        match static_type(&def.value) {
+                            Some(StaticType::String | StaticType::Number | StaticType::Boolean) => {
+                                resolved.push(ast::TemplatePart::Ref {
+                                    path: vec!["var".to_owned(), name],
+                                    range,
+                                });
+                            }
+                            _ => {
+                                self.errors.push(Error::new(
+                                    ErrorKind::NonScalarInterpolation {
+                                        rule: spec::ids::SCALAR_INTERPOLATION,
+                                        name,
+                                    },
+                                    range,
+                                ));
+                                valid = false;
+                            }
                         }
                     }
                 }
@@ -699,6 +773,38 @@ impl Modeler {
 
     fn fold_array_spread(&mut self, operand: ast::Expr) -> Option<Vec<ast::Expr>> {
         let operand = self.fold_expr(operand)?;
+
+        // a dynamic var splices as accessors into the one evaluated binding
+        if matches!(operand.kind, ast::ExprKind::Bound { .. }) {
+            if let ast::ExprKind::Array(values) = &unwrap_bound(&operand).kind {
+                let ranges: Vec<SrcRange> = values.iter().map(|value| value.range).collect();
+                return Some(
+                    ranges
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, range)| {
+                            ast::Expr::new(
+                                ast::ExprKind::Index {
+                                    target: Box::new(operand.clone()),
+                                    index: Box::new(ast::Expr::new(ast::ExprKind::Num(index.to_string()), range)),
+                                },
+                                range,
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            self.errors.push(Error::new(
+                ErrorKind::SpreadTypeMismatch {
+                    rule: spec::ids::SPREAD_OPERANDS,
+                    expected: "array",
+                    found: ExprType::of(&operand),
+                },
+                operand.range,
+            ));
+            return None;
+        }
+
         match operand.kind {
             ast::ExprKind::Array(values) => Some(values),
             kind => {
@@ -718,6 +824,44 @@ impl Modeler {
 
     fn fold_object_spread(&mut self, operand: ast::Expr) -> Option<Vec<ast::Attr>> {
         let operand = self.fold_expr(operand)?;
+
+        // a dynamic var splices as accessors into the one evaluated binding
+        if matches!(operand.kind, ast::ExprKind::Bound { .. }) {
+            if let ast::ExprKind::Object(items) = &unwrap_bound(&operand).kind {
+                let keys: Vec<(String, SrcRange)> = items
+                    .iter()
+                    .map(|item| match item {
+                        ast::ObjectItem::Attr(attr) => (attr.key.clone(), attr.range),
+                        ast::ObjectItem::Spread(_) => unreachable!("folded objects only hold attrs"),
+                    })
+                    .collect();
+                return Some(
+                    keys.into_iter()
+                        .map(|(key, range)| ast::Attr {
+                            value: ast::Expr::new(
+                                ast::ExprKind::Index {
+                                    target: Box::new(operand.clone()),
+                                    index: Box::new(ast::Expr::new(ast::ExprKind::Str(key.clone()), range)),
+                                },
+                                range,
+                            ),
+                            key,
+                            range,
+                        })
+                        .collect(),
+                );
+            }
+            self.errors.push(Error::new(
+                ErrorKind::SpreadTypeMismatch {
+                    rule: spec::ids::SPREAD_OPERANDS,
+                    expected: "object",
+                    found: ExprType::of(&operand),
+                },
+                operand.range,
+            ));
+            return None;
+        }
+
         match operand.kind {
             ast::ExprKind::Object(items) => Some(
                 items
@@ -960,6 +1104,71 @@ impl Modeler {
                     map
                 })
                 .collect(),
+            // a dynamic var iterates by its definition's shape; bindings access
+            // the one evaluated value by position instead of re-evaluating it
+            ast::ExprKind::Bound { name, expr } => {
+                let bound = ast::Expr::new(ast::ExprKind::Bound { name, expr }, collection.range);
+                let accessor = |index: ast::ExprKind, range| {
+                    ast::Expr::new(
+                        ast::ExprKind::Index {
+                            target: Box::new(bound.clone()),
+                            index: Box::new(ast::Expr::new(index, range)),
+                        },
+                        range,
+                    )
+                };
+
+                match &unwrap_bound(&bound).kind {
+                    ast::ExprKind::Array(values) => {
+                        let ranges: Vec<SrcRange> = values.iter().map(|value| value.range).collect();
+                        ranges
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, range)| {
+                                let mut map = HashMap::new();
+                                let element = accessor(ast::ExprKind::Num(index.to_string()), range);
+                                if bindings.len() == 2 {
+                                    let index = ast::Expr::new(ast::ExprKind::Num(index.to_string()), range);
+                                    map.insert(bindings[0].clone(), index);
+                                    map.insert(bindings[1].clone(), element);
+                                } else {
+                                    map.insert(bindings[0].clone(), element);
+                                }
+                                map
+                            })
+                            .collect()
+                    }
+                    ast::ExprKind::Object(items) => {
+                        let keys: Vec<(String, SrcRange)> = items
+                            .iter()
+                            .map(|item| match item {
+                                ast::ObjectItem::Attr(attr) => (attr.key.clone(), attr.range),
+                                ast::ObjectItem::Spread(_) => unreachable!("folded objects only hold attrs"),
+                            })
+                            .collect();
+                        keys.into_iter()
+                            .map(|(key, range)| {
+                                let mut map = HashMap::new();
+                                map.insert(bindings[0].clone(), ast::Expr::new(ast::ExprKind::Str(key.clone()), range));
+                                if bindings.len() == 2 {
+                                    map.insert(bindings[1].clone(), accessor(ast::ExprKind::Str(key), range));
+                                }
+                                map
+                            })
+                            .collect()
+                    }
+                    _ => {
+                        self.errors.push(Error::new(
+                            ErrorKind::ForCollectionMismatch {
+                                rule: spec::ids::FOR_COLLECTIONS,
+                                found: ExprType::of(&bound),
+                            },
+                            collection.range,
+                        ));
+                        return None;
+                    }
+                }
+            }
             kind => {
                 let collection = ast::Expr::new(kind, collection.range);
                 self.errors.push(Error::new(
@@ -1328,9 +1537,23 @@ impl Modeler {
         }
     }
 
-    fn lookup_var(&mut self, name: String, range: SrcRange) -> Option<ast::Expr> {
+    // none = unknown, out of scope, or an invalid definition; all diagnosed
+    fn lookup_var(&mut self, name: String, range: SrcRange) -> Option<VarDef> {
         match self.vars.get(&name) {
-            Some(value) => Some(value.clone()),
+            Some(def) => {
+                if self.scopes.iter().any(|frame| frame.contains(&name)) {
+                    def.clone()
+                } else {
+                    self.errors.push(Error::new(
+                        ErrorKind::VarNotInScope {
+                            rule: spec::ids::VISIBLE_VARS,
+                            name,
+                        },
+                        range,
+                    ));
+                    None
+                }
+            }
             None => {
                 self.errors.push(Error::new(
                     ErrorKind::UnknownVariable {
@@ -1405,16 +1628,19 @@ impl Modeler {
             unreachable!("block {} does not have a model lowering", desc.id.as_str());
         };
 
+        let (decls, bindings) = self.enter_scope(decls);
         let (fields, blocks) = self.model_body(decls, desc, range);
         let children = blocks
             .into_iter()
             .filter_map(|block| self.model_child(block, desc.id))
             .collect();
+        self.scopes.pop();
 
         name.map(|name| Span {
             name,
             kind: span_kind,
             fields,
+            bindings,
             children,
         })
     }
@@ -1426,10 +1652,24 @@ impl Modeler {
         desc: &spec::BlockDesc,
         range: SrcRange,
     ) -> Option<Repeat> {
+        // the block's vars collect first but their frame opens after count
+        // models: count is drawn once in the parent scope, while the vars
+        // re-evaluate per iteration, so count referencing them is out of scope
+        let (vars_blocks, decls) = split_vars(decls);
+        let mut names = Vec::new();
+        let mut bindings = Vec::new();
+        self.repeat_depth += 1;
+        for block in vars_blocks {
+            self.collect_vars(block, &mut names, &mut bindings);
+        }
+        self.repeat_depth -= 1;
+
         let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
 
         self.repeat_depth += 1;
+        self.scopes.push(names);
         let children = self.model_dynamic_children(blocks, desc, range);
+        self.scopes.pop();
         self.repeat_depth -= 1;
 
         let (count, count_range) = fields.remove(&spec::ids::COUNT)?;
@@ -1467,6 +1707,7 @@ impl Modeler {
             name,
             count,
             count_range,
+            bindings,
             children,
         })
     }
@@ -1478,10 +1719,16 @@ impl Modeler {
         desc: &spec::BlockDesc,
         range: SrcRange,
     ) -> Option<Choice> {
+        let (decls, bindings) = self.enter_scope(decls);
         let (_, blocks) = self.model_dynamic_body(decls, desc, range);
         let children = self.model_dynamic_children(blocks, desc, range);
+        self.scopes.pop();
 
-        Some(Choice { name, children })
+        Some(Choice {
+            name,
+            bindings,
+            children,
+        })
     }
 
     fn model_maybe(
@@ -1491,8 +1738,19 @@ impl Modeler {
         desc: &spec::BlockDesc,
         range: SrcRange,
     ) -> Option<Maybe> {
+        // chance models outside the block's own scope, like a repeat count
+        let (vars_blocks, decls) = split_vars(decls);
+        let mut names = Vec::new();
+        let mut bindings = Vec::new();
+        for block in vars_blocks {
+            self.collect_vars(block, &mut names, &mut bindings);
+        }
+
         let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
+
+        self.scopes.push(names);
         let children = self.model_dynamic_children(blocks, desc, range);
+        self.scopes.pop();
 
         let (chance, chance_range) = fields
             .remove(&spec::ids::CHANCE)
@@ -1519,6 +1777,7 @@ impl Modeler {
             name,
             chance,
             chance_range,
+            bindings,
             children,
         })
     }
@@ -1867,6 +2126,7 @@ impl Modeler {
                     range,
                 })
             }
+            ast::ExprKind::Bound { name, .. } => Some(Value::VarRef(name)),
             ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before model lowering"),
             ast::ExprKind::LoopRef(_) => unreachable!("loop references are substituted before model lowering"),
             ast::ExprKind::Spread(_) => unreachable!("spreads are spliced before model lowering"),
@@ -2523,6 +2783,11 @@ impl Modeler {
         for part in parts {
             match part {
                 ast::TemplatePart::Lit(value) => modeled.push(Part::Lit(value)),
+                // var parts survive resolution only for dynamic scalar vars
+                ast::TemplatePart::Ref { path, .. } if path.len() == 2 && path[0] == "var" => {
+                    let name = path.into_iter().nth(1).expect("path has two segments");
+                    modeled.push(Part::VarRef(name));
+                }
                 ast::TemplatePart::Ref { path, range } => match model_ctx_ref(&path, self.repeat_depth) {
                     Some(ctx_ref) => modeled.push(Part::Ref(ctx_ref)),
                     None => {
@@ -2588,44 +2853,19 @@ impl Modeler {
     }
 }
 
-fn expr_references_vars(expr: &ast::Expr) -> bool {
-    match &expr.kind {
-        ast::ExprKind::VarRef(_) => true,
-        ast::ExprKind::Template(parts) => parts.iter().any(
-            |part| matches!(part, ast::TemplatePart::Ref { path, .. } if path.first().is_some_and(|segment| segment == "var")),
-        ),
-        ast::ExprKind::Array(values) => values.iter().any(expr_references_vars),
-        ast::ExprKind::Object(items) => items.iter().any(|item| match item {
-            ast::ObjectItem::Attr(attr) => expr_references_vars(&attr.value),
-            ast::ObjectItem::Spread(operand) => expr_references_vars(operand),
-        }),
-        ast::ExprKind::Func { args, .. } => args.iter().any(expr_references_vars),
-        ast::ExprKind::Unary { operand, .. } => expr_references_vars(operand),
-        ast::ExprKind::Binary { lhs, rhs, .. } => expr_references_vars(lhs) || expr_references_vars(rhs),
-        ast::ExprKind::Cond { cond, then, otherwise } => {
-            expr_references_vars(cond) || expr_references_vars(then) || expr_references_vars(otherwise)
+// vars blocks bind to their enclosing block, everything else models in place
+fn split_vars(decls: Vec<ast::Decl>) -> (Vec<ast::Block>, Vec<ast::Decl>) {
+    let mut vars = Vec::new();
+    let mut rest = Vec::with_capacity(decls.len());
+    for decl in decls {
+        match decl {
+            ast::Decl::Block(block) if spec::SPEC.block(&block.kind).is_some_and(|desc| desc.id == spec::ids::VARS) => {
+                vars.push(block);
+            }
+            decl => rest.push(decl),
         }
-        ast::ExprKind::Index { target, index } => expr_references_vars(target) || expr_references_vars(index),
-        ast::ExprKind::Slice { target, start, end } => {
-            expr_references_vars(target)
-                || start.as_deref().is_some_and(expr_references_vars)
-                || end.as_deref().is_some_and(expr_references_vars)
-        }
-        ast::ExprKind::Spread(operand) => expr_references_vars(operand),
-        ast::ExprKind::For {
-            collection,
-            key,
-            body,
-            cond,
-            ..
-        } => {
-            expr_references_vars(collection)
-                || key.as_deref().is_some_and(expr_references_vars)
-                || expr_references_vars(body)
-                || cond.as_deref().is_some_and(expr_references_vars)
-        }
-        _ => false,
     }
+    (vars, rest)
 }
 
 fn float_bound(number: Number) -> f64 {
@@ -2709,8 +2949,9 @@ fn static_type(expr: &ast::Expr) -> Option<StaticType> {
             })),
             _ => None,
         },
-        // a dynamic index is only typed when the target is a literal with agreeing elements
-        ast::ExprKind::Index { target, .. } => match &target.kind {
+        // a dynamic index is only typed when the target is a literal with agreeing
+        // elements; a bound target types by its definition
+        ast::ExprKind::Index { target, .. } => match &unwrap_bound(target).kind {
             ast::ExprKind::Array(values) => unify_static_types(values.iter()),
             ast::ExprKind::Object(items) => unify_static_types(items.iter().map(|item| match item {
                 ast::ObjectItem::Attr(attr) => &attr.value,
@@ -2720,6 +2961,8 @@ fn static_type(expr: &ast::Expr) -> Option<StaticType> {
         },
         // a residual slice always selects from an array
         ast::ExprKind::Slice { .. } => Some(StaticType::Array),
+        // a binding is typed by its definition
+        ast::ExprKind::Bound { expr, .. } => static_type(expr),
         ast::ExprKind::VarRef(_) => unreachable!("variable references are resolved before type checks"),
         ast::ExprKind::LoopRef(_) => unreachable!("loop references are substituted before type checks"),
         ast::ExprKind::Spread(_) => unreachable!("spreads are spliced before type checks"),
@@ -2782,7 +3025,17 @@ fn expr_is_constant(expr: &ast::Expr) -> bool {
         }
         // constant indexes and slices fold away, residual ones are dynamic
         ast::ExprKind::Index { .. } | ast::ExprKind::Slice { .. } => false,
+        // a binding resolves per scope instantiation
+        ast::ExprKind::Bound { .. } => false,
         _ => true,
+    }
+}
+
+// sees through references to bindings to the underlying definition
+fn unwrap_bound(expr: &ast::Expr) -> &ast::Expr {
+    match &expr.kind {
+        ast::ExprKind::Bound { expr, .. } => unwrap_bound(expr),
+        _ => expr,
     }
 }
 
@@ -2880,7 +3133,7 @@ fn collapse_template(template: Template) -> Value {
             .into_iter()
             .map(|part| match part {
                 Part::Lit(value) => value,
-                Part::Ref(_) => unreachable!("all parts are literal"),
+                Part::Ref(_) | Part::VarRef(_) => unreachable!("all parts are literal"),
             })
             .collect();
         Value::Str(joined)
@@ -2986,7 +3239,7 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
         name: String,
     },
-    VarInVar {
+    VarNotInScope {
         rule: spec::Id,
         name: String,
     },
@@ -3239,9 +3492,9 @@ impl fmt::Display for ErrorKind {
                 let rule = rule_desc(*rule);
                 write!(formatter, "variable `{name}` is defined more than once; {}", rule.summary)
             }
-            Self::VarInVar { rule, name } => {
+            Self::VarNotInScope { rule, name } => {
                 let rule = rule_desc(*rule);
-                write!(formatter, "variable `{name}` references another variable; {}", rule.summary)
+                write!(formatter, "variable `{name}` is not in scope here; {}", rule.summary)
             }
             Self::UnknownVariable { rule, name } => {
                 let rule = rule_desc(*rule);
@@ -3798,7 +4051,7 @@ mod tests {
     }
 
     #[test]
-    fn splices_template_variables_and_keeps_context_references() {
+    fn lowers_template_variables_to_bindings_keeping_context_references() {
         let model = model(
             r#"
             vars { q = "q ${trace.index}" }
@@ -3807,12 +4060,21 @@ mod tests {
         )
         .unwrap();
 
+        // the ctx ref makes the var dynamic: the definition becomes a root
+        // binding and the use site references it
+        assert_eq!(model.bindings.len(), 1);
+        assert_eq!(model.bindings[0].name, "q");
+        let Value::Template(definition) = &model.bindings[0].value else {
+            panic!("expected a template binding");
+        };
+        assert!(matches!(&definition.parts[0], Part::Lit(value) if value == "q "));
+        assert!(matches!(definition.parts[1], Part::Ref(CtxRef::TraceIndex)));
+
         let Some(Value::Template(template)) = &model.traces[0].fields.input else {
             panic!("expected a template");
         };
-        assert!(matches!(&template.parts[0], Part::Lit(value) if value == "q "));
-        assert!(matches!(template.parts[1], Part::Ref(CtxRef::TraceIndex)));
-        assert!(matches!(&template.parts[2], Part::Lit(value) if value == "!"));
+        assert!(matches!(&template.parts[0], Part::VarRef(name) if name == "q"));
+        assert!(matches!(&template.parts[1], Part::Lit(value) if value == "!"));
     }
 
     #[test]
@@ -3875,7 +4137,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_variables_referencing_other_variables() {
+    fn rejects_variables_referencing_same_scope_variables() {
         for source in [
             r#"vars { a = 1 b = var.a } trace "example" {}"#,
             r#"vars { a = 1 b = "${var.a}" } trace "example" {}"#,
@@ -3885,12 +4147,193 @@ mod tests {
             let errors = model(source).unwrap_err();
             assert_eq!(
                 errors[0].kind(),
-                &ErrorKind::VarInVar {
-                    rule: spec::ids::STATIC_VARS,
-                    name: "b".to_owned(),
+                &ErrorKind::VarNotInScope {
+                    rule: spec::ids::VISIBLE_VARS,
+                    name: "a".to_owned(),
                 }
             );
         }
+    }
+
+    #[test]
+    fn shares_dynamic_root_vars_as_a_single_binding() {
+        let model = model(r#"vars { m = choice("a", "b") } trace "t" { input = var.m output = var.m }"#).unwrap();
+
+        assert_eq!(model.bindings.len(), 1);
+        assert_eq!(model.bindings[0].name, "m");
+        assert!(matches!(&model.traces[0].fields.input, Some(Value::VarRef(name)) if name == "m"));
+        assert!(matches!(&model.traces[0].fields.output, Some(Value::VarRef(name)) if name == "m"));
+    }
+
+    #[test]
+    fn scopes_vars_to_spans_and_dynamic_blocks() {
+        let model = model(
+            r#"
+            trace "t" {
+                llm "Chat Completion" {
+                    vars { pt = range(1, 9) }
+                    metrics = { prompt_tokens = var.pt, tokens = var.pt + 4 }
+                }
+                repeat {
+                    count = 2
+                    vars { r = range(1, 9) }
+                    task "turn" { input = var.r }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert!(model.bindings.is_empty());
+        assert!(model.traces[0].bindings.is_empty());
+        let children = &model.traces[0].children;
+        let Child::Span(llm) = &children[0] else {
+            panic!("expected a span");
+        };
+        assert_eq!(llm.bindings.len(), 1);
+        assert_eq!(llm.bindings[0].name, "pt");
+        let Child::Repeat(repeat) = &children[1] else {
+            panic!("expected a repeat");
+        };
+        assert_eq!(repeat.bindings.len(), 1);
+        assert_eq!(repeat.bindings[0].name, "r");
+    }
+
+    #[test]
+    fn resolves_outer_scope_vars_in_var_values() {
+        let model = model(
+            r#"
+            vars { base = 100 }
+            trace "t" {
+                vars { n = var.base + range(1, 9) }
+                input = var.n
+            }
+            "#,
+        )
+        .unwrap();
+
+        // base is constant and substitutes, n is dynamic and binds on the trace
+        assert!(model.bindings.is_empty());
+        assert_eq!(model.traces[0].bindings.len(), 1);
+        assert_eq!(model.traces[0].bindings[0].name, "n");
+        assert!(matches!(&model.traces[0].fields.input, Some(Value::VarRef(name)) if name == "n"));
+    }
+
+    #[test]
+    fn resolves_outer_dynamic_vars_in_var_values_as_binding_refs() {
+        let model = model(
+            r#"
+            vars { total = range(10, 20) }
+            trace "t" {
+                vars { half = var.total / 2 }
+                input = var.half
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(model.bindings.len(), 1);
+        let Value::Binary { lhs, .. } = &model.traces[0].bindings[0].value else {
+            panic!("expected a binary binding");
+        };
+        assert!(matches!(&**lhs, Value::VarRef(name) if name == "total"));
+    }
+
+    #[test]
+    fn rejects_references_outside_the_declaring_block() {
+        let errors = model(
+            r#"
+            trace "t" {
+                task "a" {
+                    vars { x = range(1, 2) }
+                    input = var.x
+                }
+                task "b" { input = var.x }
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::VarNotInScope {
+                rule: spec::ids::VISIBLE_VARS,
+                name: "x".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_repeat_index_in_vars_outside_a_repeat() {
+        let errors = model(r#"vars { q = "q ${repeat.index}" } trace "t" { repeat { count = 1 task "x" { input = var.q } } }"#)
+            .unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::RepeatIndexOutsideRepeat { .. }));
+    }
+
+    #[test]
+    fn resolves_repeat_index_in_repeat_scope_vars() {
+        let model = model(
+            r#"
+            trace "t" {
+                repeat {
+                    count = 2
+                    vars { q = "q ${repeat.index}" }
+                    task "turn" { input = var.q }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
+            panic!("expected a repeat");
+        };
+        assert_eq!(repeat.bindings[0].name, "q");
+        let Value::Template(template) = &repeat.bindings[0].value else {
+            panic!("expected a template binding");
+        };
+        assert!(matches!(template.parts[1], Part::Ref(CtxRef::RepeatIndex)));
+    }
+
+    #[test]
+    fn rejects_repeat_counts_referencing_the_repeats_own_vars() {
+        let errors = model(r#"trace "t" { repeat { vars { n = range(1, 3) } count = var.n task "x" {} } }"#).unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
+    }
+
+    #[test]
+    fn allows_repeat_counts_referencing_outer_dynamic_vars() {
+        let model = model(
+            r#"
+            trace "t" {
+                vars { turns = range(1, 4) }
+                repeat { count = var.turns task "x" {} }
+                task "summary" { input = { turns = var.turns } }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
+            panic!("expected a repeat");
+        };
+        assert!(matches!(&repeat.count, Value::VarRef(name) if name == "turns"));
+    }
+
+    #[test]
+    fn unrolls_for_exprs_over_dynamic_vars_as_binding_accessors() {
+        let model = model(r#"vars { xs = [range(1, 5), range(6, 9)] } trace "t" { input = [for x in var.xs : x] }"#).unwrap();
+
+        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        assert_eq!(array.elem.len(), 2);
+        assert!(array.elem.iter().all(|value| matches!(
+            value,
+            Value::Index { target, .. } if matches!(&**target, Value::VarRef(name) if name == "xs")
+        )));
     }
 
     #[test]
@@ -4382,16 +4825,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_interpolating_func_variables() {
-        let errors = model(r#"vars { s = choice("a", "b") } trace "t" { input = "${var.s}" }"#).unwrap_err();
+    fn interpolates_func_variables_with_agreeing_scalar_types() {
+        let model = model(r#"vars { s = choice("a", "b") } trace "t" { input = "${var.s}" }"#).unwrap();
 
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonScalarInterpolation {
-                rule: spec::ids::SCALAR_INTERPOLATION,
-                name: "s".to_owned(),
-            }
-        );
+        assert_eq!(model.bindings.len(), 1);
+        let Some(Value::Template(template)) = &model.traces[0].fields.input else {
+            panic!("expected a template");
+        };
+        assert!(matches!(&template.parts[0], Part::VarRef(name) if name == "s"));
     }
 
     #[test]
@@ -4831,10 +5272,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_operator_exprs_referencing_vars_in_vars() {
+    fn rejects_operator_exprs_referencing_same_scope_vars_in_vars() {
         let errors = model(r#"vars { a = 1 b = 1 + var.a } trace "t" { input = 1 }"#).unwrap_err();
 
-        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
+        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
     }
 
     #[test]
@@ -4845,8 +5286,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_interpolating_dynamic_vars() {
-        let errors = model(r#"vars { d = 1 + range(1, 2) } trace "t" { output = "${var.d}" }"#).unwrap_err();
+    fn interpolates_dynamic_scalar_vars_as_binding_refs() {
+        let model = model(r#"vars { d = 1 + range(1, 2) } trace "t" { output = "d ${var.d}" }"#).unwrap();
+
+        assert_eq!(model.bindings.len(), 1);
+        assert_eq!(model.bindings[0].name, "d");
+        let Some(Value::Template(template)) = &model.traces[0].fields.output else {
+            panic!("expected a template output");
+        };
+        assert!(matches!(&template.parts[1], Part::VarRef(name) if name == "d"));
+    }
+
+    #[test]
+    fn rejects_interpolating_dynamic_vars_without_a_scalar_type() {
+        let errors = model(r#"vars { d = choice("a", 1) } trace "t" { output = "${var.d}" }"#).unwrap_err();
 
         assert!(matches!(errors[0].kind(), ErrorKind::NonScalarInterpolation { .. }));
     }
@@ -5096,10 +5549,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_index_exprs_referencing_vars_in_vars() {
+    fn rejects_index_exprs_referencing_same_scope_vars_in_vars() {
         let errors = model(r#"vars { a = [1] b = var.a[0] } trace "t" { input = 1 }"#).unwrap_err();
 
-        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
+        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
     }
 
     fn ints(value: &Value) -> Vec<i64> {
@@ -5245,18 +5698,29 @@ mod tests {
     }
 
     #[test]
-    fn splices_spreads_holding_dynamic_elements() {
+    fn splices_spreads_of_dynamic_vars_as_binding_accessors() {
         let model = model(r#"vars { xs = [range(1, 5)] } trace "t" { input = [...var.xs] }"#).unwrap();
+
+        // the sampled element is drawn once in the binding; the spliced element
+        // indexes into it instead of re-sampling
+        assert_eq!(model.bindings.len(), 1);
+        let Value::Array(definition) = &model.bindings[0].value else {
+            panic!("expected an array binding");
+        };
+        assert!(matches!(
+            definition.elem[0],
+            Value::Func {
+                func: Func::Range(Range::Int { min: 1, max: 5 }),
+                ..
+            }
+        ));
 
         let Some(Value::Array(array)) = &model.traces[0].fields.input else {
             panic!("expected an array");
         };
         assert!(matches!(
-            array.elem[0],
-            Value::Func {
-                func: Func::Range(Range::Int { min: 1, max: 5 }),
-                ..
-            }
+            &array.elem[0],
+            Value::Index { target, .. } if matches!(&**target, Value::VarRef(name) if name == "xs")
         ));
     }
 
@@ -5333,10 +5797,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_spreads_referencing_vars_in_vars() {
+    fn rejects_spreads_referencing_same_scope_vars_in_vars() {
         let errors = model(r#"vars { a = [1] b = [...var.a] } trace "t" { input = 1 }"#).unwrap_err();
 
-        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
+        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
     }
 
     #[test]
@@ -5421,7 +5885,7 @@ mod tests {
                     .iter()
                     .map(|part| match part {
                         Part::Lit(value) => value.as_str(),
-                        Part::Ref(_) => panic!("expected literal parts"),
+                        Part::Ref(_) | Part::VarRef(_) => panic!("expected literal parts"),
                     })
                     .collect()
             })
@@ -5550,10 +6014,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_for_exprs_referencing_vars_in_vars() {
+    fn rejects_for_exprs_referencing_same_scope_vars_in_vars() {
         let errors = model(r#"vars { a = [1] b = [for x in var.a : x] } trace "t" { input = 1 }"#).unwrap_err();
 
-        assert!(matches!(errors[0].kind(), ErrorKind::VarInVar { .. }));
+        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
     }
 
     #[test]
@@ -5589,13 +6053,7 @@ mod tests {
             panic!("expected a repeat child");
         };
         assert_eq!(repeat.name.as_deref(), Some("turns"));
-        assert!(matches!(
-            repeat.count,
-            Value::Func {
-                func: Func::Range(_),
-                ..
-            }
-        ));
+        assert!(matches!(&repeat.count, Value::VarRef(name) if name == "turns"));
         assert!(matches!(
             repeat.children.as_slice(),
             [Child::Span(Span {
@@ -5637,11 +6095,11 @@ mod tests {
             }
         );
 
-        let errors = model(r#"trace "t" { choice { vars { a = 1 } task "turn" {} } }"#).unwrap_err();
+        let errors = model(r#"trace "t" { choice { trace "inner" {} task "turn" {} } }"#).unwrap_err();
         assert_eq!(
             errors[0].kind(),
             &ErrorKind::BlockNotAllowed {
-                block: spec::ids::VARS,
+                block: spec::ids::TRACE,
                 parent: spec::Place::Block { id: spec::ids::CHOICE },
             }
         );

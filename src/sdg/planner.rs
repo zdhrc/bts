@@ -1,8 +1,9 @@
 use crate::dsl::{
-    Array as ModelArray, BinOp, Child as ModelChild, Choice as ModelChoice, CtxRef as ModelCtxRef, Func as ModelFunc,
-    Maybe as ModelMaybe, Model, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField,
-    Part as ModelPart, Range as ModelRange, Repeat as ModelRepeat, Span as ModelSpan, SpanFields as ModelSpanFields,
-    SpanKind as ModelSpanKind, SrcRange, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
+    Array as ModelArray, BinOp, Binding as ModelBinding, Child as ModelChild, Choice as ModelChoice, CtxRef as ModelCtxRef,
+    Func as ModelFunc, Maybe as ModelMaybe, Model, Number as ModelNumber, Object as ModelObject,
+    ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange, Repeat as ModelRepeat, Span as ModelSpan,
+    SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange, Template as ModelTemplate, Trace as ModelTrace,
+    UnaryOp, Value as ModelValue,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -71,6 +72,27 @@ struct Ctx {
     rng: SmallRng,
     // iteration indexes of the enclosing repeats, innermost last
     repeat_indices: Vec<usize>,
+    // evaluated scope bindings, innermost last; names are unique per the modeler
+    env: Vec<(String, ModelValue)>,
+}
+
+impl Ctx {
+    // a scope's bindings evaluate once at instantiation, in declaration order
+    fn push_bindings(&mut self, bindings: &[ModelBinding]) -> Result<(), Error> {
+        for binding in bindings {
+            let value = eval_binding(binding.value.clone(), self)?;
+            self.env.push((binding.name.clone(), value));
+        }
+        Ok(())
+    }
+
+    fn binding(&self, name: &str) -> &ModelValue {
+        self.env
+            .iter()
+            .rev()
+            .find_map(|(known, value)| (known == name).then_some(value))
+            .expect("modeler guarantees references resolve to an evaluated binding")
+    }
 }
 
 impl Planner {
@@ -78,7 +100,14 @@ impl Planner {
         let start = self.events.len();
         let root = EventRef(start);
 
-        let ModelTrace { name, fields, children } = trace;
+        let ModelTrace {
+            name,
+            fields,
+            bindings,
+            children,
+        } = trace;
+
+        ctx.push_bindings(&bindings)?;
 
         self.events.push(EventPlan {
             root,
@@ -104,38 +133,52 @@ impl Planner {
             ModelChild::Repeat(ModelRepeat {
                 count,
                 count_range,
+                bindings,
                 children,
                 ..
             }) => {
+                // count is drawn in the parent scope, bindings re-evaluate per iteration
                 let count = eval_count(count, count_range, ctx)?;
                 for index in 0..count {
                     ctx.repeat_indices.push(index);
+                    let scope = ctx.env.len();
+                    ctx.push_bindings(&bindings)?;
                     for child in &children {
                         self.plan_child(child.clone(), root, parent, ctx)?;
                     }
+                    ctx.env.truncate(scope);
                     ctx.repeat_indices.pop();
                 }
                 Ok(())
             }
 
-            ModelChild::Choice(ModelChoice { children, .. }) => {
+            ModelChild::Choice(ModelChoice { bindings, children, .. }) => {
+                let scope = ctx.env.len();
+                ctx.push_bindings(&bindings)?;
                 let pick = ctx.rng.random_range(0..children.len());
                 let child = children.into_iter().nth(pick).expect("modeler guarantees choice has a child");
 
-                self.plan_child(child, root, parent, ctx)
+                let planned = self.plan_child(child, root, parent, ctx);
+                ctx.env.truncate(scope);
+                planned
             }
 
             ModelChild::Maybe(ModelMaybe {
                 chance,
                 chance_range,
+                bindings,
                 children,
                 ..
             }) => {
+                // chance is drawn in the parent scope, bindings evaluate only on inclusion
                 let chance = eval_chance(chance, chance_range, ctx)?;
                 if ctx.rng.random_bool(chance) {
+                    let scope = ctx.env.len();
+                    ctx.push_bindings(&bindings)?;
                     for child in children {
                         self.plan_child(child, root, parent, ctx)?;
                     }
+                    ctx.env.truncate(scope);
                 }
                 Ok(())
             }
@@ -149,8 +192,12 @@ impl Planner {
             name,
             kind,
             fields,
+            bindings,
             children,
         } = span;
+
+        let scope = ctx.env.len();
+        ctx.push_bindings(&bindings)?;
 
         self.events.push(EventPlan {
             root,
@@ -169,6 +216,7 @@ impl Planner {
             self.plan_child(child, root, event_ref, ctx)?;
         }
 
+        ctx.env.truncate(scope);
         Ok(())
     }
 }
@@ -221,12 +269,83 @@ fn lower_fields(fields: ModelSpanFields, ctx: &mut Ctx) -> Result<EventFields, E
     })
 }
 
+// fully evaluates a scope binding to a constant value the environment can hold
+fn eval_binding(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
+    let value = match value {
+        ModelValue::Str(_) | ModelValue::Num(_) | ModelValue::Bool(_) | ModelValue::Null => value,
+        ModelValue::Template(template) => ModelValue::Str(resolve_template(template, ctx)),
+        ModelValue::VarRef(name) => ctx.binding(&name).clone(),
+
+        ModelValue::Array(ModelArray { elem }) => ModelValue::Array(ModelArray {
+            elem: elem
+                .into_iter()
+                .map(|value| eval_binding(value, ctx))
+                .collect::<Result<_, _>>()?,
+        }),
+
+        ModelValue::Object(ModelObject { elem }) => ModelValue::Object(ModelObject {
+            elem: elem
+                .into_iter()
+                .map(|ModelObjectField { key, value }| {
+                    Ok(ModelObjectField {
+                        key,
+                        value: eval_binding(value, ctx)?,
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        }),
+
+        // a pick may itself still be dynamic, so recurse on the result
+        ModelValue::Func { func, range } => eval_binding(eval_func(func, range, ctx)?, ctx)?,
+
+        ModelValue::Unary { op, operand, range } => {
+            let operand = eval_operand(*operand, ctx)?;
+            scalar_to_value(eval_unary(op, operand, range)?)
+        }
+        ModelValue::Binary { op, lhs, rhs, range } => scalar_to_value(eval_binary(op, *lhs, *rhs, range, ctx)?),
+
+        ModelValue::Cond {
+            cond, then, otherwise, ..
+        } => {
+            let taken = if eval_operand(*cond, ctx)?.into_bool() {
+                then
+            } else {
+                otherwise
+            };
+            eval_binding(*taken, ctx)?
+        }
+
+        ModelValue::Index { target, index, range } => eval_binding(eval_index(*target, *index, range, ctx)?, ctx)?,
+
+        ModelValue::Slice {
+            target,
+            start,
+            end,
+            range,
+        } => eval_binding(eval_slice(*target, start, end, range, ctx)?, ctx)?,
+    };
+
+    Ok(value)
+}
+
+fn scalar_to_value(scalar: Scalar) -> ModelValue {
+    match scalar {
+        Scalar::Int(value) => ModelValue::Num(ModelNumber::Int(value)),
+        Scalar::Float(value) => ModelValue::Num(ModelNumber::Float(value)),
+        Scalar::Bool(value) => ModelValue::Bool(value),
+        Scalar::Str(value) => ModelValue::Str(value),
+    }
+}
+
 fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
     let value = match value {
         ModelValue::Str(value) => JsonValue::String(value),
         ModelValue::Template(template) => JsonValue::String(resolve_template(template, ctx)),
         ModelValue::Bool(value) => JsonValue::Bool(value),
         ModelValue::Null => JsonValue::Null,
+
+        // the stored value is constant, so lowering it is pure conversion
+        ModelValue::VarRef(name) => lower_value(ctx.binding(&name).clone(), ctx)?,
 
         ModelValue::Num(ModelNumber::Int(value)) => JsonValue::Number(value.into()),
 
@@ -340,6 +459,7 @@ fn eval_index(target: ModelValue, index: ModelValue, range: SrcRange, ctx: &mut 
 fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     match value {
         ModelValue::Array(_) | ModelValue::Object(_) => Ok(value),
+        ModelValue::VarRef(name) => eval_container(ctx.binding(&name).clone(), ctx),
         ModelValue::Func { func, range } => eval_container(eval_func(func, range, ctx)?, ctx),
         ModelValue::Cond {
             cond, then, otherwise, ..
@@ -694,6 +814,7 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
         ModelValue::Num(ModelNumber::Float(value)) => Scalar::Float(value),
         ModelValue::Bool(value) => Scalar::Bool(value),
 
+        ModelValue::VarRef(name) => eval_operand(ctx.binding(&name).clone(), ctx)?,
         ModelValue::Func { func, range } => eval_operand(eval_func(func, range, ctx)?, ctx)?,
 
         ModelValue::Unary { op, operand, range } => {
@@ -833,6 +954,13 @@ fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> String {
                 .last()
                 .expect("modeler validated repeat.index is inside a repeat")
                 .to_string(),
+            ModelPart::VarRef(name) => match ctx.binding(&name) {
+                ModelValue::Str(value) => value.clone(),
+                ModelValue::Num(ModelNumber::Int(value)) => value.to_string(),
+                ModelValue::Num(ModelNumber::Float(value)) => scalar_text(Scalar::Float(*value)),
+                ModelValue::Bool(value) => if *value { "true" } else { "false" }.to_owned(),
+                _ => unreachable!("modeler validated interpolated bindings as scalars"),
+            },
         })
         .collect()
 }
@@ -856,7 +984,10 @@ pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
             trace_index: index,
             rng: SmallRng::seed_from_u64(seed.wrapping_add(index as u64)),
             repeat_indices: Vec::new(),
+            env: Vec::new(),
         };
+        // the root scope instantiates once per generated trace
+        ctx.push_bindings(&model.bindings)?;
         planner.plan_trace(model.traces[index % model.traces.len()].clone(), &mut ctx)?;
     }
 
@@ -1724,5 +1855,143 @@ mod tests {
         let model = compile(include_str!("../../tests/fixtures/dynamic.bt")).unwrap();
         let plan_b = plan(model, 10, 42).unwrap();
         assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn evaluates_root_bindings_once_per_trace() {
+        let model = compile(
+            r#"
+            vars { x = range(0, 1000000) }
+            trace "t" { input = var.x output = var.x }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 4, 7).unwrap();
+
+        let values: Vec<JsonValue> = plan
+            .events
+            .iter()
+            .map(|event| {
+                let input = event.fields.input.clone().unwrap();
+                assert_eq!(Some(&input), event.fields.output.as_ref());
+                input
+            })
+            .collect();
+        // the binding re-samples across traces
+        assert!(values.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn evaluates_repeat_bindings_once_per_iteration() {
+        let model = compile(
+            r#"
+            trace "t" {
+                repeat {
+                    count = 3
+                    vars { r = range(0, 1000000) }
+                    task "turn" { input = var.r output = var.r }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 3).unwrap();
+
+        let turns = &plan.events[1..];
+        assert_eq!(turns.len(), 3);
+        let mut values = Vec::new();
+        for event in turns {
+            let input = event.fields.input.clone().unwrap();
+            assert_eq!(Some(&input), event.fields.output.as_ref());
+            values.push(input);
+        }
+        // the binding re-samples across iterations
+        assert!(values.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn sums_span_bindings_exactly() {
+        let model = compile(
+            r#"
+            trace "t" {
+                llm "Chat Completion" {
+                    vars {
+                        pt = round(lognormal(600, 0.4))
+                        ct = round(lognormal(90, 0.7))
+                    }
+                    metrics = { prompt_tokens = var.pt, completion_tokens = var.ct, tokens = var.pt + var.ct }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 5, 11).unwrap();
+
+        let llms = plan.events.iter().filter(|event| matches!(event.kind, EventKind::Llm));
+        for event in llms {
+            let metrics = event.fields.metrics.as_ref().unwrap();
+            let pt = metrics["prompt_tokens"].as_i64().unwrap();
+            let ct = metrics["completion_tokens"].as_i64().unwrap();
+            assert_eq!(metrics["tokens"].as_i64().unwrap(), pt + ct);
+        }
+    }
+
+    #[test]
+    fn interpolates_bindings_consistently_with_value_references() {
+        let model = compile(
+            r#"
+            vars { m = choice("gpt-4o", "gpt-4o-mini") }
+            trace "t" { input = "model: ${var.m}" metadata = { model = var.m } }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 6, 5).unwrap();
+
+        for event in plan.events.iter() {
+            let name = event.fields.metadata.as_ref().unwrap()["model"].as_str().unwrap().to_owned();
+            assert_eq!(event.fields.input, Some(JsonValue::from(format!("model: {name}"))));
+        }
+    }
+
+    #[test]
+    fn shares_choice_bindings_across_alternatives() {
+        let model = compile(
+            r#"
+            trace "t" {
+                choice {
+                    vars { c = range(0, 1000000) }
+                    task "a" { input = var.c output = var.c }
+                    task "b" { input = var.c output = var.c }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 5, 13).unwrap();
+
+        for event in plan.events.iter().filter(|event| event.parent.is_some()) {
+            assert_eq!(event.fields.input, event.fields.output);
+            assert!(event.fields.input.as_ref().unwrap().is_i64());
+        }
+    }
+
+    #[test]
+    fn evaluates_maybe_bindings_only_on_inclusion() {
+        let model = compile(
+            r#"
+            trace "t" {
+                maybe {
+                    chance = 0.5
+                    vars { e = range(0, 1000000) }
+                    task "escalation" { input = var.e }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 8, 17).unwrap();
+
+        let included = plan.events.iter().filter(|event| event.parent.is_some()).count();
+        assert!((1..8).contains(&included), "expected a mix of inclusions, got {included}");
     }
 }

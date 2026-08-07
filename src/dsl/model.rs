@@ -4,12 +4,23 @@ use crate::dsl::diag::SrcRange;
 #[derive(Debug, Clone)]
 pub(crate) struct Model {
     pub(crate) traces: Vec<Trace>,
+    // root-scope bindings, evaluated once per generated trace before its own
+    pub(crate) bindings: Vec<Binding>,
+}
+
+// a dynamic scoped variable, evaluated once per instantiation of its declaring
+// block; constant vars substitute in the modeler and never get here
+#[derive(Debug, Clone)]
+pub(crate) struct Binding {
+    pub(crate) name: String,
+    pub(crate) value: Value,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Trace {
     pub(crate) name: String,
     pub(crate) fields: SpanFields,
+    pub(crate) bindings: Vec<Binding>,
     pub(crate) children: Vec<Child>,
 }
 
@@ -29,6 +40,7 @@ pub(crate) struct Span {
     pub(crate) name: String,
     pub(crate) kind: SpanKind,
     pub(crate) fields: SpanFields,
+    pub(crate) bindings: Vec<Binding>,
     pub(crate) children: Vec<Child>,
 }
 
@@ -39,6 +51,8 @@ pub(crate) struct Repeat {
     pub(crate) name: Option<String>,
     pub(crate) count: Value,
     pub(crate) count_range: SrcRange,
+    // evaluated per iteration, count is drawn in the parent scope
+    pub(crate) bindings: Vec<Binding>,
     pub(crate) children: Vec<Child>,
 }
 
@@ -46,6 +60,7 @@ pub(crate) struct Repeat {
 pub(crate) struct Choice {
     #[allow(dead_code)]
     pub(crate) name: Option<String>,
+    pub(crate) bindings: Vec<Binding>,
     pub(crate) children: Vec<Child>,
 }
 
@@ -55,6 +70,8 @@ pub(crate) struct Maybe {
     pub(crate) name: Option<String>,
     pub(crate) chance: Value,
     pub(crate) chance_range: SrcRange,
+    // evaluated only when the children are included, chance is drawn in the parent scope
+    pub(crate) bindings: Vec<Binding>,
     pub(crate) children: Vec<Child>,
 }
 
@@ -86,6 +103,9 @@ pub(crate) enum Value {
     Null,
     Array(Array),
     Object(Object),
+    // a reference to a scoped binding, looked up in the environment during
+    // generation; the modeler guarantees the name is bound
+    VarRef(String),
     // range points at the call site so generation failures have a location
     Func {
         func: Func,
@@ -246,6 +266,8 @@ pub(crate) struct Template {
 pub(crate) enum Part {
     Lit(String),
     Ref(CtxRef),
+    // a scoped binding interpolated into the template, scalar by validation
+    VarRef(String),
 }
 
 // already validated by the modeler so resolving one can't fail

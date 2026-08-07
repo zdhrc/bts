@@ -43,6 +43,12 @@ pub enum ExprKind {
     Array(Vec<Expr>),
     Object(Vec<ObjectItem>),
     VarRef(String),
+    // a var ref resolved to a dynamic scoped variable, synthesized by the modeler;
+    // carries the folded definition so type checks see through to it
+    Bound {
+        name: String,
+        expr: Box<Expr>,
+    },
     // a loop binding introduced by an enclosing for expr
     LoopRef(String),
     Func {
