@@ -193,6 +193,9 @@ pub(crate) enum Func {
     Len {
         target: Box<Value>,
     },
+    Tokens {
+        value: Box<Value>,
+    },
     Format {
         template: String,
         args: Vec<Value>,
