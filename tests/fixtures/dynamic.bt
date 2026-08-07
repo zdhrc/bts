@@ -1,17 +1,29 @@
-# dynamic blocks vary the shape of each generated trace
+# dynamic blocks vary the shape of each generated trace; scoped vars are drawn
+# once per scope, so the data stays coherent across it
 vars {
     model = "gpt-4o-mini"
 }
 
 trace "support-sessions" {
+    # drawn once per trace: the repeat and the summary below both see it
+    vars {
+        turns = range(1, 4)
+    }
+
     repeat "turns" {
-        count = range(1, 4)
+        count = var.turns
 
         task "turn" {
             input = "question ${repeat.index}"
             output = "answer ${repeat.index}"
 
             llm "Chat Completion" {
+                # drawn once per iteration, so the token sum is exact
+                vars {
+                    prompt_toks = round(lognormal(600, 0.4))
+                    completion_toks = round(lognormal(90, 0.7))
+                }
+
                 input = [
                     { role = "system", content = "You are a support agent." },
                     { role = "user", content = "question ${repeat.index}" },
@@ -19,9 +31,9 @@ trace "support-sessions" {
                 output = { role = "assistant", content = "answer ${repeat.index}" }
                 metadata = { model = var.model, provider = "openai" }
                 metrics = {
-                    prompt_tokens = 512
-                    completion_tokens = 96
-                    tokens = 608
+                    prompt_tokens = var.prompt_toks
+                    completion_tokens = var.completion_toks
+                    tokens = var.prompt_toks + var.completion_toks
                 }
             }
         }
@@ -34,7 +46,7 @@ trace "support-sessions" {
         }
 
         function "summarize_session" {
-            input = { turns = range(1, 4) }
+            input = { turns = var.turns }
             output = { summary = "customer asked about an order" }
         }
     }

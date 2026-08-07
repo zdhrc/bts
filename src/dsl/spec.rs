@@ -273,7 +273,8 @@ pub(crate) mod ids {
     pub(crate) const HEREDOC_INDENT: Id = Id::new("rule.heredoc-indentation");
     pub(crate) const KNOWN_REFERENCES: Id = Id::new("rule.known-references");
     pub(crate) const UNIQUE_VARS: Id = Id::new("rule.unique-vars");
-    pub(crate) const STATIC_VARS: Id = Id::new("rule.static-vars");
+    pub(crate) const SCOPED_VARS: Id = Id::new("rule.scoped-vars");
+    pub(crate) const VISIBLE_VARS: Id = Id::new("rule.visible-vars");
     pub(crate) const DEFINED_VARS: Id = Id::new("rule.defined-vars");
     pub(crate) const SCALAR_INTERPOLATION: Id = Id::new("rule.scalar-interpolation");
     pub(crate) const UNIQUE_OBJECT_KEYS: Id = Id::new("rule.unique-object-keys");
@@ -376,6 +377,17 @@ const SPAN_FIELDS: &[FieldDesc] = &[
 ];
 
 const ROOT_ONLY: &[Place] = &[Place::Root];
+const ANYWHERE: &[Place] = &[
+    Place::Root,
+    Place::Block { id: ids::TRACE },
+    Place::Block { id: ids::TASK },
+    Place::Block { id: ids::LLM },
+    Place::Block { id: ids::TOOL },
+    Place::Block { id: ids::FUNCTION },
+    Place::Block { id: ids::REPEAT },
+    Place::Block { id: ids::CHOICE },
+    Place::Block { id: ids::MAYBE },
+];
 const IN_TRACE_SPAN_OR_DYNAMIC: &[Place] = &[
     Place::Block { id: ids::TRACE },
     Place::Block { id: ids::TASK },
@@ -425,7 +437,7 @@ const LLM_CONVENTIONS: &[&str] = &[
     "`metadata` holds the request parameters at the top level: `model`, `provider` (e.g. `openai`, `anthropic`), and settings like `temperature`, `max_tokens`, or `tool_choice`. Use a real registered model id so Braintrust can compute cost from token counts.",
     "`metrics` uses Braintrust's exact field names: `prompt_tokens`, `completion_tokens`, and `tokens` (their sum). These power the token and cost columns in the UI.",
     "Optional metrics, same exact names: `prompt_cached_tokens` (cache reads) and `prompt_cache_creation_tokens` (cache writes), both already included in `prompt_tokens`; `time_to_first_token` in seconds, smaller than the span duration; `estimated_cost` to override the computed cost.",
-    "Metric values cannot reference sibling fields, so a sampled `prompt_tokens` cannot feed an exact `tokens` sum. Write token metrics as constants that sum correctly; to vary them per trace, put alternative `llm` blocks differing only in metrics inside a `choice` block.",
+    "Metric values cannot reference sibling fields, so a sampled `prompt_tokens` cannot feed an exact `tokens` sum directly. Declare sampled token counts in a `vars` block on the llm span and reference them: `vars { pt = round(lognormal(600, 0.4)), ct = round(lognormal(90, 0.7)) }` then `metrics = { prompt_tokens = var.pt, completion_tokens = var.ct, tokens = var.pt + var.ct }`.",
 ];
 const TOOL_CONVENTIONS: &[&str] = &[
     "Name tool spans exactly the tool's function name (`get_stock_performance`), never a description of what it does.",
@@ -468,8 +480,12 @@ const VARS_RULES: &[RuleDesc] = &[
         summary: "A variable name may be defined at most once across all vars blocks.",
     },
     RuleDesc {
-        id: ids::STATIC_VARS,
-        summary: "A variable value may not reference other variables.",
+        id: ids::SCOPED_VARS,
+        summary: "A variable is evaluated once per instantiation of the block that declares it — the root scope once per generated trace, a repeat scope once per iteration, a choice or maybe scope once per inclusion — and every reference sees that one value.",
+    },
+    RuleDesc {
+        id: ids::VISIBLE_VARS,
+        summary: "A variable may be referenced anywhere inside the block that declares it, nested blocks included; a variable's own value may only reference variables declared in an enclosing block.",
     },
 ];
 const FUNC_RULES: &[RuleDesc] = &[
@@ -479,7 +495,7 @@ const FUNC_RULES: &[RuleDesc] = &[
     },
     RuleDesc {
         id: ids::FUNC_POSITIONS,
-        summary: "A non-constant expression (a function call, or an operator expression containing one) may only appear where any value is accepted; fields with a specific type and interpolations must use values known before generation.",
+        summary: "A non-constant expression (a function call, a reference to a variable holding one, or an operator expression containing either) may only appear where any value is accepted; fields with a specific type must use values known before generation.",
     },
 ];
 const OPERAND_TYPES_RULE: RuleDesc = RuleDesc {
@@ -652,7 +668,7 @@ const VAR_REF_RULES: &[RuleDesc] = &[
     },
     RuleDesc {
         id: ids::SCALAR_INTERPOLATION,
-        summary: "An interpolated variable must be a string, number, or boolean.",
+        summary: "An interpolated variable must be a string, number, or boolean; a dynamic variable must have one of those types known before generation.",
     },
 ];
 
@@ -688,7 +704,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
     ExprDesc {
         id: ids::VAR_REF,
         syntax: "var.<name>",
-        summary: "A reference to a variable defined in a vars block, resolved before generation. Usable as any value, or interpolated with `${var.<name>}`.",
+        summary: "A reference to a variable defined in a vars block in scope. Constant values resolve during validation; a value that varies per trace is evaluated once per instantiation of its declaring block, so every reference sees the same value. Usable as any value, or interpolated with `${var.<name>}`.",
         examples: &["var.temperature", "\"model: ${var.model}\""],
         rules: VAR_REF_RULES,
     },
@@ -1081,10 +1097,10 @@ const BLOCKS: &[BlockDesc] = &[
     BlockDesc {
         id: ids::VARS,
         keyword: "vars",
-        summary: "A block of named values shared across the shape via `var.<name>` references.",
+        summary: "A block of named values scoped to the block that contains it and shared via `var.<name>` references; each value is evaluated once per instantiation of that block.",
         syntax: "vars { <name> = <value> ... }",
         name: NamePolicy::Forbidden,
-        allowed_in: ROOT_ONLY,
+        allowed_in: ANYWHERE,
         body: BodyDesc { fields: &[], open: true },
         rules: VARS_RULES,
         conventions: NO_CONVENTIONS,

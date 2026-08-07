@@ -9,8 +9,8 @@ pub(crate) mod spec;
 pub(crate) use ast::{BinOp, UnaryOp};
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use model::{
-    Array, Child, Choice, CtxRef, Func, Maybe, Model, Number, Object, ObjectField, Part, Range, Repeat, Span, SpanFields,
-    SpanKind, Template, Trace, Value,
+    Array, Binding, Child, Choice, CtxRef, Func, Maybe, Model, Number, Object, ObjectField, Part, Range, Repeat, Span,
+    SpanFields, SpanKind, Template, Trace, Value,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
