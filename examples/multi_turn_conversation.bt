@@ -59,14 +59,15 @@ trace "billing-support" {
                 output = "The seat was added by jordan@ on the 4th; I can remove it and refund the difference."
 
                 llm "Chat Completion" {
-                    # later turns carry the authored history forward by hand
+                    # later turns replay the earlier turns' fields instead of
+                    # copying the history by hand
                     input = [
                         { role = "system", content = var.system },
-                        { role = "user", content = "I was charged twice this month." },
-                        { role = "assistant", content = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added." },
-                        { role = "user", content = "We didn't add any seats." },
+                        { role = "user", content = task.turn_0.input },
+                        { role = "assistant", content = task.turn_0.output },
+                        { role = "user", content = task.turn_1.input },
                     ]
-                    output = { role = "assistant", content = "The seat was added by jordan@ on the 4th; I can remove it and refund the difference." }
+                    output = { role = "assistant", content = task.turn_1.output }
                     metadata = var.meta
                     metrics = { prompt_tokens = 476, completion_tokens = 61, tokens = 537, time_to_first_token = 0.31 }
                 }
@@ -79,13 +80,13 @@ trace "billing-support" {
                 llm "Chat Completion" {
                     input = [
                         { role = "system", content = var.system },
-                        { role = "user", content = "I was charged twice this month." },
-                        { role = "assistant", content = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added." },
-                        { role = "user", content = "We didn't add any seats." },
-                        { role = "assistant", content = "The seat was added by jordan@ on the 4th; I can remove it and refund the difference." },
-                        { role = "user", content = "Yes, please refund it." },
+                        { role = "user", content = task.turn_0.input },
+                        { role = "assistant", content = task.turn_0.output },
+                        { role = "user", content = task.turn_1.input },
+                        { role = "assistant", content = task.turn_1.output },
+                        { role = "user", content = task.turn_2.input },
                     ]
-                    output = { role = "assistant", content = "Done -- the refund lands in 3-5 business days." }
+                    output = { role = "assistant", content = task.turn_2.output }
                     metadata = var.meta
                     metrics = { prompt_tokens = 549, completion_tokens = 24, tokens = 573, time_to_first_token = 0.27 }
                 }

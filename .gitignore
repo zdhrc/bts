@@ -6,6 +6,7 @@ plan-bank.md
 
 # editor and agent local config
 .claude/settings.local.json
+.claude/worktrees
 .vscode/
 .idea/
 

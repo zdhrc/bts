@@ -1,4 +1,4 @@
-use crate::dsl::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, UnaryOp};
+use crate::dsl::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::lexer::{Token, TokenKind, Tokens};
 use std::fmt;
@@ -25,8 +25,6 @@ struct Parser<'src> {
     src: &'src str,
     errors: Errors,
     index: usize,
-    // loop bindings currently in scope, bare idents resolve against these
-    scopes: Vec<String>,
 }
 
 impl<'src> Parser<'src> {
@@ -36,7 +34,6 @@ impl<'src> Parser<'src> {
             src,
             errors: Vec::new(),
             index: 0,
-            scopes: Vec::new(),
         }
     }
 
@@ -68,7 +65,7 @@ impl<'src> Parser<'src> {
         };
 
         let decl = match &self.peek().kind {
-            TokenKind::String(_) | TokenKind::Template(_) | TokenKind::LBrace => {
+            TokenKind::String(_) | TokenKind::TemplateOpen | TokenKind::LBrace => {
                 self.parse_block(ident, range).map(Decl::Block)
             }
             TokenKind::Equals => self.parse_attr(ident, range).map(Decl::Attr),
@@ -87,11 +84,14 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_block(&mut self, kind: String, range: SrcRange) -> Option<Block> {
-        if self.check(token!(Template(value))) {
-            self.errors.push(Error::new(ErrorKind::InterpolatedName, self.peek().range));
-            self.next();
+        if self.check(token!(TemplateOpen)) {
+            // consume the whole template so recovery resumes after it
+            if let Some(template) = self.parse_template() {
+                self.errors.push(Error::new(ErrorKind::InterpolatedName, template.range));
+            }
         }
 
+        let name_range = self.check(token!(String(value))).then(|| self.peek().range);
         let name = self.consume(token!(String(value)));
         self.expect(token!(LBrace), ErrorKind::UnexpectedToken)?;
 
@@ -108,6 +108,7 @@ impl<'src> Parser<'src> {
         Some(Block {
             kind,
             name,
+            name_range,
             decls,
             range,
         })
@@ -194,8 +195,12 @@ impl<'src> Parser<'src> {
 
     // x[i] and x.f, .f sugars to ["f"], x[a:b] slices
     fn parse_postfix(&mut self) -> Option<Expr> {
-        let mut expr = self.parse_primary()?;
+        let expr = self.parse_primary()?;
+        self.parse_postfix_from(expr)
+    }
 
+    // the postfix loop from an already-parsed head, shared with interpolation holes
+    fn parse_postfix_from(&mut self, mut expr: Expr) -> Option<Expr> {
         loop {
             match &self.peek().kind {
                 TokenKind::LBrack => {
@@ -238,19 +243,86 @@ impl<'src> Parser<'src> {
                     let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedAccessorField)?;
 
                     let range = SrcRange::new(expr.range.start, name_range.end);
-                    expr = Expr::new(
-                        ExprKind::Index {
-                            target: Box::new(expr),
-                            index: Box::new(Expr::new(ExprKind::Str(name), name_range)),
-                        },
-                        range,
-                    );
+                    // a dot extends a reference path, on anything else it sugars to a string index
+                    expr = match expr.kind {
+                        ExprKind::Ref { mut path } => {
+                            path.push(name);
+                            Expr::new(ExprKind::Ref { path }, range)
+                        }
+                        kind => Expr::new(
+                            ExprKind::Index {
+                                target: Box::new(Expr::new(kind, expr.range)),
+                                index: Box::new(Expr::new(ExprKind::Str(name), name_range)),
+                            },
+                            range,
+                        ),
+                    };
                 }
                 _ => break,
             }
         }
 
         Some(expr)
+    }
+
+    // a template arrives flat from the lexer: literal chunks around ${...}
+    // holes; each hole must hold a reference path expression
+    fn parse_template(&mut self) -> Option<Expr> {
+        let start = self.peek().range.start;
+        self.expect(token!(TemplateOpen), ErrorKind::ExpectedStringLiteral)?;
+
+        let mut parts = Vec::new();
+        loop {
+            if let Some(value) = self.consume(token!(TemplateChunk(value))) {
+                parts.push(TemplatePart::Lit(value));
+            } else if self.check(token!(InterpOpen)) {
+                let open = self.peek().range;
+                self.next();
+                match self.parse_interpolation_ref() {
+                    Some((expr, end)) => parts.push(TemplatePart::Ref {
+                        expr,
+                        range: SrcRange::new(open.start, end),
+                    }),
+                    None => self.skip_interpolation(),
+                }
+            } else if self.check(token!(TemplateClose)) {
+                let end = self.peek().range.end;
+                self.next();
+                return Some(Expr::new(ExprKind::Template(parts), SrcRange::new(start, end)));
+            } else {
+                // lexing closes every template it emits, so this is unreachable
+                self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
+                return None;
+            }
+        }
+    }
+
+    // a reference head extended by postfix selections, up to the hole's closing
+    // brace; operators and calls stay out of the hole's top level, but bracket
+    // indexes and slice bounds hold full expressions
+    fn parse_interpolation_ref(&mut self) -> Option<(Expr, usize)> {
+        let range = self.peek().range;
+        let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedInterpolationPath)?;
+        let head = Expr::new(ExprKind::Ref { path: vec![name] }, range);
+        let expr = self.parse_postfix_from(head)?;
+
+        if !self.check(token!(InterpClose)) {
+            self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
+            return None;
+        }
+        let end = self.peek().range.end;
+        self.next();
+        Some((expr, end))
+    }
+
+    // drops a bad hole's tokens through its closing brace so the template resumes
+    fn skip_interpolation(&mut self) {
+        while !self.check(token!(TemplateClose)) && !self.eof() {
+            if self.consume(token!(InterpClose)).is_some() {
+                return;
+            }
+            self.next();
+        }
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
@@ -271,11 +343,7 @@ impl<'src> Parser<'src> {
                 let value = self.expect(token!(String(value)), ErrorKind::ExpectedStringLiteral)?;
                 Some(Expr::new(ExprKind::Str(value), range))
             }
-            TokenKind::Template(_) => {
-                let range = self.peek().range;
-                let value = self.expect(token!(Template(value)), ErrorKind::ExpectedStringLiteral)?;
-                Some(Expr::new(ExprKind::Template(value), range))
-            }
+            TokenKind::TemplateOpen => self.parse_template(),
             TokenKind::Number(_) => {
                 let range = self.peek().range;
                 let value = self.expect(token!(Number(value)), ErrorKind::ExpectedNumberLiteral)?;
@@ -292,12 +360,6 @@ impl<'src> Parser<'src> {
                 } else if value == "null" {
                     self.next();
                     Some(Expr::new(ExprKind::Null, range))
-                } else if value == "var" {
-                    self.next();
-                    self.expect(token!(Dot), ErrorKind::ExpectedVariableName)?;
-                    let name_range = self.peek().range;
-                    let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedVariableName)?;
-                    Some(Expr::new(ExprKind::VarRef(name), SrcRange::new(range.start, name_range.end)))
                 } else if matches!(self.peek_ahead().kind, TokenKind::LParen) {
                     let name = value.clone();
                     self.next();
@@ -315,13 +377,11 @@ impl<'src> Parser<'src> {
                     self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
 
                     Some(Expr::new(ExprKind::Func { name, args }, SrcRange::new(range.start, end)))
-                } else if self.scopes.iter().any(|binding| binding == value) {
+                } else {
+                    // any other ident starts a reference path, the modeler resolves it
                     let name = value.clone();
                     self.next();
-                    Some(Expr::new(ExprKind::LoopRef(name), range))
-                } else {
-                    self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
-                    None
+                    Some(Expr::new(ExprKind::Ref { path: vec![name] }, range))
                 }
             }
             TokenKind::LBrack => {
@@ -425,10 +485,7 @@ impl<'src> Parser<'src> {
         let collection = self.parse_expr()?;
         self.expect(token!(Colon), ErrorKind::ExpectedForColon)?;
 
-        self.scopes.extend(bindings.iter().cloned());
-        let tail = self.parse_for_tail(object);
-        self.scopes.truncate(self.scopes.len() - bindings.len());
-        let (key, body, cond) = tail?;
+        let (key, body, cond) = self.parse_for_tail(object)?;
 
         let end = self.peek().range.end;
         if object {
@@ -449,7 +506,6 @@ impl<'src> Parser<'src> {
         ))
     }
 
-    // the part of a for expr with bindings in scope, split out so the caller can pop them
     fn parse_for_tail(&mut self, object: bool) -> Option<(Option<Expr>, Expr, Option<Expr>)> {
         let (key, body) = if object {
             let key = self.parse_expr()?;
@@ -578,7 +634,7 @@ pub(super) enum ErrorKind {
     ExpectedNumberLiteral,
     ExpectedExpression,
     InterpolatedName,
-    ExpectedVariableName,
+    ExpectedInterpolationPath,
     ExpectedAccessorField,
     ExpectedTernaryColon,
     ExpectedForBinding,
@@ -600,7 +656,7 @@ impl fmt::Display for ErrorKind {
             Self::ExpectedNumberLiteral => "expected number",
             Self::ExpectedExpression => "expected expression",
             Self::InterpolatedName => "block names do not support interpolation",
-            Self::ExpectedVariableName => "expected variable name",
+            Self::ExpectedInterpolationPath => "expected a reference path in interpolation",
             Self::ExpectedAccessorField => "expected field name after `.`",
             Self::ExpectedTernaryColon => "expected `:` in conditional expression",
             Self::ExpectedForBinding => "expected loop binding name after `for`",
@@ -754,12 +810,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bare_identifiers_that_are_not_keyword_literals() {
-        // the stray `nil` is re-scanned as a declaration during recovery, adding a second error
-        assert_error_kinds(
-            r#"trace "a" { output = nil }"#,
-            &[ErrorKind::UnexpectedToken, ErrorKind::ExpectedDeclaration],
-        );
+    fn parses_bare_identifiers_as_references() {
+        // `nil` is not a keyword literal, it parses as a reference the modeler rejects
+        let ast = parse(r#"trace "a" { output = nil }"#).unwrap();
+        let output = attr(&block(&ast.decls[0]).decls[0]);
+        assert!(matches!(&output.value.kind, ExprKind::Ref { path } if path == &["nil"]));
     }
 
     #[test]
@@ -774,7 +829,10 @@ mod tests {
         };
         assert_eq!(parts.len(), 2);
         assert!(matches!(&parts[0], TemplatePart::Lit(value) if value == "q "));
-        assert!(matches!(&parts[1], TemplatePart::Ref { path, .. } if path == &["trace", "index"]));
+        let TemplatePart::Ref { expr, .. } = &parts[1] else {
+            panic!("expected a reference hole");
+        };
+        assert!(matches!(&expr.kind, ExprKind::Ref { path } if path == &["trace", "index"]));
 
         let ExprKind::Array(tags) = &attr(&trace.decls[1]).value.kind else {
             panic!("expected an array");
@@ -783,8 +841,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_interpolation_holes_with_indexes_and_quoted_segments() {
+        use crate::dsl::ast::TemplatePart;
+
+        let ast = parse(r#"trace "a" { input = "v ${var.xs[repeat.index - 1]} n ${llm["Chat Completion"].output}" }"#).unwrap();
+        let ExprKind::Template(parts) = &attr(&block(&ast.decls[0]).decls[0]).value.kind else {
+            panic!("expected a template");
+        };
+        assert_eq!(parts.len(), 4);
+
+        // ${var.xs[repeat.index - 1]} is an index whose bracket holds a full expression
+        let TemplatePart::Ref { expr, .. } = &parts[1] else {
+            panic!("expected a reference hole");
+        };
+        let ExprKind::Index { target, index } = &expr.kind else {
+            panic!("expected an index");
+        };
+        assert!(matches!(&target.kind, ExprKind::Ref { path } if path == &["var", "xs"]));
+        assert!(matches!(&index.kind, ExprKind::Binary { op: BinOp::Sub, .. }));
+
+        // ${llm["Chat Completion"].output} is a quoted segment then a field selection
+        let TemplatePart::Ref { expr, .. } = &parts[3] else {
+            panic!("expected a reference hole");
+        };
+        let ExprKind::Index { target, index } = &expr.kind else {
+            panic!("expected an index");
+        };
+        assert!(matches!(&index.kind, ExprKind::Str(value) if value == "output"));
+        let ExprKind::Index { target, index } = &target.kind else {
+            panic!("expected an index");
+        };
+        assert!(matches!(&target.kind, ExprKind::Ref { path } if path == &["llm"]));
+        assert!(matches!(&index.kind, ExprKind::Str(value) if value == "Chat Completion"));
+    }
+
+    #[test]
+    fn rejects_calls_at_an_interpolation_holes_top_level() {
+        assert_error_kinds(r#"a = "${upper(x)}""#, &[ErrorKind::UnexpectedToken]);
+    }
+
+    #[test]
     fn rejects_interpolated_block_names() {
         assert_error_kinds(r#"trace "${trace.index}" {}"#, &[ErrorKind::InterpolatedName]);
+    }
+
+    #[test]
+    fn rejects_interpolations_without_a_reference_path() {
+        assert_error_kinds(r#"a = "${}""#, &[ErrorKind::ExpectedInterpolationPath]);
+        assert_error_kinds(r#"a = "${1x}""#, &[ErrorKind::ExpectedInterpolationPath]);
+        assert_error_kinds(r#"a = "${.index}""#, &[ErrorKind::ExpectedInterpolationPath]);
+    }
+
+    #[test]
+    fn rejects_malformed_interpolation_paths() {
+        assert_error_kinds(r#"a = "${trace.}""#, &[ErrorKind::ExpectedAccessorField]);
+        assert_error_kinds(r#"a = "${tr ace}""#, &[ErrorKind::UnexpectedToken]);
+        assert_error_kinds(r#"a = "${a + b}""#, &[ErrorKind::UnexpectedToken]);
+        assert_error_kinds(r#"a = "${x?y:z}""#, &[ErrorKind::UnexpectedToken]);
+    }
+
+    #[test]
+    fn recovers_template_parsing_after_a_bad_hole() {
+        // the bad hole drops out, the template and its later parts survive
+        let errors = parse(r#"a = "x ${a +} y ${b.}""#).unwrap_err();
+        assert_eq!(errors.len(), 2);
     }
 
     #[test]
@@ -794,14 +914,55 @@ mod tests {
         let trace = block(&ast.decls[0]);
 
         let metadata = attr(&trace.decls[0]);
-        assert!(matches!(&metadata.value.kind, ExprKind::VarRef(name) if name == "meta"));
+        assert!(matches!(&metadata.value.kind, ExprKind::Ref { path } if path == &["var", "meta"]));
         let range = metadata.value.range;
         assert_eq!(&source[range.start..range.end], "var.meta");
 
         let ExprKind::Array(items) = &attr(&trace.decls[1]).value.kind else {
             panic!("expected an array");
         };
-        assert!(matches!(&items[0].kind, ExprKind::VarRef(name) if name == "x"));
+        assert!(matches!(&items[0].kind, ExprKind::Ref { path } if path == &["var", "x"]));
+    }
+
+    #[test]
+    fn parses_context_references() {
+        let source = r#"trace "a" { input = trace.index metrics = { turn = repeat.index + 1, of = repeat.count } }"#;
+        let ast = parse(source).unwrap();
+        let trace = block(&ast.decls[0]);
+
+        let input = attr(&trace.decls[0]);
+        assert!(matches!(&input.value.kind, ExprKind::Ref { path } if path == &["trace", "index"]));
+        let range = input.value.range;
+        assert_eq!(&source[range.start..range.end], "trace.index");
+
+        let ExprKind::Object(items) = &attr(&trace.decls[1]).value.kind else {
+            panic!("expected an object");
+        };
+        let ObjectItem::Attr(turn) = &items[0] else {
+            panic!("expected an attribute");
+        };
+        let ExprKind::Binary { lhs, .. } = &turn.value.kind else {
+            panic!("expected a binary expression");
+        };
+        assert!(matches!(&lhs.kind, ExprKind::Ref { path } if path == &["repeat", "index"]));
+        let ObjectItem::Attr(of) = &items[1] else {
+            panic!("expected an attribute");
+        };
+        assert!(matches!(&of.value.kind, ExprKind::Ref { path } if path == &["repeat", "count"]));
+    }
+
+    #[test]
+    fn parses_loop_references_as_paths() {
+        let ast = parse(r#"trace "a" { input = [for trace in [1] : trace] }"#).unwrap();
+        let ExprKind::For { body, .. } = &attr(&block(&ast.decls[0]).decls[0]).value.kind else {
+            panic!("expected a for expression");
+        };
+        assert!(matches!(&body.kind, ExprKind::Ref { path } if path == &["trace"]));
+    }
+
+    #[test]
+    fn rejects_context_references_missing_a_field() {
+        assert_error_kinds(r#"trace "a" { input = repeat. }"#, &[ErrorKind::ExpectedAccessorField]);
     }
 
     #[test]
@@ -844,8 +1005,12 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_variable_references() {
-        assert_error_kinds(r#"trace "a" { metadata = var }"#, &[ErrorKind::ExpectedVariableName]);
-        assert_error_kinds(r#"trace "a" { metadata = var. }"#, &[ErrorKind::ExpectedVariableName]);
+        // a bare `var` parses as a reference, the modeler rejects it as unknown
+        let ast = parse(r#"trace "a" { metadata = var }"#).unwrap();
+        let metadata = attr(&block(&ast.decls[0]).decls[0]);
+        assert!(matches!(&metadata.value.kind, ExprKind::Ref { path } if path == &["var"]));
+
+        assert_error_kinds(r#"trace "a" { metadata = var. }"#, &[ErrorKind::ExpectedAccessorField]);
     }
 
     #[test]
@@ -869,7 +1034,7 @@ mod tests {
             panic!("expected a nested index expression");
         };
         assert!(matches!(&index.kind, ExprKind::Num(value) if value == "0"));
-        assert!(matches!(&target.kind, ExprKind::VarRef(name) if name == "xs"));
+        assert!(matches!(&target.kind, ExprKind::Ref { path } if path == &["var", "xs"]));
 
         let range = input.value.range;
         assert_eq!(&source[range.start..range.end], r#"var.xs[0]["k"].name"#);
@@ -1244,7 +1409,7 @@ mod tests {
         let ExprKind::Slice { target, start, end } = &input.value.kind else {
             panic!("expected a slice expression");
         };
-        assert!(matches!(&target.kind, ExprKind::VarRef(name) if name == "xs"));
+        assert!(matches!(&target.kind, ExprKind::Ref { path } if path == &["var", "xs"]));
         assert!(matches!(&start.as_ref().unwrap().kind, ExprKind::Num(value) if value == "1"));
         assert!(matches!(&end.as_ref().unwrap().kind, ExprKind::Num(value) if value == "3"));
         let range = input.value.range;
@@ -1302,7 +1467,7 @@ mod tests {
         let ExprKind::Spread(operand) = &values[1].kind else {
             panic!("expected a spread element");
         };
-        assert!(matches!(&operand.kind, ExprKind::VarRef(name) if name == "xs"));
+        assert!(matches!(&operand.kind, ExprKind::Ref { path } if path == &["var", "xs"]));
         let range = values[1].range;
         assert_eq!(&source[range.start..range.end], "...var.xs");
     }
@@ -1317,7 +1482,7 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert!(matches!(&items[0], ObjectItem::Attr(attr) if attr.key == "a"));
         assert!(
-            matches!(&items[1], ObjectItem::Spread(operand) if matches!(&operand.kind, ExprKind::VarRef(name) if name == "meta"))
+            matches!(&items[1], ObjectItem::Spread(operand) if matches!(&operand.kind, ExprKind::Ref { path } if path == &["var", "meta"]))
         );
         assert!(matches!(&items[2], ObjectItem::Attr(attr) if attr.key == "b"));
     }
@@ -1344,13 +1509,13 @@ mod tests {
             panic!("expected a for expression");
         };
         assert_eq!(bindings, &["x".to_owned()]);
-        assert!(matches!(&collection.kind, ExprKind::VarRef(name) if name == "xs"));
+        assert!(matches!(&collection.kind, ExprKind::Ref { path } if path == &["var", "xs"]));
         assert!(key.is_none() && cond.is_none());
 
         let ExprKind::Binary { lhs, .. } = &body.kind else {
             panic!("expected a binary body");
         };
-        assert!(matches!(&lhs.kind, ExprKind::LoopRef(name) if name == "x"));
+        assert!(matches!(&lhs.kind, ExprKind::Ref { path } if path == &["x"]));
 
         let range = input.value.range;
         assert_eq!(&source[range.start..range.end], "[for x in var.xs : x * 2]");
@@ -1375,8 +1540,8 @@ mod tests {
             panic!("expected a for expression");
         };
         assert_eq!(bindings, &["k".to_owned(), "v".to_owned()]);
-        assert!(matches!(&key.as_ref().unwrap().kind, ExprKind::LoopRef(name) if name == "k"));
-        assert!(matches!(&body.kind, ExprKind::LoopRef(name) if name == "v"));
+        assert!(matches!(&key.as_ref().unwrap().kind, ExprKind::Ref { path } if path == &["k"]));
+        assert!(matches!(&body.kind, ExprKind::Ref { path } if path == &["v"]));
     }
 
     #[test]
@@ -1389,8 +1554,8 @@ mod tests {
         let ExprKind::For { collection, body, .. } = &body.kind else {
             panic!("expected a nested for expression");
         };
-        assert!(matches!(&collection.kind, ExprKind::LoopRef(name) if name == "x"));
-        assert!(matches!(&body.kind, ExprKind::LoopRef(name) if name == "y"));
+        assert!(matches!(&collection.kind, ExprKind::Ref { path } if path == &["x"]));
+        assert!(matches!(&body.kind, ExprKind::Ref { path } if path == &["y"]));
     }
 
     #[test]
@@ -1411,13 +1576,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_loop_refs_outside_their_scope() {
-        // x is out of scope in the collection and after the for expr
-        assert_first_error(r#"trace "t" { input = [for x in x : x] }"#, ErrorKind::UnexpectedToken);
-        assert_first_error(
-            r#"trace "t" { input = [[for x in var.xs : x], x] }"#,
-            ErrorKind::UnexpectedToken,
-        );
+    fn parses_out_of_scope_refs_for_the_modeler_to_reject() {
+        // x is out of scope in the collection and after the for expr, but scoping
+        // is the modeler's concern, both parse as plain references
+        assert!(parse(r#"trace "t" { input = [for x in x : x] }"#).is_ok());
+        assert!(parse(r#"trace "t" { input = [[for x in var.xs : x], x] }"#).is_ok());
     }
 
     #[test]
@@ -1455,7 +1618,7 @@ mod tests {
 
     #[test]
     fn recovers_to_the_next_declaration_after_an_operator_error() {
-        // the dangling + errors once, output = 2 still parses as the next decl
-        assert_error_kinds(r#"trace "t" { input = 1 + output = 2 }"#, &[ErrorKind::UnexpectedToken]);
+        // the dangling + swallows the next key as a reference, the stray = errors once
+        assert_error_kinds(r#"trace "t" { input = 1 + output = 2 }"#, &[ErrorKind::ExpectedIdentifier]);
     }
 }

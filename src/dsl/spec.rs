@@ -217,6 +217,9 @@ pub(crate) mod ids {
     pub(crate) const MULTILINE: Id = Id::new("expr.multiline-string");
     pub(crate) const HEREDOC: Id = Id::new("expr.heredoc");
     pub(crate) const VAR_REF: Id = Id::new("expr.variable-reference");
+    pub(crate) const CTX_REF: Id = Id::new("expr.context-reference");
+    pub(crate) const BLOCK_REF: Id = Id::new("expr.block-reference");
+    pub(crate) const SELF_REF: Id = Id::new("expr.self-reference");
     pub(crate) const NUMBER: Id = Id::new("expr.number");
     pub(crate) const BOOLEAN: Id = Id::new("expr.boolean");
     pub(crate) const NULL: Id = Id::new("expr.null");
@@ -306,9 +309,17 @@ pub(crate) mod ids {
     pub(crate) const BOOLEAN_CONDITIONS: Id = Id::new("rule.boolean-conditions");
     pub(crate) const NONZERO_DIVISORS: Id = Id::new("rule.nonzero-divisors");
     pub(crate) const REPEAT_COUNT: Id = Id::new("rule.repeat-count");
-    pub(crate) const REPEAT_INDEX: Id = Id::new("rule.repeat-index");
+    pub(crate) const REPEAT_REFS: Id = Id::new("rule.repeat-refs");
     pub(crate) const MAYBE_CHANCE: Id = Id::new("rule.maybe-chance");
     pub(crate) const DYNAMIC_CHILDREN: Id = Id::new("rule.dynamic-children");
+    pub(crate) const BLOCK_REFS: Id = Id::new("rule.block-references");
+    pub(crate) const REF_COLLECTIONS: Id = Id::new("rule.reference-collections");
+    pub(crate) const REF_FIELDS: Id = Id::new("rule.reference-fields");
+    pub(crate) const ACYCLIC_REFS: Id = Id::new("rule.acyclic-references");
+    pub(crate) const SELF_REFS: Id = Id::new("rule.self-reference");
+    pub(crate) const STATIC_STRUCTURE: Id = Id::new("rule.static-structure");
+    pub(crate) const RESERVED_REPEAT_NAMES: Id = Id::new("rule.reserved-repeat-names");
+    pub(crate) const REF_EXISTENCE: Id = Id::new("rule.reference-existence");
 
     pub(crate) const MULTI_TURN_CONVERSATION: Id = Id::new("example.multi-turn-conversation");
     pub(crate) const AGENT_TOOL_LOOP: Id = Id::new("example.agent-tool-loop");
@@ -437,7 +448,7 @@ const LLM_CONVENTIONS: &[&str] = &[
     "`metadata` holds the request parameters at the top level: `model`, `provider` (e.g. `openai`, `anthropic`), and settings like `temperature`, `max_tokens`, or `tool_choice`. Use a real registered model id so Braintrust can compute cost from token counts.",
     "`metrics` uses Braintrust's exact field names: `prompt_tokens`, `completion_tokens`, and `tokens` (their sum). These power the token and cost columns in the UI.",
     "Optional metrics, same exact names: `prompt_cached_tokens` (cache reads) and `prompt_cache_creation_tokens` (cache writes), both already included in `prompt_tokens`; `time_to_first_token` in seconds, smaller than the span duration; `estimated_cost` to override the computed cost.",
-    "Metric values cannot reference sibling fields, so a sampled `prompt_tokens` cannot feed an exact `tokens` sum directly. Declare sampled token counts in a `vars` block on the llm span and reference them: `vars { pt = round(lognormal(600, 0.4)), ct = round(lognormal(90, 0.7)) }` then `metrics = { prompt_tokens = var.pt, completion_tokens = var.ct, tokens = var.pt + var.ct }`.",
+    "Metric keys can reference their siblings, so sampled token counts sum exactly in place: `metrics = { prompt_tokens = round(lognormal(600, 0.4)), completion_tokens = round(lognormal(90, 0.7)), tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens }`. For counts that match the actual content, compute them: `tokens = tokens(self.input) + tokens(self.output)`.",
 ];
 const TOOL_CONVENTIONS: &[&str] = &[
     "Name tool spans exactly the tool's function name (`get_stock_performance`), never a description of what it does.",
@@ -450,7 +461,7 @@ const FUNCTION_CONVENTIONS: &[&str] = &[
 ];
 const REPEAT_CONVENTIONS: &[&str] = &[
     "Sample `count` (`weighted`, `poisson`, `range`) so structure differs per trace; a constant count belongs only in a grouping repeat.",
-    "Every iteration stamps identical content except `${repeat.index}`, so repeat suits structurally similar steps (tool rounds, workers) — not conversation turns, which must carry history coherently.",
+    "Iterations stamp identical content except where `repeat.index` and `repeat.count` parameterize it. Index into or slice a trace-scope var to vary content per iteration — `input = var.messages[:(repeat.index * 2) + 1]` carries conversation history coherently across turns.",
     "`repeat` with `count = 1` stamps its children once and adds no span, which groups several blocks into a single `choice` alternative.",
 ];
 const CHOICE_CONVENTIONS: &[&str] = &[
@@ -470,9 +481,44 @@ const UNIQUE_OBJECT_KEYS_RULE: &[RuleDesc] = &[RuleDesc {
     id: ids::UNIQUE_OBJECT_KEYS,
     summary: "An object key may appear at most once in an object.",
 }];
-const KNOWN_REFERENCES_RULE: &[RuleDesc] = &[RuleDesc {
+const KNOWN_REFERENCES_RULE: RuleDesc = RuleDesc {
     id: ids::KNOWN_REFERENCES,
-    summary: "An interpolation may only use documented references; currently `trace.index`, the 0-based index of the generated trace, `repeat.index`, the 0-based iteration of the innermost enclosing repeat block, and `var.<name>` for a defined variable.",
+    summary: "A reference must be documented; currently `trace.index`, the 0-based index of the generated trace, `repeat.index` and `repeat.count`, the 0-based iteration and total count of the innermost enclosing repeat block, `var.<name>` for a defined variable, block references rooted at a block kind or `trace`, and `self` for the enclosing span or trace.",
+};
+const KNOWN_REFERENCES_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE];
+const BLOCK_REF_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::BLOCK_REFS,
+        summary: "A block reference resolves lexically: walking up the enclosing blocks, the nearest scope whose children include a matching kind and name wins. `self` addresses the innermost enclosing span or trace; `trace` addresses the enclosing trace's own fields. A reference must end in a field and never crosses trace boundaries.",
+    },
+    RuleDesc {
+        id: ids::REF_COLLECTIONS,
+        summary: "Same-kind siblings sharing a name form an ordered positional collection: a lone match is addressed directly (an explicit `[0]` also works); several matches require an index segment before the field.",
+    },
+    RuleDesc {
+        id: ids::REF_FIELDS,
+        summary: "The referenceable surface of a block is its fields — input, output, expected, error, metadata, metrics, and tags — plus key and index selections into them; vars stay private to their scopes, and a reference to a field the target never sets is rejected.",
+    },
+    RuleDesc {
+        id: ids::ACYCLIC_REFS,
+        summary: "References work regardless of where they are written, as long as the value dataflow stays acyclic; a reference cycle is rejected during validation when it is visible statically and fails generation otherwise.",
+    },
+    RuleDesc {
+        id: ids::STATIC_STRUCTURE,
+        summary: "Structure stays independent of generated data: `count`, `chance`, and `for` collections cannot reach a block reference, directly or through variables, and root-scope vars cannot hold block references at all.",
+    },
+    RuleDesc {
+        id: ids::RESERVED_REPEAT_NAMES,
+        summary: "`index` and `count` cannot name a repeat block: under `repeat.<name>` they address the named enclosing repeat's current iteration and total count.",
+    },
+    RuleDesc {
+        id: ids::REF_EXISTENCE,
+        summary: "A reference crossing a named choice or maybe evaluates to null when that branch was not picked or did not fire; guard with `!= null` or read `choice.<name>.chosen` and `maybe.<name>.included`. An out-of-range iteration or position index fails generation instead.",
+    },
+];
+const SELF_REF_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::SELF_REFS,
+    summary: "`self` addresses the innermost enclosing span or trace, skipping repeat, choice, and maybe blocks; it takes no name segment and works regardless of duplicate names.",
 }];
 const VARS_RULES: &[RuleDesc] = &[
     RuleDesc {
@@ -647,16 +693,18 @@ const HEREDOC_RULES: &[RuleDesc] = &[
         summary: "`<<` keeps every content line verbatim; `<<-` strips the longest whitespace prefix shared by the non-blank content lines, and blank lines keep only their newline.",
     },
 ];
+const REPEAT_REFS_RULE: RuleDesc = RuleDesc {
+    id: ids::REPEAT_REFS,
+    summary: "`repeat.index` (the 0-based iteration) and `repeat.count` (the total number of iterations) resolve against the innermost enclosing repeat block and are only valid inside one.",
+};
 const REPEAT_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::REPEAT_COUNT,
         summary: "`count` must evaluate to a non-negative integer; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
     },
-    RuleDesc {
-        id: ids::REPEAT_INDEX,
-        summary: "`repeat.index` interpolates the 0-based iteration of the innermost enclosing repeat block and is only valid inside one.",
-    },
+    REPEAT_REFS_RULE,
 ];
+const CTX_REF_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE, REPEAT_REFS_RULE];
 const MAYBE_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::MAYBE_CHANCE,
     summary: "`chance` must evaluate to a number between 0 and 1 inclusive; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
@@ -685,7 +733,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         syntax: "\"text ${reference} text\"",
         summary: "A string containing `${...}` interpolations resolved for each generated trace. Valid anywhere a string is, except block names.",
         examples: &["\"question #${trace.index}\""],
-        rules: KNOWN_REFERENCES_RULE,
+        rules: KNOWN_REFERENCES_RULES,
     },
     ExprDesc {
         id: ids::MULTILINE,
@@ -707,6 +755,37 @@ const EXPR_TYPES: &[ExprDesc] = &[
         summary: "A reference to a variable defined in a vars block in scope. Constant values resolve during validation; a value that varies per trace is evaluated once per instantiation of its declaring block, so every reference sees the same value. Usable as any value, or interpolated with `${var.<name>}`.",
         examples: &["var.temperature", "\"model: ${var.model}\""],
         rules: VAR_REF_RULES,
+    },
+    ExprDesc {
+        id: ids::CTX_REF,
+        syntax: "trace.index | repeat.index | repeat.count",
+        summary: "A context reference resolved for each generated trace: `trace.index` is the 0-based index of the trace being generated; `repeat.index` and `repeat.count` are the 0-based iteration and total count of the innermost enclosing repeat block. All are integers, usable as any number or interpolated with `${...}`.",
+        examples: &["repeat.index + 1", "var.messages[:repeat.index + 1]", "\"question #${trace.index}\""],
+        rules: CTX_REF_RULES,
+    },
+    ExprDesc {
+        id: ids::BLOCK_REF,
+        syntax: "<kind>.<name>.<field> | <kind>[\"name\"].<field> | trace.<field> | repeat.<name>[i]... | choice.<name>.chosen | maybe.<name>.included",
+        summary: "A reference to another block's field, resolved for each generated trace: the head names a block kind, the name segment picks the block among the enclosing scopes' children, and the path ends in one of its fields, optionally followed by key or index selections into the field's value. `trace.<field>` reads the enclosing trace's own fields. `repeat.<name>` addresses a repeat's iterations: `[i]` selects one, a slice like `[:repeat.index]` projects the rest of the path over each selected iteration and yields an array, and `.index`/`.count` read the named enclosing repeat's current iteration. `choice.<name>.chosen` is the 0-based pick and `maybe.<name>.included` whether it fired; a reference crossing an unchosen branch reads as null. Usable as any value, or interpolated with `${...}`.",
+        examples: &[
+            "llm.chat.output.content",
+            "llm[\"Chat Completion\"].metrics.tokens",
+            "trace.input",
+            "repeat.rounds[repeat.index - 1].llm.chat.output",
+            "[...repeat.rounds[:repeat.index].llm.chat.output]",
+            "choice.outcome.chosen",
+        ],
+        rules: BLOCK_REF_RULES,
+    },
+    ExprDesc {
+        id: ids::SELF_REF,
+        syntax: "self.<field>",
+        summary: "A reference to the innermost enclosing span or trace's own fields, for derivations that read the block's other values. Skips enclosing repeat, choice, and maybe blocks, and stays unambiguous under duplicate names.",
+        examples: &[
+            "tokens(self.output)",
+            "self.metrics.prompt_tokens + self.metrics.completion_tokens",
+        ],
+        rules: SELF_REF_RULES,
     },
     ExprDesc {
         id: ids::NUMBER,
@@ -1310,11 +1389,12 @@ additive       = multiplicative, { ( "+" | "-" ), multiplicative } ;
 multiplicative = unary, { ( "*" | "/" | "%" ), unary } ;
 unary          = ( "-" | "!" ), unary | postfix ;
 postfix        = primary, { "[", expression, "]" | "[", [ expression ], ":", [ expression ], "]" | ".", identifier } ;
-primary        = string | number | boolean | null | array | object | variable | binding | function
+primary        = string | number | boolean | null | array | object | variable | context | binding | function
                | "(", expression, ")" ;
 boolean        = "true" | "false" ;
 null           = "null" ;
 variable       = "var", ".", identifier ;
+context        = ( "trace" | "repeat" ), ".", identifier ;
 binding        = identifier (* a loop binding introduced by an enclosing for expression *) ;
 function       = identifier, "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
 array          = "[", [ array_items | for_array ], "]" ;
@@ -1333,8 +1413,8 @@ quoted         = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | inte
 multiline      = '"""', NEWLINE, { ANY_EXCEPT_TRIPLE_QUOTE | escape | interpolation }, '"""' ;
 heredoc        = "<<", [ "-" ], identifier, NEWLINE, { ANY | escape | interpolation }, NEWLINE, [ WHITESPACE ], identifier ;
 escape         = "$${" ;
-interpolation  = "${", reference, "}" ;
-reference      = identifier, { ".", identifier } ;
+interpolation  = "${", reference_path, "}" ;
+reference_path = identifier, { ".", identifier | "[", expression, "]" | "[", [ expression ], ":", [ expression ], "]" } ;
 comment        = ( "#" | "//" ), { ANY_EXCEPT_NEWLINE } ;
 "##,
         notes: &[
@@ -1345,7 +1425,8 @@ comment        = ( "#" | "//" ), { ANY_EXCEPT_NEWLINE } ;
             "Inside strings, `$${` escapes a literal `${`; any other `$` is literal.",
             "Block names are plain strings; interpolation is not allowed in them.",
             "Binary operators are left-associative; `?:` is right-associative.",
-            "Interpolations accept references only, not operators or function calls.",
+            "Interpolations accept reference paths only — no operators or function calls at the hole's top level, though bracket indexes and slice bounds hold full expressions.",
+            "`trace` and `repeat` are not reserved; a loop binding with either name shadows the context references inside its for expression.",
             "A missing comma between numeric items parses as subtraction: `[1 -2]` is the one-element array `[-1]`.",
             "A missing comma before an item starting with `[` parses as an index: `[var.a [0]]` is the one-element array `[var.a[0]]`.",
             "`for` is a keyword only directly after `[` or `{`; `{ for = 1 }` is still an attribute. `in` and `if` are keywords only inside a for expression, and none of the three can name a loop binding.",

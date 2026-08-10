@@ -6,11 +6,11 @@ mod modeler;
 mod parser;
 pub(crate) mod spec;
 
-pub(crate) use ast::{BinOp, UnaryOp};
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use model::{
-    Array, Binding, Child, Choice, CtxRef, Func, Maybe, Model, Number, Object, ObjectField, Part, Range, Repeat, Span,
-    SpanFields, SpanKind, Template, Trace, Value,
+    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NodeId, Number, Object,
+    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, SpanFields, SpanKind, Step, Template,
+    Trace, UnaryOp, Value,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};

@@ -16,6 +16,8 @@ pub enum Decl {
 pub struct Block {
     pub kind: String,
     pub name: Option<String>,
+    // the name literal's own range, for name-precise diagnostics
+    pub name_range: Option<SrcRange>,
     pub decls: Vec<Decl>,
     pub range: SrcRange,
 }
@@ -42,15 +44,10 @@ pub enum ExprKind {
     Null,
     Array(Vec<Expr>),
     Object(Vec<ObjectItem>),
-    VarRef(String),
-    // a var ref resolved to a dynamic scoped variable, synthesized by the modeler;
-    // carries the folded definition so type checks see through to it
-    Bound {
-        name: String,
-        expr: Box<Expr>,
+    // a dotted reference path like a.b.c, plain syntax with no namespace meaning
+    Ref {
+        path: Vec<String>,
     },
-    // a loop binding introduced by an enclosing for expr
-    LoopRef(String),
     Func {
         name: String,
         args: Vec<Expr>,
@@ -148,10 +145,12 @@ impl fmt::Display for BinOp {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+// a hole holds a reference path expression: a ref head extended by field and
+// index selections, with full expressions legal inside the brackets
+#[derive(Debug, Clone, PartialEq)]
 pub enum TemplatePart {
     Lit(String),
-    Ref { path: Vec<String>, range: SrcRange },
+    Ref { expr: Expr, range: SrcRange },
 }
 
 impl Expr {

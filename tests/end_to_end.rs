@@ -111,6 +111,50 @@ fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
 }
 
 #[test]
+fn dry_run_resolves_context_references_in_expressions() {
+    let shape = write_shape(
+        r#"
+        trace "conversation" {
+            vars { messages = ["q0", "a0", "q1", "a1", "q2", "a2"] }
+            repeat "turns" {
+                count = 3
+                llm "chat" {
+                    input = var.messages[:(repeat.index * 2) + 1]
+                    output = var.messages[(repeat.index * 2) + 1]
+                    metrics = { turn = repeat.index + 1, of = repeat.count }
+                }
+            }
+        }
+        "#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+        .args(["generate", "--from"])
+        .arg(&shape)
+        .args(["--count", "1", "--over", "1h", "--dry-run"])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    let turns = events
+        .iter()
+        .filter(|event| event["span_attributes"]["name"] == "chat")
+        .collect::<Vec<_>>();
+
+    // history grows per iteration while the answer tracks the turn
+    assert_eq!(turns.len(), 3);
+    assert_eq!(turns[0]["input"], JsonValue::from(vec!["q0"]));
+    assert_eq!(turns[2]["input"], JsonValue::from(vec!["q0", "a0", "q1", "a1", "q2"]));
+    assert_eq!(turns[2]["output"], JsonValue::from("a2"));
+    for (index, turn) in turns.iter().enumerate() {
+        assert_eq!(turn["metrics"]["turn"].as_i64().unwrap(), index as i64 + 1);
+        assert_eq!(turn["metrics"]["of"].as_i64().unwrap(), 3);
+    }
+}
+
+#[test]
 fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     let shape = write_shape(r#"trace "t" { input = 100 / range(0, 0) }"#);
     let output = Command::new(env!("CARGO_BIN_EXE_bts"))
@@ -128,6 +172,54 @@ fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
         stderr.contains(":1:21: generation error: expression divides by zero"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn threads_referenced_content_across_spans() {
+    let shape = write_shape(
+        r#"
+        trace "support" {
+            input = "Can I get invoices with our VAT number on them?"
+            output = llm.chat.output.content
+
+            llm "chat" {
+                input = [{ role = "user", content = trace.input }]
+                output = { role = "assistant", content = choice("Yes -- add it under Billing Settings.", "Yes, in Tax IDs.") }
+                metrics = {
+                    prompt_tokens = round(lognormal(400, 0.3)),
+                    completion_tokens = round(lognormal(40, 0.5)),
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
+                }
+            }
+        }
+        "#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+        .args(["generate", "--from"])
+        .arg(&shape)
+        .args(["--count", "4", "--over", "1h", "--dry-run", "--seed", "9"])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    assert_eq!(events.len(), 8);
+
+    for pair in events.chunks(2) {
+        let (root, llm) = (&pair[0], &pair[1]);
+        // the sampled answer threads from the llm span up into the trace output
+        assert_eq!(root["output"], llm["output"]["content"]);
+        // and the question threads down into the llm's message list
+        assert_eq!(llm["input"][0]["content"], root["input"]);
+        // sibling metric keys sum exactly
+        let metrics = &llm["metrics"];
+        assert_eq!(
+            metrics["tokens"].as_i64().unwrap(),
+            metrics["prompt_tokens"].as_i64().unwrap() + metrics["completion_tokens"].as_i64().unwrap()
+        );
+    }
 }
 
 #[test]

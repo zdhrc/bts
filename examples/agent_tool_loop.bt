@@ -1,6 +1,6 @@
 # agent loop with tool calls -- variance axes: how many rounds run and which
-# tool each round calls. each round is an independent stamp: rounds cannot see
-# each other's results, so keep per-round content self-contained.
+# tool each round calls. rounds carry history: each llm call replays what
+# earlier rounds said, and the closing answer reads the loop's last message.
 
 vars {
     system = "You are an ops agent. Inspect the cluster with tools before answering."
@@ -9,7 +9,8 @@ vars {
 
 trace "ops-agent" {
     input = "Why is checkout-api throwing 502s?"
-    output = "checkout-api is crash-looping on a bad config value; rolling back now."
+    # the trace answers with whatever the closing span actually said
+    output = llm["anthropic.messages.create"].output.content
     metadata = { run_id = uuid() }
     tags = ["agent", "ops"]
 
@@ -18,9 +19,11 @@ trace "ops-agent" {
         count = weighted([1, 5], [2, 3], [3, 1.5], [4, 0.5])
 
         llm "anthropic.messages.create" {
+            # the message list grows by one assistant turn per round
             input = [
                 { role = "system", content = var.system },
-                { role = "user", content = "Why is checkout-api throwing 502s?" },
+                { role = "user", content = trace.input },
+                ...repeat.rounds[:repeat.index].llm["anthropic.messages.create"].output,
             ]
             output = { role = "assistant", content = "Let me inspect the pods and recent logs." }
             metadata = var.meta
@@ -40,15 +43,20 @@ trace "ops-agent" {
         }
     }
 
-    # the closing answer sits outside the loop
+    # the closing answer sits outside the loop and replays the whole run
     llm "anthropic.messages.create" {
         input = [
             { role = "system", content = var.system },
-            { role = "user", content = "Why is checkout-api throwing 502s?" },
-            { role = "assistant", content = "Tool results show crash-looping pods and config parse errors." },
+            { role = "user", content = trace.input },
+            ...repeat.rounds[:].llm["anthropic.messages.create"].output,
         ]
         output = { role = "assistant", content = "checkout-api is crash-looping on a bad config value; rolling back now." }
         metadata = var.meta
-        metrics = { prompt_tokens = 1418, completion_tokens = 58, tokens = 1476, time_to_first_token = 0.71 }
+        metrics = {
+            prompt_tokens = 1418,
+            completion_tokens = 58,
+            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
+            time_to_first_token = 0.71,
+        }
     }
 }

@@ -1,9 +1,10 @@
 use crate::dsl::{
-    Array as ModelArray, BinOp, Binding as ModelBinding, Child as ModelChild, Choice as ModelChoice, CtxRef as ModelCtxRef,
-    Func as ModelFunc, Maybe as ModelMaybe, Model, Number as ModelNumber, Object as ModelObject,
-    ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange, Repeat as ModelRepeat, Span as ModelSpan,
-    SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange, Template as ModelTemplate, Trace as ModelTrace,
-    UnaryOp, Value as ModelValue,
+    Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild, Choice as ModelChoice,
+    CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NodeId, Number as ModelNumber,
+    Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange, RefId,
+    Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields,
+    SpanKind as ModelSpanKind, SrcRange, Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp,
+    Value as ModelValue,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -71,157 +72,823 @@ pub(super) struct Planner {
     traces: Vec<Range<usize>>,
 }
 
+// stable fnv-1a so seeds survive toolchain upgrades; std hashers make no
+// cross-release guarantee
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn mix(hash: u64, value: u64) -> u64 {
+    value.to_le_bytes().iter().fold(hash, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+fn mix_str(hash: u64, value: &str) -> u64 {
+    value.bytes().fold(hash, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+// slot discriminators: a draw is addressed by (instance path, slot), never by
+// evaluation order, so edits to one expression leave every other draw alone
+const COUNT_SALT: u64 = 0x01;
+const CHANCE_SALT: u64 = 0x02;
+const PICK_SALT: u64 = 0x03;
+const FIELD_SALT: u64 = 0x10;
+const KEY_SALT: u64 = 0x20;
+const TAG_SALT: u64 = 0x30;
+const BINDING_SALT: u64 = 0x40;
+
+fn field_salt(field: Field) -> u64 {
+    FIELD_SALT
+        + match field {
+            Field::Input => 0,
+            Field::Output => 1,
+            Field::Expected => 2,
+            Field::Error => 3,
+            Field::Metadata => 4,
+            Field::Metrics => 5,
+            Field::Tags => 6,
+        }
+}
+
+// a lazily evaluated value; busy marks re-entry, which is a reference cycle
 #[derive(Debug)]
-struct Ctx {
+enum BindSlot {
+    Todo(ModelValue),
+    Busy,
+    Done(ModelValue),
+}
+
+#[derive(Debug)]
+enum JsonSlot {
+    Todo(ModelValue),
+    Busy,
+    Done(JsonValue),
+}
+
+#[derive(Debug)]
+enum TagSlot {
+    Todo(ModelTemplate),
+    Busy,
+    Done(String),
+}
+
+#[derive(Debug, Default)]
+struct FieldSlots {
+    input: Option<JsonSlot>,
+    output: Option<JsonSlot>,
+    expected: Option<JsonSlot>,
+    error: Option<JsonSlot>,
+    metadata: Option<Vec<(String, JsonSlot)>>,
+    metrics: Option<Vec<(String, JsonSlot)>>,
+    tags: Vec<TagSlot>,
+}
+
+fn field_slots(fields: &ModelSpanFields) -> FieldSlots {
+    let slot = |value: &Option<ModelValue>| value.clone().map(JsonSlot::Todo);
+    let keyed = |object: &Option<ModelObject>| {
+        object.as_ref().map(|object| {
+            object
+                .elem
+                .iter()
+                .map(|field| (field.key.clone(), JsonSlot::Todo(field.value.clone())))
+                .collect()
+        })
+    };
+    FieldSlots {
+        input: slot(&fields.input),
+        output: slot(&fields.output),
+        expected: slot(&fields.expected),
+        error: slot(&fields.error),
+        metadata: keyed(&fields.metadata),
+        metrics: keyed(&fields.metrics),
+        tags: fields.tags.iter().cloned().map(TagSlot::Todo).collect(),
+    }
+}
+
+// one instantiation of a block for one generated trace; repeats instantiate a
+// collection whose children are the iterations
+#[derive(Debug)]
+struct Instance {
+    node: NodeId,
+    parent: Option<usize>,
+    children: Vec<usize>,
+    shape: Shape,
+    // the stable address of this instantiation, the basis for its slots' rngs
+    path: u64,
+    bindings: Vec<(String, BindSlot)>,
+    fields: FieldSlots,
+}
+
+#[derive(Debug)]
+enum Shape {
+    Trace { name: String },
+    Span { name: String, kind: EventKind },
+    Collection,
+    Iteration { index: usize, count: usize },
+    // only the picked branch instantiates; a reference into another branch
+    // finds no instance and reads as null
+    Choice { pick: usize },
+    Maybe { included: bool },
+}
+
+#[derive(Debug)]
+struct Ctx<'m> {
+    refs: &'m [ResolvedRef],
     trace_index: usize,
+    // the address every instance path derives from: seed and trace index
+    base: u64,
+    // the rng of the slot evaluating right now, swapped as slots force
     rng: SmallRng,
-    // iteration indexes of the enclosing repeats, innermost last
-    repeat_indices: Vec<usize>,
-    // evaluated scope bindings, innermost last; names are unique per the modeler
-    env: Vec<(String, ModelValue)>,
+    // the instance whose expression is evaluating right now
+    site: usize,
+    // the last reference crossed, for shape errors that surface downstream
+    last_ref: Option<SrcRange>,
+    instances: Vec<Instance>,
 }
 
-impl Ctx {
-    // a scope's bindings evaluate once at instantiation, in declaration order
-    fn push_bindings(&mut self, bindings: &[ModelBinding]) -> Result<(), Error> {
-        for binding in bindings {
-            let value = eval_binding(binding.value.clone(), self)?;
-            self.env.push((binding.name.clone(), value));
+impl<'m> Ctx<'m> {
+    fn new(refs: &'m [ResolvedRef], seed: u64, trace_index: usize) -> Self {
+        let base = mix(mix(FNV_BASIS, seed), trace_index as u64);
+        Self {
+            refs,
+            trace_index,
+            base,
+            rng: SmallRng::seed_from_u64(base),
+            site: 0,
+            last_ref: None,
+            instances: Vec::new(),
         }
-        Ok(())
     }
 
-    fn binding(&self, name: &str) -> &ModelValue {
-        self.env
-            .iter()
-            .rev()
-            .find_map(|(known, value)| (known == name).then_some(value))
-            .expect("modeler guarantees references resolve to an evaluated binding")
+    fn slot_rng(&self, path: u64, salt: u64) -> SmallRng {
+        SmallRng::seed_from_u64(mix(path, salt))
     }
-}
 
-impl Planner {
-    fn plan_trace(&mut self, trace: ModelTrace, ctx: &mut Ctx) -> Result<(), Error> {
-        let start = self.events.len();
-        let root = EventRef(start);
+    // evaluates with the site and rng of a slot, restoring the previous ones
+    fn scoped<T>(&mut self, site: usize, rng: SmallRng, eval: impl FnOnce(&mut Self) -> T) -> T {
+        let outer_site = std::mem::replace(&mut self.site, site);
+        let outer_rng = std::mem::replace(&mut self.rng, rng);
+        let value = eval(self);
+        self.site = outer_site;
+        self.rng = outer_rng;
+        value
+    }
 
-        let ModelTrace {
-            name,
+    fn add_instance(
+        &mut self,
+        node: NodeId,
+        parent: Option<usize>,
+        shape: Shape,
+        salt: u64,
+        bindings: &[ModelBinding],
+        fields: FieldSlots,
+    ) -> usize {
+        let parent_path = parent.map_or(self.base, |parent| self.instances[parent].path);
+        let path = mix(mix(parent_path, node.0 as u64), salt);
+        let instance = Instance {
+            node,
+            parent,
+            children: Vec::new(),
+            shape,
+            path,
+            bindings: bindings
+                .iter()
+                .map(|binding| (binding.name.clone(), BindSlot::Todo(binding.value.clone())))
+                .collect(),
             fields,
-            bindings,
-            children,
-        } = trace;
-
-        ctx.push_bindings(&bindings)?;
-
-        self.events.push(EventPlan {
-            root,
-            parent: None,
-            name,
-            kind: EventKind::Task,
-            fields: lower_fields(fields, ctx)?,
-        });
-
-        for child in children {
-            self.plan_child(child, root, root, ctx)?;
+        };
+        let index = self.instances.len();
+        self.instances.push(instance);
+        if let Some(parent) = parent {
+            self.instances[parent].children.push(index);
         }
+        index
+    }
 
-        self.traces.push(start..self.events.len());
+    // the root scope instantiates once per generated trace; its bindings ride
+    // on the trace instance so references inside them resolve against it
+    fn instantiate_trace(&mut self, trace: &ModelTrace, root: &[ModelBinding]) -> Result<(), Error> {
+        let bindings: Vec<ModelBinding> = root.iter().chain(trace.bindings.iter()).cloned().collect();
+        let instance = self.add_instance(
+            trace.node,
+            None,
+            Shape::Trace {
+                name: trace.name.clone(),
+            },
+            0,
+            &bindings,
+            field_slots(&trace.fields),
+        );
+        for child in &trace.children {
+            self.instantiate_child(child, instance)?;
+        }
         Ok(())
     }
 
-    // dynamic blocks draw their structural decisions before any child is planned
-    fn plan_child(&mut self, child: ModelChild, root: EventRef, parent: EventRef, ctx: &mut Ctx) -> Result<(), Error> {
+    // structural decisions draw here, addressed by the block's own path so
+    // they stay stable no matter what else changes
+    fn instantiate_child(&mut self, child: &ModelChild, parent: usize) -> Result<(), Error> {
         match child {
-            ModelChild::Span(span) => self.plan_span(span, root, parent, ctx),
+            ModelChild::Span(span) => {
+                let kind = match span.kind {
+                    ModelSpanKind::Task => EventKind::Task,
+                    ModelSpanKind::Llm => EventKind::Llm,
+                    ModelSpanKind::Tool => EventKind::Tool,
+                    ModelSpanKind::Function => EventKind::Function,
+                };
+                let instance = self.add_instance(
+                    span.node,
+                    Some(parent),
+                    Shape::Span {
+                        name: span.name.clone(),
+                        kind,
+                    },
+                    0,
+                    &span.bindings,
+                    field_slots(&span.fields),
+                );
+                for child in &span.children {
+                    self.instantiate_child(child, instance)?;
+                }
+                Ok(())
+            }
 
             ModelChild::Repeat(ModelRepeat {
+                node,
                 count,
                 count_range,
                 bindings,
                 children,
                 ..
             }) => {
+                let collection = self.add_instance(*node, Some(parent), Shape::Collection, 0, &[], FieldSlots::default());
                 // count is drawn in the parent scope, bindings re-evaluate per iteration
-                let count = eval_count(count, count_range, ctx)?;
+                let rng = self.slot_rng(self.instances[collection].path, COUNT_SALT);
+                let count = self.scoped(parent, rng, |ctx| eval_count(count.clone(), *count_range, ctx))?;
                 for index in 0..count {
-                    ctx.repeat_indices.push(index);
-                    let scope = ctx.env.len();
-                    ctx.push_bindings(&bindings)?;
-                    for child in &children {
-                        self.plan_child(child.clone(), root, parent, ctx)?;
+                    let iteration = self.add_instance(
+                        *node,
+                        Some(collection),
+                        Shape::Iteration { index, count },
+                        index as u64 + 1,
+                        bindings,
+                        FieldSlots::default(),
+                    );
+                    for child in children {
+                        self.instantiate_child(child, iteration)?;
                     }
-                    ctx.env.truncate(scope);
-                    ctx.repeat_indices.pop();
                 }
                 Ok(())
             }
 
-            ModelChild::Choice(ModelChoice { bindings, children, .. }) => {
-                let scope = ctx.env.len();
-                ctx.push_bindings(&bindings)?;
-                let pick = ctx.rng.random_range(0..children.len());
-                let child = children.into_iter().nth(pick).expect("modeler guarantees choice has a child");
-
-                let planned = self.plan_child(child, root, parent, ctx);
-                ctx.env.truncate(scope);
-                planned
+            ModelChild::Choice(ModelChoice {
+                node,
+                bindings,
+                children,
+                ..
+            }) => {
+                let path = mix(mix(self.instances[parent].path, node.0 as u64), 0);
+                let mut rng = self.slot_rng(path, PICK_SALT);
+                let pick = rng.random_range(0..children.len());
+                let instance = self.add_instance(*node, Some(parent), Shape::Choice { pick }, 0, bindings, FieldSlots::default());
+                self.instantiate_child(&children[pick], instance)
             }
 
             ModelChild::Maybe(ModelMaybe {
+                node,
                 chance,
                 chance_range,
                 bindings,
                 children,
                 ..
             }) => {
+                let path = mix(mix(self.instances[parent].path, node.0 as u64), 0);
                 // chance is drawn in the parent scope, bindings evaluate only on inclusion
-                let chance = eval_chance(chance, chance_range, ctx)?;
-                if ctx.rng.random_bool(chance) {
-                    let scope = ctx.env.len();
-                    ctx.push_bindings(&bindings)?;
+                let rng = self.slot_rng(path, CHANCE_SALT);
+                let chance = self.scoped(parent, rng, |ctx| eval_chance(chance.clone(), *chance_range, ctx))?;
+                let mut rng = self.slot_rng(path, PICK_SALT);
+                let included = rng.random_bool(chance);
+                let instance = self.add_instance(*node, Some(parent), Shape::Maybe { included }, 0, bindings, FieldSlots::default());
+                if included {
                     for child in children {
-                        self.plan_child(child, root, parent, ctx)?;
+                        self.instantiate_child(child, instance)?;
                     }
-                    ctx.env.truncate(scope);
                 }
                 Ok(())
             }
         }
     }
 
-    fn plan_span(&mut self, span: ModelSpan, root: EventRef, parent: EventRef, ctx: &mut Ctx) -> Result<(), Error> {
-        let event_ref = EventRef(self.events.len());
+    // one scope level up; collections are transparent, an iteration and its
+    // repeat are the same scope
+    fn scope_parent(&self, instance: usize) -> Option<usize> {
+        let parent = self.instances[instance].parent?;
+        match self.instances[parent].shape {
+            Shape::Collection => self.instances[parent].parent,
+            _ => Some(parent),
+        }
+    }
 
-        let ModelSpan {
-            name,
-            kind,
-            fields,
-            bindings,
-            children,
-        } = span;
+    fn ctx_value(&self, ctx_ref: ModelCtxRef) -> i64 {
+        if ctx_ref == ModelCtxRef::TraceIndex {
+            return self.trace_index as i64;
+        }
+        let mut at = Some(self.site);
+        while let Some(instance) = at {
+            if let Shape::Iteration { index, count } = self.instances[instance].shape {
+                return match ctx_ref {
+                    ModelCtxRef::RepeatIndex => index as i64,
+                    ModelCtxRef::RepeatCount => count as i64,
+                    ModelCtxRef::TraceIndex => unreachable!("trace index returned above"),
+                };
+            }
+            at = self.instances[instance].parent;
+        }
+        unreachable!("modeler validated repeat refs are inside a repeat")
+    }
 
-        let scope = ctx.env.len();
-        ctx.push_bindings(&bindings)?;
+    // a binding evaluates once, on first use, in its declaring scope
+    fn force_binding(&mut self, name: &str) -> Result<ModelValue, Error> {
+        let mut at = Some(self.site);
+        while let Some(instance) = at {
+            let found = self.instances[instance]
+                .bindings
+                .iter()
+                .position(|(known, _)| known == name);
+            if let Some(position) = found {
+                return self.force_binding_slot(instance, position);
+            }
+            at = self.instances[instance].parent;
+        }
+        unreachable!("modeler guarantees references resolve to a binding in scope")
+    }
 
-        self.events.push(EventPlan {
-            root,
-            parent: Some(parent),
-            name,
-            kind: match kind {
-                ModelSpanKind::Task => EventKind::Task,
-                ModelSpanKind::Llm => EventKind::Llm,
-                ModelSpanKind::Tool => EventKind::Tool,
-                ModelSpanKind::Function => EventKind::Function,
-            },
-            fields: lower_fields(fields, ctx)?,
-        });
+    fn force_binding_slot(&mut self, instance: usize, position: usize) -> Result<ModelValue, Error> {
+        match std::mem::replace(&mut self.instances[instance].bindings[position].1, BindSlot::Busy) {
+            BindSlot::Done(value) => {
+                self.instances[instance].bindings[position].1 = BindSlot::Done(value.clone());
+                Ok(value)
+            }
+            BindSlot::Busy => Err(Error::new(
+                ErrorKind::CircularReference,
+                self.last_ref.unwrap_or(SrcRange::new(0, 0)),
+            )),
+            BindSlot::Todo(expr) => {
+                let path = self.instances[instance].path;
+                let name = &self.instances[instance].bindings[position].0;
+                let rng = self.slot_rng(path, mix_str(BINDING_SALT, name));
+                let value = self.scoped(instance, rng, |ctx| eval_binding(expr, ctx))?;
+                self.instances[instance].bindings[position].1 = BindSlot::Done(value.clone());
+                Ok(value)
+            }
+        }
+    }
 
-        for child in children {
-            self.plan_child(child, root, event_ref, ctx)?;
+    // resolves a block reference to the referenced field's json value
+    fn resolve_ref(&mut self, ref_id: RefId) -> Result<JsonValue, Error> {
+        let reference = self.refs[ref_id.0 as usize].clone();
+        self.last_ref = Some(reference.range);
+
+        let mut at = self.site;
+        for _ in 0..reference.up {
+            at = self
+                .scope_parent(at)
+                .expect("modeler validated the up walk stays inside the trace");
         }
 
-        ctx.env.truncate(scope);
+        self.apply_steps(at, &reference.steps, &reference.accessor, &reference.path, reference.range)
+    }
+
+    // walks the remaining steps from an instance; an iteration slice fans the
+    // rest of the reference out over each iteration and collects an array
+    fn apply_steps(
+        &mut self,
+        at: usize,
+        steps: &[Step],
+        accessor: &Accessor,
+        path: &[Selection],
+        range: SrcRange,
+    ) -> Result<JsonValue, Error> {
+        let Some((step, rest)) = steps.split_first() else {
+            return self.read_accessor(at, accessor, path, range);
+        };
+
+        match step {
+            Step::Child { candidates, position } => {
+                let node = match position {
+                    None => candidates[0],
+                    Some(value) => {
+                        // the position evaluates at the referencing site
+                        let position = match eval_operand(value.clone(), self)? {
+                            Scalar::Int(value) => value,
+                            Scalar::Float(_) => return Err(Error::new(ErrorKind::NonIntegerIndex, range)),
+                            _ => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+                        };
+                        let position = usize::try_from(position)
+                            .ok()
+                            .filter(|&position| position < candidates.len())
+                            .ok_or(Error::new(ErrorKind::IndexOutOfBounds, range))?;
+                        candidates[position]
+                    }
+                };
+                let child = self.instances[at]
+                    .children
+                    .iter()
+                    .copied()
+                    .find(|&child| self.instances[child].node == node);
+                match child {
+                    Some(child) => self.apply_steps(child, rest, accessor, path, range),
+                    // an unpicked branch or a skipped maybe has no instance
+                    None => match self.instances[at].shape {
+                        Shape::Choice { .. } | Shape::Maybe { .. } => Ok(JsonValue::Null),
+                        _ => unreachable!("spans of an instantiation always instantiate"),
+                    },
+                }
+            }
+
+            Step::Iteration(value) => {
+                let iterations = self.instances[at].children.clone();
+                let index = match eval_operand(value.clone(), self)? {
+                    Scalar::Int(value) => value,
+                    Scalar::Float(_) => return Err(Error::new(ErrorKind::NonIntegerIndex, range)),
+                    _ => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+                };
+                let index = usize::try_from(index)
+                    .ok()
+                    .filter(|&index| index < iterations.len())
+                    .ok_or(Error::new(ErrorKind::IndexOutOfBounds, range))?;
+                self.apply_steps(iterations[index], rest, accessor, path, range)
+            }
+
+            Step::Iterations { start, end } => {
+                let iterations = self.instances[at].children.clone();
+                let len = iterations.len();
+                let start = match start {
+                    Some(bound) => eval_slice_bound(bound.clone(), range, self)?.min(len),
+                    None => 0,
+                };
+                let end = match end {
+                    Some(bound) => eval_slice_bound(bound.clone(), range, self)?.min(len),
+                    None => len,
+                };
+                let selected = if start >= end { &[][..] } else { &iterations[start..end] };
+                let mut projected = Vec::with_capacity(selected.len());
+                for &iteration in selected {
+                    projected.push(self.apply_steps(iteration, rest, accessor, path, range)?);
+                }
+                Ok(JsonValue::Array(projected))
+            }
+        }
+    }
+
+    fn read_accessor(&mut self, at: usize, accessor: &Accessor, path: &[Selection], range: SrcRange) -> Result<JsonValue, Error> {
+        match accessor {
+            Accessor::Field(field) => self.read_field(at, *field, path.to_vec(), range),
+            // the current iteration of the repeat collection `at`, found on
+            // the referencing site's own chain
+            Accessor::Index | Accessor::Count => {
+                let mut cursor = Some(self.site);
+                while let Some(instance) = cursor {
+                    if let Shape::Iteration { index, count } = self.instances[instance].shape
+                        && self.instances[instance].parent == Some(at)
+                    {
+                        let value = match accessor {
+                            Accessor::Index => index,
+                            _ => count,
+                        };
+                        return Ok(JsonValue::Number((value as i64).into()));
+                    }
+                    cursor = self.instances[instance].parent;
+                }
+                unreachable!("modeler validated the named repeat encloses the reference")
+            }
+            Accessor::Chosen => match self.instances[at].shape {
+                Shape::Choice { pick } => Ok(JsonValue::Number((pick as i64).into())),
+                _ => unreachable!("modeler validated chosen against a choice"),
+            },
+            Accessor::Included => match self.instances[at].shape {
+                Shape::Maybe { included } => Ok(JsonValue::Bool(included)),
+                _ => unreachable!("modeler validated included against a maybe"),
+            },
+        }
+    }
+
+    fn read_field(
+        &mut self,
+        instance: usize,
+        field: Field,
+        path: Vec<Selection>,
+        at: SrcRange,
+    ) -> Result<JsonValue, Error> {
+        let mut selections = path.into_iter().peekable();
+
+        let json = match field {
+            Field::Input | Field::Output | Field::Expected | Field::Error => {
+                self.force_field(instance, field, at)?
+            }
+            Field::Metadata | Field::Metrics => {
+                // a leading string selection reads just its key, so sibling
+                // keys of the same object stay independent slots
+                match selections.peek() {
+                    Some(Selection::Index(_)) => {
+                        let Some(Selection::Index(value)) = selections.next() else {
+                            unreachable!("the peeked selection is an index");
+                        };
+                        let Scalar::Str(key) = eval_operand(value, self)? else {
+                            return Err(Error::new(ErrorKind::RefShapeMismatch, at));
+                        };
+                        self.force_key(instance, field, &key, at)?
+                    }
+                    _ => self.force_object(instance, field, at)?,
+                }
+            }
+            Field::Tags => {
+                let count = self.instances[instance].fields.tags.len();
+                let mut tags = Vec::with_capacity(count);
+                for index in 0..count {
+                    tags.push(JsonValue::String(self.force_tag(instance, index, at)?));
+                }
+                JsonValue::Array(tags)
+            }
+        };
+
+        let mut json = json;
+        for selection in selections {
+            json = json_select(json, selection, at, self)?;
+        }
+        Ok(json)
+    }
+
+    fn force_field(&mut self, instance: usize, field: Field, at: SrcRange) -> Result<JsonValue, Error> {
+        let slot = {
+            let fields = &mut self.instances[instance].fields;
+            let slot = match field {
+                Field::Input => &mut fields.input,
+                Field::Output => &mut fields.output,
+                Field::Expected => &mut fields.expected,
+                Field::Error => &mut fields.error,
+                _ => unreachable!("keyed and tag fields force through their own paths"),
+            };
+            // only a dynamic position can reach a block without the field
+            let Some(slot) = slot.as_mut() else {
+                return Err(Error::new(ErrorKind::AbsentRefField, at));
+            };
+            std::mem::replace(slot, JsonSlot::Busy)
+        };
+
+        let done = match slot {
+            JsonSlot::Done(json) => json,
+            JsonSlot::Busy => return Err(Error::new(ErrorKind::CircularReference, at)),
+            JsonSlot::Todo(expr) => {
+                let rng = self.slot_rng(self.instances[instance].path, field_salt(field));
+                self.scoped(instance, rng, |ctx| lower_value(expr, ctx))?
+            }
+        };
+
+        let fields = &mut self.instances[instance].fields;
+        let slot = match field {
+            Field::Input => &mut fields.input,
+            Field::Output => &mut fields.output,
+            Field::Expected => &mut fields.expected,
+            Field::Error => &mut fields.error,
+            _ => unreachable!("keyed and tag fields force through their own paths"),
+        };
+        *slot.as_mut().expect("the slot was just taken") = JsonSlot::Done(done.clone());
+        Ok(done)
+    }
+
+    fn force_key(&mut self, instance: usize, field: Field, key: &str, at: SrcRange) -> Result<JsonValue, Error> {
+        fn keyed(fields: &mut FieldSlots, field: Field) -> Option<&mut Vec<(String, JsonSlot)>> {
+            match field {
+                Field::Metadata => fields.metadata.as_mut(),
+                Field::Metrics => fields.metrics.as_mut(),
+                _ => unreachable!("only keyed fields force by key"),
+            }
+        }
+
+        let (position, slot) = {
+            let Some(entries) = keyed(&mut self.instances[instance].fields, field) else {
+                return Err(Error::new(ErrorKind::AbsentRefField, at));
+            };
+            let Some(position) = entries.iter().position(|(known, _)| known == key) else {
+                return Err(Error::new(ErrorKind::MissingObjectKey, at));
+            };
+            (position, std::mem::replace(&mut entries[position].1, JsonSlot::Busy))
+        };
+
+        let done = match slot {
+            JsonSlot::Done(json) => json,
+            JsonSlot::Busy => return Err(Error::new(ErrorKind::CircularReference, at)),
+            JsonSlot::Todo(expr) => {
+                let salt = mix_str(mix(field_salt(field), KEY_SALT), key);
+                let rng = self.slot_rng(self.instances[instance].path, salt);
+                self.scoped(instance, rng, |ctx| lower_value(expr, ctx))?
+            }
+        };
+
+        let entries = keyed(&mut self.instances[instance].fields, field).expect("the entries were just taken");
+        entries[position].1 = JsonSlot::Done(done.clone());
+        Ok(done)
+    }
+
+    fn force_object(&mut self, instance: usize, field: Field, at: SrcRange) -> Result<JsonValue, Error> {
+        let keys: Vec<String> = {
+            let fields = &self.instances[instance].fields;
+            let entries = match field {
+                Field::Metadata => fields.metadata.as_ref(),
+                Field::Metrics => fields.metrics.as_ref(),
+                _ => unreachable!("only keyed fields force as objects"),
+            };
+            let Some(entries) = entries else {
+                return Err(Error::new(ErrorKind::AbsentRefField, at));
+            };
+            entries.iter().map(|(key, _)| key.clone()).collect()
+        };
+
+        let mut object = JsonMap::with_capacity(keys.len());
+        for key in keys {
+            let value = self.force_key(instance, field, &key, at)?;
+            object.insert(key, value);
+        }
+        Ok(JsonValue::Object(object))
+    }
+
+    fn force_tag(&mut self, instance: usize, index: usize, at: SrcRange) -> Result<String, Error> {
+        let slot = std::mem::replace(&mut self.instances[instance].fields.tags[index], TagSlot::Busy);
+        let done = match slot {
+            TagSlot::Done(text) => text,
+            TagSlot::Busy => return Err(Error::new(ErrorKind::CircularReference, at)),
+            TagSlot::Todo(template) => {
+                let rng = self.slot_rng(self.instances[instance].path, mix(TAG_SALT, index as u64));
+                self.scoped(instance, rng, |ctx| resolve_template(template, ctx))?
+            }
+        };
+        self.instances[instance].fields.tags[index] = TagSlot::Done(done.clone());
+        Ok(done)
+    }
+
+    // forces every field of an event instance, in declaration order
+    fn event_fields(&mut self, instance: usize) -> Result<EventFields, Error> {
+        let at = SrcRange::new(0, 0);
+        let scalar = |ctx: &mut Self, field: Field| -> Result<Option<JsonValue>, Error> {
+            match ctx.force_field(instance, field, at) {
+                Ok(json) => Ok(Some(json)),
+                Err(error) if error.kind == ErrorKind::AbsentRefField => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+        let keyed = |ctx: &mut Self, field: Field| -> Result<Option<JsonMap<String, JsonValue>>, Error> {
+            match ctx.force_object(instance, field, at) {
+                Ok(JsonValue::Object(object)) => Ok(Some(object)),
+                Ok(_) => unreachable!("forcing an object field yields an object"),
+                Err(error) if error.kind == ErrorKind::AbsentRefField => Ok(None),
+                Err(error) => Err(error),
+            }
+        };
+
+        let input = scalar(self, Field::Input)?;
+        let output = scalar(self, Field::Output)?;
+        let expected = scalar(self, Field::Expected)?;
+        let error = scalar(self, Field::Error)?;
+        let metadata = keyed(self, Field::Metadata)?;
+        let metrics = keyed(self, Field::Metrics)?;
+        let count = self.instances[instance].fields.tags.len();
+        let mut tags = Vec::with_capacity(count);
+        for index in 0..count {
+            tags.push(self.force_tag(instance, index, at)?);
+        }
+
+        Ok(EventFields {
+            input,
+            output,
+            expected,
+            error,
+            metadata,
+            metrics,
+            tags: tags.into_boxed_slice(),
+        })
+    }
+}
+
+// selections drill into a referenced field's json value
+fn json_select(json: JsonValue, selection: Selection, at: SrcRange, ctx: &mut Ctx) -> Result<JsonValue, Error> {
+    match selection {
+        Selection::Index(value) => match (json, eval_operand(value, ctx)?) {
+            (JsonValue::Array(mut elems), Scalar::Int(position)) => usize::try_from(position)
+                .ok()
+                .filter(|&position| position < elems.len())
+                .map(|position| elems.swap_remove(position))
+                .ok_or(Error::new(ErrorKind::IndexOutOfBounds, at)),
+            (JsonValue::Array(_), Scalar::Float(_)) => Err(Error::new(ErrorKind::NonIntegerIndex, at)),
+            (JsonValue::Object(mut map), Scalar::Str(key)) => {
+                map.remove(&key).ok_or(Error::new(ErrorKind::MissingObjectKey, at))
+            }
+            _ => Err(Error::new(ErrorKind::RefShapeMismatch, at)),
+        },
+        Selection::Slice { start, end } => {
+            let JsonValue::Array(elems) = json else {
+                return Err(Error::new(ErrorKind::RefShapeMismatch, at));
+            };
+            let len = elems.len();
+            let start = match start {
+                Some(bound) => eval_slice_bound(bound, at, ctx)?.min(len),
+                None => 0,
+            };
+            let end = match end {
+                Some(bound) => eval_slice_bound(bound, at, ctx)?.min(len),
+                None => len,
+            };
+            let elems = if start >= end {
+                Vec::new()
+            } else {
+                elems.into_iter().skip(start).take(end - start).collect()
+            };
+            Ok(JsonValue::Array(elems))
+        }
+    }
+}
+
+// splices dynamic spreads in place; items stay lazy like untaken branches
+fn splice_array(elem: Vec<ModelArrayElem>, ctx: &mut Ctx) -> Result<Vec<ModelValue>, Error> {
+    let mut items = Vec::with_capacity(elem.len());
+    for entry in elem {
+        match entry {
+            ModelArrayElem::Item(value) => items.push(value),
+            ModelArrayElem::Spread(value) => match eval_container(value, ctx)? {
+                ModelValue::Array(ModelArray { elem }) => items.extend(splice_array(elem, ctx)?),
+                _ => return Err(shape_error(ctx)),
+            },
+        }
+    }
+    Ok(items)
+}
+
+// a referenced value re-enters evaluation as a constant model value
+fn json_to_value(json: JsonValue) -> ModelValue {
+    match json {
+        JsonValue::Null => ModelValue::Null,
+        JsonValue::Bool(value) => ModelValue::Bool(value),
+        JsonValue::Number(number) => match number.as_i64() {
+            Some(value) => ModelValue::Num(ModelNumber::Int(value)),
+            None => ModelValue::Num(ModelNumber::Float(number.as_f64().expect("json numbers convert to floats"))),
+        },
+        JsonValue::String(value) => ModelValue::Str(value),
+        JsonValue::Array(elems) => ModelValue::Array(ModelArray {
+            elem: elems.into_iter().map(|value| ModelArrayElem::Item(json_to_value(value))).collect(),
+        }),
+        JsonValue::Object(map) => ModelValue::Object(ModelObject {
+            elem: map
+                .into_iter()
+                .map(|(key, value)| ModelObjectField {
+                    key,
+                    value: json_to_value(value),
+                })
+                .collect(),
+        }),
+    }
+}
+
+impl Planner {
+    // emission stays strictly pre-order: the materializer's timing and
+    // last-descendant scans depend on parents preceding children
+    fn emit_trace(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+        let start = self.events.len();
+        let root = EventRef(start);
+        self.emit_instance(0, root, None, ctx)?;
+        self.traces.push(start..self.events.len());
+        Ok(())
+    }
+
+    fn emit_instance(&mut self, instance: usize, root: EventRef, parent: Option<EventRef>, ctx: &mut Ctx) -> Result<(), Error> {
+        let event = match &ctx.instances[instance].shape {
+            Shape::Trace { name } => Some((name.clone(), EventKind::Task)),
+            Shape::Span { name, kind } => Some((name.clone(), *kind)),
+            // dynamic blocks are structurally transparent
+            Shape::Collection | Shape::Iteration { .. } | Shape::Choice { .. } | Shape::Maybe { .. } => None,
+        };
+
+        let parent = match event {
+            Some((name, kind)) => {
+                let event_ref = EventRef(self.events.len());
+                let fields = ctx.event_fields(instance)?;
+                self.events.push(EventPlan {
+                    root,
+                    parent,
+                    name,
+                    kind,
+                    fields,
+                });
+                Some(event_ref)
+            }
+            None => parent,
+        };
+
+        let children = ctx.instances[instance].children.clone();
+        for child in children {
+            self.emit_instance(child, root, parent, ctx)?;
+        }
         Ok(())
     }
 }
@@ -262,29 +929,19 @@ fn child_len(child: &ModelChild) -> usize {
     }
 }
 
-fn lower_fields(fields: ModelSpanFields, ctx: &mut Ctx) -> Result<EventFields, Error> {
-    Ok(EventFields {
-        input: fields.input.map(|value| lower_value(value, ctx)).transpose()?,
-        output: fields.output.map(|value| lower_value(value, ctx)).transpose()?,
-        expected: fields.expected.map(|value| lower_value(value, ctx)).transpose()?,
-        error: fields.error.map(|value| lower_value(value, ctx)).transpose()?,
-        metadata: fields.metadata.map(|object| lower_object(object, ctx)).transpose()?,
-        metrics: fields.metrics.map(|object| lower_object(object, ctx)).transpose()?,
-        tags: fields.tags.into_iter().map(|tag| resolve_template(tag, ctx)).collect(),
-    })
-}
-
 // fully evaluates a scope binding to a constant value the environment can hold
 fn eval_binding(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match value {
         ModelValue::Str(_) | ModelValue::Num(_) | ModelValue::Bool(_) | ModelValue::Null => value,
-        ModelValue::Template(template) => ModelValue::Str(resolve_template(template, ctx)),
-        ModelValue::VarRef(name) => ctx.binding(&name).clone(),
+        ModelValue::Template(template) => ModelValue::Str(resolve_template(template, ctx)?),
+        ModelValue::VarRef(name) => ctx.force_binding(&name)?,
+        ModelValue::CtxRef(ctx_ref) => ModelValue::Num(ModelNumber::Int(ctx.ctx_value(ctx_ref))),
+        ModelValue::BlockRef { ref_id, .. } => json_to_value(ctx.resolve_ref(ref_id)?),
 
         ModelValue::Array(ModelArray { elem }) => ModelValue::Array(ModelArray {
-            elem: elem
+            elem: splice_array(elem, ctx)?
                 .into_iter()
-                .map(|value| eval_binding(value, ctx))
+                .map(|value| Ok(ModelArrayElem::Item(eval_binding(value, ctx)?)))
                 .collect::<Result<_, _>>()?,
         }),
 
@@ -312,7 +969,7 @@ fn eval_binding(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
         ModelValue::Cond {
             cond, then, otherwise, ..
         } => {
-            let taken = if eval_operand(*cond, ctx)?.into_bool() {
+            let taken = if eval_operand(*cond, ctx)?.into_bool(ctx)? {
                 then
             } else {
                 otherwise
@@ -345,12 +1002,17 @@ fn scalar_to_value(scalar: Scalar) -> ModelValue {
 fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
     let value = match value {
         ModelValue::Str(value) => JsonValue::String(value),
-        ModelValue::Template(template) => JsonValue::String(resolve_template(template, ctx)),
+        ModelValue::Template(template) => JsonValue::String(resolve_template(template, ctx)?),
         ModelValue::Bool(value) => JsonValue::Bool(value),
         ModelValue::Null => JsonValue::Null,
 
         // the stored value is constant, so lowering it is pure conversion
-        ModelValue::VarRef(name) => lower_value(ctx.binding(&name).clone(), ctx)?,
+        ModelValue::VarRef(name) => lower_value(ctx.force_binding(&name)?, ctx)?,
+
+        ModelValue::CtxRef(ctx_ref) => JsonValue::Number(ctx.ctx_value(ctx_ref).into()),
+
+        // a referenced field is already json
+        ModelValue::BlockRef { ref_id, .. } => ctx.resolve_ref(ref_id)?,
 
         ModelValue::Num(ModelNumber::Int(value)) => JsonValue::Number(value.into()),
 
@@ -360,7 +1022,8 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
         }
 
         ModelValue::Array(ModelArray { elem }) => JsonValue::Array(
-            elem.into_iter()
+            splice_array(elem, ctx)?
+                .into_iter()
                 .map(|value| lower_value(value, ctx))
                 .collect::<Result<_, _>>()?,
         ),
@@ -380,7 +1043,7 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
         ModelValue::Cond {
             cond, then, otherwise, ..
         } => {
-            let taken = if eval_operand(*cond, ctx)?.into_bool() {
+            let taken = if eval_operand(*cond, ctx)?.into_bool(ctx)? {
                 then
             } else {
                 otherwise
@@ -412,6 +1075,7 @@ fn eval_slice(
     let ModelValue::Array(ModelArray { elem }) = eval_container(target, ctx)? else {
         unreachable!("modeler validated the slice target as an array");
     };
+    let elem = splice_array(elem, ctx)?;
 
     let len = elem.len();
     let start = match start {
@@ -429,7 +1093,9 @@ fn eval_slice(
         elem.into_iter().skip(start).take(end - start).collect()
     };
 
-    Ok(ModelValue::Array(ModelArray { elem }))
+    Ok(ModelValue::Array(ModelArray {
+        elem: elem.into_iter().map(ModelArrayElem::Item).collect(),
+    }))
 }
 
 fn eval_slice_bound(bound: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<usize, Error> {
@@ -446,11 +1112,14 @@ fn eval_index(target: ModelValue, index: ModelValue, range: SrcRange, ctx: &mut 
     let index = eval_operand(index, ctx)?;
 
     match (target, index) {
-        (ModelValue::Array(ModelArray { elem }), Scalar::Int(position)) => usize::try_from(position)
-            .ok()
-            .filter(|&position| position < elem.len())
-            .map(|position| elem.into_iter().nth(position).expect("position is in bounds"))
-            .ok_or(Error::new(ErrorKind::IndexOutOfBounds, range)),
+        (ModelValue::Array(ModelArray { elem }), Scalar::Int(position)) => {
+            let elem = splice_array(elem, ctx)?;
+            usize::try_from(position)
+                .ok()
+                .filter(|&position| position < elem.len())
+                .map(|position| elem.into_iter().nth(position).expect("position is in bounds"))
+                .ok_or(Error::new(ErrorKind::IndexOutOfBounds, range))
+        }
         (ModelValue::Array(_), Scalar::Float(_)) => Err(Error::new(ErrorKind::NonIntegerIndex, range)),
         (ModelValue::Object(ModelObject { elem }), Scalar::Str(key)) => elem
             .into_iter()
@@ -464,12 +1133,16 @@ fn eval_index(target: ModelValue, index: ModelValue, range: SrcRange, ctx: &mut 
 fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     match value {
         ModelValue::Array(_) | ModelValue::Object(_) => Ok(value),
-        ModelValue::VarRef(name) => eval_container(ctx.binding(&name).clone(), ctx),
+        ModelValue::VarRef(name) => eval_container(ctx.force_binding(&name)?, ctx),
+        ModelValue::BlockRef { ref_id, range } => match json_to_value(ctx.resolve_ref(ref_id)?) {
+            value @ (ModelValue::Array(_) | ModelValue::Object(_)) => Ok(value),
+            _ => Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+        },
         ModelValue::Func { func, range } => eval_container(eval_func(func, range, ctx)?, ctx),
         ModelValue::Cond {
             cond, then, otherwise, ..
         } => {
-            let taken = if eval_operand(*cond, ctx)?.into_bool() {
+            let taken = if eval_operand(*cond, ctx)?.into_bool(ctx)? {
                 then
             } else {
                 otherwise
@@ -569,7 +1242,10 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
                 return Err(Error::new(ErrorKind::EmptySplitSeparator, range));
             }
             ModelValue::Array(ModelArray {
-                elem: text.split(&separator).map(|part| ModelValue::Str(part.to_owned())).collect(),
+                elem: text
+                    .split(&separator)
+                    .map(|part| ModelArrayElem::Item(ModelValue::Str(part.to_owned())))
+                    .collect(),
             })
         }
         ModelFunc::Join { array, separator } => {
@@ -608,7 +1284,8 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             let length = match lower_value(*target, ctx)? {
                 JsonValue::String(text) => text.chars().count(),
                 JsonValue::Array(elems) => elems.len(),
-                _ => unreachable!("modeler validated the target as a string or array"),
+                // reference-fed targets settle their types here
+                _ => return Err(shape_error(ctx)),
             };
             ModelValue::Num(ModelNumber::Int(length as i64))
         }
@@ -620,12 +1297,13 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             };
             ModelValue::Num(ModelNumber::Int(BPE.encode_ordinary(&text).len() as i64))
         }
-        ModelFunc::Format { template, args } => {
-            let mut pieces = template.split("{}");
-            let mut text = pieces.next().expect("split yields at least one piece").to_owned();
+        ModelFunc::Format { pieces, args } => {
+            // the modeler guarantees one more piece than args
+            let mut pieces = pieces.into_iter();
+            let mut text = pieces.next().unwrap_or_default();
             for (arg, piece) in args.into_iter().zip(pieces) {
                 text.push_str(&scalar_text(eval_operand(arg, ctx)?));
-                text.push_str(piece);
+                text.push_str(&piece);
             }
             ModelValue::Str(text)
         }
@@ -689,7 +1367,8 @@ fn finite_float(value: f64, range: SrcRange) -> Result<ModelValue, Error> {
 fn eval_text(value: ModelValue, ctx: &mut Ctx) -> Result<String, Error> {
     match eval_operand(value, ctx)? {
         Scalar::Str(text) => Ok(text),
-        _ => unreachable!("modeler validated the argument as a string"),
+        // reference-fed arguments settle their types here
+        _ => Err(shape_error(ctx)),
     }
 }
 
@@ -703,7 +1382,8 @@ fn eval_to_int(scalar: Scalar, op: fn(f64) -> f64, range: SrcRange) -> Result<Mo
             }
             value as i64
         }
-        _ => unreachable!("modeler validated the argument as a number"),
+        // reference-fed arguments settle their types here
+        _ => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
     };
 
     Ok(ModelValue::Num(ModelNumber::Int(value)))
@@ -793,10 +1473,11 @@ enum Scalar {
 }
 
 impl Scalar {
-    fn into_bool(self) -> bool {
+    // reference-fed values settle their types here, not in the modeler
+    fn into_bool(self, ctx: &Ctx) -> Result<bool, Error> {
         match self {
-            Self::Bool(value) => value,
-            _ => unreachable!("modeler validated operand types"),
+            Self::Bool(value) => Ok(value),
+            _ => Err(shape_error(ctx)),
         }
     }
 
@@ -822,12 +1503,22 @@ fn scalar_to_json(scalar: Scalar) -> JsonValue {
 fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
     let scalar = match value {
         ModelValue::Str(value) => Scalar::Str(value),
-        ModelValue::Template(template) => Scalar::Str(resolve_template(template, ctx)),
+        ModelValue::Template(template) => Scalar::Str(resolve_template(template, ctx)?),
         ModelValue::Num(ModelNumber::Int(value)) => Scalar::Int(value),
         ModelValue::Num(ModelNumber::Float(value)) => Scalar::Float(value),
         ModelValue::Bool(value) => Scalar::Bool(value),
 
-        ModelValue::VarRef(name) => eval_operand(ctx.binding(&name).clone(), ctx)?,
+        ModelValue::VarRef(name) => eval_operand(ctx.force_binding(&name)?, ctx)?,
+        ModelValue::CtxRef(ctx_ref) => Scalar::Int(ctx.ctx_value(ctx_ref)),
+        ModelValue::BlockRef { ref_id, range } => match ctx.resolve_ref(ref_id)? {
+            JsonValue::String(value) => Scalar::Str(value),
+            JsonValue::Bool(value) => Scalar::Bool(value),
+            JsonValue::Number(number) => match number.as_i64() {
+                Some(value) => Scalar::Int(value),
+                None => Scalar::Float(number.as_f64().expect("json numbers convert to floats")),
+            },
+            _ => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+        },
         ModelValue::Func { func, range } => eval_operand(eval_func(func, range, ctx)?, ctx)?,
 
         ModelValue::Unary { op, operand, range } => {
@@ -838,7 +1529,7 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
         ModelValue::Cond {
             cond, then, otherwise, ..
         } => {
-            let taken = if eval_operand(*cond, ctx)?.into_bool() {
+            let taken = if eval_operand(*cond, ctx)?.into_bool(ctx)? {
                 then
             } else {
                 otherwise
@@ -847,13 +1538,20 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
         }
         ModelValue::Index { target, index, range } => eval_operand(eval_index(*target, *index, range, ctx)?, ctx)?,
 
-        // a slice is always an array, which is never a scalar operand
-        ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) | ModelValue::Slice { .. } => {
-            unreachable!("modeler validated operand types")
-        }
+        // reference-fed values can put any json shape here, so what the
+        // modeler used to guarantee statically is checked at evaluation
+        ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) => return Err(shape_error(ctx)),
+        // a residual slice is still rejected statically, refs never make one
+        ModelValue::Slice { .. } => unreachable!("modeler validated operand types"),
     };
 
     Ok(scalar)
+}
+
+// the culprit for a shape mismatch is the last reference crossed; without one
+// the value came from a modeler-validated position and the range is unknown
+fn shape_error(ctx: &Ctx) -> Error {
+    Error::new(ErrorKind::RefShapeMismatch, ctx.last_ref.unwrap_or(SrcRange::new(0, 0)))
 }
 
 fn eval_unary(op: UnaryOp, operand: Scalar, range: SrcRange) -> Result<Scalar, Error> {
@@ -863,7 +1561,7 @@ fn eval_unary(op: UnaryOp, operand: Scalar, range: SrcRange) -> Result<Scalar, E
         }
         (UnaryOp::Neg, Scalar::Float(value)) => Scalar::Float(-value),
         (UnaryOp::Not, Scalar::Bool(value)) => Scalar::Bool(!value),
-        _ => unreachable!("modeler validated operand types"),
+        _ => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
     };
 
     Ok(scalar)
@@ -872,24 +1570,50 @@ fn eval_unary(op: UnaryOp, operand: Scalar, range: SrcRange) -> Result<Scalar, E
 fn eval_binary(op: BinOp, lhs: ModelValue, rhs: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<Scalar, Error> {
     // logical ops short-circuit so guard idioms never evaluate the right side
     if matches!(op, BinOp::And | BinOp::Or) {
-        let left = eval_operand(lhs, ctx)?.into_bool();
+        let left = eval_operand(lhs, ctx)?.into_bool(ctx)?;
         let value = match (op, left) {
             (BinOp::And, false) => false,
             (BinOp::Or, true) => true,
-            _ => eval_operand(rhs, ctx)?.into_bool(),
+            _ => eval_operand(rhs, ctx)?.into_bool(ctx)?,
         };
         return Ok(Scalar::Bool(value));
+    }
+
+    let numeric = |scalar: &Scalar| matches!(scalar, Scalar::Int(_) | Scalar::Float(_));
+
+    // equality tolerates null so absence guards read naturally
+    if matches!(op, BinOp::Eq | BinOp::Ne) {
+        let lhs = eval_nullable(lhs, ctx)?;
+        let rhs = eval_nullable(rhs, ctx)?;
+        let equal = match (&lhs, &rhs) {
+            (None, None) => true,
+            (None, Some(_)) | (Some(_), None) => false,
+            (Some(lhs), Some(rhs)) => match (lhs, rhs) {
+                (Scalar::Str(lhs), Scalar::Str(rhs)) => lhs == rhs,
+                (Scalar::Bool(lhs), Scalar::Bool(rhs)) => lhs == rhs,
+                (Scalar::Int(lhs), Scalar::Int(rhs)) => lhs == rhs,
+                _ if numeric(lhs) && numeric(rhs) => lhs.as_float() == rhs.as_float(),
+                _ => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+            },
+        };
+        return Ok(Scalar::Bool(if op == BinOp::Eq { equal } else { !equal }));
     }
 
     let lhs = eval_operand(lhs, ctx)?;
     let rhs = eval_operand(rhs, ctx)?;
 
     let scalar = match op {
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => eval_arith(op, lhs, rhs, range)?,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+            if !numeric(&lhs) || !numeric(&rhs) {
+                return Err(Error::new(ErrorKind::RefShapeMismatch, range));
+            }
+            eval_arith(op, lhs, rhs, range)?
+        }
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             let ordering = match (&lhs, &rhs) {
                 (Scalar::Int(lhs), Scalar::Int(rhs)) => lhs.partial_cmp(rhs),
-                _ => lhs.as_float().partial_cmp(&rhs.as_float()),
+                _ if numeric(&lhs) && numeric(&rhs) => lhs.as_float().partial_cmp(&rhs.as_float()),
+                _ => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
             };
             let ordering = ordering.expect("finite numbers are always ordered");
             Scalar::Bool(match op {
@@ -900,19 +1624,51 @@ fn eval_binary(op: BinOp, lhs: ModelValue, rhs: ModelValue, range: SrcRange, ctx
                 _ => unreachable!("operator is a comparison"),
             })
         }
-        BinOp::Eq | BinOp::Ne => {
-            let equal = match (&lhs, &rhs) {
-                (Scalar::Str(lhs), Scalar::Str(rhs)) => lhs == rhs,
-                (Scalar::Bool(lhs), Scalar::Bool(rhs)) => lhs == rhs,
-                (Scalar::Int(lhs), Scalar::Int(rhs)) => lhs == rhs,
-                _ => lhs.as_float() == rhs.as_float(),
-            };
-            Scalar::Bool(if op == BinOp::Eq { equal } else { !equal })
-        }
+        BinOp::Eq | BinOp::Ne => unreachable!("equality evaluates through the nullable path above"),
         BinOp::And | BinOp::Or => unreachable!("logical operators short-circuit above"),
     };
 
     Ok(scalar)
+}
+
+// a scalar or an explicit absence, for equality's null probes
+fn eval_nullable(value: ModelValue, ctx: &mut Ctx) -> Result<Option<Scalar>, Error> {
+    match value {
+        ModelValue::Null => Ok(None),
+        ModelValue::BlockRef { ref_id, range } => match ctx.resolve_ref(ref_id)? {
+            JsonValue::Null => Ok(None),
+            JsonValue::String(value) => Ok(Some(Scalar::Str(value))),
+            JsonValue::Bool(value) => Ok(Some(Scalar::Bool(value))),
+            JsonValue::Number(number) => Ok(Some(match number.as_i64() {
+                Some(value) => Scalar::Int(value),
+                None => Scalar::Float(number.as_f64().expect("json numbers convert to floats")),
+            })),
+            _ => Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+        },
+        ModelValue::VarRef(name) => {
+            let value = ctx.force_binding(&name)?;
+            eval_nullable(value, ctx)
+        }
+        ModelValue::Index { target, index, range } => {
+            let value = eval_index(*target, *index, range, ctx)?;
+            eval_nullable(value, ctx)
+        }
+        ModelValue::Cond {
+            cond, then, otherwise, ..
+        } => {
+            let taken = if eval_operand(*cond, ctx)?.into_bool(ctx)? {
+                then
+            } else {
+                otherwise
+            };
+            eval_nullable(*taken, ctx)
+        }
+        ModelValue::Func { func, range } => {
+            let value = eval_func(func, range, ctx)?;
+            eval_nullable(value, ctx)
+        }
+        value => Ok(Some(eval_operand(value, ctx)?)),
+    }
 }
 
 fn eval_arith(op: BinOp, lhs: Scalar, rhs: Scalar, range: SrcRange) -> Result<Scalar, Error> {
@@ -955,27 +1711,27 @@ fn eval_arith(op: BinOp, lhs: Scalar, rhs: Scalar, range: SrcRange) -> Result<Sc
     Ok(scalar)
 }
 
-fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> String {
-    template
-        .parts
-        .into_iter()
-        .map(|part| match part {
-            ModelPart::Lit(value) => value,
-            ModelPart::Ref(ModelCtxRef::TraceIndex) => ctx.trace_index.to_string(),
-            ModelPart::Ref(ModelCtxRef::RepeatIndex) => ctx
-                .repeat_indices
-                .last()
-                .expect("modeler validated repeat.index is inside a repeat")
-                .to_string(),
-            ModelPart::VarRef(name) => match ctx.binding(&name) {
-                ModelValue::Str(value) => value.clone(),
-                ModelValue::Num(ModelNumber::Int(value)) => value.to_string(),
-                ModelValue::Num(ModelNumber::Float(value)) => scalar_text(Scalar::Float(*value)),
-                ModelValue::Bool(value) => if *value { "true" } else { "false" }.to_owned(),
+fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> Result<String, Error> {
+    let mut text = String::new();
+    for part in template.parts {
+        match part {
+            ModelPart::Lit(value) => text.push_str(&value),
+            ModelPart::Ref(ctx_ref) => text.push_str(&ctx.ctx_value(ctx_ref).to_string()),
+            ModelPart::VarRef(name) => match ctx.force_binding(&name)? {
+                ModelValue::Str(value) => text.push_str(&value),
+                ModelValue::Num(ModelNumber::Int(value)) => text.push_str(&value.to_string()),
+                ModelValue::Num(ModelNumber::Float(value)) => text.push_str(&scalar_text(Scalar::Float(value))),
+                ModelValue::Bool(value) => text.push_str(if value { "true" } else { "false" }),
                 _ => unreachable!("modeler validated interpolated bindings as scalars"),
             },
-        })
-        .collect()
+            // scalar-ness the modeler deferred is enforced right here
+            ModelPart::Dynamic(value) => {
+                let scalar = eval_operand(value, ctx)?;
+                text.push_str(&scalar_text(scalar));
+            }
+        }
+    }
+    Ok(text)
 }
 
 // multiple trace templates cycle in source order
@@ -992,16 +1748,11 @@ pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
     };
 
     for index in 0..count {
-        // each trace gets its own rng so its values don't depend on the traces planned before it
-        let mut ctx = Ctx {
-            trace_index: index,
-            rng: SmallRng::seed_from_u64(seed.wrapping_add(index as u64)),
-            repeat_indices: Vec::new(),
-            env: Vec::new(),
-        };
-        // the root scope instantiates once per generated trace
-        ctx.push_bindings(&model.bindings)?;
-        planner.plan_trace(model.traces[index % model.traces.len()].clone(), &mut ctx)?;
+        // every draw is addressed by seed, trace index, and instance path, so
+        // a trace's values depend on nothing planned before it
+        let mut ctx = Ctx::new(&model.refs, seed, index);
+        ctx.instantiate_trace(&model.traces[index % model.traces.len()], &model.bindings)?;
+        planner.emit_trace(&mut ctx)?;
     }
 
     Ok(Plan {
@@ -1037,6 +1788,9 @@ enum ErrorKind {
     ClampBoundsOutOfOrder,
     EmptySplitSeparator,
     JoinElementNotScalar,
+    CircularReference,
+    AbsentRefField,
+    RefShapeMismatch,
 }
 
 impl fmt::Display for ErrorKind {
@@ -1055,6 +1809,9 @@ impl fmt::Display for ErrorKind {
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
             Self::EmptySplitSeparator => "split separator is empty",
             Self::JoinElementNotScalar => "join element is not a string, number, or boolean",
+            Self::CircularReference => "references form a cycle",
+            Self::AbsentRefField => "referenced block does not set the field",
+            Self::RefShapeMismatch => "referenced value has the wrong shape for this position",
         })
     }
 }
@@ -1105,6 +1862,85 @@ mod tests {
             [JsonValue::from("q 0"), JsonValue::from("q 1"), JsonValue::from("q 2")]
         );
         assert_eq!(plan.events[2].fields.tags.as_ref(), ["t-2"]);
+    }
+
+    #[test]
+    fn evaluates_context_references_in_expressions() {
+        let model = compile(
+            r#"
+            trace "t" {
+                input = trace.index
+                repeat {
+                    count = 3
+                    task "turn" { metrics = { turn = repeat.index + 1, of = repeat.count } }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 2, 0).unwrap();
+
+        assert_eq!(plan.events[0].fields.input, Some(JsonValue::from(0)));
+        assert_eq!(plan.events[4].fields.input, Some(JsonValue::from(1)));
+        for (offset, event) in plan.events[1..4].iter().enumerate() {
+            let metrics = event.fields.metrics.as_ref().unwrap();
+            assert_eq!(metrics["turn"], JsonValue::from(offset as i64 + 1));
+            assert_eq!(metrics["of"], JsonValue::from(3));
+        }
+    }
+
+    #[test]
+    fn slices_trace_scope_vars_by_repeat_index() {
+        let model = compile(
+            r#"
+            trace "t" {
+                vars { messages = ["q0", "a0", "q1", "a1"] }
+                repeat {
+                    count = 2
+                    task "turn" { input = var.messages[:(repeat.index * 2) + 1] }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 0).unwrap();
+
+        assert_eq!(plan.events[1].fields.input, Some(JsonValue::from(vec!["q0"])));
+        assert_eq!(
+            plan.events[2].fields.input,
+            Some(JsonValue::from(vec!["q0", "a0", "q1"]))
+        );
+    }
+
+    #[test]
+    fn resolves_repeat_refs_against_the_innermost_repeat() {
+        let model = compile(
+            r#"
+            trace "t" {
+                repeat {
+                    count = 2
+                    repeat {
+                        count = repeat.index + 1
+                        task "step" { metrics = { inner = repeat.index, of = repeat.count } }
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 0).unwrap();
+
+        // outer iteration 0 runs the inner repeat once, iteration 1 twice
+        let metrics = plan
+            .events
+            .iter()
+            .skip(1)
+            .map(|event| {
+                let metrics = event.fields.metrics.as_ref().unwrap();
+                (metrics["inner"].as_i64().unwrap(), metrics["of"].as_i64().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metrics, [(0, 1), (0, 2), (1, 2)]);
     }
 
     #[test]
@@ -2030,5 +2866,255 @@ mod tests {
 
         let included = plan.events.iter().filter(|event| event.parent.is_some()).count();
         assert!((1..8).contains(&included), "expected a mix of inclusions, got {included}");
+    }
+
+    #[test]
+    fn threads_referenced_values_across_spans() {
+        let model = compile(
+            r#"
+            trace "t" {
+                # written above the block it reads, order is dataflow not layout
+                output = llm.chat.output.content
+                metadata = { echoed = "${llm.chat.output.content}" }
+                task "plan" { output = "planned" }
+                llm "chat" {
+                    input = [{ role = "user", content = task.plan.output }]
+                    output = { role = "assistant", content = choice("alpha", "beta") }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 4, 11).unwrap();
+
+        for range in plan.traces.iter() {
+            let trace = &plan.events[range.start];
+            let llm = &plan.events[range.start + 2];
+            let content = &llm.fields.output.as_ref().unwrap()["content"];
+
+            // the sampled content flows to the trace output and its template
+            assert_eq!(trace.fields.output.as_ref().unwrap(), content);
+            let echoed = &trace.fields.metadata.as_ref().unwrap()["echoed"];
+            assert_eq!(echoed, content);
+
+            // and the task output flows into the llm input
+            let input = llm.fields.input.as_ref().unwrap();
+            assert_eq!(input[0]["content"], JsonValue::String("planned".to_owned()));
+        }
+    }
+
+    #[test]
+    fn sums_sibling_metric_keys_exactly() {
+        let model = compile(
+            r#"
+            trace "t" {
+                llm "chat" {
+                    output = "brief answer"
+                    metrics = {
+                        prompt_tokens = round(lognormal(600, 0.4)),
+                        completion_tokens = round(lognormal(90, 0.7)),
+                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
+                        exact = tokens(self.output),
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 3, 5).unwrap();
+
+        for range in plan.traces.iter() {
+            let metrics = plan.events[range.start + 1].fields.metrics.as_ref().unwrap();
+            let total = metrics["prompt_tokens"].as_i64().unwrap() + metrics["completion_tokens"].as_i64().unwrap();
+            assert_eq!(metrics["tokens"].as_i64().unwrap(), total);
+            assert!(metrics["exact"].as_i64().unwrap() > 0);
+        }
+    }
+
+    #[test]
+    fn correlates_same_iteration_references_inside_repeats() {
+        let model = compile(
+            r#"
+            trace "t" {
+                repeat {
+                    count = 4
+                    llm "gen" { output = choice("a", "b", "c") }
+                    tool "use" { input = llm.gen.output }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 2, 23).unwrap();
+
+        let mut distinct = std::collections::HashSet::new();
+        for range in plan.traces.iter() {
+            // events: trace, then (llm, tool) pairs per iteration
+            for pair in plan.events[range.start + 1..range.end].chunks(2) {
+                let output = pair[0].fields.output.as_ref().unwrap();
+                let input = pair[1].fields.input.as_ref().unwrap();
+                assert_eq!(input, output, "each round's tool reads its own llm");
+                distinct.insert(output.as_str().unwrap().to_owned());
+            }
+        }
+        assert!(distinct.len() > 1, "iterations draw independently");
+    }
+
+    #[test]
+    fn draws_a_referenced_field_once() {
+        let model = compile(
+            r#"
+            trace "t" {
+                task "roll" { output = range(0, 1000000) }
+                task "a" { input = task.roll.output }
+                task "b" { input = task.roll.output }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 3).unwrap();
+
+        let rolled = plan.events[1].fields.output.as_ref().unwrap();
+        assert_eq!(plan.events[2].fields.input.as_ref().unwrap(), rolled);
+        assert_eq!(plan.events[3].fields.input.as_ref().unwrap(), rolled);
+    }
+
+    #[test]
+    fn fails_generation_on_dynamic_position_cycles() {
+        // the static graph skips dynamic positions, in-progress marking catches them
+        let model = compile(
+            r#"
+            trace "t" {
+                llm "x" { input = llm["x"][trace.index % 1].input output = 1 }
+            }
+            "#,
+        )
+        .unwrap();
+        let error = plan(model, 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "references form a cycle");
+    }
+
+    #[test]
+    fn accumulates_history_across_iterations() {
+        let model = compile(
+            r#"
+            trace "t" {
+                repeat "rounds" {
+                    count = 3
+                    llm "chat" {
+                        input = [{ role = "user", content = trace.input }, ...repeat.rounds[:repeat.index].llm.chat.output]
+                        output = { role = "assistant", content = "reply ${repeat.rounds.index}" }
+                    }
+                }
+                input = "q"
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 7).unwrap();
+
+        // round i replays the user turn plus i earlier assistant turns
+        for (round, event) in plan.events[1..].iter().enumerate() {
+            let input = event.fields.input.as_ref().unwrap().as_array().unwrap();
+            assert_eq!(input.len(), 1 + round);
+            for (earlier, message) in input[1..].iter().enumerate() {
+                assert_eq!(message["content"], JsonValue::String(format!("reply {earlier}")));
+            }
+        }
+    }
+
+    #[test]
+    fn reads_previous_iterations_with_guards() {
+        let model = compile(
+            r#"
+            trace "t" {
+                repeat "r" {
+                    count = 3
+                    task "step" {
+                        output = range(0, 1000)
+                        input = repeat.index > 0 ? repeat.r[repeat.index - 1].task.step.output : -1
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 1, 13).unwrap();
+
+        assert_eq!(plan.events[1].fields.input.as_ref().unwrap().as_i64().unwrap(), -1);
+        for pair in plan.events[1..].windows(2) {
+            assert_eq!(pair[1].fields.input, pair[0].fields.output);
+        }
+    }
+
+    #[test]
+    fn fails_generation_on_out_of_range_iterations() {
+        let model = compile(
+            r#"
+            trace "t" {
+                repeat "r" { count = 2 task "step" { output = 1 } }
+                input = repeat.r[trace.index + 2].task.step.output
+            }
+            "#,
+        )
+        .unwrap();
+        let error = plan(model, 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "array index is out of bounds");
+    }
+
+    #[test]
+    fn reports_branch_outcomes_and_nulls() {
+        let model = compile(
+            r#"
+            trace "t" {
+                choice "outcome" {
+                    task "resolved" { output = "ok" }
+                    task "escalated" { output = "paged" }
+                }
+                maybe "retry" { chance = 0.5 task "again" { output = 1 } }
+                metadata = {
+                    picked = choice.outcome.chosen,
+                    resolved = choice.outcome.task.resolved.output != null,
+                    retried = maybe.retry.included,
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let plan = plan(model, 16, 29).unwrap();
+
+        let mut picks = std::collections::HashSet::new();
+        let mut retries = std::collections::HashSet::new();
+        for range in plan.traces.iter() {
+            let trace = &plan.events[range.start];
+            let metadata = trace.fields.metadata.as_ref().unwrap();
+            let picked = metadata["picked"].as_i64().unwrap();
+            picks.insert(picked);
+            retries.insert(metadata["retried"].as_bool().unwrap());
+
+            // the null probe agrees with the recorded pick
+            assert_eq!(metadata["resolved"].as_bool().unwrap(), picked == 0);
+
+            // the picked branch's span is the one that emitted
+            let branch = &plan.events[range.start + 1];
+            let expected = if picked == 0 { "resolved" } else { "escalated" };
+            assert_eq!(branch.name, expected);
+        }
+        assert_eq!(picks.len(), 2, "both branches occur across traces");
+        assert_eq!(retries.len(), 2, "both maybe outcomes occur across traces");
+    }
+
+    #[test]
+    fn keeps_unrelated_draws_stable_across_edits() {
+        // path-addressed rngs: editing one field must not reshuffle another's draws
+        let before = compile(r#"trace "t" { input = range(0, 1000000) output = "x" }"#).unwrap();
+        let after = compile(r#"trace "t" { input = range(0, 1000000) output = "y ${trace.index}" }"#).unwrap();
+
+        let before = plan(before, 5, 99).unwrap();
+        let after = plan(after, 5, 99).unwrap();
+
+        for (before, after) in before.events.iter().zip(after.events.iter()) {
+            assert_eq!(before.fields.input, after.fields.input);
+        }
     }
 }

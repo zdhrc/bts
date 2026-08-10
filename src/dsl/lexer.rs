@@ -1,4 +1,3 @@
-use crate::dsl::ast::TemplatePart;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use std::{fmt, iter::Peekable, str::CharIndices};
 
@@ -53,8 +52,15 @@ pub(super) enum TokenKind {
 
     Ident(String),
     String(String),
-    Template(Vec<TemplatePart>),
     Number(String),
+
+    // an interpolated string arrives flat: literal chunks around ${...} holes
+    // whose contents lex as ordinary tokens
+    TemplateOpen,
+    TemplateChunk(String),
+    InterpOpen,
+    InterpClose,
+    TemplateClose,
 
     Eof,
 }
@@ -80,163 +86,167 @@ impl<'src> Lexer<'src> {
         let mut errors: Errors = Vec::new();
 
         while let Some((idx, ch)) = self.next() {
-            match ch {
-                ch if ch.is_whitespace() => {}
-                // parenbraceckets
-                '{' => tokens.push(Token::new(TokenKind::LBrace, idx, idx + ch.len_utf8())),
-                '}' => tokens.push(Token::new(TokenKind::RBrace, idx, idx + ch.len_utf8())),
-                '[' => tokens.push(Token::new(TokenKind::LBrack, idx, idx + ch.len_utf8())),
-                ']' => tokens.push(Token::new(TokenKind::RBrack, idx, idx + ch.len_utf8())),
-                '(' => tokens.push(Token::new(TokenKind::LParen, idx, idx + ch.len_utf8())),
-                ')' => tokens.push(Token::new(TokenKind::RParen, idx, idx + ch.len_utf8())),
-
-                // punctuation
-                ',' => tokens.push(Token::new(TokenKind::Comma, idx, idx + ch.len_utf8())),
-                // ... spreads, a lone .. stays two dots so diagnostics point at real tokens
-                '.' => {
-                    if matches!(self.peek(), Some((_, '.'))) {
-                        let (second, _) = self.next().expect("peeked character is present");
-                        if matches!(self.peek(), Some((_, '.'))) {
-                            let (third, _) = self.next().expect("peeked character is present");
-                            tokens.push(Token::new(TokenKind::Ellipsis, idx, third + '.'.len_utf8()));
-                        } else {
-                            tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8()));
-                            tokens.push(Token::new(TokenKind::Dot, second, second + '.'.len_utf8()));
-                        }
-                    } else {
-                        tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8()));
-                    }
-                }
-
-                // operators, = peeks for == and so on
-                '+' => tokens.push(Token::new(TokenKind::Plus, idx, idx + ch.len_utf8())),
-                '-' => tokens.push(Token::new(TokenKind::Minus, idx, idx + ch.len_utf8())),
-                '*' => tokens.push(Token::new(TokenKind::Star, idx, idx + ch.len_utf8())),
-                '/' => {
-                    if matches!(self.peek(), Some((_, '/'))) {
-                        self.skip_comment();
-                    } else {
-                        tokens.push(Token::new(TokenKind::Slash, idx, idx + ch.len_utf8()));
-                    }
-                }
-                '#' => self.skip_comment(),
-                '%' => tokens.push(Token::new(TokenKind::Percent, idx, idx + ch.len_utf8())),
-                '?' => tokens.push(Token::new(TokenKind::Question, idx, idx + ch.len_utf8())),
-                ':' => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
-                '=' => match self.lex_paired(ch) {
-                    Some(end) => tokens.push(Token::new(TokenKind::EqEq, idx, end)),
-                    None => match self.lex_trailing('>') {
-                        Some(end) => tokens.push(Token::new(TokenKind::FatArrow, idx, end)),
-                        None => tokens.push(Token::new(TokenKind::Equals, idx, idx + ch.len_utf8())),
-                    },
-                },
-                '!' => match self.lex_trailing('=') {
-                    Some(end) => tokens.push(Token::new(TokenKind::NotEq, idx, end)),
-                    None => tokens.push(Token::new(TokenKind::Bang, idx, idx + ch.len_utf8())),
-                },
-                '<' => match self.heredoc_intro(idx) {
-                    Some((delimiter, dedent, intro_end)) => {
-                        // the first < is consumed, eat the rest of the introducer
-                        while matches!(self.peek(), Some((p_idx, _)) if p_idx < intro_end) {
-                            self.next();
-                        }
-                        let token = self.lex_heredoc(idx, intro_end, delimiter, dedent, &mut errors);
-                        tokens.push(token);
-                    }
-                    None => match self.lex_trailing('=') {
-                        Some(end) => tokens.push(Token::new(TokenKind::LtEq, idx, end)),
-                        None => tokens.push(Token::new(TokenKind::Lt, idx, idx + ch.len_utf8())),
-                    },
-                },
-                '>' => match self.lex_trailing('=') {
-                    Some(end) => tokens.push(Token::new(TokenKind::GtEq, idx, end)),
-                    None => tokens.push(Token::new(TokenKind::Gt, idx, idx + ch.len_utf8())),
-                },
-
-                // & and | only exist doubled
-                '&' => match self.lex_paired(ch) {
-                    Some(end) => tokens.push(Token::new(TokenKind::AmpAmp, idx, end)),
-                    None => {
-                        errors.push(Error::new(
-                            ErrorKind::UnpairedOperator(ch),
-                            SrcRange::new(idx, idx + ch.len_utf8()),
-                        ));
-                    }
-                },
-                '|' => match self.lex_paired(ch) {
-                    Some(end) => tokens.push(Token::new(TokenKind::PipePipe, idx, end)),
-                    None => {
-                        errors.push(Error::new(
-                            ErrorKind::UnpairedOperator(ch),
-                            SrcRange::new(idx, idx + ch.len_utf8()),
-                        ));
-                    }
-                },
-
-                // ident:
-                // - first char must be alphabetic
-                // - ident chars must be alphanumeric or underscores
-                // - whitespace or the start of another token breaks
-                // - all other chars emit a diag and break
-                ch if ch.is_ascii_alphabetic() => {
-                    let start = idx;
-                    let mut end = idx + ch.len_utf8();
-                    let mut value = String::new();
-                    value.push(ch);
-
-                    while let Some((i_idx, i_ch)) = self.peek() {
-                        match i_ch {
-                            c if c.is_ascii_alphanumeric() || c == '_' => {
-                                value.push(i_ch);
-                                end = i_idx + i_ch.len_utf8();
-                                self.next();
-                            }
-                            c if c.is_whitespace() => break,
-                            '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' | '+' | '*' | '/' | '%' | '<'
-                            | '>' | '!' | '&' | '|' | '?' | ':' | '#' => break,
-                            _ => {
-                                errors.push(Error::new(
-                                    ErrorKind::InvalidIdentToken,
-                                    SrcRange::new(i_idx, i_idx + i_ch.len_utf8()),
-                                ));
-                                self.next();
-                                break;
-                            }
-                        }
-                    }
-                    tokens.push(Token::new(TokenKind::Ident(value), start, end));
-                }
-
-                // strings:
-                // - ${reference} interpolations split them into template parts
-                // - plain strings stay a single String token
-                // - """ opens a multi-line string
-                '"' => {
-                    let token = if self.src[idx..].starts_with(TRIPLE_QUOTE) {
-                        self.next();
-                        self.next();
-                        self.lex_multiline_string(idx, &mut errors)
-                    } else {
-                        self.lex_string(idx, &mut errors)
-                    };
-                    tokens.push(token);
-                }
-
-                // numbers
-                ch if ch.is_ascii_digit() => {
-                    let token = self.lex_number(idx, ch, &mut errors);
-                    tokens.push(token);
-                }
-
-                // errors
-                _ => {
-                    errors.push(Error::new(ErrorKind::UnknownToken, SrcRange::new(idx, idx + ch.len_utf8())));
-                }
-            }
+            self.lex_token(idx, ch, &mut tokens, &mut errors);
         }
         tokens.push(Token::new(TokenKind::Eof, self.src.len(), self.src.len()));
 
         if errors.is_empty() { Ok(tokens) } else { Err(errors) }
+    }
+
+    // lexes the token starting at an already-consumed char; strings append
+    // several tokens when interpolations flatten them
+    fn lex_token(&mut self, idx: usize, ch: char, tokens: &mut Tokens, errors: &mut Errors) {
+        match ch {
+            ch if ch.is_whitespace() => {}
+            // parenbraceckets
+            '{' => tokens.push(Token::new(TokenKind::LBrace, idx, idx + ch.len_utf8())),
+            '}' => tokens.push(Token::new(TokenKind::RBrace, idx, idx + ch.len_utf8())),
+            '[' => tokens.push(Token::new(TokenKind::LBrack, idx, idx + ch.len_utf8())),
+            ']' => tokens.push(Token::new(TokenKind::RBrack, idx, idx + ch.len_utf8())),
+            '(' => tokens.push(Token::new(TokenKind::LParen, idx, idx + ch.len_utf8())),
+            ')' => tokens.push(Token::new(TokenKind::RParen, idx, idx + ch.len_utf8())),
+
+            // punctuation
+            ',' => tokens.push(Token::new(TokenKind::Comma, idx, idx + ch.len_utf8())),
+            // ... spreads, a lone .. stays two dots so diagnostics point at real tokens
+            '.' => {
+                if matches!(self.peek(), Some((_, '.'))) {
+                    let (second, _) = self.next().expect("peeked character is present");
+                    if matches!(self.peek(), Some((_, '.'))) {
+                        let (third, _) = self.next().expect("peeked character is present");
+                        tokens.push(Token::new(TokenKind::Ellipsis, idx, third + '.'.len_utf8()));
+                    } else {
+                        tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8()));
+                        tokens.push(Token::new(TokenKind::Dot, second, second + '.'.len_utf8()));
+                    }
+                } else {
+                    tokens.push(Token::new(TokenKind::Dot, idx, idx + ch.len_utf8()));
+                }
+            }
+
+            // operators, = peeks for == and so on
+            '+' => tokens.push(Token::new(TokenKind::Plus, idx, idx + ch.len_utf8())),
+            '-' => tokens.push(Token::new(TokenKind::Minus, idx, idx + ch.len_utf8())),
+            '*' => tokens.push(Token::new(TokenKind::Star, idx, idx + ch.len_utf8())),
+            '/' => {
+                if matches!(self.peek(), Some((_, '/'))) {
+                    self.skip_comment();
+                } else {
+                    tokens.push(Token::new(TokenKind::Slash, idx, idx + ch.len_utf8()));
+                }
+            }
+            '#' => self.skip_comment(),
+            '%' => tokens.push(Token::new(TokenKind::Percent, idx, idx + ch.len_utf8())),
+            '?' => tokens.push(Token::new(TokenKind::Question, idx, idx + ch.len_utf8())),
+            ':' => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
+            '=' => match self.lex_paired(ch) {
+                Some(end) => tokens.push(Token::new(TokenKind::EqEq, idx, end)),
+                None => match self.lex_trailing('>') {
+                    Some(end) => tokens.push(Token::new(TokenKind::FatArrow, idx, end)),
+                    None => tokens.push(Token::new(TokenKind::Equals, idx, idx + ch.len_utf8())),
+                },
+            },
+            '!' => match self.lex_trailing('=') {
+                Some(end) => tokens.push(Token::new(TokenKind::NotEq, idx, end)),
+                None => tokens.push(Token::new(TokenKind::Bang, idx, idx + ch.len_utf8())),
+            },
+            '<' => match self.heredoc_intro(idx) {
+                Some((delimiter, dedent, intro_end)) => {
+                    // the first < is consumed, eat the rest of the introducer
+                    while matches!(self.peek(), Some((p_idx, _)) if p_idx < intro_end) {
+                        self.next();
+                    }
+                    self.lex_heredoc(idx, intro_end, delimiter, dedent, tokens, errors);
+                }
+                None => match self.lex_trailing('=') {
+                    Some(end) => tokens.push(Token::new(TokenKind::LtEq, idx, end)),
+                    None => tokens.push(Token::new(TokenKind::Lt, idx, idx + ch.len_utf8())),
+                },
+            },
+            '>' => match self.lex_trailing('=') {
+                Some(end) => tokens.push(Token::new(TokenKind::GtEq, idx, end)),
+                None => tokens.push(Token::new(TokenKind::Gt, idx, idx + ch.len_utf8())),
+            },
+
+            // & and | only exist doubled
+            '&' => match self.lex_paired(ch) {
+                Some(end) => tokens.push(Token::new(TokenKind::AmpAmp, idx, end)),
+                None => {
+                    errors.push(Error::new(
+                        ErrorKind::UnpairedOperator(ch),
+                        SrcRange::new(idx, idx + ch.len_utf8()),
+                    ));
+                }
+            },
+            '|' => match self.lex_paired(ch) {
+                Some(end) => tokens.push(Token::new(TokenKind::PipePipe, idx, end)),
+                None => {
+                    errors.push(Error::new(
+                        ErrorKind::UnpairedOperator(ch),
+                        SrcRange::new(idx, idx + ch.len_utf8()),
+                    ));
+                }
+            },
+
+            // ident:
+            // - first char must be alphabetic
+            // - ident chars must be alphanumeric or underscores
+            // - whitespace or the start of another token breaks
+            // - all other chars emit a diag and break
+            ch if ch.is_ascii_alphabetic() => {
+                let start = idx;
+                let mut end = idx + ch.len_utf8();
+                let mut value = String::new();
+                value.push(ch);
+
+                while let Some((i_idx, i_ch)) = self.peek() {
+                    match i_ch {
+                        c if c.is_ascii_alphanumeric() || c == '_' => {
+                            value.push(i_ch);
+                            end = i_idx + i_ch.len_utf8();
+                            self.next();
+                        }
+                        c if c.is_whitespace() => break,
+                        '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' | '+' | '*' | '/' | '%' | '<'
+                        | '>' | '!' | '&' | '|' | '?' | ':' | '#' => break,
+                        _ => {
+                            errors.push(Error::new(
+                                ErrorKind::InvalidIdentToken,
+                                SrcRange::new(i_idx, i_idx + i_ch.len_utf8()),
+                            ));
+                            self.next();
+                            break;
+                        }
+                    }
+                }
+                tokens.push(Token::new(TokenKind::Ident(value), start, end));
+            }
+
+            // strings:
+            // - a plain string stays a single String token
+            // - ${...} interpolations flatten it into a template token run
+            // - """ opens a multi-line string
+            '"' => {
+                if self.src[idx..].starts_with(TRIPLE_QUOTE) {
+                    self.next();
+                    self.next();
+                    self.lex_multiline_string(idx, tokens, errors);
+                } else {
+                    self.lex_string(idx, tokens, errors);
+                }
+            }
+
+            // numbers
+            ch if ch.is_ascii_digit() => {
+                let token = self.lex_number(idx, ch, errors);
+                tokens.push(token);
+            }
+
+            // errors
+            _ => {
+                errors.push(Error::new(ErrorKind::UnknownToken, SrcRange::new(idx, idx + ch.len_utf8())));
+            }
+        }
     }
 
     // comments run to the end of the line, the newline stays for the whitespace skip
@@ -246,11 +256,9 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn lex_string(&mut self, start: usize, errors: &mut Errors) -> Token {
+    fn lex_string(&mut self, start: usize, tokens: &mut Tokens, errors: &mut Errors) {
         let mut end = start + '"'.len_utf8();
-        let mut parts: Vec<TemplatePart> = Vec::new();
-        let mut lit = String::new();
-        let mut interpolated = false;
+        let mut pieces = StringPieces::default();
 
         loop {
             match self.next() {
@@ -268,27 +276,21 @@ impl<'src> Lexer<'src> {
                             if matches!(self.peek(), Some((_, '{'))) {
                                 let (b_idx, _) = self.next().expect("peeked character is present");
                                 end = b_idx + '{'.len_utf8();
-                                lit.push_str("${");
+                                pieces.push_str(s_idx, "${", end);
                             } else {
-                                lit.push_str("$$");
+                                pieces.push_str(s_idx, "$$", end);
                             }
                         }
                         Some((_, '{')) => {
                             self.next();
-                            interpolated = true;
-                            flush(&mut lit, &mut parts);
-
-                            let (part, ref_end) = self.lex_reference(s_idx, None, errors);
-                            end = ref_end;
-                            if let Some(part) = part {
-                                parts.push(part);
-                            }
+                            pieces.flush();
+                            end = self.lex_interpolation(s_idx, None, &mut pieces.tokens, errors);
                         }
-                        _ => lit.push('$'),
+                        _ => pieces.push(s_idx, '$'),
                     }
                 }
                 Some((s_idx, c)) => {
-                    lit.push(c);
+                    pieces.push(s_idx, c);
                     end = s_idx + c.len_utf8();
                 }
                 None => {
@@ -298,7 +300,8 @@ impl<'src> Lexer<'src> {
             }
         }
 
-        Token::new(string_kind(&mut parts, lit, interpolated), start, end)
+        let open = SrcRange::new(start, start + '"'.len_utf8());
+        pieces.emit(open, SrcRange::new(end - '"'.len_utf8(), end), tokens);
     }
 
     // <<DELIM or <<-DELIM directly before an identifier opens a heredoc
@@ -321,7 +324,7 @@ impl<'src> Lexer<'src> {
 
     // the closing delimiter must sit alone on its line; its leading whitespace is
     // stripped from every content line, and the newline before it is dropped
-    fn lex_multiline_string(&mut self, start: usize, errors: &mut Errors) -> Token {
+    fn lex_multiline_string(&mut self, start: usize, tokens: &mut Tokens, errors: &mut Errors) {
         let content_from = start + TRIPLE_QUOTE.len();
         let Some(closing) = self.src[content_from..].find(TRIPLE_QUOTE).map(|found| content_from + found) else {
             errors.push(Error::new(
@@ -329,7 +332,8 @@ impl<'src> Lexer<'src> {
                 SrcRange::new(start, self.src.len()),
             ));
             while self.next().is_some() {}
-            return Token::new(TokenKind::String(String::new()), start, self.src.len());
+            tokens.push(Token::new(TokenKind::String(String::new()), start, self.src.len()));
+            return;
         };
         let end = closing + TRIPLE_QUOTE.len();
 
@@ -361,23 +365,22 @@ impl<'src> Lexer<'src> {
         } else {
             true
         };
-        let (mut parts, mut lit, interpolated) = self.scan_multiline(closing, indent, true, at_line_start, errors);
+        let mut pieces = StringPieces::default();
+        self.scan_multiline(closing, indent, true, at_line_start, &mut pieces, errors);
 
         // consume the closing quotes; the newline before their line is not part of the value
         self.next();
         self.next();
         self.next();
-        if lit.ends_with('\n') {
-            lit.pop();
-        }
+        pieces.pop_newline();
 
-        Token::new(string_kind(&mut parts, lit, interpolated), start, end)
+        pieces.emit(SrcRange::new(start, content_from), SrcRange::new(closing, end), tokens);
     }
 
     // content runs from the next line to the first line holding only the delimiter
     // word; << keeps lines verbatim, <<- strips their longest shared indentation,
     // and either way the newline ending the last content line stays in the value
-    fn lex_heredoc(&mut self, start: usize, intro_end: usize, delimiter: &str, dedent: bool, errors: &mut Errors) -> Token {
+    fn lex_heredoc(&mut self, start: usize, intro_end: usize, delimiter: &str, dedent: bool, tokens: &mut Tokens, errors: &mut Errors) {
         let unterminated = |lexer: &mut Self, errors: &mut Errors| {
             errors.push(Error::new(
                 ErrorKind::UnterminatedString,
@@ -391,7 +394,8 @@ impl<'src> Lexer<'src> {
             .find('\n')
             .map(|newline| intro_end + newline + '\n'.len_utf8())
         else {
-            return unterminated(self, errors);
+            tokens.push(unterminated(self, errors));
+            return;
         };
 
         // find the closer line first so positions drive the scan
@@ -413,7 +417,8 @@ impl<'src> Lexer<'src> {
             line_start = line_end + '\n'.len_utf8();
         }
         let Some((closer_start, end)) = closer else {
-            return unterminated(self, errors);
+            tokens.push(unterminated(self, errors));
+            return;
         };
 
         let indent = if dedent {
@@ -423,14 +428,15 @@ impl<'src> Lexer<'src> {
         };
 
         let at_line_start = self.scan_opener_line(errors);
-        let (mut parts, lit, interpolated) = self.scan_multiline(closer_start, indent, false, at_line_start, errors);
+        let mut pieces = StringPieces::default();
+        self.scan_multiline(closer_start, indent, false, at_line_start, &mut pieces, errors);
 
         // consume the closer line through the delimiter word
         while matches!(self.peek(), Some((p_idx, _)) if p_idx < end) {
             self.next();
         }
 
-        Token::new(string_kind(&mut parts, lit, interpolated), start, end)
+        pieces.emit(SrcRange::new(start, intro_end), SrcRange::new(closer_start, end), tokens);
     }
 
     // only whitespace may follow a multi-line opener on its line; content found
@@ -465,12 +471,9 @@ impl<'src> Lexer<'src> {
         indent: &str,
         strict: bool,
         mut at_line_start: bool,
+        pieces: &mut StringPieces,
         errors: &mut Errors,
-    ) -> (Vec<TemplatePart>, String, bool) {
-        let mut parts: Vec<TemplatePart> = Vec::new();
-        let mut lit = String::new();
-        let mut interpolated = false;
-
+    ) {
         loop {
             if matches!(self.peek(), Some((p_idx, _)) if p_idx == stop) {
                 break;
@@ -519,8 +522,8 @@ impl<'src> Lexer<'src> {
             }
 
             match self.next() {
-                Some((_, '\n')) => {
-                    lit.push('\n');
+                Some((n_idx, '\n')) => {
+                    pieces.push(n_idx, '\n');
                     at_line_start = true;
                 }
                 // \r\n collapses to \n so dedent and trimming see one newline shape
@@ -528,74 +531,63 @@ impl<'src> Lexer<'src> {
                 Some((s_idx, '$')) => match self.peek() {
                     // $${ escapes a literal ${, any other $ stays literal
                     Some((_, '$')) => {
-                        self.next();
+                        let (d_idx, _) = self.next().expect("peeked character is present");
                         if matches!(self.peek(), Some((_, '{'))) {
-                            self.next();
-                            lit.push_str("${");
+                            let (b_idx, _) = self.next().expect("peeked character is present");
+                            pieces.push_str(s_idx, "${", b_idx + '{'.len_utf8());
                         } else {
-                            lit.push_str("$$");
+                            pieces.push_str(s_idx, "$$", d_idx + '$'.len_utf8());
                         }
                     }
                     Some((_, '{')) => {
                         self.next();
-                        interpolated = true;
-                        flush(&mut lit, &mut parts);
-
-                        let (part, _) = self.lex_reference(s_idx, Some(stop), errors);
-                        if let Some(part) = part {
-                            parts.push(part);
-                        }
+                        pieces.flush();
+                        self.lex_interpolation(s_idx, Some(stop), &mut pieces.tokens, errors);
                     }
-                    _ => lit.push('$'),
+                    _ => pieces.push(s_idx, '$'),
                 },
-                Some((_, ch)) => lit.push(ch),
+                Some((c_idx, ch)) => pieces.push(c_idx, ch),
                 None => break,
             }
         }
-
-        (parts, lit, interpolated)
     }
 
-    // scans ${reference} contents, open = idx of $ and ${ is already eaten
-    // leaves the terminator unconsumed so the enclosing string still ends on it:
-    // a " for quoted strings, a newline or the delimiter at closing for multi-line ones
-    fn lex_reference(&mut self, open: usize, closing: Option<usize>, errors: &mut Errors) -> (Option<TemplatePart>, usize) {
+    // scans a ${...} hole, open = idx of $ and ${ is already eaten; contents lex
+    // as ordinary tokens between InterpOpen and InterpClose markers, strings
+    // included (quoted segments like llm["Chat Completion"]); multi-line holes
+    // still end on a newline or the delimiter at stop
+    fn lex_interpolation(&mut self, open: usize, stop: Option<usize>, tokens: &mut Tokens, errors: &mut Errors) -> usize {
+        tokens.push(Token::new(TokenKind::InterpOpen, open, open + "${".len()));
         let mut end = open + "${".len();
-        let mut content = String::new();
+        let mut depth = 0usize;
 
-        let closed = loop {
+        loop {
             match self.peek() {
-                Some((i_idx, '}')) => {
+                Some((i_idx, '}')) if depth == 0 => {
                     self.next();
                     end = i_idx + '}'.len_utf8();
-                    break true;
+                    tokens.push(Token::new(TokenKind::InterpClose, i_idx, end));
+                    return end;
                 }
-                Some((i_idx, _)) if Some(i_idx) == closing => break false,
-                Some((_, '"')) if closing.is_none() => break false,
-                Some((_, '\n')) if closing.is_some() => break false,
-                None => break false,
-                Some((i_idx, c)) => {
-                    content.push(c);
-                    end = i_idx + c.len_utf8();
+                Some((i_idx, _)) if Some(i_idx) == stop => break,
+                Some((_, '\n')) if stop.is_some() => break,
+                None => break,
+                Some((i_idx, i_ch)) => {
                     self.next();
+                    // nested braces stay ordinary tokens, only the balancing } closes the hole
+                    match i_ch {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    self.lex_token(i_idx, i_ch, tokens, errors);
+                    end = tokens.last().map_or(end, |token| token.range.end);
                 }
             }
-        };
-
-        let range = SrcRange::new(open, end);
-
-        if !closed {
-            errors.push(Error::new(ErrorKind::UnterminatedInterpolation, range));
-            return (None, end);
         }
 
-        match lex_reference_path(&content) {
-            Some(path) => (Some(TemplatePart::Ref { path, range }), end),
-            None => {
-                errors.push(Error::new(ErrorKind::InvalidReference, range));
-                (None, end)
-            }
-        }
+        errors.push(Error::new(ErrorKind::UnterminatedInterpolation, SrcRange::new(open, end)));
+        end
     }
 
     fn lex_number(&mut self, start: usize, first: char, errors: &mut Errors) -> Token {
@@ -651,18 +643,59 @@ impl<'src> Lexer<'src> {
     }
 }
 
-fn flush(lit: &mut String, parts: &mut Vec<TemplatePart>) {
-    if !lit.is_empty() {
-        parts.push(TemplatePart::Lit(std::mem::take(lit)));
-    }
+// accumulates one string's scanned pieces; without a hole they collapse back
+// into a single String token, with one they emit flat as TemplateOpen, chunk
+// and hole tokens, TemplateClose
+#[derive(Debug, Default)]
+struct StringPieces {
+    tokens: Tokens,
+    lit: String,
+    lit_from: usize,
+    lit_to: usize,
 }
 
-fn string_kind(parts: &mut Vec<TemplatePart>, mut lit: String, interpolated: bool) -> TokenKind {
-    if interpolated {
-        flush(&mut lit, parts);
-        TokenKind::Template(std::mem::take(parts))
-    } else {
-        TokenKind::String(lit)
+impl StringPieces {
+    fn push(&mut self, idx: usize, ch: char) {
+        if self.lit.is_empty() {
+            self.lit_from = idx;
+        }
+        self.lit.push(ch);
+        self.lit_to = idx + ch.len_utf8();
+    }
+
+    fn push_str(&mut self, from: usize, text: &str, to: usize) {
+        if self.lit.is_empty() {
+            self.lit_from = from;
+        }
+        self.lit.push_str(text);
+        self.lit_to = to;
+    }
+
+    // the newline before a """ closer's line is not part of the value
+    fn pop_newline(&mut self) {
+        if self.lit.ends_with('\n') {
+            self.lit.pop();
+            self.lit_to -= '\n'.len_utf8();
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.lit.is_empty() {
+            let chunk = TokenKind::TemplateChunk(std::mem::take(&mut self.lit));
+            self.tokens.push(Token::new(chunk, self.lit_from, self.lit_to));
+        }
+    }
+
+    // a hole always pushed InterpOpen, so any buffered token means a template
+    fn emit(mut self, open: SrcRange, close: SrcRange, tokens: &mut Tokens) {
+        if self.tokens.is_empty() {
+            tokens.push(Token::new(TokenKind::String(self.lit), open.start, close.end));
+        } else {
+            self.flush();
+            tokens.push(Token { kind: TokenKind::TemplateOpen, range: open });
+            tokens.append(&mut self.tokens);
+            tokens.push(Token { kind: TokenKind::TemplateClose, range: close });
+        }
     }
 }
 
@@ -693,21 +726,6 @@ fn common_indent(content: &str) -> &str {
     indent.unwrap_or("")
 }
 
-// a reference is a dotted ident path, whitespace around segments is fine
-fn lex_reference_path(content: &str) -> Option<Vec<String>> {
-    content
-        .split('.')
-        .map(str::trim)
-        .map(|segment| {
-            let mut chars = segment.chars();
-            let first = chars.next()?;
-            let valid = first.is_ascii_alphabetic() && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-
-            valid.then(|| segment.to_owned())
-        })
-        .collect()
-}
-
 pub(super) fn lex(src: &str) -> Result<Tokens, Diags> {
     Lexer::new(src)
         .lex()
@@ -731,7 +749,6 @@ pub(super) enum ErrorKind {
     ContentBeforeMultilineCloser,
     UnderindentedMultilineLine,
     UnterminatedInterpolation,
-    InvalidReference,
     InvalidNumber,
     UnpairedOperator(char),
 }
@@ -750,7 +767,6 @@ impl fmt::Display for ErrorKind {
             }
             Self::UnderindentedMultilineLine => formatter.write_str("line is indented less than the closing \"\"\""),
             Self::UnterminatedInterpolation => formatter.write_str("unterminated interpolation"),
-            Self::InvalidReference => formatter.write_str("invalid reference"),
             Self::InvalidNumber => formatter.write_str("invalid number"),
             Self::UnpairedOperator(op) => write!(formatter, "stray `{op}`; did you mean `{op}{op}`?"),
         }
@@ -978,9 +994,24 @@ mod tests {
     }
 
     #[test]
-    fn keeps_operators_inside_interpolations_invalid() {
-        assert_error_kinds(r#""${a + b}""#, &[ErrorKind::InvalidReference]);
-        assert_error_kinds(r#""${x?y:z}""#, &[ErrorKind::InvalidReference]);
+    fn lexes_interpolation_contents_as_ordinary_tokens() {
+        let tokens = Lexer::new(r#""${a + b}""#).lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+
+        // the parser rejects non-path holes, the lexer just hands it tokens
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::TemplateOpen,
+                TokenKind::InterpOpen,
+                TokenKind::Ident("a".to_owned()),
+                TokenKind::Plus,
+                TokenKind::Ident("b".to_owned()),
+                TokenKind::InterpClose,
+                TokenKind::TemplateClose,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
@@ -1019,33 +1050,46 @@ mod tests {
     }
 
     #[test]
-    fn lexes_interpolated_strings_into_template_parts() {
+    fn lexes_interpolated_strings_into_template_tokens() {
         let tokens = Lexer::new(r#""a ${trace.index} b""#).lex().unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
 
         assert_eq!(
-            tokens[0].kind,
-            TokenKind::Template(vec![
-                TemplatePart::Lit("a ".to_owned()),
-                TemplatePart::Ref {
-                    path: vec!["trace".to_owned(), "index".to_owned()],
-                    range: SrcRange::new(3, 17),
-                },
-                TemplatePart::Lit(" b".to_owned()),
-            ])
+            kinds,
+            [
+                TokenKind::TemplateOpen,
+                TokenKind::TemplateChunk("a ".to_owned()),
+                TokenKind::InterpOpen,
+                TokenKind::Ident("trace".to_owned()),
+                TokenKind::Dot,
+                TokenKind::Ident("index".to_owned()),
+                TokenKind::InterpClose,
+                TokenKind::TemplateChunk(" b".to_owned()),
+                TokenKind::TemplateClose,
+                TokenKind::Eof,
+            ]
         );
-        assert_eq!(tokens[0].range, SrcRange::new(0, 20));
+        assert_eq!(tokens[0].range, SrcRange::new(0, 1));
+        assert_eq!(tokens[2].range, SrcRange::new(3, 5));
+        assert_eq!(tokens[6].range, SrcRange::new(16, 17));
+        assert_eq!(tokens[8].range, SrcRange::new(19, 20));
     }
 
     #[test]
     fn lexes_a_lone_interpolation_and_tolerates_padding() {
         let tokens = Lexer::new(r#""${ index }""#).lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
 
         assert_eq!(
-            tokens[0].kind,
-            TokenKind::Template(vec![TemplatePart::Ref {
-                path: vec!["index".to_owned()],
-                range: SrcRange::new(1, 11),
-            }])
+            kinds,
+            [
+                TokenKind::TemplateOpen,
+                TokenKind::InterpOpen,
+                TokenKind::Ident("index".to_owned()),
+                TokenKind::InterpClose,
+                TokenKind::TemplateClose,
+                TokenKind::Eof,
+            ]
         );
     }
 
@@ -1058,8 +1102,16 @@ mod tests {
 
     #[test]
     fn rejects_unterminated_interpolations() {
-        // closing quote still ends the string so no double error
-        assert_error_kinds(r#""${trace""#, &[ErrorKind::UnterminatedInterpolation]);
+        // a quote inside a hole lexes as an inner string, so a malformed hole
+        // reports every layer it breaks
+        assert_error_kinds(
+            r#""${trace""#,
+            &[
+                ErrorKind::UnterminatedString,
+                ErrorKind::UnterminatedInterpolation,
+                ErrorKind::UnterminatedString,
+            ],
+        );
         assert_error_kinds(
             r#""${trace"#,
             &[ErrorKind::UnterminatedInterpolation, ErrorKind::UnterminatedString],
@@ -1067,10 +1119,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_reference_paths() {
-        for src in [r#""${}""#, r#""${1x}""#, r#""${tr ace}""#, r#""${trace.}""#, r#""${.index}""#] {
-            assert_error_kinds(src, &[ErrorKind::InvalidReference]);
-        }
+    fn lexes_quoted_segments_inside_interpolations() {
+        let tokens = Lexer::new(r#""x ${llm["Chat Completion"].output}""#).lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::TemplateOpen,
+                TokenKind::TemplateChunk("x ".to_owned()),
+                TokenKind::InterpOpen,
+                TokenKind::Ident("llm".to_owned()),
+                TokenKind::LBrack,
+                TokenKind::String("Chat Completion".to_owned()),
+                TokenKind::RBrack,
+                TokenKind::Dot,
+                TokenKind::Ident("output".to_owned()),
+                TokenKind::InterpClose,
+                TokenKind::TemplateClose,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
@@ -1147,20 +1216,27 @@ mod tests {
     }
 
     #[test]
-    fn lexes_multiline_interpolations_into_template_parts() {
+    fn lexes_multiline_interpolations_into_template_tokens() {
         let tokens = Lexer::new("\"\"\"\n  q ${trace.index}\n  a\n  \"\"\"").lex().unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
 
         assert_eq!(
-            tokens[0].kind,
-            TokenKind::Template(vec![
-                TemplatePart::Lit("q ".to_owned()),
-                TemplatePart::Ref {
-                    path: vec!["trace".to_owned(), "index".to_owned()],
-                    range: SrcRange::new(8, 22),
-                },
-                TemplatePart::Lit("\na".to_owned()),
-            ])
+            kinds,
+            [
+                TokenKind::TemplateOpen,
+                TokenKind::TemplateChunk("q ".to_owned()),
+                TokenKind::InterpOpen,
+                TokenKind::Ident("trace".to_owned()),
+                TokenKind::Dot,
+                TokenKind::Ident("index".to_owned()),
+                TokenKind::InterpClose,
+                TokenKind::TemplateChunk("\na".to_owned()),
+                TokenKind::TemplateClose,
+                TokenKind::Eof,
+            ]
         );
+        assert_eq!(tokens[2].range, SrcRange::new(8, 10));
+        assert_eq!(tokens[6].range, SrcRange::new(21, 22));
     }
 
     #[test]
@@ -1211,20 +1287,26 @@ mod tests {
     }
 
     #[test]
-    fn lexes_heredoc_interpolations_into_template_parts() {
+    fn lexes_heredoc_interpolations_into_template_tokens() {
         let tokens = Lexer::new("<<EOT\nq ${trace.index}\nEOT").lex().unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
 
         assert_eq!(
-            tokens[0].kind,
-            TokenKind::Template(vec![
-                TemplatePart::Lit("q ".to_owned()),
-                TemplatePart::Ref {
-                    path: vec!["trace".to_owned(), "index".to_owned()],
-                    range: SrcRange::new(8, 22),
-                },
-                TemplatePart::Lit("\n".to_owned()),
-            ])
+            kinds,
+            [
+                TokenKind::TemplateOpen,
+                TokenKind::TemplateChunk("q ".to_owned()),
+                TokenKind::InterpOpen,
+                TokenKind::Ident("trace".to_owned()),
+                TokenKind::Dot,
+                TokenKind::Ident("index".to_owned()),
+                TokenKind::InterpClose,
+                TokenKind::TemplateChunk("\n".to_owned()),
+                TokenKind::TemplateClose,
+                TokenKind::Eof,
+            ]
         );
+        assert_eq!(tokens[2].range, SrcRange::new(8, 10));
     }
 
     #[test]
