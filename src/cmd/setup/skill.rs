@@ -221,7 +221,7 @@ fn render_skill(spec: &Spec) -> String {
     .unwrap();
     writeln!(
         output,
-        "4. Validate file-based source with `bts check <path>` after editing.\n"
+        "4. Validate file-based source with `bts check syntax <path>` after editing.\n"
     )
     .unwrap();
     writeln!(
@@ -509,7 +509,7 @@ mod tests {
 
         assert!(skill.starts_with("---\nname: bts\ndescription:"));
         assert!(skill.contains(GENERATED_MARKER));
-        assert!(skill.contains("bts check <path>"));
+        assert!(skill.contains("bts check syntax <path>"));
         assert!(skill.contains("bts generate --from <path> --count <traces> --over <duration> --dry-run"));
         assert!(skill.contains(SPEC.summary));
         assert!(skill.contains(SPEC.surface.grammar.trim()));

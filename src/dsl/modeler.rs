@@ -1,9 +1,9 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NodeId, Number,
-    Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, Span, SpanFields, SpanKind, Step,
-    Template, Trace, UnaryOp, Value, WeightedOption,
+    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NodeId, Number, Object,
+    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, Span, SpanFields, SpanKind, Step, Template, Trace,
+    UnaryOp, Value, WeightedOption,
 };
 use crate::dsl::spec;
 use std::{
@@ -117,10 +117,7 @@ impl Folded {
         match self.kind {
             FoldedKind::Value(value) => value,
             FoldedKind::Array(values) => Value::Array(Array {
-                elem: values
-                    .into_iter()
-                    .map(|value| ArrayElem::Item(value.into_value()))
-                    .collect(),
+                elem: values.into_iter().map(|value| ArrayElem::Item(value.into_value())).collect(),
             }),
             FoldedKind::Object(fields) => Value::Object(Object {
                 elem: fields
@@ -191,8 +188,14 @@ struct SymNode {
 // and drill-in selections needs the full symbol tree, so it waits for fixup
 #[derive(Debug, Clone)]
 enum Segment {
-    Name { value: String, range: SrcRange },
-    Index { value: Value, range: SrcRange },
+    Name {
+        value: String,
+        range: SrcRange,
+    },
+    Index {
+        value: Value,
+        range: SrcRange,
+    },
     Slice {
         start: Option<Value>,
         end: Option<Value>,
@@ -430,7 +433,8 @@ impl Modeler {
             (Field::Metrics, fields.metrics.is_some()),
             (Field::Tags, !fields.tags.is_empty()),
         ];
-        sym.fields.extend(set.into_iter().filter_map(|(field, set)| set.then_some(field)));
+        sym.fields
+            .extend(set.into_iter().filter_map(|(field, set)| set.then_some(field)));
     }
 
     // collects a block's vars and pushes their scope frame; the caller pops it
@@ -534,7 +538,9 @@ impl Modeler {
         match kind {
             ast::ExprKind::Str(value) => Some(Folded::value(Value::Str(value), range)),
             ast::ExprKind::Template(parts) => self.fold_template(parts, range),
-            ast::ExprKind::Num(raw) => self.model_number(raw, false, range).map(|number| Folded::value(Value::Num(number), range)),
+            ast::ExprKind::Num(raw) => self
+                .model_number(raw, false, range)
+                .map(|number| Folded::value(Value::Num(number), range)),
             ast::ExprKind::Bool(value) => Some(Folded::value(Value::Bool(value), range)),
             ast::ExprKind::Null => Some(Folded::value(Value::Null, range)),
             ast::ExprKind::Array(values) => self.fold_array(values, range),
@@ -634,11 +640,7 @@ impl Modeler {
 
         if let Some(head) = self.block_head(&path[0], range) {
             let head = head?;
-            let segments = path
-                .into_iter()
-                .skip(1)
-                .map(|value| Segment::Name { value, range })
-                .collect();
+            let segments = path.into_iter().skip(1).map(|value| Segment::Name { value, range }).collect();
             return Some(self.begin_block_ref(head, segments, range));
         }
 
@@ -706,22 +708,11 @@ impl Modeler {
         pending.range = range;
         let extended = RefId(self.pending.len() as u32);
         self.pending.push(pending);
-        Folded::value(
-            Value::BlockRef {
-                ref_id: extended,
-                range,
-            },
-            range,
-        )
+        Folded::value(Value::BlockRef { ref_id: extended, range }, range)
     }
 
     // selects the trailing segments of a reference path as string indexes
-    fn select_segments(
-        &mut self,
-        head: Folded,
-        segments: impl Iterator<Item = String>,
-        range: SrcRange,
-    ) -> Option<Folded> {
+    fn select_segments(&mut self, head: Folded, segments: impl Iterator<Item = String>, range: SrcRange) -> Option<Folded> {
         let mut selected = head;
         for segment in segments {
             let index = Folded::value(Value::Str(segment), range);
@@ -892,9 +883,7 @@ impl Modeler {
         }
 
         match operand.kind {
-            FoldedKind::Value(Value::Bool(value)) if op == ast::UnaryOp::Not => {
-                Some(Folded::value(Value::Bool(!value), range))
-            }
+            FoldedKind::Value(Value::Bool(value)) if op == ast::UnaryOp::Not => Some(Folded::value(Value::Bool(!value), range)),
             // negating a constant computes now, overflow can only hit i64::MIN
             FoldedKind::Value(Value::Num(number)) => {
                 let negated = match number {
@@ -1551,9 +1540,7 @@ impl Modeler {
                 }
 
                 let shape = match self.var_value(&name).map(|value| &value.kind) {
-                    Some(FoldedKind::Array(values)) => {
-                        Some(VarShape::Array(values.iter().map(|value| value.range).collect()))
-                    }
+                    Some(FoldedKind::Array(values)) => Some(VarShape::Array(values.iter().map(|value| value.range).collect())),
                     Some(FoldedKind::Object(fields)) => Some(VarShape::Object(
                         fields.iter().map(|field| (field.key.clone(), field.range)).collect(),
                     )),
@@ -1641,12 +1628,7 @@ impl Modeler {
     }
 
     // filter first so skipped elements never fold their bodies
-    fn fold_iteration(
-        &mut self,
-        key: &Option<Box<ast::Expr>>,
-        body: &ast::Expr,
-        cond: &Option<Box<ast::Expr>>,
-    ) -> Iteration {
+    fn fold_iteration(&mut self, key: &Option<Box<ast::Expr>>, body: &ast::Expr, cond: &Option<Box<ast::Expr>>) -> Iteration {
         if let Some(cond) = cond {
             let Some(cond) = self.fold_expr((**cond).clone()) else {
                 return Iteration::Invalid;
@@ -1751,9 +1733,7 @@ impl Modeler {
                     || self.value_reaches_block_ref(then)
                     || self.value_reaches_block_ref(otherwise)
             }
-            Value::Index { target, index, .. } => {
-                self.value_reaches_block_ref(target) || self.value_reaches_block_ref(index)
-            }
+            Value::Index { target, index, .. } => self.value_reaches_block_ref(target) || self.value_reaches_block_ref(index),
             Value::Slice { target, start, end, .. } => {
                 self.value_reaches_block_ref(target)
                     || start.as_deref().is_some_and(|bound| self.value_reaches_block_ref(bound))
@@ -1773,13 +1753,9 @@ impl Modeler {
                 | Func::Uuid
                 | Func::Hex { .. }
                 | Func::Alphanum { .. } => false,
-                Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => {
-                    self.value_reaches_block_ref(text)
-                }
+                Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => self.value_reaches_block_ref(text),
                 Func::Replace { text, from, to } => {
-                    self.value_reaches_block_ref(text)
-                        || self.value_reaches_block_ref(from)
-                        || self.value_reaches_block_ref(to)
+                    self.value_reaches_block_ref(text) || self.value_reaches_block_ref(from) || self.value_reaches_block_ref(to)
                 }
                 Func::Split { text, separator } => {
                     self.value_reaches_block_ref(text) || self.value_reaches_block_ref(separator)
@@ -1790,12 +1766,8 @@ impl Modeler {
                 Func::Contains { target, needle } => {
                     self.value_reaches_block_ref(target) || self.value_reaches_block_ref(needle)
                 }
-                Func::StartsWith { text, prefix } => {
-                    self.value_reaches_block_ref(text) || self.value_reaches_block_ref(prefix)
-                }
-                Func::EndsWith { text, suffix } => {
-                    self.value_reaches_block_ref(text) || self.value_reaches_block_ref(suffix)
-                }
+                Func::StartsWith { text, prefix } => self.value_reaches_block_ref(text) || self.value_reaches_block_ref(prefix),
+                Func::EndsWith { text, suffix } => self.value_reaches_block_ref(text) || self.value_reaches_block_ref(suffix),
                 Func::Len { target } => self.value_reaches_block_ref(target),
                 Func::Tokens { value } => self.value_reaches_block_ref(value),
                 Func::Format { args, .. } => any(args),
@@ -1941,12 +1913,7 @@ impl Modeler {
 
     // the definition value behind a var name, chasing var-to-var definitions
     fn var_value(&self, name: &str) -> Option<&Folded> {
-        let def = self
-            .scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.vars.get(name))?
-            .as_ref()?;
+        let def = self.scopes.iter().rev().find_map(|scope| scope.vars.get(name))?.as_ref()?;
         match &def.value.kind {
             FoldedKind::Value(Value::VarRef(inner)) => self.var_value(inner),
             _ => Some(&def.value),
@@ -3197,9 +3164,7 @@ impl Modeler {
                 Value::Object(object) => unify_types(object.elem.iter().map(|field| self.value_type(&field.value))),
                 Value::VarRef(name) => match self.var_value(name).map(|value| &value.kind) {
                     Some(FoldedKind::Array(values)) => unify_types(values.iter().map(|value| self.static_type(value))),
-                    Some(FoldedKind::Object(fields)) => {
-                        unify_types(fields.iter().map(|field| self.static_type(&field.value)))
-                    }
+                    Some(FoldedKind::Object(fields)) => unify_types(fields.iter().map(|field| self.static_type(&field.value))),
                     _ => None,
                 },
                 _ => None,
@@ -3443,7 +3408,11 @@ impl Modeler {
                                 self.errors.push(Error::new(
                                     ErrorKind::RepeatRefOutsideRepeat {
                                         rule: spec::ids::REPEAT_REFS,
-                                        path: format!("repeat.{}.{}", self.syms[node.0 as usize].name.as_deref().unwrap_or("?"), value),
+                                        path: format!(
+                                            "repeat.{}.{}",
+                                            self.syms[node.0 as usize].name.as_deref().unwrap_or("?"),
+                                            value
+                                        ),
                                     },
                                     at,
                                 ));
@@ -3574,9 +3543,7 @@ impl Modeler {
         // a statically known target joins the dependency graph; dynamic
         // positions and iteration steps fall to generation-time in-progress
         // detection instead
-        if !has_iteration
-            && let (Some(from), Some(node), Accessor::Field(field)) = (slot, target, &accessor)
-        {
+        if !has_iteration && let (Some(from), Some(node), Accessor::Field(field)) = (slot, target, &accessor) {
             let key = match (field, path.first()) {
                 (Field::Metadata | Field::Metrics, Some(Selection::Index(Value::Str(key)))) => Some(key.clone()),
                 _ => None,
@@ -3603,7 +3570,13 @@ impl Modeler {
 
     // dynamic blocks have no positional collections: to be addressed, a
     // repeat, choice, or maybe must be uniquely named among its siblings
-    fn lone_candidate(&mut self, steps: &mut Vec<Step>, candidates: Vec<NodeId>, name: &str, range: SrcRange) -> Option<NodeId> {
+    fn lone_candidate(
+        &mut self,
+        steps: &mut Vec<Step>,
+        candidates: Vec<NodeId>,
+        name: &str,
+        range: SrcRange,
+    ) -> Option<NodeId> {
         if candidates.len() > 1 {
             self.errors.push(Error::new(
                 ErrorKind::AmbiguousBlockRef {
@@ -3863,7 +3836,10 @@ fn collect_child_refs(child: &Child, found: &mut Vec<RefId>) {
 }
 
 fn collect_field_refs(fields: &SpanFields, found: &mut Vec<RefId>) {
-    for value in [&fields.input, &fields.output, &fields.expected, &fields.error].into_iter().flatten() {
+    for value in [&fields.input, &fields.output, &fields.expected, &fields.error]
+        .into_iter()
+        .flatten()
+    {
         collect_refs(value, found);
     }
     for object in [&fields.metadata, &fields.metrics].into_iter().flatten() {
@@ -4708,11 +4684,7 @@ impl fmt::Display for ErrorKind {
             }
             Self::UnknownBlockRef { rule, keyword, name } => {
                 let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "no {keyword} block named \"{name}\" is in scope; {}",
-                    rule.summary
-                )
+                write!(formatter, "no {keyword} block named \"{name}\" is in scope; {}", rule.summary)
             }
             Self::AmbiguousBlockRef { rule, name, count } => {
                 let rule = rule_desc(*rule);
@@ -4724,11 +4696,7 @@ impl fmt::Display for ErrorKind {
             }
             Self::IncompleteBlockRef { rule, keyword } => {
                 let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "`{keyword}` reference does not reach a field; {}",
-                    rule.summary
-                )
+                write!(formatter, "`{keyword}` reference does not reach a field; {}", rule.summary)
             }
             Self::AbsentFieldRef { rule, field, label } => {
                 let rule = rule_desc(*rule);
@@ -4760,11 +4728,7 @@ impl fmt::Display for ErrorKind {
             }
             Self::ReservedRepeatName { rule, name } => {
                 let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "`{name}` cannot name a repeat block; {}",
-                    rule.summary
-                )
+                write!(formatter, "`{name}` cannot name a repeat block; {}", rule.summary)
             }
             Self::CircularReference { rule, chain } => {
                 let rule = rule_desc(*rule);
@@ -4776,19 +4740,11 @@ impl fmt::Display for ErrorKind {
             }
             Self::RootVarBlockRef { rule, name } => {
                 let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "root var `{name}` cannot hold a block reference; {}",
-                    rule.summary
-                )
+                write!(formatter, "root var `{name}` cannot hold a block reference; {}", rule.summary)
             }
             Self::StructuralBlockRef { rule, field } => {
                 let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "`{field}` cannot depend on a block reference; {}",
-                    rule.summary
-                )
+                write!(formatter, "`{field}` cannot depend on a block reference; {}", rule.summary)
             }
             Self::ForBlockRefCollection { rule } => {
                 let rule = rule_desc(*rule);
@@ -5316,10 +5272,7 @@ mod tests {
     #[test]
     fn selects_into_variables_by_path() {
         let model = model(r#"vars { m = { a = { b = 4 } } } trace "t" { input = var.m.a.b }"#).unwrap();
-        assert!(matches!(
-            model.traces[0].fields.input,
-            Some(Value::Num(Number::Int(4)))
-        ));
+        assert!(matches!(model.traces[0].fields.input, Some(Value::Num(Number::Int(4)))));
     }
 
     #[test]
@@ -5718,10 +5671,9 @@ mod tests {
 
     #[test]
     fn resolves_repeat_count_in_templates() {
-        let model = model(
-            r#"trace "t" { repeat { count = 2 task "x" { input = "turn ${repeat.index} of ${repeat.count}" } } }"#,
-        )
-        .unwrap();
+        let model =
+            model(r#"trace "t" { repeat { count = 2 task "x" { input = "turn ${repeat.index} of ${repeat.count}" } } }"#)
+                .unwrap();
 
         let Child::Repeat(repeat) = &model.traces[0].children[0] else {
             panic!("expected a repeat");
@@ -7349,7 +7301,12 @@ mod tests {
             panic!("expected an array");
         };
         assert_eq!(array.elem.len(), 2);
-        assert!(array.elem.iter().all(|value| matches!(value, ArrayElem::Item(Value::Binary { .. }))));
+        assert!(
+            array
+                .elem
+                .iter()
+                .all(|value| matches!(value, ArrayElem::Item(Value::Binary { .. })))
+        );
     }
 
     #[test]
@@ -7874,7 +7831,11 @@ mod tests {
 
         for (source, matches_kind) in cases {
             let errors = model(source).unwrap_err();
-            assert!(matches_kind(errors[0].kind()), "unexpected error for {source}: {:?}", errors[0].kind());
+            assert!(
+                matches_kind(errors[0].kind()),
+                "unexpected error for {source}: {:?}",
+                errors[0].kind()
+            );
         }
     }
 
@@ -7883,18 +7844,16 @@ mod tests {
         let errors = model(r#"vars { x = self.output } trace "t" { input = var.x }"#).unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::SelfOutsideBlock { .. }));
 
-        let errors = model(r#"vars { x = llm.chat.output } trace "t" { input = var.x llm "chat" { output = 1 } }"#)
-            .unwrap_err();
+        let errors =
+            model(r#"vars { x = llm.chat.output } trace "t" { input = var.x llm "chat" { output = 1 } }"#).unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::RootVarBlockRef { .. }));
     }
 
     #[test]
     fn keeps_structure_independent_of_references() {
         // count cannot reach a reference, directly or through a var
-        let errors = model(
-            r#"trace "t" { task "n" { output = 3 } repeat { count = task.n.output task "x" {} } }"#,
-        )
-        .unwrap_err();
+        let errors =
+            model(r#"trace "t" { task "n" { output = 3 } repeat { count = task.n.output task "x" {} } }"#).unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::StructuralBlockRef { .. }));
 
         let errors = model(
@@ -7909,10 +7868,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::StructuralBlockRef { .. }));
 
-        let errors = model(
-            r#"trace "t" { task "n" { output = [1] } input = [for x in task.n.output : x] }"#,
-        )
-        .unwrap_err();
+        let errors = model(r#"trace "t" { task "n" { output = [1] } input = [for x in task.n.output : x] }"#).unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::ForBlockRefCollection { .. }));
     }
 
@@ -7953,17 +7909,21 @@ mod tests {
         .unwrap();
 
         // the metadata ref selects one iteration then descends
-        let last = model
-            .refs
-            .iter()
-            .find(|resolved| matches!(&resolved.steps[..], [Step::Child { .. }, Step::Iteration(_), Step::Child { .. }]));
+        let last = model.refs.iter().find(|resolved| {
+            matches!(
+                &resolved.steps[..],
+                [Step::Child { .. }, Step::Iteration(_), Step::Child { .. }]
+            )
+        });
         assert!(last.is_some(), "expected an iteration-selecting ref: {:?}", model.refs);
 
         // the history ref projects over an iteration slice
-        let history = model
-            .refs
-            .iter()
-            .find(|resolved| matches!(&resolved.steps[..], [Step::Child { .. }, Step::Iterations { .. }, Step::Child { .. }]));
+        let history = model.refs.iter().find(|resolved| {
+            matches!(
+                &resolved.steps[..],
+                [Step::Child { .. }, Step::Iterations { .. }, Step::Child { .. }]
+            )
+        });
         assert!(history.is_some(), "expected a projecting ref: {:?}", model.refs);
 
         // named accessors close without a field
@@ -7978,17 +7938,12 @@ mod tests {
         assert!(matches!(errors[0].kind(), ErrorKind::ReservedRepeatName { .. }));
 
         // descending without selecting an iteration
-        let errors = model(
-            r#"trace "t" { repeat "r" { count = 1 llm "c" { output = 1 } } input = repeat.r.llm.c.output }"#,
-        )
-        .unwrap_err();
+        let errors = model(r#"trace "t" { repeat "r" { count = 1 llm "c" { output = 1 } } input = repeat.r.llm.c.output }"#)
+            .unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::RepeatIterationRequired { .. }));
 
         // index/count of a repeat that does not enclose the reference
-        let errors = model(
-            r#"trace "t" { repeat "r" { count = 1 task "x" {} } input = repeat.r.index }"#,
-        )
-        .unwrap_err();
+        let errors = model(r#"trace "t" { repeat "r" { count = 1 task "x" {} } input = repeat.r.index }"#).unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::RepeatRefOutsideRepeat { .. }));
     }
 
@@ -8024,8 +7979,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(modeled.refs.iter().any(|resolved| matches!(resolved.accessor, Accessor::Chosen)));
-        assert!(modeled.refs.iter().any(|resolved| matches!(resolved.accessor, Accessor::Included)));
+        assert!(
+            modeled
+                .refs
+                .iter()
+                .any(|resolved| matches!(resolved.accessor, Accessor::Chosen))
+        );
+        assert!(
+            modeled
+                .refs
+                .iter()
+                .any(|resolved| matches!(resolved.accessor, Accessor::Included))
+        );
     }
 
     #[test]

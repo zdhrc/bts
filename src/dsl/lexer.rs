@@ -207,8 +207,8 @@ impl<'src> Lexer<'src> {
                             self.next();
                         }
                         c if c.is_whitespace() => break,
-                        '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' | '+' | '*' | '/' | '%' | '<'
-                        | '>' | '!' | '&' | '|' | '?' | ':' | '#' => break,
+                        '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' | '+' | '*' | '/' | '%' | '<' | '>'
+                        | '!' | '&' | '|' | '?' | ':' | '#' => break,
                         _ => {
                             errors.push(Error::new(
                                 ErrorKind::InvalidIdentToken,
@@ -380,7 +380,15 @@ impl<'src> Lexer<'src> {
     // content runs from the next line to the first line holding only the delimiter
     // word; << keeps lines verbatim, <<- strips their longest shared indentation,
     // and either way the newline ending the last content line stays in the value
-    fn lex_heredoc(&mut self, start: usize, intro_end: usize, delimiter: &str, dedent: bool, tokens: &mut Tokens, errors: &mut Errors) {
+    fn lex_heredoc(
+        &mut self,
+        start: usize,
+        intro_end: usize,
+        delimiter: &str,
+        dedent: bool,
+        tokens: &mut Tokens,
+        errors: &mut Errors,
+    ) {
         let unterminated = |lexer: &mut Self, errors: &mut Errors| {
             errors.push(Error::new(
                 ErrorKind::UnterminatedString,
@@ -692,9 +700,15 @@ impl StringPieces {
             tokens.push(Token::new(TokenKind::String(self.lit), open.start, close.end));
         } else {
             self.flush();
-            tokens.push(Token { kind: TokenKind::TemplateOpen, range: open });
+            tokens.push(Token {
+                kind: TokenKind::TemplateOpen,
+                range: open,
+            });
             tokens.append(&mut self.tokens);
-            tokens.push(Token { kind: TokenKind::TemplateClose, range: close });
+            tokens.push(Token {
+                kind: TokenKind::TemplateClose,
+                range: close,
+            });
         }
     }
 }

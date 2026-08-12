@@ -9,16 +9,16 @@ pub(crate) mod spec;
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use model::{
     Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NodeId, Number, Object,
-    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, SpanFields, SpanKind, Step, Template,
-    Trace, UnaryOp, Value,
+    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, SpanFields, SpanKind, Step, Template, Trace, UnaryOp,
+    Value,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
 
 pub(crate) fn compile(src: &str) -> Result<Model, Diags> {
-    let tokens = lex(src)?;
-    let ast = parse(tokens, src)?;
-    model(ast)
+    let tokens = tracing::info_span!("lex").in_scope(|| lex(src))?;
+    let ast = tracing::info_span!("parse").in_scope(|| parse(tokens, src))?;
+    tracing::info_span!("model").in_scope(|| model(ast))
 }
 
 #[cfg(test)]

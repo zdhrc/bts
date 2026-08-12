@@ -1,4 +1,4 @@
-use crate::cmd::render_diags;
+use crate::cmd::{parse_duration, render_diags};
 use crate::{conf::Braintrust, dsl, sdg};
 use std::{
     fmt, fs,
@@ -33,18 +33,33 @@ pub struct Args {
     /// print the Braintrust payload without writing it
     #[arg(long)]
     dry_run: bool,
+
+    /// print phase timings to stderr while running
+    #[arg(long)]
+    profile: bool,
 }
 
 impl Args {
     pub fn run(self) -> Result<(), Error> {
+        if self.profile {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                .with_timer(tracing_subscriber::fmt::time::uptime())
+                .with_target(false)
+                .init();
+        }
+
         let source = fs::read_to_string(&self.from).map_err(|source| Error::ReadShape {
             path: self.from.clone(),
             source,
         })?;
         let source_name = self.from.display().to_string();
-        let model = dsl::compile(&source).map_err(|diags| Error::InvalidShape {
-            details: render_diags(&source_name, &source, &diags),
-        })?;
+        let model = tracing::info_span!("compile")
+            .in_scope(|| dsl::compile(&source))
+            .map_err(|diags| Error::InvalidShape {
+                details: render_diags(&source_name, &source, &diags),
+            })?;
         let seed = match self.seed {
             Some(seed) => seed,
             None => {
@@ -53,8 +68,9 @@ impl Args {
                 seed
             }
         };
-        let events = sdg::generate(model, self.count.get(), self.over, self.dist, SystemTime::now(), seed).map_err(
-            |error| match error {
+        let events = tracing::info_span!("generate")
+            .in_scope(|| sdg::generate(model, self.count.get(), self.over, self.dist, SystemTime::now(), seed))
+            .map_err(|error| match error {
                 // expression evaluation failures render like compile diagnostics with line:col
                 sdg::Error::Plan(plan_error) => Error::FailedGeneration {
                     details: render_diags(
@@ -68,16 +84,16 @@ impl Args {
                     ),
                 },
                 other => Error::Generate(other),
-            },
-        )?;
+            })?;
 
         if self.dry_run {
-            println!("{}", serde_json::to_string_pretty(&events)?);
+            let encoded = tracing::info_span!("encode").in_scope(|| serde_json::to_string_pretty(&events))?;
+            println!("{encoded}");
             return Ok(());
         }
 
         let config = Braintrust::from_env()?;
-        let inserted = sdg::write(&config, &events)?;
+        let inserted = tracing::info_span!("write").in_scope(|| sdg::write(&config, &events))?;
         println!(
             "inserted {} traces and {} child spans into project {} ({} rows acknowledged)",
             events.trace_count(),
@@ -88,31 +104,6 @@ impl Args {
 
         Ok(())
     }
-}
-
-fn parse_duration(value: &str) -> Result<Duration, String> {
-    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
-        (number, 1_u64)
-    } else if let Some(number) = value.strip_suffix('s') {
-        (number, 1_000)
-    } else if let Some(number) = value.strip_suffix('m') {
-        (number, 60_000)
-    } else if let Some(number) = value.strip_suffix('h') {
-        (number, 3_600_000)
-    } else if let Some(number) = value.strip_suffix('d') {
-        (number, 86_400_000)
-    } else {
-        return Err("duration must end in ms, s, m, h, or d".to_owned());
-    };
-    let number = number
-        .parse::<u64>()
-        .map_err(|_| "duration must start with a whole number".to_owned())?;
-    let milliseconds = number
-        .checked_mul(multiplier)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| "duration must be greater than zero and within range".to_owned())?;
-
-    Ok(Duration::from_millis(milliseconds))
 }
 
 #[derive(Debug)]

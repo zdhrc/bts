@@ -760,7 +760,11 @@ const EXPR_TYPES: &[ExprDesc] = &[
         id: ids::CTX_REF,
         syntax: "trace.index | repeat.index | repeat.count",
         summary: "A context reference resolved for each generated trace: `trace.index` is the 0-based index of the trace being generated; `repeat.index` and `repeat.count` are the 0-based iteration and total count of the innermost enclosing repeat block. All are integers, usable as any number or interpolated with `${...}`.",
-        examples: &["repeat.index + 1", "var.messages[:repeat.index + 1]", "\"question #${trace.index}\""],
+        examples: &[
+            "repeat.index + 1",
+            "var.messages[:repeat.index + 1]",
+            "\"question #${trace.index}\"",
+        ],
         rules: CTX_REF_RULES,
     },
     ExprDesc {

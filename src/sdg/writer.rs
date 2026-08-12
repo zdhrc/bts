@@ -3,8 +3,10 @@ use reqwest::{StatusCode, blocking::Client, header::CONTENT_TYPE};
 use serde::Deserialize;
 use std::fmt;
 
-// braintrust's lambda-backed api caps request bodies; advertised as logs3_payload_max_bytes on GET /version
-const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
+// braintrust's lambda-backed api caps request bodies; advertised as logs3_payload_max_bytes (5MiB) on
+// GET /version, but the gateway measures requests after lambda event wrapping inflates them, so bodies
+// near the advertised cap still 413. the official sdk batches at half the advertised limit; match that.
+const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024 / 2;
 const PAYLOAD_OPEN: &[u8] = b"{\"events\":[";
 const PAYLOAD_CLOSE: &[u8] = b"]}";
 
@@ -41,10 +43,22 @@ impl<'config> Writer<'config> {
             self.config.project_id,
         );
         let mut row_ids = Vec::with_capacity(events.event_count());
+        let mut pending = payloads(events, MAX_PAYLOAD_BYTES)?;
+        pending.reverse();
 
-        for payload in payloads(events, MAX_PAYLOAD_BYTES)? {
-            let inserted = self.send(&url, payload)?;
-            row_ids.extend(inserted.row_ids.into_vec());
+        while let Some(payload) = pending.pop() {
+            let sent = tracing::info_span!("insert", events = payload.event_count(), bytes = payload.body_len)
+                .in_scope(|| self.send(&url, &payload));
+            match sent {
+                Ok(inserted) => row_ids.extend(inserted.row_ids.into_vec()),
+                // the server's effective limit can sit below our cap; split and retry until it takes
+                Err(error) if error.is_payload_too_large() && payload.event_count() > 1 => {
+                    let (left, right) = payload.split();
+                    pending.push(right);
+                    pending.push(left);
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(InsertResponse {
@@ -52,13 +66,13 @@ impl<'config> Writer<'config> {
         })
     }
 
-    fn send(&self, url: &str, payload: Payload) -> Result<InsertResponse, Error> {
+    fn send(&self, url: &str, payload: &Payload) -> Result<InsertResponse, Error> {
         let response = self
             .client
             .post(url)
             .bearer_auth(&self.config.api_key)
             .header(CONTENT_TYPE, "application/json")
-            .body(payload.body)
+            .body(payload.body())
             .send()
             .map_err(|error| Error::new(ErrorKind::SendRequest(error)))?;
         let status = response.status();
@@ -75,9 +89,9 @@ impl<'config> Writer<'config> {
             .map_err(|error| Error::new(ErrorKind::DecodeResponse(error)))?;
 
         // partial ack means braintrust dropped events, report failure not a fake success
-        if inserted.row_count() != payload.event_count {
+        if inserted.row_count() != payload.event_count() {
             return Err(Error::new(ErrorKind::UnexpectedRowCount {
-                expected: payload.event_count,
+                expected: payload.event_count(),
                 actual: inserted.row_count(),
             }));
         }
@@ -88,41 +102,60 @@ impl<'config> Writer<'config> {
 
 #[derive(Debug)]
 struct Payload {
-    body: Vec<u8>,
-    event_count: usize,
+    events: Vec<Vec<u8>>,
+    body_len: usize,
 }
 
 impl Payload {
-    fn open() -> Self {
-        Self {
-            body: PAYLOAD_OPEN.to_vec(),
-            event_count: 0,
-        }
+    fn new(events: Vec<Vec<u8>>) -> Self {
+        let body_len = PAYLOAD_OPEN.len()
+            + PAYLOAD_CLOSE.len()
+            + events.iter().map(Vec::len).sum::<usize>()
+            + events.len().saturating_sub(1);
+
+        Self { events, body_len }
+    }
+
+    fn event_count(&self) -> usize {
+        self.events.len()
     }
 
     fn fits(&self, encoded_length: usize, limit: usize) -> bool {
-        let separator = usize::from(self.event_count > 0);
-        self.body.len() + separator + encoded_length + PAYLOAD_CLOSE.len() <= limit
+        let separator = usize::from(!self.events.is_empty());
+        self.body_len + separator + encoded_length <= limit
     }
 
-    fn push(&mut self, encoded: &[u8]) {
-        if self.event_count > 0 {
-            self.body.push(b',');
+    fn push(&mut self, encoded: Vec<u8>) {
+        self.body_len += usize::from(!self.events.is_empty()) + encoded.len();
+        self.events.push(encoded);
+    }
+
+    fn split(mut self) -> (Self, Self) {
+        let right = self.events.split_off(self.events.len() / 2);
+        (Self::new(self.events), Self::new(right))
+    }
+
+    fn body(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(self.body_len);
+        body.extend_from_slice(PAYLOAD_OPEN);
+
+        for (index, event) in self.events.iter().enumerate() {
+            if index > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(event);
         }
-        self.body.extend_from_slice(encoded);
-        self.event_count += 1;
-    }
 
-    fn close(mut self) -> Self {
-        self.body.extend_from_slice(PAYLOAD_CLOSE);
-        self
+        body.extend_from_slice(PAYLOAD_CLOSE);
+        body
     }
 }
 
 // greedily packs serialized events into payloads that stay under the byte limit
 fn payloads(events: &EventBatch, limit: usize) -> Result<Vec<Payload>, Error> {
+    let _span = tracing::info_span!("pack").entered();
     let mut payloads = Vec::new();
-    let mut current = Payload::open();
+    let mut current = Payload::new(Vec::new());
 
     for event in &events.events {
         let encoded = serde_json::to_vec(event).map_err(|error| Error::new(ErrorKind::EncodeEvent(error)))?;
@@ -136,15 +169,15 @@ fn payloads(events: &EventBatch, limit: usize) -> Result<Vec<Payload>, Error> {
         }
 
         if !current.fits(encoded.len(), limit) {
-            payloads.push(current.close());
-            current = Payload::open();
+            payloads.push(current);
+            current = Payload::new(Vec::new());
         }
 
-        current.push(&encoded);
+        current.push(encoded);
     }
 
-    if current.event_count > 0 {
-        payloads.push(current.close());
+    if current.event_count() > 0 {
+        payloads.push(current);
     }
 
     Ok(payloads)
@@ -152,6 +185,21 @@ fn payloads(events: &EventBatch, limit: usize) -> Result<Vec<Payload>, Error> {
 
 pub(super) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, Error> {
     Writer::new(config)?.write(events)
+}
+
+// what a write would send, without sending it
+pub(crate) struct PackStats {
+    pub(crate) payload_count: usize,
+    pub(crate) body_bytes: usize,
+}
+
+pub(super) fn pack_stats(events: &EventBatch) -> Result<PackStats, Error> {
+    let payloads = payloads(events, MAX_PAYLOAD_BYTES)?;
+
+    Ok(PackStats {
+        payload_count: payloads.len(),
+        body_bytes: payloads.iter().map(|payload| payload.body_len).sum(),
+    })
 }
 
 #[derive(Debug)]
@@ -207,6 +255,10 @@ impl std::error::Error for Error {}
 impl Error {
     fn new(kind: ErrorKind) -> Self {
         Self { kind }
+    }
+
+    fn is_payload_too_large(&self) -> bool {
+        matches!(&self.kind, ErrorKind::Rejected { status, .. } if *status == StatusCode::PAYLOAD_TOO_LARGE)
     }
 
     #[cfg(test)]
@@ -294,10 +346,11 @@ mod tests {
         assert!(payloads.len() > 1);
         let mut ids = Vec::new();
         for payload in &payloads {
-            assert!(payload.body.len() <= limit);
-            let parsed: JsonValue = serde_json::from_slice(&payload.body).unwrap();
+            let body = payload.body();
+            assert!(body.len() <= limit);
+            let parsed: JsonValue = serde_json::from_slice(&body).unwrap();
             let batch = parsed["events"].as_array().unwrap();
-            assert_eq!(batch.len(), payload.event_count);
+            assert_eq!(batch.len(), payload.event_count());
             ids.extend(batch.iter().map(|event| event["id"].as_str().unwrap().to_owned()));
         }
         let expected: Vec<_> = (0..10).map(|index| format!("event-{index}")).collect();
@@ -323,8 +376,8 @@ mod tests {
         let mut config = Braintrust::new("secret".to_owned(), project_id);
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(5);
-        // three ~2MiB events: two fit under the 5MiB cap, the third spills into a second payload
-        let events = event_batch(3, 2 * 1024 * 1024);
+        // three ~1MiB events: two fit under the 2.5MiB cap, the third spills into a second payload
+        let events = event_batch(3, 1024 * 1024);
 
         let inserted = write(&config, &events).unwrap();
 
@@ -336,6 +389,51 @@ mod tests {
             let payload: JsonValue = serde_json::from_slice(body).unwrap();
             assert_eq!(payload["events"].as_array().unwrap().len(), expected_count);
         }
+    }
+
+    #[test]
+    fn splits_and_retries_when_the_server_rejects_a_payload_as_too_large() {
+        let project_id = Uuid::new_v4();
+        let (api_url, requests) = serve(vec![
+            (StatusCode::PAYLOAD_TOO_LARGE, r#"{"message": "Request Too Long"}"#.to_owned()),
+            (StatusCode::OK, serde_json::json!({ "row_ids": ["1"] }).to_string()),
+            (StatusCode::OK, serde_json::json!({ "row_ids": ["2"] }).to_string()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(5);
+        let events = event_batch(2, 64);
+
+        let inserted = write(&config, &events).unwrap();
+
+        assert_eq!(inserted.row_ids.as_ref(), ["1", "2"]);
+        // one rejected request for the pair, then one per half in original order
+        for expected_ids in [vec!["event-0", "event-1"], vec!["event-0"], vec!["event-1"]] {
+            let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (_, body) = split_request(&request);
+            let payload: JsonValue = serde_json::from_slice(body).unwrap();
+            let ids: Vec<_> = payload["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, expected_ids);
+        }
+    }
+
+    #[test]
+    fn surfaces_the_rejection_when_a_single_event_payload_is_too_large() {
+        let project_id = Uuid::new_v4();
+        let (api_url, _requests) = serve_once(StatusCode::PAYLOAD_TOO_LARGE, r#"{"message": "Request Too Long"}"#.to_owned());
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(5);
+        let events = event_batch(1, 64);
+
+        let error = write(&config, &events).unwrap_err();
+
+        assert!(error.is_payload_too_large());
     }
 
     fn event_batch(count: usize, input_bytes: usize) -> EventBatch {

@@ -34,10 +34,7 @@ pub(crate) struct ResolvedRef {
 #[derive(Debug, Clone)]
 pub(crate) enum Selection {
     Index(Value),
-    Slice {
-        start: Option<Value>,
-        end: Option<Value>,
-    },
+    Slice { start: Option<Value>, end: Option<Value> },
 }
 
 #[derive(Debug, Clone)]

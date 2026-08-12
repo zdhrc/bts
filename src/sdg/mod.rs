@@ -7,7 +7,7 @@ use std::fmt;
 use std::time::{Duration, SystemTime};
 
 pub(crate) use materializer::{Distribution, EventBatch};
-pub(crate) use writer::InsertResponse;
+pub(crate) use writer::{InsertResponse, PackStats};
 
 pub(crate) fn generate(
     model: Model,
@@ -21,12 +21,20 @@ pub(crate) fn generate(
         return Err(Error::EmptyShape);
     }
 
-    let plan = planner::plan(model, count, seed).map_err(Error::Plan)?;
-    materializer::materialize(plan, over, distribution, now).map_err(Error::Materialize)
+    let plan = tracing::info_span!("plan")
+        .in_scope(|| planner::plan(model, count, seed))
+        .map_err(Error::Plan)?;
+    tracing::info_span!("materialize")
+        .in_scope(|| materializer::materialize(plan, over, distribution, now))
+        .map_err(Error::Materialize)
 }
 
 pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, writer::Error> {
     writer::write(config, events)
+}
+
+pub(crate) fn pack_stats(events: &EventBatch) -> Result<PackStats, writer::Error> {
+    writer::pack_stats(events)
 }
 
 #[derive(Debug)]

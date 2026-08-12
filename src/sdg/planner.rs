@@ -1,10 +1,9 @@
 use crate::dsl::{
-    Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild, Choice as ModelChoice,
-    CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NodeId, Number as ModelNumber,
-    Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange, RefId,
-    Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields,
-    SpanKind as ModelSpanKind, SrcRange, Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp,
-    Value as ModelValue,
+    Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild,
+    Choice as ModelChoice, CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NodeId,
+    Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange,
+    RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
+    Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -78,15 +77,16 @@ const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 fn mix(hash: u64, value: u64) -> u64 {
-    value.to_le_bytes().iter().fold(hash, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
+    value
+        .to_le_bytes()
+        .iter()
+        .fold(hash, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME))
 }
 
 fn mix_str(hash: u64, value: &str) -> u64 {
-    value.bytes().fold(hash, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
+    value
+        .bytes()
+        .fold(hash, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME))
 }
 
 // slot discriminators: a draw is addressed by (instance path, slot), never by
@@ -352,7 +352,14 @@ impl<'m> Ctx<'m> {
                 let path = mix(mix(self.instances[parent].path, node.0 as u64), 0);
                 let mut rng = self.slot_rng(path, PICK_SALT);
                 let pick = rng.random_range(0..children.len());
-                let instance = self.add_instance(*node, Some(parent), Shape::Choice { pick }, 0, bindings, FieldSlots::default());
+                let instance = self.add_instance(
+                    *node,
+                    Some(parent),
+                    Shape::Choice { pick },
+                    0,
+                    bindings,
+                    FieldSlots::default(),
+                );
                 self.instantiate_child(&children[pick], instance)
             }
 
@@ -370,7 +377,14 @@ impl<'m> Ctx<'m> {
                 let chance = self.scoped(parent, rng, |ctx| eval_chance(chance.clone(), *chance_range, ctx))?;
                 let mut rng = self.slot_rng(path, PICK_SALT);
                 let included = rng.random_bool(chance);
-                let instance = self.add_instance(*node, Some(parent), Shape::Maybe { included }, 0, bindings, FieldSlots::default());
+                let instance = self.add_instance(
+                    *node,
+                    Some(parent),
+                    Shape::Maybe { included },
+                    0,
+                    bindings,
+                    FieldSlots::default(),
+                );
                 if included {
                     for child in children {
                         self.instantiate_child(child, instance)?;
@@ -413,10 +427,7 @@ impl<'m> Ctx<'m> {
     fn force_binding(&mut self, name: &str) -> Result<ModelValue, Error> {
         let mut at = Some(self.site);
         while let Some(instance) = at {
-            let found = self.instances[instance]
-                .bindings
-                .iter()
-                .position(|(known, _)| known == name);
+            let found = self.instances[instance].bindings.iter().position(|(known, _)| known == name);
             if let Some(position) = found {
                 return self.force_binding_slot(instance, position);
             }
@@ -543,7 +554,13 @@ impl<'m> Ctx<'m> {
         }
     }
 
-    fn read_accessor(&mut self, at: usize, accessor: &Accessor, path: &[Selection], range: SrcRange) -> Result<JsonValue, Error> {
+    fn read_accessor(
+        &mut self,
+        at: usize,
+        accessor: &Accessor,
+        path: &[Selection],
+        range: SrcRange,
+    ) -> Result<JsonValue, Error> {
         match accessor {
             Accessor::Field(field) => self.read_field(at, *field, path.to_vec(), range),
             // the current iteration of the repeat collection `at`, found on
@@ -575,19 +592,11 @@ impl<'m> Ctx<'m> {
         }
     }
 
-    fn read_field(
-        &mut self,
-        instance: usize,
-        field: Field,
-        path: Vec<Selection>,
-        at: SrcRange,
-    ) -> Result<JsonValue, Error> {
+    fn read_field(&mut self, instance: usize, field: Field, path: Vec<Selection>, at: SrcRange) -> Result<JsonValue, Error> {
         let mut selections = path.into_iter().peekable();
 
         let json = match field {
-            Field::Input | Field::Output | Field::Expected | Field::Error => {
-                self.force_field(instance, field, at)?
-            }
+            Field::Input | Field::Output | Field::Expected | Field::Error => self.force_field(instance, field, at)?,
             Field::Metadata | Field::Metrics => {
                 // a leading string selection reads just its key, so sibling
                 // keys of the same object stay independent slots
@@ -836,7 +845,10 @@ fn json_to_value(json: JsonValue) -> ModelValue {
         },
         JsonValue::String(value) => ModelValue::Str(value),
         JsonValue::Array(elems) => ModelValue::Array(ModelArray {
-            elem: elems.into_iter().map(|value| ModelArrayElem::Item(json_to_value(value))).collect(),
+            elem: elems
+                .into_iter()
+                .map(|value| ModelArrayElem::Item(json_to_value(value)))
+                .collect(),
         }),
         JsonValue::Object(map) => ModelValue::Object(ModelObject {
             elem: map
@@ -1906,10 +1918,7 @@ mod tests {
         let plan = plan(model, 1, 0).unwrap();
 
         assert_eq!(plan.events[1].fields.input, Some(JsonValue::from(vec!["q0"])));
-        assert_eq!(
-            plan.events[2].fields.input,
-            Some(JsonValue::from(vec!["q0", "a0", "q1"]))
-        );
+        assert_eq!(plan.events[2].fields.input, Some(JsonValue::from(vec!["q0", "a0", "q1"])));
     }
 
     #[test]

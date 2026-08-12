@@ -39,6 +39,31 @@ fn render_diags(source_name: &str, src: &str, diags: &dsl::Diags) -> String {
         .join("\n")
 }
 
+fn parse_duration(value: &str) -> Result<std::time::Duration, String> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_000)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600_000)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 86_400_000)
+    } else {
+        return Err("duration must end in ms, s, m, h, or d".to_owned());
+    };
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| "duration must start with a whole number".to_owned())?;
+    let milliseconds = number
+        .checked_mul(multiplier)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "duration must be greater than zero and within range".to_owned())?;
+
+    Ok(std::time::Duration::from_millis(milliseconds))
+}
+
 #[derive(Debug)]
 pub enum Error {
     Check(check::Error),
