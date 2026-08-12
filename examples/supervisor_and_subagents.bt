@@ -7,18 +7,25 @@ vars {
 
 trace "research-supervisor" {
     input = "Compare our checkout latency to the last two releases."
-    output = "p95 latency regressed 18% in v42, traced to the new fraud check."
-    metadata = { run_id = uuid() }
+    # the two supervisor calls share a name, so they form a positional
+    # collection: [1] is the closing synthesis, and the trace answers with it
+    output = llm["Chat Completion"][1].output.content
+    metadata = { run_id = uuid(), profiled = maybe.profiler.included }
     tags = ["multi-agent"]
 
     llm "Chat Completion" {
         input = [
             { role = "system", content = "You are a supervisor. Split the request into subtasks and delegate." },
-            { role = "user", content = "Compare our checkout latency to the last two releases." },
+            { role = "user", content = trace.input },
         ]
         output = { role = "assistant", content = "Delegating: (1) pull latency metrics, (2) diff the releases." }
         metadata = var.meta
-        metrics = { prompt_tokens = 322, completion_tokens = 45, tokens = 367, time_to_first_token = 0.41 }
+        metrics = {
+            prompt_tokens = tokens(self.input)
+            completion_tokens = tokens(self.output)
+            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+            time_to_first_token = 0.41
+        }
     }
 
     task "metrics_agent" {
@@ -28,11 +35,16 @@ trace "research-supervisor" {
         llm "Chat Completion" {
             input = [
                 { role = "system", content = "You query the metrics warehouse and report numbers plainly." },
-                { role = "user", content = "Pull p50/p95 checkout latency for v40 through v42." },
+                { role = "user", content = task.metrics_agent.input },
             ]
-            output = { role = "assistant", content = "v40 p95 412ms, v41 p95 418ms, v42 p95 493ms." }
+            output = { role = "assistant", content = task.metrics_agent.output }
             metadata = var.meta
-            metrics = { prompt_tokens = 288, completion_tokens = 39, tokens = 327, time_to_first_token = 0.38 }
+            metrics = {
+                prompt_tokens = tokens(self.input)
+                completion_tokens = tokens(self.output)
+                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                time_to_first_token = 0.38
+            }
         }
     }
 
@@ -43,16 +55,21 @@ trace "research-supervisor" {
         llm "Chat Completion" {
             input = [
                 { role = "system", content = "You read release diffs and summarize behavioral changes." },
-                { role = "user", content = "Diff v41..v42 for checkout-path changes." },
+                { role = "user", content = task.diff_agent.input },
             ]
-            output = { role = "assistant", content = "A synchronous fraud check was added to the checkout path in v42." }
+            output = { role = "assistant", content = task.diff_agent.output }
             metadata = var.meta
-            metrics = { prompt_tokens = 301, completion_tokens = 33, tokens = 334, time_to_first_token = 0.44 }
+            metrics = {
+                prompt_tokens = tokens(self.input)
+                completion_tokens = tokens(self.output)
+                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                time_to_first_token = 0.44
+            }
         }
     }
 
     # a third specialist joins only for some runs
-    maybe {
+    maybe "profiler" {
         chance = 0.4
 
         task "profiler_agent" {
@@ -62,22 +79,36 @@ trace "research-supervisor" {
             llm "Chat Completion" {
                 input = [
                     { role = "system", content = "You run profiles and report hot paths." },
-                    { role = "user", content = "Profile the fraud check under load." },
+                    { role = "user", content = task.profiler_agent.input },
                 ]
-                output = { role = "assistant", content = "The fraud check adds 70-90ms per call at p95." }
+                output = { role = "assistant", content = task.profiler_agent.output }
                 metadata = var.meta
-                metrics = { prompt_tokens = 296, completion_tokens = 31, tokens = 327, time_to_first_token = 0.4 }
+                metrics = {
+                    prompt_tokens = tokens(self.input)
+                    completion_tokens = tokens(self.output)
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                    time_to_first_token = 0.4
+                }
             }
         }
     }
 
     llm "Chat Completion" {
+        # the synthesis prompt threads the subagents' actual findings, and
+        # mentions the profiler only when its branch fired
         input = [
             { role = "system", content = "You are a supervisor. Synthesize your subagents' findings." },
-            { role = "user", content = "Metrics: v42 p95 493ms vs 418ms. Diff: new synchronous fraud check." },
+            { role = "user", content = maybe.profiler.included
+                ? "Metrics: ${task.metrics_agent.output} Diff: ${task.diff_agent.output} Profile: ${maybe.profiler.task.profiler_agent.output}"
+                : "Metrics: ${task.metrics_agent.output} Diff: ${task.diff_agent.output}" },
         ]
         output = { role = "assistant", content = "p95 latency regressed 18% in v42, traced to the new fraud check." }
         metadata = var.meta
-        metrics = { prompt_tokens = 402, completion_tokens = 36, tokens = 438, time_to_first_token = 0.43 }
+        metrics = {
+            prompt_tokens = tokens(self.input)
+            completion_tokens = tokens(self.output)
+            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+            time_to_first_token = 0.43
+        }
     }
 }

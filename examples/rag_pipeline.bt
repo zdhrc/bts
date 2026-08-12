@@ -8,7 +8,8 @@ vars {
 
 trace "docs-qa" {
     input = "How do I rotate API keys?"
-    output = "Rotate keys under Settings > API; the old key stays valid for 24 hours. [doc_112]"
+    # the trace answers with whatever the generate span actually said
+    output = llm["Chat Completion"].output.content
     metadata = { request_id = uuid() }
     tags = ["rag"]
 
@@ -21,8 +22,10 @@ trace "docs-qa" {
     }
 
     task "rerank" {
-        input = { candidates = 3 }
-        output = { kept = ["doc_112", "doc_089"] }
+        # downstream stages read the retriever's actual output; kept is a
+        # slice of the candidate ids
+        input = { candidates = len(tool.search_docs.output.doc_ids) }
+        output = { kept = tool.search_docs.output.doc_ids[:2] }
     }
 
     llm "Chat Completion" {
@@ -31,15 +34,20 @@ trace "docs-qa" {
             {
                 role = "user"
                 content = <<-CTX
-                    [doc_112] API keys: rotation and expiry
-                    [doc_089] Service accounts and scopes
+                    [${task.rerank.output.kept[0]}] API keys: rotation and expiry
+                    [${task.rerank.output.kept[1]}] Service accounts and scopes
 
-                    Question: How do I rotate API keys?
+                    Question: ${trace.input}
                 CTX
             },
         ]
         output = { role = "assistant", content = "Rotate keys under Settings > API; the old key stays valid for 24 hours. [doc_112]" }
         metadata = var.meta
-        metrics = { prompt_tokens = 883, completion_tokens = 43, tokens = 926, time_to_first_token = 0.47 }
+        metrics = {
+            prompt_tokens = tokens(self.input)
+            completion_tokens = tokens(self.output)
+            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+            time_to_first_token = 0.47
+        }
     }
 }

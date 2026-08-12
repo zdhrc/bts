@@ -13,11 +13,12 @@ vars {
 }
 
 trace "support-sessions" {
+    # the root exchange replays the turns' own fields via block references
     input = [
-        { role = "user", content = "How did NVDA do today?" },
-        { role = "user", content = "And over the last year?" },
+        { role = "user", content = task.turn_0.input },
+        { role = "user", content = task.turn_1.input },
     ]
-    output = "Up 20.4% over the past twelve months."
+    output = task.turn_1.output
 
     task "turn_0" {
         input = "How did NVDA do today?"
@@ -26,16 +27,17 @@ trace "support-sessions" {
         llm "Chat Completion" {
             input = [
                 { role = "system", content = var.system },
-                { role = "user", content = "How did NVDA do today?" },
+                { role = "user", content = task.turn_0.input },
             ]
-            output = { role = "assistant", content = "NVDA closed down 1.4% at $207.40." }
+            output = { role = "assistant", content = task.turn_0.output }
 
             metadata = var.meta
 
             metrics = {
                 prompt_tokens = 612
                 completion_tokens = 24
-                tokens = 636
+                # sibling metric keys reference each other, so the sum is exact
+                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
                 time_to_first_token = 0.4
             }
         }
@@ -46,20 +48,22 @@ trace "support-sessions" {
         output = "Up 20.4% over the past twelve months."
 
         llm "Chat Completion" {
+            # later turns replay the earlier turns' fields instead of copying
+            # the history by hand
             input = [
                 { role = "system", content = var.system },
-                { role = "user", content = "How did NVDA do today?" },
-                { role = "assistant", content = "NVDA closed down 1.4% at $207.40." },
-                { role = "user", content = "And over the last year?" },
+                { role = "user", content = task.turn_0.input },
+                { role = "assistant", content = task.turn_0.output },
+                { role = "user", content = task.turn_1.input },
             ]
-            output = { role = "assistant", content = "Up 20.4% over the past twelve months." }
+            output = { role = "assistant", content = task.turn_1.output }
 
             metadata = var.meta
 
             metrics = {
                 prompt_tokens = 648
                 completion_tokens = 18
-                tokens = 666
+                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
                 time_to_first_token = 0.3
             }
         }

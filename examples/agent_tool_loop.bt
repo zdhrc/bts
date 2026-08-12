@@ -25,9 +25,18 @@ trace "ops-agent" {
                 { role = "user", content = trace.input },
                 ...repeat.rounds[:repeat.index].llm["anthropic.messages.create"].output,
             ]
-            output = { role = "assistant", content = "Let me inspect the pods and recent logs." }
+            # the narration agrees with whichever tool this round actually calls
+            output = { role = "assistant", content = choice.tool_call.chosen == 0
+                ? "Checking the pod status for checkout-api."
+                : "Pulling the recent checkout-api logs." }
             metadata = var.meta
-            metrics = { prompt_tokens = 934, completion_tokens = 41, tokens = 975, time_to_first_token = 0.62 }
+            # prompt cost tracks the growing history exactly
+            metrics = {
+                prompt_tokens = tokens(self.input)
+                completion_tokens = tokens(self.output)
+                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                time_to_first_token = 0.62
+            }
         }
 
         choice "tool_call" {
@@ -53,10 +62,10 @@ trace "ops-agent" {
         output = { role = "assistant", content = "checkout-api is crash-looping on a bad config value; rolling back now." }
         metadata = var.meta
         metrics = {
-            prompt_tokens = 1418,
-            completion_tokens = 58,
-            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
-            time_to_first_token = 0.71,
+            prompt_tokens = tokens(self.input)
+            completion_tokens = tokens(self.output)
+            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+            time_to_first_token = 0.71
         }
     }
 }

@@ -9,11 +9,15 @@ vars {
 
 trace "copilot-window" {
     # each generated trace gets its own session id; in a real population,
-    # several windows would share one
-    metadata = { session_id = format("sess_{}", hex(10)) }
+    # several windows would share one. the window number follows the pick:
+    # the same-named turns form a collection indexed here by `chosen`
+    metadata = {
+        session_id = format("sess_{}", hex(10))
+        window = choice.position.task.turn[choice.position.chosen].metadata.window
+    }
     tags = ["copilot"]
 
-    choice "window_position" {
+    choice "position" {
         # opening window: no carried context yet
         task "turn" {
             input = "Why does my worker pool deadlock on shutdown?"
@@ -27,7 +31,12 @@ trace "copilot-window" {
                 ]
                 output = { role = "assistant", content = "Your workers block on the results channel; close it before joining." }
                 metadata = var.meta
-                metrics = { prompt_tokens = 364, completion_tokens = 41, tokens = 405, time_to_first_token = 0.36 }
+                metrics = {
+                    prompt_tokens = tokens(self.input)
+                    completion_tokens = tokens(self.output)
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                    time_to_first_token = 0.36
+                }
             }
         }
 
@@ -45,7 +54,12 @@ trace "copilot-window" {
                 ]
                 output = { role = "assistant", content = "Flush from the same goroutine that closes the channel, after the join." }
                 metadata = var.meta
-                metrics = { prompt_tokens = 512, completion_tokens = 38, tokens = 550, time_to_first_token = 0.42 }
+                metrics = {
+                    prompt_tokens = tokens(self.input)
+                    completion_tokens = tokens(self.output)
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                    time_to_first_token = 0.42
+                }
             }
         }
     }

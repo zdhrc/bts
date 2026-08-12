@@ -1,8 +1,8 @@
 # fanout over parallel workers -- variance axes: fan width and worker
-# heterogeneity. a choice inside the repeat gives each stamped worker its own
-# coherent authored content. generated timestamps are sequential slots, so the
-# fanout is structural: workers read as siblings, not as temporally
-# overlapping spans.
+# heterogeneity. a choice inside each worker gives it its own coherent
+# authored report. generated timestamps are sequential slots, so the fanout
+# is structural: workers read as siblings, not as temporally overlapping
+# spans.
 
 vars {
     system = "Summarize the incident report in one sentence."
@@ -18,13 +18,17 @@ trace "incident-digest" {
     repeat "workers" {
         count = range(2, 6)
 
-        # each stamp picks one worker variant; repeat.index labels the shard
+        # each stamp picks one report variant; repeat.index labels the shard
         # but never stands in for content
-        choice "worker" {
-            task "summarize_report" {
-                input = { report_id = "inc_${repeat.index}" }
-                output = { summary = "connection pool exhausted during peak traffic" }
+        task "summarize_report" {
+            input = { report_id = "inc_${repeat.index}" }
+            # the worker's own output follows whichever report was picked:
+            # the same-named llms form a collection indexed by `chosen`
+            output = { summary = choice.report.chosen == 0
+                ? choice.report.llm["Chat Completion"][0].output.content
+                : choice.report.llm["Chat Completion"][1].output.content }
 
+            choice "report" {
                 llm "Chat Completion" {
                     input = [
                         { role = "system", content = var.system },
@@ -32,13 +36,13 @@ trace "incident-digest" {
                     ]
                     output = { role = "assistant", content = "connection pool exhausted during peak traffic" }
                     metadata = var.meta
-                    metrics = { prompt_tokens = 641, completion_tokens = 24, tokens = 665, time_to_first_token = 0.33 }
+                    metrics = {
+                        prompt_tokens = tokens(self.input)
+                        completion_tokens = tokens(self.output)
+                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                        time_to_first_token = 0.33
+                    }
                 }
-            }
-
-            task "summarize_report" {
-                input = { report_id = "inc_${repeat.index}" }
-                output = { summary = "retry storm after the tuesday deploy" }
 
                 llm "Chat Completion" {
                     input = [
@@ -47,14 +51,20 @@ trace "incident-digest" {
                     ]
                     output = { role = "assistant", content = "retry storm after the tuesday deploy" }
                     metadata = var.meta
-                    metrics = { prompt_tokens = 588, completion_tokens = 21, tokens = 609, time_to_first_token = 0.29 }
+                    metrics = {
+                        prompt_tokens = tokens(self.input)
+                        completion_tokens = tokens(self.output)
+                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                        time_to_first_token = 0.29
+                    }
                 }
             }
         }
     }
 
     task "reduce" {
-        input = "merge worker summaries"
+        # a slice projects the rest of the path over every stamped worker
+        input = { summaries = [...repeat.workers[:].task.summarize_report.output.summary] }
         output = "7 incidents, 2 sev-1s; the common cause was connection pool exhaustion."
     }
 }

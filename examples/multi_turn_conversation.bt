@@ -11,8 +11,14 @@ vars {
 }
 
 trace "billing-support" {
-    # root input/output are omitted: they are fixed per shape, so they cannot
-    # follow whichever conversation the choice picks
+    # the root exchange follows whichever conversation the choice picks:
+    # `chosen` is the 0-based pick, and ?: only evaluates the taken side
+    input = choice.conversation.chosen == 0
+        ? choice.conversation.task.turn_0.input
+        : choice.conversation.repeat.refund_dispute[0].task.turn_0.input
+    output = choice.conversation.chosen == 0
+        ? choice.conversation.task.turn_0.output
+        : choice.conversation.repeat.refund_dispute[0].task.turn_2.output
     metadata = { conversation_id = uuid(), entrypoint = "web-chat" }
     tags = ["support", "billing"]
 
@@ -24,13 +30,20 @@ trace "billing-support" {
             output = "Yes -- add it under Billing Settings > Tax IDs and future invoices will include it."
 
             llm "Chat Completion" {
+                # the message list replays the enclosing turn's own fields
                 input = [
                     { role = "system", content = var.system },
-                    { role = "user", content = "Can I get invoices with our VAT number on them?" },
+                    { role = "user", content = task.turn_0.input },
                 ]
-                output = { role = "assistant", content = "Yes -- add it under Billing Settings > Tax IDs and future invoices will include it." }
+                output = { role = "assistant", content = task.turn_0.output }
                 metadata = var.meta
-                metrics = { prompt_tokens = 412, completion_tokens = 37, tokens = 449, time_to_first_token = 0.34 }
+                # token counts computed from the actual content, summed in place
+                metrics = {
+                    prompt_tokens = tokens(self.input)
+                    completion_tokens = tokens(self.output)
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                    time_to_first_token = 0.34
+                }
             }
         }
 
@@ -46,11 +59,16 @@ trace "billing-support" {
                 llm "Chat Completion" {
                     input = [
                         { role = "system", content = var.system },
-                        { role = "user", content = "I was charged twice this month." },
+                        { role = "user", content = task.turn_0.input },
                     ]
-                    output = { role = "assistant", content = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added." }
+                    output = { role = "assistant", content = task.turn_0.output }
                     metadata = var.meta
-                    metrics = { prompt_tokens = 401, completion_tokens = 52, tokens = 453, time_to_first_token = 0.29 }
+                    metrics = {
+                        prompt_tokens = tokens(self.input)
+                        completion_tokens = tokens(self.output)
+                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                        time_to_first_token = 0.29
+                    }
                 }
             }
 
@@ -69,7 +87,12 @@ trace "billing-support" {
                     ]
                     output = { role = "assistant", content = task.turn_1.output }
                     metadata = var.meta
-                    metrics = { prompt_tokens = 476, completion_tokens = 61, tokens = 537, time_to_first_token = 0.31 }
+                    metrics = {
+                        prompt_tokens = tokens(self.input)
+                        completion_tokens = tokens(self.output)
+                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                        time_to_first_token = 0.31
+                    }
                 }
             }
 
@@ -88,7 +111,12 @@ trace "billing-support" {
                     ]
                     output = { role = "assistant", content = task.turn_2.output }
                     metadata = var.meta
-                    metrics = { prompt_tokens = 549, completion_tokens = 24, tokens = 573, time_to_first_token = 0.27 }
+                    metrics = {
+                        prompt_tokens = tokens(self.input)
+                        completion_tokens = tokens(self.output)
+                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                        time_to_first_token = 0.27
+                    }
                 }
             }
         }

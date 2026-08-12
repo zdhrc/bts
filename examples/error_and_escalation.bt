@@ -9,7 +9,8 @@ vars {
 trace "payments-agent" {
     input = "Charge the June invoice for acct_9W31."
     output = "Charged $1,240.00 against the card on file."
-    metadata = { run_id = uuid() }
+    # whether this run hit the failure path rides along as queryable metadata
+    metadata = { run_id = uuid(), retried = maybe.failure.included }
     # tags are static per shape: they cannot follow the maybe branch, so tag
     # the population, not the outcome
     tags = ["payments"]
@@ -17,11 +18,16 @@ trace "payments-agent" {
     llm "Chat Completion" {
         input = [
             { role = "system", content = "You are a payments agent. Confirm the invoice before charging." },
-            { role = "user", content = "Charge the June invoice for acct_9W31." },
+            { role = "user", content = trace.input },
         ]
         output = { role = "assistant", content = "June invoice is $1,240.00; charging the card on file." }
         metadata = var.meta
-        metrics = { prompt_tokens = 356, completion_tokens = 29, tokens = 385, time_to_first_token = 0.32 }
+        metrics = {
+            prompt_tokens = tokens(self.input)
+            completion_tokens = tokens(self.output)
+            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+            time_to_first_token = 0.32
+        }
     }
 
     # 7% of traces show a failed first attempt and a human escalation before
@@ -36,7 +42,8 @@ trace "payments-agent" {
         }
 
         task "escalate_to_human" {
-            input = "charge declined; needs manual review before retry"
+            # the nearest charge_customer wins: this reads the failing sibling
+            input = "charge declined (${tool.charge_customer.error}); needs manual review before retry"
             output = "ticket PAY-4411 approved a retry against the backup card"
         }
     }

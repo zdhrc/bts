@@ -5,7 +5,7 @@ vars {
 }
 
 trace "support-sessions" {
-    # drawn once per trace: the repeat and the summary below both see it
+    # drawn once per trace: the repeat, the wrapup, and the metadata all see it
     vars {
         turns = range(1, 4)
     }
@@ -18,22 +18,18 @@ trace "support-sessions" {
             output = "answer ${repeat.index}"
 
             llm "Chat Completion" {
-                # drawn once per iteration, so the token sum is exact
-                vars {
-                    prompt_toks = round(lognormal(600, 0.4))
-                    completion_toks = round(lognormal(90, 0.7))
-                }
-
+                # the message list replays the enclosing turn's own fields
                 input = [
                     { role = "system", content = "You are a support agent." },
-                    { role = "user", content = "question ${repeat.index}" },
+                    { role = "user", content = task.turn.input },
                 ]
-                output = { role = "assistant", content = "answer ${repeat.index}" }
+                output = { role = "assistant", content = task.turn.output }
                 metadata = { model = var.model, provider = "openai" }
+                # token counts computed from the actual content, summed in place
                 metrics = {
-                    prompt_tokens = var.prompt_toks
-                    completion_tokens = var.completion_toks
-                    tokens = var.prompt_toks + var.completion_toks
+                    prompt_tokens = tokens(self.input)
+                    completion_tokens = tokens(self.output)
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
                 }
             }
         }
@@ -46,12 +42,13 @@ trace "support-sessions" {
         }
 
         function "summarize_session" {
-            input = { turns = var.turns }
+            # block references select repeat iterations by index
+            input = { turns = var.turns, last_answer = repeat.turns[var.turns - 1].task.turn.output }
             output = { summary = "customer asked about an order" }
         }
     }
 
-    maybe {
+    maybe "escalation" {
         chance = 0.25
 
         task "escalation" {
@@ -60,5 +57,7 @@ trace "support-sessions" {
         }
     }
 
+    # whether the escalation fired rides along as queryable metadata
+    metadata = { escalated = maybe.escalation.included }
     tags = ["support"]
 }
