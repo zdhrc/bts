@@ -4,6 +4,9 @@
 term-bank.md
 plan-bank.md
 
+# bt cli local state and bts run logs
+.bt/
+
 # editor and agent local config
 .claude/settings.local.json
 .claude/worktrees

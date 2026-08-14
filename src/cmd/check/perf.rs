@@ -1,4 +1,5 @@
-use crate::cmd::{parse_duration, render_diags};
+use crate::cmd::render_diags;
+use crate::conf::parse_duration;
 use crate::{dsl, sdg};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;

@@ -1,10 +1,11 @@
-use crate::cmd::{parse_duration, render_diags};
-use crate::{conf::Braintrust, dsl, sdg};
+use crate::cmd::{logging, render_diags};
+use crate::conf::{Braintrust, Settings, parse_duration};
+use crate::{dsl, sdg};
 use std::{
-    fmt, fs,
+    env, fmt, fs,
     num::NonZeroUsize,
-    path::PathBuf,
-    time::{Duration, SystemTime},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[derive(Debug, clap::Args)]
@@ -34,6 +35,10 @@ pub struct Args {
     #[arg(long)]
     dry_run: bool,
 
+    /// print the final run summary as JSON on stdout
+    #[arg(long, conflicts_with = "dry_run")]
+    json: bool,
+
     /// print phase timings to stderr while running
     #[arg(long)]
     profile: bool,
@@ -41,15 +46,27 @@ pub struct Args {
 
 impl Args {
     pub fn run(self) -> Result<(), Error> {
-        if self.profile {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-                .with_timer(tracing_subscriber::fmt::time::uptime())
-                .with_target(false)
-                .init();
+        let settings = Settings::load()?;
+        let log_path = logging::init("generate", self.profile, &settings);
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            argv = %env::args().skip(1).collect::<Vec<_>>().join(" "),
+            "run started",
+        );
+
+        let result = self.execute(&settings, log_path.as_deref());
+        if let Err(error) = &result {
+            tracing::error!(%error, "run failed");
+            if let Some(path) = &log_path {
+                eprintln!("run log: {}", path.display());
+            }
         }
 
+        result
+    }
+
+    fn execute(self, settings: &Settings, log_path: Option<&Path>) -> Result<(), Error> {
+        let started = Instant::now();
         let source = fs::read_to_string(&self.from).map_err(|source| Error::ReadShape {
             path: self.from.clone(),
             source,
@@ -68,6 +85,7 @@ impl Args {
                 seed
             }
         };
+        tracing::info!(seed, "seed resolved");
         let events = tracing::info_span!("generate")
             .in_scope(|| sdg::generate(model, self.count.get(), self.over, self.dist, SystemTime::now(), seed))
             .map_err(|error| match error {
@@ -92,18 +110,52 @@ impl Args {
             return Ok(());
         }
 
-        let config = Braintrust::from_env()?;
+        let mut config = Braintrust::from_env()?;
+        config.request_timeout = settings.request_timeout;
+        tracing::info!(project_id = %config.project_id, api_url = %config.api_url, "writing to braintrust");
         let inserted = tracing::info_span!("write").in_scope(|| sdg::write(&config, &events))?;
-        println!(
-            "inserted {} traces and {} child spans into project {} ({} rows acknowledged)",
-            events.trace_count(),
-            events.event_count() - events.trace_count(),
-            config.project_id,
-            inserted.row_count(),
+        tracing::info!(
+            traces = events.trace_count(),
+            events = events.event_count(),
+            rows = inserted.row_count(),
+            "insert acknowledged",
         );
+
+        if self.json {
+            let summary = Summary {
+                seed,
+                traces: events.trace_count(),
+                events: events.event_count(),
+                rows: inserted.row_count(),
+                project_id: config.project_id.to_string(),
+                duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                log: log_path.map(|path| path.display().to_string()),
+            };
+            println!("{}", serde_json::to_string(&summary)?);
+        } else {
+            println!(
+                "inserted {} traces and {} child spans into project {} ({} rows acknowledged)",
+                events.trace_count(),
+                events.event_count() - events.trace_count(),
+                config.project_id,
+                inserted.row_count(),
+            );
+        }
 
         Ok(())
     }
+}
+
+// machine-readable success summary for --json; errors stay human-readable on stderr
+#[derive(serde::Serialize)]
+struct Summary {
+    seed: u64,
+    traces: usize,
+    events: usize,
+    rows: usize,
+    project_id: String,
+    duration_ms: u64,
+    log: Option<String>,
 }
 
 #[derive(Debug)]
@@ -182,6 +234,26 @@ mod tests {
         assert_eq!(args.dist, sdg::Distribution::Linear);
         assert_eq!(args.seed, None);
         assert!(!args.dry_run);
+        assert!(!args.json);
+    }
+
+    #[test]
+    fn rejects_json_summaries_for_dry_runs() {
+        assert!(
+            parse_generate(&[
+                "bts",
+                "generate",
+                "--from",
+                "simple.bt",
+                "--count",
+                "1",
+                "--over",
+                "1h",
+                "--dry-run",
+                "--json",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

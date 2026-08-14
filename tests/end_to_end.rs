@@ -26,7 +26,7 @@ trace "conversation" {
 fn dry_run_expands_a_shape_into_the_requested_window() {
     let shape = write_shape(SIMPLE_SHAPE);
     let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+    let output = bts()
         .args(["generate", "--from"])
         .arg(&shape)
         .args(["--count", "25", "--over", "1h", "--dry-run"])
@@ -72,7 +72,7 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
 #[test]
 fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     let shape = write_shape(include_str!("fixtures/dynamic.bt"));
-    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+    let output = bts()
         .args(["generate", "--from"])
         .arg(&shape)
         .args(["--count", "20", "--over", "1h", "--dry-run", "--seed", "42"])
@@ -127,7 +127,7 @@ fn dry_run_resolves_context_references_in_expressions() {
         }
         "#,
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+    let output = bts()
         .args(["generate", "--from"])
         .arg(&shape)
         .args(["--count", "1", "--over", "1h", "--dry-run"])
@@ -157,7 +157,7 @@ fn dry_run_resolves_context_references_in_expressions() {
 #[test]
 fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     let shape = write_shape(r#"trace "t" { input = 100 / range(0, 0) }"#);
-    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+    let output = bts()
         .args(["generate", "--from"])
         .arg(&shape)
         .args(["--count", "1", "--over", "1h", "--dry-run", "--seed", "0"])
@@ -194,7 +194,7 @@ fn threads_referenced_content_across_spans() {
         }
         "#,
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+    let output = bts()
         .args(["generate", "--from"])
         .arg(&shape)
         .args(["--count", "4", "--over", "1h", "--dry-run", "--seed", "9"])
@@ -227,7 +227,7 @@ fn writes_generated_events_to_the_configured_endpoint() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
     let (api_url, request) = serve_insert(6);
-    let output = Command::new(env!("CARGO_BIN_EXE_bts"))
+    let output = bts()
         .args(["generate", "--from"])
         .arg(&shape)
         .args(["--count", "2", "--over", "1h"])
@@ -246,6 +246,40 @@ fn writes_generated_events_to_the_configured_endpoint() {
     assert!(headers.starts_with(&format!("POST /v1/project_logs/{project_id}/insert HTTP/1.1\r\n")));
     assert!(headers.to_ascii_lowercase().contains("authorization: bearer test-secret\r\n"));
     assert_eq!(payload["events"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn emits_a_json_summary_when_requested() {
+    let shape = write_shape(SIMPLE_SHAPE);
+    let project_id = Uuid::new_v4();
+    let (api_url, _request) = serve_insert(3);
+    let output = bts()
+        .args(["generate", "--from"])
+        .arg(&shape)
+        .args(["--count", "1", "--over", "1h", "--seed", "3", "--json"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let summary: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["seed"], 3);
+    assert_eq!(summary["traces"], 1);
+    assert_eq!(summary["events"], 3);
+    assert_eq!(summary["rows"], 3);
+    assert_eq!(summary["project_id"], project_id.to_string());
+    assert!(summary["duration_ms"].is_u64());
+    assert!(summary["log"].as_str().unwrap().ends_with(".jsonl"));
+}
+
+// run from the temp dir so run logs land in a throwaway .bt, not the repo
+fn bts() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bts"));
+    command.current_dir(std::env::temp_dir());
+    command
 }
 
 fn write_shape(source: &str) -> std::path::PathBuf {

@@ -1,10 +1,11 @@
+mod logs;
 mod perf;
 mod syntax;
 
 use std::fmt;
 
 #[derive(Debug, clap::Args)]
-#[command(about = "check a bts shape before generating from it")]
+#[command(about = "check a bts shape before generating from it, or inspect past runs")]
 pub struct Args {
     #[command(subcommand)]
     command: Cmd,
@@ -14,6 +15,7 @@ pub struct Args {
 enum Cmd {
     Syntax(syntax::Args),
     Perf(perf::Args),
+    Logs(logs::Args),
 }
 
 impl Args {
@@ -21,6 +23,7 @@ impl Args {
         match self.command {
             Cmd::Syntax(args) => args.run()?,
             Cmd::Perf(args) => args.run()?,
+            Cmd::Logs(args) => args.run()?,
         }
 
         Ok(())
@@ -31,6 +34,7 @@ impl Args {
 pub enum Error {
     Syntax(syntax::Error),
     Perf(perf::Error),
+    Logs(logs::Error),
 }
 
 impl fmt::Display for Error {
@@ -38,11 +42,18 @@ impl fmt::Display for Error {
         match self {
             Self::Syntax(source) => source.fmt(formatter),
             Self::Perf(source) => source.fmt(formatter),
+            Self::Logs(source) => source.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<logs::Error> for Error {
+    fn from(source: logs::Error) -> Self {
+        Self::Logs(source)
+    }
+}
 
 impl From<syntax::Error> for Error {
     fn from(source: syntax::Error) -> Self {
@@ -81,6 +92,20 @@ mod tests {
         let args = parse_check(&["bts", "check", "perf", "shape.bt", "--count", "10", "--over", "1h"]).unwrap();
 
         assert!(matches!(args.command, Cmd::Perf(_)));
+    }
+
+    #[test]
+    fn parses_the_logs_subcommand() {
+        for argv in [
+            &["bts", "check", "logs"][..],
+            &["bts", "check", "logs", "--last"],
+            &["bts", "check", "logs", "generate-20260813T000000Z-1.jsonl"],
+        ] {
+            let args = parse_check(argv).unwrap();
+            assert!(matches!(args.command, Cmd::Logs(_)));
+        }
+        // a named run and --last are mutually exclusive
+        assert!(parse_check(&["bts", "check", "logs", "some-run", "--last"]).is_err());
     }
 
     #[test]

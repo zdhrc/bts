@@ -1,5 +1,7 @@
 mod check;
 mod generate;
+mod init;
+mod logging;
 mod setup;
 
 use crate::dsl;
@@ -16,6 +18,7 @@ pub struct Cli {
 enum Cmd {
     Check(check::Args),
     Generate(generate::Args),
+    Init(init::Args),
     Setup(setup::Args),
 }
 
@@ -24,6 +27,7 @@ impl Cli {
         match self.command {
             Cmd::Check(args) => args.run()?,
             Cmd::Generate(args) => args.run()?,
+            Cmd::Init(args) => args.run()?,
             Cmd::Setup(args) => args.run()?,
         }
 
@@ -39,35 +43,11 @@ fn render_diags(source_name: &str, src: &str, diags: &dsl::Diags) -> String {
         .join("\n")
 }
 
-fn parse_duration(value: &str) -> Result<std::time::Duration, String> {
-    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
-        (number, 1_u64)
-    } else if let Some(number) = value.strip_suffix('s') {
-        (number, 1_000)
-    } else if let Some(number) = value.strip_suffix('m') {
-        (number, 60_000)
-    } else if let Some(number) = value.strip_suffix('h') {
-        (number, 3_600_000)
-    } else if let Some(number) = value.strip_suffix('d') {
-        (number, 86_400_000)
-    } else {
-        return Err("duration must end in ms, s, m, h, or d".to_owned());
-    };
-    let number = number
-        .parse::<u64>()
-        .map_err(|_| "duration must start with a whole number".to_owned())?;
-    let milliseconds = number
-        .checked_mul(multiplier)
-        .filter(|value| *value > 0)
-        .ok_or_else(|| "duration must be greater than zero and within range".to_owned())?;
-
-    Ok(std::time::Duration::from_millis(milliseconds))
-}
-
 #[derive(Debug)]
 pub enum Error {
     Check(check::Error),
     Generate(generate::Error),
+    Init(init::Error),
     Setup(setup::Error),
 }
 
@@ -76,6 +56,7 @@ impl fmt::Display for Error {
         match self {
             Self::Check(source) => source.fmt(formatter),
             Self::Generate(source) => source.fmt(formatter),
+            Self::Init(source) => source.fmt(formatter),
             Self::Setup(source) => source.fmt(formatter),
         }
     }
@@ -92,6 +73,12 @@ impl From<check::Error> for Error {
 impl From<generate::Error> for Error {
     fn from(source: generate::Error) -> Self {
         Self::Generate(source)
+    }
+}
+
+impl From<init::Error> for Error {
+    fn from(source: init::Error) -> Self {
+        Self::Init(source)
     }
 }
 

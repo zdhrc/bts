@@ -1,7 +1,8 @@
 use crate::{conf::Braintrust, sdg::materializer::EventBatch};
-use reqwest::{StatusCode, blocking::Client, header::CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
+use reqwest::{StatusCode, blocking::Client};
 use serde::Deserialize;
-use std::fmt;
+use std::{fmt, thread, time::Duration};
 
 // braintrust's lambda-backed api caps request bodies; advertised as logs3_payload_max_bytes (5MiB) on
 // GET /version, but the gateway measures requests after lambda event wrapping inflates them, so bodies
@@ -9,6 +10,12 @@ use std::fmt;
 const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024 / 2;
 const PAYLOAD_OPEN: &[u8] = b"{\"events\":[";
 const PAYLOAD_CLOSE: &[u8] = b"]}";
+
+// transient failures (timeouts, 429s, 5xx) back off exponentially before giving up; the
+// server's Retry-After wins over the computed backoff when present, capped so a run never stalls
+const MAX_SEND_ATTEMPTS: u32 = 4;
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct InsertResponse {
@@ -24,6 +31,7 @@ impl InsertResponse {
 struct Writer<'config> {
     client: Client,
     config: &'config Braintrust,
+    backoff_base: Duration,
 }
 
 impl<'config> Writer<'config> {
@@ -33,7 +41,11 @@ impl<'config> Writer<'config> {
             .build()
             .map_err(|error| Error::new(ErrorKind::BuildClient(error)))?;
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            backoff_base: BACKOFF_BASE,
+        })
     }
 
     fn write(&self, events: &EventBatch) -> Result<InsertResponse, Error> {
@@ -48,11 +60,16 @@ impl<'config> Writer<'config> {
 
         while let Some(payload) = pending.pop() {
             let sent = tracing::info_span!("insert", events = payload.event_count(), bytes = payload.body_len)
-                .in_scope(|| self.send(&url, &payload));
+                .in_scope(|| self.send_with_retry(&url, &payload));
             match sent {
                 Ok(inserted) => row_ids.extend(inserted.row_ids.into_vec()),
                 // the server's effective limit can sit below our cap; split and retry until it takes
                 Err(error) if error.is_payload_too_large() && payload.event_count() > 1 => {
+                    tracing::warn!(
+                        events = payload.event_count(),
+                        bytes = payload.body_len,
+                        "payload rejected as too large, splitting and retrying",
+                    );
                     let (left, right) = payload.split();
                     pending.push(right);
                     pending.push(left);
@@ -64,6 +81,39 @@ impl<'config> Writer<'config> {
         Ok(InsertResponse {
             row_ids: row_ids.into_boxed_slice(),
         })
+    }
+
+    fn send_with_retry(&self, url: &str, payload: &Payload) -> Result<InsertResponse, Error> {
+        let mut backoff = self.backoff_base;
+
+        for attempt in 1..=MAX_SEND_ATTEMPTS {
+            let error = match self.send(url, payload) {
+                Ok(inserted) => return Ok(inserted),
+                Err(error) => error,
+            };
+            if !error.is_transient() {
+                return Err(error);
+            }
+            if attempt == MAX_SEND_ATTEMPTS {
+                return Err(Error::new(ErrorKind::RetriesExhausted {
+                    attempts: attempt,
+                    source: Box::new(error),
+                }));
+            }
+            let delay = error.retry_after().unwrap_or(backoff).min(MAX_BACKOFF);
+            tracing::warn!(
+                attempt,
+                max_attempts = MAX_SEND_ATTEMPTS,
+                delay = ?delay,
+                events = payload.event_count(),
+                %error,
+                "transient insert failure, backing off and retrying",
+            );
+            thread::sleep(delay);
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+
+        unreachable!("the final attempt either returns its result or the exhausted error")
     }
 
     fn send(&self, url: &str, payload: &Payload) -> Result<InsertResponse, Error> {
@@ -78,10 +128,20 @@ impl<'config> Writer<'config> {
         let status = response.status();
 
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs);
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("failed to read response body: {error}"));
-            return Err(Error::new(ErrorKind::Rejected { status, body }));
+            return Err(Error::new(ErrorKind::Rejected {
+                status,
+                body,
+                retry_after,
+            }));
         }
 
         let inserted: InsertResponse = response
@@ -211,11 +271,25 @@ pub(crate) struct Error {
 enum ErrorKind {
     BuildClient(reqwest::Error),
     EncodeEvent(serde_json::Error),
-    EventTooLarge { size: usize, limit: usize },
+    EventTooLarge {
+        size: usize,
+        limit: usize,
+    },
     SendRequest(reqwest::Error),
-    Rejected { status: StatusCode, body: String },
+    Rejected {
+        status: StatusCode,
+        body: String,
+        retry_after: Option<Duration>,
+    },
     DecodeResponse(reqwest::Error),
-    UnexpectedRowCount { expected: usize, actual: usize },
+    UnexpectedRowCount {
+        expected: usize,
+        actual: usize,
+    },
+    RetriesExhausted {
+        attempts: u32,
+        source: Box<Error>,
+    },
 }
 
 impl fmt::Display for ErrorKind {
@@ -230,7 +304,7 @@ impl fmt::Display for ErrorKind {
                 )
             }
             Self::SendRequest(source) => write!(formatter, "failed to send request: {source}"),
-            Self::Rejected { status, body } => {
+            Self::Rejected { status, body, .. } => {
                 write!(formatter, "Braintrust rejected the request with {status}: {body}")
             }
             Self::DecodeResponse(source) => write!(formatter, "failed to decode Braintrust response: {source}"),
@@ -239,6 +313,9 @@ impl fmt::Display for ErrorKind {
                     formatter,
                     "Braintrust acknowledged {actual} rows, but {expected} events were submitted"
                 )
+            }
+            Self::RetriesExhausted { attempts, source } => {
+                write!(formatter, "insert failed after {attempts} attempts: {source}")
             }
         }
     }
@@ -259,6 +336,23 @@ impl Error {
 
     fn is_payload_too_large(&self) -> bool {
         matches!(&self.kind, ErrorKind::Rejected { status, .. } if *status == StatusCode::PAYLOAD_TOO_LARGE)
+    }
+
+    // worth retrying: the request never got a verdict, the server was overloaded, or it failed
+    // internally; 4xx rejections (including 413, which the split path handles) are final
+    fn is_transient(&self) -> bool {
+        match &self.kind {
+            ErrorKind::SendRequest(source) => source.is_timeout() || source.is_connect(),
+            ErrorKind::Rejected { status, .. } => status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS,
+            _ => false,
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match &self.kind {
+            ErrorKind::Rejected { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -331,7 +425,7 @@ mod tests {
 
         assert!(matches!(
             error.kind(),
-            ErrorKind::Rejected { status, body }
+            ErrorKind::Rejected { status, body, .. }
                 if *status == StatusCode::BAD_REQUEST && body == r#"{"error":"invalid event"}"#
         ));
     }
@@ -420,6 +514,65 @@ mod tests {
                 .collect();
             assert_eq!(ids, expected_ids);
         }
+    }
+
+    #[test]
+    fn retries_transient_failures_until_success() {
+        let project_id = Uuid::new_v4();
+        let (api_url, requests) = serve(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, "{}".to_owned()),
+            (StatusCode::OK, serde_json::json!({ "row_ids": ["1", "2", "3"] }).to_string()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(5);
+        let mut writer = Writer::new(&config).unwrap();
+        writer.backoff_base = Duration::from_millis(1);
+        let events = event_batch(3, 0);
+
+        let inserted = writer.write(&events).unwrap();
+
+        assert_eq!(inserted.row_ids.as_ref(), ["1", "2", "3"]);
+        // the rejected attempt and the successful retry both reached the server
+        for _ in 0..2 {
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+
+    #[test]
+    fn gives_up_after_exhausting_retries() {
+        let project_id = Uuid::new_v4();
+        let (api_url, _requests) = serve(vec![(StatusCode::BAD_GATEWAY, "{}".to_owned()); 4]);
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(5);
+        let mut writer = Writer::new(&config).unwrap();
+        writer.backoff_base = Duration::from_millis(1);
+        let events = event_batch(1, 0);
+
+        let error = writer.write(&events).unwrap_err();
+
+        assert!(matches!(error.kind(), ErrorKind::RetriesExhausted { attempts: 4, .. }));
+        assert!(error.to_string().contains("after 4 attempts"));
+    }
+
+    #[test]
+    fn does_not_retry_final_rejections() {
+        let project_id = Uuid::new_v4();
+        let (api_url, requests) = serve_once(StatusCode::UNPROCESSABLE_ENTITY, "{}".to_owned());
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(5);
+        let mut writer = Writer::new(&config).unwrap();
+        writer.backoff_base = Duration::from_millis(1);
+        let events = event_batch(1, 0);
+
+        let error = writer.write(&events).unwrap_err();
+
+        assert!(matches!(error.kind(), ErrorKind::Rejected { .. }));
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        // a second request would mean the 4xx was retried
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
     #[test]
