@@ -1,8 +1,8 @@
 mod check;
-mod generate;
 mod init;
 mod logging;
 mod setup;
+mod write;
 
 use crate::dsl;
 use std::fmt;
@@ -17,18 +17,18 @@ pub struct Cli {
 #[derive(Debug, clap::Subcommand)]
 enum Cmd {
     Check(check::Args),
-    Generate(generate::Args),
     Init(init::Args),
     Setup(setup::Args),
+    Write(write::Args),
 }
 
 impl Cli {
     pub fn run(self) -> Result<(), Error> {
         match self.command {
             Cmd::Check(args) => args.run()?,
-            Cmd::Generate(args) => args.run()?,
             Cmd::Init(args) => args.run()?,
             Cmd::Setup(args) => args.run()?,
+            Cmd::Write(args) => args.run()?,
         }
 
         Ok(())
@@ -46,18 +46,18 @@ fn render_diags(source_name: &str, src: &str, diags: &dsl::Diags) -> String {
 #[derive(Debug)]
 pub enum Error {
     Check(check::Error),
-    Generate(generate::Error),
     Init(init::Error),
     Setup(setup::Error),
+    Write(write::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Check(source) => source.fmt(formatter),
-            Self::Generate(source) => source.fmt(formatter),
             Self::Init(source) => source.fmt(formatter),
             Self::Setup(source) => source.fmt(formatter),
+            Self::Write(source) => source.fmt(formatter),
         }
     }
 }
@@ -70,12 +70,6 @@ impl From<check::Error> for Error {
     }
 }
 
-impl From<generate::Error> for Error {
-    fn from(source: generate::Error) -> Self {
-        Self::Generate(source)
-    }
-}
-
 impl From<init::Error> for Error {
     fn from(source: init::Error) -> Self {
         Self::Init(source)
@@ -85,6 +79,12 @@ impl From<init::Error> for Error {
 impl From<setup::Error> for Error {
     fn from(source: setup::Error) -> Self {
         Self::Setup(source)
+    }
+}
+
+impl From<write::Error> for Error {
+    fn from(source: write::Error) -> Self {
+        Self::Write(source)
     }
 }
 

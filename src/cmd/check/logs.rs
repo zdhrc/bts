@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn renders_plain_events_with_their_fields() {
-        let raw = r#"{"timestamp":"2026-08-12T23:45:03.205846Z","level":"INFO","fields":{"message":"seed resolved","seed":42},"target":"bts::cmd::generate"}"#;
+        let raw = r#"{"timestamp":"2026-08-12T23:45:03.205846Z","level":"INFO","fields":{"message":"seed resolved","seed":42},"target":"bts::cmd::write"}"#;
 
         let line = render_line(raw);
 

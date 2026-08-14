@@ -36,18 +36,18 @@ bts check syntax shape.bt        # or `bts check syntax -` to read stdin
 Preview what would be generated, without writing anything:
 
 ```sh
-bts generate --from shape.bt --count 5 --over 1h --dry-run
+bts write --from shape.bt --count 5 --over 1h --dry-run
 ```
 
 Generate 200 traces spread over the last 24 hours and write them to Braintrust:
 
 ```sh
-bts generate --from shape.bt --count 200 --over 24h
+bts write --from shape.bt --count 200 --over 24h
 ```
 
 Trace volume is spread linearly by default; pass `--dist sine` for a wavier load pattern. Generation is seeded — every run prints its seed, and passing `--seed <n>` reproduces a run exactly. Pass `--json` to get the final summary (seed, counts, duration, run log path) as a single JSON line on stdout, for scripts and agents.
 
-Every `generate` run also writes a JSON-lines log to `.bt/bts/logs/` (next to the nearest `.bt` project directory, or the current directory) with phase timings, the seed, per-batch insert results, retry warnings, and any failure. The last 20 runs are kept, the directory gitignores itself, and a failed run prints the path to its log. Pass `--profile` to also stream phase timings to stderr. Transient write failures (timeouts, 429s, 5xx) are retried with exponential backoff before the run gives up.
+Every `write` run also writes a JSON-lines log to `.bt/bts/logs/` (next to the nearest `.bt` project directory, or the current directory) with phase timings, the seed, per-batch insert results, retry warnings, and any failure. The last 20 runs are kept, the directory gitignores itself, and a failed run prints the path to its log. Pass `--profile` to also stream phase timings to stderr. Transient write failures (timeouts, 429s, 5xx) are retried with exponential backoff before the run gives up.
 
 Inspect past runs without digging through the JSONL yourself:
 
@@ -70,7 +70,7 @@ keep_runs = 20            # run log files kept before the oldest are pruned
 request_timeout = "30s"   # per-request timeout for Braintrust API calls
 ```
 
-Everything is optional and shown here with its default. The `BTS_LOG` environment variable overrides `log.level` for a single run — `BTS_LOG=debug bts generate ...` — and `off` disables the run log entirely.
+Everything is optional and shown here with its default. The `BTS_LOG` environment variable overrides `log.level` for a single run — `BTS_LOG=debug bts write ...` — and `off` disables the run log entirely.
 
 Optionally, install the `bts` agent skill so Claude Code or Codex can write and debug shape files with the full language reference on hand:
 

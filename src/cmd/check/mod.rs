@@ -99,7 +99,7 @@ mod tests {
         for argv in [
             &["bts", "check", "logs"][..],
             &["bts", "check", "logs", "--last"],
-            &["bts", "check", "logs", "generate-20260813T000000Z-1.jsonl"],
+            &["bts", "check", "logs", "write-20260813T000000Z-1.jsonl"],
         ] {
             let args = parse_check(argv).unwrap();
             assert!(matches!(args.command, Cmd::Logs(_)));

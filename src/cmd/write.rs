@@ -47,7 +47,7 @@ pub struct Args {
 impl Args {
     pub fn run(self) -> Result<(), Error> {
         let settings = Settings::load()?;
-        let log_path = logging::init("generate", self.profile, &settings);
+        let log_path = logging::init("write", self.profile, &settings);
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
             argv = %env::args().skip(1).collect::<Vec<_>>().join(" "),
@@ -218,16 +218,16 @@ mod tests {
     use crate::cmd::{Cli, Cmd};
     use clap::Parser as _;
 
-    fn parse_generate(argv: &[&str]) -> Result<Args, clap::Error> {
+    fn parse_write(argv: &[&str]) -> Result<Args, clap::Error> {
         Cli::try_parse_from(argv).map(|cli| match cli.command {
-            Cmd::Generate(args) => args,
-            other => panic!("expected a generate command, parsed {other:?}"),
+            Cmd::Write(args) => args,
+            other => panic!("expected a write command, parsed {other:?}"),
         })
     }
 
     #[test]
     fn parses_requested_command_shape() {
-        let args = parse_generate(&["bts", "generate", "--from", "simple.bt", "--count", "25", "--over", "1h"]).unwrap();
+        let args = parse_write(&["bts", "write", "--from", "simple.bt", "--count", "25", "--over", "1h"]).unwrap();
 
         assert_eq!(args.from, PathBuf::from("simple.bt"));
         assert_eq!(args.count.get(), 25);
@@ -241,9 +241,9 @@ mod tests {
     #[test]
     fn rejects_json_summaries_for_dry_runs() {
         assert!(
-            parse_generate(&[
+            parse_write(&[
                 "bts",
-                "generate",
+                "write",
                 "--from",
                 "simple.bt",
                 "--count",
@@ -259,9 +259,9 @@ mod tests {
 
     #[test]
     fn parses_the_sine_distribution() {
-        let args = parse_generate(&[
+        let args = parse_write(&[
             "bts",
-            "generate",
+            "write",
             "--from",
             "simple.bt",
             "--count",
@@ -278,12 +278,12 @@ mod tests {
 
     #[test]
     fn rejects_zero_counts_and_invalid_durations() {
-        assert!(parse_generate(&["bts", "generate", "--from", "simple.bt", "--count", "0", "--over", "1h"]).is_err());
-        assert!(parse_generate(&["bts", "generate", "--from", "simple.bt", "--count", "1", "--over", "hour"]).is_err());
+        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "0", "--over", "1h"]).is_err());
+        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "1", "--over", "hour"]).is_err());
         assert!(
-            parse_generate(&[
+            parse_write(&[
                 "bts",
-                "generate",
+                "write",
                 "--from",
                 "simple.bt",
                 "--count",

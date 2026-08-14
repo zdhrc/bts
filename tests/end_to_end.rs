@@ -27,7 +27,7 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
     let shape = write_shape(SIMPLE_SHAPE);
     let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
     let output = bts()
-        .args(["generate", "--from"])
+        .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "25", "--over", "1h", "--dry-run"])
         .output()
@@ -73,7 +73,7 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
 fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     let shape = write_shape(include_str!("fixtures/dynamic.bt"));
     let output = bts()
-        .args(["generate", "--from"])
+        .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "20", "--over", "1h", "--dry-run", "--seed", "42"])
         .output()
@@ -128,7 +128,7 @@ fn dry_run_resolves_context_references_in_expressions() {
         "#,
     );
     let output = bts()
-        .args(["generate", "--from"])
+        .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "1", "--over", "1h", "--dry-run"])
         .output()
@@ -158,7 +158,7 @@ fn dry_run_resolves_context_references_in_expressions() {
 fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     let shape = write_shape(r#"trace "t" { input = 100 / range(0, 0) }"#);
     let output = bts()
-        .args(["generate", "--from"])
+        .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "1", "--over", "1h", "--dry-run", "--seed", "0"])
         .output()
@@ -195,7 +195,7 @@ fn threads_referenced_content_across_spans() {
         "#,
     );
     let output = bts()
-        .args(["generate", "--from"])
+        .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "4", "--over", "1h", "--dry-run", "--seed", "9"])
         .output()
@@ -228,7 +228,7 @@ fn writes_generated_events_to_the_configured_endpoint() {
     let project_id = Uuid::new_v4();
     let (api_url, request) = serve_insert(6);
     let output = bts()
-        .args(["generate", "--from"])
+        .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "2", "--over", "1h"])
         .env("BRAINTRUST_API_KEY", "test-secret")
@@ -254,7 +254,7 @@ fn emits_a_json_summary_when_requested() {
     let project_id = Uuid::new_v4();
     let (api_url, _request) = serve_insert(3);
     let output = bts()
-        .args(["generate", "--from"])
+        .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "1", "--over", "1h", "--seed", "3", "--json"])
         .env("BRAINTRUST_API_KEY", "test-secret")
@@ -283,7 +283,7 @@ fn bts() -> Command {
 }
 
 fn write_shape(source: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("bts-generate-{}.bt", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("bts-write-{}.bt", Uuid::new_v4()));
     fs::write(&path, source).unwrap();
     path
 }

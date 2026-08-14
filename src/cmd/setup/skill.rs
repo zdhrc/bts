@@ -226,7 +226,7 @@ fn render_skill(spec: &Spec) -> String {
     .unwrap();
     writeln!(
         output,
-        "5. Preview generated Braintrust events with `bts generate --from <path> --count <traces> --over <duration> --dry-run`."
+        "5. Preview generated Braintrust events with `bts write --from <path> --count <traces> --over <duration> --dry-run`."
     )
     .unwrap();
     writeln!(
@@ -510,7 +510,7 @@ mod tests {
         assert!(skill.starts_with("---\nname: bts\ndescription:"));
         assert!(skill.contains(GENERATED_MARKER));
         assert!(skill.contains("bts check syntax <path>"));
-        assert!(skill.contains("bts generate --from <path> --count <traces> --over <duration> --dry-run"));
+        assert!(skill.contains("bts write --from <path> --count <traces> --over <duration> --dry-run"));
         assert!(skill.contains(SPEC.summary));
         assert!(skill.contains(SPEC.surface.grammar.trim()));
         for expression in SPEC.expressions {
