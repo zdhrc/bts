@@ -112,6 +112,7 @@ impl Args {
 
         let mut config = Braintrust::from_env()?;
         config.request_timeout = settings.request_timeout;
+        config.write_concurrency = settings.write_concurrency;
         tracing::info!(project_id = %config.project_id, api_url = %config.api_url, "writing to braintrust");
         let inserted = tracing::info_span!("write").in_scope(|| sdg::write(&config, &events))?;
         tracing::info!(

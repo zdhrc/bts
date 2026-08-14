@@ -2,6 +2,8 @@ use crate::{conf::Braintrust, sdg::materializer::EventBatch};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{StatusCode, blocking::Client};
 use serde::Deserialize;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, thread, time::Duration};
 
 // braintrust's lambda-backed api caps request bodies; advertised as logs3_payload_max_bytes (5MiB) on
@@ -48,19 +50,84 @@ impl<'config> Writer<'config> {
         })
     }
 
+    // payloads are independent, so a pool of scoped worker threads sends them concurrently;
+    // insert latency dominates a run, so wall time shrinks by roughly the worker count
     fn write(&self, events: &EventBatch) -> Result<InsertResponse, Error> {
         let url = format!(
             "{}/v1/project_logs/{}/insert",
             self.config.api_url.trim_end_matches('/'),
             self.config.project_id,
         );
+        let payloads = payloads(events, MAX_PAYLOAD_BYTES)?;
+        let workers = self.config.write_concurrency.min(payloads.len()).max(1);
+        // payloads are indexed so acknowledged row ids reassemble in submission
+        // order no matter which worker finishes first
+        let mut slots: Vec<Option<Vec<String>>> = Vec::new();
+        slots.resize_with(payloads.len(), || None);
+        let slots = Mutex::new(slots);
+        let pending = Mutex::new(payloads.into_iter().enumerate().rev().collect::<Vec<_>>());
+        let failed = AtomicBool::new(false);
+        // workers re-enter the caller's span so insert logs keep their place in the tree
+        let span = tracing::Span::current();
+
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _guard = span.enter();
+                        self.drain(&url, &pending, &slots, &failed)
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .try_for_each(|handle| handle.join().expect("writer worker panicked"))
+        })?;
+
         let mut row_ids = Vec::with_capacity(events.event_count());
-        let mut pending = payloads(events, MAX_PAYLOAD_BYTES)?;
-        pending.reverse();
+        for slot in slots.into_inner().unwrap() {
+            row_ids.extend(slot.expect("every payload has a result when no worker failed"));
+        }
+
+        Ok(InsertResponse {
+            row_ids: row_ids.into_boxed_slice(),
+        })
+    }
+
+    // pulls the next unsent payload until the queue drains or any worker fails
+    fn drain(
+        &self,
+        url: &str,
+        pending: &Mutex<Vec<(usize, Payload)>>,
+        slots: &Mutex<Vec<Option<Vec<String>>>>,
+        failed: &AtomicBool,
+    ) -> Result<(), Error> {
+        loop {
+            // fail fast: leave remaining payloads unsent once any worker errors
+            if failed.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let Some((index, payload)) = pending.lock().unwrap().pop() else {
+                return Ok(());
+            };
+            match self.write_payload(url, payload) {
+                Ok(row_ids) => slots.lock().unwrap()[index] = Some(row_ids),
+                Err(error) => {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn write_payload(&self, url: &str, payload: Payload) -> Result<Vec<String>, Error> {
+        let mut row_ids = Vec::with_capacity(payload.event_count());
+        let mut pending = vec![payload];
 
         while let Some(payload) = pending.pop() {
             let sent = tracing::info_span!("insert", events = payload.event_count(), bytes = payload.body_len)
-                .in_scope(|| self.send_with_retry(&url, &payload));
+                .in_scope(|| self.send_with_retry(url, &payload));
             match sent {
                 Ok(inserted) => row_ids.extend(inserted.row_ids.into_vec()),
                 // the server's effective limit can sit below our cap; split and retry until it takes
@@ -78,9 +145,7 @@ impl<'config> Writer<'config> {
             }
         }
 
-        Ok(InsertResponse {
-            row_ids: row_ids.into_boxed_slice(),
-        })
+        Ok(row_ids)
     }
 
     fn send_with_retry(&self, url: &str, payload: &Payload) -> Result<InsertResponse, Error> {
@@ -470,6 +535,8 @@ mod tests {
         let mut config = Braintrust::new("secret".to_owned(), project_id);
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(5);
+        // one worker so the payloads arrive in order; the fake server replies by arrival
+        config.write_concurrency = 1;
         // three ~1MiB events: two fit under the 2.5MiB cap, the third spills into a second payload
         let events = event_batch(3, 1024 * 1024);
 
@@ -483,6 +550,22 @@ mod tests {
             let payload: JsonValue = serde_json::from_slice(body).unwrap();
             assert_eq!(payload["events"].as_array().unwrap().len(), expected_count);
         }
+    }
+
+    #[test]
+    fn writes_payloads_concurrently_and_preserves_event_order() {
+        let project_id = Uuid::new_v4();
+        // eight ~1MiB events pack into four payloads, written by four workers at once
+        let api_url = serve_matching(4);
+        let mut config = Braintrust::new("secret".to_owned(), project_id);
+        config.api_url = api_url;
+        config.request_timeout = Duration::from_secs(5);
+        let events = event_batch(8, 1024 * 1024);
+
+        let inserted = write(&config, &events).unwrap();
+
+        let expected: Vec<_> = (0..8).map(|index| format!("event-{index}")).collect();
+        assert_eq!(inserted.row_ids.as_ref(), expected.as_slice());
     }
 
     #[test]
@@ -646,6 +729,38 @@ mod tests {
         });
 
         (format!("http://{address}"), receiver)
+    }
+
+    // acknowledges each request with the event ids it carried, so concurrent
+    // requests get the right response regardless of arrival order
+    fn serve_matching(connections: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            for _ in 0..connections {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                let (_, body) = split_request(&request);
+                let payload: JsonValue = serde_json::from_slice(body).unwrap();
+                let row_ids: Vec<_> = payload["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|event| event["id"].clone())
+                    .collect();
+                let body = serde_json::json!({ "row_ids": row_ids }).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                )
+                .unwrap();
+            }
+        });
+
+        format!("http://{address}")
     }
 
     fn read_request(stream: &mut TcpStream) -> Vec<u8> {

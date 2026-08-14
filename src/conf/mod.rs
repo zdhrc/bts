@@ -6,6 +6,7 @@ use uuid::Uuid;
 const BRAINTRUST_API_URL: &str = "https://api.braintrust.dev";
 const CONFIG_PATH: &str = ".bt/bts/config.toml";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_WRITE_CONCURRENCY: usize = 8;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_KEPT_RUNS: usize = 20;
 
@@ -15,6 +16,7 @@ pub(crate) struct Braintrust {
     pub(crate) api_key: String,
     pub(crate) project_id: Uuid,
     pub(crate) request_timeout: Duration,
+    pub(crate) write_concurrency: usize,
 }
 
 impl Braintrust {
@@ -24,6 +26,7 @@ impl Braintrust {
             api_key,
             project_id,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            write_concurrency: DEFAULT_WRITE_CONCURRENCY,
         }
     }
 
@@ -47,6 +50,7 @@ pub(crate) struct Settings {
     pub(crate) log_level: String,
     pub(crate) keep_runs: usize,
     pub(crate) request_timeout: Duration,
+    pub(crate) write_concurrency: usize,
 }
 
 impl Default for Settings {
@@ -55,6 +59,7 @@ impl Default for Settings {
             log_level: DEFAULT_LOG_LEVEL.to_owned(),
             keep_runs: DEFAULT_KEPT_RUNS,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            write_concurrency: DEFAULT_WRITE_CONCURRENCY,
         }
     }
 }
@@ -98,6 +103,12 @@ impl Settings {
                 reason,
             })?;
         }
+        if let Some(concurrency) = file.http.write_concurrency {
+            if concurrency == 0 {
+                return Err(Error::InvalidConcurrency { path: path.to_owned() });
+            }
+            settings.write_concurrency = concurrency;
+        }
 
         Ok(settings)
     }
@@ -122,6 +133,7 @@ struct LogSection {
 #[serde(deny_unknown_fields, default)]
 struct HttpSection {
     request_timeout: Option<String>,
+    write_concurrency: Option<usize>,
 }
 
 // bare values must be real levels so typos fail; the env-filter parser alone would accept
@@ -192,6 +204,7 @@ pub(crate) enum Error {
     ParseConfig { path: PathBuf, source: toml::de::Error },
     InvalidLogLevel { path: PathBuf, value: String, reason: String },
     InvalidTimeout { path: PathBuf, value: String, reason: String },
+    InvalidConcurrency { path: PathBuf },
 }
 
 impl fmt::Display for Error {
@@ -215,6 +228,13 @@ impl fmt::Display for Error {
                 write!(
                     formatter,
                     "invalid http.request_timeout {value:?} in {}: {reason}",
+                    path.display()
+                )
+            }
+            Self::InvalidConcurrency { path } => {
+                write!(
+                    formatter,
+                    "invalid http.write_concurrency in {}: must be greater than zero",
                     path.display()
                 )
             }
@@ -242,6 +262,7 @@ mod tests {
 
             [http]
             request_timeout = "2m"
+            write_concurrency = 4
             "#,
         )
         .unwrap();
@@ -249,6 +270,7 @@ mod tests {
         assert_eq!(settings.log_level, "debug");
         assert_eq!(settings.keep_runs, 5);
         assert_eq!(settings.request_timeout, Duration::from_secs(120));
+        assert_eq!(settings.write_concurrency, 4);
     }
 
     #[test]
@@ -257,6 +279,7 @@ mod tests {
             let settings = parse(raw).unwrap();
             assert_eq!(settings.keep_runs, DEFAULT_KEPT_RUNS);
             assert_eq!(settings.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+            assert_eq!(settings.write_concurrency, DEFAULT_WRITE_CONCURRENCY);
         }
         assert_eq!(parse("").unwrap().log_level, DEFAULT_LOG_LEVEL);
     }
@@ -292,6 +315,12 @@ mod tests {
             matches!(error, Error::InvalidTimeout { value, .. } if value == "soon"),
             "not the expected error"
         );
+    }
+
+    #[test]
+    fn rejects_a_zero_write_concurrency() {
+        let error = parse("[http]\nwrite_concurrency = 0\n").unwrap_err();
+        assert!(matches!(error, Error::InvalidConcurrency { .. }), "{error}");
     }
 
     #[test]

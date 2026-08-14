@@ -15,6 +15,10 @@ const CONFIG_TEMPLATE: &str = r#"# bts runtime configuration; every key is optio
 [http]
 # per-request timeout for Braintrust API calls, such as 30s or 2m
 #request_timeout = "30s"
+
+# how many insert requests are in flight at once; lower this on flaky
+# connections or when Braintrust rate limits, must be greater than zero
+#write_concurrency = 8
 "#;
 
 #[derive(Debug, clap::Args)]
@@ -94,6 +98,7 @@ mod tests {
         assert_eq!(settings.log_level, defaults.log_level);
         assert_eq!(settings.keep_runs, defaults.keep_runs);
         assert_eq!(settings.request_timeout, defaults.request_timeout);
+        assert_eq!(settings.write_concurrency, defaults.write_concurrency);
     }
 
     #[test]
