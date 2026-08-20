@@ -1,5 +1,6 @@
 [package]
 name = "bts"
+repository = "https://github.com/zdhrc/bts"
 version = "0.1.0"
 edition = "2024"
 description = "another synthetics generator"
@@ -23,3 +24,8 @@ uuid = { version = "1.24.0", features = ["v4"] }
 [profile.profiling]
 inherits = "release"
 debug = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
