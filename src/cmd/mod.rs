@@ -2,6 +2,7 @@ mod check;
 mod init;
 mod logging;
 mod setup;
+mod update;
 mod write;
 
 use crate::dsl;
@@ -19,6 +20,7 @@ enum Cmd {
     Check(check::Args),
     Init(init::Args),
     Setup(setup::Args),
+    Update(update::Args),
     Write(write::Args),
 }
 
@@ -28,6 +30,7 @@ impl Cli {
             Cmd::Check(args) => args.run()?,
             Cmd::Init(args) => args.run()?,
             Cmd::Setup(args) => args.run()?,
+            Cmd::Update(args) => args.run()?,
             Cmd::Write(args) => args.run()?,
         }
 
@@ -48,6 +51,7 @@ pub enum Error {
     Check(check::Error),
     Init(init::Error),
     Setup(setup::Error),
+    Update(update::Error),
     Write(write::Error),
 }
 
@@ -57,6 +61,7 @@ impl fmt::Display for Error {
             Self::Check(source) => source.fmt(formatter),
             Self::Init(source) => source.fmt(formatter),
             Self::Setup(source) => source.fmt(formatter),
+            Self::Update(source) => source.fmt(formatter),
             Self::Write(source) => source.fmt(formatter),
         }
     }
@@ -79,6 +84,12 @@ impl From<init::Error> for Error {
 impl From<setup::Error> for Error {
     fn from(source: setup::Error) -> Self {
         Self::Setup(source)
+    }
+}
+
+impl From<update::Error> for Error {
+    fn from(source: update::Error) -> Self {
+        Self::Update(source)
     }
 }
 
