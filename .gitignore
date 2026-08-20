@@ -1,17 +1,86 @@
-/target
+# Rust / Cargo build output
+/target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
 
-# local working notes
-term-bank.md
-plan-bank.md
+# Local working notes
+/term-bank.md
+/plan-bank.md
 
-# bt cli local state and bts run logs
-.bt/
+# Environment files, credentials, and private key material
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+/secrets/
+/credentials/
 
-# editor and agent local config
-.claude/settings.local.json
-.claude/worktrees
-.vscode/
-.idea/
+# Local coding-agent state and workspaces
+/.agents/
+/.bt/
+/.claude/
+/.codex/
+/.cursor/
+/.continue/
+/.aider/
+/.avante/
+/.cline/
+/.roo/
+/.windsurf/
+/.opencode/
+/.gemini/
+/.augment/
+/.amp/
+/.kilocode/
 
-# os cruft
+# Editors and IDEs
+/.vscode/
+/.idea/
+*.code-workspace
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
+
+# macOS Finder and filesystem metadata
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Logs, temporary files, and local caches
+*.log
+*.log.*
+*.tmp
+*.temp
+*.bak
+*.cache
+*.pid
+*.pid.lock
+/logs/
+/.cache/
+/tmp/
+/temp/
+
+# Test coverage and profiling reports
+/coverage/
+/htmlcov/
+/.coverage
+coverage.lcov
+lcov.info
