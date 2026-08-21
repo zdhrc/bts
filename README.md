@@ -6,15 +6,31 @@ It's "another synthetics generator".
 
 ## Install
 
-Requires a Rust toolchain (edition 2024, so Rust 1.85 or newer). From a clone of this repo:
+Prebuilt binaries for macOS and Linux (arm64 and x86_64) install to `~/.local/bin`:
 
 ```sh
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/zdhrc/bts/releases/latest/download/bts-installer.sh | sh
 ```
 
-Verify with `bts --version`.
+Verify with `bts --version`. Later, `bts update` fetches and installs the latest release in place.
 
-## Setup
+To build from source instead, `cargo install --path .` from a clone of this repo (edition 2024, so Rust 1.85 or newer). Source builds have no install receipt, so `bts update` only works for installer-managed installs.
+
+## Quickstart
+
+Initialize the directory you'll generate traces from:
+
+```sh
+bts init
+```
+
+This scaffolds `.bt/bts/config.toml`, an optional file controlling runtime behavior (see [Configuration](#configuration)). The `.bt` directory is a shared home for Braintrust tooling; everything `bts` owns — config, run logs — lives under its own `.bt/bts/` corner.
+
+Next, install the `bts` agent skill so Claude Code or Codex can write and debug shape files with the full language reference on hand:
+
+```sh
+bts setup skill claude    # or codex; --scope local|user|global
+```
 
 Writing to Braintrust requires two environment variables:
 
@@ -25,24 +41,20 @@ export BRAINTRUST_PROJECT_ID="<project uuid>"
 
 `BRAINTRUST_API_URL` can optionally override the default API endpoint. None of this is needed for `check` or `--dry-run`.
 
-## Usage
-
-Validate a shape file:
-
-```sh
-bts check syntax shape.bt        # or `bts check syntax -` to read stdin
-```
-
-Preview what would be generated, without writing anything:
-
-```sh
-bts write --from shape.bt --count 5 --over 1h --dry-run
-```
-
-Generate 200 traces spread over the last 24 hours and write them to Braintrust:
+Then describe a trace in a shape file (see [The shape language](#the-shape-language)) and write a batch:
 
 ```sh
 bts write --from shape.bt --count 200 --over 24h
+```
+
+## Handy commands
+
+```sh
+bts check syntax shape.bt                                 # validate a shape file (`-` reads stdin)
+bts write --from shape.bt --count 5 --over 1h --dry-run   # preview without writing anything
+bts write --from shape.bt --count 200 --over 24h          # generate and write to Braintrust
+bts check logs                                            # list recent runs with ok / failed verdicts
+bts update                                                # update bts to the latest release
 ```
 
 Trace volume is spread linearly by default; pass `--dist sine` for a wavier load pattern. Generation is seeded — every run prints its seed, and passing `--seed <n>` reproduces a run exactly. Pass `--json` to get the final summary (seed, counts, duration, run log path) as a single JSON line on stdout, for scripts and agents.
@@ -59,7 +71,7 @@ bts check logs <run-file-name>   # render a specific run from the listing
 
 ## Configuration
 
-`bts init` scaffolds `.bt/bts/config.toml` in the current directory — an optional file controlling runtime behavior:
+`.bt/bts/config.toml` (scaffolded by `bts init`) controls runtime behavior:
 
 ```toml
 [log]
@@ -71,12 +83,6 @@ request_timeout = "30s"   # per-request timeout for Braintrust API calls
 ```
 
 Everything is optional and shown here with its default. The `BTS_LOG` environment variable overrides `log.level` for a single run — `BTS_LOG=debug bts write ...` — and `off` disables the run log entirely.
-
-Optionally, install the `bts` agent skill so Claude Code or Codex can write and debug shape files with the full language reference on hand:
-
-```sh
-bts setup skill claude    # or codex; --scope local|user|global
-```
 
 ## The shape language
 
