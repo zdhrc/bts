@@ -362,7 +362,13 @@ pub(crate) enum Func {
     Alphanum {
         length: usize,
     },
+    Noise {
+        size: Box<Value>,
+    },
 }
+
+// backstop so a typo'd noise size can't balloon a run
+pub(crate) const NOISE_SIZE_CAP: i64 = 8 << 20;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WeightedOption {

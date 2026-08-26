@@ -1,6 +1,6 @@
 use crate::dsl::{
     Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild,
-    Choice as ModelChoice, CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NodeId,
+    Choice as ModelChoice, CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NOISE_SIZE_CAP, NodeId,
     Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange,
     RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
     Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
@@ -1363,6 +1363,19 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             length,
             ctx,
         )),
+        ModelFunc::Noise { size } => {
+            let size = match eval_operand(*size, ctx)? {
+                Scalar::Int(value) if (0..=NOISE_SIZE_CAP).contains(&value) => value as usize,
+                Scalar::Int(_) | Scalar::Float(_) => return Err(Error::new(ErrorKind::NoiseSizeOutOfRange, range)),
+                // reference-fed arguments settle their types here
+                _ => return Err(shape_error(ctx)),
+            };
+            ModelValue::Str(random_text(
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+                size,
+                ctx,
+            ))
+        }
     };
 
     Ok(value)
@@ -1797,6 +1810,7 @@ enum ErrorKind {
     NegativeRepeatCount,
     NonIntegerRepeatCount,
     ChanceOutOfRange,
+    NoiseSizeOutOfRange,
     ClampBoundsOutOfOrder,
     EmptySplitSeparator,
     JoinElementNotScalar,
@@ -1818,6 +1832,7 @@ impl fmt::Display for ErrorKind {
             Self::NegativeRepeatCount => "repeat count is negative",
             Self::NonIntegerRepeatCount => "repeat count is not an integer",
             Self::ChanceOutOfRange => "maybe chance is not between 0 and 1",
+            Self::NoiseSizeOutOfRange => "noise size is not an integer between 0 and 8388608",
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
             Self::EmptySplitSeparator => "split separator is empty",
             Self::JoinElementNotScalar => "join element is not a string, number, or boolean",
@@ -2329,6 +2344,36 @@ mod tests {
 
         let plan_b = plan(compile(source).unwrap(), 5, 7).unwrap();
         assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn evaluates_noise_reproducibly_and_rejects_bad_sizes() {
+        let source = r#"trace "t" { input = [noise(64), noise(round(range(10, 20))), noise(0)] }"#;
+        let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
+        for event in plan_a.events.iter() {
+            let JsonValue::Array(values) = event.fields.input.as_ref().unwrap() else {
+                panic!("expected an array");
+            };
+
+            let noise = values[0].as_str().unwrap();
+            assert_eq!(noise.len(), 64);
+            assert!(noise.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/'));
+
+            let sized = values[1].as_str().unwrap();
+            assert!((10..=20).contains(&sized.len()));
+
+            assert_eq!(values[2].as_str().unwrap(), "");
+        }
+        let plan_b = plan(compile(source).unwrap(), 3, 7).unwrap();
+        assert_eq!(plan_a, plan_b);
+
+        for source in [
+            r#"trace "t" { input = noise(range(1, 1) - 2) }"#,
+            r#"trace "t" { input = noise(range(1.5, 1.5)) }"#,
+        ] {
+            let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+            assert_eq!(error.to_string(), "noise size is not an integer between 0 and 8388608");
+        }
     }
 
     #[test]

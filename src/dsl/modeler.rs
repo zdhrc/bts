@@ -1,9 +1,9 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NodeId, Number, Object,
-    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, Span, SpanFields, SpanKind, Step, Template, Trace,
-    UnaryOp, Value, WeightedOption,
+    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId,
+    Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, Span, SpanFields, SpanKind, Step,
+    Template, Trace, UnaryOp, Value, WeightedOption,
 };
 use crate::dsl::spec;
 use std::{
@@ -1779,6 +1779,7 @@ impl Modeler {
                 Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
                     self.value_reaches_block_ref(value)
                 }
+                Func::Noise { size } => self.value_reaches_block_ref(size),
             },
         }
     }
@@ -2796,6 +2797,27 @@ impl Modeler {
                     Func::Alphanum { length }
                 })
             }
+            "noise" => {
+                let [size] = self.func_args(func, args, "exactly one argument (size)", range)?;
+                // a constant size settles its bounds during validation
+                if let FoldedKind::Value(Value::Num(number)) = &size.kind {
+                    let valid = matches!(number, Number::Int(value) if (0..=NOISE_SIZE_CAP).contains(value));
+                    if !valid {
+                        self.errors.push(Error::new(
+                            ErrorKind::ParamOutOfRange {
+                                rule: spec::ids::NOISE_SIZE,
+                                func,
+                                param: "size",
+                                expected: "an integer between 0 and 8388608",
+                            },
+                            size.range,
+                        ));
+                        return None;
+                    }
+                }
+                let size = self.model_typed_arg(size, func, StaticType::Number)?;
+                Some(Func::Noise { size: Box::new(size) })
+            }
 
             _ => unreachable!("function {name} does not have a model lowering"),
         }
@@ -3206,7 +3228,8 @@ impl Modeler {
             | Func::Format { .. }
             | Func::Uuid
             | Func::Hex { .. }
-            | Func::Alphanum { .. } => Some(StaticType::String),
+            | Func::Alphanum { .. }
+            | Func::Noise { .. } => Some(StaticType::String),
             Func::Split { .. } => Some(StaticType::Array),
         }
     }
@@ -3965,6 +3988,7 @@ fn collect_func_refs(func: &Func, found: &mut Vec<RefId>) {
         Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
             collect_refs(value, found)
         }
+        Func::Noise { size } => collect_refs(size, found),
     }
 }
 
@@ -6181,6 +6205,46 @@ mod tests {
             let errors = model(source).unwrap_err();
             assert!(matches!(errors[0].kind(), ErrorKind::ParamOutOfRange { param: "length", .. }));
         }
+    }
+
+    #[test]
+    fn models_noise_and_rejects_invalid_sizes() {
+        let model_ok = model(r#"trace "t" { input = [noise(64), noise(round(lognormal(100, 0.5)))] }"#).unwrap();
+        let Some(Value::Array(array)) = &model_ok.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        for elem in &array.elem {
+            assert!(matches!(
+                elem,
+                ArrayElem::Item(Value::Func {
+                    func: Func::Noise { .. },
+                    ..
+                })
+            ));
+        }
+
+        // constant sizes settle their bounds during validation
+        for source in [
+            r#"trace "t" { input = noise(0 - 1) }"#,
+            r#"trace "t" { input = noise(1.5) }"#,
+            r#"trace "t" { input = noise(8388609) }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert!(matches!(
+                errors[0].kind(),
+                ErrorKind::ParamOutOfRange {
+                    func: "noise",
+                    param: "size",
+                    ..
+                }
+            ));
+        }
+
+        let errors = model(r#"trace "t" { input = noise("x") }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "noise", .. }));
+
+        let errors = model(r#"trace "t" { input = noise() }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "noise", .. }));
     }
 
     #[test]

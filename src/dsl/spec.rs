@@ -269,6 +269,7 @@ pub(crate) mod ids {
     pub(crate) const FUNC_UUID: Id = Id::new("func.uuid");
     pub(crate) const FUNC_HEX: Id = Id::new("func.hex");
     pub(crate) const FUNC_ALPHANUM: Id = Id::new("func.alphanum");
+    pub(crate) const FUNC_NOISE: Id = Id::new("func.noise");
 
     pub(crate) const MULTILINE_DELIMITERS: Id = Id::new("rule.multiline-delimiters");
     pub(crate) const MULTILINE_INDENT: Id = Id::new("rule.multiline-indentation");
@@ -298,6 +299,7 @@ pub(crate) mod ids {
     pub(crate) const CLAMP_BOUNDS: Id = Id::new("rule.clamp-bounds");
     pub(crate) const INTEGER_RESULTS: Id = Id::new("rule.integer-results");
     pub(crate) const RANDOM_LENGTH: Id = Id::new("rule.random-string-length");
+    pub(crate) const NOISE_SIZE: Id = Id::new("rule.noise-size");
     pub(crate) const OPERAND_TYPES: Id = Id::new("rule.operand-types");
     pub(crate) const INDEXABLE_TARGETS: Id = Id::new("rule.indexable-targets");
     pub(crate) const INDEX_BOUNDS: Id = Id::new("rule.index-bounds");
@@ -639,6 +641,14 @@ const RANDOM_STRING_RULES: &[RuleDesc] = &[
     },
 ];
 const UUID_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE];
+const NOISE_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    FUNC_ARG_TYPES_RULE,
+    RuleDesc {
+        id: ids::NOISE_SIZE,
+        summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+    },
+];
 const INDEX_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::INDEXABLE_TARGETS,
@@ -1173,6 +1183,14 @@ const FUNCS: &[FuncDesc] = &[
         summary: "A random alphanumeric string (0-9, A-Z, a-z) of the given constant length, for each generated trace.",
         examples: &["alphanum(12)"],
         rules: RANDOM_STRING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_NOISE,
+        name: "noise",
+        syntax: "noise(size)",
+        summary: "An opaque random base64-style string of the given size in bytes, for padding a trace with payload weight where storage size matters; the size may be dynamic, so payloads can vary per trace.",
+        examples: &["noise(250000)", "noise(round(lognormal(80000, 0.9)))"],
+        rules: NOISE_RULES,
     },
 ];
 
