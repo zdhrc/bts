@@ -33,6 +33,8 @@ pub(super) struct EventPlan {
     pub(super) name: String,
     pub(super) kind: EventKind,
     pub(super) fields: EventFields,
+    // total span duration; none takes the materializer's default slot
+    pub(super) duration: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -94,6 +96,7 @@ fn mix_str(hash: u64, value: &str) -> u64 {
 const COUNT_SALT: u64 = 0x01;
 const CHANCE_SALT: u64 = 0x02;
 const PICK_SALT: u64 = 0x03;
+const DURATION_SALT: u64 = 0x04;
 const FIELD_SALT: u64 = 0x10;
 const KEY_SALT: u64 = 0x20;
 const TAG_SALT: u64 = 0x30;
@@ -143,6 +146,8 @@ struct FieldSlots {
     metadata: Option<Vec<(String, JsonSlot)>>,
     metrics: Option<Vec<(String, JsonSlot)>>,
     tags: Vec<TagSlot>,
+    // not a lazy slot: nothing references a duration, it evaluates at emission
+    duration: Option<(ModelValue, SrcRange)>,
 }
 
 fn field_slots(fields: &ModelSpanFields) -> FieldSlots {
@@ -164,6 +169,7 @@ fn field_slots(fields: &ModelSpanFields) -> FieldSlots {
         metadata: keyed(&fields.metadata),
         metrics: keyed(&fields.metrics),
         tags: fields.tags.iter().cloned().map(TagSlot::Todo).collect(),
+        duration: fields.duration.clone(),
     }
 }
 
@@ -885,12 +891,20 @@ impl Planner {
             Some((name, kind)) => {
                 let event_ref = EventRef(self.events.len());
                 let fields = ctx.event_fields(instance)?;
+                let duration = match ctx.instances[instance].fields.duration.clone() {
+                    Some((value, range)) => {
+                        let rng = ctx.slot_rng(ctx.instances[instance].path, DURATION_SALT);
+                        Some(ctx.scoped(instance, rng, |ctx| eval_duration(value, range, ctx))?)
+                    }
+                    None => None,
+                };
                 self.events.push(EventPlan {
                     root,
                     parent,
                     name,
                     kind,
                     fields,
+                    duration,
                 });
                 Some(event_ref)
             }
@@ -910,6 +924,21 @@ fn eval_count(count: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<usize
         Scalar::Int(value) => usize::try_from(value).map_err(|_| Error::new(ErrorKind::NegativeRepeatCount, range)),
         Scalar::Float(_) => Err(Error::new(ErrorKind::NonIntegerRepeatCount, range)),
         _ => unreachable!("modeler validated the count as a number"),
+    }
+}
+
+fn eval_duration(duration: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<std::time::Duration, Error> {
+    let seconds = match eval_operand(duration, ctx)? {
+        Scalar::Int(value) => value as f64,
+        Scalar::Float(value) => value,
+        // reference-fed durations settle their types here
+        _ => return Err(Error::new(ErrorKind::DurationOutOfRange, range)),
+    };
+
+    if seconds > 0.0 {
+        std::time::Duration::try_from_secs_f64(seconds).map_err(|_| Error::new(ErrorKind::DurationOutOfRange, range))
+    } else {
+        Err(Error::new(ErrorKind::DurationOutOfRange, range))
     }
 }
 
@@ -1810,6 +1839,7 @@ enum ErrorKind {
     NegativeRepeatCount,
     NonIntegerRepeatCount,
     ChanceOutOfRange,
+    DurationOutOfRange,
     NoiseSizeOutOfRange,
     ClampBoundsOutOfOrder,
     EmptySplitSeparator,
@@ -1832,6 +1862,7 @@ impl fmt::Display for ErrorKind {
             Self::NegativeRepeatCount => "repeat count is negative",
             Self::NonIntegerRepeatCount => "repeat count is not an integer",
             Self::ChanceOutOfRange => "maybe chance is not between 0 and 1",
+            Self::DurationOutOfRange => "duration is not a positive number of seconds",
             Self::NoiseSizeOutOfRange => "noise size is not an integer between 0 and 8388608",
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
             Self::EmptySplitSeparator => "split separator is empty",
@@ -2761,6 +2792,31 @@ mod tests {
         let source = r#"trace "t" { maybe { chance = range(2.0, 2.0) task "turn" {} } }"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "maybe chance is not between 0 and 1");
+    }
+
+    #[test]
+    fn varies_durations_per_trace_and_reproduces_them_by_seed() {
+        let source = r#"trace "t" { task "turn" { duration = range(0.2, 5.0) } }"#;
+        let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
+
+        let durations: std::collections::HashSet<_> = plan_a
+            .events
+            .iter()
+            .filter(|event| event.name == "turn")
+            .map(|event| event.duration.expect("the span sets a duration"))
+            .collect();
+        assert!(durations.len() > 1, "expected varying durations over 20 traces");
+
+        let plan_b = plan(compile(source).unwrap(), 20, 7).unwrap();
+        assert_eq!(plan_a, plan_b);
+    }
+
+    #[test]
+    fn fails_on_invalid_dynamic_durations() {
+        let source = r#"trace "t" { task "turn" { duration = 0.0 - range(1.0, 1.0) } }"#;
+        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        assert_eq!(error.to_string(), "duration is not a positive number of seconds");
+        assert_eq!(&source[error.range.start..error.range.end], "0.0 - range(1.0, 1.0)");
     }
 
     #[test]

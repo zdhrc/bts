@@ -14,6 +14,7 @@ trace "docs-qa" {
     tags = ["rag"]
 
     tool "search_docs" {
+        duration = lognormal(0.4, 0.3)
         input = { query = "rotate API keys", top_k = 8 }
         output = {
             doc_ids = ["doc_112", "doc_089", "doc_331"]
@@ -22,6 +23,7 @@ trace "docs-qa" {
     }
 
     task "rerank" {
+        duration = 0.12
         # downstream stages read the retriever's actual output; kept is a
         # slice of the candidate ids
         input = { candidates = len(tool.search_docs.output.doc_ids) }
@@ -29,6 +31,10 @@ trace "docs-qa" {
     }
 
     llm "Chat Completion" {
+        # one sampled generation time feeds the span duration and keeps
+        # time_to_first_token under it
+        vars { gen_time = lognormal(2.4, 0.4) }
+        duration = var.gen_time
         input = [
             { role = "system", content = var.system },
             {
@@ -47,7 +53,7 @@ trace "docs-qa" {
             prompt_tokens = tokens(self.input)
             completion_tokens = tokens(self.output)
             tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-            time_to_first_token = 0.47
+            time_to_first_token = var.gen_time * range(0.1, 0.25)
         }
     }
 }

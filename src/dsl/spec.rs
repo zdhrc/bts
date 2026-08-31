@@ -211,6 +211,7 @@ pub(crate) mod ids {
     pub(crate) const TAGS: Id = Id::new("field.tags");
     pub(crate) const COUNT: Id = Id::new("field.count");
     pub(crate) const CHANCE: Id = Id::new("field.chance");
+    pub(crate) const DURATION: Id = Id::new("field.duration");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
@@ -313,6 +314,7 @@ pub(crate) mod ids {
     pub(crate) const REPEAT_COUNT: Id = Id::new("rule.repeat-count");
     pub(crate) const REPEAT_REFS: Id = Id::new("rule.repeat-refs");
     pub(crate) const MAYBE_CHANCE: Id = Id::new("rule.maybe-chance");
+    pub(crate) const SPAN_DURATION: Id = Id::new("rule.span-duration");
     pub(crate) const DYNAMIC_CHILDREN: Id = Id::new("rule.dynamic-children");
     pub(crate) const BLOCK_REFS: Id = Id::new("rule.block-references");
     pub(crate) const REF_COLLECTIONS: Id = Id::new("rule.reference-collections");
@@ -385,6 +387,13 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         keyword: "tags",
         summary: "String labels attached to the trace or span.",
         value: &STRING_ARRAY,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::DURATION,
+        keyword: "duration",
+        summary: "Total duration of the trace or span in seconds, evaluated per generated trace; a span with children ends at the later of this duration or its last child's end. Defaults to 0.1.",
+        value: &ANY,
         cardinality: Cardinality::Optional,
     },
 ];
@@ -714,6 +723,10 @@ const REPEAT_RULES: &[RuleDesc] = &[
     },
     REPEAT_REFS_RULE,
 ];
+const SPAN_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::SPAN_DURATION,
+    summary: "`duration` must evaluate to a finite number of seconds greater than zero; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+}];
 const CTX_REF_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE, REPEAT_REFS_RULE];
 const MAYBE_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::MAYBE_CHANCE,
@@ -1217,7 +1230,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: TRACE_CONVENTIONS,
     },
     BlockDesc {
@@ -1231,7 +1244,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: TASK_CONVENTIONS,
     },
     BlockDesc {
@@ -1245,7 +1258,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: LLM_CONVENTIONS,
     },
     BlockDesc {
@@ -1259,7 +1272,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: TOOL_CONVENTIONS,
     },
     BlockDesc {
@@ -1273,7 +1286,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: FUNCTION_CONVENTIONS,
     },
     BlockDesc {

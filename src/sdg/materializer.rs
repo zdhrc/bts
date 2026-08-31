@@ -91,7 +91,9 @@ pub(super) struct SpanAttributes {
 struct Materializer {
     plan: Plan,
     span_ids: Box<[String]>,
-    trace_starts: Box<[usize]>,
+    // per-event offsets from the trace anchor, from the duration layout
+    starts: Box<[Duration]>,
+    ends: Box<[Duration]>,
     anchors: Box<[SystemTime]>,
 }
 
@@ -99,19 +101,29 @@ impl Materializer {
     // anchors spread traces across the past window, leaving room for the longest trace to finish by now
     fn new(plan: Plan, over: Duration, distribution: Distribution, now: SystemTime) -> Result<Self, Error> {
         let span_ids = (0..plan.events.len()).map(|_| Uuid::new_v4().to_string()).collect();
-        let max_slots = plan.traces.iter().map(|trace| trace.len()).max().unwrap_or_default();
-        let max_slots = u32::try_from(max_slots).map_err(|_| Error::new(ErrorKind::TimestampOutOfRange, EventRef(0)))?;
-        let max_trace_duration = EVENT_SLOT
-            .checked_mul(max_slots)
-            .ok_or_else(|| Error::new(ErrorKind::TimestampOutOfRange, EventRef(0)))?;
+        let last_descendants = last_descendants(&plan.events);
+        let mut starts = vec![Duration::ZERO; plan.events.len()];
+        let mut ends = vec![Duration::ZERO; plan.events.len()];
+        for trace in plan.traces.iter() {
+            layout(
+                &plan.events,
+                &last_descendants,
+                trace.start,
+                Duration::ZERO,
+                &mut starts,
+                &mut ends,
+            )?;
+        }
+
+        // the root encloses its whole trace, so its end is the trace's extent
+        let max_extent = plan.traces.iter().map(|trace| ends[trace.start]).max().unwrap_or_default();
         let available = over
-            .checked_sub(max_trace_duration)
+            .checked_sub(max_extent)
             .ok_or_else(|| Error::new(ErrorKind::WindowTooShort, EventRef(0)))?;
         let window_start = now
             .checked_sub(over)
             .ok_or_else(|| Error::new(ErrorKind::TimestampOutOfRange, EventRef(0)))?;
         let last_index = plan.traces.len().saturating_sub(1);
-        let mut trace_starts = Vec::with_capacity(plan.events.len());
         let mut anchors = Vec::with_capacity(plan.events.len());
 
         for (index, trace) in plan.traces.iter().enumerate() {
@@ -124,20 +136,19 @@ impl Materializer {
                 .checked_add(available.mul_f64(distribution.position(ratio)))
                 .ok_or_else(|| Error::new(ErrorKind::TimestampOutOfRange, EventRef(trace.start)))?;
 
-            trace_starts.extend(std::iter::repeat_n(trace.start, trace.len()));
             anchors.extend(std::iter::repeat_n(anchor, trace.len()));
         }
 
         Ok(Self {
             plan,
             span_ids,
-            trace_starts: trace_starts.into_boxed_slice(),
+            starts: starts.into_boxed_slice(),
+            ends: ends.into_boxed_slice(),
             anchors: anchors.into_boxed_slice(),
         })
     }
 
     fn materialize(mut self) -> Result<EventBatch, Error> {
-        let last_descendants = self.last_descendants();
         let event_plans = std::mem::take(&mut self.plan.events);
         let events = event_plans
             .into_vec()
@@ -145,10 +156,9 @@ impl Materializer {
             .enumerate()
             .map(|(index, event)| {
                 let event_ref = EventRef(index);
-                let trace_start = self.trace_starts[index];
                 let anchor = self.anchors[index];
-                let start = self.timestamp(event_ref, anchor, index - trace_start)?;
-                let end = self.timestamp(event_ref, anchor, last_descendants[index] - trace_start + 1)?;
+                let start = self.timestamp(event_ref, anchor, self.starts[index])?;
+                let end = self.timestamp(event_ref, anchor, self.ends[index])?;
                 let EventFields {
                     input,
                     output,
@@ -194,30 +204,13 @@ impl Materializer {
         })
     }
 
-    fn last_descendants(&self) -> Box<[usize]> {
-        let mut last_descendants = (0..self.plan.events.len()).collect::<Vec<_>>();
-
-        for index in (0..self.plan.events.len()).rev() {
-            if let Some(parent) = self.plan.events[index].parent {
-                last_descendants[parent.0] = last_descendants[parent.0].max(last_descendants[index]);
-            }
-        }
-
-        last_descendants.into_boxed_slice()
-    }
-
     fn resolve(&self, event_ref: EventRef) -> &str {
         self.span_ids
             .get(event_ref.0)
             .expect("planner guarantees that event references are in bounds")
     }
 
-    fn timestamp(&self, event: EventRef, anchor: SystemTime, slot: usize) -> Result<SystemTime, Error> {
-        let slot = u32::try_from(slot).map_err(|_| Error::new(ErrorKind::TimestampOutOfRange, event))?;
-        let offset = EVENT_SLOT
-            .checked_mul(slot)
-            .ok_or_else(|| Error::new(ErrorKind::TimestampOutOfRange, event))?;
-
+    fn timestamp(&self, event: EventRef, anchor: SystemTime, offset: Duration) -> Result<SystemTime, Error> {
         anchor
             .checked_add(offset)
             .ok_or_else(|| Error::new(ErrorKind::TimestampOutOfRange, event))
@@ -242,6 +235,48 @@ impl Materializer {
         metrics.insert(key.to_owned(), JsonValue::from(seconds));
         Ok(())
     }
+}
+
+fn last_descendants(events: &[crate::sdg::planner::EventPlan]) -> Box<[usize]> {
+    let mut last_descendants = (0..events.len()).collect::<Vec<_>>();
+
+    for index in (0..events.len()).rev() {
+        if let Some(parent) = events[index].parent {
+            last_descendants[parent.0] = last_descendants[parent.0].max(last_descendants[index]);
+        }
+    }
+
+    last_descendants.into_boxed_slice()
+}
+
+// lays a subtree out from its offset within the trace: children run
+// sequentially after a fixed lead, and a span ends at the later of its own
+// duration or its last child's end; events are pre-order, so the direct
+// children of `index` chain through their last descendants
+fn layout(
+    events: &[crate::sdg::planner::EventPlan],
+    last_descendants: &[usize],
+    index: usize,
+    offset: Duration,
+    starts: &mut [Duration],
+    ends: &mut [Duration],
+) -> Result<(), Error> {
+    let overflow = || Error::new(ErrorKind::TimestampOutOfRange, EventRef(index));
+
+    starts[index] = offset;
+    let mut cursor = offset.checked_add(EVENT_SLOT).ok_or_else(overflow)?;
+    let mut tail = offset;
+    let mut child = index + 1;
+    while child <= last_descendants[index] {
+        layout(events, last_descendants, child, cursor, starts, ends)?;
+        cursor = ends[child];
+        tail = ends[child];
+        child = last_descendants[child] + 1;
+    }
+
+    let own = events[index].duration.unwrap_or(EVENT_SLOT);
+    ends[index] = tail.max(offset.checked_add(own).ok_or_else(overflow)?);
+    Ok(())
 }
 
 fn format_timestamp(timestamp: SystemTime) -> String {
@@ -420,6 +455,7 @@ mod tests {
                     metrics: Some(metrics),
                     tags: Box::new([]),
                 },
+                duration: None,
             }]),
             traces: Box::new([0..1]),
         };
@@ -427,6 +463,56 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::ReservedMetric("start"));
         assert_eq!(error.event(), EventRef(0));
+    }
+
+    #[test]
+    fn lays_spans_out_by_their_durations() {
+        let source = r#"
+            trace "t" {
+                duration = 60
+                task "a" { duration = 2 }
+                task "b" {
+                    llm "c" { duration = 1.5 }
+                }
+            }
+        "#;
+        let now = UNIX_EPOCH + Duration::from_secs(7_200);
+        let events = materialize(
+            plan(compile(source).unwrap(), 1, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            now,
+        )
+        .unwrap();
+
+        let time = |index: usize, key: &str| events.events[index].metrics[key].as_f64().unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+
+        // leaves span exactly their durations
+        assert!(close(time(1, "end") - time(1, "start"), 2.0));
+        assert!(close(time(3, "end") - time(3, "start"), 1.5));
+        // a sibling starts where the previous one ends
+        assert!(close(time(2, "start"), time(1, "end")));
+        // a parent outlived by its children ends with its last child
+        assert!(close(time(2, "end"), time(3, "end")));
+        // an explicit total longer than the children stretches the span
+        assert!(close(time(0, "end") - time(0, "start"), 60.0));
+        // the single trace anchors so its computed extent ends at now
+        assert_eq!(time(0, "end"), 7_200.0);
+    }
+
+    #[test]
+    fn rejects_windows_shorter_than_the_longest_trace() {
+        let source = r#"trace "t" { duration = 7200 }"#;
+        let error = materialize(
+            plan(compile(source).unwrap(), 1, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            SystemTime::now(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::WindowTooShort);
     }
 
     #[test]

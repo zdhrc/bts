@@ -10,6 +10,8 @@ use std::{
 
 #[derive(Debug, clap::Args)]
 #[command(about = "generate synthetic traces from a bts shape and write them to Braintrust")]
+#[command(group = clap::ArgGroup::new("window").required(true).args(["over", "start"]))]
+#[command(group = clap::ArgGroup::new("volume").required(true).args(["count", "rate"]))]
 pub struct Args {
     /// bts shape file to generate from
     #[arg(long, value_name = "PATH")]
@@ -17,11 +19,27 @@ pub struct Args {
 
     /// exact number of top-level traces to generate
     #[arg(long, value_name = "TRACES")]
-    count: NonZeroUsize,
+    count: Option<NonZeroUsize>,
 
-    /// historical window over which to spread traces, such as 1h or 30m
+    /// trace volume as a rate over the window, such as 20/h or 0.5/m
+    #[arg(long, value_name = "RATE", value_parser = parse_rate)]
+    rate: Option<f64>,
+
+    /// historical window over which to spread traces, such as 1h or 30m; ends at now
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
-    over: Duration,
+    over: Option<Duration>,
+
+    /// how far back from now the window ends, such as 1d; combines with --over
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration, requires = "over")]
+    offset: Option<Duration>,
+
+    /// absolute window start, RFC 3339 with an offset, such as 2026-08-27T14:00:00Z
+    #[arg(long, value_name = "TIMESTAMP", value_parser = parse_timestamp, requires = "end")]
+    start: Option<SystemTime>,
+
+    /// absolute window end, RFC 3339 with an offset; pairs with --start
+    #[arg(long, value_name = "TIMESTAMP", value_parser = parse_timestamp, requires = "start")]
+    end: Option<SystemTime>,
 
     /// how trace volume is distributed over the window
     #[arg(long, value_name = "SHAPE", value_enum, default_value_t)]
@@ -65,8 +83,46 @@ impl Args {
         result
     }
 
+    // the flag groups reduce to the (count, over, until) triple generation consumes
+    fn resolve_run(&self) -> Result<(usize, Duration, SystemTime), Error> {
+        let (over, until) = match (self.over, self.start, self.end) {
+            (Some(over), None, None) => {
+                let now = SystemTime::now();
+                let until = match self.offset {
+                    Some(offset) => now.checked_sub(offset).ok_or(Error::OffsetOutOfRange)?,
+                    None => now,
+                };
+                (over, until)
+            }
+            (None, Some(start), Some(end)) => {
+                let over = end
+                    .duration_since(start)
+                    .ok()
+                    .filter(|over| !over.is_zero())
+                    .ok_or(Error::EmptyWindow)?;
+                (over, end)
+            }
+            _ => unreachable!("clap enforces exactly one window form"),
+        };
+
+        let count = match (self.count, self.rate) {
+            (Some(count), None) => count.get(),
+            (None, Some(rate)) => {
+                let count = (rate * over.as_secs_f64()).round() as usize;
+                if count == 0 {
+                    return Err(Error::NoTracesAtRate);
+                }
+                count
+            }
+            _ => unreachable!("clap enforces exactly one volume form"),
+        };
+
+        Ok((count, over, until))
+    }
+
     fn execute(self, settings: &Settings, log_path: Option<&Path>) -> Result<(), Error> {
         let started = Instant::now();
+        let (count, over, until) = self.resolve_run()?;
         let source = fs::read_to_string(&self.from).map_err(|source| Error::ReadShape {
             path: self.from.clone(),
             source,
@@ -87,7 +143,7 @@ impl Args {
         };
         tracing::info!(seed, "seed resolved");
         let events = tracing::info_span!("generate")
-            .in_scope(|| sdg::generate(model, self.count.get(), self.over, self.dist, SystemTime::now(), seed))
+            .in_scope(|| sdg::generate(model, count, over, self.dist, until, seed))
             .map_err(|error| match error {
                 // expression evaluation failures render like compile diagnostics with line:col
                 sdg::Error::Plan(plan_error) => Error::FailedGeneration {
@@ -147,6 +203,38 @@ impl Args {
     }
 }
 
+// rfc3339 with an explicit offset or Z, so a timestamp means the same instant everywhere
+fn parse_timestamp(value: &str) -> Result<SystemTime, String> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(SystemTime::from)
+        .map_err(|_| "timestamp must be RFC 3339 with an offset, like 2026-08-27T14:00:00Z".to_owned())
+}
+
+// traces per second from a <number>/<unit> literal like 20/h or 0.5/m
+fn parse_rate(value: &str) -> Result<f64, String> {
+    let (number, seconds) = if let Some(number) = value.strip_suffix("/ms") {
+        (number, 0.001)
+    } else if let Some(number) = value.strip_suffix("/s") {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix("/m") {
+        (number, 60.0)
+    } else if let Some(number) = value.strip_suffix("/h") {
+        (number, 3_600.0)
+    } else if let Some(number) = value.strip_suffix("/d") {
+        (number, 86_400.0)
+    } else {
+        return Err("rate must end in /ms, /s, /m, /h, or /d".to_owned());
+    };
+    let number = number
+        .parse::<f64>()
+        .map_err(|_| "rate must start with a number".to_owned())?;
+    if !number.is_finite() || number <= 0.0 {
+        return Err("rate must be greater than zero".to_owned());
+    }
+
+    Ok(number / seconds)
+}
+
 // machine-readable success summary for --json; errors stay human-readable on stderr
 #[derive(serde::Serialize)]
 struct Summary {
@@ -161,6 +249,9 @@ struct Summary {
 
 #[derive(Debug)]
 pub enum Error {
+    EmptyWindow,
+    OffsetOutOfRange,
+    NoTracesAtRate,
     ReadShape { path: PathBuf, source: std::io::Error },
     InvalidShape { details: String },
     FailedGeneration { details: String },
@@ -173,6 +264,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyWindow => formatter.write_str("window end must be after its start"),
+            Self::OffsetOutOfRange => formatter.write_str("offset reaches further back than timestamps can represent"),
+            Self::NoTracesAtRate => formatter.write_str("rate over this window rounds to zero traces"),
             Self::ReadShape { path, source } => {
                 write!(formatter, "could not read shape {}: {source}", path.display())
             }
@@ -230,12 +324,174 @@ mod tests {
         let args = parse_write(&["bts", "write", "--from", "simple.bt", "--count", "25", "--over", "1h"]).unwrap();
 
         assert_eq!(args.from, PathBuf::from("simple.bt"));
-        assert_eq!(args.count.get(), 25);
-        assert_eq!(args.over, Duration::from_secs(3_600));
+        assert_eq!(args.count.unwrap().get(), 25);
+        assert_eq!(args.over, Some(Duration::from_secs(3_600)));
         assert_eq!(args.dist, sdg::Distribution::Linear);
         assert_eq!(args.seed, None);
         assert!(!args.dry_run);
         assert!(!args.json);
+    }
+
+    #[test]
+    fn parses_the_absolute_window_and_rate_forms() {
+        let args = parse_write(&[
+            "bts",
+            "write",
+            "--from",
+            "simple.bt",
+            "--rate",
+            "30/m",
+            "--start",
+            "2026-08-27T12:00:00Z",
+            "--end",
+            "2026-08-27T14:00:00Z",
+        ])
+        .unwrap();
+
+        assert_eq!(args.rate, Some(0.5));
+        assert_eq!(
+            args.end.unwrap().duration_since(args.start.unwrap()).unwrap(),
+            Duration::from_secs(7_200)
+        );
+
+        let (count, over, until) = args.resolve_run().unwrap();
+        assert_eq!(count, 3_600);
+        assert_eq!(over, Duration::from_secs(7_200));
+        assert_eq!(until, args.end.unwrap());
+    }
+
+    #[test]
+    fn offsets_shift_the_window_back_from_now() {
+        let args = parse_write(&[
+            "bts",
+            "write",
+            "--from",
+            "simple.bt",
+            "--count",
+            "1",
+            "--over",
+            "1h",
+            "--offset",
+            "1d",
+        ])
+        .unwrap();
+
+        let (_, _, until) = args.resolve_run().unwrap();
+        let lag = SystemTime::now().duration_since(until).unwrap();
+        assert!(lag >= Duration::from_secs(86_400));
+        assert!(lag < Duration::from_secs(86_400 + 60));
+    }
+
+    #[test]
+    fn requires_exactly_one_window_and_volume_form() {
+        // a member of each group is required
+        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "1"]).is_err());
+        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--over", "1h"]).is_err());
+
+        // the forms are mutually exclusive
+        assert!(
+            parse_write(&[
+                "bts",
+                "write",
+                "--from",
+                "simple.bt",
+                "--count",
+                "1",
+                "--rate",
+                "1/h",
+                "--over",
+                "1h"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_write(&[
+                "bts",
+                "write",
+                "--from",
+                "simple.bt",
+                "--count",
+                "1",
+                "--over",
+                "1h",
+                "--start",
+                "2026-08-27T12:00:00Z",
+                "--end",
+                "2026-08-27T14:00:00Z",
+            ])
+            .is_err()
+        );
+
+        // half of a pairing is not enough
+        assert!(
+            parse_write(&[
+                "bts",
+                "write",
+                "--from",
+                "simple.bt",
+                "--count",
+                "1",
+                "--end",
+                "2026-08-27T14:00:00Z"
+            ])
+            .is_err()
+        );
+        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "1", "--offset", "1d"]).is_err());
+    }
+
+    #[test]
+    fn rejects_degenerate_resolved_runs() {
+        let args = parse_write(&[
+            "bts",
+            "write",
+            "--from",
+            "simple.bt",
+            "--count",
+            "1",
+            "--start",
+            "2026-08-27T14:00:00Z",
+            "--end",
+            "2026-08-27T14:00:00Z",
+        ])
+        .unwrap();
+        assert!(matches!(args.resolve_run(), Err(Error::EmptyWindow)));
+
+        let args = parse_write(&[
+            "bts",
+            "write",
+            "--from",
+            "simple.bt",
+            "--rate",
+            "1/d",
+            "--start",
+            "2026-08-27T13:59:59Z",
+            "--end",
+            "2026-08-27T14:00:00Z",
+        ])
+        .unwrap();
+        assert!(matches!(args.resolve_run(), Err(Error::NoTracesAtRate)));
+    }
+
+    #[test]
+    fn parses_timestamps() {
+        let expected = parse_timestamp("2026-08-25T14:00:00Z").unwrap();
+        assert_eq!(parse_timestamp("2026-08-25T09:00:00-05:00").unwrap(), expected);
+        assert!(parse_timestamp("2026-08-25T14:00:00").is_err());
+        assert!(parse_timestamp("2026-08-25").is_err());
+        assert!(parse_timestamp("yesterday").is_err());
+    }
+
+    #[test]
+    fn parses_rates() {
+        assert_eq!(parse_rate("2/s").unwrap(), 2.0);
+        assert_eq!(parse_rate("30/m").unwrap(), 0.5);
+        assert_eq!(parse_rate("7200/h").unwrap(), 2.0);
+        assert_eq!(parse_rate("0.5/s").unwrap(), 0.5);
+        assert!(parse_rate("2").is_err());
+        assert!(parse_rate("2/w").is_err());
+        assert!(parse_rate("0/h").is_err());
+        assert!(parse_rate("-1/h").is_err());
+        assert!(parse_rate("fast/h").is_err());
     }
 
     #[test]

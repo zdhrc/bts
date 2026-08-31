@@ -57,7 +57,7 @@ bts check logs                                            # list recent runs wit
 bts update                                                # update bts to the latest release
 ```
 
-Trace volume is spread linearly by default; pass `--dist sine` for a wavier load pattern. Generation is seeded — every run prints its seed, and passing `--seed <n>` reproduces a run exactly. Pass `--json` to get the final summary (seed, counts, duration, run log path) as a single JSON line on stdout, for scripts and agents.
+The generation window ends at now by default; `--offset 1d` slides it back, and `--start`/`--end` (RFC 3339 timestamps) pin it absolutely in place of `--over`. Volume is either an exact `--count` or a `--rate` over the window, like `20/h`. Trace volume is spread linearly by default; pass `--dist sine` for a wavier load pattern. Generation is seeded — every run prints its seed, and passing `--seed <n>` reproduces a run exactly. Pass `--json` to get the final summary (seed, counts, duration, run log path) as a single JSON line on stdout, for scripts and agents.
 
 Every `write` run also writes a JSON-lines log to `.bt/bts/logs/` (next to the nearest `.bt` project directory, or the current directory) with phase timings, the seed, per-batch insert results, retry warnings, and any failure. The last 20 runs are kept, the directory gitignores itself, and a failed run prints the path to its log. Pass `--profile` to also stream phase timings to stderr. Transient write failures (timeouts, 429s, 5xx) are retried with exponential backoff before the run gives up.
 
@@ -129,7 +129,7 @@ trace "support-sessions" {
 
 The building blocks:
 
-- **Span blocks** — `trace`, `task`, `llm`, `tool`, and `function` nest to form the span tree, with fields like `input`, `output`, `metadata`, `metrics`, and `tags`.
+- **Span blocks** — `trace`, `task`, `llm`, `tool`, and `function` nest to form the span tree, with fields like `input`, `output`, `metadata`, `metrics`, and `tags`. A `duration` field (seconds, any numeric expression) controls each span's place on the timeline; parents stretch to cover their children.
 - **Dynamic blocks** — `repeat`, `choice`, and `maybe` vary the shape of each generated trace: repeated sections, one-of alternatives, and probabilistic inclusion.
 - **Expressions** — full expression language with arithmetic, comparisons, conditionals, string interpolation (`"${...}"`), arrays, objects, spreads, slices, and shared values via `vars`. A `vars` block can sit at the root or inside any block; each value is drawn once per instantiation of that block, so a sampled value stays consistent everywhere it's referenced.
 - **References** — spans read each other's fields, so generated data stays coherent: block references like `task.turn_0.output` or `llm["Chat Completion"].metrics.tokens` thread one span's values into another, `self` reads the enclosing span's own fields, and `choice.<name>.chosen` / `maybe.<name>.included` expose what a dynamic block did. Slices project over repeat iterations — `...repeat.rounds[:repeat.index].llm.chat.output` replays an agent loop's history.
