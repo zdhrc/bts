@@ -167,6 +167,9 @@ pub(crate) struct SpanFields {
     pub(crate) metadata: Option<Object>,
     pub(crate) metrics: Option<Object>,
     pub(crate) tags: Vec<Template>,
+    // total seconds, a generation directive rather than a payload field; the
+    // range points diagnostics at the expression when a dynamic value fails
+    pub(crate) duration: Option<(Value, SrcRange)>,
 }
 
 // a validated context reference, usable as a value or a template part
@@ -362,7 +365,13 @@ pub(crate) enum Func {
     Alphanum {
         length: usize,
     },
+    Noise {
+        size: Box<Value>,
+    },
 }
+
+// backstop so a typo'd noise size can't balloon a run
+pub(crate) const NOISE_SIZE_CAP: i64 = 8 << 20;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WeightedOption {

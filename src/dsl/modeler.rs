@@ -1,9 +1,9 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NodeId, Number, Object,
-    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, Span, SpanFields, SpanKind, Step, Template, Trace,
-    UnaryOp, Value, WeightedOption,
+    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId,
+    Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, Span, SpanFields, SpanKind, Step,
+    Template, Trace, UnaryOp, Value, WeightedOption,
 };
 use crate::dsl::spec;
 use std::{
@@ -1779,6 +1779,7 @@ impl Modeler {
                 Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
                     self.value_reaches_block_ref(value)
                 }
+                Func::Noise { size } => self.value_reaches_block_ref(size),
             },
         }
     }
@@ -2377,6 +2378,44 @@ impl Modeler {
             }
         }
 
+        // duration is a generation directive, not a payload field: any numeric
+        // expression, dynamic values allowed, settled at generation when the
+        // static type is unknown (eg a block reference)
+        if field.id == spec::ids::DURATION {
+            if matches!(self.static_type(&value), Some(found) if found != StaticType::Number) {
+                self.errors.push(Error::new(
+                    ErrorKind::TypeMismatch {
+                        block: block.id,
+                        field: field.id,
+                        expected: &spec::ExprType::Number,
+                        found: self.found_type(&value),
+                    },
+                    value.range,
+                ));
+                return;
+            }
+            let range = value.range;
+            let value = value.into_value();
+            // constant durations validate now, dynamic ones fail the run during generation
+            if let Value::Num(number) = &value {
+                let seconds = match number {
+                    Number::Int(value) => *value as f64,
+                    Number::Float(value) => *value,
+                };
+                if !(seconds.is_finite() && seconds > 0.0) {
+                    self.errors.push(Error::new(
+                        ErrorKind::DurationOutOfRange {
+                            rule: spec::ids::SPAN_DURATION,
+                        },
+                        range,
+                    ));
+                    return;
+                }
+            }
+            fields.duration = Some((value, range));
+            return;
+        }
+
         if !self.validate_value(&value, block.id, field.id, field.value) {
             return;
         }
@@ -2796,6 +2835,27 @@ impl Modeler {
                     Func::Alphanum { length }
                 })
             }
+            "noise" => {
+                let [size] = self.func_args(func, args, "exactly one argument (size)", range)?;
+                // a constant size settles its bounds during validation
+                if let FoldedKind::Value(Value::Num(number)) = &size.kind {
+                    let valid = matches!(number, Number::Int(value) if (0..=NOISE_SIZE_CAP).contains(value));
+                    if !valid {
+                        self.errors.push(Error::new(
+                            ErrorKind::ParamOutOfRange {
+                                rule: spec::ids::NOISE_SIZE,
+                                func,
+                                param: "size",
+                                expected: "an integer between 0 and 8388608",
+                            },
+                            size.range,
+                        ));
+                        return None;
+                    }
+                }
+                let size = self.model_typed_arg(size, func, StaticType::Number)?;
+                Some(Func::Noise { size: Box::new(size) })
+            }
 
             _ => unreachable!("function {name} does not have a model lowering"),
         }
@@ -3206,7 +3266,8 @@ impl Modeler {
             | Func::Format { .. }
             | Func::Uuid
             | Func::Hex { .. }
-            | Func::Alphanum { .. } => Some(StaticType::String),
+            | Func::Alphanum { .. }
+            | Func::Noise { .. } => Some(StaticType::String),
             Func::Split { .. } => Some(StaticType::Array),
         }
     }
@@ -3850,6 +3911,9 @@ fn collect_field_refs(fields: &SpanFields, found: &mut Vec<RefId>) {
     for tag in &fields.tags {
         collect_template_refs(tag, found);
     }
+    if let Some((duration, _)) = &fields.duration {
+        collect_refs(duration, found);
+    }
 }
 
 fn collect_template_refs(template: &Template, found: &mut Vec<RefId>) {
@@ -3965,6 +4029,7 @@ fn collect_func_refs(func: &Func, found: &mut Vec<RefId>) {
         Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
             collect_refs(value, found)
         }
+        Func::Noise { size } => collect_refs(size, found),
     }
 }
 
@@ -4283,6 +4348,7 @@ struct FieldsBuilder {
     metadata: Option<Object>,
     metrics: Option<Object>,
     tags: Option<Vec<Template>>,
+    duration: Option<(Value, SrcRange)>,
     seen: HashSet<spec::Id>,
 }
 
@@ -4296,6 +4362,7 @@ impl FieldsBuilder {
             metadata: self.metadata,
             metrics: self.metrics,
             tags: self.tags.unwrap_or_default(),
+            duration: self.duration,
         }
     }
 }
@@ -4563,6 +4630,9 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
     },
     ChanceOutOfRange {
+        rule: spec::Id,
+    },
+    DurationOutOfRange {
         rule: spec::Id,
     },
     RepeatRefOutsideRepeat {
@@ -4957,6 +5027,10 @@ impl fmt::Display for ErrorKind {
             Self::ChanceOutOfRange { rule } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "maybe chance is not between 0 and 1; {}", rule.summary)
+            }
+            Self::DurationOutOfRange { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "duration is not a positive number of seconds; {}", rule.summary)
             }
             Self::RepeatRefOutsideRepeat { rule, path } => {
                 let rule = rule_desc(*rule);
@@ -6181,6 +6255,46 @@ mod tests {
             let errors = model(source).unwrap_err();
             assert!(matches!(errors[0].kind(), ErrorKind::ParamOutOfRange { param: "length", .. }));
         }
+    }
+
+    #[test]
+    fn models_noise_and_rejects_invalid_sizes() {
+        let model_ok = model(r#"trace "t" { input = [noise(64), noise(round(lognormal(100, 0.5)))] }"#).unwrap();
+        let Some(Value::Array(array)) = &model_ok.traces[0].fields.input else {
+            panic!("expected an array");
+        };
+        for elem in &array.elem {
+            assert!(matches!(
+                elem,
+                ArrayElem::Item(Value::Func {
+                    func: Func::Noise { .. },
+                    ..
+                })
+            ));
+        }
+
+        // constant sizes settle their bounds during validation
+        for source in [
+            r#"trace "t" { input = noise(0 - 1) }"#,
+            r#"trace "t" { input = noise(1.5) }"#,
+            r#"trace "t" { input = noise(8388609) }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert!(matches!(
+                errors[0].kind(),
+                ErrorKind::ParamOutOfRange {
+                    func: "noise",
+                    param: "size",
+                    ..
+                }
+            ));
+        }
+
+        let errors = model(r#"trace "t" { input = noise("x") }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "noise", .. }));
+
+        let errors = model(r#"trace "t" { input = noise() }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "noise", .. }));
     }
 
     #[test]
@@ -7604,6 +7718,66 @@ mod tests {
             panic!("expected a repeat child");
         };
         assert!(matches!(repeat.count, Value::Num(Number::Int(0))));
+    }
+
+    #[test]
+    fn models_span_durations() {
+        let model = model(
+            r#"
+            trace "t" {
+                vars { latency = 0.25 }
+                duration = 60
+                task "a" { duration = lognormal(0.8, 0.5) }
+                llm "b" { duration = var.latency }
+                tool "c" { duration = 1.5 }
+                function "d" { duration = 2 }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let trace = &model.traces[0];
+        assert!(matches!(trace.fields.duration, Some((Value::Num(Number::Int(60)), _))));
+        let Child::Span(task) = &trace.children[0] else {
+            panic!("expected a span child");
+        };
+        assert!(matches!(task.fields.duration, Some((Value::Func { .. }, _))));
+        let Child::Span(llm) = &trace.children[1] else {
+            panic!("expected a span child");
+        };
+        // constant vars substitute during modeling
+        assert!(matches!(llm.fields.duration, Some((Value::Num(Number::Float(seconds)), _)) if seconds == 0.25));
+    }
+
+    #[test]
+    fn rejects_invalid_durations() {
+        let source = r#"trace "t" { duration = "fast" }"#;
+        let errors = model(source).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::TypeMismatch {
+                block: spec::ids::TRACE,
+                field: spec::ids::DURATION,
+                expected: &spec::ExprType::Number,
+                found: ExprType::String,
+            }
+        );
+        let range = errors[0].range();
+        assert_eq!(&source[range.start..range.end], "\"fast\"");
+
+        for source in [
+            r#"trace "t" { duration = 0 }"#,
+            r#"trace "t" { duration = 0.0 }"#,
+            r#"trace "t" { task "a" { duration = 0 - 2 } }"#,
+        ] {
+            let errors = model(source).unwrap_err();
+            assert_eq!(
+                errors[0].kind(),
+                &ErrorKind::DurationOutOfRange {
+                    rule: spec::ids::SPAN_DURATION,
+                }
+            );
+        }
     }
 
     #[test]

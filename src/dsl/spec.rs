@@ -211,6 +211,7 @@ pub(crate) mod ids {
     pub(crate) const TAGS: Id = Id::new("field.tags");
     pub(crate) const COUNT: Id = Id::new("field.count");
     pub(crate) const CHANCE: Id = Id::new("field.chance");
+    pub(crate) const DURATION: Id = Id::new("field.duration");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
@@ -269,6 +270,7 @@ pub(crate) mod ids {
     pub(crate) const FUNC_UUID: Id = Id::new("func.uuid");
     pub(crate) const FUNC_HEX: Id = Id::new("func.hex");
     pub(crate) const FUNC_ALPHANUM: Id = Id::new("func.alphanum");
+    pub(crate) const FUNC_NOISE: Id = Id::new("func.noise");
 
     pub(crate) const MULTILINE_DELIMITERS: Id = Id::new("rule.multiline-delimiters");
     pub(crate) const MULTILINE_INDENT: Id = Id::new("rule.multiline-indentation");
@@ -298,6 +300,7 @@ pub(crate) mod ids {
     pub(crate) const CLAMP_BOUNDS: Id = Id::new("rule.clamp-bounds");
     pub(crate) const INTEGER_RESULTS: Id = Id::new("rule.integer-results");
     pub(crate) const RANDOM_LENGTH: Id = Id::new("rule.random-string-length");
+    pub(crate) const NOISE_SIZE: Id = Id::new("rule.noise-size");
     pub(crate) const OPERAND_TYPES: Id = Id::new("rule.operand-types");
     pub(crate) const INDEXABLE_TARGETS: Id = Id::new("rule.indexable-targets");
     pub(crate) const INDEX_BOUNDS: Id = Id::new("rule.index-bounds");
@@ -311,6 +314,7 @@ pub(crate) mod ids {
     pub(crate) const REPEAT_COUNT: Id = Id::new("rule.repeat-count");
     pub(crate) const REPEAT_REFS: Id = Id::new("rule.repeat-refs");
     pub(crate) const MAYBE_CHANCE: Id = Id::new("rule.maybe-chance");
+    pub(crate) const SPAN_DURATION: Id = Id::new("rule.span-duration");
     pub(crate) const DYNAMIC_CHILDREN: Id = Id::new("rule.dynamic-children");
     pub(crate) const BLOCK_REFS: Id = Id::new("rule.block-references");
     pub(crate) const REF_COLLECTIONS: Id = Id::new("rule.reference-collections");
@@ -383,6 +387,13 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         keyword: "tags",
         summary: "String labels attached to the trace or span.",
         value: &STRING_ARRAY,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::DURATION,
+        keyword: "duration",
+        summary: "Total duration of the trace or span in seconds, evaluated per generated trace; a span with children ends at the later of this duration or its last child's end. Defaults to 0.1.",
+        value: &ANY,
         cardinality: Cardinality::Optional,
     },
 ];
@@ -639,6 +650,14 @@ const RANDOM_STRING_RULES: &[RuleDesc] = &[
     },
 ];
 const UUID_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE];
+const NOISE_RULES: &[RuleDesc] = &[
+    FUNC_ARITY_RULE,
+    FUNC_ARG_TYPES_RULE,
+    RuleDesc {
+        id: ids::NOISE_SIZE,
+        summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+    },
+];
 const INDEX_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::INDEXABLE_TARGETS,
@@ -704,6 +723,10 @@ const REPEAT_RULES: &[RuleDesc] = &[
     },
     REPEAT_REFS_RULE,
 ];
+const SPAN_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::SPAN_DURATION,
+    summary: "`duration` must evaluate to a finite number of seconds greater than zero; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+}];
 const CTX_REF_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE, REPEAT_REFS_RULE];
 const MAYBE_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::MAYBE_CHANCE,
@@ -1174,6 +1197,14 @@ const FUNCS: &[FuncDesc] = &[
         examples: &["alphanum(12)"],
         rules: RANDOM_STRING_RULES,
     },
+    FuncDesc {
+        id: ids::FUNC_NOISE,
+        name: "noise",
+        syntax: "noise(size)",
+        summary: "An opaque random base64-style string of the given size in bytes, for padding a trace with payload weight where storage size matters; the size may be dynamic, so payloads can vary per trace.",
+        examples: &["noise(250000)", "noise(round(lognormal(80000, 0.9)))"],
+        rules: NOISE_RULES,
+    },
 ];
 
 const BLOCKS: &[BlockDesc] = &[
@@ -1199,7 +1230,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: TRACE_CONVENTIONS,
     },
     BlockDesc {
@@ -1213,7 +1244,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: TASK_CONVENTIONS,
     },
     BlockDesc {
@@ -1227,7 +1258,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: LLM_CONVENTIONS,
     },
     BlockDesc {
@@ -1241,7 +1272,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: TOOL_CONVENTIONS,
     },
     BlockDesc {
@@ -1255,7 +1286,7 @@ const BLOCKS: &[BlockDesc] = &[
             fields: SPAN_FIELDS,
             open: false,
         },
-        rules: NO_RULES,
+        rules: SPAN_RULES,
         conventions: FUNCTION_CONVENTIONS,
     },
     BlockDesc {

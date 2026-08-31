@@ -18,7 +18,9 @@ const REALISM_POINTS: &[&str] = &[
     "LLM metrics: token counts are long-tailed and never round; real prompts don't cost exactly 500 tokens. Sample `prompt_tokens` and `completion_tokens`, then keep the sum exact with `tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens` — or compute exact counts from the content itself with `tokens(self.input)`. Vary `time_to_first_token`, keeping it under the span duration.",
     "Metadata: model and provider stay consistent within a trace; vary them across traces by putting alternatives in `choice` branches, not by sampling each span independently.",
     "Errors: a few percent of real traces fail. Gate an `error` field, an empty output, or an escalation span behind `maybe` with a single-digit `chance`.",
-    "Tags: tag values are constant for a whole run, so pick labels true of every generated trace; to mix tagged populations, generate separately from separate shapes.",
+    "Latency: every span defaults to a 100ms slot; real ones don't. Set `duration` (seconds) with long-tailed samples — `duration = lognormal(2.0, 0.6)` on llm spans — and share the sample through a var when `time_to_first_token` must stay under it. A parent stretches to cover its children, so set durations on leaves and pin a parent's only when the span should outlast them.",
+    "Tags: to mix tagged populations, interpolate a per-trace var into the tag (`vars { env = weighted(...) }`, `tags = [\"${var.env}\"]`) instead of duplicating the shape.",
+    "Populations: one shape file with one trace block covers a whole population — `choice`, `maybe`, and `repeat` capture every case as alternative subtrees, so never fan out into near-duplicate shape files or scripted batches of write commands. Aim for a single `bts write` per run; a second run (same shape, different `--offset`, `--dist`, or seed) is only for populations needing disjoint time windows or volumes.",
 ];
 const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
 Steal the structure, replace the content, and expand along the axis each one names.";
@@ -231,7 +233,12 @@ fn render_skill(spec: &Spec) -> String {
     .unwrap();
     writeln!(
         output,
-        "6. When the user requests a live write, set `BRAINTRUST_API_KEY` and `BRAINTRUST_PROJECT_ID`, then rerun without `--dry-run`.\n"
+        "6. Shape the run's timeline with flags on that same command: `--offset <duration>` slides the `--over` window back from now, `--start <ts> --end <ts>` (RFC 3339) pin it absolutely, `--rate <n/unit>` (e.g. `20/h`) sizes the volume from the window instead of `--count`, and `--dist` shapes how traces spread across it."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "7. When the user requests a live write, set `BRAINTRUST_API_KEY` and `BRAINTRUST_PROJECT_ID`, then rerun without `--dry-run`.\n"
     )
     .unwrap();
     writeln!(

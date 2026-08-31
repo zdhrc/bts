@@ -155,6 +155,75 @@ fn dry_run_resolves_context_references_in_expressions() {
 }
 
 #[test]
+fn dry_run_fills_an_absolute_window_at_the_requested_rate() {
+    let shape = write_shape(SIMPLE_SHAPE);
+    let output = bts()
+        .args(["write", "--from"])
+        .arg(&shape)
+        .args([
+            "--rate",
+            "30/m",
+            "--start",
+            "2026-08-25T12:00:00Z",
+            "--end",
+            "2026-08-25T13:00:00Z",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    let roots = events
+        .iter()
+        .filter(|event| event["span_parents"].as_array().unwrap().is_empty())
+        .count();
+
+    // 0.5 traces per second over an hour
+    assert_eq!(roots, 1_800);
+
+    // every timestamp lands inside the requested window
+    let window_start = parse_rfc3339_secs("2026-08-25T12:00:00Z");
+    let window_end = parse_rfc3339_secs("2026-08-25T13:00:00Z");
+    for event in events {
+        let start = event["metrics"]["start"].as_f64().unwrap();
+        let end = event["metrics"]["end"].as_f64().unwrap();
+        assert!(start >= window_start && end <= window_end, "event escapes the window");
+    }
+}
+
+#[test]
+fn dry_run_honors_span_durations() {
+    let shape = write_shape(
+        r#"
+        trace "session" {
+            llm "chat" { duration = 2.5 }
+        }
+        "#,
+    );
+    let output = bts()
+        .args(["write", "--from"])
+        .arg(&shape)
+        .args(["--count", "1", "--over", "1h", "--dry-run"])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    let chat = events
+        .iter()
+        .find(|event| event["span_attributes"]["name"] == "chat")
+        .unwrap();
+    let elapsed = chat["metrics"]["end"].as_f64().unwrap() - chat["metrics"]["start"].as_f64().unwrap();
+
+    assert!((elapsed - 2.5).abs() < 1e-6, "expected a 2.5s span, got {elapsed}");
+}
+
+#[test]
 fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     let shape = write_shape(r#"trace "t" { input = 100 / range(0, 0) }"#);
     let output = bts()
@@ -280,6 +349,10 @@ fn bts() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bts"));
     command.current_dir(std::env::temp_dir());
     command
+}
+
+fn parse_rfc3339_secs(timestamp: &str) -> f64 {
+    chrono::DateTime::parse_from_rfc3339(timestamp).unwrap().timestamp() as f64
 }
 
 fn write_shape(source: &str) -> std::path::PathBuf {
