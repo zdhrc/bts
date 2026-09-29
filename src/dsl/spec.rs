@@ -1202,8 +1202,11 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_ATTACHMENT,
         name: "attachment",
         syntax: "attachment(path, content_type)",
-        summary: "References a local file as an attachment in a logged value. This initial form takes a constant absolute path and MIME type.",
-        examples: &["attachment(\"/tmp/report.pdf\", \"application/pdf\")"],
+        summary: "References a local file as an attachment in a logged value. The path may be absolute or relative to the shape file's directory.",
+        examples: &[
+            "attachment(\"report.pdf\", \"application/pdf\")",
+            "attachment(\"/tmp/report.pdf\", \"application/pdf\")",
+        ],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {

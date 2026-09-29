@@ -378,6 +378,48 @@ fn uploads_an_attachment_before_inserting_its_reference() {
 }
 
 #[test]
+fn resolves_relative_attachments_from_the_shape_directory() {
+    let shape_dir = std::env::temp_dir().join(format!("bts-relative-{}", Uuid::new_v4()));
+    fs::create_dir(&shape_dir).unwrap();
+    let shape = shape_dir.join("shape.bt");
+    let file = shape_dir.join("report.pdf");
+    let contents = b"relative attachment payload";
+    fs::write(&file, contents).unwrap();
+    fs::write(
+        &shape,
+        "trace \"review\" { input = { document = attachment(\"report.pdf\", \"application/pdf\") } }",
+    )
+    .unwrap();
+    let relative_shape = shape.strip_prefix(std::env::temp_dir()).unwrap();
+    let project_id = Uuid::new_v4();
+    let org_id = Uuid::new_v4();
+    let (api_url, requests) = serve_attachment_flow(org_id);
+
+    let output = bts()
+        .args(["write", "--from"])
+        .arg(relative_shape)
+        .args(["--count", "1", "--over", "1h"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(shape_dir).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 5);
+    let (_, init_body) = split_request(&requests[1]);
+    let init: JsonValue = serde_json::from_slice(init_body).unwrap();
+    assert_eq!(init["filename"], "report.pdf");
+    let (_, upload_body) = split_request(&requests[2]);
+    assert_eq!(upload_body, contents);
+    let (_, insert_body) = split_request(&requests[4]);
+    let inserted: JsonValue = serde_json::from_slice(insert_body).unwrap();
+    assert_eq!(inserted["events"][0]["input"]["document"]["key"], init["key"]);
+}
+
+#[test]
 fn emits_a_json_summary_when_requested() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();

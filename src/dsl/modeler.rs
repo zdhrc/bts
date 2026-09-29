@@ -2860,15 +2860,13 @@ impl Modeler {
             }
             "attachment" => {
                 let [path, content_type] = self.func_args(func, args, "exactly two arguments (path, content_type)", range)?;
-                let Some(path_text) =
-                    const_string(&path).filter(|path| Path::new(path).is_absolute() && Path::new(path).file_name().is_some())
-                else {
+                let Some(path_text) = const_string(&path).filter(|path| Path::new(path).file_name().is_some()) else {
                     self.errors.push(Error::new(
                         ErrorKind::ParamOutOfRange {
                             rule: spec::ids::FUNC_ARG_TYPES,
                             func,
                             param: "path",
-                            expected: "a constant absolute file path",
+                            expected: "a constant file path",
                         },
                         path.range,
                     ));

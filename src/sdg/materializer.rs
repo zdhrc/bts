@@ -40,6 +40,30 @@ pub(crate) struct EventBatch {
 }
 
 impl EventBatch {
+    pub(crate) fn resolve_attachment_paths(&mut self, shape_file: &std::path::Path) -> std::io::Result<()> {
+        if !self
+            .attachments
+            .iter()
+            .any(|attachment| std::path::Path::new(&attachment.path).is_relative())
+        {
+            return Ok(());
+        }
+
+        let shape_file = std::path::absolute(shape_file)?;
+        let shape_dir = shape_file.parent().expect("an absolute shape path has a parent");
+        for attachment in &mut self.attachments {
+            let path = std::path::Path::new(&attachment.path);
+            if path.is_relative() {
+                attachment.path = shape_dir
+                    .join(path)
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "attachment path is not UTF-8"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn event_count(&self) -> usize {
         self.events.len()
     }
