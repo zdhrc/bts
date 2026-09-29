@@ -9,6 +9,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 use std::fs;
+use std::io::Read;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, thread, time::Duration};
@@ -100,8 +101,9 @@ impl<'config> Writer<'config> {
             self.config.project_id,
         );
         let payloads = payloads(events, MAX_PAYLOAD_BYTES)?;
+        let attachment_bytes = self.preflight_attachments(&events.attachments)?;
         if !events.attachments.is_empty() {
-            self.upload_attachments(&events.attachments)?;
+            self.upload_attachments(&events.attachments, &attachment_bytes)?;
         }
         let workers = self.config.write_concurrency.min(payloads.len()).max(1);
         // payloads are indexed so acknowledged row ids reassemble in submission
@@ -149,7 +151,77 @@ impl<'config> Writer<'config> {
         })
     }
 
-    fn upload_attachments(&self, attachments: &[Attachment]) -> Result<(), Error> {
+    fn preflight_attachments(&self, attachments: &[Attachment]) -> Result<Vec<Vec<u8>>, Error> {
+        if attachments.len() > self.config.max_attachment_uploads {
+            return Err(Error::new(ErrorKind::Attachment(format!(
+                "{} distinct attachments exceed the configured attachments.max_uploads limit of {}",
+                attachments.len(),
+                self.config.max_attachment_uploads,
+            ))));
+        }
+
+        let mut total = 0_u64;
+        for attachment in attachments {
+            let size = fs::metadata(&attachment.path)
+                .map_err(|source| {
+                    Error::new(ErrorKind::Attachment(format!(
+                        "{}: file metadata failed: {source}",
+                        attachment.path
+                    )))
+                })?
+                .len();
+            self.check_attachment_size(attachment, size, total)?;
+            total += size;
+        }
+
+        // Capture bounded bytes for every file before sending any request. A missing or
+        // growing later file cannot leave earlier attachments uploaded without logs.
+        let mut contents = Vec::with_capacity(attachments.len());
+        total = 0;
+        for attachment in attachments {
+            let mut file = fs::File::open(&attachment.path).map_err(|source| {
+                Error::new(ErrorKind::Attachment(format!(
+                    "{}: file open failed: {source}",
+                    attachment.path
+                )))
+            })?;
+            let remaining = self.config.max_attachment_total_bytes - total;
+            let limit = self.config.max_attachment_file_bytes.min(remaining);
+            let mut bytes = Vec::new();
+            file.by_ref()
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|source| {
+                    Error::new(ErrorKind::Attachment(format!(
+                        "{}: file read failed: {source}",
+                        attachment.path
+                    )))
+                })?;
+            let size = bytes.len() as u64;
+            self.check_attachment_size(attachment, size, total)?;
+            total += size;
+            contents.push(bytes);
+        }
+        Ok(contents)
+    }
+
+    fn check_attachment_size(&self, attachment: &Attachment, size: u64, total: u64) -> Result<(), Error> {
+        if size > self.config.max_attachment_file_bytes {
+            return Err(Error::new(ErrorKind::Attachment(format!(
+                "{}: {size} bytes exceed the configured attachments.max_file_bytes limit of {}",
+                attachment.path, self.config.max_attachment_file_bytes,
+            ))));
+        }
+        if size > self.config.max_attachment_total_bytes.saturating_sub(total) {
+            return Err(Error::new(ErrorKind::Attachment(format!(
+                "attachment uploads exceed the configured attachments.max_total_bytes limit of {} bytes",
+                self.config.max_attachment_total_bytes,
+            ))));
+        }
+        Ok(())
+    }
+
+    fn upload_attachments(&self, attachments: &[Attachment], contents: &[Vec<u8>]) -> Result<(), Error> {
         let project_url = format!(
             "{}/v1/project/{}",
             self.config.api_url.trim_end_matches('/'),
@@ -174,8 +246,8 @@ impl<'config> Writer<'config> {
             })
             .map_err(|detail| Error::new(ErrorKind::Attachment(format!("project lookup failed: {detail}"))))?;
 
-        for (index, attachment) in attachments.iter().enumerate() {
-            self.upload_attachment(attachment, &project.org_id).map_err(|detail| {
+        for (index, (attachment, bytes)) in attachments.iter().zip(contents).enumerate() {
+            self.upload_attachment(attachment, bytes, &project.org_id).map_err(|detail| {
                 Error::new(ErrorKind::Attachment(format!(
                     "attachment {}/{} {} (key {}): {detail}; {} earlier upload(s) completed; no log rows inserted",
                     index + 1,
@@ -196,8 +268,7 @@ impl<'config> Writer<'config> {
         Ok(())
     }
 
-    fn upload_attachment(&self, attachment: &Attachment, org_id: &str) -> Result<(), String> {
-        let bytes = fs::read(&attachment.path).map_err(|source| format!("file read failed: {source}"))?;
+    fn upload_attachment(&self, attachment: &Attachment, bytes: &[u8], org_id: &str) -> Result<(), String> {
         let api_url = self.config.api_url.trim_end_matches('/');
         let response = self
             .client
@@ -229,7 +300,7 @@ impl<'config> Writer<'config> {
             upload = upload.header(name, value);
         }
         let expected_bytes = bytes.len() as u64;
-        match upload.body(bytes).send() {
+        match upload.body(bytes.to_vec()).send() {
             Ok(response) if response.status().is_success() => {}
             Ok(response) if is_definite_upload_rejection(response.status()) => {
                 let failure = format!("signed upload rejected with HTTP {}", response.status());
@@ -1188,6 +1259,38 @@ mod tests {
             let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(split_request(&request).0.starts_with("GET /attachment?"));
         }
+    }
+
+    #[test]
+    fn attachment_limits_fail_before_any_request() {
+        let (first, mut events) = attachment_batch();
+        let second = std::env::temp_dir().join(format!("bts-attachment-limit-{}", Uuid::new_v4()));
+        fs::write(&second, b"sample").unwrap();
+        let mut config = Braintrust::new("secret".to_owned(), Uuid::new_v4());
+        config.api_url = "http://127.0.0.1:9".to_owned();
+
+        config.max_attachment_file_bytes = 5;
+        let error = write(&config, &events).unwrap_err().to_string();
+        assert!(error.contains("attachments.max_file_bytes"), "{error}");
+
+        let mut other = events.attachments[0].clone();
+        other.path = second.display().to_string();
+        other.filename = second.file_name().unwrap().to_string_lossy().into_owned();
+        other.key = Uuid::new_v4().to_string();
+        events.attachments = vec![events.attachments[0].clone(), other].into_boxed_slice();
+
+        config.max_attachment_file_bytes = 6;
+        config.max_attachment_uploads = 1;
+        let error = write(&config, &events).unwrap_err().to_string();
+        assert!(error.contains("attachments.max_uploads"), "{error}");
+
+        config.max_attachment_uploads = 2;
+        config.max_attachment_total_bytes = 10;
+        let error = write(&config, &events).unwrap_err().to_string();
+        assert!(error.contains("attachments.max_total_bytes"), "{error}");
+
+        fs::remove_file(first).unwrap();
+        fs::remove_file(second).unwrap();
     }
 
     fn attachment_batch() -> (std::path::PathBuf, EventBatch) {

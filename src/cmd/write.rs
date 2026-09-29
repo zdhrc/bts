@@ -175,6 +175,9 @@ impl Args {
         let mut config = Braintrust::from_env()?;
         config.request_timeout = settings.request_timeout;
         config.write_concurrency = settings.write_concurrency;
+        config.max_attachment_uploads = settings.max_attachment_uploads;
+        config.max_attachment_file_bytes = settings.max_attachment_file_bytes;
+        config.max_attachment_total_bytes = settings.max_attachment_total_bytes;
         tracing::info!(project_id = %config.project_id, api_url = %config.api_url, "writing to braintrust");
         let inserted = tracing::info_span!("write").in_scope(|| sdg::write(&config, &events))?;
         tracing::info!(
