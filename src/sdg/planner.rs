@@ -1026,6 +1026,8 @@ fn eval_binding(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
             end,
             range,
         } => eval_binding(eval_slice(*target, start, end, range, ctx)?, ctx)?,
+
+        ModelValue::ArgRef(_) => unreachable!("scorer expressions never evaluate during generation"),
     };
 
     Ok(value)
@@ -1100,6 +1102,8 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
             end,
             range,
         } => lower_value(eval_slice(*target, start, end, range, ctx)?, ctx)?,
+
+        ModelValue::ArgRef(_) => unreachable!("scorer expressions never evaluate during generation"),
     };
 
     Ok(value)
@@ -1597,6 +1601,7 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
         ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) => return Err(shape_error(ctx)),
         // a residual slice is still rejected statically, refs never make one
         ModelValue::Slice { .. } => unreachable!("modeler validated operand types"),
+        ModelValue::ArgRef(_) => unreachable!("scorer expressions never evaluate during generation"),
     };
 
     Ok(scalar)

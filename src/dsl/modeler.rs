@@ -1,9 +1,9 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId,
-    Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, Span, SpanFields, SpanKind, Step,
-    Template, Trace, UnaryOp, Value, WeightedOption,
+    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP,
+    NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang,
+    Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
 };
 use crate::dsl::spec;
 use std::{
@@ -47,6 +47,7 @@ impl ExprType {
                 Value::CtxRef(_) => Self::Number,
                 // constant exprs fold to values, only dynamic ones get here
                 Value::VarRef(_)
+                | Value::ArgRef(_)
                 | Value::BlockRef { .. }
                 | Value::Unary { .. }
                 | Value::Binary { .. }
@@ -268,6 +269,9 @@ pub(super) struct Modeler {
     errors: Errors,
     // how many repeat blocks enclose the decl being lowered, gates repeat.index
     repeat_depth: usize,
+    // folding inside a scorer block; swaps the reference namespaces from
+    // generation context to scorer runtime arguments
+    in_scorer: bool,
     // the symbol tree of blocks, indexed by NodeId in walk order
     syms: Vec<SymNode>,
     // the chain of blocks enclosing the decl being lowered, innermost last
@@ -288,6 +292,7 @@ impl Modeler {
             declared: HashSet::new(),
             errors: Vec::new(),
             repeat_depth: 0,
+            in_scorer: false,
             syms: Vec::new(),
             sym_stack: Vec::new(),
             pending: Vec::new(),
@@ -318,6 +323,7 @@ impl Modeler {
 
     fn model(mut self) -> Result<Model, Errors> {
         let mut traces = Vec::new();
+        let mut scorers = Vec::new();
 
         // collect vars first so refs work no matter the decl order
         let (vars_blocks, rest) = split_vars(std::mem::take(&mut self.ast.decls));
@@ -349,6 +355,10 @@ impl Modeler {
                     if desc.id == spec::ids::TRACE && desc.allows(spec::Place::Root) {
                         if let Some(trace) = self.model_trace(block, desc) {
                             traces.push(trace);
+                        }
+                    } else if desc.id == spec::ids::SCORER && desc.allows(spec::Place::Root) {
+                        if let Some(scorer) = self.model_scorer(block, desc) {
+                            scorers.push(scorer);
                         }
                     } else {
                         self.errors.push(Error::new(
@@ -382,7 +392,7 @@ impl Modeler {
             }
         });
 
-        if traces.is_empty() && self.errors.is_empty() {
+        if traces.is_empty() && scorers.is_empty() && self.errors.is_empty() {
             self.errors.push(Error::new(
                 ErrorKind::EmptyShape {
                     rule: spec::ids::NONEMPTY_SHAPE,
@@ -392,7 +402,12 @@ impl Modeler {
         }
 
         if self.errors.is_empty() {
-            Ok(Model { traces, bindings, refs })
+            Ok(Model {
+                traces,
+                bindings,
+                refs,
+                scorers,
+            })
         } else {
             Err(self.errors)
         }
@@ -419,6 +434,658 @@ impl Modeler {
             bindings,
             children,
         })
+    }
+
+    // a scorer never enters the symbol tree: block references are rejected
+    // inside it and nothing references into it, so the pending-ref fixup
+    // machinery stays untouched
+    fn model_scorer(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Scorer> {
+        let ast::Block { name, decls, range, .. } = block;
+        let name = self.model_name(name, range, desc);
+
+        // the flag must cover the vars collect so scorer vars gate on constancy
+        self.in_scorer = true;
+        // scorer bindings never reach the model: dynamic ones are rejected and
+        // constant ones substitute at each use
+        let (decls, _) = self.enter_scope(decls);
+
+        let mut lang = None;
+        let mut file = None;
+        let mut seen = HashSet::new();
+        let mut kind = None;
+        let mut kinds = 0usize;
+
+        for decl in decls {
+            match decl {
+                ast::Decl::Attr(attr) => {
+                    let attr_range = attr.range;
+                    let Some(field_desc) = desc.field(&attr.key) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownField {
+                                block: desc.id,
+                                keyword: attr.key,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    };
+                    let field_id = field_desc.id;
+                    if !seen.insert(field_id) {
+                        self.errors.push(Error::new(
+                            ErrorKind::DuplicateField {
+                                block: desc.id,
+                                field: field_id,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    }
+                    if let Some(folded) = self.fold_expr(attr.value) {
+                        if field_id == spec::ids::LANG {
+                            lang = self.model_scorer_lang(folded);
+                        } else {
+                            file = self.model_scorer_file(folded);
+                        }
+                    }
+                }
+                ast::Decl::Block(inner) => {
+                    let inner_range = inner.range;
+                    let parent = spec::Place::Block { id: desc.id };
+                    let Some(inner_desc) = spec::SPEC.block(&inner.kind) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownBlock {
+                                keyword: inner.kind,
+                                parent,
+                            },
+                            inner_range,
+                        ));
+                        continue;
+                    };
+                    if !inner_desc.allows(parent) {
+                        self.errors.push(Error::new(
+                            ErrorKind::BlockNotAllowed {
+                                block: inner_desc.id,
+                                parent,
+                            },
+                            inner_range,
+                        ));
+                        continue;
+                    }
+
+                    kinds += 1;
+                    if kinds > 1 {
+                        self.errors.push(Error::new(
+                            ErrorKind::ExtraScorerKind {
+                                rule: spec::ids::SCORER_KIND,
+                            },
+                            inner_range,
+                        ));
+                        continue;
+                    }
+
+                    self.model_name(inner.name, inner_range, inner_desc);
+                    kind = if inner_desc.id == spec::ids::CODE {
+                        self.model_code(inner.decls, inner_desc, inner_range)
+                    } else {
+                        self.model_judge(inner.decls, inner_desc, inner_range)
+                    };
+                }
+            }
+        }
+
+        if kinds == 0 {
+            self.errors.push(Error::new(
+                ErrorKind::MissingScorerKind {
+                    rule: spec::ids::SCORER_KIND,
+                },
+                range,
+            ));
+        }
+
+        self.scopes.pop();
+        self.in_scorer = false;
+
+        match (name, kind) {
+            (Some(name), Some(kind)) => Some(Scorer { name, lang, file, kind }),
+            _ => None,
+        }
+    }
+
+    // lang is the constant string "python" or "typescript"
+    fn model_scorer_lang(&mut self, folded: Folded) -> Option<ScorerLang> {
+        match const_string(&folded).as_deref() {
+            Some("python") => Some(ScorerLang::Python),
+            Some("typescript") => Some(ScorerLang::Typescript),
+            _ => {
+                self.errors.push(Error::new(
+                    ErrorKind::InvalidScorerLang {
+                        rule: spec::ids::SCORER_LANG,
+                    },
+                    folded.range,
+                ));
+                None
+            }
+        }
+    }
+
+    // file is a bare stem; the builder appends the kind suffix and extension
+    fn model_scorer_file(&mut self, folded: Folded) -> Option<String> {
+        let stem = const_string(&folded).filter(|stem| !stem.is_empty() && !stem.contains(['/', '\\', '.']));
+        if stem.is_none() {
+            self.errors.push(Error::new(
+                ErrorKind::InvalidScorerFile {
+                    rule: spec::ids::SCORER_FILE,
+                },
+                folded.range,
+            ));
+        }
+        stem
+    }
+
+    fn model_code(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerKind> {
+        let mut score = None;
+        let mut seen = HashSet::new();
+        let mut whens = Vec::new();
+
+        for decl in decls {
+            match decl {
+                ast::Decl::Attr(attr) => {
+                    let attr_range = attr.range;
+                    let Some(field) = desc.field(&attr.key) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownField {
+                                block: desc.id,
+                                keyword: attr.key,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    };
+                    if !seen.insert(field.id) {
+                        self.errors.push(Error::new(
+                            ErrorKind::DuplicateField {
+                                block: desc.id,
+                                field: field.id,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    }
+                    if let Some(folded) = self.fold_expr(attr.value) {
+                        score = self.model_score(folded, desc.id);
+                    }
+                }
+                ast::Decl::Block(inner) => {
+                    let inner_range = inner.range;
+                    let parent = spec::Place::Block { id: desc.id };
+                    let Some(inner_desc) = spec::SPEC.block(&inner.kind) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownBlock {
+                                keyword: inner.kind,
+                                parent,
+                            },
+                            inner_range,
+                        ));
+                        continue;
+                    };
+                    if !inner_desc.allows(parent) {
+                        self.errors.push(Error::new(
+                            ErrorKind::BlockNotAllowed {
+                                block: inner_desc.id,
+                                parent,
+                            },
+                            inner_range,
+                        ));
+                        continue;
+                    }
+                    self.model_name(inner.name, inner_range, inner_desc);
+                    if let Some(when) = self.model_when(inner.decls, inner_desc, inner_range) {
+                        whens.push(when);
+                    }
+                }
+            }
+        }
+
+        if !seen.contains(&spec::ids::SCORE) {
+            self.errors.push(Error::new(
+                ErrorKind::MissingField {
+                    block: desc.id,
+                    field: spec::ids::SCORE,
+                },
+                range,
+            ));
+        }
+
+        score.map(|score| ScorerKind::Code { score, whens })
+    }
+
+    fn model_when(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<When> {
+        let mut cond = None;
+        let mut score = None;
+        let mut seen = HashSet::new();
+
+        for decl in decls {
+            match decl {
+                ast::Decl::Attr(attr) => {
+                    let attr_range = attr.range;
+                    let Some(field) = desc.field(&attr.key) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownField {
+                                block: desc.id,
+                                keyword: attr.key,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    };
+                    let field_id = field.id;
+                    if !seen.insert(field_id) {
+                        self.errors.push(Error::new(
+                            ErrorKind::DuplicateField {
+                                block: desc.id,
+                                field: field_id,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    }
+                    let Some(folded) = self.fold_expr(attr.value) else {
+                        continue;
+                    };
+                    if field_id == spec::ids::COND {
+                        cond = self.model_cond(folded, desc.id);
+                    } else {
+                        score = self.model_score(folded, desc.id);
+                    }
+                }
+                ast::Decl::Block(inner) => {
+                    let parent = spec::Place::Block { id: desc.id };
+                    let error = match spec::SPEC.block(&inner.kind) {
+                        Some(inner_desc) => ErrorKind::BlockNotAllowed {
+                            block: inner_desc.id,
+                            parent,
+                        },
+                        None => ErrorKind::UnknownBlock {
+                            keyword: inner.kind,
+                            parent,
+                        },
+                    };
+                    self.errors.push(Error::new(error, inner.range));
+                }
+            }
+        }
+
+        for field in desc.body.fields {
+            if field.cardinality == spec::Cardinality::Required && !seen.contains(&field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::MissingField {
+                        block: desc.id,
+                        field: field.id,
+                    },
+                    range,
+                ));
+            }
+        }
+
+        match (cond, score) {
+            (Some(cond), Some(score)) => Some(When { cond, score }),
+            _ => None,
+        }
+    }
+
+    fn model_judge(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerKind> {
+        let mut model = None;
+        let mut prompt = None;
+        let mut options = None;
+        let mut seen = HashSet::new();
+
+        for decl in decls {
+            match decl {
+                ast::Decl::Attr(attr) => {
+                    let attr_range = attr.range;
+                    let Some(field) = desc.field(&attr.key) else {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownField {
+                                block: desc.id,
+                                keyword: attr.key,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    };
+                    let field_id = field.id;
+                    if !seen.insert(field_id) {
+                        self.errors.push(Error::new(
+                            ErrorKind::DuplicateField {
+                                block: desc.id,
+                                field: field_id,
+                            },
+                            attr_range,
+                        ));
+                        continue;
+                    }
+                    let Some(folded) = self.fold_expr(attr.value) else {
+                        continue;
+                    };
+                    if field_id == spec::ids::MODEL {
+                        match const_string(&folded) {
+                            Some(value) => model = Some(value),
+                            None => {
+                                self.errors.push(Error::new(
+                                    ErrorKind::InvalidJudgeModel {
+                                        rule: spec::ids::JUDGE_MODEL,
+                                    },
+                                    folded.range,
+                                ));
+                            }
+                        }
+                    } else if field_id == spec::ids::PROMPT {
+                        prompt = self.model_judge_prompt(folded);
+                    } else {
+                        options = self.model_judge_options(folded);
+                    }
+                }
+                ast::Decl::Block(inner) => {
+                    let parent = spec::Place::Block { id: desc.id };
+                    let error = match spec::SPEC.block(&inner.kind) {
+                        Some(inner_desc) => ErrorKind::BlockNotAllowed {
+                            block: inner_desc.id,
+                            parent,
+                        },
+                        None => ErrorKind::UnknownBlock {
+                            keyword: inner.kind,
+                            parent,
+                        },
+                    };
+                    self.errors.push(Error::new(error, inner.range));
+                }
+            }
+        }
+
+        for field in desc.body.fields {
+            if field.cardinality == spec::Cardinality::Required && !seen.contains(&field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::MissingField {
+                        block: desc.id,
+                        field: field.id,
+                    },
+                    range,
+                ));
+            }
+        }
+
+        match (model, prompt, options) {
+            (Some(model), Some(prompt), Some(options)) => Some(ScorerKind::Judge { model, prompt, options }),
+            _ => None,
+        }
+    }
+
+    // a judge prompt becomes a braintrust prompt template, so its holes must
+    // be plain argument paths a template slot can express, never computed text
+    fn model_judge_prompt(&mut self, folded: Folded) -> Option<Value> {
+        let renderable = match &folded.kind {
+            FoldedKind::Value(Value::Str(_)) => true,
+            FoldedKind::Value(Value::Template(template)) => template.parts.iter().all(|part| match part {
+                Part::Lit(_) => true,
+                Part::Dynamic(value) => is_arg_path(value),
+                Part::Ref(_) | Part::VarRef(_) => false,
+            }),
+            _ => false,
+        };
+
+        if !renderable {
+            self.errors.push(Error::new(
+                ErrorKind::InvalidJudgePrompt {
+                    rule: spec::ids::JUDGE_PROMPT,
+                },
+                folded.range,
+            ));
+            return None;
+        }
+
+        Some(folded.into_value())
+    }
+
+    // options is an object of constant scores between 0 and 1, at least two
+    fn model_judge_options(&mut self, folded: Folded) -> Option<Vec<JudgeOption>> {
+        let FoldedKind::Object(fields) = &folded.kind else {
+            self.errors.push(Error::new(
+                ErrorKind::InvalidJudgeOptions {
+                    rule: spec::ids::JUDGE_OPTIONS,
+                },
+                folded.range,
+            ));
+            return None;
+        };
+
+        let mut options = Vec::with_capacity(fields.len());
+        let mut valid = true;
+        for field in fields {
+            let score = match &field.value.kind {
+                FoldedKind::Value(Value::Num(number)) => {
+                    let score = float_bound(number.clone());
+                    (0.0..=1.0).contains(&score).then_some(score)
+                }
+                _ => None,
+            };
+            match score {
+                Some(score) => options.push(JudgeOption {
+                    label: field.key.clone(),
+                    score,
+                }),
+                None => {
+                    self.errors.push(Error::new(
+                        ErrorKind::InvalidJudgeOptions {
+                            rule: spec::ids::JUDGE_OPTIONS,
+                        },
+                        field.value.range,
+                    ));
+                    valid = false;
+                }
+            }
+        }
+
+        if fields.len() < 2 {
+            self.errors.push(Error::new(
+                ErrorKind::InvalidJudgeOptions {
+                    rule: spec::ids::JUDGE_OPTIONS,
+                },
+                folded.range,
+            ));
+            valid = false;
+        }
+
+        valid.then_some(options)
+    }
+
+    // score exprs are numbers (or arg-fed residuals); constants must land in 0..=1
+    fn model_score(&mut self, folded: Folded, block: spec::Id) -> Option<Value> {
+        if self.static_type(&folded) != Some(StaticType::Number) && !self.defers_to_generation(&folded) {
+            self.errors.push(Error::new(
+                ErrorKind::TypeMismatch {
+                    block,
+                    field: spec::ids::SCORE,
+                    expected: &spec::ExprType::Number,
+                    found: self.found_type(&folded),
+                },
+                folded.range,
+            ));
+            return None;
+        }
+
+        if let FoldedKind::Value(Value::Num(number)) = &folded.kind
+            && !(0.0..=1.0).contains(&float_bound(number.clone()))
+        {
+            self.errors.push(Error::new(
+                ErrorKind::ScoreOutOfRange {
+                    rule: spec::ids::SCORE_RANGE,
+                },
+                folded.range,
+            ));
+            return None;
+        }
+
+        let value = folded.into_value();
+        self.check_scorer_value(&value);
+        Some(value)
+    }
+
+    // conds are booleans (or arg-fed residuals settled by the emitted code)
+    fn model_cond(&mut self, folded: Folded, block: spec::Id) -> Option<Value> {
+        if self.static_type(&folded) != Some(StaticType::Boolean) && !self.defers_to_generation(&folded) {
+            self.errors.push(Error::new(
+                ErrorKind::TypeMismatch {
+                    block,
+                    field: spec::ids::COND,
+                    expected: &spec::ExprType::Boolean,
+                    found: self.found_type(&folded),
+                },
+                folded.range,
+            ));
+            return None;
+        }
+
+        let value = folded.into_value();
+        self.check_scorer_value(&value);
+        Some(value)
+    }
+
+    // scorer expressions must emit as python or typescript; the exhaustive
+    // matches force a transpilability decision on every future variant
+    fn check_scorer_value(&mut self, value: &Value) {
+        match value {
+            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::ArgRef(_) => {}
+            Value::VarRef(_) | Value::CtxRef(_) | Value::BlockRef { .. } => {
+                unreachable!("rejected in scorer scope during folding")
+            }
+            Value::Template(template) => {
+                for part in &template.parts {
+                    match part {
+                        Part::Lit(_) => {}
+                        Part::Dynamic(value) => self.check_scorer_value(value),
+                        Part::Ref(_) | Part::VarRef(_) => unreachable!("rejected in scorer scope during folding"),
+                    }
+                }
+            }
+            Value::Array(array) => {
+                for elem in &array.elem {
+                    match elem {
+                        ArrayElem::Item(value) | ArrayElem::Spread(value) => self.check_scorer_value(value),
+                    }
+                }
+            }
+            Value::Object(object) => {
+                for field in &object.elem {
+                    self.check_scorer_value(&field.value);
+                }
+            }
+            Value::Unary { operand, .. } => self.check_scorer_value(operand),
+            Value::Binary { lhs, rhs, .. } => {
+                self.check_scorer_value(lhs);
+                self.check_scorer_value(rhs);
+            }
+            Value::Cond { cond, then, otherwise } => {
+                self.check_scorer_value(cond);
+                self.check_scorer_value(then);
+                self.check_scorer_value(otherwise);
+            }
+            Value::Index { target, index, .. } => {
+                self.check_scorer_value(target);
+                self.check_scorer_value(index);
+            }
+            Value::Slice { target, start, end, .. } => {
+                self.check_scorer_value(target);
+                if let Some(start) = start {
+                    self.check_scorer_value(start);
+                }
+                if let Some(end) = end {
+                    self.check_scorer_value(end);
+                }
+            }
+            Value::Func { func, range } => match func {
+                Func::Tokens { value } => {
+                    self.errors.push(Error::new(
+                        ErrorKind::ScorerFunc {
+                            rule: spec::ids::SCORER_EXPRS,
+                            func: "tokens",
+                        },
+                        *range,
+                    ));
+                    self.check_scorer_value(value);
+                }
+                Func::Noise { size } => {
+                    self.errors.push(Error::new(
+                        ErrorKind::ScorerFunc {
+                            rule: spec::ids::SCORER_EXPRS,
+                            func: "noise",
+                        },
+                        *range,
+                    ));
+                    self.check_scorer_value(size);
+                }
+                Func::Choice(options) | Func::Min(options) | Func::Max(options) => {
+                    for option in options {
+                        self.check_scorer_value(option);
+                    }
+                }
+                Func::Weighted(options) => {
+                    for option in options {
+                        self.check_scorer_value(&option.value);
+                    }
+                }
+                Func::Range(_)
+                | Func::Normal { .. }
+                | Func::Lognormal { .. }
+                | Func::Exponential { .. }
+                | Func::Pareto { .. }
+                | Func::Beta { .. }
+                | Func::Poisson { .. }
+                | Func::Chance { .. }
+                | Func::Uuid
+                | Func::Hex { .. }
+                | Func::Alphanum { .. } => {}
+                Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => self.check_scorer_value(text),
+                Func::Replace { text, from, to } => {
+                    self.check_scorer_value(text);
+                    self.check_scorer_value(from);
+                    self.check_scorer_value(to);
+                }
+                Func::Split { text, separator } => {
+                    self.check_scorer_value(text);
+                    self.check_scorer_value(separator);
+                }
+                Func::Join { array, separator } => {
+                    self.check_scorer_value(array);
+                    self.check_scorer_value(separator);
+                }
+                Func::Contains { target, needle } => {
+                    self.check_scorer_value(target);
+                    self.check_scorer_value(needle);
+                }
+                Func::StartsWith { text, prefix } => {
+                    self.check_scorer_value(text);
+                    self.check_scorer_value(prefix);
+                }
+                Func::EndsWith { text, suffix } => {
+                    self.check_scorer_value(text);
+                    self.check_scorer_value(suffix);
+                }
+                Func::Len { target } => self.check_scorer_value(target),
+                Func::Format { args, .. } => {
+                    for arg in args {
+                        self.check_scorer_value(arg);
+                    }
+                }
+                Func::Clamp { value, min, max } => {
+                    self.check_scorer_value(value);
+                    self.check_scorer_value(min);
+                    self.check_scorer_value(max);
+                }
+                Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
+                    self.check_scorer_value(value);
+                }
+            },
+        }
     }
 
     // notes which fields a block sets so absent-field references diagnose
@@ -497,6 +1164,22 @@ impl Modeler {
                         owner,
                     });
                     self.current_slot = outer_slot;
+
+                    // scorer vars must fold to constants; anything else would
+                    // need evaluating at generation, which scorer code never does
+                    if self.in_scorer
+                        && let Some(def) = &def
+                        && !def.constant
+                    {
+                        self.errors.push(Error::new(
+                            ErrorKind::ScorerDynamicVar {
+                                rule: spec::ids::SCORER_EXPRS,
+                                name: attr.key.clone(),
+                            },
+                            attr.range,
+                        ));
+                        continue;
+                    }
 
                     // a root var evaluates before any trace exists, so block
                     // references inside one have nothing to anchor to
@@ -592,6 +1275,18 @@ impl Modeler {
             let mut segments = path.into_iter().skip(1);
             let name = segments.next().expect("path has at least two segments");
             let def = self.lookup_var(name.clone(), range)?;
+            // scorer expressions only substitute constants; a dynamic root
+            // binding is a legal declaration but an illegal use here
+            if self.in_scorer && !def.constant {
+                self.errors.push(Error::new(
+                    ErrorKind::ScorerDynamicVar {
+                        rule: spec::ids::SCORER_EXPRS,
+                        name,
+                    },
+                    range,
+                ));
+                return None;
+            }
             let head = if def.constant {
                 Folded::new(def.value.kind, range)
             } else {
@@ -614,6 +1309,13 @@ impl Modeler {
             segments.next();
             let head = Folded::new(binding.kind, range);
             return self.select_segments(head, segments, range);
+        }
+
+        // scorer scope swaps the reference namespaces wholesale: bare args
+        // resolve, every generation-context head is rejected, and no pending
+        // reference is ever recorded
+        if self.in_scorer {
+            return self.fold_scorer_ref(path, range);
         }
 
         // exact context paths resolve before block heads so trace.index stays
@@ -646,6 +1348,43 @@ impl Modeler {
 
         self.require_ctx_ref(&path, range)
             .map(|ctx_ref| Folded::value(Value::CtxRef(ctx_ref), range))
+    }
+
+    // the scorer namespaces: bare input/output/expected/metadata are the
+    // runtime arguments braintrust passes the scorer; generation heads get a
+    // scorer-specific diagnostic instead of resolving
+    fn fold_scorer_ref(&mut self, path: Vec<String>, range: SrcRange) -> Option<Folded> {
+        let arg = match path[0].as_str() {
+            "input" => Some(ScorerArg::Input),
+            "output" => Some(ScorerArg::Output),
+            "expected" => Some(ScorerArg::Expected),
+            "metadata" => Some(ScorerArg::Metadata),
+            _ => None,
+        };
+        if let Some(arg) = arg {
+            let head = Folded::value(Value::ArgRef(arg), range);
+            let mut segments = path.into_iter();
+            segments.next();
+            return self.select_segments(head, segments, range);
+        }
+
+        let generation_head = matches!(
+            path[0].as_str(),
+            "task" | "llm" | "tool" | "function" | "repeat" | "choice" | "maybe" | "trace" | "self"
+        );
+        let kind = if generation_head {
+            ErrorKind::ScorerRef {
+                rule: spec::ids::SCORER_ARGS,
+                path: path.join("."),
+            }
+        } else {
+            ErrorKind::UnknownReference {
+                rule: spec::ids::KNOWN_REFERENCES,
+                path: path.join("."),
+            }
+        };
+        self.errors.push(Error::new(kind, range));
+        None
     }
 
     // classifies a reference head: none = not a block head, some(none) = a
@@ -1715,6 +2454,9 @@ impl Modeler {
         let any = |values: &[Value]| values.iter().any(|value| self.value_reaches_block_ref(value));
         match value {
             Value::BlockRef { .. } => true,
+            // scorer args are opaque to shape checks exactly like block
+            // references, and never appear outside scorer scope
+            Value::ArgRef(_) => true,
             Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::CtxRef(_) => false,
             Value::Template(template) => template.parts.iter().any(|part| match part {
                 Part::Dynamic(value) => self.value_reaches_block_ref(value),
@@ -2712,6 +3454,14 @@ impl Modeler {
                             needle: Box::new(needle?),
                         })
                     }
+                    // a reference-fed target settles string-vs-array when it evaluates
+                    _ if self.defers_to_generation(&target) => {
+                        let needle = self.model_scalar_arg(needle, func);
+                        Some(Func::Contains {
+                            target: Box::new(target.into_value()),
+                            needle: Box::new(needle?),
+                        })
+                    }
                     _ => {
                         self.push_func_arg_type(&target, func, "string or array");
                         None
@@ -3202,6 +3952,8 @@ impl Modeler {
             Value::CtxRef(_) => Some(StaticType::Number),
             // a referenced field's shape is only known at generation
             Value::BlockRef { .. } => None,
+            // a scorer argument's shape is only known when the scorer runs
+            Value::ArgRef(_) => None,
             Value::Func { func, .. } => self.func_type(func),
             Value::Unary { op: UnaryOp::Neg, .. } => Some(StaticType::Number),
             Value::Unary { op: UnaryOp::Not, .. } => Some(StaticType::Boolean),
@@ -3927,7 +4679,13 @@ fn collect_template_refs(template: &Template, found: &mut Vec<RefId>) {
 fn collect_refs(value: &Value, found: &mut Vec<RefId>) {
     match value {
         Value::BlockRef { ref_id, .. } => found.push(*ref_id),
-        Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::VarRef(_) | Value::CtxRef(_) => {}
+        Value::Str(_)
+        | Value::Num(_)
+        | Value::Bool(_)
+        | Value::Null
+        | Value::VarRef(_)
+        | Value::CtxRef(_)
+        | Value::ArgRef(_) => {}
         Value::Template(template) => collect_template_refs(template, found),
         Value::Array(array) => {
             for elem in &array.elem {
@@ -4220,8 +4978,31 @@ fn value_is_constant(value: &Value) -> bool {
             ArrayElem::Spread(_) => false,
         }),
         Value::Object(object) => object.elem.iter().all(|field| value_is_constant(&field.value)),
-        Value::Template(_) | Value::Func { .. } | Value::VarRef(_) | Value::CtxRef(_) | Value::BlockRef { .. } => false,
+        Value::Template(_)
+        | Value::Func { .. }
+        | Value::VarRef(_)
+        | Value::CtxRef(_)
+        | Value::ArgRef(_)
+        | Value::BlockRef { .. } => false,
         Value::Unary { .. } | Value::Binary { .. } | Value::Cond { .. } | Value::Index { .. } | Value::Slice { .. } => false,
+    }
+}
+
+// a plain scorer-argument path (`input`, `metadata.tier`) a judge prompt
+// template slot can express; identifier keys only, no computed selections
+fn is_arg_path(value: &Value) -> bool {
+    match value {
+        Value::ArgRef(_) => true,
+        Value::Index { target, index, .. } => match &**index {
+            Value::Str(key) => {
+                let identifier = !key.is_empty()
+                    && key.chars().next().is_some_and(|first| first.is_ascii_alphabetic())
+                    && key.chars().all(|part| part.is_ascii_alphanumeric() || part == '_');
+                identifier && is_arg_path(target)
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -4639,6 +5420,42 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
         path: String,
     },
+    ScorerRef {
+        rule: spec::Id,
+        path: String,
+    },
+    ScorerDynamicVar {
+        rule: spec::Id,
+        name: String,
+    },
+    ScorerFunc {
+        rule: spec::Id,
+        func: &'static str,
+    },
+    InvalidScorerLang {
+        rule: spec::Id,
+    },
+    InvalidScorerFile {
+        rule: spec::Id,
+    },
+    MissingScorerKind {
+        rule: spec::Id,
+    },
+    ExtraScorerKind {
+        rule: spec::Id,
+    },
+    ScoreOutOfRange {
+        rule: spec::Id,
+    },
+    InvalidJudgeModel {
+        rule: spec::Id,
+    },
+    InvalidJudgePrompt {
+        rule: spec::Id,
+    },
+    InvalidJudgeOptions {
+        rule: spec::Id,
+    },
 }
 
 impl fmt::Display for ErrorKind {
@@ -4826,7 +5643,7 @@ impl fmt::Display for ErrorKind {
             }
             Self::EmptyShape { rule } => {
                 let rule = rule_desc(*rule);
-                write!(formatter, "shape declares no traces; {}", rule.summary)
+                write!(formatter, "shape declares no traces or scorers; {}", rule.summary)
             }
             Self::UnknownFunction { rule, name } => {
                 let rule = rule_desc(*rule);
@@ -5035,6 +5852,78 @@ impl fmt::Display for ErrorKind {
             Self::RepeatRefOutsideRepeat { rule, path } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "`{path}` is not inside a repeat block; {}", rule.summary)
+            }
+            Self::ScorerRef { rule, path } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "reference `{path}` is not available inside a scorer; {}",
+                    rule.summary
+                )
+            }
+            Self::ScorerDynamicVar { rule, name } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "variable `{name}` does not have a constant value, so a scorer cannot use it; {}",
+                    rule.summary
+                )
+            }
+            Self::ScorerFunc { rule, func } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "function `{func}` is not available in scorer expressions; {}",
+                    rule.summary
+                )
+            }
+            Self::InvalidScorerLang { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "`lang` must be \"python\" or \"typescript\"; {}", rule.summary)
+            }
+            Self::InvalidScorerFile { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "`file` must be a bare file stem; {}", rule.summary)
+            }
+            Self::MissingScorerKind { rule } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "scorer declares neither a `code` nor a `judge` block; {}",
+                    rule.summary
+                )
+            }
+            Self::ExtraScorerKind { rule } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "scorer declares more than one `code` or `judge` block; {}",
+                    rule.summary
+                )
+            }
+            Self::ScoreOutOfRange { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "constant score is outside 0 to 1; {}", rule.summary)
+            }
+            Self::InvalidJudgeModel { rule } => {
+                let rule = rule_desc(*rule);
+                write!(formatter, "`model` must be a constant string; {}", rule.summary)
+            }
+            Self::InvalidJudgePrompt { rule } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "judge prompt may only interpolate scorer argument paths; {}",
+                    rule.summary
+                )
+            }
+            Self::InvalidJudgeOptions { rule } => {
+                let rule = rule_desc(*rule);
+                write!(
+                    formatter,
+                    "judge options must map at least two labels to constant scores between 0 and 1; {}",
+                    rule.summary
+                )
             }
         }
     }
@@ -8197,5 +9086,397 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn models_a_code_scorer() {
+        let model = model(
+            r#"
+            scorer "response-quality" {
+                lang = "python"
+                code {
+                    score = clamp(normal(0.78, 0.12), 0, 1)
+                    when {
+                        cond = output == null
+                        score = 0
+                    }
+                    when {
+                        cond = contains(output, "I'm sorry")
+                        score = range(0.1, 0.4)
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert!(model.traces.is_empty());
+        assert_eq!(model.scorers.len(), 1);
+        let scorer = &model.scorers[0];
+        assert_eq!(scorer.name, "response-quality");
+        assert_eq!(scorer.lang, Some(ScorerLang::Python));
+        let ScorerKind::Code { score, whens } = &scorer.kind else {
+            panic!("expected a code scorer");
+        };
+        assert!(matches!(
+            score,
+            Value::Func {
+                func: Func::Clamp { .. },
+                ..
+            }
+        ));
+        assert_eq!(whens.len(), 2);
+        assert!(matches!(
+            &whens[0].cond,
+            Value::Binary { op: BinOp::Eq, lhs, .. } if matches!(&**lhs, Value::ArgRef(ScorerArg::Output))
+        ));
+        assert!(matches!(whens[0].score, Value::Num(Number::Int(0))));
+        assert!(matches!(
+            &whens[1].cond,
+            Value::Func {
+                func: Func::Contains { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn models_a_judge_scorer() {
+        let model = model(
+            r#"
+            scorer "helpfulness" {
+                judge {
+                    model = "gpt-4o-mini"
+                    prompt = "Rate the response to ${input} given ${output}."
+                    options = { excellent = 1.0, good = 0.6, poor = 0.2 }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let scorer = &model.scorers[0];
+        assert_eq!(scorer.lang, None);
+        let ScorerKind::Judge {
+            model: judge_model,
+            prompt,
+            options,
+        } = &scorer.kind
+        else {
+            panic!("expected a judge scorer");
+        };
+        assert_eq!(judge_model, "gpt-4o-mini");
+        let Value::Template(template) = prompt else {
+            panic!("expected a templated prompt");
+        };
+        assert!(
+            template
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::Dynamic(Value::ArgRef(ScorerArg::Input))))
+        );
+        assert!(
+            template
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::Dynamic(Value::ArgRef(ScorerArg::Output))))
+        );
+        assert_eq!(options.len(), 3);
+        assert_eq!((options[0].label.as_str(), options[0].score), ("excellent", 1.0));
+        assert_eq!((options[2].label.as_str(), options[2].score), ("poor", 0.2));
+    }
+
+    #[test]
+    fn models_scorers_alongside_traces() {
+        let model = model(
+            r#"
+            vars { threshold = 0.5 }
+            scorer "quality" { code { score = var.threshold } }
+            trace "t" { input = var.threshold }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(model.traces.len(), 1);
+        assert_eq!(model.scorers.len(), 1);
+        // the constant root var substitutes in both places
+        let ScorerKind::Code { score, .. } = &model.scorers[0].kind else {
+            panic!("expected a code scorer");
+        };
+        assert!(matches!(score, Value::Num(Number::Float(value)) if *value == 0.5));
+    }
+
+    #[test]
+    fn models_arg_selections() {
+        let model = model(
+            r#"
+            scorer "tiered" {
+                code {
+                    score = 0.9
+                    when {
+                        cond = metadata.tier == "pro"
+                        score = 1
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let ScorerKind::Code { whens, .. } = &model.scorers[0].kind else {
+            panic!("expected a code scorer");
+        };
+        assert!(matches!(
+            &whens[0].cond,
+            Value::Binary { op: BinOp::Eq, lhs, .. }
+                if matches!(&**lhs, Value::Index { target, .. } if matches!(&**target, Value::ArgRef(ScorerArg::Metadata)))
+        ));
+    }
+
+    #[test]
+    fn rejects_generation_refs_in_scorers() {
+        for reference in ["llm.chat.output", "trace.index", "repeat.index", "self.output"] {
+            let errors = model(&format!(
+                r#"scorer "s" {{ code {{ score = 0.5 when {{ cond = {reference} == null score = 0 }} }} }}"#
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(errors[0].kind(), ErrorKind::ScorerRef { path, .. } if path == reference),
+                "reference {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_untranspilable_funcs_in_scorers() {
+        let errors = model(
+            r#"
+            scorer "s" {
+                code {
+                    score = tokens(output) / 100
+                    when {
+                        cond = len(noise(10)) > 5
+                        score = 0
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(errors[0].kind(), ErrorKind::ScorerFunc { func: "tokens", .. }));
+        assert!(matches!(errors[1].kind(), ErrorKind::ScorerFunc { func: "noise", .. }));
+    }
+
+    #[test]
+    fn rejects_dynamic_vars_in_scorers() {
+        // a dynamic declaration inside the scorer
+        let errors = model(r#"scorer "s" { vars { roll = range(0, 1) } code { score = 0.5 } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::ScorerDynamicVar { name, .. } if name == "roll"
+        ));
+
+        // a use of a dynamic root var; the declaration itself stays legal
+        let errors = model(
+            r#"
+            vars { roll = range(0, 1) }
+            scorer "s" { code { score = var.roll } }
+            trace "t" { input = var.roll }
+            "#,
+        )
+        .unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::ScorerDynamicVar { name, .. } if name == "roll"
+        ));
+    }
+
+    #[test]
+    fn models_scorer_file_stems() {
+        let stemmed = model(r#"scorer "s" { file = "quality" code { score = 0.5 } }"#).unwrap();
+        assert_eq!(stemmed.scorers[0].file.as_deref(), Some("quality"));
+
+        // unset stays none so the builder falls back to the slug
+        let unset = model(r#"scorer "s" { code { score = 0.5 } }"#).unwrap();
+        assert_eq!(unset.scorers[0].file, None);
+
+        // judges accept the attr even though builds skip them
+        let judge =
+            model(r#"scorer "s" { file = "quality" judge { model = "m" prompt = "p" options = { a = 1, b = 0 } } }"#).unwrap();
+        assert_eq!(judge.scorers[0].file.as_deref(), Some("quality"));
+    }
+
+    #[test]
+    fn rejects_invalid_scorer_files() {
+        for file in [r#""quality.py""#, r#""gen/quality""#, r#""""#, "3", r#"choice("a", "b")"#] {
+            let errors = model(&format!(r#"scorer "s" {{ file = {file} code {{ score = 0.5 }} }}"#)).unwrap_err();
+            assert!(matches!(errors[0].kind(), ErrorKind::InvalidScorerFile { .. }), "file {file}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_scorer_langs() {
+        for lang in [r#""rust""#, "3", "choice(\"python\", \"typescript\")"] {
+            let errors = model(&format!(r#"scorer "s" {{ lang = {lang} code {{ score = 0.5 }} }}"#)).unwrap_err();
+            assert!(matches!(errors[0].kind(), ErrorKind::InvalidScorerLang { .. }), "lang {lang}");
+        }
+    }
+
+    #[test]
+    fn requires_exactly_one_scorer_kind() {
+        let errors = model(r#"scorer "s" { lang = "python" }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::MissingScorerKind { .. }));
+
+        let errors = model(
+            r#"
+            scorer "s" {
+                code { score = 0.5 }
+                judge { model = "m" prompt = "p" options = { a = 1, b = 0 } }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::ExtraScorerKind { .. }));
+
+        let errors = model(r#"scorer "s" { code { score = 0.5 } code { score = 0.7 } }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::ExtraScorerKind { .. }));
+    }
+
+    #[test]
+    fn rejects_constant_scores_outside_range() {
+        let errors = model(r#"scorer "s" { code { score = 1.5 } }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::ScoreOutOfRange { .. }));
+
+        let errors = model(r#"scorer "s" { code { score = 0.5 when { cond = output == null score = -1 } } }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::ScoreOutOfRange { .. }));
+    }
+
+    #[test]
+    fn checks_scorer_field_types() {
+        let errors = model(r#"scorer "s" { code { score = "high" } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::TypeMismatch {
+                block: spec::ids::CODE,
+                field: spec::ids::SCORE,
+                expected: &spec::ExprType::Number,
+                found: ExprType::String,
+            }
+        );
+
+        let errors = model(r#"scorer "s" { code { score = 0.5 when { cond = 3 score = 0 } } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::TypeMismatch {
+                block: spec::ids::WHEN,
+                field: spec::ids::COND,
+                expected: &spec::ExprType::Boolean,
+                found: ExprType::Number,
+            }
+        );
+    }
+
+    #[test]
+    fn validates_judge_fields() {
+        let errors =
+            model(r#"scorer "s" { judge { model = "m ${input}" prompt = "p" options = { a = 1, b = 0 } } }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgeModel { .. }));
+
+        let errors = model(r#"scorer "s" { judge { model = "m" prompt = "p" options = { a = 1 } } }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgeOptions { .. }));
+
+        // prompt holes must be argument paths a template slot can express;
+        // a non-identifier key has no slot spelling
+        let errors = model(
+            r#"scorer "s" { judge { model = "m" prompt = "grade ${metadata["user tier"]}" options = { a = 1, b = 0 } } }"#,
+        )
+        .unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgePrompt { .. }));
+
+        // and a computed prompt expression is rejected even when it types as a string
+        let errors = model(
+            r#"scorer "s" { judge { model = "m" prompt = contains(output, "x") ? "a" : "b" options = { a = 1, b = 0 } } }"#,
+        )
+        .unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgePrompt { .. }));
+
+        // dotted argument selections stay legal prompt holes
+        let dotted =
+            model(r#"scorer "s" { judge { model = "m" prompt = "grade ${metadata.tier}" options = { a = 1, b = 0 } } }"#)
+                .unwrap();
+        assert!(matches!(dotted.scorers[0].kind, ScorerKind::Judge { .. }));
+
+        let errors = model(r#"scorer "s" { judge { model = "m" prompt = "p" options = { a = 1.5, b = 0 } } }"#).unwrap_err();
+        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgeOptions { .. }));
+
+        let errors = model(r#"scorer "s" { judge { model = "m" options = { a = 1, b = 0 } } }"#).unwrap_err();
+        assert_eq!(
+            errors[0].kind(),
+            &ErrorKind::MissingField {
+                block: spec::ids::JUDGE,
+                field: spec::ids::PROMPT,
+            }
+        );
+    }
+
+    #[test]
+    fn enforces_scorer_block_placement() {
+        let errors = model(r#"trace "t" { when { cond = true score = 1 } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::WHEN
+        ));
+
+        let errors = model(r#"trace "t" { scorer "s" { code { score = 0.5 } } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::SCORER
+        ));
+
+        let errors = model(r#"scorer "s" { task "x" { input = 1 } code { score = 0.5 } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::TASK
+        ));
+
+        let errors = model(r#"scorer "s" { code "named" { score = 0.5 } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::UnexpectedName { block } if *block == spec::ids::CODE
+        ));
+
+        let errors = model(r#"scorer { code { score = 0.5 } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::MissingName { block } if *block == spec::ids::SCORER
+        ));
+    }
+
+    #[test]
+    fn keeps_scorer_args_out_of_trace_scope() {
+        // bare scorer arg names stay unknown references in traces
+        let errors = model(r#"trace "t" { input = output }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::UnknownReference { path, .. } if path == "output"
+        ));
+    }
+
+    #[test]
+    fn defers_contains_over_reference_fed_targets() {
+        // the widening that lets scorers probe args also serves block refs
+        let model = model(
+            r#"
+            trace "t" {
+                task "x" { output = "hello" }
+                metrics = { hit = contains(task.x.output, "ell") ? 1 : 0 }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(model.traces.len(), 1);
     }
 }

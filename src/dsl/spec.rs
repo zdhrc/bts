@@ -201,6 +201,10 @@ pub(crate) mod ids {
     pub(crate) const REPEAT: Id = Id::new("block.repeat");
     pub(crate) const CHOICE: Id = Id::new("block.choice");
     pub(crate) const MAYBE: Id = Id::new("block.maybe");
+    pub(crate) const SCORER: Id = Id::new("block.scorer");
+    pub(crate) const CODE: Id = Id::new("block.code");
+    pub(crate) const JUDGE: Id = Id::new("block.judge");
+    pub(crate) const WHEN: Id = Id::new("block.when");
 
     pub(crate) const INPUT: Id = Id::new("field.input");
     pub(crate) const OUTPUT: Id = Id::new("field.output");
@@ -212,6 +216,13 @@ pub(crate) mod ids {
     pub(crate) const COUNT: Id = Id::new("field.count");
     pub(crate) const CHANCE: Id = Id::new("field.chance");
     pub(crate) const DURATION: Id = Id::new("field.duration");
+    pub(crate) const LANG: Id = Id::new("field.lang");
+    pub(crate) const FILE: Id = Id::new("field.file");
+    pub(crate) const SCORE: Id = Id::new("field.score");
+    pub(crate) const COND: Id = Id::new("field.cond");
+    pub(crate) const MODEL: Id = Id::new("field.model");
+    pub(crate) const PROMPT: Id = Id::new("field.prompt");
+    pub(crate) const OPTIONS: Id = Id::new("field.options");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
@@ -324,6 +335,15 @@ pub(crate) mod ids {
     pub(crate) const STATIC_STRUCTURE: Id = Id::new("rule.static-structure");
     pub(crate) const RESERVED_REPEAT_NAMES: Id = Id::new("rule.reserved-repeat-names");
     pub(crate) const REF_EXISTENCE: Id = Id::new("rule.reference-existence");
+    pub(crate) const SCORER_KIND: Id = Id::new("rule.scorer-kind");
+    pub(crate) const SCORER_ARGS: Id = Id::new("rule.scorer-arguments");
+    pub(crate) const SCORER_EXPRS: Id = Id::new("rule.scorer-expressions");
+    pub(crate) const SCORER_LANG: Id = Id::new("rule.scorer-lang");
+    pub(crate) const SCORER_FILE: Id = Id::new("rule.scorer-file");
+    pub(crate) const SCORE_RANGE: Id = Id::new("rule.score-range");
+    pub(crate) const JUDGE_MODEL: Id = Id::new("rule.judge-model");
+    pub(crate) const JUDGE_PROMPT: Id = Id::new("rule.judge-prompt");
+    pub(crate) const JUDGE_OPTIONS: Id = Id::new("rule.judge-options");
 
     pub(crate) const MULTI_TURN_CONVERSATION: Id = Id::new("example.multi-turn-conversation");
     pub(crate) const AGENT_TOOL_LOOP: Id = Id::new("example.agent-tool-loop");
@@ -332,11 +352,16 @@ pub(crate) mod ids {
     pub(crate) const WINDOWED_SESSION: Id = Id::new("example.windowed-session");
     pub(crate) const RAG_PIPELINE: Id = Id::new("example.rag-pipeline");
     pub(crate) const ERROR_AND_ESCALATION: Id = Id::new("example.error-and-escalation");
+    pub(crate) const CODE_SCORER: Id = Id::new("example.code-scorer");
+    pub(crate) const JUDGE_SCORER: Id = Id::new("example.judge-scorer");
 }
 
 const ANY: ExprType = ExprType::Any;
 const STRING: ExprType = ExprType::String;
+const NUMBER: ExprType = ExprType::Number;
+const BOOLEAN: ExprType = ExprType::Boolean;
 const OBJECT: ExprType = ExprType::Object { values: &ANY };
+const NUMBER_OBJECT: ExprType = ExprType::Object { values: &NUMBER };
 const STRING_ARRAY: ExprType = ExprType::Array { items: &STRING };
 
 const SPAN_FIELDS: &[FieldDesc] = &[
@@ -409,6 +434,7 @@ const ANYWHERE: &[Place] = &[
     Place::Block { id: ids::REPEAT },
     Place::Block { id: ids::CHOICE },
     Place::Block { id: ids::MAYBE },
+    Place::Block { id: ids::SCORER },
 ];
 const IN_TRACE_SPAN_OR_DYNAMIC: &[Place] = &[
     Place::Block { id: ids::TRACE },
@@ -420,6 +446,8 @@ const IN_TRACE_SPAN_OR_DYNAMIC: &[Place] = &[
     Place::Block { id: ids::CHOICE },
     Place::Block { id: ids::MAYBE },
 ];
+const IN_SCORER: &[Place] = &[Place::Block { id: ids::SCORER }];
+const IN_CODE: &[Place] = &[Place::Block { id: ids::CODE }];
 
 const REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
     id: ids::COUNT,
@@ -436,6 +464,72 @@ const MAYBE_FIELDS: &[FieldDesc] = &[FieldDesc {
     value: &ANY,
     cardinality: Cardinality::Optional,
 }];
+
+const SCORER_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::LANG,
+        keyword: "lang",
+        summary: "Language of the emitted scorer code, the constant string \"python\" or \"typescript\"; the push command may override it, and judge scorers ignore it. Defaults to python.",
+        value: &STRING,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::FILE,
+        keyword: "file",
+        summary: "Output file stem scorers with the same value pack into when built (`<file>.scorer.py`); defaults to the scorer's own name. Judge scorers have no source and ignore it.",
+        value: &STRING,
+        cardinality: Cardinality::Optional,
+    },
+];
+
+const CODE_FIELDS: &[FieldDesc] = &[FieldDesc {
+    id: ids::SCORE,
+    keyword: "score",
+    summary: "Fallback score expression, a number between 0 and 1, used when no `when` case matches.",
+    value: &NUMBER,
+    cardinality: Cardinality::Required,
+}];
+
+const WHEN_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::COND,
+        keyword: "cond",
+        summary: "Boolean condition over the scorer arguments; cases are checked in order and the first match wins.",
+        value: &BOOLEAN,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::SCORE,
+        keyword: "score",
+        summary: "Score produced when this case matches, a number between 0 and 1.",
+        value: &NUMBER,
+        cardinality: Cardinality::Required,
+    },
+];
+
+const JUDGE_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::MODEL,
+        keyword: "model",
+        summary: "Constant string naming the judge model, a registered model id like `gpt-4o-mini`.",
+        value: &STRING,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::PROMPT,
+        keyword: "prompt",
+        summary: "Judge prompt; `${input}`, `${output}`, `${expected}`, and `${metadata}` interpolate the scorer arguments.",
+        value: &STRING,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::OPTIONS,
+        keyword: "options",
+        summary: "Object mapping each choice label the judge may answer to the constant score it yields.",
+        value: &NUMBER_OBJECT,
+        cardinality: Cardinality::Required,
+    },
+];
 
 const NO_RULES: &[RuleDesc] = &[];
 const NO_CONVENTIONS: &[&str] = &[];
@@ -482,6 +576,67 @@ const CHOICE_CONVENTIONS: &[&str] = &[
 const MAYBE_CONVENTIONS: &[&str] = &[
     "Model rare paths — errors, escalations, retries — at realistic single-digit chances.",
     "Children are included together or not at all, so one maybe block holds a whole correlated failure; nest maybe inside choice branches to give paths different failure rates.",
+];
+const SCORER_CONVENTIONS: &[&str] = &[
+    "Name scorers the way Braintrust scorer functions are named, lowercase and hyphenated (`response-quality`), never a prose description.",
+    "Scorers usually live in their own .bt file with no trace block; a shape file keeps its one-trace-per-file convention.",
+];
+const CODE_CONVENTIONS: &[&str] = &[
+    "Sample scores from a distribution clamped into range (`clamp(normal(0.78, 0.12), 0, 1)`) instead of constants so scores vary realistically.",
+    "Give failure modes their own `when` cases with low score ranges so the scorer reacts to what the output actually says.",
+];
+const JUDGE_CONVENTIONS: &[&str] = &[
+    "Write the prompt as an instruction to a grader and interpolate the arguments it should judge: `${input}`, `${output}`.",
+    "`options` keys are the labels the judge answers with; values are the scores they map to, best first (`{ excellent = 1.0, good = 0.6, poor = 0.2 }`).",
+    "Use a real registered model id for `model` so the pushed scorer can run.",
+];
+
+const SCORER_KIND_RULE: RuleDesc = RuleDesc {
+    id: ids::SCORER_KIND,
+    summary: "A scorer declares exactly one `code` or `judge` block.",
+};
+const SCORER_ARGS_RULE: RuleDesc = RuleDesc {
+    id: ids::SCORER_ARGS,
+    summary: "Inside a scorer, bare `input`, `output`, `expected`, and `metadata` are the arguments Braintrust passes the scorer at runtime; block references, `self`, `trace.index`, and `repeat.index`/`repeat.count` are not available.",
+};
+const SCORER_EXPRS_RULE: RuleDesc = RuleDesc {
+    id: ids::SCORER_EXPRS,
+    summary: "Scorer expressions must translate to the emitted Python or TypeScript: `tokens` and `noise` are unavailable, and a referenced variable must have a constant value.",
+};
+const SCORER_LANG_RULE: RuleDesc = RuleDesc {
+    id: ids::SCORER_LANG,
+    summary: "`lang` is the constant string \"python\" or \"typescript\".",
+};
+const SCORER_FILE_RULE: RuleDesc = RuleDesc {
+    id: ids::SCORER_FILE,
+    summary: "`file` is a constant string naming a bare file stem, without path separators or extensions; scorers packed into one file must resolve to the same language.",
+};
+const SCORE_RANGE_RULE: RuleDesc = RuleDesc {
+    id: ids::SCORE_RANGE,
+    summary: "A constant `score` must be between 0 and 1; keep sampled scores in range with `clamp`.",
+};
+const SCORER_RULES: &[RuleDesc] = &[
+    SCORER_KIND_RULE,
+    SCORER_ARGS_RULE,
+    SCORER_EXPRS_RULE,
+    SCORER_LANG_RULE,
+    SCORER_FILE_RULE,
+];
+const CODE_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
+const WHEN_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
+const JUDGE_RULES: &[RuleDesc] = &[
+    RuleDesc {
+        id: ids::JUDGE_MODEL,
+        summary: "`model` is a constant string.",
+    },
+    RuleDesc {
+        id: ids::JUDGE_PROMPT,
+        summary: "`prompt` is a string whose interpolations may only be scorer argument paths like `${input}` or `${metadata.tier}`, since the pushed judge renders them as prompt template slots.",
+    },
+    RuleDesc {
+        id: ids::JUDGE_OPTIONS,
+        summary: "`options` maps at least two labels to constant scores between 0 and 1.",
+    },
 ];
 const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
     id: ids::FINITE_NUMBERS,
@@ -1331,6 +1486,62 @@ const BLOCKS: &[BlockDesc] = &[
         rules: MAYBE_RULES,
         conventions: MAYBE_CONVENTIONS,
     },
+    BlockDesc {
+        id: ids::SCORER,
+        keyword: "scorer",
+        summary: "A named scorer pushed to Braintrust as a scorer function rather than generated as spans.",
+        syntax: "scorer \"<name>\" { [lang = <string>] [file = <string>] (code { ... } | judge { ... }) }",
+        name: NamePolicy::Required,
+        allowed_in: ROOT_ONLY,
+        body: BodyDesc {
+            fields: SCORER_FIELDS,
+            open: false,
+        },
+        rules: SCORER_RULES,
+        conventions: SCORER_CONVENTIONS,
+    },
+    BlockDesc {
+        id: ids::CODE,
+        keyword: "code",
+        summary: "A code scorer body emitted as a scorer function in the declared language; `when` cases check in order, the first match wins, and `score` is the fallback.",
+        syntax: "code { score = <number> [when { ... }] ... }",
+        name: NamePolicy::Forbidden,
+        allowed_in: IN_SCORER,
+        body: BodyDesc {
+            fields: CODE_FIELDS,
+            open: false,
+        },
+        rules: CODE_RULES,
+        conventions: CODE_CONVENTIONS,
+    },
+    BlockDesc {
+        id: ids::WHEN,
+        keyword: "when",
+        summary: "One ordered case of a code scorer: when `cond` holds, the case's `score` is returned.",
+        syntax: "when { cond = <boolean> score = <number> }",
+        name: NamePolicy::Forbidden,
+        allowed_in: IN_CODE,
+        body: BodyDesc {
+            fields: WHEN_FIELDS,
+            open: false,
+        },
+        rules: WHEN_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
+        id: ids::JUDGE,
+        keyword: "judge",
+        summary: "An LLM-as-a-judge scorer body pushed as a Braintrust prompt function: the model grades against the prompt and its answer maps to a score through `options`.",
+        syntax: "judge { model = <string> prompt = <string> options = { <label> = <number>, ... } }",
+        name: NamePolicy::Forbidden,
+        allowed_in: IN_SCORER,
+        body: BodyDesc {
+            fields: JUDGE_FIELDS,
+            open: false,
+        },
+        rules: JUDGE_RULES,
+        conventions: JUDGE_CONVENTIONS,
+    },
 ];
 
 pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
@@ -1338,7 +1549,7 @@ pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
 const RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::NONEMPTY_SHAPE,
-        summary: "A shape must declare at least one trace block.",
+        summary: "A shape must declare at least one trace or scorer block.",
     },
     RuleDesc {
         id: ids::RESERVED_METRICS,
@@ -1398,6 +1609,20 @@ const EXAMPLES: &[Example] = &[
         summary: "A happy path with a maybe-gated failure, retry, and human escalation.",
         note: "Expand along failure rate and failure variety — declines, timeouts, empty outputs — keeping each correlated failure inside one maybe block.",
         source: include_str!("../../examples/error_and_escalation.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::CODE_SCORER,
+        summary: "A code scorer reacting to the scored output through ordered when cases.",
+        note: "Expand along failure modes: each way an output can be wrong deserves its own when case with a matching score range.",
+        source: include_str!("../../examples/code_scorer.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::JUDGE_SCORER,
+        summary: "An LLM-as-a-judge scorer grading responses against labeled options.",
+        note: "Expand along rubric granularity: more options give the judge finer distinctions to award.",
+        source: include_str!("../../examples/judge_scorer.bt"),
         valid: true,
     },
 ];

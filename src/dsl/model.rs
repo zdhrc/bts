@@ -8,6 +8,8 @@ pub(crate) struct Model {
     // resolved block references, indexed by RefId; Value::BlockRef stays an
     // opaque handle so the modeler can resolve after its single walk completes
     pub(crate) refs: Vec<ResolvedRef>,
+    // root scorer blocks in declaration order, consumed by scg rather than sdg
+    pub(crate) scorers: Vec<Scorer>,
 }
 
 // a block's identity, assigned in walk order; stable across a compile so both
@@ -172,6 +174,63 @@ pub(crate) struct SpanFields {
     pub(crate) duration: Option<(Value, SrcRange)>,
 }
 
+// a component pushed to braintrust rather than generated as spans; scorer
+// expressions are the transpilable subset, validated by the modeler so
+// emission never fails on a compiled model
+#[derive(Debug, Clone)]
+pub(crate) struct Scorer {
+    pub(crate) name: String,
+    // none = unset in source; the push side picks the default
+    pub(crate) lang: Option<ScorerLang>,
+    // output file stem this scorer packs into when built; none = its own slug
+    pub(crate) file: Option<String>,
+    pub(crate) kind: ScorerKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ScorerLang {
+    Python,
+    Typescript,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ScorerKind {
+    Code {
+        // the fallback when no `when` case matches
+        score: Value,
+        whens: Vec<When>,
+    },
+    Judge {
+        model: String,
+        // a string or template; holes only interpolate scorer args
+        prompt: Value,
+        options: Vec<JudgeOption>,
+    },
+}
+
+// one ordered case of a code scorer; the first matching cond wins
+#[derive(Debug, Clone)]
+pub(crate) struct When {
+    pub(crate) cond: Value,
+    pub(crate) score: Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JudgeOption {
+    pub(crate) label: String,
+    pub(crate) score: f64,
+}
+
+// the runtime arguments braintrust passes a scorer; read by the emitted
+// scorer code, never evaluated during generation
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ScorerArg {
+    Input,
+    Output,
+    Expected,
+    Metadata,
+}
+
 // a validated context reference, usable as a value or a template part
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum CtxRef {
@@ -218,6 +277,9 @@ pub(crate) enum Value {
     VarRef(String),
     // a context index resolved during generation, validated by the modeler
     CtxRef(CtxRef),
+    // a scorer runtime argument, resolved by the emitted scorer code rather
+    // than during generation; only appears inside scorer expressions
+    ArgRef(ScorerArg),
     // a block reference resolved through Model.refs during generation
     BlockRef {
         ref_id: RefId,

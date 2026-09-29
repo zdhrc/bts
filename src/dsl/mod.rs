@@ -9,8 +9,8 @@ pub(crate) mod spec;
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use model::{
     Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId,
-    Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, SpanFields, SpanKind, Step, Template,
-    Trace, UnaryOp, Value,
+    Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, Selection,
+    SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, When,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
