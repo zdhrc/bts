@@ -7,6 +7,9 @@ const BRAINTRUST_API_URL: &str = "https://api.braintrust.dev";
 const CONFIG_PATH: &str = ".bt/bts/config.toml";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WRITE_CONCURRENCY: usize = 8;
+const DEFAULT_MAX_ATTACHMENT_UPLOADS: usize = 16;
+const DEFAULT_MAX_ATTACHMENT_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_KEPT_RUNS: usize = 20;
 
@@ -17,6 +20,9 @@ pub(crate) struct Braintrust {
     pub(crate) project_id: Uuid,
     pub(crate) request_timeout: Duration,
     pub(crate) write_concurrency: usize,
+    pub(crate) max_attachment_uploads: usize,
+    pub(crate) max_attachment_file_bytes: u64,
+    pub(crate) max_attachment_total_bytes: u64,
 }
 
 impl Braintrust {
@@ -27,6 +33,9 @@ impl Braintrust {
             project_id,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             write_concurrency: DEFAULT_WRITE_CONCURRENCY,
+            max_attachment_uploads: DEFAULT_MAX_ATTACHMENT_UPLOADS,
+            max_attachment_file_bytes: DEFAULT_MAX_ATTACHMENT_FILE_BYTES,
+            max_attachment_total_bytes: DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES,
         }
     }
 
@@ -51,6 +60,9 @@ pub(crate) struct Settings {
     pub(crate) keep_runs: usize,
     pub(crate) request_timeout: Duration,
     pub(crate) write_concurrency: usize,
+    pub(crate) max_attachment_uploads: usize,
+    pub(crate) max_attachment_file_bytes: u64,
+    pub(crate) max_attachment_total_bytes: u64,
 }
 
 impl Default for Settings {
@@ -60,6 +72,9 @@ impl Default for Settings {
             keep_runs: DEFAULT_KEPT_RUNS,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             write_concurrency: DEFAULT_WRITE_CONCURRENCY,
+            max_attachment_uploads: DEFAULT_MAX_ATTACHMENT_UPLOADS,
+            max_attachment_file_bytes: DEFAULT_MAX_ATTACHMENT_FILE_BYTES,
+            max_attachment_total_bytes: DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES,
         }
     }
 }
@@ -109,6 +124,37 @@ impl Settings {
             }
             settings.write_concurrency = concurrency;
         }
+        if let Some(value) = file.attachments.max_uploads {
+            if value == 0 {
+                return Err(Error::InvalidAttachmentLimit {
+                    path: path.to_owned(),
+                    name: "max_uploads",
+                });
+            }
+            settings.max_attachment_uploads = value;
+        }
+        for (name, value, target) in [
+            (
+                "max_file_bytes",
+                file.attachments.max_file_bytes,
+                &mut settings.max_attachment_file_bytes,
+            ),
+            (
+                "max_total_bytes",
+                file.attachments.max_total_bytes,
+                &mut settings.max_attachment_total_bytes,
+            ),
+        ] {
+            if let Some(value) = value {
+                if value == 0 {
+                    return Err(Error::InvalidAttachmentLimit {
+                        path: path.to_owned(),
+                        name,
+                    });
+                }
+                *target = value;
+            }
+        }
 
         Ok(settings)
     }
@@ -120,6 +166,15 @@ impl Settings {
 struct FileSettings {
     log: LogSection,
     http: HttpSection,
+    attachments: AttachmentSection,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct AttachmentSection {
+    max_uploads: Option<usize>,
+    max_file_bytes: Option<u64>,
+    max_total_bytes: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -205,6 +260,7 @@ pub(crate) enum Error {
     InvalidLogLevel { path: PathBuf, value: String, reason: String },
     InvalidTimeout { path: PathBuf, value: String, reason: String },
     InvalidConcurrency { path: PathBuf },
+    InvalidAttachmentLimit { path: PathBuf, name: &'static str },
 }
 
 impl fmt::Display for Error {
@@ -238,6 +294,13 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
+            Self::InvalidAttachmentLimit { path, name } => {
+                write!(
+                    formatter,
+                    "invalid attachments.{name} in {}: must be greater than zero",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -263,6 +326,11 @@ mod tests {
             [http]
             request_timeout = "2m"
             write_concurrency = 4
+
+            [attachments]
+            max_uploads = 3
+            max_file_bytes = 1024
+            max_total_bytes = 2048
             "#,
         )
         .unwrap();
@@ -271,6 +339,9 @@ mod tests {
         assert_eq!(settings.keep_runs, 5);
         assert_eq!(settings.request_timeout, Duration::from_secs(120));
         assert_eq!(settings.write_concurrency, 4);
+        assert_eq!(settings.max_attachment_uploads, 3);
+        assert_eq!(settings.max_attachment_file_bytes, 1024);
+        assert_eq!(settings.max_attachment_total_bytes, 2048);
     }
 
     #[test]
@@ -280,6 +351,9 @@ mod tests {
             assert_eq!(settings.keep_runs, DEFAULT_KEPT_RUNS);
             assert_eq!(settings.request_timeout, DEFAULT_REQUEST_TIMEOUT);
             assert_eq!(settings.write_concurrency, DEFAULT_WRITE_CONCURRENCY);
+            assert_eq!(settings.max_attachment_uploads, DEFAULT_MAX_ATTACHMENT_UPLOADS);
+            assert_eq!(settings.max_attachment_file_bytes, DEFAULT_MAX_ATTACHMENT_FILE_BYTES);
+            assert_eq!(settings.max_attachment_total_bytes, DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES);
         }
         assert_eq!(parse("").unwrap().log_level, DEFAULT_LOG_LEVEL);
     }
@@ -321,6 +395,14 @@ mod tests {
     fn rejects_a_zero_write_concurrency() {
         let error = parse("[http]\nwrite_concurrency = 0\n").unwrap_err();
         assert!(matches!(error, Error::InvalidConcurrency { .. }), "{error}");
+    }
+
+    #[test]
+    fn rejects_zero_attachment_limits() {
+        for name in ["max_uploads", "max_file_bytes", "max_total_bytes"] {
+            let error = parse(&format!("[attachments]\n{name} = 0\n")).unwrap_err();
+            assert!(matches!(error, Error::InvalidAttachmentLimit { name: invalid, .. } if invalid == name));
+        }
     }
 
     #[test]

@@ -1,8 +1,10 @@
-use crate::sdg::planner::{EventFields, EventRef, Plan};
+use crate::sdg::planner::{Attachment, EventFields, EventRef, Plan};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -34,15 +36,84 @@ pub(crate) struct EventBatch {
 
     #[serde(skip)]
     pub(super) trace_count: usize,
+
+    #[serde(skip)]
+    pub(super) attachments: Box<[Attachment]>,
 }
 
 impl EventBatch {
+    pub(crate) fn resolve_attachment_paths(&mut self, shape_file: &Path) -> std::io::Result<()> {
+        if self.attachments.is_empty() {
+            return Ok(());
+        }
+
+        let shape_file = std::path::absolute(shape_file)?;
+        let shape_dir = shape_file.parent().expect("an absolute shape path has a parent");
+        let mut uploads: HashMap<(PathBuf, String), String> = HashMap::new();
+        let mut replacement_keys = HashMap::new();
+        let mut distinct = Vec::new();
+        for mut attachment in std::mem::take(&mut self.attachments).into_vec() {
+            let generated_key = attachment.key.clone();
+            let path = Path::new(&attachment.path);
+            if path.is_relative() {
+                attachment.path = shape_dir
+                    .join(path)
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "attachment path is not UTF-8"))?;
+            }
+            let identity = (PathBuf::from(&attachment.path), attachment.content_type.clone());
+            let key = if let Some(key) = uploads.get(&identity) {
+                key.clone()
+            } else {
+                let key = Uuid::new_v4().to_string();
+                uploads.insert(identity, key.clone());
+                attachment.key = key.clone();
+                distinct.push(attachment.clone());
+                key
+            };
+            replacement_keys.insert(generated_key, key);
+        }
+        self.attachments = distinct.into_boxed_slice();
+        for event in &mut self.events {
+            for field in [&mut event.input, &mut event.output, &mut event.expected, &mut event.error] {
+                if let Some(value) = field {
+                    replace_attachment_keys(value, &replacement_keys);
+                }
+            }
+            if let Some(metadata) = &mut event.metadata {
+                for value in metadata.values_mut() {
+                    replace_attachment_keys(value, &replacement_keys);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn event_count(&self) -> usize {
         self.events.len()
     }
 
     pub(crate) fn trace_count(&self) -> usize {
         self.trace_count
+    }
+}
+
+fn replace_attachment_keys(value: &mut JsonValue, keys: &HashMap<String, String>) {
+    match value {
+        JsonValue::Object(fields) => {
+            if fields.get("type").and_then(JsonValue::as_str) == Some("braintrust_attachment") {
+                if let Some(key) = fields.get("key").and_then(JsonValue::as_str).and_then(|key| keys.get(key)) {
+                    fields.insert("key".to_owned(), JsonValue::String(key.clone()));
+                    return;
+                }
+            }
+            for value in fields.values_mut() {
+                replace_attachment_keys(value, keys);
+            }
+        }
+        JsonValue::Array(values) => values.iter_mut().for_each(|value| replace_attachment_keys(value, keys)),
+        _ => {}
     }
 }
 
@@ -201,6 +272,7 @@ impl Materializer {
         Ok(EventBatch {
             events: events.into_boxed_slice(),
             trace_count: self.plan.traces.len(),
+            attachments: std::mem::take(&mut self.plan.attachments),
         })
     }
 
@@ -441,6 +513,7 @@ mod tests {
         let mut metrics = JsonMap::new();
         metrics.insert("start".to_owned(), JsonValue::from(1));
         let plan = Plan {
+            attachments: Box::new([]),
             events: Box::new([EventPlan {
                 root: EventRef(0),
                 parent: None,

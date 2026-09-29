@@ -19,6 +19,16 @@ const CONFIG_TEMPLATE: &str = r#"# bts runtime configuration; every key is optio
 # how many insert requests are in flight at once; lower this on flaky
 # connections or when Braintrust rate limits, must be greater than zero
 #write_concurrency = 8
+
+[attachments]
+# maximum number of distinct attachment uploads in one write run
+#max_uploads = 16
+
+# maximum size of one attachment in bytes (20 MiB)
+#max_file_bytes = 20971520
+
+# maximum combined upload size in bytes (100 MiB)
+#max_total_bytes = 104857600
 "#;
 
 #[derive(Debug, clap::Args)]

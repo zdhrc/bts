@@ -213,6 +213,12 @@ pub(crate) enum Value {
     Null,
     Array(Array),
     Object(Object),
+    Attachment {
+        path: String,
+        filename: String,
+        content_type: String,
+        key: String,
+    },
     // a reference to a scoped binding, looked up in the environment during
     // generation; the modeler guarantees the name is bound
     VarRef(String),
@@ -265,6 +271,10 @@ pub(crate) enum Value {
 // still fail on values only known during generation (bounds, overflow, elements)
 #[derive(Debug, Clone)]
 pub(crate) enum Func {
+    Attachment {
+        path: String,
+        content_type: String,
+    },
     Choice(Vec<Value>),
     Range(Range),
     Weighted(Vec<WeightedOption>),
