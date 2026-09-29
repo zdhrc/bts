@@ -318,6 +318,66 @@ fn writes_generated_events_to_the_configured_endpoint() {
 }
 
 #[test]
+fn uploads_an_attachment_before_inserting_its_reference() {
+    let file = std::env::temp_dir().join(format!("bts-attachment-{}.pdf", Uuid::new_v4()));
+    let contents = b"small pdf test payload";
+    fs::write(&file, contents).unwrap();
+    let path_literal = serde_json::to_string(&file.display().to_string()).unwrap();
+    let shape = write_shape(&format!(
+        "trace \"review\" {{ input = {{ document = attachment({path_literal}, \"application/pdf\") }} }}"
+    ));
+    let project_id = Uuid::new_v4();
+    let org_id = Uuid::new_v4();
+    let (api_url, requests) = serve_attachment_flow(org_id);
+
+    let output = bts()
+        .args(["write", "--from"])
+        .arg(&shape)
+        .args(["--count", "1", "--over", "1h"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_file(&file).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 5);
+    let (project_headers, _) = split_request(&requests[0]);
+    assert!(project_headers.starts_with(&format!("GET /v1/project/{project_id} HTTP/1.1\r\n")));
+
+    let (init_headers, init_body) = split_request(&requests[1]);
+    assert!(init_headers.starts_with("POST /attachment HTTP/1.1\r\n"));
+    let init: JsonValue = serde_json::from_slice(init_body).unwrap();
+    assert_eq!(init["org_id"], org_id.to_string());
+    assert_eq!(init["filename"], file.file_name().unwrap().to_string_lossy().as_ref());
+    assert_eq!(init["content_type"], "application/pdf");
+    let key = init["key"].as_str().unwrap();
+
+    let (upload_headers, upload_body) = split_request(&requests[2]);
+    assert!(upload_headers.starts_with("PUT /blob HTTP/1.1\r\n"));
+    assert!(!upload_headers.to_ascii_lowercase().contains("authorization:"));
+    assert!(upload_headers.to_ascii_lowercase().contains("if-none-match: *\r\n"));
+    assert_eq!(upload_body, contents);
+
+    let (status_headers, status_body) = split_request(&requests[3]);
+    assert!(status_headers.starts_with("POST /attachment/status HTTP/1.1\r\n"));
+    let status: JsonValue = serde_json::from_slice(status_body).unwrap();
+    assert_eq!(status["key"], key);
+    assert_eq!(status["status"]["upload_status"], "done");
+
+    let (insert_headers, insert_body) = split_request(&requests[4]);
+    assert!(insert_headers.starts_with(&format!("POST /v1/project_logs/{project_id}/insert HTTP/1.1\r\n")));
+    let inserted: JsonValue = serde_json::from_slice(insert_body).unwrap();
+    let document = &inserted["events"][0]["input"]["document"];
+    assert_eq!(document["type"], "braintrust_attachment");
+    assert_eq!(document["key"], key);
+    assert_eq!(document["content_type"], "application/pdf");
+}
+
+#[test]
 fn emits_a_json_summary_when_requested() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
@@ -381,6 +441,40 @@ fn serve_insert(row_count: usize) -> (String, Receiver<Vec<u8>>) {
             body,
         )
         .unwrap();
+    });
+
+    (format!("http://{address}"), receiver)
+}
+
+fn serve_attachment_flow(org_id: Uuid) -> (String, Receiver<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for step in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_request(&mut stream));
+            let body = match step {
+                0 => serde_json::json!({ "org_id": org_id.to_string() }).to_string(),
+                1 => serde_json::json!({
+                    "signedUrl": format!("http://{address}/blob"),
+                    "headers": { "If-None-Match": "*" },
+                })
+                .to_string(),
+                4 => serde_json::json!({ "row_ids": ["row"] }).to_string(),
+                _ => "{}".to_owned(),
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+        }
+        sender.send(requests).unwrap();
     });
 
     (format!("http://{address}"), receiver)

@@ -271,6 +271,7 @@ pub(crate) mod ids {
     pub(crate) const FUNC_HEX: Id = Id::new("func.hex");
     pub(crate) const FUNC_ALPHANUM: Id = Id::new("func.alphanum");
     pub(crate) const FUNC_NOISE: Id = Id::new("func.noise");
+    pub(crate) const FUNC_ATTACHMENT: Id = Id::new("func.attachment");
 
     pub(crate) const MULTILINE_DELIMITERS: Id = Id::new("rule.multiline-delimiters");
     pub(crate) const MULTILINE_INDENT: Id = Id::new("rule.multiline-indentation");
@@ -1196,6 +1197,14 @@ const FUNCS: &[FuncDesc] = &[
         summary: "A random alphanumeric string (0-9, A-Z, a-z) of the given constant length, for each generated trace.",
         examples: &["alphanum(12)"],
         rules: RANDOM_STRING_RULES,
+    },
+    FuncDesc {
+        id: ids::FUNC_ATTACHMENT,
+        name: "attachment",
+        syntax: "attachment(path, content_type)",
+        summary: "References a local file as an attachment in a logged value. This initial form takes a constant absolute path and MIME type.",
+        examples: &["attachment(\"/tmp/report.pdf\", \"application/pdf\")"],
+        rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
         id: ids::FUNC_NOISE,

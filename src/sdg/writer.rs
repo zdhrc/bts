@@ -1,7 +1,14 @@
-use crate::{conf::Braintrust, sdg::materializer::EventBatch};
+use crate::{
+    conf::Braintrust,
+    sdg::{materializer::EventBatch, planner::Attachment},
+};
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
-use reqwest::{StatusCode, blocking::Client};
+use reqwest::{
+    StatusCode,
+    blocking::{Client, Response},
+};
 use serde::Deserialize;
+use std::fs;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, thread, time::Duration};
@@ -16,12 +23,46 @@ const PAYLOAD_CLOSE: &[u8] = b"]}";
 // transient failures (timeouts, 429s, 5xx) back off exponentially before giving up; the
 // server's Retry-After wins over the computed backoff when present, capped so a run never stalls
 const MAX_SEND_ATTEMPTS: u32 = 4;
+const MAX_ATTACHMENT_STATUS_ATTEMPTS: u32 = 3;
+const MAX_ATTACHMENT_RECONCILE_ATTEMPTS: u32 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_ATTACHMENT_ERROR_CHARS: usize = 512;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct InsertResponse {
     row_ids: Box<[String]>,
+}
+
+#[derive(Deserialize)]
+struct ProjectResponse {
+    org_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachmentResponse {
+    signed_url: String,
+    headers: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttachmentMetadata {
+    status: AttachmentStatus,
+    content_length: Option<u64>,
+    download_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttachmentStatus {
+    upload_status: String,
+    error_message: Option<String>,
+}
+
+enum ReconcileError {
+    ReportedError(String),
+    Unknown(String),
 }
 
 impl InsertResponse {
@@ -59,6 +100,9 @@ impl<'config> Writer<'config> {
             self.config.project_id,
         );
         let payloads = payloads(events, MAX_PAYLOAD_BYTES)?;
+        if !events.attachments.is_empty() {
+            self.upload_attachments(&events.attachments)?;
+        }
         let workers = self.config.write_concurrency.min(payloads.len()).max(1);
         // payloads are indexed so acknowledged row ids reassemble in submission
         // order no matter which worker finishes first
@@ -70,7 +114,7 @@ impl<'config> Writer<'config> {
         // workers re-enter the caller's span so insert logs keep their place in the tree
         let span = tracing::Span::current();
 
-        thread::scope(|scope| {
+        let insert_result = thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
                 .map(|_| {
                     scope.spawn(|| {
@@ -83,7 +127,17 @@ impl<'config> Writer<'config> {
             handles
                 .into_iter()
                 .try_for_each(|handle| handle.join().expect("writer worker panicked"))
-        })?;
+        });
+        if let Err(source) = insert_result {
+            return Err(if events.attachments.is_empty() {
+                source
+            } else {
+                Error::new(ErrorKind::InsertAfterAttachments {
+                    uploaded: events.attachments.len(),
+                    source: Box::new(source),
+                })
+            });
+        }
 
         let mut row_ids = Vec::with_capacity(events.event_count());
         for slot in slots.into_inner().unwrap() {
@@ -93,6 +147,213 @@ impl<'config> Writer<'config> {
         Ok(InsertResponse {
             row_ids: row_ids.into_boxed_slice(),
         })
+    }
+
+    fn upload_attachments(&self, attachments: &[Attachment]) -> Result<(), Error> {
+        let project_url = format!(
+            "{}/v1/project/{}",
+            self.config.api_url.trim_end_matches('/'),
+            self.config.project_id,
+        );
+        let response = self
+            .client
+            .get(project_url)
+            .bearer_auth(&self.config.api_key)
+            .send()
+            .map_err(|source| {
+                Error::new(ErrorKind::Attachment(format!(
+                    "project lookup failed: {}",
+                    source.without_url()
+                )))
+            })?;
+        let project: ProjectResponse = successful_attachment_response(response)
+            .and_then(|response| {
+                response
+                    .json()
+                    .map_err(|source| format!("invalid project response: {}", source.without_url()))
+            })
+            .map_err(|detail| Error::new(ErrorKind::Attachment(format!("project lookup failed: {detail}"))))?;
+
+        for (index, attachment) in attachments.iter().enumerate() {
+            self.upload_attachment(attachment, &project.org_id).map_err(|detail| {
+                Error::new(ErrorKind::Attachment(format!(
+                    "attachment {}/{} {} (key {}): {detail}; {} earlier upload(s) completed; no log rows inserted",
+                    index + 1,
+                    attachments.len(),
+                    attachment.path,
+                    attachment.key,
+                    index,
+                )))
+            })?;
+            tracing::info!(
+                key = %attachment.key,
+                path = %attachment.path,
+                uploaded = index + 1,
+                total = attachments.len(),
+                "attachment uploaded",
+            );
+        }
+        Ok(())
+    }
+
+    fn upload_attachment(&self, attachment: &Attachment, org_id: &str) -> Result<(), String> {
+        let bytes = fs::read(&attachment.path).map_err(|source| format!("file read failed: {source}"))?;
+        let api_url = self.config.api_url.trim_end_matches('/');
+        let response = self
+            .client
+            .post(format!("{api_url}/attachment"))
+            .bearer_auth(&self.config.api_key)
+            .json(&serde_json::json!({
+                "key": attachment.key,
+                "filename": attachment.filename,
+                "content_type": attachment.content_type,
+                "org_id": org_id,
+            }))
+            .send()
+            .map_err(|source| {
+                format!(
+                    "initialization outcome unknown; request was not retried: {}",
+                    source.without_url()
+                )
+            })?;
+        let init: AttachmentResponse = successful_attachment_response(response)
+            .and_then(|response| {
+                response
+                    .json()
+                    .map_err(|source| format!("initialization outcome unknown: invalid response: {}", source.without_url()))
+            })
+            .map_err(|detail| format!("initialization failed: {detail}"))?;
+
+        let mut upload = self.client.put(&init.signed_url);
+        for (name, value) in init.headers {
+            upload = upload.header(name, value);
+        }
+        let expected_bytes = bytes.len() as u64;
+        match upload.body(bytes).send() {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) if is_definite_upload_rejection(response.status()) => {
+                let failure = format!("signed upload rejected with HTTP {}", response.status());
+                let status_result = self.set_attachment_status(attachment, org_id, "error", Some(&failure));
+                return Err(match status_result {
+                    Ok(()) => format!("{failure}; Braintrust marked the attachment as error"),
+                    Err(status_error) => format!("{failure}; error status update also failed: {status_error}"),
+                });
+            }
+            Ok(response) => {
+                let failure = format!("signed upload returned HTTP {}", response.status());
+                self.reconcile_attachment(attachment, org_id, expected_bytes)
+                    .map_err(|error| describe_reconciliation_error(&failure, error))?;
+            }
+            Err(source) => {
+                let failure = format!("signed upload request failed: {}", source.without_url());
+                self.reconcile_attachment(attachment, org_id, expected_bytes)
+                    .map_err(|error| describe_reconciliation_error(&failure, error))?;
+            }
+        }
+
+        self.set_attachment_status(attachment, org_id, "done", None)
+            .map_err(|detail| format!("file uploaded, but completion status update failed: {detail}"))?;
+        Ok(())
+    }
+
+    fn reconcile_attachment(&self, attachment: &Attachment, org_id: &str, expected_bytes: u64) -> Result<(), ReconcileError> {
+        let url = format!("{}/attachment", self.config.api_url.trim_end_matches('/'));
+        let mut last_result = String::from("no attachment metadata received");
+        for attempt in 1..=MAX_ATTACHMENT_RECONCILE_ATTEMPTS {
+            let response = self
+                .client
+                .get(&url)
+                .bearer_auth(&self.config.api_key)
+                .query(&[
+                    ("key", attachment.key.as_str()),
+                    ("filename", attachment.filename.as_str()),
+                    ("content_type", attachment.content_type.as_str()),
+                    ("org_id", org_id),
+                ])
+                .send();
+            last_result = match response {
+                Ok(response) => match successful_attachment_response(response).and_then(|response| {
+                    response
+                        .json::<AttachmentMetadata>()
+                        .map_err(|source| source.without_url().to_string())
+                }) {
+                    Ok(metadata) => {
+                        if metadata.status.upload_status == "error" {
+                            return Err(ReconcileError::ReportedError(safe_attachment_detail(
+                                &metadata
+                                    .status
+                                    .error_message
+                                    .unwrap_or_else(|| "no detail provided".to_owned()),
+                            )));
+                        }
+                        if let Some(actual) = metadata.content_length {
+                            if actual != expected_bytes {
+                                return Err(ReconcileError::Unknown(format!(
+                                    "GET /attachment reports a stored object of {actual} bytes, expected {expected_bytes}"
+                                )));
+                            }
+                        }
+                        if metadata.content_length == Some(expected_bytes)
+                            || metadata.download_url.is_some_and(|url| !url.is_empty())
+                        {
+                            return Ok(());
+                        }
+                        format!(
+                            "Braintrust reports attachment status {} without verifiable object metadata",
+                            metadata.status.upload_status
+                        )
+                    }
+                    Err(detail) => detail,
+                },
+                Err(source) => source.without_url().to_string(),
+            };
+            if attempt < MAX_ATTACHMENT_RECONCILE_ATTEMPTS {
+                thread::sleep(self.backoff_base);
+            }
+        }
+        Err(ReconcileError::Unknown(format!(
+            "GET /attachment did not confirm the uploaded object after {MAX_ATTACHMENT_RECONCILE_ATTEMPTS} attempts: {last_result}"
+        )))
+    }
+
+    fn set_attachment_status(
+        &self,
+        attachment: &Attachment,
+        org_id: &str,
+        upload_status: &str,
+        error_message: Option<&str>,
+    ) -> Result<(), String> {
+        let url = format!("{}/attachment/status", self.config.api_url.trim_end_matches('/'));
+        let status = match error_message {
+            Some(message) => serde_json::json!({ "upload_status": upload_status, "error_message": message }),
+            None => serde_json::json!({ "upload_status": upload_status }),
+        };
+        for attempt in 1..=MAX_ATTACHMENT_STATUS_ATTEMPTS {
+            let result = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.config.api_key)
+                .json(&serde_json::json!({ "key": attachment.key, "org_id": org_id, "status": status }))
+                .send();
+            let (retry, failure) = match result {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) => {
+                    let retry = response.status().is_server_error() || response.status() == StatusCode::TOO_MANY_REQUESTS;
+                    (retry, attachment_http_error(response))
+                }
+                Err(source) => {
+                    let retry = source.is_timeout() || source.is_connect();
+                    (retry, source.without_url().to_string())
+                }
+            };
+            if !retry || attempt == MAX_ATTACHMENT_STATUS_ATTEMPTS {
+                return Err(format!(
+                    "POST /attachment/status failed after {attempt} attempt(s): {failure}"
+                ));
+            }
+            thread::sleep(self.backoff_base);
+        }
+        unreachable!("the final status attempt either succeeds or returns an error")
     }
 
     // pulls the next unsent payload until the queue drains or any worker fails
@@ -225,6 +486,53 @@ impl<'config> Writer<'config> {
     }
 }
 
+fn successful_attachment_response(response: Response) -> Result<Response, String> {
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(attachment_http_error(response))
+    }
+}
+
+fn describe_reconciliation_error(failure: &str, error: ReconcileError) -> String {
+    match error {
+        ReconcileError::ReportedError(detail) => format!("{failure}; Braintrust reports attachment error: {detail}"),
+        ReconcileError::Unknown(detail) => {
+            format!("{failure}; upload outcome unknown: {detail}; attachment status was left unchanged")
+        }
+    }
+}
+
+fn is_definite_upload_rejection(status: StatusCode) -> bool {
+    status.is_client_error()
+        && !matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::CONFLICT
+                | StatusCode::PRECONDITION_FAILED
+                | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+fn safe_attachment_detail(detail: &str) -> String {
+    if detail.contains("http://") || detail.contains("https://") {
+        "response includes a URL; detail omitted".to_owned()
+    } else {
+        detail.chars().take(MAX_ATTACHMENT_ERROR_CHARS).collect()
+    }
+}
+
+fn attachment_http_error(response: Response) -> String {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    let detail = safe_attachment_detail(&body);
+    if detail.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {detail}")
+    }
+}
+
 #[derive(Debug)]
 struct Payload {
     events: Vec<Vec<u8>>,
@@ -334,6 +642,11 @@ pub(crate) struct Error {
 
 #[derive(Debug)]
 enum ErrorKind {
+    Attachment(String),
+    InsertAfterAttachments {
+        uploaded: usize,
+        source: Box<Error>,
+    },
     BuildClient(reqwest::Error),
     EncodeEvent(serde_json::Error),
     EventTooLarge {
@@ -360,6 +673,11 @@ enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Attachment(message) => formatter.write_str(message),
+            Self::InsertAfterAttachments { uploaded, source } => write!(
+                formatter,
+                "{uploaded} attachment(s) uploaded, but log insertion failed: {source}; some log rows may have been inserted"
+            ),
             Self::BuildClient(source) => write!(formatter, "failed to build HTTP client: {source}"),
             Self::EncodeEvent(source) => write!(formatter, "failed to encode an event as JSON: {source}"),
             Self::EventTooLarge { size, limit } => {
@@ -672,6 +990,228 @@ mod tests {
         assert!(error.is_payload_too_large());
     }
 
+    #[test]
+    fn rejected_attachment_upload_reports_error_status_and_skips_insert() {
+        let (file, events) = attachment_batch();
+        let org_id = Uuid::new_v4();
+        let (api_url, requests) = serve(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({ "org_id": org_id.to_string() }).to_string(),
+            ),
+            (StatusCode::OK, attachment_init_response()),
+            (StatusCode::FORBIDDEN, "signed-url-secret".to_owned()),
+            (StatusCode::OK, "{}".to_owned()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), Uuid::new_v4());
+        config.api_url = api_url;
+
+        let error = write(&config, &events).unwrap_err().to_string();
+        fs::remove_file(file).unwrap();
+
+        assert!(error.contains("signed upload rejected with HTTP 403"), "{error}");
+        assert!(error.contains(&events.attachments[0].path), "{error}");
+        assert!(error.contains("no log rows inserted"), "{error}");
+        assert!(!error.contains("signed-url-secret"), "{error}");
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (headers, body) = split_request(&request);
+        assert!(headers.starts_with("POST /attachment/status HTTP/1.1\r\n"));
+        let status: JsonValue = serde_json::from_slice(body).unwrap();
+        assert_eq!(status["status"]["upload_status"], "error");
+        assert!(status["status"]["error_message"].as_str().unwrap().contains("HTTP 403"));
+    }
+
+    #[test]
+    fn attachment_initialization_conflict_is_reported_without_retry() {
+        let (file, events) = attachment_batch();
+        let (api_url, requests) = serve(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({ "org_id": Uuid::new_v4().to_string() }).to_string(),
+            ),
+            (StatusCode::CONFLICT, r#"{"error":"key already exists"}"#.to_owned()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), Uuid::new_v4());
+        config.api_url = api_url;
+
+        let error = write(&config, &events).unwrap_err().to_string();
+        fs::remove_file(file).unwrap();
+
+        assert!(error.contains("initialization failed: HTTP 409"), "{error}");
+        assert!(error.contains("key already exists"), "{error}");
+        assert!(error.contains("no log rows inserted"), "{error}");
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(split_request(&request).0.starts_with("POST /attachment HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn reconciles_an_uncertain_upload_before_inserting_logs() {
+        let (file, events) = attachment_batch();
+        let bytes = fs::metadata(&file).unwrap().len();
+        let org_id = Uuid::new_v4();
+        let (api_url, requests) = serve(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({ "org_id": org_id.to_string() }).to_string(),
+            ),
+            (StatusCode::OK, attachment_init_response()),
+            (StatusCode::SERVICE_UNAVAILABLE, "{}".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({ "status": { "upload_status": "uploading" }, "contentLength": bytes }).to_string(),
+            ),
+            (StatusCode::OK, "{}".to_owned()),
+            (StatusCode::OK, serde_json::json!({ "row_ids": ["row"] }).to_string()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), Uuid::new_v4());
+        config.api_url = api_url;
+
+        let inserted = write(&config, &events).unwrap();
+        fs::remove_file(file).unwrap();
+
+        assert_eq!(inserted.row_count(), 1);
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (headers, _) = split_request(&request);
+        assert!(headers.starts_with("GET /attachment?"));
+        assert!(headers.contains("key="));
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (headers, body) = split_request(&request);
+        assert!(headers.starts_with("POST /attachment/status HTTP/1.1\r\n"));
+        let status: JsonValue = serde_json::from_slice(body).unwrap();
+        assert_eq!(status["status"]["upload_status"], "done");
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(split_request(&request).0.starts_with("POST /v1/project_logs/"));
+    }
+
+    #[test]
+    fn retries_transient_attachment_status_failures() {
+        let (file, events) = attachment_batch();
+        let org_id = Uuid::new_v4();
+        let (api_url, requests) = serve(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({ "org_id": org_id.to_string() }).to_string(),
+            ),
+            (StatusCode::OK, attachment_init_response()),
+            (StatusCode::OK, "{}".to_owned()),
+            (StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"try again"}"#.to_owned()),
+            (StatusCode::OK, "{}".to_owned()),
+            (StatusCode::OK, serde_json::json!({ "row_ids": ["row"] }).to_string()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), Uuid::new_v4());
+        config.api_url = api_url;
+        let mut writer = Writer::new(&config).unwrap();
+        writer.backoff_base = Duration::from_millis(1);
+
+        let inserted = writer.write(&events).unwrap();
+        fs::remove_file(file).unwrap();
+
+        assert_eq!(inserted.row_count(), 1);
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        for _ in 0..2 {
+            let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(split_request(&request).0.starts_with("POST /attachment/status HTTP/1.1\r\n"));
+        }
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(split_request(&request).0.starts_with("POST /v1/project_logs/"));
+    }
+
+    #[test]
+    fn completion_status_failure_stops_before_log_insertion() {
+        let (file, events) = attachment_batch();
+        let (api_url, requests) = serve(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({ "org_id": Uuid::new_v4().to_string() }).to_string(),
+            ),
+            (StatusCode::OK, attachment_init_response()),
+            (StatusCode::OK, "{}".to_owned()),
+            (StatusCode::BAD_REQUEST, r#"{"error":"invalid status"}"#.to_owned()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), Uuid::new_v4());
+        config.api_url = api_url;
+
+        let error = write(&config, &events).unwrap_err().to_string();
+        fs::remove_file(file).unwrap();
+
+        assert!(
+            error.contains("file uploaded, but completion status update failed"),
+            "{error}"
+        );
+        assert!(error.contains("HTTP 400"), "{error}");
+        assert!(error.contains("no log rows inserted"), "{error}");
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(split_request(&request).0.starts_with("POST /attachment/status HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn unresolved_upload_failure_does_not_mark_status_or_insert_logs() {
+        let (file, events) = attachment_batch();
+        let (api_url, requests) = serve(vec![
+            (
+                StatusCode::OK,
+                serde_json::json!({ "org_id": Uuid::new_v4().to_string() }).to_string(),
+            ),
+            (StatusCode::OK, attachment_init_response()),
+            (StatusCode::SERVICE_UNAVAILABLE, "{}".to_owned()),
+            (StatusCode::NOT_FOUND, "{}".to_owned()),
+            (StatusCode::NOT_FOUND, "{}".to_owned()),
+            (StatusCode::NOT_FOUND, "{}".to_owned()),
+        ]);
+        let mut config = Braintrust::new("secret".to_owned(), Uuid::new_v4());
+        config.api_url = api_url;
+        let mut writer = Writer::new(&config).unwrap();
+        writer.backoff_base = Duration::from_millis(1);
+
+        let error = writer.write(&events).unwrap_err().to_string();
+        fs::remove_file(file).unwrap();
+
+        assert!(error.contains("upload outcome unknown"), "{error}");
+        assert!(error.contains("attachment status was left unchanged"), "{error}");
+        assert!(error.contains("no log rows inserted"), "{error}");
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        for _ in 0..MAX_ATTACHMENT_RECONCILE_ATTEMPTS {
+            let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(split_request(&request).0.starts_with("GET /attachment?"));
+        }
+    }
+
+    fn attachment_batch() -> (std::path::PathBuf, EventBatch) {
+        let file = std::env::temp_dir().join(format!("bts-attachment-failure-{}", Uuid::new_v4()));
+        fs::write(&file, b"sample").unwrap();
+        let mut events = event_batch(1, 0);
+        events.attachments = vec![Attachment {
+            path: file.display().to_string(),
+            filename: file.file_name().unwrap().to_string_lossy().into_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            key: Uuid::new_v4().to_string(),
+        }]
+        .into_boxed_slice();
+        (file, events)
+    }
+
+    fn attachment_init_response() -> String {
+        serde_json::json!({
+            "signedUrl": "$API_URL/blob",
+            "headers": { "If-None-Match": "*" },
+        })
+        .to_string()
+    }
+
     fn event_batch(count: usize, input_bytes: usize) -> EventBatch {
         let events = (0..count)
             .map(|index| Event {
@@ -695,6 +1235,7 @@ mod tests {
             .collect();
 
         EventBatch {
+            attachments: Box::new([]),
             events,
             trace_count: count,
         }
@@ -715,6 +1256,7 @@ mod tests {
                 let request = read_request(&mut stream);
                 sender.send(request).unwrap();
 
+                let body = body.replace("$API_URL", &format!("http://{address}"));
                 let reason = status.canonical_reason().unwrap_or("Unknown");
                 write!(
                     stream,

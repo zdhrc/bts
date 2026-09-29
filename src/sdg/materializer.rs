@@ -1,4 +1,4 @@
-use crate::sdg::planner::{EventFields, EventRef, Plan};
+use crate::sdg::planner::{Attachment, EventFields, EventRef, Plan};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -34,6 +34,9 @@ pub(crate) struct EventBatch {
 
     #[serde(skip)]
     pub(super) trace_count: usize,
+
+    #[serde(skip)]
+    pub(super) attachments: Box<[Attachment]>,
 }
 
 impl EventBatch {
@@ -201,6 +204,7 @@ impl Materializer {
         Ok(EventBatch {
             events: events.into_boxed_slice(),
             trace_count: self.plan.traces.len(),
+            attachments: std::mem::take(&mut self.plan.attachments),
         })
     }
 
@@ -441,6 +445,7 @@ mod tests {
         let mut metrics = JsonMap::new();
         metrics.insert("start".to_owned(), JsonValue::from(1));
         let plan = Plan {
+            attachments: Box::new([]),
             events: Box::new([EventPlan {
                 root: EventRef(0),
                 parent: None,
