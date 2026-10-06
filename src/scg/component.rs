@@ -1,43 +1,5 @@
 use super::emit;
-use crate::dsl::{Part, ScorerLang, Value};
-
-// what gets pushed: one braintrust function, whatever kind of component it
-// came from; future kinds (tools, agents) add variants beside Scorer
-pub(crate) struct Component {
-    pub(crate) name: String,
-    pub(crate) slug: String,
-    pub(crate) kind: ComponentKind,
-    pub(crate) payload: Payload,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum ComponentKind {
-    Scorer,
-}
-
-impl ComponentKind {
-    // the wire value of function_type
-    pub(crate) fn function_type(self) -> &'static str {
-        match self {
-            Self::Scorer => "scorer",
-        }
-    }
-}
-
-pub(crate) enum Payload {
-    // an inline code function; lang picks the runtime
-    Code {
-        lang: ScorerLang,
-        code: String,
-    },
-    // a prompt-type llm classifier, natively editable in the braintrust ui
-    Prompt {
-        model: String,
-        content: String,
-        choice_scores: Vec<(String, f64)>,
-        use_cot: bool,
-    },
-}
+use crate::dsl::{Part, Value};
 
 // braintrust function slugs: lowercase alphanumeric runs joined by hyphens
 pub(super) fn slugify(name: &str) -> Option<String> {

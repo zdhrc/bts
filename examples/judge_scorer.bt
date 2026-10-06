@@ -1,5 +1,5 @@
-# judge scorer -- an llm grades each response against labeled options; pushed
-# as a braintrust prompt function, so no code is generated for it
+# judge scorer -- an llm grades each response against labeled options; built
+# as a Braintrust SDK prompt scorer for `bt functions push`
 
 scorer "helpfulness" {
     judge {

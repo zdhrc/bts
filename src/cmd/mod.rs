@@ -2,7 +2,6 @@ mod build;
 mod check;
 mod init;
 mod logging;
-mod push;
 mod setup;
 mod update;
 mod write;
@@ -22,7 +21,6 @@ enum Cmd {
     Build(build::Args),
     Check(check::Args),
     Init(init::Args),
-    Push(push::Args),
     Setup(setup::Args),
     Update(update::Args),
     Write(write::Args),
@@ -34,7 +32,6 @@ impl Cli {
             Cmd::Build(args) => args.run()?,
             Cmd::Check(args) => args.run()?,
             Cmd::Init(args) => args.run()?,
-            Cmd::Push(args) => args.run()?,
             Cmd::Setup(args) => args.run()?,
             Cmd::Update(args) => args.run()?,
             Cmd::Write(args) => args.run()?,
@@ -57,7 +54,6 @@ pub enum Error {
     Build(build::Error),
     Check(check::Error),
     Init(init::Error),
-    Push(push::Error),
     Setup(setup::Error),
     Update(update::Error),
     Write(write::Error),
@@ -69,7 +65,6 @@ impl fmt::Display for Error {
             Self::Build(source) => source.fmt(formatter),
             Self::Check(source) => source.fmt(formatter),
             Self::Init(source) => source.fmt(formatter),
-            Self::Push(source) => source.fmt(formatter),
             Self::Setup(source) => source.fmt(formatter),
             Self::Update(source) => source.fmt(formatter),
             Self::Write(source) => source.fmt(formatter),
@@ -94,12 +89,6 @@ impl From<check::Error> for Error {
 impl From<init::Error> for Error {
     fn from(source: init::Error) -> Self {
         Self::Init(source)
-    }
-}
-
-impl From<push::Error> for Error {
-    fn from(source: push::Error) -> Self {
-        Self::Push(source)
     }
 }
 

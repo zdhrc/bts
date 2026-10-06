@@ -469,14 +469,14 @@ const SCORER_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         id: ids::LANG,
         keyword: "lang",
-        summary: "Language of the emitted scorer code, the constant string \"python\" or \"typescript\"; the push command may override it, and judge scorers ignore it. Defaults to python.",
+        summary: "Language of the emitted scorer code, the constant string \"python\" or \"typescript\"; the build command may override it, and judge scorers ignore it. Defaults to python.",
         value: &STRING,
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
         id: ids::FILE,
         keyword: "file",
-        summary: "Output file stem scorers with the same value pack into when built (`<file>.scorer.py`); defaults to the scorer's own name. Judge scorers have no source and ignore it.",
+        summary: "Output file stem code scorers with the same value pack into when built (`<file>.scorer.py`); defaults to the scorer's own name. Judge scorers build into their own source files and ignore it.",
         value: &STRING,
         cardinality: Cardinality::Optional,
     },
@@ -1489,7 +1489,7 @@ const BLOCKS: &[BlockDesc] = &[
     BlockDesc {
         id: ids::SCORER,
         keyword: "scorer",
-        summary: "A named scorer pushed to Braintrust as a scorer function rather than generated as spans.",
+        summary: "A named scorer built into a Braintrust SDK definition for `bt functions push` rather than generated as spans.",
         syntax: "scorer \"<name>\" { [lang = <string>] [file = <string>] (code { ... } | judge { ... }) }",
         name: NamePolicy::Required,
         allowed_in: ROOT_ONLY,
@@ -1531,7 +1531,7 @@ const BLOCKS: &[BlockDesc] = &[
     BlockDesc {
         id: ids::JUDGE,
         keyword: "judge",
-        summary: "An LLM-as-a-judge scorer body pushed as a Braintrust prompt function: the model grades against the prompt and its answer maps to a score through `options`.",
+        summary: "An LLM-as-a-judge scorer body built as a Braintrust SDK prompt scorer: the model grades against the prompt and its answer maps to a score through `options`.",
         syntax: "judge { model = <string> prompt = <string> options = { <label> = <number>, ... } }",
         name: NamePolicy::Forbidden,
         allowed_in: IN_SCORER,

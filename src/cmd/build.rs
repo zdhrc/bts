@@ -4,13 +4,13 @@ use crate::{dsl, scg};
 use std::{env, fmt, fs, path::PathBuf};
 
 #[derive(Debug, clap::Args)]
-#[command(about = "build scorer source files from a bts shape without pushing them")]
+#[command(about = "build Braintrust SDK scorer files for `bt functions push`")]
 pub struct Args {
     /// bts shape file whose scorer blocks should be built
     #[arg(long, value_name = "PATH")]
     from: PathBuf,
 
-    /// force the emitted language for code scorers, overriding each block's lang
+    /// force the emitted language for scorers, overriding each code block's lang
     #[arg(long, value_name = "LANG", value_enum)]
     lang: Option<Lang>,
 
@@ -75,23 +75,47 @@ impl Args {
             return Err(Error::NoScorers);
         }
 
+        let project = crate::conf::project_name()?;
         let lang = self.lang.map(Lang::into_model);
-        let assembly = tracing::info_span!("assemble").in_scope(|| scg::assemble(&model.scorers, lang).map_err(Error::Plan))?;
+        let assembly =
+            tracing::info_span!("assemble").in_scope(|| scg::assemble(&model.scorers, lang, &project).map_err(Error::Plan))?;
         let built = tracing::info_span!("build")
-            .in_scope(|| scg::build(&assembly, &self.out))
+            .in_scope(|| {
+                scg::build(&assembly, &self.out, |path, diff| {
+                    println!("updating {}:\n{diff}", path.display());
+                })
+            })
             .map_err(Error::Build)?;
 
         for source in &built {
-            match &source.path {
-                Some(path) => println!("wrote {} ({})", path.display(), source.slugs.join(", ")),
-                None => println!(
-                    "skipped {} (judge): pushes as a prompt function, no code",
-                    source.slugs.join(", ")
-                ),
-            }
+            let verb = match source.action {
+                scg::builder::Action::Created => "created",
+                scg::builder::Action::Updated => "updated",
+                scg::builder::Action::Unchanged => "unchanged",
+            };
+            println!("{verb} {} ({})", source.path.display(), source.slugs.join(", "));
         }
-        let written = built.iter().filter(|source| source.path.is_some()).count();
+        let written = built
+            .iter()
+            .filter(|source| source.action != scg::builder::Action::Unchanged)
+            .count();
         tracing::info!(written, scorers = model.scorers.len(), "build finished");
+        let names = built
+            .iter()
+            .map(|source| {
+                source
+                    .path
+                    .file_name()
+                    .expect("generated file has a name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "from {} run: bt functions push --if-exists replace {names}",
+            self.out.display()
+        );
 
         Ok(())
     }

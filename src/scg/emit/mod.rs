@@ -38,14 +38,11 @@ pub(crate) struct Item<'m> {
     pub(crate) whens: &'m [When],
 }
 
-// renders one source module holding a named function per item, with imports
-// and runtime helpers merged; alias appends a `handler` binding to the lone
-// item's function, for pushed code where braintrust may expect that name
-pub(crate) fn module(lang: ScorerLang, items: &[Item], alias: bool) -> Result<String, Error> {
-    debug_assert!(!alias || items.len() == 1, "only single-scorer push modules alias handler");
+// Render named scorer functions with their shared imports and helpers.
+pub(crate) fn module(lang: ScorerLang, items: &[Item]) -> Result<String, Error> {
     match lang {
-        ScorerLang::Python => python::module(items, alias),
-        ScorerLang::Typescript => typescript::module(items, alias),
+        ScorerLang::Python => python::module(items),
+        ScorerLang::Typescript => typescript::module(items),
     }
 }
 

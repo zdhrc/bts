@@ -1,129 +1,25 @@
-use super::client::RemoteFunction;
-use super::component::{Component, Payload};
-use crate::dsl::ScorerLang;
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
-
-// none = the remote already matches what would be pushed; some = a rendered
-// human-readable diff. comparison is field-by-field because remote objects
-// carry server fields a whole-object equality would trip over.
-pub(super) fn changed(component: &Component, remote: &RemoteFunction) -> Option<String> {
-    let mut sections = Vec::new();
-
-    if remote.name != component.name {
-        sections.push(format!("  - name: {}\n  + name: {}", remote.name, component.name));
-    }
-
-    match &component.payload {
-        Payload::Code { lang, code } => {
-            let runtime = match lang {
-                ScorerLang::Python => "python",
-                ScorerLang::Typescript => "node",
-            };
-            let inline = remote.function_data.get("type").and_then(JsonValue::as_str) == Some("code")
-                && remote.function_data.pointer("/data/type").and_then(JsonValue::as_str) == Some("inline")
-                && remote
-                    .function_data
-                    .pointer("/data/runtime_context/runtime")
-                    .and_then(JsonValue::as_str)
-                    == Some(runtime);
-            if inline {
-                let remote_code = remote
-                    .function_data
-                    .pointer("/data/code")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default();
-                if !code_equal(remote_code, code) {
-                    sections.push(lines(remote_code, code));
-                }
-            } else {
-                // a different shape entirely; put replaces it wholesale
-                sections.push(format!("  - {}\n  + an inline {runtime} code scorer", describe(remote)));
-            }
-        }
-        Payload::Prompt {
-            model,
-            content,
-            choice_scores,
-            use_cot,
-        } => {
-            let expected = prompt_subset_local(model, content, choice_scores, *use_cot);
-            let found = prompt_subset_remote(remote);
-            if found.as_ref() != Some(&expected) {
-                let found = found
-                    .map(|value| serde_json::to_string_pretty(&value).expect("json maps encode"))
-                    .unwrap_or_else(|| describe(remote));
-                let expected = serde_json::to_string_pretty(&expected).expect("json maps encode");
-                sections.push(lines(&found, &expected));
-            }
-        }
-    }
-
-    (!sections.is_empty()).then(|| sections.join("\n"))
-}
-
-fn describe(remote: &RemoteFunction) -> String {
-    match remote.function_data.get("type").and_then(JsonValue::as_str) {
-        Some(kind) => format!("a {kind} function"),
-        None => "a function of unknown shape".to_owned(),
-    }
-}
-
-// the slice of prompt_data reconciliation cares about, normalized so number
-// representation and key order cannot flap the comparison
-fn prompt_subset_local(model: &str, content: &str, choice_scores: &[(String, f64)], use_cot: bool) -> JsonValue {
-    let scores: JsonMap<String, JsonValue> = choice_scores
-        .iter()
-        .map(|(label, score)| (label.clone(), json!(score)))
-        .collect();
-    json!({
-        "messages": [{ "role": "user", "content": content }],
-        "model": model,
-        "use_cot": use_cot,
-        "choice_scores": scores,
-    })
-}
-
-fn prompt_subset_remote(remote: &RemoteFunction) -> Option<JsonValue> {
-    if remote.function_data.get("type").and_then(JsonValue::as_str) != Some("prompt") {
+// Compare generated output with an existing local file before overwriting it.
+// Keep whitespace significant: a build should report any byte change.
+pub(super) fn changed(old: &str, new: &str) -> Option<String> {
+    if old == new {
         return None;
     }
-    let data = remote.prompt_data.as_ref()?;
-    let messages: Vec<JsonValue> = data
-        .pointer("/prompt/messages")?
-        .as_array()?
-        .iter()
-        .map(|message| {
-            json!({
-                "role": message.get("role").and_then(JsonValue::as_str).unwrap_or_default(),
-                "content": message.get("content").and_then(JsonValue::as_str).unwrap_or_default(),
-            })
-        })
-        .collect();
-    let scores: JsonMap<String, JsonValue> = data
-        .pointer("/parser/choice_scores")?
-        .as_object()?
-        .iter()
-        .map(|(label, score)| (label.clone(), json!(score.as_f64().unwrap_or(f64::NAN))))
-        .collect();
-    Some(json!({
-        "messages": messages,
-        "model": data.pointer("/options/model").and_then(JsonValue::as_str).unwrap_or_default(),
-        "use_cot": data.pointer("/parser/use_cot").and_then(JsonValue::as_bool).unwrap_or_default(),
-        "choice_scores": scores,
-    }))
-}
-
-// servers may normalize trailing whitespace; never let that read as a change
-fn code_equal(remote: &str, local: &str) -> bool {
-    let normalize = |code: &str| {
-        code.lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim_end()
-            .to_owned()
-    };
-    normalize(remote) == normalize(local)
+    if old.lines().eq(new.lines()) {
+        return Some(format!(
+            "  - {}\n  + {}",
+            if old.ends_with('\n') {
+                "final newline"
+            } else {
+                "no final newline"
+            },
+            if new.ends_with('\n') {
+                "final newline"
+            } else {
+                "no final newline"
+            },
+        ));
+    }
+    Some(lines(old, new))
 }
 
 enum Op<'diff> {
@@ -216,8 +112,9 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_trailing_whitespace() {
-        assert!(code_equal("a  \nb\n\n", "a\nb"));
-        assert!(!code_equal("a\nb", "a\nc"));
+    fn detects_file_changes() {
+        assert!(changed("a\n", "a\n").is_none());
+        assert!(changed("a  \n", "a\n").is_some());
+        assert!(changed("a", "a\n").unwrap().contains("no final newline"));
     }
 }

@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 const BRAINTRUST_API_URL: &str = "https://api.braintrust.dev";
 const CONFIG_PATH: &str = ".bt/bts/config.toml";
+const BT_CONTEXT_PATH: &str = ".bt/config.json";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WRITE_CONCURRENCY: usize = 8;
 const DEFAULT_LOG_LEVEL: &str = "info";
@@ -163,6 +164,28 @@ pub(crate) fn project_root() -> std::io::Result<PathBuf> {
     Ok(root.to_path_buf())
 }
 
+// The bt CLI's selected project is also the target for generated SDK scorers.
+pub(crate) fn project_name() -> Result<String, Error> {
+    let path = project_root().map_err(Error::CurrentDirectory)?.join(BT_CONTEXT_PATH);
+    let raw = fs::read_to_string(&path).map_err(|source| Error::ReadProjectContext {
+        path: path.clone(),
+        source,
+    })?;
+    let context: BtContext = serde_json::from_str(&raw).map_err(|source| Error::ParseProjectContext {
+        path: path.clone(),
+        source,
+    })?;
+    context
+        .project
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(Error::MissingProjectName { path })
+}
+
+#[derive(Deserialize)]
+struct BtContext {
+    project: Option<String>,
+}
+
 pub(crate) fn parse_duration(value: &str) -> Result<Duration, String> {
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
         (number, 1_u64)
@@ -201,6 +224,9 @@ pub(crate) enum Error {
     InvalidProjectId { source: uuid::Error },
     CurrentDirectory(std::io::Error),
     ReadConfig { path: PathBuf, source: std::io::Error },
+    ReadProjectContext { path: PathBuf, source: std::io::Error },
+    ParseProjectContext { path: PathBuf, source: serde_json::Error },
+    MissingProjectName { path: PathBuf },
     ParseConfig { path: PathBuf, source: toml::de::Error },
     InvalidLogLevel { path: PathBuf, value: String, reason: String },
     InvalidTimeout { path: PathBuf, value: String, reason: String },
@@ -217,6 +243,19 @@ impl fmt::Display for Error {
             }
             Self::ReadConfig { path, source } => {
                 write!(formatter, "could not read config {}: {source}", path.display())
+            }
+            Self::ReadProjectContext { path, source } => {
+                write!(formatter, "could not read bt project context {}: {source}", path.display())
+            }
+            Self::ParseProjectContext { path, source } => {
+                write!(formatter, "invalid bt project context {}: {source}", path.display())
+            }
+            Self::MissingProjectName { path } => {
+                write!(
+                    formatter,
+                    "bt project context {} has no project name; select one with `bt switch`",
+                    path.display()
+                )
             }
             Self::ParseConfig { path, source } => {
                 write!(formatter, "invalid config {}: {source}", path.display())

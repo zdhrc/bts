@@ -1,4 +1,4 @@
-# one code scorer and one judge scorer, exercising both push payloads
+# one code scorer and one judge scorer, exercising both generated definitions
 
 scorer "answer-quality" {
     lang = "python"
