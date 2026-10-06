@@ -3,7 +3,8 @@ use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
     Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Field, Func, JudgeOption, Maybe, Model,
     NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg,
-    ScorerKind, ScorerLang, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
+    ScorerKind, ScorerLang, ScorerSpan, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value,
+    WeightedOption, When,
 };
 use crate::dsl::spec;
 use std::{
@@ -151,6 +152,7 @@ enum BlockKind {
     Llm,
     Tool,
     Function,
+    ScorerSpan,
     Repeat,
     Choice,
     Maybe,
@@ -164,6 +166,7 @@ impl BlockKind {
             Self::Llm => "llm",
             Self::Tool => "tool",
             Self::Function => "function",
+            Self::ScorerSpan => "scorer",
             Self::Repeat => "repeat",
             Self::Choice => "choice",
             Self::Maybe => "maybe",
@@ -278,6 +281,8 @@ pub(super) struct Modeler {
     sym_stack: Vec<NodeId>,
     // block references recorded mid-walk, indexed by RefId, resolved at fixup
     pending: Vec<PendingRef>,
+    // nested scorer names resolve after all top-level definitions are known
+    pending_scorers: Vec<(String, SrcRange)>,
     // the slot whose expression is folding, for dependency edges
     current_slot: Option<SlotId>,
     // static dependency edges for cycle detection: (from, to, reference site)
@@ -296,6 +301,7 @@ impl Modeler {
             syms: Vec::new(),
             sym_stack: Vec::new(),
             pending: Vec::new(),
+            pending_scorers: Vec::new(),
             current_slot: None,
             edges: Vec::new(),
         }
@@ -324,6 +330,7 @@ impl Modeler {
     fn model(mut self) -> Result<Model, Errors> {
         let mut traces = Vec::new();
         let mut scorers = Vec::new();
+        let mut scorer_names_seen = HashSet::new();
         let mut automations = Vec::new();
 
         // collect vars first so refs work no matter the decl order
@@ -358,7 +365,16 @@ impl Modeler {
                             traces.push(trace);
                         }
                     } else if desc.id == spec::ids::SCORER && desc.allows(spec::Place::Root) {
+                        let range = block.name_range.unwrap_or(block.range);
                         if let Some(scorer) = self.model_scorer(block, desc) {
+                            if !scorer_names_seen.insert(scorer.name.clone()) {
+                                self.errors.push(Error::new(
+                                    ErrorKind::DuplicateScorerName {
+                                        name: scorer.name.clone(),
+                                    },
+                                    range,
+                                ));
+                            }
                             scorers.push(scorer);
                         }
                     } else if desc.id == spec::ids::AUTOMATION && desc.allows(spec::Place::Root) {
@@ -388,6 +404,12 @@ impl Modeler {
         self.detect_cycles();
 
         let scorer_names: HashSet<&str> = scorers.iter().map(|scorer| scorer.name.as_str()).collect();
+        for (name, range) in &self.pending_scorers {
+            if !scorer_names.contains(name.as_str()) {
+                self.errors
+                    .push(Error::new(ErrorKind::UnknownScorerReference { name: name.clone() }, *range));
+            }
+        }
         let mut automation_names = HashSet::new();
         for (automation, range) in &automations {
             if !automation_names.insert(automation.name.as_str()) {
@@ -2860,11 +2882,13 @@ impl Modeler {
         let ast::Block {
             kind,
             name,
+            name_range,
             decls,
             range,
             ..
         } = block;
-        let Some(desc) = spec::SPEC.block(&kind) else {
+        let place = spec::Place::Block { id: parent };
+        let Some(desc) = spec::SPEC.block_in(&kind, place).or_else(|| spec::SPEC.block(&kind)) else {
             self.errors.push(Error::new(
                 ErrorKind::UnknownBlock {
                     keyword: kind,
@@ -2911,6 +2935,10 @@ impl Modeler {
         } else if desc.id == spec::ids::MAYBE {
             let node = self.enter_sym(BlockKind::Maybe, name.clone());
             self.model_maybe(node, name, decls, desc, range).map(Child::Maybe)
+        } else if desc.id == spec::ids::SCORER_SPAN {
+            let node = self.enter_sym(BlockKind::ScorerSpan, name.clone());
+            self.model_scorer_span(node, name, name_range.unwrap_or(range), decls, desc, range)
+                .map(Child::Scorer)
         } else {
             let kind = if desc.id == spec::ids::TASK {
                 BlockKind::Task
@@ -2926,6 +2954,107 @@ impl Modeler {
         };
         self.leave_sym();
         child
+    }
+
+    fn model_scorer_span(
+        &mut self,
+        node: NodeId,
+        name: Option<String>,
+        name_range: SrcRange,
+        decls: Vec<ast::Decl>,
+        desc: &spec::BlockDesc,
+        range: SrcRange,
+    ) -> Option<ScorerSpan> {
+        let (decls, bindings) = self.enter_scope(decls);
+        let mut score = None;
+        let mut reason = None;
+        let mut seen = HashSet::new();
+        for decl in decls {
+            let ast::Decl::Attr(attr) = decl else {
+                if let ast::Decl::Block(block) = decl {
+                    self.errors.push(Error::new(
+                        ErrorKind::BlockNotAllowed {
+                            block: spec::SPEC.block(&block.kind).map_or(desc.id, |inner| inner.id),
+                            parent: spec::Place::Block { id: desc.id },
+                        },
+                        block.range,
+                    ));
+                }
+                continue;
+            };
+            let Some(field) = desc.field(&attr.key) else {
+                self.errors.push(Error::new(
+                    ErrorKind::UnknownField {
+                        block: desc.id,
+                        keyword: attr.key,
+                    },
+                    attr.range,
+                ));
+                continue;
+            };
+            if !seen.insert(field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::DuplicateField {
+                        block: desc.id,
+                        field: field.id,
+                    },
+                    attr.range,
+                ));
+                continue;
+            }
+            let Some(folded) = self.fold_expr(attr.value) else { continue };
+            let expected = if field.id == spec::ids::SCORE {
+                StaticType::Number
+            } else {
+                StaticType::String
+            };
+            if self.static_type(&folded) != Some(expected) && !self.defers_to_generation(&folded) {
+                self.push_type_mismatch(&folded, desc.id, field.id, field.value);
+                continue;
+            }
+            if field.id == spec::ids::SCORE
+                && let FoldedKind::Value(Value::Num(number)) = &folded.kind
+                && !(0.0..=1.0).contains(&float_bound(number.clone()))
+            {
+                self.errors.push(Error::new(
+                    ErrorKind::ScoreOutOfRange {
+                        rule: spec::ids::SCORE_RANGE,
+                    },
+                    folded.range,
+                ));
+                continue;
+            }
+            let value_range = folded.range;
+            if field.id == spec::ids::SCORE {
+                score = Some((folded.into_value(), value_range));
+            } else {
+                reason = Some((folded.into_value(), value_range));
+            }
+        }
+        if !seen.contains(&spec::ids::SCORE) {
+            self.errors.push(Error::new(
+                ErrorKind::MissingField {
+                    block: desc.id,
+                    field: spec::ids::SCORE,
+                },
+                range,
+            ));
+        }
+        self.scopes.pop();
+        if let Some(name) = &name {
+            self.pending_scorers.push((name.clone(), name_range));
+        }
+        match (name, score) {
+            (Some(name), Some((score, score_range))) => Some(ScorerSpan {
+                node,
+                name,
+                score,
+                score_range,
+                reason,
+                bindings,
+            }),
+            _ => None,
+        }
     }
 
     fn model_span(
@@ -4818,10 +4947,17 @@ fn collect_trace_refs(trace: &Trace, found: &mut Vec<RefId>) {
 }
 
 fn collect_child_refs(child: &Child, found: &mut Vec<RefId>) {
-    let (bindings, children) = match child {
+    let (bindings, children): (&[Binding], &[Child]) = match child {
         Child::Span(span) => {
             collect_field_refs(&span.fields, found);
             (&span.bindings, &span.children)
+        }
+        Child::Scorer(scorer) => {
+            collect_refs(&scorer.score, found);
+            if let Some((reason, _)) = &scorer.reason {
+                collect_refs(reason, found);
+            }
+            (&scorer.bindings, &[][..])
         }
         Child::Repeat(repeat) => {
             collect_refs(&repeat.count, found);
@@ -5402,6 +5538,12 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
         path: String,
     },
+    UnknownScorerReference {
+        name: String,
+    },
+    DuplicateScorerName {
+        name: String,
+    },
     DuplicateVar {
         rule: spec::Id,
         name: String,
@@ -5750,6 +5892,13 @@ impl fmt::Display for ErrorKind {
                 let rule = rule_desc(*rule);
                 write!(formatter, "unknown reference `{path}`; {}", rule.summary)
             }
+            Self::UnknownScorerReference { name } => {
+                write!(
+                    formatter,
+                    "unknown scorer {name:?}; declare a top-level scorer block in this source"
+                )
+            }
+            Self::DuplicateScorerName { name } => write!(formatter, "duplicate top-level scorer name {name:?}"),
             Self::DuplicateVar { rule, name } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "variable `{name}` is defined more than once; {}", rule.summary)
@@ -9636,7 +9785,13 @@ mod tests {
         let errors = model(r#"trace "t" { scorer "s" { code { score = 0.5 } } }"#).unwrap_err();
         assert!(matches!(
             errors[0].kind(),
-            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::SCORER
+            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::CODE
+        ));
+
+        let errors = model(r#"trace "t" { scorer "s" { score = 0.5 } }"#).unwrap_err();
+        assert!(matches!(
+            errors[0].kind(),
+            ErrorKind::UnknownScorerReference { name } if name == "s"
         ));
 
         let errors = model(r#"scorer "s" { task "x" { input = 1 } code { score = 0.5 } }"#).unwrap_err();

@@ -70,6 +70,80 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
 }
 
 #[test]
+fn write_filter_omits_synthetic_scorers_without_changing_application_values() {
+    let shape = write_shape(
+        r#"
+        trace "support" {
+            input = "question ${trace.index}"
+            output = weighted(["resolved", 3], ["escalated", 1])
+            llm "Chat Completion" {
+                output = trace.output
+                scorer "answer-quality" {
+                    score = clamp(normal(0.75, 0.1), 0, 1)
+                    reason = "Observed ${trace.output}"
+                }
+            }
+        }
+        scorer "answer-quality" {
+            code { score = output == "resolved" ? 1 : 0 }
+        }
+        "#,
+    );
+    let run = |filter: Option<&str>| {
+        let mut command = bts();
+        command.args(["write", "--from"]).arg(&shape).args([
+            "--count",
+            "3",
+            "--start",
+            "2026-09-01T00:00:00Z",
+            "--end",
+            "2026-09-01T01:00:00Z",
+            "--seed",
+            "42",
+            "--dry-run",
+        ]);
+        if let Some(filter) = filter {
+            command.args(["--filter", filter]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<JsonValue>(&output.stdout).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let with_scores = run(None);
+    let without_scores = run(Some("block.kind != \"scorer\""));
+    let without_llms = run(Some("block.name != \"Chat Completion\""));
+    fs::remove_file(shape).unwrap();
+
+    assert_eq!(with_scores.len(), 9);
+    assert_eq!(without_scores.len(), 6);
+    assert_eq!(without_llms.len(), 3);
+    for (full, filtered) in with_scores.chunks_exact(3).zip(without_scores.chunks_exact(2)) {
+        assert_eq!(full[0]["input"], filtered[0]["input"]);
+        assert_eq!(full[0]["output"], filtered[0]["output"]);
+        assert_eq!(full[1]["output"], filtered[1]["output"]);
+        assert_eq!(full[0]["metrics"], filtered[0]["metrics"]);
+        assert_eq!(full[1]["metrics"], filtered[1]["metrics"]);
+        assert_eq!(full[2]["span_attributes"]["type"], "scorer");
+        assert_eq!(full[2]["span_attributes"]["purpose"], "scorer");
+        assert_eq!(full[2]["span_attributes"]["name"], "answer-quality");
+        assert_eq!(full[2]["span_parents"][0], full[1]["span_id"]);
+        assert_eq!(full[2]["scores"]["answer-quality"], full[2]["output"]["score"]);
+        assert_eq!(full[1]["scores"]["answer-quality"], full[2]["output"]["score"]);
+        assert!(filtered[1].get("scores").is_none());
+        assert_eq!(full[2]["input"]["output"], full[1]["output"]);
+        assert!(
+            full[2]["scores"]["answer-quality"]
+                .as_f64()
+                .is_some_and(|score| (0.0..=1.0).contains(&score))
+        );
+        assert!(full[2]["metadata"]["reason"].as_str().unwrap().starts_with("Observed "));
+    }
+}
+
+#[test]
 fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     let shape = write_shape(include_str!("fixtures/dynamic.bt"));
     let output = bts()

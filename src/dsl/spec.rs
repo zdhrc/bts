@@ -20,6 +20,12 @@ impl Spec {
         self.blocks.iter().find(|block| block.keyword == keyword)
     }
 
+    pub(crate) fn block_in(&self, keyword: &str, place: Place) -> Option<&BlockDesc> {
+        self.blocks
+            .iter()
+            .find(|block| block.keyword == keyword && block.allows(place))
+    }
+
     pub(crate) fn block_by_id(&self, id: Id) -> Option<&BlockDesc> {
         self.blocks.iter().find(|block| block.id == id)
     }
@@ -202,6 +208,7 @@ pub(crate) mod ids {
     pub(crate) const CHOICE: Id = Id::new("block.choice");
     pub(crate) const MAYBE: Id = Id::new("block.maybe");
     pub(crate) const SCORER: Id = Id::new("block.scorer");
+    pub(crate) const SCORER_SPAN: Id = Id::new("block.scorer-span");
     pub(crate) const AUTOMATION: Id = Id::new("block.automation");
     pub(crate) const CODE: Id = Id::new("block.code");
     pub(crate) const JUDGE: Id = Id::new("block.judge");
@@ -220,6 +227,7 @@ pub(crate) mod ids {
     pub(crate) const LANG: Id = Id::new("field.lang");
     pub(crate) const FILE: Id = Id::new("field.file");
     pub(crate) const SCORE: Id = Id::new("field.score");
+    pub(crate) const REASON: Id = Id::new("field.reason");
     pub(crate) const COND: Id = Id::new("field.cond");
     pub(crate) const MODEL: Id = Id::new("field.model");
     pub(crate) const PROMPT: Id = Id::new("field.prompt");
@@ -488,6 +496,23 @@ const SCORER_FIELDS: &[FieldDesc] = &[
         id: ids::FILE,
         keyword: "file",
         summary: "Optional output file stem for packing code scorers; defaults to the scorer slug. Judge scorers ignore this field.",
+        value: &STRING,
+        cardinality: Cardinality::Optional,
+    },
+];
+
+const SCORER_SPAN_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::SCORE,
+        keyword: "score",
+        summary: "Synthetic score from 0 to 1 for the named top-level scorer.",
+        value: &NUMBER,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::REASON,
+        keyword: "reason",
+        summary: "Optional explanation recorded on the synthetic scorer span.",
         value: &STRING,
         cardinality: Cardinality::Optional,
     },
@@ -1572,6 +1597,20 @@ const BLOCKS: &[BlockDesc] = &[
         },
         rules: SCORER_RULES,
         conventions: SCORER_CONVENTIONS,
+    },
+    BlockDesc {
+        id: ids::SCORER_SPAN,
+        keyword: "scorer",
+        summary: "A synthetic scorer span whose name references a top-level scorer definition in this shape.",
+        syntax: "scorer \"<top-level scorer name>\" { score = <number> [reason = <string>] }",
+        name: NamePolicy::Required,
+        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
+        body: BodyDesc {
+            fields: SCORER_SPAN_FIELDS,
+            open: false,
+        },
+        rules: &[SCORE_RANGE_RULE],
+        conventions: NO_CONVENTIONS,
     },
     BlockDesc {
         id: ids::AUTOMATION,

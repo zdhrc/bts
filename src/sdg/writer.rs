@@ -683,12 +683,14 @@ mod tests {
                 span_attributes: SpanAttributes {
                     name: "root".to_owned(),
                     kind: "task".to_owned(),
+                    purpose: None,
                 },
                 input: (input_bytes > 0).then(|| JsonValue::String("x".repeat(input_bytes))),
                 output: None,
                 expected: None,
                 error: None,
                 metadata: None,
+                scores: None,
                 metrics: JsonMap::new(),
                 tags: Box::new([]),
             })

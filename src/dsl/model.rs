@@ -105,9 +105,20 @@ pub(crate) struct Trace {
 #[derive(Debug, Clone)]
 pub(crate) enum Child {
     Span(Span),
+    Scorer(ScorerSpan),
     Repeat(Repeat),
     Choice(Choice),
     Maybe(Maybe),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScorerSpan {
+    pub(crate) node: NodeId,
+    pub(crate) name: String,
+    pub(crate) score: Value,
+    pub(crate) score_range: SrcRange,
+    pub(crate) reason: Option<(Value, SrcRange)>,
+    pub(crate) bindings: Vec<Binding>,
 }
 
 #[derive(Debug, Clone)]

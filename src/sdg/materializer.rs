@@ -70,6 +70,9 @@ pub(super) struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) metadata: Option<JsonMap<String, JsonValue>>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) scores: Option<JsonMap<String, JsonValue>>,
+
     pub(super) metrics: JsonMap<String, JsonValue>,
 
     #[serde(skip_serializing_if = "tags_are_empty")]
@@ -86,6 +89,9 @@ pub(super) struct SpanAttributes {
 
     #[serde(rename = "type")]
     pub(super) kind: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) purpose: Option<&'static str>,
 }
 
 struct Materializer {
@@ -115,8 +121,17 @@ impl Materializer {
             )?;
         }
 
-        // the root encloses its whole trace, so its end is the trace's extent
+        // The application root's end excludes asynchronous scorer spans. Keep
+        // one score slot inside the requested window for shapes that declare
+        // synthetic scorers, whether or not this run's filter writes them.
         let max_extent = plan.traces.iter().map(|trace| ends[trace.start]).max().unwrap_or_default();
+        let max_extent = if plan.scorer_postlude {
+            max_extent
+                .checked_add(EVENT_SLOT)
+                .ok_or_else(|| Error::new(ErrorKind::TimestampOutOfRange, EventRef(0)))?
+        } else {
+            max_extent
+        };
         let available = over
             .checked_sub(max_extent)
             .ok_or_else(|| Error::new(ErrorKind::WindowTooShort, EventRef(0)))?;
@@ -186,12 +201,14 @@ impl Materializer {
                     span_attributes: SpanAttributes {
                         name: event.name,
                         kind: event.kind.as_str().to_owned(),
+                        purpose: (event.kind == crate::sdg::planner::EventKind::Scorer).then_some("scorer"),
                     },
                     input,
                     output,
                     expected,
                     error,
                     metadata,
+                    scores: event.scores,
                     metrics,
                     tags,
                 })
@@ -249,10 +266,9 @@ fn last_descendants(events: &[crate::sdg::planner::EventPlan]) -> Box<[usize]> {
     last_descendants.into_boxed_slice()
 }
 
-// lays a subtree out from its offset within the trace: children run
-// sequentially after a fixed lead, and a span ends at the later of its own
-// duration or its last child's end; events are pre-order, so the direct
-// children of `index` chain through their last descendants
+// Application children run sequentially after a fixed lead. Scorer children
+// start after the application span ends, like asynchronously applied online
+// scores, and never move application timestamps or extend the parent.
 fn layout(
     events: &[crate::sdg::planner::EventPlan],
     last_descendants: &[usize],
@@ -266,16 +282,24 @@ fn layout(
     starts[index] = offset;
     let mut cursor = offset.checked_add(EVENT_SLOT).ok_or_else(overflow)?;
     let mut tail = offset;
+    let mut scorers = Vec::new();
     let mut child = index + 1;
     while child <= last_descendants[index] {
-        layout(events, last_descendants, child, cursor, starts, ends)?;
-        cursor = ends[child];
-        tail = ends[child];
+        if events[child].kind == crate::sdg::planner::EventKind::Scorer {
+            scorers.push(child);
+        } else {
+            layout(events, last_descendants, child, cursor, starts, ends)?;
+            cursor = ends[child];
+            tail = ends[child];
+        }
         child = last_descendants[child] + 1;
     }
 
     let own = events[index].duration.unwrap_or(EVENT_SLOT);
     ends[index] = tail.max(offset.checked_add(own).ok_or_else(overflow)?);
+    for scorer in scorers {
+        layout(events, last_descendants, scorer, ends[index], starts, ends)?;
+    }
     Ok(())
 }
 
@@ -455,9 +479,11 @@ mod tests {
                     metrics: Some(metrics),
                     tags: Box::new([]),
                 },
+                scores: None,
                 duration: None,
             }]),
             traces: Box::new([0..1]),
+            scorer_postlude: false,
         };
         let error = materialize(plan, Duration::from_secs(3_600), Distribution::Linear, SystemTime::now()).unwrap_err();
 
