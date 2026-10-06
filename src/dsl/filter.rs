@@ -2,8 +2,7 @@ use crate::dsl::ast::{BinOp, Expr, ExprKind, UnaryOp};
 use crate::dsl::{lexer::lex, parser::parse_expression};
 use std::str::FromStr;
 
-/// A write-time selection predicate over generated block instances. Top-level
-/// scorer definitions are never candidates because they generate no events.
+// scorer definitions are not filtered because they do not generate spans
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WriteFilter(Option<FilterExpr>);
 

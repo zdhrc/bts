@@ -21,8 +21,7 @@ static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expec
 pub(super) struct Plan {
     pub(super) events: Box<[EventPlan]>,
     pub(super) traces: Box<[Range<usize>]>,
-    // reserve one score-span slot even when a write filter hides scorers, so
-    // application timestamps match between filtered and unfiltered writes
+    // keep application times the same with or without scorer spans
     pub(super) scorer_postlude: bool,
 }
 

@@ -1,4 +1,9 @@
-use crate::dsl::spec::{Cardinality, NamePolicy, Place, RuleDesc, SPEC, Spec};
+use crate::cmd::{
+    Cli,
+    spec::{SPEC as CLI_SPEC, Spec as CliSpec},
+};
+use crate::dsl::spec::{Cardinality, NamePolicy, Place, RuleDesc, SPEC as DSL_SPEC, Spec as DslSpec};
+use clap::CommandFactory as _;
 use std::env;
 use std::fmt::{self, Write as _};
 use std::fs;
@@ -131,7 +136,7 @@ fn install_skill(agent: Agent, scope: Scope) -> Result<PathBuf, Error> {
         .map(PathBuf::from);
     let skill_dir = skill_dir(agent, scope, &current_dir, home_dir.as_deref(), claude_config_dir.as_deref())?;
 
-    write_skill(&skill_dir, &render_skill(&SPEC))
+    write_skill(&skill_dir, &render_skill(&DSL_SPEC, &CLI_SPEC))
 }
 
 fn user_home_dir() -> Option<PathBuf> {
@@ -191,21 +196,21 @@ fn write_skill(skill_dir: &Path, contents: &str) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
-fn render_skill(spec: &Spec) -> String {
+fn render_skill(spec: &DslSpec, cli_spec: &CliSpec) -> String {
     let mut output = String::new();
 
     writeln!(output, "---").unwrap();
     writeln!(output, "name: {SKILL_NAME}").unwrap();
     writeln!(
         output,
-        "description: Write, review, explain, and debug `bts` language source. Use when working with `bts` files, synthetic trace definitions, or `bts` syntax and validation errors."
+        "description: Write, review, explain, and debug `bts` language source and CLI workflows. Use when working with `bts` files, synthetic trace definitions, or `bts` commands and errors."
     )
     .unwrap();
     writeln!(output, "---\n").unwrap();
     writeln!(output, "{GENERATED_MARKER}\n").unwrap();
     writeln!(output, "# `{}` language\n", spec.name).unwrap();
     writeln!(output, "{}\n", spec.summary).unwrap();
-    writeln!(output, "## Workflow\n").unwrap();
+    writeln!(output, "## Shape authoring workflow\n").unwrap();
     writeln!(
         output,
         "1. Read the language reference below before creating or changing `bts` source."
@@ -228,25 +233,12 @@ fn render_skill(spec: &Spec) -> String {
     .unwrap();
     writeln!(
         output,
-        "5. Preview generated Braintrust events with `bts write --from <path> --count <traces> --over <duration> --dry-run`."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "6. Shape the run's timeline with flags on that same command: `--offset <duration>` slides the `--over` window back from now, `--start <ts> --end <ts>` (RFC 3339) pin it absolutely, `--rate <n/unit>` (e.g. `20/h`) sizes the volume from the window instead of `--count`, and `--dist` shapes how traces spread across it."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "7. When the user requests a live write, select the project with `bt switch`, set `BRAINTRUST_API_KEY`, then rerun without `--dry-run`. The project name and ID come from `.bt/config.json`.\n"
-    )
-    .unwrap();
-    writeln!(
-        output,
         "Treat this generated reference as authoritative for `bts` language version {} (specification schema version {}).\n",
         spec.language_version, spec.schema_version
     )
     .unwrap();
+
+    render_cli_spec(&mut output, cli_spec);
 
     writeln!(output, "## Authoring for realism\n").unwrap();
     writeln!(output, "{REALISM_LEAD}\n").unwrap();
@@ -364,6 +356,57 @@ fn render_skill(spec: &Spec) -> String {
     output
 }
 
+fn render_cli_spec(output: &mut String, spec: &CliSpec) {
+    let cli = Cli::command();
+    writeln!(output, "## CLI commands\n").unwrap();
+    writeln!(output, "{}\n", spec.summary).unwrap();
+
+    for command in spec.commands {
+        let definition = command.path.iter().fold(&cli, |parent, part| {
+            parent
+                .get_subcommands()
+                .find(|child| child.get_name() == *part)
+                .expect("CLI spec names an existing command")
+        });
+        writeln!(output, "### {}\n", inline_code(&format!("bts {}", command.path.join(" ")))).unwrap();
+        if let Some(about) = definition.get_about() {
+            writeln!(output, "{}\n", about).unwrap();
+        }
+        for guidance in command.guidance {
+            writeln!(output, "- {guidance}").unwrap();
+        }
+        writeln!(output).unwrap();
+
+        writeln!(output, "Arguments and options:").unwrap();
+        for argument in definition.get_arguments() {
+            let name = if let Some(long) = argument.get_long() {
+                format!("--{long}")
+            } else {
+                format!("<{}>", argument.get_id())
+            };
+            let name = if argument.get_action().takes_values() && argument.get_long().is_some() {
+                let value = argument
+                    .get_value_names()
+                    .and_then(|names| names.first())
+                    .map_or("VALUE", |name| name.as_str());
+                format!("{name} <{value}>")
+            } else {
+                name
+            };
+            let help = argument.get_help().map(ToString::to_string).unwrap_or_default();
+            writeln!(output, "- {}: {}", inline_code(&name), help).unwrap();
+        }
+        writeln!(output).unwrap();
+        if !command.examples.is_empty() {
+            writeln!(output, "Examples:").unwrap();
+            for example in command.examples {
+                writeln!(output, "- {}", inline_code(example)).unwrap();
+            }
+            writeln!(output).unwrap();
+        }
+    }
+}
+
 fn render_rules(output: &mut String, rules: &[RuleDesc]) {
     if rules.is_empty() {
         return;
@@ -392,7 +435,7 @@ fn cardinality(cardinality: Cardinality) -> &'static str {
     }
 }
 
-fn placements(spec: &Spec, allowed_in: &[Place]) -> String {
+fn placements(spec: &DslSpec, allowed_in: &[Place]) -> String {
     allowed_in
         .iter()
         .map(|place| match *place {
@@ -512,25 +555,25 @@ mod tests {
 
     #[test]
     fn renders_the_language_spec_into_the_skill() {
-        let skill = render_skill(&SPEC);
+        let skill = render_skill(&DSL_SPEC, &CLI_SPEC);
 
         assert!(skill.starts_with("---\nname: bts\ndescription:"));
         assert!(skill.contains(GENERATED_MARKER));
         assert!(skill.contains("bts check syntax <path>"));
-        assert!(skill.contains("bts write --from <path> --count <traces> --over <duration> --dry-run"));
-        assert!(skill.contains(SPEC.summary));
-        assert!(skill.contains(SPEC.surface.grammar.trim()));
-        for expression in SPEC.expressions {
+        assert!(skill.contains("bts write --from shape.bt --count 100 --over 1h --dry-run"));
+        assert!(skill.contains(DSL_SPEC.summary));
+        assert!(skill.contains(DSL_SPEC.surface.grammar.trim()));
+        for expression in DSL_SPEC.expressions {
             assert!(skill.contains(expression.id.as_str()));
             assert!(skill.contains(expression.syntax));
             assert!(skill.contains(expression.summary));
         }
-        for function in SPEC.functions {
+        for function in DSL_SPEC.functions {
             assert!(skill.contains(function.name));
             assert!(skill.contains(function.syntax));
             assert!(skill.contains(function.summary));
         }
-        for block in SPEC.blocks {
+        for block in DSL_SPEC.blocks {
             assert!(skill.contains(block.keyword));
             assert!(skill.contains(block.syntax));
             assert!(skill.contains(block.summary));
@@ -548,15 +591,26 @@ mod tests {
             assert!(skill.contains(point));
         }
         assert!(skill.contains(EXAMPLES_PREAMBLE));
-        for example in SPEC.examples {
+        for example in DSL_SPEC.examples {
             assert!(skill.contains(example.summary));
             assert!(skill.contains(example.note));
             assert!(skill.contains(example.source.trim()));
         }
-        for rule in SPEC.rules {
+        for rule in DSL_SPEC.rules {
             assert!(skill.contains(rule.id.as_str()));
             assert!(skill.contains(rule.summary));
         }
+        assert!(skill.contains(CLI_SPEC.summary));
+        for command in CLI_SPEC.commands {
+            assert!(skill.contains(&format!("bts {}", command.path.join(" "))));
+            for guidance in command.guidance {
+                assert!(skill.contains(guidance));
+            }
+            for example in command.examples {
+                assert!(skill.contains(example));
+            }
+        }
+        assert!(skill.contains("--filter <EXPR>"));
     }
 
     #[test]

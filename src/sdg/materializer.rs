@@ -121,9 +121,7 @@ impl Materializer {
             )?;
         }
 
-        // The application root's end excludes asynchronous scorer spans. Keep
-        // one score slot inside the requested window for shapes that declare
-        // synthetic scorers, whether or not this run's filter writes them.
+        // leave room after the trace for scorer spans, even when filtered out
         let max_extent = plan.traces.iter().map(|trace| ends[trace.start]).max().unwrap_or_default();
         let max_extent = if plan.scorer_postlude {
             max_extent
@@ -266,9 +264,8 @@ fn last_descendants(events: &[crate::sdg::planner::EventPlan]) -> Box<[usize]> {
     last_descendants.into_boxed_slice()
 }
 
-// Application children run sequentially after a fixed lead. Scorer children
-// start after the application span ends, like asynchronously applied online
-// scores, and never move application timestamps or extend the parent.
+// application children run in order
+// scorer children start after their parent ends and do not change its timing
 fn layout(
     events: &[crate::sdg::planner::EventPlan],
     last_descendants: &[usize],

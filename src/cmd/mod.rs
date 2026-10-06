@@ -3,6 +3,7 @@ mod check;
 mod init;
 mod logging;
 mod setup;
+mod spec;
 mod sync;
 mod update;
 mod write;
