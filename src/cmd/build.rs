@@ -75,7 +75,7 @@ impl Args {
             return Err(Error::NoScorers);
         }
 
-        let project = crate::conf::project_name()?;
+        let project = crate::conf::ProjectContext::load()?.name;
         let lang = self.lang.map(Lang::into_model);
         let assembly =
             tracing::info_span!("assemble").in_scope(|| scg::assemble(&model.scorers, lang, &project).map_err(Error::Plan))?;

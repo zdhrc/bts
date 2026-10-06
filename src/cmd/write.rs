@@ -166,7 +166,7 @@ impl Args {
             return Ok(());
         }
 
-        let mut config = Braintrust::from_env()?;
+        let mut config = Braintrust::load()?;
         config.request_timeout = settings.request_timeout;
         config.write_concurrency = settings.write_concurrency;
         tracing::info!(project_id = %config.project_id, api_url = %config.api_url, "writing to braintrust");

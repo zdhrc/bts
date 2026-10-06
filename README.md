@@ -32,14 +32,15 @@ Next, install the `bts` agent skill so Claude Code or Codex can write and debug 
 bts setup skill claude    # or codex; --scope local|user|global
 ```
 
-Writing to Braintrust requires two environment variables:
+Select a Braintrust project with `bt switch`. Both scorer builds and live writes use
+the selected project's name and ID from `.bt/config.json`. Writing also requires an API key:
 
 ```sh
 export BRAINTRUST_API_KEY="sk-..."
-export BRAINTRUST_PROJECT_ID="<project uuid>"
 ```
 
-`BRAINTRUST_API_URL` can optionally override the default API endpoint. None of this is needed for `check` or `--dry-run`.
+`BRAINTRUST_API_URL` can optionally override the default API endpoint. The project context
+and API key are not needed for `check` or `--dry-run`.
 
 Then describe a trace in a shape file (see [The shape language](#the-shape-language)) and write a batch:
 
@@ -70,6 +71,9 @@ bts check logs <run-file-name>   # render a specific run from the listing
 ```
 
 ## Configuration
+
+`.bt/config.json` is the shared `bt` project context. Its `project` and `project_id`
+select the project for generated scorers and live writes.
 
 `.bt/bts/config.toml` (scaffolded by `bts init`) controls runtime behavior:
 

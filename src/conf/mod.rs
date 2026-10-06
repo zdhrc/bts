@@ -31,11 +31,10 @@ impl Braintrust {
         }
     }
 
-    pub(crate) fn from_env() -> Result<Self, Error> {
+    pub(crate) fn load() -> Result<Self, Error> {
         let api_key = required_env("BRAINTRUST_API_KEY")?;
-        let project_id = required_env("BRAINTRUST_PROJECT_ID")?;
-        let project_id = Uuid::parse_str(&project_id).map_err(|source| Error::InvalidProjectId { source })?;
-        let mut config = Self::new(api_key, project_id);
+        let project = ProjectContext::load()?;
+        let mut config = Self::new(api_key, project.id);
 
         if let Some(api_url) = env::var_os("BRAINTRUST_API_URL").filter(|value| !value.is_empty()) {
             config.api_url = api_url.to_string_lossy().into_owned();
@@ -164,26 +163,40 @@ pub(crate) fn project_root() -> std::io::Result<PathBuf> {
     Ok(root.to_path_buf())
 }
 
-// The bt CLI's selected project is also the target for generated SDK scorers.
-pub(crate) fn project_name() -> Result<String, Error> {
-    let path = project_root().map_err(Error::CurrentDirectory)?.join(BT_CONTEXT_PATH);
-    let raw = fs::read_to_string(&path).map_err(|source| Error::ReadProjectContext {
-        path: path.clone(),
-        source,
-    })?;
-    let context: BtContext = serde_json::from_str(&raw).map_err(|source| Error::ParseProjectContext {
-        path: path.clone(),
-        source,
-    })?;
-    context
-        .project
-        .filter(|name| !name.trim().is_empty())
-        .ok_or(Error::MissingProjectName { path })
+// The bt CLI's selected project is the target for both generated scorers and live writes.
+pub(crate) struct ProjectContext {
+    pub(crate) name: String,
+    pub(crate) id: Uuid,
+}
+
+impl ProjectContext {
+    pub(crate) fn load() -> Result<Self, Error> {
+        let path = project_root().map_err(Error::CurrentDirectory)?.join(BT_CONTEXT_PATH);
+        let raw = fs::read_to_string(&path).map_err(|source| Error::ReadProjectContext {
+            path: path.clone(),
+            source,
+        })?;
+        let context: BtContext = serde_json::from_str(&raw).map_err(|source| Error::ParseProjectContext {
+            path: path.clone(),
+            source,
+        })?;
+        let name = context
+            .project
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| Error::MissingProjectName { path: path.clone() })?;
+        let id = context
+            .project_id
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| Error::MissingProjectId { path: path.clone() })?;
+        let id = Uuid::parse_str(&id).map_err(|source| Error::InvalidProjectId { path, source })?;
+        Ok(Self { name, id })
+    }
 }
 
 #[derive(Deserialize)]
 struct BtContext {
     project: Option<String>,
+    project_id: Option<String>,
 }
 
 pub(crate) fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -221,12 +234,13 @@ fn required_env(name: &'static str) -> Result<String, Error> {
 #[derive(Debug)]
 pub(crate) enum Error {
     MissingVariable(&'static str),
-    InvalidProjectId { source: uuid::Error },
+    InvalidProjectId { path: PathBuf, source: uuid::Error },
     CurrentDirectory(std::io::Error),
     ReadConfig { path: PathBuf, source: std::io::Error },
     ReadProjectContext { path: PathBuf, source: std::io::Error },
     ParseProjectContext { path: PathBuf, source: serde_json::Error },
     MissingProjectName { path: PathBuf },
+    MissingProjectId { path: PathBuf },
     ParseConfig { path: PathBuf, source: toml::de::Error },
     InvalidLogLevel { path: PathBuf, value: String, reason: String },
     InvalidTimeout { path: PathBuf, value: String, reason: String },
@@ -237,7 +251,13 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingVariable(name) => write!(formatter, "environment variable {name} is required"),
-            Self::InvalidProjectId { source } => write!(formatter, "BRAINTRUST_PROJECT_ID must be a UUID: {source}"),
+            Self::InvalidProjectId { path, source } => {
+                write!(
+                    formatter,
+                    "bt project context {} has an invalid project_id: {source}",
+                    path.display()
+                )
+            }
             Self::CurrentDirectory(source) => {
                 write!(formatter, "could not determine the current directory: {source}")
             }
@@ -254,6 +274,13 @@ impl fmt::Display for Error {
                 write!(
                     formatter,
                     "bt project context {} has no project name; select one with `bt switch`",
+                    path.display()
+                )
+            }
+            Self::MissingProjectId { path } => {
+                write!(
+                    formatter,
+                    "bt project context {} has no project_id; select one with `bt switch`",
                     path.display()
                 )
             }

@@ -238,7 +238,7 @@ fn render_skill(spec: &Spec) -> String {
     .unwrap();
     writeln!(
         output,
-        "7. When the user requests a live write, set `BRAINTRUST_API_KEY` and `BRAINTRUST_PROJECT_ID`, then rerun without `--dry-run`.\n"
+        "7. When the user requests a live write, select the project with `bt switch`, set `BRAINTRUST_API_KEY`, then rerun without `--dry-run`. The project name and ID come from `.bt/config.json`.\n"
     )
     .unwrap();
     writeln!(

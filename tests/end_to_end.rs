@@ -295,17 +295,20 @@ fn threads_referenced_content_across_spans() {
 fn writes_generated_events_to_the_configured_endpoint() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
     let (api_url, request) = serve_insert(6);
     let output = bts()
+        .current_dir(&root)
         .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "2", "--over", "1h"])
         .env("BRAINTRUST_API_KEY", "test-secret")
-        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env("BRAINTRUST_PROJECT_ID", Uuid::new_v4().to_string())
         .env("BRAINTRUST_API_URL", api_url)
         .output()
         .unwrap();
     fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
     let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
     let (headers, body) = split_request(&request);
     let payload: JsonValue = serde_json::from_slice(body).unwrap();
@@ -321,17 +324,20 @@ fn writes_generated_events_to_the_configured_endpoint() {
 fn emits_a_json_summary_when_requested() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
     let (api_url, _request) = serve_insert(3);
     let output = bts()
+        .current_dir(&root)
         .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "1", "--over", "1h", "--seed", "3", "--json"])
         .env("BRAINTRUST_API_KEY", "test-secret")
-        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env_remove("BRAINTRUST_PROJECT_ID")
         .env("BRAINTRUST_API_URL", api_url)
         .output()
         .unwrap();
     fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let summary: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
@@ -348,10 +354,8 @@ fn emits_a_json_summary_when_requested() {
 #[test]
 fn build_writes_scorer_sources_without_credentials() {
     let shape = write_shape(include_str!("fixtures/scorers.bt"));
-    let root = std::env::temp_dir().join(format!("bts-build-{}", Uuid::new_v4()));
+    let root = write_project_context(Uuid::new_v4());
     let out = root.join("generated");
-    fs::create_dir_all(root.join(".bt")).unwrap();
-    fs::write(root.join(".bt/config.json"), r#"{"project":"test-project"}"#).unwrap();
     let output = bts()
         .current_dir(&root)
         .args(["build", "--from"])
@@ -425,6 +429,14 @@ fn write_shape(source: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("bts-write-{}.bt", Uuid::new_v4()));
     fs::write(&path, source).unwrap();
     path
+}
+
+fn write_project_context(project_id: Uuid) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("bts-context-{}", Uuid::new_v4()));
+    fs::create_dir_all(root.join(".bt")).unwrap();
+    let context = serde_json::json!({ "project": "test-project", "project_id": project_id.to_string() });
+    fs::write(root.join(".bt/config.json"), context.to_string()).unwrap();
+    root
 }
 
 fn serve_insert(row_count: usize) -> (String, Receiver<Vec<u8>>) {
