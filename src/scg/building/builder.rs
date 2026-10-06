@@ -132,10 +132,10 @@ mod tests {
         assert_eq!(scorers.len(), 2);
         assert!(out.join("pyproject.toml").exists());
         let code = &scorers[0].path;
-        assert_eq!(code.file_name().unwrap(), "answer-quality.scorer.py");
+        assert_eq!(code.file_name().unwrap(), "answer_quality_scorer.py");
         assert!(fs::read_to_string(code).unwrap().contains("def scorer_answer_quality("));
         assert_eq!(scorers[1].slugs, ["helpfulness"]);
-        assert_eq!(scorers[1].path.file_name().unwrap(), "helpfulness.scorer.py");
+        assert_eq!(scorers[1].path.file_name().unwrap(), "helpfulness_scorer.py");
         assert!(fs::read_to_string(&scorers[1].path).unwrap().contains("choice_scores="));
 
         fs::remove_dir_all(out).unwrap();
@@ -153,7 +153,7 @@ mod tests {
         assert_eq!(scorers.len(), 1);
         assert_eq!(scorers[0].slugs, ["response-quality", "response-length"]);
         let path = &scorers[0].path;
-        assert_eq!(path.file_name().unwrap(), "quality.scorer.py");
+        assert_eq!(path.file_name().unwrap(), "quality_scorer.py");
         let contents = fs::read_to_string(path).unwrap();
         assert!(contents.contains("def scorer_response_quality(") && contents.contains("def scorer_response_length("));
 
@@ -171,7 +171,7 @@ mod tests {
         assert!(
             built
                 .iter()
-                .any(|file| file.path == out.join("src/scorers/quality.scorer.py"))
+                .any(|file| file.path == out.join("src/scorers/quality_scorer.py"))
         );
         fs::remove_dir_all(out.parent().unwrap()).unwrap();
     }
@@ -181,7 +181,7 @@ mod tests {
         let model = compile("scorer \"s\" { code { score = 0.5 } }").unwrap();
         let assembly = assemble(&model.scorers, None, "test-project").unwrap();
         let out = out_dir();
-        let path = out.join("src/scorers/s.scorer.py");
+        let path = out.join("src/scorers/s_scorer.py");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "old\n").unwrap();
         let mut observed = false;

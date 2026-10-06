@@ -8,9 +8,9 @@ pub(crate) mod spec;
 
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use model::{
-    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId,
-    Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, Selection,
-    SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, When,
+    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP,
+    NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang,
+    Selection, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, When,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
@@ -39,6 +39,20 @@ mod tests {
             let result = compile(example.source);
             assert_eq!(result.is_ok(), example.valid, "example {}", example.id.as_str());
         }
+    }
+
+    #[test]
+    fn rejects_unbound_or_ambiguous_scoring_automations() {
+        let source = r#"automation "bad" {
+            type = "scorer"
+            scorers = ["missing"]
+            scope = "span"
+            root = true
+            span_names = ["answer"]
+        }"#;
+        let errors = compile(source).unwrap_err();
+        assert!(errors.iter().any(|error| error.what.contains("unknown scorer \"missing\"")));
+        assert!(errors.iter().any(|error| error.what.contains("set either root = true")));
     }
 
     #[test]

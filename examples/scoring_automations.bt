@@ -1,0 +1,60 @@
+# Scoring fixture: code scoring on an LLM span and judge scoring on the final trace.
+trace "password-reset-assistant" {
+    input = "How do I reset my password?"
+    expected = "Use the Forgot password link and follow the email instructions."
+    output = llm["password-reset-answer"].output.content
+
+    llm "password-reset-answer" {
+        input = [{ role = "user", content = trace.input }]
+        output = {
+            role = "assistant",
+            content = weighted(
+                ["Use the Forgot password link and follow the email instructions.", 8],
+                ["Contact support for help.", 2]
+            )
+        }
+        metadata = { model = "glm-5.2" }
+    }
+}
+
+scorer "reset-instructions" {
+    lang = "python"
+    code {
+        score = 0
+        when {
+            cond = contains(output.content, "Forgot password")
+            score = 1
+        }
+    }
+}
+
+scorer "response-helpfulness" {
+    judge {
+        model = "glm-5.2"
+        prompt = """
+            Rate how helpful the response is to the user's request.
+            Request: ${input}
+            Expected: ${expected}
+            Response: ${output}
+            """
+        options = { helpful = 1.0, partial = 0.5, unhelpful = 0.0 }
+    }
+}
+
+automation "score-reset-instructions" {
+    type = "scorer"
+    scorers = ["reset-instructions"]
+    scope = "span"
+    span_names = ["password-reset-answer"]
+    sampling_rate = 1.0
+    enabled = true
+}
+
+automation "judge-final-response" {
+    type = "scorer"
+    scorers = ["response-helpfulness"]
+    scope = "span"
+    span_names = ["password-reset-assistant"]
+    sampling_rate = 1.0
+    enabled = true
+}

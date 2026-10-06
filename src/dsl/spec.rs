@@ -202,6 +202,7 @@ pub(crate) mod ids {
     pub(crate) const CHOICE: Id = Id::new("block.choice");
     pub(crate) const MAYBE: Id = Id::new("block.maybe");
     pub(crate) const SCORER: Id = Id::new("block.scorer");
+    pub(crate) const AUTOMATION: Id = Id::new("block.automation");
     pub(crate) const CODE: Id = Id::new("block.code");
     pub(crate) const JUDGE: Id = Id::new("block.judge");
     pub(crate) const WHEN: Id = Id::new("block.when");
@@ -223,6 +224,13 @@ pub(crate) mod ids {
     pub(crate) const MODEL: Id = Id::new("field.model");
     pub(crate) const PROMPT: Id = Id::new("field.prompt");
     pub(crate) const OPTIONS: Id = Id::new("field.options");
+    pub(crate) const TYPE: Id = Id::new("field.type");
+    pub(crate) const SCORERS: Id = Id::new("field.scorers");
+    pub(crate) const SCOPE: Id = Id::new("field.scope");
+    pub(crate) const SPAN_NAMES: Id = Id::new("field.span-names");
+    pub(crate) const ROOT: Id = Id::new("field.root");
+    pub(crate) const SAMPLING_RATE: Id = Id::new("field.sampling-rate");
+    pub(crate) const ENABLED: Id = Id::new("field.enabled");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
@@ -340,10 +348,12 @@ pub(crate) mod ids {
     pub(crate) const SCORER_EXPRS: Id = Id::new("rule.scorer-expressions");
     pub(crate) const SCORER_LANG: Id = Id::new("rule.scorer-lang");
     pub(crate) const SCORER_FILE: Id = Id::new("rule.scorer-file");
+    pub(crate) const SCORER_SOURCE_FILES: Id = Id::new("rule.scorer-source-files");
     pub(crate) const SCORE_RANGE: Id = Id::new("rule.score-range");
     pub(crate) const JUDGE_MODEL: Id = Id::new("rule.judge-model");
     pub(crate) const JUDGE_PROMPT: Id = Id::new("rule.judge-prompt");
     pub(crate) const JUDGE_OPTIONS: Id = Id::new("rule.judge-options");
+    pub(crate) const AUTOMATION_BINDING: Id = Id::new("rule.automation-binding");
 
     pub(crate) const MULTI_TURN_CONVERSATION: Id = Id::new("example.multi-turn-conversation");
     pub(crate) const AGENT_TOOL_LOOP: Id = Id::new("example.agent-tool-loop");
@@ -354,6 +364,7 @@ pub(crate) mod ids {
     pub(crate) const ERROR_AND_ESCALATION: Id = Id::new("example.error-and-escalation");
     pub(crate) const CODE_SCORER: Id = Id::new("example.code-scorer");
     pub(crate) const JUDGE_SCORER: Id = Id::new("example.judge-scorer");
+    pub(crate) const SCORING_AUTOMATIONS: Id = Id::new("example.scoring-automations");
 }
 
 const ANY: ExprType = ExprType::Any;
@@ -476,11 +487,68 @@ const SCORER_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         id: ids::FILE,
         keyword: "file",
-        summary: "Output file stem code scorers with the same value pack into when built (`<file>.scorer.py`); defaults to the scorer's own name. Judge scorers build into their own source files and ignore it.",
+        summary: "Optional output file stem for packing code scorers; defaults to the scorer slug. Judge scorers ignore this field.",
         value: &STRING,
         cardinality: Cardinality::Optional,
     },
 ];
+
+const AUTOMATION_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::TYPE,
+        keyword: "type",
+        summary: "Automation kind; currently only the constant string \"scorer\".",
+        value: &STRING,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::SCORERS,
+        keyword: "scorers",
+        summary: "One or more names of scorer blocks in this source, deployed with `bt functions push`.",
+        value: &STRING_ARRAY,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::SCOPE,
+        keyword: "scope",
+        summary: "Scoring scope; currently only the constant string \"span\".",
+        value: &STRING,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::ROOT,
+        keyword: "root",
+        summary: "Apply to root spans when true; use either this or `span_names`.",
+        value: &BOOLEAN,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::SPAN_NAMES,
+        keyword: "span_names",
+        summary: "Apply to spans with these names; use either this or `root`.",
+        value: &STRING_ARRAY,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::SAMPLING_RATE,
+        keyword: "sampling_rate",
+        summary: "Fraction of matching spans to score, from 0 to 1; defaults to 1.",
+        value: &NUMBER,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::ENABLED,
+        keyword: "enabled",
+        summary: "Whether online scoring is active; defaults to true.",
+        value: &BOOLEAN,
+        cardinality: Cardinality::Optional,
+    },
+];
+
+const AUTOMATION_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::AUTOMATION_BINDING,
+    summary: "A scorer automation names local scorer blocks and targets either root spans or named spans.",
+}];
 
 const CODE_FIELDS: &[FieldDesc] = &[FieldDesc {
     id: ids::SCORE,
@@ -579,7 +647,7 @@ const MAYBE_CONVENTIONS: &[&str] = &[
 ];
 const SCORER_CONVENTIONS: &[&str] = &[
     "Name scorers the way Braintrust scorer functions are named, lowercase and hyphenated (`response-quality`), never a prose description.",
-    "Scorers usually live in their own .bt file with no trace block; a shape file keeps its one-trace-per-file convention.",
+    "Scorers may share a .bt file with one trace and its automations when testing scoring behavior together.",
 ];
 const CODE_CONVENTIONS: &[&str] = &[
     "Sample scores from a distribution clamped into range (`clamp(normal(0.78, 0.12), 0, 1)`) instead of constants so scores vary realistically.",
@@ -611,6 +679,10 @@ const SCORER_FILE_RULE: RuleDesc = RuleDesc {
     id: ids::SCORER_FILE,
     summary: "`file` is a constant string naming a bare file stem, without path separators or extensions; scorers packed into one file must resolve to the same language.",
 };
+const SCORER_SOURCE_FILES_RULE: RuleDesc = RuleDesc {
+    id: ids::SCORER_SOURCE_FILES,
+    summary: "Python scorer source filenames normalize the effective code file stem or judge slug to lowercase ASCII alphanumeric runs joined by underscores, prefix a leading digit with an underscore, and append `_scorer.py`. TypeScript scorer filenames use `<stem>.scorer.ts`.",
+};
 const SCORE_RANGE_RULE: RuleDesc = RuleDesc {
     id: ids::SCORE_RANGE,
     summary: "A constant `score` must be between 0 and 1; keep sampled scores in range with `clamp`.",
@@ -621,6 +693,7 @@ const SCORER_RULES: &[RuleDesc] = &[
     SCORER_EXPRS_RULE,
     SCORER_LANG_RULE,
     SCORER_FILE_RULE,
+    SCORER_SOURCE_FILES_RULE,
 ];
 const CODE_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
 const WHEN_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
@@ -1501,6 +1574,20 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: SCORER_CONVENTIONS,
     },
     BlockDesc {
+        id: ids::AUTOMATION,
+        keyword: "automation",
+        summary: "A named online scoring rule binding pushed scorer functions to root or named spans.",
+        syntax: "automation \"<name>\" { type = \"scorer\" scorers = [\"<scorer>\"] scope = \"span\" (root = true | span_names = [\"<span>\"]) [sampling_rate = <number>] [enabled = <boolean>] }",
+        name: NamePolicy::Required,
+        allowed_in: ROOT_ONLY,
+        body: BodyDesc {
+            fields: AUTOMATION_FIELDS,
+            open: false,
+        },
+        rules: AUTOMATION_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
         id: ids::CODE,
         keyword: "code",
         summary: "A code scorer body emitted as a scorer function in the declared language; `when` cases check in order, the first match wins, and `score` is the fallback.",
@@ -1549,7 +1636,7 @@ pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
 const RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::NONEMPTY_SHAPE,
-        summary: "A shape must declare at least one trace or scorer block.",
+        summary: "A shape must declare at least one trace, scorer, or automation block.",
     },
     RuleDesc {
         id: ids::RESERVED_METRICS,
@@ -1623,6 +1710,13 @@ const EXAMPLES: &[Example] = &[
         summary: "An LLM-as-a-judge scorer grading responses against labeled options.",
         note: "Expand along rubric granularity: more options give the judge finer distinctions to award.",
         source: include_str!("../../examples/judge_scorer.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::SCORING_AUTOMATIONS,
+        summary: "Synthetic support responses with code and judge scorers bound to their spans.",
+        note: "Build and push the scorers, then sync the automations before writing traces.",
+        source: include_str!("../../examples/scoring_automations.bt"),
         valid: true,
     },
 ];

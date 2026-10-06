@@ -3,6 +3,7 @@ mod check;
 mod init;
 mod logging;
 mod setup;
+mod sync;
 mod update;
 mod write;
 
@@ -22,6 +23,7 @@ enum Cmd {
     Check(check::Args),
     Init(init::Args),
     Setup(setup::Args),
+    Sync(sync::Args),
     Update(update::Args),
     Write(write::Args),
 }
@@ -33,6 +35,7 @@ impl Cli {
             Cmd::Check(args) => args.run()?,
             Cmd::Init(args) => args.run()?,
             Cmd::Setup(args) => args.run()?,
+            Cmd::Sync(args) => args.run()?,
             Cmd::Update(args) => args.run()?,
             Cmd::Write(args) => args.run()?,
         }
@@ -55,6 +58,7 @@ pub enum Error {
     Check(check::Error),
     Init(init::Error),
     Setup(setup::Error),
+    Sync(sync::Error),
     Update(update::Error),
     Write(write::Error),
 }
@@ -66,6 +70,7 @@ impl fmt::Display for Error {
             Self::Check(source) => source.fmt(formatter),
             Self::Init(source) => source.fmt(formatter),
             Self::Setup(source) => source.fmt(formatter),
+            Self::Sync(source) => source.fmt(formatter),
             Self::Update(source) => source.fmt(formatter),
             Self::Write(source) => source.fmt(formatter),
         }
@@ -95,6 +100,12 @@ impl From<init::Error> for Error {
 impl From<setup::Error> for Error {
     fn from(source: setup::Error) -> Self {
         Self::Setup(source)
+    }
+}
+
+impl From<sync::Error> for Error {
+    fn from(source: sync::Error) -> Self {
+        Self::Sync(source)
     }
 }
 

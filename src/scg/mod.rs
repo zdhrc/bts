@@ -9,7 +9,7 @@ use std::fmt;
 
 const JUDGE_USE_COT: bool = true;
 
-fn resolve_slugs(scorers: &[Scorer]) -> Result<Vec<String>, Error> {
+pub(crate) fn resolve_slugs(scorers: &[Scorer]) -> Result<Vec<String>, Error> {
     let mut slugs = Vec::with_capacity(scorers.len());
     let mut first_by_slug: HashMap<String, String> = HashMap::new();
     for scorer in scorers {
@@ -32,10 +32,26 @@ fn resolve_lang(scorer: &Scorer, lang: Option<ScorerLang>) -> ScorerLang {
     lang.or(scorer.lang).unwrap_or(ScorerLang::Python)
 }
 
-fn extension(lang: ScorerLang) -> &'static str {
+fn source_name(stem: &str, lang: ScorerLang) -> String {
     match lang {
-        ScorerLang::Python => "py",
-        ScorerLang::Typescript => "ts",
+        ScorerLang::Python => {
+            let mut normalized = String::new();
+            for ch in stem.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    normalized.push(ch.to_ascii_lowercase());
+                } else if !normalized.ends_with('_') && !normalized.is_empty() {
+                    normalized.push('_');
+                }
+            }
+            let normalized = normalized.trim_end_matches('_');
+            let prefix = if normalized.starts_with(|ch: char| ch.is_ascii_digit()) {
+                "_"
+            } else {
+                ""
+            };
+            format!("{prefix}{normalized}_scorer.py")
+        }
+        ScorerLang::Typescript => format!("{stem}.scorer.ts"),
     }
 }
 
@@ -87,7 +103,7 @@ pub(crate) fn assemble(scorers: &[Scorer], lang: Option<ScorerLang>, project: &s
             .collect();
         let source = emit::module(file_lang, &items).map_err(Error::Emit)?;
         files.push(SourceFile {
-            name: format!("{stem}.scorer.{}", extension(file_lang)),
+            name: source_name(&stem, file_lang),
             contents: registry::code(file_lang, project, &items, &source),
             slugs: members.iter().map(|&member| slugs[member].clone()).collect(),
             lang: file_lang,
@@ -98,7 +114,7 @@ pub(crate) fn assemble(scorers: &[Scorer], lang: Option<ScorerLang>, project: &s
         if let ScorerKind::Judge { model, prompt, options } = &scorer.kind {
             let judge_lang = lang.unwrap_or(ScorerLang::Python);
             files.push(SourceFile {
-                name: format!("{slug}.scorer.{}", extension(judge_lang)),
+                name: source_name(slug, judge_lang),
                 contents: registry::judge(
                     judge_lang,
                     project,

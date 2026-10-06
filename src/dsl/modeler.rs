@@ -1,9 +1,9 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP,
-    NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang,
-    Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
+    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Field, Func, JudgeOption, Maybe, Model,
+    NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg,
+    ScorerKind, ScorerLang, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
 };
 use crate::dsl::spec;
 use std::{
@@ -324,6 +324,7 @@ impl Modeler {
     fn model(mut self) -> Result<Model, Errors> {
         let mut traces = Vec::new();
         let mut scorers = Vec::new();
+        let mut automations = Vec::new();
 
         // collect vars first so refs work no matter the decl order
         let (vars_blocks, rest) = split_vars(std::mem::take(&mut self.ast.decls));
@@ -360,6 +361,11 @@ impl Modeler {
                         if let Some(scorer) = self.model_scorer(block, desc) {
                             scorers.push(scorer);
                         }
+                    } else if desc.id == spec::ids::AUTOMATION && desc.allows(spec::Place::Root) {
+                        let range = block.range;
+                        if let Some(automation) = self.model_automation(block, desc) {
+                            automations.push((automation, range));
+                        }
                     } else {
                         self.errors.push(Error::new(
                             ErrorKind::BlockNotAllowed {
@@ -381,6 +387,22 @@ impl Modeler {
         let refs = self.resolve_pending(&live);
         self.detect_cycles();
 
+        let scorer_names: HashSet<&str> = scorers.iter().map(|scorer| scorer.name.as_str()).collect();
+        let mut automation_names = HashSet::new();
+        for (automation, range) in &automations {
+            if !automation_names.insert(automation.name.as_str()) {
+                self.automation_error(format!("duplicate automation name {:?}", automation.name), *range);
+            }
+            for scorer in &automation.scorers {
+                if !scorer_names.contains(scorer.as_str()) {
+                    self.automation_error(
+                        format!("unknown scorer {scorer:?}; declare a scorer block in this source"),
+                        *range,
+                    );
+                }
+            }
+        }
+
         // per-iteration evaluation can repeat an identical diagnostic, keep the first
         let mut seen: Vec<Error> = Vec::new();
         self.errors.retain(|error| {
@@ -392,7 +414,7 @@ impl Modeler {
             }
         });
 
-        if traces.is_empty() && scorers.is_empty() && self.errors.is_empty() {
+        if traces.is_empty() && scorers.is_empty() && automations.is_empty() && self.errors.is_empty() {
             self.errors.push(Error::new(
                 ErrorKind::EmptyShape {
                     rule: spec::ids::NONEMPTY_SHAPE,
@@ -407,6 +429,7 @@ impl Modeler {
                 bindings,
                 refs,
                 scorers,
+                automations: automations.into_iter().map(|(automation, _)| automation).collect(),
             })
         } else {
             Err(self.errors)
@@ -434,6 +457,176 @@ impl Modeler {
             bindings,
             children,
         })
+    }
+
+    fn automation_error(&mut self, reason: String, range: SrcRange) {
+        self.errors.push(Error::new(
+            ErrorKind::InvalidAutomation {
+                rule: spec::ids::AUTOMATION_BINDING,
+                reason,
+            },
+            range,
+        ));
+    }
+
+    fn model_automation(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Automation> {
+        let ast::Block { name, decls, range, .. } = block;
+        let name = self.model_name(name, range, desc);
+        let mut seen = HashSet::new();
+        let mut kind = None;
+        let mut scorers = None;
+        let mut scope = None;
+        let mut root = None;
+        let mut span_names = None;
+        let mut sampling_rate = None;
+        let mut enabled = None;
+
+        for decl in decls {
+            let ast::Decl::Attr(attr) = decl else {
+                let ast::Decl::Block(inner) = decl else { unreachable!() };
+                let parent = spec::Place::Block { id: desc.id };
+                if let Some(inner_desc) = spec::SPEC.block(&inner.kind) {
+                    self.errors.push(Error::new(
+                        ErrorKind::BlockNotAllowed {
+                            block: inner_desc.id,
+                            parent,
+                        },
+                        inner.range,
+                    ));
+                } else {
+                    self.errors.push(Error::new(
+                        ErrorKind::UnknownBlock {
+                            keyword: inner.kind,
+                            parent,
+                        },
+                        inner.range,
+                    ));
+                }
+                continue;
+            };
+            let Some(field) = desc.field(&attr.key) else {
+                self.errors.push(Error::new(
+                    ErrorKind::UnknownField {
+                        block: desc.id,
+                        keyword: attr.key,
+                    },
+                    attr.range,
+                ));
+                continue;
+            };
+            if !seen.insert(field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::DuplicateField {
+                        block: desc.id,
+                        field: field.id,
+                    },
+                    attr.range,
+                ));
+                continue;
+            }
+            let Some(folded) = self.fold_expr(attr.value) else { continue };
+            let value = folded.into_value();
+            match field.id {
+                id if id == spec::ids::TYPE => kind = self.automation_string(value, field.keyword, attr.range),
+                id if id == spec::ids::SCORERS => scorers = self.automation_strings(value, field.keyword, attr.range),
+                id if id == spec::ids::SCOPE => scope = self.automation_string(value, field.keyword, attr.range),
+                id if id == spec::ids::ROOT => root = self.automation_bool(value, field.keyword, attr.range),
+                id if id == spec::ids::SPAN_NAMES => span_names = self.automation_strings(value, field.keyword, attr.range),
+                id if id == spec::ids::ENABLED => enabled = self.automation_bool(value, field.keyword, attr.range),
+                id if id == spec::ids::SAMPLING_RATE => {
+                    sampling_rate = match value {
+                        Value::Num(number) if (0.0..=1.0).contains(&float_bound(number.clone())) => Some(float_bound(number)),
+                        _ => {
+                            self.automation_error("sampling_rate must be a constant number from 0 to 1".to_owned(), attr.range);
+                            None
+                        }
+                    };
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        for field in desc
+            .body
+            .fields
+            .iter()
+            .filter(|field| field.cardinality == spec::Cardinality::Required)
+        {
+            if !seen.contains(&field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::MissingField {
+                        block: desc.id,
+                        field: field.id,
+                    },
+                    range,
+                ));
+            }
+        }
+        if kind.as_deref().is_some_and(|value| value != "scorer") {
+            self.automation_error("type must be \"scorer\"".to_owned(), range);
+        }
+        if scope.as_deref().is_some_and(|value| value != "span") {
+            self.automation_error("scope must be \"span\"".to_owned(), range);
+        }
+        if root == Some(true) && span_names.is_some() || root != Some(true) && span_names.is_none() {
+            self.automation_error("set either root = true or a nonempty span_names array".to_owned(), range);
+        }
+
+        match (name, kind, scorers, scope) {
+            (Some(name), Some(kind), Some(scorers), Some(scope)) if kind == "scorer" && scope == "span" => Some(Automation {
+                name,
+                scorers,
+                root: root.unwrap_or(false),
+                span_names: span_names.unwrap_or_default(),
+                sampling_rate: sampling_rate.unwrap_or(1.0),
+                enabled: enabled.unwrap_or(true),
+            }),
+            _ => None,
+        }
+    }
+
+    fn automation_string(&mut self, value: Value, field: &str, range: SrcRange) -> Option<String> {
+        match value {
+            Value::Str(value) if !value.is_empty() => Some(value),
+            _ => {
+                self.automation_error(format!("{field} must be a nonempty constant string"), range);
+                None
+            }
+        }
+    }
+
+    fn automation_strings(&mut self, value: Value, field: &str, range: SrcRange) -> Option<Vec<String>> {
+        let Value::Array(array) = value else {
+            self.automation_error(format!("{field} must be a nonempty array of constant strings"), range);
+            return None;
+        };
+        let mut values = Vec::new();
+        for item in array.elem {
+            let ArrayElem::Item(Value::Str(value)) = item else {
+                self.automation_error(format!("{field} must contain only constant strings"), range);
+                return None;
+            };
+            if value.is_empty() || values.contains(&value) {
+                self.automation_error(format!("{field} must contain distinct nonempty strings"), range);
+                return None;
+            }
+            values.push(value);
+        }
+        if values.is_empty() {
+            self.automation_error(format!("{field} must not be empty"), range);
+            return None;
+        }
+        Some(values)
+    }
+
+    fn automation_bool(&mut self, value: Value, field: &str, range: SrcRange) -> Option<bool> {
+        match value {
+            Value::Bool(value) => Some(value),
+            _ => {
+                self.automation_error(format!("{field} must be a constant boolean"), range);
+                None
+            }
+        }
     }
 
     // a scorer never enters the symbol tree: block references are rejected
@@ -5456,6 +5649,10 @@ pub(super) enum ErrorKind {
     InvalidJudgeOptions {
         rule: spec::Id,
     },
+    InvalidAutomation {
+        rule: spec::Id,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ErrorKind {
@@ -5643,7 +5840,11 @@ impl fmt::Display for ErrorKind {
             }
             Self::EmptyShape { rule } => {
                 let rule = rule_desc(*rule);
-                write!(formatter, "shape declares no traces or scorers; {}", rule.summary)
+                write!(
+                    formatter,
+                    "shape declares no traces, scorers, or automations; {}",
+                    rule.summary
+                )
             }
             Self::UnknownFunction { rule, name } => {
                 let rule = rule_desc(*rule);
@@ -5924,6 +6125,9 @@ impl fmt::Display for ErrorKind {
                     "judge options must map at least two labels to constant scores between 0 and 1; {}",
                     rule.summary
                 )
+            }
+            Self::InvalidAutomation { rule, reason } => {
+                write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
             }
         }
     }

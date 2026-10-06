@@ -10,6 +10,7 @@ pub(crate) struct Model {
     pub(crate) refs: Vec<ResolvedRef>,
     // root scorer blocks in declaration order, consumed by scg rather than sdg
     pub(crate) scorers: Vec<Scorer>,
+    pub(crate) automations: Vec<Automation>,
 }
 
 // a block's identity, assigned in walk order; stable across a compile so both
@@ -185,6 +186,16 @@ pub(crate) struct Scorer {
     // output file stem this scorer packs into when built; none = its own slug
     pub(crate) file: Option<String>,
     pub(crate) kind: ScorerKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Automation {
+    pub(crate) name: String,
+    pub(crate) scorers: Vec<String>,
+    pub(crate) root: bool,
+    pub(crate) span_names: Vec<String>,
+    pub(crate) sampling_rate: f64,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
