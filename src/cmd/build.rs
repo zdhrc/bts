@@ -14,7 +14,7 @@ pub struct Args {
     #[arg(long, value_name = "LANG", value_enum)]
     lang: Option<Lang>,
 
-    /// directory the source files are written into; defaults to the current directory
+    /// codebase root; scorer files are written under src/scorers
     #[arg(long, value_name = "DIR", default_value = ".")]
     out: PathBuf,
 
@@ -89,19 +89,24 @@ impl Args {
 
         for source in &built {
             let verb = match source.action {
-                scg::builder::Action::Created => "created",
-                scg::builder::Action::Updated => "updated",
-                scg::builder::Action::Unchanged => "unchanged",
+                scg::building::Action::Created => "created",
+                scg::building::Action::Updated => "updated",
+                scg::building::Action::Unchanged => "unchanged",
             };
-            println!("{verb} {} ({})", source.path.display(), source.slugs.join(", "));
+            if source.slugs.is_empty() {
+                println!("{verb} {}", source.path.display());
+            } else {
+                println!("{verb} {} ({})", source.path.display(), source.slugs.join(", "));
+            }
         }
         let written = built
             .iter()
-            .filter(|source| source.action != scg::builder::Action::Unchanged)
+            .filter(|source| source.action != scg::building::Action::Unchanged)
             .count();
         tracing::info!(written, scorers = model.scorers.len(), "build finished");
         let names = built
             .iter()
+            .filter(|source| !source.slugs.is_empty())
             .map(|source| {
                 source
                     .path
@@ -114,7 +119,7 @@ impl Args {
             .join(" ");
         println!(
             "from {} run: bt functions push --if-exists replace {names}",
-            self.out.display()
+            self.out.join("src/scorers").display()
         );
 
         Ok(())
@@ -128,7 +133,7 @@ pub enum Error {
     NoScorers,
     Plan(scg::Error),
     Config(crate::conf::Error),
-    Build(scg::builder::Error),
+    Build(scg::building::Error),
 }
 
 impl fmt::Display for Error {

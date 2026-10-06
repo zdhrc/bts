@@ -1,4 +1,4 @@
-pub(crate) mod builder;
+pub(crate) mod building;
 mod component;
 mod diff;
 mod emit;
@@ -90,6 +90,7 @@ pub(crate) fn assemble(scorers: &[Scorer], lang: Option<ScorerLang>, project: &s
             name: format!("{stem}.scorer.{}", extension(file_lang)),
             contents: registry::code(file_lang, project, &items, &source),
             slugs: members.iter().map(|&member| slugs[member].clone()).collect(),
+            lang: file_lang,
         });
     }
 
@@ -108,6 +109,7 @@ pub(crate) fn assemble(scorers: &[Scorer], lang: Option<ScorerLang>, project: &s
                     options.iter().map(|option| (option.label.as_str(), option.score)).collect(),
                 ),
                 slugs: vec![slug.clone()],
+                lang: judge_lang,
             });
         }
     }
@@ -204,14 +206,15 @@ pub(crate) struct SourceFile {
     pub(crate) name: String,
     pub(crate) contents: String,
     pub(crate) slugs: Vec<String>,
+    pub(crate) lang: ScorerLang,
 }
 
 pub(crate) fn build(
     assembly: &Assembly,
     out: &std::path::Path,
     before_overwrite: impl FnMut(&std::path::Path, &str),
-) -> Result<Vec<builder::Built>, builder::Error> {
-    builder::build(assembly, out, before_overwrite)
+) -> Result<Vec<building::Built>, building::Error> {
+    building::build(assembly, out, before_overwrite)
 }
 
 #[derive(Debug)]
