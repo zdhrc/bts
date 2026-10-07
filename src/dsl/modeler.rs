@@ -10,6 +10,7 @@ use crate::dsl::spec;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    path::Path,
 };
 
 enum FieldValue {
@@ -42,7 +43,7 @@ impl ExprType {
                 Value::Bool(_) => Self::Boolean,
                 Value::Null => Self::Null,
                 Value::Array(_) => Self::Array,
-                Value::Object(_) => Self::Object,
+                Value::Object(_) | Value::Attachment { .. } => Self::Object,
                 Value::Func { .. } => Self::Func,
                 // context indexes and counts are always integers
                 Value::CtxRef(_) => Self::Number,
@@ -1260,6 +1261,7 @@ impl Modeler {
     fn check_scorer_value(&mut self, value: &Value) {
         match value {
             Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::ArgRef(_) => {}
+            Value::Attachment { .. } => unreachable!("attachments are only materialized during generation"),
             Value::CtxRef(CtxRef::RepeatIndex | CtxRef::RepeatCount) => {}
             Value::VarRef(_) | Value::CtxRef(CtxRef::TraceIndex) | Value::BlockRef { .. } => {
                 unreachable!("rejected in scorer scope during folding")
@@ -1309,6 +1311,15 @@ impl Modeler {
                 }
             }
             Value::Func { func, range } => match func {
+                Func::Attachment { .. } => {
+                    self.errors.push(Error::new(
+                        ErrorKind::ScorerFunc {
+                            rule: spec::ids::SCORER_EXPRS,
+                            func: "attachment",
+                        },
+                        *range,
+                    ));
+                }
                 Func::Tokens { value } => {
                     self.errors.push(Error::new(
                         ErrorKind::ScorerFunc {
@@ -2777,7 +2788,7 @@ impl Modeler {
             // scorer args are opaque to shape checks exactly like block
             // references, and never appear outside scorer scope
             Value::ArgRef(_) => true,
-            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::CtxRef(_) => false,
+            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::CtxRef(_) | Value::Attachment { .. } => false,
             Value::Template(template) => template.parts.iter().any(|part| match part {
                 Part::Dynamic(value) => self.value_reaches_block_ref(value),
                 Part::Lit(_) | Part::Ref(_) | Part::VarRef(_) => false,
@@ -2814,7 +2825,8 @@ impl Modeler {
                 | Func::Chance { .. }
                 | Func::Uuid
                 | Func::Hex { .. }
-                | Func::Alphanum { .. } => false,
+                | Func::Alphanum { .. }
+                | Func::Attachment { .. } => false,
                 Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => self.value_reaches_block_ref(text),
                 Func::Replace { text, from, to } => {
                     self.value_reaches_block_ref(text) || self.value_reaches_block_ref(from) || self.value_reaches_block_ref(to)
@@ -4033,6 +4045,37 @@ impl Modeler {
                 let size = self.model_typed_arg(size, func, StaticType::Number)?;
                 Some(Func::Noise { size: Box::new(size) })
             }
+            "attachment" => {
+                let [path, content_type] = self.func_args(func, args, "exactly two arguments (path, content_type)", range)?;
+                let Some(path_text) = const_string(&path).filter(|path| Path::new(path).file_name().is_some()) else {
+                    self.errors.push(Error::new(
+                        ErrorKind::ParamOutOfRange {
+                            rule: spec::ids::FUNC_ARG_TYPES,
+                            func,
+                            param: "path",
+                            expected: "a constant file path",
+                        },
+                        path.range,
+                    ));
+                    return None;
+                };
+                let Some(content_type_text) = const_string(&content_type).filter(|value| !value.is_empty()) else {
+                    self.errors.push(Error::new(
+                        ErrorKind::ParamOutOfRange {
+                            rule: spec::ids::FUNC_ARG_TYPES,
+                            func,
+                            param: "content_type",
+                            expected: "a non-empty constant MIME type",
+                        },
+                        content_type.range,
+                    ));
+                    return None;
+                };
+                Some(Func::Attachment {
+                    path: path_text,
+                    content_type: content_type_text,
+                })
+            }
 
             _ => unreachable!("function {name} does not have a model lowering"),
         }
@@ -4369,7 +4412,7 @@ impl Modeler {
             Value::Bool(_) => Some(StaticType::Boolean),
             Value::Null => Some(StaticType::Null),
             Value::Array(_) => Some(StaticType::Array),
-            Value::Object(_) => Some(StaticType::Object),
+            Value::Object(_) | Value::Attachment { .. } => Some(StaticType::Object),
             // a binding is typed by its definition
             Value::VarRef(name) => {
                 let value = self.var_value(name)?;
@@ -4448,6 +4491,7 @@ impl Modeler {
             | Func::Alphanum { .. }
             | Func::Noise { .. } => Some(StaticType::String),
             Func::Split { .. } => Some(StaticType::Array),
+            Func::Attachment { .. } => Some(StaticType::Object),
         }
     }
 
@@ -5119,7 +5163,8 @@ fn collect_refs(value: &Value, found: &mut Vec<RefId>) {
         | Value::Null
         | Value::VarRef(_)
         | Value::CtxRef(_)
-        | Value::ArgRef(_) => {}
+        | Value::ArgRef(_)
+        | Value::Attachment { .. } => {}
         Value::Template(template) => collect_template_refs(template, found),
         Value::Array(array) => {
             for elem in &array.elem {
@@ -5183,7 +5228,8 @@ fn collect_func_refs(func: &Func, found: &mut Vec<RefId>) {
         | Func::Chance { .. }
         | Func::Uuid
         | Func::Hex { .. }
-        | Func::Alphanum { .. } => {}
+        | Func::Alphanum { .. }
+        | Func::Attachment { .. } => {}
         Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => collect_refs(text, found),
         Func::Replace { text, from, to } => {
             collect_refs(text, found);
@@ -5417,7 +5463,8 @@ fn value_is_constant(value: &Value) -> bool {
         | Value::VarRef(_)
         | Value::CtxRef(_)
         | Value::ArgRef(_)
-        | Value::BlockRef { .. } => false,
+        | Value::BlockRef { .. }
+        | Value::Attachment { .. } => false,
         Value::Unary { .. } | Value::Binary { .. } | Value::Cond { .. } | Value::Index { .. } | Value::Slice { .. } => false,
     }
 }
@@ -9824,6 +9871,10 @@ mod tests {
                         cond = len(noise(10)) > 5
                         score = 0
                     }
+                    when {
+                        cond = len([attachment("report.txt", "text/plain")]) > 0
+                        score = 0
+                    }
                 }
             }
             "#,
@@ -9832,6 +9883,7 @@ mod tests {
 
         assert!(matches!(errors[0].kind(), ErrorKind::ScorerFunc { func: "tokens", .. }));
         assert!(matches!(errors[1].kind(), ErrorKind::ScorerFunc { func: "noise", .. }));
+        assert!(matches!(errors[2].kind(), ErrorKind::ScorerFunc { func: "attachment", .. }));
     }
 
     #[test]

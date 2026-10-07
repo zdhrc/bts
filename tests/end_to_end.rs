@@ -397,6 +397,214 @@ fn writes_generated_events_to_the_configured_endpoint() {
 }
 
 #[test]
+fn uploads_an_attachment_before_inserting_its_reference() {
+    let file = std::env::temp_dir().join(format!("bts-attachment-{}.pdf", Uuid::new_v4()));
+    let contents = b"small pdf test payload";
+    fs::write(&file, contents).unwrap();
+    let path_literal = serde_json::to_string(&file.display().to_string()).unwrap();
+    let shape = write_shape(&format!(
+        "trace \"review\" {{ input = {{ document = attachment({path_literal}, \"application/pdf\") }} }}"
+    ));
+    let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let org_id = Uuid::new_v4();
+    let (api_url, requests) = serve_attachment_flow(org_id, 3);
+
+    let output = bts()
+        .current_dir(&root)
+        .args(["write", "--from"])
+        .arg(&shape)
+        .args(["--count", "3", "--over", "1h"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env_remove("BRAINTRUST_PROJECT_ID")
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_file(&file).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 5);
+    let (project_headers, _) = split_request(&requests[0]);
+    assert!(project_headers.starts_with(&format!("GET /v1/project/{project_id} HTTP/1.1\r\n")));
+
+    let (init_headers, init_body) = split_request(&requests[1]);
+    assert!(init_headers.starts_with("POST /attachment HTTP/1.1\r\n"));
+    let init: JsonValue = serde_json::from_slice(init_body).unwrap();
+    assert_eq!(init["org_id"], org_id.to_string());
+    assert_eq!(init["filename"], file.file_name().unwrap().to_string_lossy().as_ref());
+    assert_eq!(init["content_type"], "application/pdf");
+    let key = init["key"].as_str().unwrap();
+
+    let (upload_headers, upload_body) = split_request(&requests[2]);
+    assert!(upload_headers.starts_with("PUT /blob HTTP/1.1\r\n"));
+    assert!(!upload_headers.to_ascii_lowercase().contains("authorization:"));
+    assert!(upload_headers.to_ascii_lowercase().contains("if-none-match: *\r\n"));
+    assert_eq!(upload_body, contents);
+
+    let (status_headers, status_body) = split_request(&requests[3]);
+    assert!(status_headers.starts_with("POST /attachment/status HTTP/1.1\r\n"));
+    let status: JsonValue = serde_json::from_slice(status_body).unwrap();
+    assert_eq!(status["key"], key);
+    assert_eq!(status["status"]["upload_status"], "done");
+
+    let (insert_headers, insert_body) = split_request(&requests[4]);
+    assert!(insert_headers.starts_with(&format!("POST /v1/project_logs/{project_id}/insert HTTP/1.1\r\n")));
+    let inserted: JsonValue = serde_json::from_slice(insert_body).unwrap();
+    assert_eq!(inserted["events"].as_array().unwrap().len(), 3);
+    for event in inserted["events"].as_array().unwrap() {
+        let document = &event["input"]["document"];
+        assert_eq!(document["type"], "braintrust_attachment");
+        assert_eq!(document["key"], key);
+        assert_eq!(document["content_type"], "application/pdf");
+    }
+}
+
+#[test]
+fn filtered_blocks_do_not_upload_attachments_or_emit_scorer_spans() {
+    let shape = write_shape(
+        r#"
+        trace "review" {
+            task "attachment-holder" {
+                output = attachment("filtered-out.pdf", "application/pdf")
+            }
+            task "scored" {
+                output = "ok"
+                scorer "inline-score" { score = 1 }
+            }
+        }
+        scorer "inline-score" { code { score = 1 } }
+        "#,
+    );
+    let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let (api_url, request) = serve_insert(2);
+    let output = bts()
+        .current_dir(&root)
+        .args(["write", "--from"])
+        .arg(&shape)
+        .args([
+            "--count",
+            "1",
+            "--over",
+            "1h",
+            "--filter",
+            "block.name != \"attachment-holder\" && block.kind != \"scorer\"",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (headers, body) = split_request(&request);
+    assert!(headers.starts_with(&format!("POST /v1/project_logs/{project_id}/insert HTTP/1.1\r\n")));
+    let payload: JsonValue = serde_json::from_slice(body).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["span_attributes"]["name"], "review");
+    assert_eq!(events[1]["span_attributes"]["name"], "scored");
+    assert!(events[1].get("scores").is_none());
+}
+
+#[test]
+fn attachment_keys_are_run_scoped_and_distinguish_full_paths() {
+    let shape = write_shape("");
+    let first = shape.with_file_name(format!("bts-first-{}.pdf", Uuid::new_v4()));
+    let second = shape.with_file_name(format!("bts-second-{}.pdf", Uuid::new_v4()));
+    fs::write(&first, b"same bytes").unwrap();
+    fs::write(&second, b"same bytes").unwrap();
+    let first_name = serde_json::to_string(&first.file_name().unwrap().to_string_lossy()).unwrap();
+    let first_path = serde_json::to_string(&first.display().to_string()).unwrap();
+    let second_path = serde_json::to_string(&second.display().to_string()).unwrap();
+    fs::write(
+        &shape,
+        format!(
+            "trace \"review\" {{ input = {{ first = attachment({first_name}, \"application/pdf\"), same = attachment({first_path}, \"application/pdf\"), second = attachment({second_path}, \"application/pdf\"), other_type = attachment({first_path}, \"text/plain\") }} }}"
+        ),
+    )
+    .unwrap();
+
+    let generate = || {
+        let output = bts()
+            .args(["write", "--from"])
+            .arg(&shape)
+            .args(["--count", "3", "--over", "1h", "--seed", "42", "--dry-run"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<JsonValue>(&output.stdout).unwrap()
+    };
+    let first_run = generate();
+    let second_run = generate();
+    fs::remove_file(shape).unwrap();
+    fs::remove_file(first).unwrap();
+    fs::remove_file(second).unwrap();
+
+    let events = first_run["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3);
+    let shared = &events[0]["input"]["first"]["key"];
+    assert!(shared.is_string());
+    for event in events {
+        assert_eq!(&event["input"]["same"]["key"], shared);
+        assert_eq!(&event["input"]["first"]["key"], shared);
+        assert_ne!(&event["input"]["second"]["key"], shared);
+        assert_ne!(&event["input"]["other_type"]["key"], shared);
+    }
+    assert_ne!(&second_run["events"][0]["input"]["first"]["key"], shared);
+}
+
+#[test]
+fn resolves_relative_attachments_from_the_shape_directory() {
+    let shape_dir = std::env::temp_dir().join(format!("bts-relative-{}", Uuid::new_v4()));
+    fs::create_dir(&shape_dir).unwrap();
+    let shape = shape_dir.join("shape.bt");
+    let file = shape_dir.join("report.pdf");
+    let contents = b"relative attachment payload";
+    fs::write(&file, contents).unwrap();
+    fs::write(
+        &shape,
+        "trace \"review\" { input = { document = attachment(\"report.pdf\", \"application/pdf\") } }",
+    )
+    .unwrap();
+    let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let relative_shape = std::path::Path::new("..").join(shape.strip_prefix(std::env::temp_dir()).unwrap());
+    let org_id = Uuid::new_v4();
+    let (api_url, requests) = serve_attachment_flow(org_id, 1);
+
+    let output = bts()
+        .current_dir(&root)
+        .args(["write", "--from"])
+        .arg(&relative_shape)
+        .args(["--count", "1", "--over", "1h"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env_remove("BRAINTRUST_PROJECT_ID")
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(shape_dir).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 5);
+    let (_, init_body) = split_request(&requests[1]);
+    let init: JsonValue = serde_json::from_slice(init_body).unwrap();
+    assert_eq!(init["filename"], "report.pdf");
+    let (_, upload_body) = split_request(&requests[2]);
+    assert_eq!(upload_body, contents);
+    let (_, insert_body) = split_request(&requests[4]);
+    let inserted: JsonValue = serde_json::from_slice(insert_body).unwrap();
+    assert_eq!(inserted["events"][0]["input"]["document"]["key"], init["key"]);
+}
+
+#[test]
 fn emits_a_json_summary_when_requested() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
@@ -793,7 +1001,41 @@ fn serve_json_sequence(replies: Vec<JsonValue>) -> (String, Receiver<Vec<Vec<u8>
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
-                body
+                body,
+            )
+            .unwrap();
+        }
+        sender.send(requests).unwrap();
+    });
+    (format!("http://{address}"), receiver)
+}
+
+fn serve_attachment_flow(org_id: Uuid, row_count: usize) -> (String, Receiver<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for step in 0..5 {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_request(&mut stream));
+            let body = match step {
+                0 => serde_json::json!({ "org_id": org_id.to_string() }).to_string(),
+                1 => serde_json::json!({
+                    "signedUrl": format!("http://{address}/blob"),
+                    "headers": { "If-None-Match": "*" },
+                })
+                .to_string(),
+                4 => serde_json::json!({ "row_ids": (0..row_count).map(|index| format!("row-{index}")).collect::<Vec<_>>() })
+                    .to_string(),
+                _ => "{}".to_owned(),
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
             )
             .unwrap();
         }

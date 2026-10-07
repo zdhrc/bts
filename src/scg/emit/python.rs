@@ -140,6 +140,7 @@ impl Emitter {
             Value::Bool(false) => ("False".to_owned(), ATOM),
             Value::Null => ("None".to_owned(), ATOM),
             Value::ArgRef(arg) => (arg_name(*arg).to_owned(), ATOM),
+            Value::Attachment { .. } => return Err(Error::Unsupported { what: "`attachment`" }),
             Value::Template(template) => self.template(template)?,
             Value::Array(array) => {
                 let mut items = Vec::with_capacity(array.elem.len());
@@ -405,6 +406,7 @@ impl Emitter {
                     POSTFIX,
                 )
             }
+            Func::Attachment { .. } => return Err(Error::Unsupported { what: "`attachment`" }),
             Func::Tokens { .. } => return Err(Error::Unsupported { what: "`tokens`" }),
             Func::Noise { .. } => return Err(Error::Unsupported { what: "`noise`" }),
         };

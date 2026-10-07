@@ -146,7 +146,7 @@ impl Args {
             }
         };
         tracing::info!(seed, "seed resolved");
-        let events = tracing::info_span!("generate")
+        let mut events = tracing::info_span!("generate")
             .in_scope(|| {
                 sdg::generate_filtered(
                     model,
@@ -173,6 +173,12 @@ impl Args {
                 },
                 other => Error::Generate(other),
             })?;
+        events
+            .resolve_attachment_paths(&self.from)
+            .map_err(|source| Error::ResolveAttachmentPaths {
+                path: self.from.clone(),
+                source,
+            })?;
 
         if self.dry_run {
             let encoded = tracing::info_span!("encode").in_scope(|| serde_json::to_string_pretty(&events))?;
@@ -183,6 +189,9 @@ impl Args {
         let mut config = Braintrust::load()?;
         config.request_timeout = settings.request_timeout;
         config.write_concurrency = settings.write_concurrency;
+        config.max_attachment_uploads = settings.max_attachment_uploads;
+        config.max_attachment_file_bytes = settings.max_attachment_file_bytes;
+        config.max_attachment_total_bytes = settings.max_attachment_total_bytes;
         tracing::info!(project_id = %config.project_id, api_url = %config.api_url, "writing to braintrust");
         let inserted = tracing::info_span!("write").in_scope(|| sdg::write(&config, &events))?;
         tracing::info!(
@@ -267,6 +276,7 @@ pub enum Error {
     OffsetOutOfRange,
     NoTracesAtRate,
     ReadShape { path: PathBuf, source: std::io::Error },
+    ResolveAttachmentPaths { path: PathBuf, source: std::io::Error },
     InvalidShape { details: String },
     FailedGeneration { details: String },
     Generate(sdg::Error),
@@ -283,6 +293,13 @@ impl fmt::Display for Error {
             Self::NoTracesAtRate => formatter.write_str("rate over this window rounds to zero traces"),
             Self::ReadShape { path, source } => {
                 write!(formatter, "could not read shape {}: {source}", path.display())
+            }
+            Self::ResolveAttachmentPaths { path, source } => {
+                write!(
+                    formatter,
+                    "could not resolve attachments relative to {}: {source}",
+                    path.display()
+                )
             }
             Self::InvalidShape { details } => write!(formatter, "shape is invalid:\n{details}"),
             Self::FailedGeneration { details } => write!(formatter, "generation failed:\n{details}"),

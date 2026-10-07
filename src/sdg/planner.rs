@@ -13,6 +13,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::LazyLock;
 use tiktoken_rs::CoreBPE;
+use uuid::Uuid;
 
 // building the encoder parses the embedded vocab, do it once
 static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expect("the embedded vocab parses"));
@@ -21,8 +22,17 @@ static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expec
 pub(super) struct Plan {
     pub(super) events: Box<[EventPlan]>,
     pub(super) traces: Box<[Range<usize>]>,
+    pub(super) attachments: Box<[Attachment]>,
     // keep application times the same with or without scorer spans
     pub(super) scorer_postlude: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct Attachment {
+    pub(super) path: String,
+    pub(super) filename: String,
+    pub(super) content_type: String,
+    pub(super) key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,6 +86,7 @@ pub(super) struct EventFields {
 pub(super) struct Planner {
     events: Vec<EventPlan>,
     traces: Vec<Range<usize>>,
+    attachments: Vec<Attachment>,
 }
 
 // stable fnv-1a so seeds survive toolchain upgrades; std hashers make no
@@ -196,36 +207,23 @@ struct Instance {
 
 #[derive(Debug)]
 enum Shape {
-    Trace {
-        name: String,
-    },
-    Span {
-        name: String,
-        kind: EventKind,
-    },
-    Scorer {
-        name: String,
-        score: ModelValue,
-        score_range: SrcRange,
-        reason: Option<(ModelValue, SrcRange)>,
-    },
-    Collection {
-        name: Option<String>,
-    },
-    Iteration {
-        index: usize,
-        count: usize,
-    },
+    Trace { name: String },
+    Span { name: String, kind: EventKind },
+    Scorer(Box<ScorerShape>),
+    Collection { name: Option<String> },
+    Iteration { index: usize, count: usize },
     // only the picked branch instantiates; a reference into another branch
     // finds no instance and reads as null
-    Choice {
-        name: Option<String>,
-        pick: usize,
-    },
-    Maybe {
-        name: Option<String>,
-        included: bool,
-    },
+    Choice { name: Option<String>, pick: usize },
+    Maybe { name: Option<String>, included: bool },
+}
+
+#[derive(Debug)]
+struct ScorerShape {
+    name: String,
+    score: ModelValue,
+    score_range: SrcRange,
+    reason: Option<(ModelValue, SrcRange)>,
 }
 
 #[derive(Debug)]
@@ -241,6 +239,7 @@ struct Ctx<'m> {
     // the last reference crossed, for shape errors that surface downstream
     last_ref: Option<SrcRange>,
     instances: Vec<Instance>,
+    attachments: Vec<Attachment>,
 }
 
 impl<'m> Ctx<'m> {
@@ -254,6 +253,7 @@ impl<'m> Ctx<'m> {
             site: 0,
             last_ref: None,
             instances: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -354,12 +354,12 @@ impl<'m> Ctx<'m> {
                 self.add_instance(
                     scorer.node,
                     Some(parent),
-                    Shape::Scorer {
+                    Shape::Scorer(Box::new(ScorerShape {
                         name: scorer.name.clone(),
                         score: scorer.score.clone(),
                         score_range: scorer.score_range,
                         reason: scorer.reason.clone(),
-                    },
+                    })),
                     0,
                     &scorer.bindings,
                     FieldSlots::default(),
@@ -957,16 +957,11 @@ impl Planner {
                 None,
             ),
             Shape::Span { name, kind } => (Some(kind.as_str()), Some(name.as_str()), Some((name.clone(), *kind)), None),
-            Shape::Scorer {
-                name,
-                score,
-                score_range,
-                reason,
-            } => (
+            Shape::Scorer(scorer) => (
                 Some("scorer"),
-                Some(name.as_str()),
-                Some((name.clone(), EventKind::Scorer)),
-                Some((score.clone(), *score_range, reason.clone())),
+                Some(scorer.name.as_str()),
+                Some((scorer.name.clone(), EventKind::Scorer)),
+                Some((scorer.score.clone(), scorer.score_range, scorer.reason.clone())),
             ),
             Shape::Collection { name } => (Some("repeat"), name.as_deref(), None, None),
             Shape::Choice { name, .. } => (Some("choice"), name.as_deref(), None, None),
@@ -1129,7 +1124,9 @@ fn has_scorer(child: &ModelChild) -> bool {
 // fully evaluates a scope binding to a constant value the environment can hold
 fn eval_binding(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match value {
-        ModelValue::Str(_) | ModelValue::Num(_) | ModelValue::Bool(_) | ModelValue::Null => value,
+        ModelValue::Str(_) | ModelValue::Num(_) | ModelValue::Bool(_) | ModelValue::Null | ModelValue::Attachment { .. } => {
+            value
+        }
         ModelValue::Template(template) => ModelValue::Str(resolve_template(template, ctx)?),
         ModelValue::VarRef(name) => ctx.force_binding(&name)?,
         ModelValue::CtxRef(ctx_ref) => ModelValue::Num(ModelNumber::Int(ctx.ctx_value(ctx_ref))),
@@ -1204,6 +1201,27 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
         ModelValue::Template(template) => JsonValue::String(resolve_template(template, ctx)?),
         ModelValue::Bool(value) => JsonValue::Bool(value),
         ModelValue::Null => JsonValue::Null,
+        ModelValue::Attachment {
+            path,
+            filename,
+            content_type,
+            key,
+        } => {
+            if !ctx.attachments.iter().any(|attachment| attachment.key == key) {
+                ctx.attachments.push(Attachment {
+                    path,
+                    filename: filename.clone(),
+                    content_type: content_type.clone(),
+                    key: key.clone(),
+                });
+            }
+            serde_json::json!({
+                "type": "braintrust_attachment",
+                "filename": filename,
+                "content_type": content_type,
+                "key": key,
+            })
+        }
 
         // the stored value is constant, so lowering it is pure conversion
         ModelValue::VarRef(name) => lower_value(ctx.force_binding(&name)?, ctx)?,
@@ -1364,6 +1382,23 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error>
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
+        ModelFunc::Attachment { path, content_type } => {
+            let filename = std::path::Path::new(&path)
+                .file_name()
+                .expect("modeler validates attachment path")
+                .to_string_lossy()
+                .into_owned();
+            let mut key_bytes = [0; 16];
+            ctx.rng.fill(&mut key_bytes);
+            key_bytes[6] = (key_bytes[6] & 0x0f) | 0x40;
+            key_bytes[8] = (key_bytes[8] & 0x3f) | 0x80;
+            ModelValue::Attachment {
+                path,
+                filename,
+                content_type,
+                key: Uuid::from_bytes(key_bytes).to_string(),
+            }
+        }
         ModelFunc::Choice(options) => {
             let pick = ctx.rng.random_range(0..options.len());
             options
@@ -1754,7 +1789,9 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
 
         // reference-fed values can put any json shape here, so what the
         // modeler used to guarantee statically is checked at evaluation
-        ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) => return Err(shape_error(ctx)),
+        ModelValue::Null | ModelValue::Array(_) | ModelValue::Object(_) | ModelValue::Attachment { .. } => {
+            return Err(shape_error(ctx));
+        }
         // a residual slice is still rejected statically, refs never make one
         ModelValue::Slice { .. } => unreachable!("modeler validated operand types"),
         ModelValue::ArgRef(_) => unreachable!("scorer expressions never evaluate during generation"),
@@ -1967,6 +2004,7 @@ pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &W
     let mut planner = Planner {
         events: Vec::with_capacity(capacity),
         traces: Vec::with_capacity(count),
+        attachments: Vec::new(),
     };
 
     for index in 0..count {
@@ -1975,11 +2013,13 @@ pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &W
         let mut ctx = Ctx::new(&model.refs, seed, index);
         ctx.instantiate_trace(&model.traces[index % model.traces.len()], &model.bindings)?;
         planner.emit_trace(&mut ctx, filter)?;
+        planner.attachments.extend(ctx.attachments);
     }
 
     Ok(Plan {
         events: planner.events.into_boxed_slice(),
         traces: planner.traces.into_boxed_slice(),
+        attachments: planner.attachments.into_boxed_slice(),
         scorer_postlude,
     })
 }
