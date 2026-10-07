@@ -220,7 +220,7 @@ pub(crate) enum ScorerKind {
     Code {
         // the fallback when no `when` case matches
         score: Value,
-        whens: Vec<When>,
+        steps: Vec<ScorerStep>,
     },
     Judge {
         model: String,
@@ -230,11 +230,18 @@ pub(crate) enum ScorerKind {
     },
 }
 
-// one ordered case of a code scorer; the first matching cond wins
+// nested checks run before this block's score
 #[derive(Debug, Clone)]
 pub(crate) struct When {
     pub(crate) cond: Value,
-    pub(crate) score: Value,
+    pub(crate) score: Option<Value>,
+    pub(crate) steps: Vec<ScorerStep>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ScorerStep {
+    When(When),
+    Repeat { count: Value, steps: Vec<ScorerStep> },
 }
 
 #[derive(Debug, Clone)]

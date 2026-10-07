@@ -1,5 +1,5 @@
 use super::{Error, Helper, Item, arg_name, escape, float, fn_name, num};
-use crate::dsl::{ArrayElem, BinOp, Func, Part, Range, Template, UnaryOp, Value};
+use crate::dsl::{ArrayElem, BinOp, CtxRef, Func, Part, Range, ScorerStep, Template, UnaryOp, Value};
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
@@ -20,6 +20,7 @@ pub(super) fn module(items: &[Item]) -> Result<String, Error> {
     let mut emitter = Emitter::default();
     let mut functions = Vec::with_capacity(items.len());
     for item in items {
+        emitter.next_loop = 0;
         let function_name = fn_name(item.slug);
         let name = escape(item.name);
 
@@ -27,16 +28,7 @@ pub(super) fn module(items: &[Item]) -> Result<String, Error> {
             "# scorer \"{}\"\ndef {function_name}(output, input=None, expected=None, metadata=None):\n",
             name
         );
-        for when in item.whens {
-            let cond = emitter.expr(&when.cond, 0)?;
-            let score = emitter.expr(&when.score, 0)?;
-            writeln!(function, "    if {cond}:").expect("writing to a string cannot fail");
-            writeln!(
-                function,
-                "        return {{\"name\": \"{name}\", \"score\": {score}, \"metadata\": {{}}}}"
-            )
-            .expect("writing to a string cannot fail");
-        }
+        emitter.steps(item.steps, &name, 1, &mut function)?;
         let fallback = emitter.expr(item.score, 0)?;
         writeln!(
             function,
@@ -79,9 +71,60 @@ fn helper_snippet(helper: Helper) -> &'static str {
 struct Emitter {
     imports: BTreeSet<&'static str>,
     helpers: BTreeSet<Helper>,
+    loops: Vec<(String, String)>,
+    next_loop: usize,
 }
 
 impl Emitter {
+    fn steps(&mut self, steps: &[ScorerStep], name: &str, depth: usize, out: &mut String) -> Result<(), Error> {
+        let indent = "    ".repeat(depth);
+        for step in steps {
+            match step {
+                ScorerStep::When(when) => {
+                    let cond = self.expr(&when.cond, 0)?;
+                    writeln!(out, "{indent}if {cond}:").unwrap();
+                    self.steps(&when.steps, name, depth + 1, out)?;
+                    if let Some(score) = &when.score {
+                        let score = self.expr(score, 0)?;
+                        writeln!(
+                            out,
+                            "{indent}    return {{\"name\": \"{name}\", \"score\": {score}, \"metadata\": {{}}}}"
+                        )
+                        .unwrap();
+                    }
+                }
+                ScorerStep::Repeat { count, steps } => {
+                    let value = self.expr(count, 0)?;
+                    let id = self.next_loop;
+                    self.next_loop += 1;
+                    let suffix = if id == 0 { String::new() } else { format!("_{id}") };
+                    let count_name = format!("repeat_count{suffix}");
+                    let index_name = format!("repeat_index{suffix}");
+                    writeln!(out, "{indent}{count_name} = {value}").unwrap();
+                    writeln!(
+                        out,
+                        "{indent}if isinstance({count_name}, bool) or not isinstance({count_name}, int) or {count_name} < 0:"
+                    )
+                    .unwrap();
+                    writeln!(
+                        out,
+                        "{indent}    raise ValueError(\"repeat count must be a non-negative integer\")"
+                    )
+                    .unwrap();
+                    writeln!(out, "{indent}for {index_name} in range({count_name}):").unwrap();
+                    self.loops.push((index_name, count_name));
+                    if steps.is_empty() {
+                        writeln!(out, "{indent}    pass").unwrap();
+                    } else {
+                        self.steps(steps, name, depth + 1, out)?;
+                    }
+                    self.loops.pop();
+                }
+            }
+        }
+        Ok(())
+    }
+
     // precedence-aware: parenthesizes only when the child binds looser than
     // its context requires
     fn expr(&mut self, value: &Value, ctx: u8) -> Result<String, Error> {
@@ -120,11 +163,29 @@ impl Emitter {
                     what: "a variable binding",
                 });
             }
-            Value::CtxRef(_) => {
-                return Err(Error::Unsupported {
-                    what: "a context reference",
-                });
-            }
+            Value::CtxRef(ctx) => match ctx {
+                CtxRef::RepeatIndex => (
+                    self.loops
+                        .last()
+                        .ok_or(Error::Unsupported {
+                            what: "repeat.index outside repeat",
+                        })?
+                        .0
+                        .clone(),
+                    ATOM,
+                ),
+                CtxRef::RepeatCount => (
+                    self.loops
+                        .last()
+                        .ok_or(Error::Unsupported {
+                            what: "repeat.count outside repeat",
+                        })?
+                        .1
+                        .clone(),
+                    ATOM,
+                ),
+                CtxRef::TraceIndex => return Err(Error::Unsupported { what: "trace.index" }),
+            },
             Value::BlockRef { .. } => {
                 return Err(Error::Unsupported {
                     what: "a block reference",
@@ -429,14 +490,14 @@ mod tests {
         let items: Vec<Item> = named
             .iter()
             .map(|(slug, scorer)| {
-                let ScorerKind::Code { score, whens } = &scorer.kind else {
+                let ScorerKind::Code { score, steps } = &scorer.kind else {
                     panic!("expected a code scorer");
                 };
                 Item {
                     name: &scorer.name,
                     slug,
                     score,
-                    whens,
+                    steps,
                 }
             })
             .collect();
@@ -445,6 +506,41 @@ mod tests {
 
     fn emit(source: &str) -> String {
         render(source).unwrap()
+    }
+
+    #[test]
+    fn emits_nested_scorer_repeats() {
+        let generated = emit(
+            r#"scorer "s" { code {
+            score = 0
+            repeat {
+                count = len(output)
+                when { cond = output[repeat.index] == expected score = 1 }
+                repeat { count = repeat.index + 1 when { cond = repeat.index < repeat.count score = 0.5 } }
+            }
+        } }"#,
+        );
+        assert!(generated.contains("repeat_count = len(output)"));
+        assert!(generated.contains("for repeat_index in range(repeat_count):"));
+        assert!(generated.contains("if output[repeat_index] == expected:"));
+        assert!(generated.contains("repeat_count_1 = repeat_index + 1"));
+        assert!(generated.contains("if repeat_index_1 < repeat_count_1:"));
+    }
+
+    #[test]
+    fn emits_nested_when_fallthrough() {
+        let generated = emit(
+            r#"scorer "s" { code {
+            score = 0
+            when { cond = len(output) > 0
+                when { cond = output[0] == expected score = 1 }
+                score = 0.5
+            }
+        } }"#,
+        );
+        assert!(generated.contains("    if len(output) > 0:\n        if output[0] == expected:\n            return"));
+        assert!(generated.contains("\n        return {\"name\": \"s\", \"score\": 0.5"));
+        assert!(generated.contains("\n    return {\"name\": \"s\", \"score\": 0"));
     }
 
     // the expression under test, wrapped in a minimal scorer

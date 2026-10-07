@@ -1,5 +1,5 @@
 use super::{Error, Helper, Item, arg_name, escape, float, fn_name, num};
-use crate::dsl::{ArrayElem, BinOp, Func, Part, Range, Template, UnaryOp, Value};
+use crate::dsl::{ArrayElem, BinOp, CtxRef, Func, Part, Range, ScorerStep, Template, UnaryOp, Value};
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
@@ -19,6 +19,7 @@ pub(super) fn module(items: &[Item]) -> Result<String, Error> {
     let mut emitter = Emitter::default();
     let mut functions = Vec::with_capacity(items.len());
     for item in items {
+        emitter.next_loop = 0;
         let function_name = fn_name(item.slug);
         let name = escape(item.name);
 
@@ -26,14 +27,7 @@ pub(super) fn module(items: &[Item]) -> Result<String, Error> {
             "// scorer \"{}\"\nfunction {function_name}({{ input, output, expected, metadata }}: {{ input?: any; output: any; expected?: any; metadata?: any }}): {{ name: string; score: number; metadata: Record<string, unknown> }} {{\n",
             name
         );
-        for when in item.whens {
-            let cond = emitter.expr(&when.cond, 0)?;
-            let score = emitter.expr(&when.score, 0)?;
-            writeln!(function, "  if ({cond}) {{").expect("writing to a string cannot fail");
-            writeln!(function, "    return {{ name: \"{name}\", score: {score}, metadata: {{}} }};")
-                .expect("writing to a string cannot fail");
-            function.push_str("  }\n");
-        }
+        emitter.steps(item.steps, &name, 1, &mut function)?;
         let fallback = emitter.expr(item.score, 0)?;
         writeln!(
             function,
@@ -103,9 +97,55 @@ fn helper_snippet(helper: Helper) -> &'static str {
 #[derive(Default)]
 struct Emitter {
     helpers: BTreeSet<Helper>,
+    loops: Vec<(String, String)>,
+    next_loop: usize,
 }
 
 impl Emitter {
+    fn steps(&mut self, steps: &[ScorerStep], name: &str, depth: usize, out: &mut String) -> Result<(), Error> {
+        let indent = "  ".repeat(depth);
+        for step in steps {
+            match step {
+                ScorerStep::When(when) => {
+                    let cond = self.expr(&when.cond, 0)?;
+                    writeln!(out, "{indent}if ({cond}) {{").unwrap();
+                    self.steps(&when.steps, name, depth + 1, out)?;
+                    if let Some(score) = &when.score {
+                        let score = self.expr(score, 0)?;
+                        writeln!(
+                            out,
+                            "{indent}  return {{ name: \"{name}\", score: {score}, metadata: {{}} }};"
+                        )
+                        .unwrap();
+                    }
+                    writeln!(out, "{indent}}}").unwrap();
+                }
+                ScorerStep::Repeat { count, steps } => {
+                    let value = self.expr(count, 0)?;
+                    let id = self.next_loop;
+                    self.next_loop += 1;
+                    let suffix = if id == 0 { String::new() } else { id.to_string() };
+                    let count_name = format!("repeatCount{suffix}");
+                    let index_name = format!("repeatIndex{suffix}");
+                    writeln!(out, "{indent}{{").unwrap();
+                    writeln!(out, "{indent}  const {count_name} = {value};").unwrap();
+                    writeln!(out, "{indent}  if (!Number.isSafeInteger({count_name}) || {count_name} < 0) throw new Error(\"repeat count must be a non-negative integer\");").unwrap();
+                    writeln!(
+                        out,
+                        "{indent}  for (let {index_name} = 0; {index_name} < {count_name}; {index_name} += 1) {{"
+                    )
+                    .unwrap();
+                    self.loops.push((index_name, count_name));
+                    self.steps(steps, name, depth + 2, out)?;
+                    self.loops.pop();
+                    writeln!(out, "{indent}  }}").unwrap();
+                    writeln!(out, "{indent}}}").unwrap();
+                }
+            }
+        }
+        Ok(())
+    }
+
     // some helpers call others; pulling one in pulls its dependencies
     fn need(&mut self, helper: Helper) {
         match helper {
@@ -160,11 +200,29 @@ impl Emitter {
                     what: "a variable binding",
                 });
             }
-            Value::CtxRef(_) => {
-                return Err(Error::Unsupported {
-                    what: "a context reference",
-                });
-            }
+            Value::CtxRef(ctx) => match ctx {
+                CtxRef::RepeatIndex => (
+                    self.loops
+                        .last()
+                        .ok_or(Error::Unsupported {
+                            what: "repeat.index outside repeat",
+                        })?
+                        .0
+                        .clone(),
+                    ATOM,
+                ),
+                CtxRef::RepeatCount => (
+                    self.loops
+                        .last()
+                        .ok_or(Error::Unsupported {
+                            what: "repeat.count outside repeat",
+                        })?
+                        .1
+                        .clone(),
+                    ATOM,
+                ),
+                CtxRef::TraceIndex => return Err(Error::Unsupported { what: "trace.index" }),
+            },
             Value::BlockRef { .. } => {
                 return Err(Error::Unsupported {
                     what: "a block reference",
@@ -438,14 +496,14 @@ mod tests {
         let items: Vec<Item> = named
             .iter()
             .map(|(slug, scorer)| {
-                let ScorerKind::Code { score, whens } = &scorer.kind else {
+                let ScorerKind::Code { score, steps } = &scorer.kind else {
                     panic!("expected a code scorer");
                 };
                 Item {
                     name: &scorer.name,
                     slug,
                     score,
-                    whens,
+                    steps,
                 }
             })
             .collect();
@@ -454,6 +512,41 @@ mod tests {
 
     fn emit(source: &str) -> String {
         render(source).unwrap()
+    }
+
+    #[test]
+    fn emits_nested_scorer_repeats() {
+        let generated = emit(
+            r#"scorer "s" { code {
+            score = 0
+            repeat {
+                count = len(output)
+                when { cond = output[repeat.index] == expected score = 1 }
+                repeat { count = repeat.index + 1 when { cond = repeat.index < repeat.count score = 0.5 } }
+            }
+        } }"#,
+        );
+        assert!(generated.contains("const repeatCount = output.length;"));
+        assert!(generated.contains("for (let repeatIndex = 0; repeatIndex < repeatCount;"));
+        assert!(generated.contains("if (output[repeatIndex] === expected)"));
+        assert!(generated.contains("const repeatCount1 = repeatIndex + 1;"));
+        assert!(generated.contains("if (repeatIndex1 < repeatCount1)"));
+    }
+
+    #[test]
+    fn emits_nested_when_fallthrough() {
+        let generated = emit(
+            r#"scorer "s" { code {
+            score = 0
+            when { cond = len(output) > 0
+                when { cond = output[0] == expected score = 1 }
+                score = 0.5
+            }
+        } }"#,
+        );
+        assert!(generated.contains("  if (output.length > 0) {\n    if (output[0] === expected) {\n      return"));
+        assert!(generated.contains("\n    return { name: \"s\", score: 0.5"));
+        assert!(generated.contains("\n  return { name: \"s\", score: 0"));
     }
 
     #[test]

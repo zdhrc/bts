@@ -1,14 +1,8 @@
 mod python;
 mod typescript;
 
-use crate::dsl::{Number, ScorerArg, ScorerLang, Value, When};
+use crate::dsl::{Number, ScorerArg, ScorerLang, ScorerStep, Value};
 use std::fmt;
-
-// expression-level emitters know nothing about scorers; only the scaffold
-// functions (python::scorer, typescript::scorer) are component-specific. if a
-// future component kind needs statements beyond guard/return, introduce a
-// small statement ir here between dsl::Value and the emitters; expressions
-// should keep flowing through Value.
 
 // language-neutral runtime helpers a generated scorer may need; collected
 // during emission so only used snippets appear, in declaration order (normal
@@ -35,7 +29,7 @@ pub(crate) struct Item<'m> {
     pub(crate) name: &'m str,
     pub(crate) slug: &'m str,
     pub(crate) score: &'m Value,
-    pub(crate) whens: &'m [When],
+    pub(crate) steps: &'m [ScorerStep],
 }
 
 // Render named scorer functions with their shared imports and helpers.

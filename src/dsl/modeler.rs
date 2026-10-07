@@ -3,8 +3,8 @@ use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
     Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Field, Func, JudgeOption, Maybe, Model,
     NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg,
-    ScorerKind, ScorerLang, ScorerSpan, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value,
-    WeightedOption, When,
+    ScorerKind, ScorerLang, ScorerSpan, ScorerStep, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp,
+    Value, WeightedOption, When,
 };
 use crate::dsl::spec;
 use std::{
@@ -800,7 +800,7 @@ impl Modeler {
     fn model_code(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerKind> {
         let mut score = None;
         let mut seen = HashSet::new();
-        let mut whens = Vec::new();
+        let mut steps = Vec::new();
 
         for decl in decls {
             match decl {
@@ -831,31 +831,8 @@ impl Modeler {
                     }
                 }
                 ast::Decl::Block(inner) => {
-                    let inner_range = inner.range;
-                    let parent = spec::Place::Block { id: desc.id };
-                    let Some(inner_desc) = spec::SPEC.block(&inner.kind) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownBlock {
-                                keyword: inner.kind,
-                                parent,
-                            },
-                            inner_range,
-                        ));
-                        continue;
-                    };
-                    if !inner_desc.allows(parent) {
-                        self.errors.push(Error::new(
-                            ErrorKind::BlockNotAllowed {
-                                block: inner_desc.id,
-                                parent,
-                            },
-                            inner_range,
-                        ));
-                        continue;
-                    }
-                    self.model_name(inner.name, inner_range, inner_desc);
-                    if let Some(when) = self.model_when(inner.decls, inner_desc, inner_range) {
-                        whens.push(when);
+                    if let Some(step) = self.model_scorer_step(inner, desc.id) {
+                        steps.push(step);
                     }
                 }
             }
@@ -871,13 +848,131 @@ impl Modeler {
             ));
         }
 
-        score.map(|score| ScorerKind::Code { score, whens })
+        score.map(|score| ScorerKind::Code { score, steps })
+    }
+
+    fn model_scorer_step(&mut self, block: ast::Block, parent_id: spec::Id) -> Option<ScorerStep> {
+        let ast::Block {
+            kind,
+            name,
+            decls,
+            range,
+            ..
+        } = block;
+        let parent = spec::Place::Block { id: parent_id };
+        let Some(desc) = spec::SPEC.block_in(&kind, parent) else {
+            let error = match spec::SPEC.block(&kind) {
+                Some(desc) => ErrorKind::BlockNotAllowed { block: desc.id, parent },
+                None => ErrorKind::UnknownBlock { keyword: kind, parent },
+            };
+            self.errors.push(Error::new(error, range));
+            return None;
+        };
+        self.model_name(name, range, desc);
+        if desc.id == spec::ids::WHEN {
+            self.model_when(decls, desc, range).map(ScorerStep::When)
+        } else {
+            self.model_scorer_repeat(decls, desc, range)
+        }
+    }
+
+    fn model_scorer_repeat(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerStep> {
+        let mut count = None;
+        let mut seen = false;
+        let mut children = Vec::new();
+        for decl in decls {
+            match decl {
+                ast::Decl::Attr(attr) => {
+                    if attr.key != "count" {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownField {
+                                block: desc.id,
+                                keyword: attr.key,
+                            },
+                            attr.range,
+                        ));
+                        continue;
+                    }
+                    if seen {
+                        self.errors.push(Error::new(
+                            ErrorKind::DuplicateField {
+                                block: desc.id,
+                                field: spec::ids::COUNT,
+                            },
+                            attr.range,
+                        ));
+                        continue;
+                    }
+                    seen = true;
+                    let Some(folded) = self.fold_expr(attr.value) else { continue };
+                    if self.static_type(&folded) != Some(StaticType::Number) && !self.defers_to_generation(&folded) {
+                        self.errors.push(Error::new(
+                            ErrorKind::TypeMismatch {
+                                block: desc.id,
+                                field: spec::ids::COUNT,
+                                expected: &spec::ExprType::Number,
+                                found: self.found_type(&folded),
+                            },
+                            folded.range,
+                        ));
+                        continue;
+                    }
+                    if let FoldedKind::Value(Value::Num(number)) = &folded.kind {
+                        match number {
+                            Number::Int(value) if *value < 0 => self.errors.push(Error::new(
+                                ErrorKind::NegativeRepeatCount {
+                                    rule: spec::ids::REPEAT_COUNT,
+                                },
+                                folded.range,
+                            )),
+                            Number::Float(_) => self.errors.push(Error::new(
+                                ErrorKind::NonIntegerRepeatCount {
+                                    rule: spec::ids::REPEAT_COUNT,
+                                },
+                                folded.range,
+                            )),
+                            _ => {}
+                        }
+                    }
+                    let value = folded.into_value();
+                    self.check_scorer_value(&value);
+                    count = Some(value);
+                }
+                ast::Decl::Block(inner) => children.push(inner),
+            }
+        }
+        if !seen {
+            self.errors.push(Error::new(
+                ErrorKind::MissingField {
+                    block: desc.id,
+                    field: spec::ids::COUNT,
+                },
+                range,
+            ));
+        }
+        if children.is_empty() {
+            self.errors.push(Error::new(
+                ErrorKind::EmptyDynamicBlock {
+                    rule: spec::ids::DYNAMIC_CHILDREN,
+                    block: desc.id,
+                },
+                range,
+            ));
+        }
+        self.repeat_depth += 1;
+        let steps = children
+            .into_iter()
+            .filter_map(|inner| self.model_scorer_step(inner, desc.id))
+            .collect();
+        self.repeat_depth -= 1;
+        count.map(|count| ScorerStep::Repeat { count, steps })
     }
 
     fn model_when(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<When> {
         let mut cond = None;
         let mut score = None;
         let mut seen = HashSet::new();
+        let mut children = Vec::new();
 
         for decl in decls {
             match decl {
@@ -913,39 +1008,34 @@ impl Modeler {
                         score = self.model_score(folded, desc.id);
                     }
                 }
-                ast::Decl::Block(inner) => {
-                    let parent = spec::Place::Block { id: desc.id };
-                    let error = match spec::SPEC.block(&inner.kind) {
-                        Some(inner_desc) => ErrorKind::BlockNotAllowed {
-                            block: inner_desc.id,
-                            parent,
-                        },
-                        None => ErrorKind::UnknownBlock {
-                            keyword: inner.kind,
-                            parent,
-                        },
-                    };
-                    self.errors.push(Error::new(error, inner.range));
-                }
+                ast::Decl::Block(inner) => children.push(inner),
             }
         }
 
-        for field in desc.body.fields {
-            if field.cardinality == spec::Cardinality::Required && !seen.contains(&field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::MissingField {
-                        block: desc.id,
-                        field: field.id,
-                    },
-                    range,
-                ));
-            }
+        if !seen.contains(&spec::ids::COND) {
+            self.errors.push(Error::new(
+                ErrorKind::MissingField {
+                    block: desc.id,
+                    field: spec::ids::COND,
+                },
+                range,
+            ));
         }
+        if !seen.contains(&spec::ids::SCORE) && children.is_empty() {
+            self.errors.push(Error::new(
+                ErrorKind::MissingField {
+                    block: desc.id,
+                    field: spec::ids::SCORE,
+                },
+                range,
+            ));
+        }
+        let steps = children
+            .into_iter()
+            .filter_map(|inner| self.model_scorer_step(inner, desc.id))
+            .collect();
 
-        match (cond, score) {
-            (Some(cond), Some(score)) => Some(When { cond, score }),
-            _ => None,
-        }
+        cond.map(|cond| When { cond, score, steps })
     }
 
     fn model_judge(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerKind> {
@@ -1170,7 +1260,8 @@ impl Modeler {
     fn check_scorer_value(&mut self, value: &Value) {
         match value {
             Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::ArgRef(_) => {}
-            Value::VarRef(_) | Value::CtxRef(_) | Value::BlockRef { .. } => {
+            Value::CtxRef(CtxRef::RepeatIndex | CtxRef::RepeatCount) => {}
+            Value::VarRef(_) | Value::CtxRef(CtxRef::TraceIndex) | Value::BlockRef { .. } => {
                 unreachable!("rejected in scorer scope during folding")
             }
             Value::Template(template) => {
@@ -1569,6 +1660,17 @@ impl Modeler {
     // runtime arguments braintrust passes the scorer; generation heads get a
     // scorer-specific diagnostic instead of resolving
     fn fold_scorer_ref(&mut self, path: Vec<String>, range: SrcRange) -> Option<Folded> {
+        if self.repeat_depth > 0 {
+            match path.as_slice() {
+                [first, second] if first == "repeat" && second == "index" => {
+                    return Some(Folded::value(Value::CtxRef(CtxRef::RepeatIndex), range));
+                }
+                [first, second] if first == "repeat" && second == "count" => {
+                    return Some(Folded::value(Value::CtxRef(CtxRef::RepeatCount), range));
+                }
+                _ => {}
+            }
+        }
         let arg = match path[0].as_str() {
             "input" => Some(ScorerArg::Input),
             "output" => Some(ScorerArg::Output),
@@ -1699,6 +1801,9 @@ impl Modeler {
                         }
                         // a template value splices its parts inline
                         FoldedKind::Value(Value::Template(template)) => modeled.extend(template.parts),
+                        FoldedKind::Value(Value::CtxRef(ctx_ref)) if self.in_scorer => {
+                            modeled.push(Part::Dynamic(Value::CtxRef(ctx_ref)));
+                        }
                         FoldedKind::Value(Value::CtxRef(ctx_ref)) => modeled.push(Part::Ref(ctx_ref)),
                         // dynamic defs resolve per scope instantiation, scalar by type
                         FoldedKind::Value(Value::VarRef(name)) => {
@@ -9468,7 +9573,7 @@ mod tests {
         let scorer = &model.scorers[0];
         assert_eq!(scorer.name, "response-quality");
         assert_eq!(scorer.lang, Some(ScorerLang::Python));
-        let ScorerKind::Code { score, whens } = &scorer.kind else {
+        let ScorerKind::Code { score, steps } = &scorer.kind else {
             panic!("expected a code scorer");
         };
         assert!(matches!(
@@ -9478,19 +9583,124 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(whens.len(), 2);
+        assert_eq!(steps.len(), 2);
+        let ScorerStep::When(first) = &steps[0] else {
+            panic!("expected when")
+        };
+        let ScorerStep::When(second) = &steps[1] else {
+            panic!("expected when")
+        };
         assert!(matches!(
-            &whens[0].cond,
+            &first.cond,
             Value::Binary { op: BinOp::Eq, lhs, .. } if matches!(&**lhs, Value::ArgRef(ScorerArg::Output))
         ));
-        assert!(matches!(whens[0].score, Value::Num(Number::Int(0))));
+        assert!(matches!(first.score, Some(Value::Num(Number::Int(0)))));
         assert!(matches!(
-            &whens[1].cond,
+            &second.cond,
             Value::Func {
                 func: Func::Contains { .. },
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn models_scorer_repeats_with_innermost_index_and_outer_count() {
+        let model = model(
+            r#"scorer "s" {
+            code {
+                score = 0
+                repeat {
+                    count = len(output)
+                    when { cond = output[repeat.index] == expected score = 1 }
+                    repeat {
+                        count = repeat.index + 1
+                        when { cond = repeat.index < repeat.count score = 0.5 }
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+        let ScorerKind::Code { steps, .. } = &model.scorers[0].kind else {
+            panic!("expected code")
+        };
+        let ScorerStep::Repeat { count, steps } = &steps[0] else {
+            panic!("expected repeat")
+        };
+        assert!(matches!(
+            count,
+            Value::Func {
+                func: Func::Len { .. },
+                ..
+            }
+        ));
+        assert!(matches!(steps[0], ScorerStep::When(_)));
+        let ScorerStep::Repeat { count, steps } = &steps[1] else {
+            panic!("expected nested repeat")
+        };
+        assert!(matches!(count, Value::Binary { lhs, .. } if matches!(&**lhs, Value::CtxRef(CtxRef::RepeatIndex))));
+        assert!(matches!(steps[0], ScorerStep::When(_)));
+    }
+
+    #[test]
+    fn scorer_repeat_rejects_bad_count() {
+        let errors = model(
+            r#"scorer "s" { code {
+            score = 0
+            repeat { count = -1 when { cond = true score = 1 } }
+        } }"#,
+        )
+        .unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind(), ErrorKind::NegativeRepeatCount { .. }))
+        );
+    }
+
+    #[test]
+    fn nests_when_and_repeat_in_scorer_code() {
+        let model = model(
+            r#"scorer "s" { code {
+            score = 0
+            when {
+                cond = len(output) > 0
+                when {
+                    cond = output[0] == expected
+                    when { cond = true score = 1 }
+                }
+                repeat { count = len(output) when { cond = output[repeat.index] == expected score = 0.5 } }
+                score = 0.25
+            }
+        } }"#,
+        )
+        .unwrap();
+        let ScorerKind::Code { steps, .. } = &model.scorers[0].kind else {
+            panic!("expected code")
+        };
+        let ScorerStep::When(outer) = &steps[0] else {
+            panic!("expected when")
+        };
+        assert_eq!(outer.steps.len(), 2);
+        assert!(matches!(outer.score, Some(Value::Num(Number::Float(value))) if value == 0.25));
+        let ScorerStep::When(middle) = &outer.steps[0] else {
+            panic!("expected nested when")
+        };
+        assert!(middle.score.is_none());
+        assert!(matches!(middle.steps[0], ScorerStep::When(_)));
+        assert!(matches!(outer.steps[1], ScorerStep::Repeat { .. }));
+    }
+
+    #[test]
+    fn when_requires_a_score_or_child_block() {
+        let errors = model(r#"scorer "s" { code { score = 0 when { cond = true } } }"#).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind(), ErrorKind::MissingField { block, field }
+            if *block == spec::ids::WHEN && *field == spec::ids::SCORE))
+        );
     }
 
     #[test]
@@ -9576,11 +9786,14 @@ mod tests {
         )
         .unwrap();
 
-        let ScorerKind::Code { whens, .. } = &model.scorers[0].kind else {
+        let ScorerKind::Code { steps, .. } = &model.scorers[0].kind else {
             panic!("expected a code scorer");
         };
+        let ScorerStep::When(when) = &steps[0] else {
+            panic!("expected when")
+        };
         assert!(matches!(
-            &whens[0].cond,
+            &when.cond,
             Value::Binary { op: BinOp::Eq, lhs, .. }
                 if matches!(&**lhs, Value::Index { target, .. } if matches!(&**target, Value::ArgRef(ScorerArg::Metadata)))
         ));

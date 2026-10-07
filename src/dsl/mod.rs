@@ -12,7 +12,7 @@ pub(crate) use filter::WriteFilter;
 pub(crate) use model::{
     Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP,
     NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang,
-    Selection, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, When,
+    ScorerStep, Selection, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};

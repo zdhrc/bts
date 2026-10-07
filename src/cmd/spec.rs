@@ -33,7 +33,8 @@ pub(crate) static SPEC: Spec = Spec {
         CommandDesc {
             path: &["build"],
             guidance: &[
-                "Build top-level scorer blocks into SDK source files, then push the generated scorer files with `bt functions push`.",
+                "Build top-level scorer blocks into SDK source files. Then change into the emitted `<out>/src/scorers` directory and run the `bt functions push --if-exists replace ...` command printed by `bts build`, passing the generated filenames from that directory.",
+                "For Python scorers, the directory used to run `bt functions push` determines the bundle's import path. Passing paths from a parent directory can produce an import that fails remotely when a path component contains a hyphen.",
             ],
             examples: &["bts build --from shape.bt"],
         },

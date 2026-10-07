@@ -90,14 +90,14 @@ pub(crate) fn assemble(scorers: &[Scorer], lang: Option<ScorerLang>, project: &s
         let items: Vec<emit::Item> = members
             .iter()
             .map(|&member| {
-                let ScorerKind::Code { score, whens } = &scorers[member].kind else {
+                let ScorerKind::Code { score, steps } = &scorers[member].kind else {
                     unreachable!("judges were filtered out")
                 };
                 emit::Item {
                     name: &scorers[member].name,
                     slug: &slugs[member],
                     score,
-                    whens,
+                    steps,
                 }
             })
             .collect();

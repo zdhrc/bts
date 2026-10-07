@@ -205,6 +205,7 @@ pub(crate) mod ids {
     pub(crate) const TOOL: Id = Id::new("block.tool");
     pub(crate) const FUNCTION: Id = Id::new("block.function");
     pub(crate) const REPEAT: Id = Id::new("block.repeat");
+    pub(crate) const SCORER_REPEAT: Id = Id::new("block.scorer-repeat");
     pub(crate) const CHOICE: Id = Id::new("block.choice");
     pub(crate) const MAYBE: Id = Id::new("block.maybe");
     pub(crate) const SCORER: Id = Id::new("block.scorer");
@@ -466,13 +467,25 @@ const IN_TRACE_SPAN_OR_DYNAMIC: &[Place] = &[
     Place::Block { id: ids::MAYBE },
 ];
 const IN_SCORER: &[Place] = &[Place::Block { id: ids::SCORER }];
-const IN_CODE: &[Place] = &[Place::Block { id: ids::CODE }];
+const IN_SCORER_CONTROL: &[Place] = &[
+    Place::Block { id: ids::CODE },
+    Place::Block { id: ids::SCORER_REPEAT },
+    Place::Block { id: ids::WHEN },
+];
 
 const REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
     id: ids::COUNT,
     keyword: "count",
     summary: "Number of times the child blocks are stamped out, evaluated per generated trace.",
     value: &ANY,
+    cardinality: Cardinality::Required,
+}];
+
+const SCORER_REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
+    id: ids::COUNT,
+    keyword: "count",
+    summary: "Number of scorer iterations; evaluated once when the repeat is reached.",
+    value: &NUMBER,
     cardinality: Cardinality::Required,
 }];
 
@@ -594,9 +607,9 @@ const WHEN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         id: ids::SCORE,
         keyword: "score",
-        summary: "Score produced when this case matches, a number between 0 and 1.",
+        summary: "Optional score returned after nested blocks when the condition matches; required if there are no nested blocks.",
         value: &NUMBER,
-        cardinality: Cardinality::Required,
+        cardinality: Cardinality::Optional,
     },
 ];
 
@@ -690,7 +703,7 @@ const SCORER_KIND_RULE: RuleDesc = RuleDesc {
 };
 const SCORER_ARGS_RULE: RuleDesc = RuleDesc {
     id: ids::SCORER_ARGS,
-    summary: "Inside a scorer, bare `input`, `output`, `expected`, and `metadata` are the arguments Braintrust passes the scorer at runtime; block references, `self`, `trace.index`, and `repeat.index`/`repeat.count` are not available.",
+    summary: "Inside a scorer, bare `input`, `output`, `expected`, and `metadata` are the arguments Braintrust passes at runtime. `repeat.index` and `repeat.count` are available inside a scorer repeat; generation block references, `self`, and `trace.index` are not.",
 };
 const SCORER_EXPRS_RULE: RuleDesc = RuleDesc {
     id: ids::SCORER_EXPRS,
@@ -972,7 +985,7 @@ const REPEAT_REFS_RULE: RuleDesc = RuleDesc {
 const REPEAT_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::REPEAT_COUNT,
-        summary: "`count` must evaluate to a non-negative integer; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+        summary: "`count` must evaluate to a non-negative integer; a constant violation is rejected during validation, and a dynamic one fails when the repeat runs.",
     },
     REPEAT_REFS_RULE,
 ];
@@ -1629,8 +1642,8 @@ const BLOCKS: &[BlockDesc] = &[
     BlockDesc {
         id: ids::CODE,
         keyword: "code",
-        summary: "A code scorer body emitted as a scorer function in the declared language; `when` cases check in order, the first match wins, and `score` is the fallback.",
-        syntax: "code { score = <number> [when { ... }] ... }",
+        summary: "A code scorer body; `when` and `repeat` blocks run in order and return on the first matching score, with `score` as the fallback.",
+        syntax: "code { score = <number> [when { ... } | repeat { ... }] ... }",
         name: NamePolicy::Forbidden,
         allowed_in: IN_SCORER,
         body: BodyDesc {
@@ -1641,12 +1654,26 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: CODE_CONVENTIONS,
     },
     BlockDesc {
+        id: ids::SCORER_REPEAT,
+        keyword: "repeat",
+        summary: "Runs its scorer child blocks `count` times. `repeat.index` and `repeat.count` refer to the innermost scorer repeat.",
+        syntax: "repeat { count = <number> (when { ... } | repeat { ... }) ... }",
+        name: NamePolicy::Forbidden,
+        allowed_in: IN_SCORER_CONTROL,
+        body: BodyDesc {
+            fields: SCORER_REPEAT_FIELDS,
+            open: false,
+        },
+        rules: REPEAT_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
         id: ids::WHEN,
         keyword: "when",
-        summary: "One ordered case of a code scorer: when `cond` holds, the case's `score` is returned.",
-        syntax: "when { cond = <boolean> score = <number> }",
+        summary: "A conditional scorer branch. When `cond` holds, nested blocks run in order, then its optional `score` is returned.",
+        syntax: "when { cond = <boolean> [when { ... } | repeat { ... }] ... [score = <number>] }",
         name: NamePolicy::Forbidden,
-        allowed_in: IN_CODE,
+        allowed_in: IN_SCORER_CONTROL,
         body: BodyDesc {
             fields: WHEN_FIELDS,
             open: false,
@@ -1683,7 +1710,7 @@ const RULES: &[RuleDesc] = &[
     },
     RuleDesc {
         id: ids::DYNAMIC_CHILDREN,
-        summary: "A dynamic block (`repeat`, `choice`, or `maybe`) must contain at least one child block.",
+        summary: "A `repeat`, `choice`, or `maybe` block must contain at least one child block.",
     },
 ];
 

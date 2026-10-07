@@ -1,60 +1,271 @@
-# Scoring fixture: code scoring on an LLM span and judge scoring on the final trace.
+# one password reset request with a few ways it can go
 trace "password-reset-assistant" {
-    input = "How do I reset my password?"
-    expected = "Use the Forgot password link and follow the email instructions."
-    output = llm["password-reset-answer"].output.content
+    input = { email = "sam@example.com", message = "Please help me reset my password." }
+    output = choice.path.chosen == 0
+        ? choice.path.task["delivered-reset"].output
+        : choice.path.chosen == 1
+            ? choice.path.task["delivery-failed-reset"].output
+            : choice.path.task["blocked-reset"].output
+    metadata = {
+        required_steps = choice.path.chosen == 2
+            ? ["lookup_account"]
+            : ["lookup_account", "issue_reset_link", "send_reset_email"]
+    }
+    tags = ["support", "password-reset"]
 
-    llm "password-reset-answer" {
-        input = [{ role = "user", content = trace.input }]
-        output = {
-            role = "assistant",
-            content = weighted(
-                ["Use the Forgot password link and follow the email instructions.", 8],
-                ["Contact support for help.", 2]
-            )
+    choice "path" {
+        # account is ok and the email goes through
+        task "delivered-reset" {
+            input = trace.input
+            output = {
+                status = "sent",
+                reply = llm["draft-reset-reply"].output.content,
+                actions = [
+                    { step = "lookup_account", status = task["verify-reset-request"].output.lookup.status },
+                    { step = "issue_reset_link", status = task["execute-reset"].output.link.status },
+                    { step = "send_reset_email", status = task["execute-reset"].output.delivery.status },
+                ]
+            }
+
+            task "verify-reset-request" {
+                input = { email = trace.input.email }
+                output = {
+                    lookup = tool["lookup-account"].output,
+                    decision = "approved",
+                    reason = "verified email and unlocked account"
+                }
+                tool "lookup-account" {
+                    input = { email = trace.input.email }
+                    output = { status = "found", email = trace.input.email, account_id = "acct_2048", email_verified = true, locked = false }
+                }
+            }
+
+            task "execute-reset" {
+                input = { account_id = task["verify-reset-request"].output.lookup.account_id }
+                output = { link = tool["issue-reset-link"].output, delivery = tool["send-reset-email"].output }
+                tool "issue-reset-link" {
+                    input = { account_id = task["verify-reset-request"].output.lookup.account_id }
+                    output = { status = "issued", expires_in_minutes = 30 }
+                }
+                tool "send-reset-email" {
+                    input = { email = trace.input.email, link_status = tool["issue-reset-link"].output.status }
+                    output = { status = "sent", provider_message_id = "msg_81" }
+                }
+            }
+
+            llm "draft-reset-reply" {
+                input = [{ role = "user", content = trace.input.message }]
+                output = { role = "assistant", content = "I sent a password reset link. Check your email and follow the link within 30 minutes." }
+                metadata = { model = "gpt-4o-mini" }
+            }
         }
-        metadata = { model = "glm-5.2" }
+
+        # email fails but the reply still says it was sent
+        task "delivery-failed-reset" {
+            input = trace.input
+            output = {
+                status = "delivery_failed",
+                reply = llm["draft-reset-reply"].output.content,
+                actions = [
+                    { step = "lookup_account", status = task["verify-reset-request"].output.lookup.status },
+                    { step = "issue_reset_link", status = task["execute-reset"].output.link.status },
+                    { step = "send_reset_email", status = task["execute-reset"].output.delivery.status },
+                ]
+            }
+
+            task "verify-reset-request" {
+                input = { email = trace.input.email }
+                output = {
+                    lookup = tool["lookup-account"].output,
+                    decision = "approved",
+                    reason = "verified email and unlocked account"
+                }
+                tool "lookup-account" {
+                    input = { email = trace.input.email }
+                    output = { status = "found", email = trace.input.email, account_id = "acct_2048", email_verified = true, locked = false }
+                }
+            }
+
+            task "execute-reset" {
+                input = { account_id = task["verify-reset-request"].output.lookup.account_id }
+                output = { link = tool["issue-reset-link"].output, delivery = tool["send-reset-email"].output }
+                tool "issue-reset-link" {
+                    input = { account_id = task["verify-reset-request"].output.lookup.account_id }
+                    output = { status = "issued", expires_in_minutes = 30 }
+                }
+                tool "send-reset-email" {
+                    input = { email = trace.input.email, link_status = tool["issue-reset-link"].output.status }
+                    output = { status = "failed", provider_message_id = null }
+                    error = "Email provider timed out"
+                }
+            }
+
+            llm "draft-reset-reply" {
+                input = [{ role = "user", content = trace.input.message }]
+                output = { role = "assistant", content = "I sent a password reset link. Check your email and follow the link within 30 minutes." }
+                metadata = { model = "gpt-4o-mini" }
+            }
+        }
+
+        # locked account stops here
+        task "blocked-reset" {
+            input = trace.input
+            output = {
+                status = "blocked",
+                reply = llm["draft-reset-reply"].output.content,
+                actions = [
+                    { step = "lookup_account", status = task["verify-reset-request"].output.lookup.status },
+                ]
+            }
+
+            task "verify-reset-request" {
+                input = { email = trace.input.email }
+                output = {
+                    lookup = tool["lookup-account"].output,
+                    decision = "blocked",
+                    reason = "account locked"
+                }
+                tool "lookup-account" {
+                    input = { email = trace.input.email }
+                    output = { status = "found", email = trace.input.email, account_id = "acct_2048", email_verified = true, locked = true }
+                }
+            }
+
+            llm "draft-reset-reply" {
+                input = [{ role = "user", content = trace.input.message }]
+                output = { role = "assistant", content = "I can't complete this password reset because the account is locked. Please contact support." }
+                metadata = { model = "gpt-4o-mini" }
+            }
+        }
     }
 }
 
-scorer "reset-instructions" {
-    lang = "python"
+# start with what the assistant said
+scorer "reset-topic-clarity" {
     code {
         score = 0
         when {
-            cond = contains(output.content, "Forgot password")
+            cond = contains(lower(output.content), "password reset")
             score = 1
         }
     }
 }
 
-scorer "response-helpfulness" {
-    judge {
-        model = "glm-5.2"
-        prompt = """
-            Rate how helpful the response is to the user's request.
-            Request: ${input}
-            Expected: ${expected}
-            Response: ${output}
-            """
-        options = { helpful = 1.0, partial = 0.5, unhelpful = 0.0 }
+scorer "no-password-collection" {
+    code {
+        score = 1
+        when {
+            cond = contains(lower(output.content), "send me your password") || contains(lower(output.content), "tell me your password")
+            score = 0
+        }
     }
 }
 
-automation "score-reset-instructions" {
+# now check the account lookup and the decision
+scorer "verification-gate" {
+    code {
+        score = 0
+        when {
+            cond = output.lookup.locked == true
+            when {
+                cond = output.decision == "blocked" && output.reason == "account locked"
+                score = 1
+            }
+        }
+        when {
+            cond = output.lookup.locked == false && output.lookup.email_verified == true
+            when {
+                cond = output.decision == "approved"
+                score = 1
+            }
+        }
+    }
+}
+
+scorer "lookup-request-binding" {
+    code {
+        score = 0
+        when {
+            cond = output.lookup.status == "found"
+            when {
+                cond = output.lookup.email == input.email && output.lookup.account_id != null
+                score = 1
+            }
+        }
+    }
+}
+
+# check the full run using the steps in the final output
+scorer "reset-workflow-order" {
+    code {
+        score = 1
+        when {
+            cond = len(output.actions) != len(metadata.required_steps)
+            score = 0
+        }
+        repeat {
+            count = len(metadata.required_steps)
+            when {
+                cond = output.actions[repeat.index].step != metadata.required_steps[repeat.index]
+                score = 0
+            }
+        }
+    }
+}
+
+scorer "reset-outcome-honesty" {
+    code {
+        score = 0
+        when {
+            cond = output.status == "blocked"
+            when {
+                cond = contains(lower(output.reply), "contact support") && len(output.actions) == 1
+                score = 1
+            }
+        }
+        when {
+            cond = output.status == "sent" || output.status == "delivery_failed"
+            repeat {
+                count = len(output.actions)
+                when {
+                    cond = output.actions[repeat.index].step == "send_reset_email"
+                    when {
+                        cond = output.actions[repeat.index].status == "sent" && contains(lower(output.reply), "check your email")
+                        score = 1
+                    }
+                    when {
+                        cond = output.actions[repeat.index].status == "failed" && !contains(lower(output.reply), "check your email")
+                        score = 1
+                    }
+                }
+            }
+        }
+    }
+}
+
+automation "review-reset-reply" {
     type = "scorer"
-    scorers = ["reset-instructions"]
+    scorers = ["reset-topic-clarity", "no-password-collection"]
     scope = "span"
-    span_names = ["password-reset-answer"]
+    span_names = ["draft-reset-reply"]
     sampling_rate = 1.0
     enabled = true
 }
 
-automation "judge-final-response" {
+automation "review-verification" {
     type = "scorer"
-    scorers = ["response-helpfulness"]
+    scorers = ["verification-gate", "lookup-request-binding"]
     scope = "span"
-    span_names = ["password-reset-assistant"]
+    span_names = ["verify-reset-request"]
+    sampling_rate = 1.0
+    enabled = true
+}
+
+automation "review-reset-workflow" {
+    type = "scorer"
+    scorers = ["reset-workflow-order", "reset-outcome-honesty"]
+    scope = "span"
+    root = true
     sampling_rate = 1.0
     enabled = true
 }
