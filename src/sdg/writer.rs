@@ -357,12 +357,12 @@ impl<'config> Writer<'config> {
                                     .unwrap_or_else(|| "no detail provided".to_owned()),
                             )));
                         }
-                        if let Some(actual) = metadata.content_length {
-                            if actual != expected_bytes {
-                                return Err(ReconcileError::Unknown(format!(
-                                    "GET /attachment reports a stored object of {actual} bytes, expected {expected_bytes}"
-                                )));
-                            }
+                        if let Some(actual) = metadata.content_length
+                            && actual != expected_bytes
+                        {
+                            return Err(ReconcileError::Unknown(format!(
+                                "GET /attachment reports a stored object of {actual} bytes, expected {expected_bytes}"
+                            )));
                         }
                         if metadata.content_length == Some(expected_bytes)
                             || metadata.download_url.is_some_and(|url| !url.is_empty())
@@ -1326,12 +1326,14 @@ mod tests {
                 span_attributes: SpanAttributes {
                     name: "root".to_owned(),
                     kind: "task".to_owned(),
+                    purpose: None,
                 },
                 input: (input_bytes > 0).then(|| JsonValue::String("x".repeat(input_bytes))),
                 output: None,
                 expected: None,
                 error: None,
                 metadata: None,
+                scores: None,
                 metrics: JsonMap::new(),
                 tags: Box::new([]),
             })

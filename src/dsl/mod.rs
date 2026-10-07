@@ -1,5 +1,6 @@
 mod ast;
 mod diag;
+mod filter;
 mod lexer;
 mod model;
 mod modeler;
@@ -7,10 +8,11 @@ mod parser;
 pub(crate) mod spec;
 
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
+pub(crate) use filter::WriteFilter;
 pub(crate) use model::{
-    Accessor, Array, ArrayElem, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId,
-    Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Selection, SpanFields, SpanKind, Step, Template,
-    Trace, UnaryOp, Value,
+    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Field, Func, Maybe, Model, NOISE_SIZE_CAP,
+    NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang,
+    ScorerStep, Selection, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
@@ -39,6 +41,26 @@ mod tests {
             let result = compile(example.source);
             assert_eq!(result.is_ok(), example.valid, "example {}", example.id.as_str());
         }
+    }
+
+    #[test]
+    fn rejects_unbound_or_ambiguous_scoring_automations() {
+        let source = r#"automation "bad" {
+            type = "scorer"
+            scorers = ["missing"]
+            scope = "span"
+            root = true
+            span_names = ["answer"]
+        }"#;
+        let errors = compile(source).unwrap_err();
+        assert!(errors.iter().any(|error| error.what.contains("unknown scorer \"missing\"")));
+        assert!(errors.iter().any(|error| error.what.contains("set either root = true")));
+    }
+
+    #[test]
+    fn nested_scorers_require_a_top_level_definition() {
+        let errors = compile("trace \"t\" { scorer \"missing\" { score = 0.5 } }").unwrap_err();
+        assert!(errors.iter().any(|error| error.what.contains("unknown scorer \"missing\"")));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::dsl::{
     Choice as ModelChoice, CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NOISE_SIZE_CAP, NodeId,
     Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange,
     RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
-    Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
+    Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue, WriteFilter,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -23,6 +23,8 @@ pub(super) struct Plan {
     pub(super) events: Box<[EventPlan]>,
     pub(super) traces: Box<[Range<usize>]>,
     pub(super) attachments: Box<[Attachment]>,
+    // keep application times the same with or without scorer spans
+    pub(super) scorer_postlude: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,6 +45,7 @@ pub(super) struct EventPlan {
     pub(super) name: String,
     pub(super) kind: EventKind,
     pub(super) fields: EventFields,
+    pub(super) scores: Option<JsonMap<String, JsonValue>>,
     // total span duration; none takes the materializer's default slot
     pub(super) duration: Option<std::time::Duration>,
 }
@@ -53,6 +56,7 @@ pub(super) enum EventKind {
     Llm,
     Tool,
     Function,
+    Scorer,
 }
 
 impl EventKind {
@@ -62,6 +66,7 @@ impl EventKind {
             EventKind::Llm => "llm",
             EventKind::Tool => "tool",
             EventKind::Function => "function",
+            EventKind::Scorer => "scorer",
         }
     }
 }
@@ -112,6 +117,8 @@ const FIELD_SALT: u64 = 0x10;
 const KEY_SALT: u64 = 0x20;
 const TAG_SALT: u64 = 0x30;
 const BINDING_SALT: u64 = 0x40;
+const SCORE_SALT: u64 = 0x50;
+const REASON_SALT: u64 = 0x51;
 
 fn field_salt(field: Field) -> u64 {
     FIELD_SALT
@@ -202,12 +209,21 @@ struct Instance {
 enum Shape {
     Trace { name: String },
     Span { name: String, kind: EventKind },
-    Collection,
+    Scorer(Box<ScorerShape>),
+    Collection { name: Option<String> },
     Iteration { index: usize, count: usize },
     // only the picked branch instantiates; a reference into another branch
     // finds no instance and reads as null
-    Choice { pick: usize },
-    Maybe { included: bool },
+    Choice { name: Option<String>, pick: usize },
+    Maybe { name: Option<String>, included: bool },
+}
+
+#[derive(Debug)]
+struct ScorerShape {
+    name: String,
+    score: ModelValue,
+    score_range: SrcRange,
+    reason: Option<(ModelValue, SrcRange)>,
 }
 
 #[derive(Debug)]
@@ -334,15 +350,40 @@ impl<'m> Ctx<'m> {
                 Ok(())
             }
 
+            ModelChild::Scorer(scorer) => {
+                self.add_instance(
+                    scorer.node,
+                    Some(parent),
+                    Shape::Scorer(Box::new(ScorerShape {
+                        name: scorer.name.clone(),
+                        score: scorer.score.clone(),
+                        score_range: scorer.score_range,
+                        reason: scorer.reason.clone(),
+                    })),
+                    0,
+                    &scorer.bindings,
+                    FieldSlots::default(),
+                );
+                Ok(())
+            }
+
             ModelChild::Repeat(ModelRepeat {
                 node,
+                name,
                 count,
                 count_range,
                 bindings,
                 children,
                 ..
             }) => {
-                let collection = self.add_instance(*node, Some(parent), Shape::Collection, 0, &[], FieldSlots::default());
+                let collection = self.add_instance(
+                    *node,
+                    Some(parent),
+                    Shape::Collection { name: name.clone() },
+                    0,
+                    &[],
+                    FieldSlots::default(),
+                );
                 // count is drawn in the parent scope, bindings re-evaluate per iteration
                 let rng = self.slot_rng(self.instances[collection].path, COUNT_SALT);
                 let count = self.scoped(parent, rng, |ctx| eval_count(count.clone(), *count_range, ctx))?;
@@ -364,6 +405,7 @@ impl<'m> Ctx<'m> {
 
             ModelChild::Choice(ModelChoice {
                 node,
+                name,
                 bindings,
                 children,
                 ..
@@ -374,7 +416,10 @@ impl<'m> Ctx<'m> {
                 let instance = self.add_instance(
                     *node,
                     Some(parent),
-                    Shape::Choice { pick },
+                    Shape::Choice {
+                        name: name.clone(),
+                        pick,
+                    },
                     0,
                     bindings,
                     FieldSlots::default(),
@@ -384,6 +429,7 @@ impl<'m> Ctx<'m> {
 
             ModelChild::Maybe(ModelMaybe {
                 node,
+                name,
                 chance,
                 chance_range,
                 bindings,
@@ -399,7 +445,10 @@ impl<'m> Ctx<'m> {
                 let instance = self.add_instance(
                     *node,
                     Some(parent),
-                    Shape::Maybe { included },
+                    Shape::Maybe {
+                        name: name.clone(),
+                        included,
+                    },
                     0,
                     bindings,
                     FieldSlots::default(),
@@ -419,7 +468,7 @@ impl<'m> Ctx<'m> {
     fn scope_parent(&self, instance: usize) -> Option<usize> {
         let parent = self.instances[instance].parent?;
         match self.instances[parent].shape {
-            Shape::Collection => self.instances[parent].parent,
+            Shape::Collection { .. } => self.instances[parent].parent,
             _ => Some(parent),
         }
     }
@@ -601,11 +650,11 @@ impl<'m> Ctx<'m> {
                 unreachable!("modeler validated the named repeat encloses the reference")
             }
             Accessor::Chosen => match self.instances[at].shape {
-                Shape::Choice { pick } => Ok(JsonValue::Number((pick as i64).into())),
+                Shape::Choice { pick, .. } => Ok(JsonValue::Number((pick as i64).into())),
                 _ => unreachable!("modeler validated chosen against a choice"),
             },
             Accessor::Included => match self.instances[at].shape {
-                Shape::Maybe { included } => Ok(JsonValue::Bool(included)),
+                Shape::Maybe { included, .. } => Ok(JsonValue::Bool(included)),
                 _ => unreachable!("modeler validated included against a maybe"),
             },
         }
@@ -884,26 +933,90 @@ fn json_to_value(json: JsonValue) -> ModelValue {
 impl Planner {
     // emission stays strictly pre-order: the materializer's timing and
     // last-descendant scans depend on parents preceding children
-    fn emit_trace(&mut self, ctx: &mut Ctx) -> Result<(), Error> {
+    fn emit_trace(&mut self, ctx: &mut Ctx, filter: &WriteFilter) -> Result<(), Error> {
         let start = self.events.len();
         let root = EventRef(start);
-        self.emit_instance(0, root, None, ctx)?;
+        self.emit_instance(0, root, None, ctx, filter)?;
         self.traces.push(start..self.events.len());
         Ok(())
     }
 
-    fn emit_instance(&mut self, instance: usize, root: EventRef, parent: Option<EventRef>, ctx: &mut Ctx) -> Result<(), Error> {
-        let event = match &ctx.instances[instance].shape {
-            Shape::Trace { name } => Some((name.clone(), EventKind::Task)),
-            Shape::Span { name, kind } => Some((name.clone(), *kind)),
-            // dynamic blocks are structurally transparent
-            Shape::Collection | Shape::Iteration { .. } | Shape::Choice { .. } | Shape::Maybe { .. } => None,
+    fn emit_instance(
+        &mut self,
+        instance: usize,
+        root: EventRef,
+        parent: Option<EventRef>,
+        ctx: &mut Ctx,
+        filter: &WriteFilter,
+    ) -> Result<(), Error> {
+        let (block_kind, block_name, event, scorer_data) = match &ctx.instances[instance].shape {
+            Shape::Trace { name } => (
+                Some("trace"),
+                Some(name.as_str()),
+                Some((name.clone(), EventKind::Task)),
+                None,
+            ),
+            Shape::Span { name, kind } => (Some(kind.as_str()), Some(name.as_str()), Some((name.clone(), *kind)), None),
+            Shape::Scorer(scorer) => (
+                Some("scorer"),
+                Some(scorer.name.as_str()),
+                Some((scorer.name.clone(), EventKind::Scorer)),
+                Some((scorer.score.clone(), scorer.score_range, scorer.reason.clone())),
+            ),
+            Shape::Collection { name } => (Some("repeat"), name.as_deref(), None, None),
+            Shape::Choice { name, .. } => (Some("choice"), name.as_deref(), None, None),
+            Shape::Maybe { name, .. } => (Some("maybe"), name.as_deref(), None, None),
+            Shape::Iteration { .. } => (None, None, None, None),
         };
+        if let Some(kind) = block_kind
+            && !filter.matches(kind, block_name)
+        {
+            return Ok(());
+        }
 
         let parent = match event {
             Some((name, kind)) => {
                 let event_ref = EventRef(self.events.len());
-                let fields = ctx.event_fields(instance)?;
+                let mut fields = ctx.event_fields(instance)?;
+                let mut scores = None;
+                if let Some((score, range, reason)) = scorer_data {
+                    let rng = ctx.slot_rng(ctx.instances[instance].path, SCORE_SALT);
+                    let score = ctx.scoped(instance, rng, |ctx| eval_score(score, range, ctx))?;
+                    let json = JsonValue::from(score);
+                    let target_index = parent.expect("scorer spans have an enclosing span").0;
+                    let target = &self.events[target_index].fields;
+                    let mut input = JsonMap::new();
+                    if let Some(value) = &target.input {
+                        input.insert("input".to_owned(), value.clone());
+                    }
+                    if let Some(value) = &target.output {
+                        input.insert("output".to_owned(), value.clone());
+                    }
+                    if let Some(value) = &target.expected {
+                        input.insert("expected".to_owned(), value.clone());
+                    }
+                    if let Some(value) = &target.metadata {
+                        input.insert("metadata".to_owned(), JsonValue::Object(value.clone()));
+                    }
+                    fields.input = Some(JsonValue::Object(input));
+                    fields.output = Some(JsonValue::Object(JsonMap::from_iter([("score".to_owned(), json.clone())])));
+                    self.events[target_index]
+                        .scores
+                        .get_or_insert_with(JsonMap::new)
+                        .insert(name.clone(), json.clone());
+                    scores = Some(JsonMap::from_iter([(name.clone(), json)]));
+                    if let Some((reason, range)) = reason {
+                        let rng = ctx.slot_rng(ctx.instances[instance].path, REASON_SALT);
+                        let reason = ctx.scoped(instance, rng, |ctx| lower_value(reason, ctx))?;
+                        if !reason.is_string() {
+                            return Err(Error::new(ErrorKind::ScorerReasonNotString, range));
+                        }
+                        fields
+                            .metadata
+                            .get_or_insert_with(JsonMap::new)
+                            .insert("reason".to_owned(), reason);
+                    }
+                }
                 let duration = match ctx.instances[instance].fields.duration.clone() {
                     Some((value, range)) => {
                         let rng = ctx.slot_rng(ctx.instances[instance].path, DURATION_SALT);
@@ -917,6 +1030,7 @@ impl Planner {
                     name,
                     kind,
                     fields,
+                    scores,
                     duration,
                 });
                 Some(event_ref)
@@ -926,7 +1040,7 @@ impl Planner {
 
         let children = ctx.instances[instance].children.clone();
         for child in children {
-            self.emit_instance(child, root, parent, ctx)?;
+            self.emit_instance(child, root, parent, ctx, filter)?;
         }
         Ok(())
     }
@@ -969,6 +1083,19 @@ fn eval_chance(chance: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<f64
     }
 }
 
+fn eval_score(score: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<f64, Error> {
+    let score = match eval_operand(score, ctx)? {
+        Scalar::Int(value) => value as f64,
+        Scalar::Float(value) => value,
+        _ => return Err(Error::new(ErrorKind::ScoreOutOfRange, range)),
+    };
+    if (0.0..=1.0).contains(&score) {
+        Ok(score)
+    } else {
+        Err(Error::new(ErrorKind::ScoreOutOfRange, range))
+    }
+}
+
 // dynamic blocks make these estimates, only used as allocation hints
 fn trace_len(trace: &ModelTrace) -> usize {
     1 + trace.children.iter().map(child_len).sum::<usize>()
@@ -976,10 +1103,21 @@ fn trace_len(trace: &ModelTrace) -> usize {
 fn child_len(child: &ModelChild) -> usize {
     match child {
         ModelChild::Span(span) => 1 + span.children.iter().map(child_len).sum::<usize>(),
+        ModelChild::Scorer(_) => 1,
         // one iteration or inclusion
         ModelChild::Repeat(repeat) => repeat.children.iter().map(child_len).sum(),
         ModelChild::Maybe(maybe) => maybe.children.iter().map(child_len).sum(),
         ModelChild::Choice(choice) => choice.children.iter().map(child_len).max().unwrap_or(0),
+    }
+}
+
+fn has_scorer(child: &ModelChild) -> bool {
+    match child {
+        ModelChild::Scorer(_) => true,
+        ModelChild::Span(span) => span.children.iter().any(has_scorer),
+        ModelChild::Repeat(repeat) => repeat.children.iter().any(has_scorer),
+        ModelChild::Choice(choice) => choice.children.iter().any(has_scorer),
+        ModelChild::Maybe(maybe) => maybe.children.iter().any(has_scorer),
     }
 }
 
@@ -1041,6 +1179,8 @@ fn eval_binding(value: ModelValue, ctx: &mut Ctx) -> Result<ModelValue, Error> {
             end,
             range,
         } => eval_binding(eval_slice(*target, start, end, range, ctx)?, ctx)?,
+
+        ModelValue::ArgRef(_) => unreachable!("scorer expressions never evaluate during generation"),
     };
 
     Ok(value)
@@ -1136,6 +1276,8 @@ fn lower_value(value: ModelValue, ctx: &mut Ctx) -> Result<JsonValue, Error> {
             end,
             range,
         } => lower_value(eval_slice(*target, start, end, range, ctx)?, ctx)?,
+
+        ModelValue::ArgRef(_) => unreachable!("scorer expressions never evaluate during generation"),
     };
 
     Ok(value)
@@ -1652,6 +1794,7 @@ fn eval_operand(value: ModelValue, ctx: &mut Ctx) -> Result<Scalar, Error> {
         }
         // a residual slice is still rejected statically, refs never make one
         ModelValue::Slice { .. } => unreachable!("modeler validated operand types"),
+        ModelValue::ArgRef(_) => unreachable!("scorer expressions never evaluate during generation"),
     };
 
     Ok(scalar)
@@ -1844,8 +1987,15 @@ fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> Result<String, Er
 }
 
 // multiple trace templates cycle in source order
+#[cfg(test)]
 pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error> {
+    plan_with_filter(model, count, seed, &WriteFilter::default())
+}
+
+pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &WriteFilter) -> Result<Plan, Error> {
     debug_assert!(!model.traces.is_empty());
+
+    let scorer_postlude = model.traces.iter().any(|trace| trace.children.iter().any(has_scorer));
 
     let capacity = (0..count)
         .map(|index| trace_len(&model.traces[index % model.traces.len()]))
@@ -1862,7 +2012,7 @@ pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
         // a trace's values depend on nothing planned before it
         let mut ctx = Ctx::new(&model.refs, seed, index);
         ctx.instantiate_trace(&model.traces[index % model.traces.len()], &model.bindings)?;
-        planner.emit_trace(&mut ctx)?;
+        planner.emit_trace(&mut ctx, filter)?;
         planner.attachments.extend(ctx.attachments);
     }
 
@@ -1870,6 +2020,7 @@ pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
         events: planner.events.into_boxed_slice(),
         traces: planner.traces.into_boxed_slice(),
         attachments: planner.attachments.into_boxed_slice(),
+        scorer_postlude,
     })
 }
 
@@ -1897,6 +2048,8 @@ enum ErrorKind {
     NegativeRepeatCount,
     NonIntegerRepeatCount,
     ChanceOutOfRange,
+    ScoreOutOfRange,
+    ScorerReasonNotString,
     DurationOutOfRange,
     NoiseSizeOutOfRange,
     ClampBoundsOutOfOrder,
@@ -1920,6 +2073,8 @@ impl fmt::Display for ErrorKind {
             Self::NegativeRepeatCount => "repeat count is negative",
             Self::NonIntegerRepeatCount => "repeat count is not an integer",
             Self::ChanceOutOfRange => "maybe chance is not between 0 and 1",
+            Self::ScoreOutOfRange => "synthetic scorer score is not a number between 0 and 1",
+            Self::ScorerReasonNotString => "synthetic scorer reason is not a string",
             Self::DurationOutOfRange => "duration is not a positive number of seconds",
             Self::NoiseSizeOutOfRange => "noise size is not an integer between 0 and 8388608",
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",

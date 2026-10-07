@@ -1,7 +1,10 @@
+mod build;
 mod check;
 mod init;
 mod logging;
 mod setup;
+mod spec;
+mod sync;
 mod update;
 mod write;
 
@@ -17,9 +20,11 @@ pub struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Cmd {
+    Build(build::Args),
     Check(check::Args),
     Init(init::Args),
     Setup(setup::Args),
+    Sync(sync::Args),
     Update(update::Args),
     Write(write::Args),
 }
@@ -27,9 +32,11 @@ enum Cmd {
 impl Cli {
     pub fn run(self) -> Result<(), Error> {
         match self.command {
+            Cmd::Build(args) => args.run()?,
             Cmd::Check(args) => args.run()?,
             Cmd::Init(args) => args.run()?,
             Cmd::Setup(args) => args.run()?,
+            Cmd::Sync(args) => args.run()?,
             Cmd::Update(args) => args.run()?,
             Cmd::Write(args) => args.run()?,
         }
@@ -48,9 +55,11 @@ fn render_diags(source_name: &str, src: &str, diags: &dsl::Diags) -> String {
 
 #[derive(Debug)]
 pub enum Error {
+    Build(build::Error),
     Check(check::Error),
     Init(init::Error),
     Setup(setup::Error),
+    Sync(sync::Error),
     Update(update::Error),
     Write(write::Error),
 }
@@ -58,9 +67,11 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Build(source) => source.fmt(formatter),
             Self::Check(source) => source.fmt(formatter),
             Self::Init(source) => source.fmt(formatter),
             Self::Setup(source) => source.fmt(formatter),
+            Self::Sync(source) => source.fmt(formatter),
             Self::Update(source) => source.fmt(formatter),
             Self::Write(source) => source.fmt(formatter),
         }
@@ -68,6 +79,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<build::Error> for Error {
+    fn from(source: build::Error) -> Self {
+        Self::Build(source)
+    }
+}
 
 impl From<check::Error> for Error {
     fn from(source: check::Error) -> Self {
@@ -84,6 +101,12 @@ impl From<init::Error> for Error {
 impl From<setup::Error> for Error {
     fn from(source: setup::Error) -> Self {
         Self::Setup(source)
+    }
+}
+
+impl From<sync::Error> for Error {
+    fn from(source: sync::Error) -> Self {
+        Self::Sync(source)
     }
 }
 

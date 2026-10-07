@@ -617,6 +617,20 @@ pub(super) fn parse(tokens: Vec<Token>, src: &str) -> Result<Ast, Diags> {
         .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
+pub(super) fn parse_expression(tokens: Vec<Token>, src: &str) -> Result<Expr, Diags> {
+    let mut parser = Parser::new(tokens, src);
+    let expr = parser.parse_expr();
+    if !parser.eof() {
+        parser
+            .errors
+            .push(Error::new(ErrorKind::UnexpectedToken, parser.peek().range));
+    }
+    match (expr, parser.errors.is_empty()) {
+        (Some(expr), true) => Ok(expr),
+        _ => Err(parser.errors.into_iter().map(Diag::from).collect()),
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) struct Error {
     kind: ErrorKind,

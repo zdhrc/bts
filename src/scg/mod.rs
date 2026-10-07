@@ -1,0 +1,299 @@
+pub(crate) mod building;
+mod component;
+mod diff;
+mod emit;
+
+use crate::dsl::{Scorer, ScorerKind, ScorerLang};
+use std::collections::HashMap;
+use std::fmt;
+
+const JUDGE_USE_COT: bool = true;
+
+pub(crate) fn resolve_slugs(scorers: &[Scorer]) -> Result<Vec<String>, Error> {
+    let mut slugs = Vec::with_capacity(scorers.len());
+    let mut first_by_slug: HashMap<String, String> = HashMap::new();
+    for scorer in scorers {
+        let slug = component::slugify(&scorer.name).ok_or_else(|| Error::UnsluggableName {
+            name: scorer.name.clone(),
+        })?;
+        if let Some(first) = first_by_slug.insert(slug.clone(), scorer.name.clone()) {
+            return Err(Error::DuplicateSlug {
+                slug,
+                first,
+                second: scorer.name.clone(),
+            });
+        }
+        slugs.push(slug);
+    }
+    Ok(slugs)
+}
+
+fn resolve_lang(scorer: &Scorer, lang: Option<ScorerLang>) -> ScorerLang {
+    lang.or(scorer.lang).unwrap_or(ScorerLang::Python)
+}
+
+fn source_name(stem: &str, lang: ScorerLang) -> String {
+    match lang {
+        ScorerLang::Python => {
+            let mut normalized = String::new();
+            for ch in stem.chars() {
+                if ch.is_ascii_alphanumeric() {
+                    normalized.push(ch.to_ascii_lowercase());
+                } else if !normalized.ends_with('_') && !normalized.is_empty() {
+                    normalized.push('_');
+                }
+            }
+            let normalized = normalized.trim_end_matches('_');
+            let prefix = if normalized.starts_with(|ch: char| ch.is_ascii_digit()) {
+                "_"
+            } else {
+                ""
+            };
+            format!("{prefix}{normalized}_scorer.py")
+        }
+        ScorerLang::Typescript => format!("{stem}.scorer.ts"),
+    }
+}
+
+fn quoted(value: &str) -> String {
+    serde_json::to_string(value).expect("a string always encodes as JSON")
+}
+
+// SDK registrations are the source files that `bt functions push` discovers.
+pub(crate) fn assemble(scorers: &[Scorer], lang: Option<ScorerLang>, project: &str) -> Result<Assembly, Error> {
+    let slugs = resolve_slugs(scorers)?;
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, (scorer, slug)) in scorers.iter().zip(&slugs).enumerate() {
+        if matches!(scorer.kind, ScorerKind::Judge { .. }) {
+            continue;
+        }
+        let stem = scorer.file.clone().unwrap_or_else(|| slug.clone());
+        match groups.iter_mut().find(|(existing, _)| *existing == stem) {
+            Some((_, members)) => members.push(index),
+            None => groups.push((stem, vec![index])),
+        }
+    }
+
+    let mut files = Vec::new();
+    for (stem, members) in groups {
+        let file_lang = resolve_lang(&scorers[members[0]], lang);
+        if let Some(&conflict) = members
+            .iter()
+            .find(|&&member| resolve_lang(&scorers[member], lang) != file_lang)
+        {
+            return Err(Error::PackedLangConflict {
+                file: stem,
+                first: scorers[members[0]].name.clone(),
+                second: scorers[conflict].name.clone(),
+            });
+        }
+        let items: Vec<emit::Item> = members
+            .iter()
+            .map(|&member| {
+                let ScorerKind::Code { score, steps } = &scorers[member].kind else {
+                    unreachable!("judges were filtered out")
+                };
+                emit::Item {
+                    name: &scorers[member].name,
+                    slug: &slugs[member],
+                    score,
+                    steps,
+                }
+            })
+            .collect();
+        let source = emit::module(file_lang, &items).map_err(Error::Emit)?;
+        files.push(SourceFile {
+            name: source_name(&stem, file_lang),
+            contents: registry::code(file_lang, project, &items, &source),
+            slugs: members.iter().map(|&member| slugs[member].clone()).collect(),
+            lang: file_lang,
+        });
+    }
+
+    for (scorer, slug) in scorers.iter().zip(&slugs) {
+        if let ScorerKind::Judge { model, prompt, options } = &scorer.kind {
+            let judge_lang = lang.unwrap_or(ScorerLang::Python);
+            files.push(SourceFile {
+                name: source_name(slug, judge_lang),
+                contents: registry::judge(
+                    judge_lang,
+                    project,
+                    &scorer.name,
+                    slug,
+                    model,
+                    &component::mustache(prompt),
+                    options.iter().map(|option| (option.label.as_str(), option.score)).collect(),
+                ),
+                slugs: vec![slug.clone()],
+                lang: judge_lang,
+            });
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for file in &files {
+        if !seen.insert(&file.name) {
+            return Err(Error::DuplicateFile { file: file.name.clone() });
+        }
+    }
+    Ok(Assembly { files })
+}
+
+mod registry {
+    use super::{JUDGE_USE_COT, ScorerLang, emit, quoted};
+    use std::fmt::Write;
+
+    pub(super) fn code(lang: ScorerLang, project: &str, items: &[emit::Item], generated: &str) -> String {
+        let body = generated.split_once('\n').map(|(_, body)| body).unwrap_or(generated);
+        let mut out = match lang {
+            ScorerLang::Python => format!(
+                "# generated by bts; edits will be overwritten\nimport braintrust\nfrom pydantic import BaseModel\nfrom typing import Any\n\nproject = braintrust.projects.create(name={})\n{body}",
+                quoted(project)
+            ),
+            ScorerLang::Typescript => format!(
+                "// generated by bts; edits will be overwritten\nimport braintrust from \"braintrust\";\nimport {{ z }} from \"zod/v3\";\n\nconst project = braintrust.projects.create({{ name: {} }});\n{body}",
+                quoted(project)
+            ),
+        };
+        for item in items {
+            let function = emit::fn_name(item.slug);
+            match lang {
+                ScorerLang::Python => {
+                    let params = format!("{function}_params");
+                    write!(
+                        out,
+                        "\n\nclass {params}(BaseModel):\n    input: Any = None\n    output: Any\n    expected: Any = None\n    metadata: Any = None\n\n\nproject.scorers.create(\n    name={},\n    slug={},\n    parameters={params},\n    handler={function},\n)\n",
+                        quoted(item.name), quoted(item.slug),
+                    ).unwrap();
+                }
+                ScorerLang::Typescript => {
+                    write!(
+                        out,
+                        "\nproject.scorers.create({{\n  name: {},\n  slug: {},\n  parameters: z.object({{ input: z.any(), output: z.union([z.null(), z.boolean(), z.number(), z.string(), z.array(z.any()), z.record(z.any())]), expected: z.any(), metadata: z.any() }}),\n  handler: {function},\n}});\n",
+                        quoted(item.name), quoted(item.slug),
+                    ).unwrap();
+                }
+            }
+        }
+        out
+    }
+
+    pub(super) fn judge(
+        lang: ScorerLang,
+        project: &str,
+        name: &str,
+        slug: &str,
+        model: &str,
+        prompt: &str,
+        options: Vec<(&str, f64)>,
+    ) -> String {
+        let scores = options
+            .iter()
+            .map(|(label, score)| format!("{}: {score}", quoted(label)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match lang {
+            ScorerLang::Python => format!(
+                "# generated by bts; edits will be overwritten\nimport braintrust\n\nproject = braintrust.projects.create(name={})\n\nproject.scorers.create(\n    name={},\n    slug={},\n    messages=[{{\"role\": \"user\", \"content\": {}}}],\n    model={},\n    use_cot={},\n    choice_scores={{{scores}}},\n)\n",
+                quoted(project),
+                quoted(name),
+                quoted(slug),
+                quoted(prompt),
+                quoted(model),
+                if JUDGE_USE_COT { "True" } else { "False" },
+            ),
+            ScorerLang::Typescript => format!(
+                "// generated by bts; edits will be overwritten\nimport braintrust from \"braintrust\";\n\nconst project = braintrust.projects.create({{ name: {} }});\n\nproject.scorers.create({{\n  name: {},\n  slug: {},\n  messages: [{{ role: \"user\", content: {} }}],\n  model: {},\n  useCot: {},\n  choiceScores: {{{scores}}},\n}});\n",
+                quoted(project),
+                quoted(name),
+                quoted(slug),
+                quoted(prompt),
+                quoted(model),
+                JUDGE_USE_COT,
+            ),
+        }
+    }
+}
+
+pub(crate) struct Assembly {
+    pub(crate) files: Vec<SourceFile>,
+}
+
+pub(crate) struct SourceFile {
+    pub(crate) name: String,
+    pub(crate) contents: String,
+    pub(crate) slugs: Vec<String>,
+    pub(crate) lang: ScorerLang,
+}
+
+pub(crate) fn build(
+    assembly: &Assembly,
+    out: &std::path::Path,
+    before_overwrite: impl FnMut(&std::path::Path, &str),
+) -> Result<Vec<building::Built>, building::Error> {
+    building::build(assembly, out, before_overwrite)
+}
+
+#[derive(Debug)]
+pub(crate) enum Error {
+    UnsluggableName { name: String },
+    DuplicateSlug { slug: String, first: String, second: String },
+    PackedLangConflict { file: String, first: String, second: String },
+    DuplicateFile { file: String },
+    Emit(emit::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsluggableName { name } => {
+                write!(formatter, "scorer name \"{name}\" has no alphanumeric characters to slug")
+            }
+            Self::DuplicateSlug { slug, first, second } => write!(
+                formatter,
+                "scorers \"{first}\" and \"{second}\" both use slug `{slug}`; rename one"
+            ),
+            Self::PackedLangConflict { file, first, second } => write!(
+                formatter,
+                "scorers \"{first}\" and \"{second}\" pack into file `{file}` but resolve to different languages"
+            ),
+            Self::DuplicateFile { file } => write!(
+                formatter,
+                "multiple scorers would build into `{file}`; change a code scorer's file stem"
+            ),
+            Self::Emit(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::compile;
+
+    #[test]
+    fn emits_sdk_registrations_for_code_and_judge() {
+        let model = compile(include_str!("../../tests/fixtures/scorers.bt")).unwrap();
+        let built = assemble(&model.scorers, None, "demo-project").unwrap();
+        assert_eq!(built.files.len(), 2);
+        let code = &built.files[0].contents;
+        assert!(code.contains("project.scorers.create("));
+        assert!(code.contains("parameters=scorer_answer_quality_params"));
+        assert!(code.contains("handler=scorer_answer_quality"));
+        assert!(code.contains("project = braintrust.projects.create(name=\"demo-project\")"));
+        let judge = &built.files[1].contents;
+        assert!(judge.contains("choice_scores={"));
+        assert!(judge.contains("messages=[{"));
+    }
+
+    #[test]
+    fn emits_typescript_sdk_registrations() {
+        let model = compile(include_str!("../../tests/fixtures/scorers.bt")).unwrap();
+        let built = assemble(&model.scorers, Some(ScorerLang::Typescript), "demo-project").unwrap();
+        assert_eq!(built.files.len(), 2);
+        assert!(built.files[0].contents.contains("parameters: z.object("));
+        assert!(built.files[0].contents.contains("handler: scorer_answer_quality"));
+        assert!(built.files[1].contents.contains("choiceScores:"));
+    }
+}

@@ -1,6 +1,7 @@
 mod cmd;
 mod conf;
 mod dsl;
+mod scg;
 mod sdg;
 
 use clap::Parser as _;

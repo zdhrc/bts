@@ -49,6 +49,10 @@ pub struct Args {
     #[arg(long, value_name = "SEED")]
     seed: Option<u64>,
 
+    /// select generated blocks by kind or name, for example 'block.kind != "scorer"'
+    #[arg(long, value_name = "EXPR")]
+    filter: Option<dsl::WriteFilter>,
+
     /// print the Braintrust payload without writing it
     #[arg(long)]
     dry_run: bool,
@@ -143,7 +147,17 @@ impl Args {
         };
         tracing::info!(seed, "seed resolved");
         let mut events = tracing::info_span!("generate")
-            .in_scope(|| sdg::generate(model, count, over, self.dist, until, seed))
+            .in_scope(|| {
+                sdg::generate_filtered(
+                    model,
+                    count,
+                    over,
+                    self.dist,
+                    until,
+                    seed,
+                    self.filter.as_ref().unwrap_or(&dsl::WriteFilter::default()),
+                )
+            })
             .map_err(|error| match error {
                 // expression evaluation failures render like compile diagnostics with line:col
                 sdg::Error::Plan(plan_error) => Error::FailedGeneration {
@@ -172,7 +186,7 @@ impl Args {
             return Ok(());
         }
 
-        let mut config = Braintrust::from_env()?;
+        let mut config = Braintrust::load()?;
         config.request_timeout = settings.request_timeout;
         config.write_concurrency = settings.write_concurrency;
         config.max_attachment_uploads = settings.max_attachment_uploads;

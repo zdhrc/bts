@@ -70,6 +70,82 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
 }
 
 #[test]
+fn write_filter_omits_synthetic_scorers_without_changing_application_values() {
+    let shape = write_shape(
+        r#"
+        trace "support" {
+            input = "question ${trace.index}"
+            output = weighted(["resolved", 3], ["escalated", 1])
+            llm "Chat Completion" {
+                output = trace.output
+                scorer "answer-quality" {
+                    score = clamp(normal(0.75, 0.1), 0, 1)
+                    reason = "Observed ${trace.output}"
+                }
+            }
+        }
+        scorer "answer-quality" {
+            code { score = output == "resolved" ? 1 : 0 }
+        }
+        "#,
+    );
+    let run = |filter: Option<&str>| {
+        let mut command = bts();
+        command.args(["write", "--from"]).arg(&shape).args([
+            "--count",
+            "3",
+            "--start",
+            "2026-09-01T00:00:00Z",
+            "--end",
+            "2026-09-01T01:00:00Z",
+            "--seed",
+            "42",
+            "--dry-run",
+        ]);
+        if let Some(filter) = filter {
+            command.args(["--filter", filter]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice::<JsonValue>(&output.stdout).unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let with_scores = run(None);
+    let without_scores = run(Some("block.kind != \"scorer\""));
+    let without_llms = run(Some("block.name != \"Chat Completion\""));
+    fs::remove_file(shape).unwrap();
+
+    assert_eq!(with_scores.len(), 9);
+    assert_eq!(without_scores.len(), 6);
+    assert_eq!(without_llms.len(), 3);
+    let (full_chunks, _) = with_scores.as_chunks::<3>();
+    let (filtered_chunks, _) = without_scores.as_chunks::<2>();
+    for (full, filtered) in full_chunks.iter().zip(filtered_chunks) {
+        assert_eq!(full[0]["input"], filtered[0]["input"]);
+        assert_eq!(full[0]["output"], filtered[0]["output"]);
+        assert_eq!(full[1]["output"], filtered[1]["output"]);
+        assert_eq!(full[0]["metrics"], filtered[0]["metrics"]);
+        assert_eq!(full[1]["metrics"], filtered[1]["metrics"]);
+        assert_eq!(full[2]["span_attributes"]["type"], "scorer");
+        assert_eq!(full[2]["span_attributes"]["purpose"], "scorer");
+        assert_eq!(full[2]["span_attributes"]["name"], "answer-quality");
+        assert_eq!(full[2]["span_parents"][0], full[1]["span_id"]);
+        assert_eq!(full[2]["scores"]["answer-quality"], full[2]["output"]["score"]);
+        assert_eq!(full[1]["scores"]["answer-quality"], full[2]["output"]["score"]);
+        assert!(filtered[1].get("scores").is_none());
+        assert_eq!(full[2]["input"]["output"], full[1]["output"]);
+        assert!(
+            full[2]["scores"]["answer-quality"]
+                .as_f64()
+                .is_some_and(|score| (0.0..=1.0).contains(&score))
+        );
+        assert!(full[2]["metadata"]["reason"].as_str().unwrap().starts_with("Observed "));
+    }
+}
+
+#[test]
 fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     let shape = write_shape(include_str!("fixtures/dynamic.bt"));
     let output = bts()
@@ -295,17 +371,20 @@ fn threads_referenced_content_across_spans() {
 fn writes_generated_events_to_the_configured_endpoint() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
     let (api_url, request) = serve_insert(6);
     let output = bts()
+        .current_dir(&root)
         .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "2", "--over", "1h"])
         .env("BRAINTRUST_API_KEY", "test-secret")
-        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env("BRAINTRUST_PROJECT_ID", Uuid::new_v4().to_string())
         .env("BRAINTRUST_API_URL", api_url)
         .output()
         .unwrap();
     fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
     let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
     let (headers, body) = split_request(&request);
     let payload: JsonValue = serde_json::from_slice(body).unwrap();
@@ -327,20 +406,23 @@ fn uploads_an_attachment_before_inserting_its_reference() {
         "trace \"review\" {{ input = {{ document = attachment({path_literal}, \"application/pdf\") }} }}"
     ));
     let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
     let org_id = Uuid::new_v4();
     let (api_url, requests) = serve_attachment_flow(org_id, 3);
 
     let output = bts()
+        .current_dir(&root)
         .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "3", "--over", "1h"])
         .env("BRAINTRUST_API_KEY", "test-secret")
-        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env_remove("BRAINTRUST_PROJECT_ID")
         .env("BRAINTRUST_API_URL", api_url)
         .output()
         .unwrap();
     fs::remove_file(shape).unwrap();
     fs::remove_file(&file).unwrap();
+    fs::remove_dir_all(root).unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
     let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -378,6 +460,56 @@ fn uploads_an_attachment_before_inserting_its_reference() {
         assert_eq!(document["key"], key);
         assert_eq!(document["content_type"], "application/pdf");
     }
+}
+
+#[test]
+fn filtered_blocks_do_not_upload_attachments_or_emit_scorer_spans() {
+    let shape = write_shape(
+        r#"
+        trace "review" {
+            task "attachment-holder" {
+                output = attachment("filtered-out.pdf", "application/pdf")
+            }
+            task "scored" {
+                output = "ok"
+                scorer "inline-score" { score = 1 }
+            }
+        }
+        scorer "inline-score" { code { score = 1 } }
+        "#,
+    );
+    let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let (api_url, request) = serve_insert(2);
+    let output = bts()
+        .current_dir(&root)
+        .args(["write", "--from"])
+        .arg(&shape)
+        .args([
+            "--count",
+            "1",
+            "--over",
+            "1h",
+            "--filter",
+            "block.name != \"attachment-holder\" && block.kind != \"scorer\"",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (headers, body) = split_request(&request);
+    assert!(headers.starts_with(&format!("POST /v1/project_logs/{project_id}/insert HTTP/1.1\r\n")));
+    let payload: JsonValue = serde_json::from_slice(body).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["span_attributes"]["name"], "review");
+    assert_eq!(events[1]["span_attributes"]["name"], "scored");
+    assert!(events[1].get("scores").is_none());
 }
 
 #[test]
@@ -440,21 +572,24 @@ fn resolves_relative_attachments_from_the_shape_directory() {
         "trace \"review\" { input = { document = attachment(\"report.pdf\", \"application/pdf\") } }",
     )
     .unwrap();
-    let relative_shape = shape.strip_prefix(std::env::temp_dir()).unwrap();
     let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let relative_shape = std::path::Path::new("..").join(shape.strip_prefix(std::env::temp_dir()).unwrap());
     let org_id = Uuid::new_v4();
     let (api_url, requests) = serve_attachment_flow(org_id, 1);
 
     let output = bts()
+        .current_dir(&root)
         .args(["write", "--from"])
-        .arg(relative_shape)
+        .arg(&relative_shape)
         .args(["--count", "1", "--over", "1h"])
         .env("BRAINTRUST_API_KEY", "test-secret")
-        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env_remove("BRAINTRUST_PROJECT_ID")
         .env("BRAINTRUST_API_URL", api_url)
         .output()
         .unwrap();
     fs::remove_dir_all(shape_dir).unwrap();
+    fs::remove_dir_all(root).unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
     let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -473,17 +608,20 @@ fn resolves_relative_attachments_from_the_shape_directory() {
 fn emits_a_json_summary_when_requested() {
     let shape = write_shape(SIMPLE_SHAPE);
     let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
     let (api_url, _request) = serve_insert(3);
     let output = bts()
+        .current_dir(&root)
         .args(["write", "--from"])
         .arg(&shape)
         .args(["--count", "1", "--over", "1h", "--seed", "3", "--json"])
         .env("BRAINTRUST_API_KEY", "test-secret")
-        .env("BRAINTRUST_PROJECT_ID", project_id.to_string())
+        .env_remove("BRAINTRUST_PROJECT_ID")
         .env("BRAINTRUST_API_URL", api_url)
         .output()
         .unwrap();
     fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
 
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let summary: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
@@ -497,6 +635,309 @@ fn emits_a_json_summary_when_requested() {
 }
 
 // run from the temp dir so run logs land in a throwaway .bt, not the repo
+#[test]
+fn build_writes_scorer_sources_without_credentials() {
+    let shape = write_shape(include_str!("../examples/scoring_automations.bt"));
+    let root = write_project_context(Uuid::new_v4());
+    let out = root.join("generated");
+    let output = bts()
+        .current_dir(&root)
+        .args(["build", "--from"])
+        .arg(&shape)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for (slug, file) in [
+        ("reset-topic-clarity", "reset_topic_clarity_scorer.py"),
+        ("no-password-collection", "no_password_collection_scorer.py"),
+        ("verification-gate", "verification_gate_scorer.py"),
+        ("lookup-request-binding", "lookup_request_binding_scorer.py"),
+        ("reset-workflow-order", "reset_workflow_order_scorer.py"),
+        ("reset-outcome-honesty", "reset_outcome_honesty_scorer.py"),
+    ] {
+        assert!(stdout.contains(&format!("{file} ({slug})")), "stdout:\n{stdout}");
+        assert!(out.join("src/scorers").join(file).exists());
+    }
+
+    let code = fs::read_to_string(out.join("src/scorers/reset_outcome_honesty_scorer.py")).unwrap();
+    assert!(code.starts_with("# generated by bts; edits will be overwritten"));
+    assert!(code.contains("def scorer_reset_outcome_honesty(output, input=None, expected=None, metadata=None):"));
+    assert!(code.contains("for repeat_index in range("));
+    assert!(code.contains("handler=scorer_reset_outcome_honesty"));
+    assert!(code.contains("project = braintrust.projects.create(name=\"test-project\")"));
+    let pyproject: toml::Value = toml::from_str(&fs::read_to_string(out.join("pyproject.toml")).unwrap()).unwrap();
+    let dependencies = pyproject["project"]["dependencies"].as_array().unwrap();
+    assert!(dependencies.iter().any(|entry| entry.as_str() == Some("braintrust>=0.39,<1")));
+    assert!(dependencies.iter().any(|entry| entry.as_str() == Some("pydantic>=2,<3")));
+    assert!(!out.join("package.json").exists());
+
+    // the language override flips the extension
+    let shape = write_shape(include_str!("../examples/scoring_automations.bt"));
+    let output = bts()
+        .current_dir(&root)
+        .args(["build", "--from"])
+        .arg(&shape)
+        .arg("--out")
+        .arg(&out)
+        .args(["--lang", "typescript"])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    for file in [
+        "reset-topic-clarity",
+        "no-password-collection",
+        "verification-gate",
+        "lookup-request-binding",
+        "reset-workflow-order",
+        "reset-outcome-honesty",
+    ] {
+        assert!(out.join("src/scorers").join(format!("{file}.scorer.ts")).exists());
+    }
+    let code = fs::read_to_string(out.join("src/scorers/reset-outcome-honesty.scorer.ts")).unwrap();
+    assert!(code.contains("function scorer_reset_outcome_honesty({ input, output, expected, metadata }: { input?: any; output: any; expected?: any; metadata?: any }): { name: string; score: number; metadata: Record<string, unknown> } {"));
+    assert!(code.contains("for (let repeatIndex = 0;"));
+    assert!(code.contains("project.scorers.create({"));
+    let package: JsonValue = serde_json::from_str(&fs::read_to_string(out.join("package.json")).unwrap()).unwrap();
+    assert_eq!(package["dependencies"]["braintrust"], "^3.30.0");
+    assert_eq!(package["dependencies"]["zod"], "^4.0.0");
+    assert!(out.join("tsconfig.json").exists());
+    assert!(!out.join("node_modules").exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn scoring_example_generates_each_reset_outcome_and_scored_span() {
+    let shape = write_shape(include_str!("../examples/scoring_automations.bt"));
+    let output = bts()
+        .args(["write", "--from"])
+        .arg(&shape)
+        .args(["--count", "6", "--over", "1h", "--dry-run", "--seed", "7"])
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    assert_eq!(events.len(), 42);
+    let roots: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| (event["span_attributes"]["name"] == "password-reset-assistant").then_some(index))
+        .collect();
+    assert_eq!(roots.len(), 6);
+    let mut outcomes = std::collections::BTreeSet::new();
+    for (position, start) in roots.iter().enumerate() {
+        let end = roots.get(position + 1).copied().unwrap_or(events.len());
+        let trace = &events[*start..end];
+        let root = &trace[0];
+        let span = |name: &str| trace.iter().find(|event| event["span_attributes"]["name"] == name);
+        let status = root["output"]["status"].as_str().unwrap();
+        outcomes.insert(status.to_owned());
+        assert_eq!(
+            root["output"]["reply"],
+            span("draft-reset-reply").unwrap()["output"]["content"]
+        );
+        assert_eq!(
+            span("verify-reset-request").unwrap()["output"]["lookup"],
+            span("lookup-account").unwrap()["output"]
+        );
+        assert_eq!(
+            span("verify-reset-request").unwrap()["input"]["email"],
+            root["input"]["email"]
+        );
+        let steps: Vec<_> = root["output"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["step"].clone())
+            .collect();
+        assert_eq!(steps, *root["metadata"]["required_steps"].as_array().unwrap());
+        match status {
+            "sent" => {
+                assert!(span("execute-reset").is_some());
+                assert_eq!(span("send-reset-email").unwrap()["output"]["status"], "sent");
+            }
+            "delivery_failed" => {
+                assert_eq!(span("send-reset-email").unwrap()["output"]["status"], "failed");
+                assert_eq!(span("send-reset-email").unwrap()["error"], "Email provider timed out");
+                assert!(root["output"]["reply"].as_str().unwrap().contains("Check your email"));
+            }
+            "blocked" => {
+                assert!(span("execute-reset").is_none());
+                assert_eq!(span("verify-reset-request").unwrap()["output"]["decision"], "blocked");
+            }
+            other => panic!("unexpected outcome: {other}"),
+        }
+    }
+    assert_eq!(
+        outcomes,
+        ["blocked", "delivery_failed", "sent"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+}
+
+const AUTOMATION_SYNC_SHAPE: &str = r#"
+scorer "reset-instructions" { code { score = 1 } }
+scorer "response-helpfulness" { code { score = 1 } }
+automation "score-reset-instructions" {
+    type = "scorer"
+    scorers = ["reset-instructions"]
+    scope = "span"
+    span_names = ["password-reset-answer"]
+    sampling_rate = 1.0
+    enabled = true
+}
+automation "judge-final-response" {
+    type = "scorer"
+    scorers = ["response-helpfulness"]
+    scope = "span"
+    span_names = ["password-reset-assistant"]
+    sampling_rate = 1.0
+    enabled = true
+}
+"#;
+
+#[test]
+fn sync_automations_resolves_pushed_scorers_and_creates_rules() {
+    let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let shape = write_shape(AUTOMATION_SYNC_SHAPE);
+    let scorer_ids = [Uuid::new_v4(), Uuid::new_v4()];
+    let replies = vec![
+        serde_json::json!({ "objects": [{ "id": scorer_ids[0].to_string(), "project_id": project_id.to_string(), "slug": "reset-instructions", "function_type": "scorer" }] }),
+        serde_json::json!({ "objects": [{ "id": scorer_ids[1].to_string(), "project_id": project_id.to_string(), "slug": "response-helpfulness", "function_type": "scorer" }] }),
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!({ "id": Uuid::new_v4().to_string() }),
+        serde_json::json!({ "id": Uuid::new_v4().to_string() }),
+    ];
+    let (api_url, requests) = serve_json_sequence(replies);
+    let output = bts()
+        .current_dir(&root)
+        .args(["sync", "automations", "--from"])
+        .arg(&shape)
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(split_request(&requests[0]).0.starts_with("GET /v1/function?"));
+    assert!(split_request(&requests[2]).0.starts_with("GET /v1/project_score?"));
+    for (index, name, scorer_id, span_name) in [
+        (4, "score-reset-instructions", scorer_ids[0], "password-reset-answer"),
+        (5, "judge-final-response", scorer_ids[1], "password-reset-assistant"),
+    ] {
+        let (headers, body) = split_request(&requests[index]);
+        assert!(headers.starts_with("PUT /v1/project_score HTTP/1.1\r\n"));
+        assert!(headers.to_ascii_lowercase().contains("authorization: bearer test-secret\r\n"));
+        let payload: JsonValue = serde_json::from_slice(body).unwrap();
+        assert_eq!(payload["project_id"], project_id.to_string());
+        assert_eq!(payload["name"], name);
+        assert_eq!(payload["score_type"], "online");
+        assert_eq!(payload["config"]["online"]["scorers"][0]["id"], scorer_id.to_string());
+        assert_eq!(payload["config"]["online"]["apply_to_span_names"][0], span_name);
+        assert_eq!(payload["config"]["online"]["status"], "active");
+    }
+}
+
+#[test]
+fn sync_automations_dry_run_does_not_put_rules() {
+    let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let shape = write_shape(AUTOMATION_SYNC_SHAPE);
+    let replies = vec![
+        serde_json::json!({ "objects": [{ "id": Uuid::new_v4().to_string(), "project_id": project_id.to_string(), "slug": "reset-instructions", "function_type": "scorer" }] }),
+        serde_json::json!({ "objects": [{ "id": Uuid::new_v4().to_string(), "project_id": project_id.to_string(), "slug": "response-helpfulness", "function_type": "scorer" }] }),
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!({ "objects": [] }),
+    ];
+    let (api_url, requests) = serve_json_sequence(replies);
+    let output = bts()
+        .current_dir(&root)
+        .args(["sync", "automations", "--from"])
+        .arg(&shape)
+        .arg("--dry-run")
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("would create score-reset-instructions"));
+    assert!(stdout.contains("would create judge-final-response"));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| split_request(request).0.starts_with("GET ")));
+}
+
+#[test]
+fn sync_automations_skips_unchanged_rules_and_updates_changed_bindings() {
+    let project_id = Uuid::new_v4();
+    let root = write_project_context(project_id);
+    let shape = write_shape(AUTOMATION_SYNC_SHAPE);
+    let scorer_ids = [Uuid::new_v4(), Uuid::new_v4()];
+    let existing = |name: &str, scorer_id: Uuid, span_name: &str, rate: f64| {
+        serde_json::json!({
+            "project_id": project_id.to_string(), "name": name, "score_type": "online",
+            "config": { "online": {
+                "sampling_rate": rate,
+            "scorers": [{ "type": "function", "id": scorer_id.to_string(), "version": "latest" }],
+                "status": "active", "scope": { "type": "span" },
+                "apply_to_root_span": false, "apply_to_span_names": [span_name]
+            }}
+        })
+    };
+    let replies = vec![
+        serde_json::json!({ "objects": [{ "id": scorer_ids[0].to_string(), "project_id": project_id.to_string(), "slug": "reset-instructions", "function_type": "scorer" }] }),
+        serde_json::json!({ "objects": [{ "id": scorer_ids[1].to_string(), "project_id": project_id.to_string(), "slug": "response-helpfulness", "function_type": "scorer" }] }),
+        serde_json::json!({ "objects": [existing("score-reset-instructions", scorer_ids[0], "password-reset-answer", 1.0)] }),
+        serde_json::json!({ "objects": [existing("judge-final-response", scorer_ids[1], "password-reset-assistant", 0.25)] }),
+        serde_json::json!({ "id": Uuid::new_v4().to_string() }),
+    ];
+    let (api_url, requests) = serve_json_sequence(replies);
+    let output = bts()
+        .current_dir(&root)
+        .args(["sync", "automations", "--from"])
+        .arg(&shape)
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api_url)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unchanged score-reset-instructions"));
+    assert!(stdout.contains("updated judge-final-response"));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 5);
+    let (headers, body) = split_request(&requests[4]);
+    assert!(headers.starts_with("PUT /v1/project_score HTTP/1.1\r\n"));
+    let payload: JsonValue = serde_json::from_slice(body).unwrap();
+    assert_eq!(payload["name"], "judge-final-response");
+    assert_eq!(payload["config"]["online"]["sampling_rate"], 1.0);
+}
+
 fn bts() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_bts"));
     command.current_dir(std::env::temp_dir());
@@ -511,6 +952,14 @@ fn write_shape(source: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("bts-write-{}.bt", Uuid::new_v4()));
     fs::write(&path, source).unwrap();
     path
+}
+
+fn write_project_context(project_id: Uuid) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("bts-context-{}", Uuid::new_v4()));
+    fs::create_dir_all(root.join(".bt")).unwrap();
+    let context = serde_json::json!({ "project": "test-project", "project_id": project_id.to_string() });
+    fs::write(root.join(".bt/config.json"), context.to_string()).unwrap();
+    root
 }
 
 fn serve_insert(row_count: usize) -> (String, Receiver<Vec<u8>>) {
@@ -535,6 +984,29 @@ fn serve_insert(row_count: usize) -> (String, Receiver<Vec<u8>>) {
         .unwrap();
     });
 
+    (format!("http://{address}"), receiver)
+}
+
+fn serve_json_sequence(replies: Vec<JsonValue>) -> (String, Receiver<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut requests = Vec::new();
+        for reply in replies {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_request(&mut stream));
+            let body = reply.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+        }
+        sender.send(requests).unwrap();
+    });
     (format!("http://{address}"), receiver)
 }
 
@@ -569,7 +1041,6 @@ fn serve_attachment_flow(org_id: Uuid, row_count: usize) -> (String, Receiver<Ve
         }
         sender.send(requests).unwrap();
     });
-
     (format!("http://{address}"), receiver)
 }
 

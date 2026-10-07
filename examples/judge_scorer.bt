@@ -1,0 +1,14 @@
+# judge scorer -- an llm grades each response against labeled options; built
+# as a Braintrust SDK prompt scorer for `bt functions push`
+
+scorer "helpfulness" {
+    judge {
+        model = "gpt-4o-mini"
+        prompt = """
+            Rate how helpful the response is to the user's request.
+            Request: ${input}
+            Response: ${output}
+            """
+        options = { excellent = 1.0, good = 0.6, poor = 0.2 }
+    }
+}
