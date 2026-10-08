@@ -8,6 +8,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+pub(crate) fn stable_uuid(key: &str) -> Uuid {
+    fn hash(bytes: &[u8], seed: u64) -> u64 {
+        bytes
+            .iter()
+            .fold(seed, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+    }
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hash(key.as_bytes(), 0xcbf29ce484222325).to_be_bytes());
+    bytes[8..].copy_from_slice(&hash(key.as_bytes(), 0x84222325cbf29ce4).to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x80; // UUID version 8: custom deterministic payload
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 const EVENT_SLOT: Duration = Duration::from_millis(100);
 
 // how trace volume spreads across the window; each variant maps an even 0..=1
@@ -32,16 +46,33 @@ impl Distribution {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct EventBatch {
-    pub(super) events: Box<[Event]>,
+    pub(crate) events: Box<[Event]>,
 
     #[serde(skip)]
-    pub(super) trace_count: usize,
+    pub(crate) trace_count: usize,
 
     #[serde(skip)]
-    pub(super) attachments: Box<[Attachment]>,
+    pub(crate) attachments: Box<[Attachment]>,
 }
 
 impl EventBatch {
+    pub(crate) fn assign_stable_ids(&mut self, key: &str) {
+        let old_to_new: HashMap<String, String> = self
+            .events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (event.span_id.clone(), stable_uuid(&format!("{key}/span/{index}")).to_string()))
+            .collect();
+        for (index, event) in self.events.iter_mut().enumerate() {
+            event.id = stable_uuid(&format!("{key}/row/{index}")).to_string();
+            event.span_id = old_to_new[&event.span_id].clone();
+            event.root_span_id = old_to_new[&event.root_span_id].clone();
+            for parent in event.span_parents.iter_mut() {
+                *parent = old_to_new[parent].clone();
+            }
+        }
+    }
+
     pub(crate) fn resolve_attachment_paths(&mut self, shape_file: &Path) -> std::io::Result<()> {
         if self.attachments.is_empty() {
             return Ok(());
@@ -91,6 +122,28 @@ impl EventBatch {
         Ok(())
     }
 
+    pub(crate) fn reuse_attachments(&mut self, keys: &HashMap<String, String>) {
+        self.attachments = std::mem::take(&mut self.attachments)
+            .into_vec()
+            .into_iter()
+            .filter(|attachment| !keys.contains_key(&attachment.key))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        for event in &mut self.events {
+            for value in [&mut event.input, &mut event.output, &mut event.expected, &mut event.error]
+                .into_iter()
+                .flatten()
+            {
+                replace_attachment_keys(value, keys);
+            }
+            if let Some(metadata) = &mut event.metadata {
+                for value in metadata.values_mut() {
+                    replace_attachment_keys(value, keys);
+                }
+            }
+        }
+    }
+
     pub(crate) fn event_count(&self) -> usize {
         self.events.len()
     }
@@ -119,36 +172,36 @@ fn replace_attachment_keys(value: &mut JsonValue, keys: &HashMap<String, String>
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct Event {
-    pub(super) id: String,
-    pub(super) span_id: String,
-    pub(super) root_span_id: String,
-    pub(super) span_parents: Box<[String]>,
-    pub(super) created: String,
-    pub(super) span_attributes: SpanAttributes,
+pub(crate) struct Event {
+    pub(crate) id: String,
+    pub(crate) span_id: String,
+    pub(crate) root_span_id: String,
+    pub(crate) span_parents: Box<[String]>,
+    pub(crate) created: String,
+    pub(crate) span_attributes: SpanAttributes,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) input: Option<JsonValue>,
+    pub(crate) input: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) output: Option<JsonValue>,
+    pub(crate) output: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) expected: Option<JsonValue>,
+    pub(crate) expected: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<JsonValue>,
+    pub(crate) error: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) metadata: Option<JsonMap<String, JsonValue>>,
+    pub(crate) metadata: Option<JsonMap<String, JsonValue>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) scores: Option<JsonMap<String, JsonValue>>,
+    pub(crate) scores: Option<JsonMap<String, JsonValue>>,
 
-    pub(super) metrics: JsonMap<String, JsonValue>,
+    pub(crate) metrics: JsonMap<String, JsonValue>,
 
     #[serde(skip_serializing_if = "tags_are_empty")]
-    pub(super) tags: Box<[String]>,
+    pub(crate) tags: Box<[String]>,
 }
 
 fn tags_are_empty(tags: &[String]) -> bool {
@@ -156,14 +209,14 @@ fn tags_are_empty(tags: &[String]) -> bool {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct SpanAttributes {
-    pub(super) name: String,
+pub(crate) struct SpanAttributes {
+    pub(crate) name: String,
 
     #[serde(rename = "type")]
-    pub(super) kind: String,
+    pub(crate) kind: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) purpose: Option<&'static str>,
+    pub(crate) purpose: Option<&'static str>,
 }
 
 struct Materializer {
@@ -377,7 +430,7 @@ fn format_timestamp(timestamp: SystemTime) -> String {
     DateTime::<Utc>::from(timestamp).to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-pub(super) fn materialize(
+pub(crate) fn materialize(
     plan: Plan,
     over: Duration,
     distribution: Distribution,
@@ -393,7 +446,7 @@ pub(crate) struct Error {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum ErrorKind {
+pub(crate) enum ErrorKind {
     ReservedMetric(&'static str),
     WindowTooShort,
     TimestampOutOfRange,

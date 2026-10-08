@@ -1,5 +1,6 @@
 mod build;
 mod check;
+pub(crate) mod client;
 mod init;
 mod logging;
 mod setup;

@@ -1,10 +1,10 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Field, Func, JudgeOption, Maybe, Model,
-    NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg,
-    ScorerKind, ScorerLang, ScorerSpan, ScorerStep, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp,
-    Value, WeightedOption, When,
+    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase, DatasetSource, Field,
+    Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat,
+    ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan, ScorerStep, Selection, Span, SpanFields, SpanKind,
+    Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
 };
 use crate::dsl::spec;
 use std::{
@@ -217,6 +217,8 @@ enum Head {
     SelfBlock(NodeId),
     // the enclosing trace's own fields
     Trace,
+    // explicit bracket selection of a module trace, including reserved names
+    ModuleTrace,
 }
 
 // a value's landing place, the nodes of the static dependency graph
@@ -282,6 +284,7 @@ pub(super) struct Modeler {
     sym_stack: Vec<NodeId>,
     // block references recorded mid-walk, indexed by RefId, resolved at fixup
     pending: Vec<PendingRef>,
+    identity_aliases: Vec<RefId>,
     // nested scorer names resolve after all top-level definitions are known
     pending_scorers: Vec<(String, SrcRange)>,
     // the slot whose expression is folding, for dependency edges
@@ -302,6 +305,7 @@ impl Modeler {
             syms: Vec::new(),
             sym_stack: Vec::new(),
             pending: Vec::new(),
+            identity_aliases: Vec::new(),
             pending_scorers: Vec::new(),
             current_slot: None,
             edges: Vec::new(),
@@ -333,6 +337,7 @@ impl Modeler {
         let mut scorers = Vec::new();
         let mut scorer_names_seen = HashSet::new();
         let mut automations = Vec::new();
+        let mut datasets = Vec::new();
 
         // collect vars first so refs work no matter the decl order
         let (vars_blocks, rest) = split_vars(std::mem::take(&mut self.ast.decls));
@@ -383,6 +388,11 @@ impl Modeler {
                         if let Some(automation) = self.model_automation(block, desc) {
                             automations.push((automation, range));
                         }
+                    } else if desc.id == spec::ids::DATASET && desc.allows(spec::Place::Root) {
+                        let range = block.range;
+                        if let Some(dataset) = self.model_dataset(block, desc) {
+                            datasets.push((dataset, range));
+                        }
                     } else {
                         self.errors.push(Error::new(
                             ErrorKind::BlockNotAllowed {
@@ -400,7 +410,7 @@ impl Modeler {
         // this iterates collected records only, never the ast; extension
         // leaves dead intermediate records behind, so only references the
         // model actually stores resolve
-        let live = live_refs(&self.pending, &traces, &bindings);
+        let live = live_refs(&self.pending, &traces, &bindings, &datasets, &self.identity_aliases);
         let refs = self.resolve_pending(&live);
         self.detect_cycles();
 
@@ -425,6 +435,86 @@ impl Modeler {
                 }
             }
         }
+        let mut dataset_names = HashSet::new();
+        for (dataset, range) in &datasets {
+            if !dataset_names.insert(dataset.name.as_str()) {
+                self.dataset_error(format!("duplicate dataset name {:?}", dataset.name), *range);
+            }
+            for case in &dataset.cases {
+                let sources: Vec<(RefId, &str)> = match &case.source {
+                    DatasetSource::Inline(_) => Vec::new(),
+                    DatasetSource::Trace(id) => vec![(*id, "trace")],
+                    DatasetSource::Span(id) => vec![(*id, "span")],
+                    DatasetSource::Group(ids) => ids.iter().map(|id| (*id, "traces")).collect(),
+                };
+                for (id, field) in sources {
+                    let desc = spec::SPEC.block_by_id(spec::ids::CASE).unwrap().field(field).unwrap();
+                    let constraint = match desc.value {
+                        spec::ExprType::Array { items } => *items,
+                        value => value,
+                    };
+                    let spec::ExprType::BlockRef { kinds } = constraint else {
+                        unreachable!("dataset source fields declare their reference types")
+                    };
+                    let reference = &refs[id.0 as usize];
+                    match &reference.accessor {
+                        Accessor::Block { kind, .. } if kinds.contains(kind) => {
+                            if reference.steps.iter().any(|step| match step {
+                                Step::Child { candidates, position } => {
+                                    position.is_some()
+                                        || candidates.iter().any(|node| !self.syms[node.0 as usize].kind.has_fields())
+                                }
+                                _ => true,
+                            }) {
+                                self.dataset_error("dataset block sources require a static path; directed generation through repeat, maybe, or choice is not supported yet".to_owned(), reference.range);
+                            }
+                        }
+                        _ => self.dataset_error(
+                            format!("case {:?} requires a reference to a {} block", case.name, kinds.join(" or ")),
+                            reference.range,
+                        ),
+                    }
+                }
+                let mut values = Vec::new();
+                if let DatasetSource::Inline(value) = &case.source {
+                    collect_refs(value, &mut values);
+                }
+                for value in [&case.expected, &case.metadata, &case.tags].into_iter().flatten() {
+                    collect_refs(value, &mut values);
+                }
+                for id in values {
+                    let reference = &refs[id.0 as usize];
+                    if matches!(reference.accessor, Accessor::Block { .. }) {
+                        self.dataset_error(
+                            "case data fields require a value; select a block field such as .input or .output".to_owned(),
+                            reference.range,
+                        );
+                    }
+                }
+            }
+        }
+        let mut data_refs = Vec::new();
+        for trace in &traces {
+            collect_trace_refs(trace, &mut data_refs);
+        }
+        for binding in &bindings {
+            collect_refs(&binding.value, &mut data_refs);
+        }
+        for id in data_refs {
+            let reference = &refs[id.0 as usize];
+            if matches!(reference.accessor, Accessor::Block { .. }) {
+                let Accessor::Block { kind, .. } = reference.accessor else {
+                    unreachable!()
+                };
+                self.errors.push(Error::new(
+                    ErrorKind::IncompleteBlockRef {
+                        rule: spec::ids::BLOCK_REFS,
+                        keyword: kind,
+                    },
+                    reference.range,
+                ));
+            }
+        }
 
         // per-iteration evaluation can repeat an identical diagnostic, keep the first
         let mut seen: Vec<Error> = Vec::new();
@@ -437,7 +527,7 @@ impl Modeler {
             }
         });
 
-        if traces.is_empty() && scorers.is_empty() && automations.is_empty() && self.errors.is_empty() {
+        if traces.is_empty() && scorers.is_empty() && automations.is_empty() && datasets.is_empty() && self.errors.is_empty() {
             self.errors.push(Error::new(
                 ErrorKind::EmptyShape {
                     rule: spec::ids::NONEMPTY_SHAPE,
@@ -453,6 +543,7 @@ impl Modeler {
                 refs,
                 scorers,
                 automations: automations.into_iter().map(|(automation, _)| automation).collect(),
+                datasets: datasets.into_iter().map(|(dataset, _)| dataset).collect(),
             })
         } else {
             Err(self.errors)
@@ -490,6 +581,153 @@ impl Modeler {
             },
             range,
         ));
+    }
+
+    fn dataset_error(&mut self, reason: String, range: SrcRange) {
+        self.errors.push(Error::new(
+            ErrorKind::InvalidDataset {
+                rule: spec::ids::DATASET_CASE,
+                reason,
+            },
+            range,
+        ));
+    }
+
+    fn model_dataset(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Dataset> {
+        let ast::Block { name, decls, range, .. } = block;
+        let name = self.model_name(name, range, desc)?;
+        let mut description = None;
+        let mut cases = Vec::new();
+        let mut names = HashSet::new();
+        for decl in decls {
+            match decl {
+                ast::Decl::Attr(attr) => {
+                    if attr.key != "description" {
+                        self.dataset_error(format!("unknown dataset field {:?}", attr.key), attr.range);
+                    } else if description.is_some() {
+                        self.dataset_error("duplicate description".to_owned(), attr.range);
+                    } else if let Some(folded) = self.fold_expr(attr.value) {
+                        match folded.into_value() {
+                            Value::Str(value) => description = Some(value),
+                            _ => self.dataset_error("description must be a constant string".to_owned(), attr.range),
+                        }
+                    }
+                }
+                ast::Decl::Block(inner) => {
+                    if inner.kind != "case" {
+                        self.dataset_error(format!("dataset contains unsupported block {:?}", inner.kind), inner.range);
+                    } else if let Some(case) = self.model_dataset_case(inner) {
+                        if !names.insert(case.name.clone()) {
+                            self.dataset_error(format!("duplicate case name {:?}", case.name), range);
+                        }
+                        cases.push(case);
+                    }
+                }
+            }
+        }
+        Some(Dataset {
+            name,
+            description,
+            cases,
+        })
+    }
+
+    fn model_dataset_case(&mut self, block: ast::Block) -> Option<DatasetCase> {
+        let desc = spec::SPEC.block_by_id(spec::ids::CASE).unwrap();
+        let ast::Block { name, decls, range, .. } = block;
+        let name = self.model_name(name, range, desc)?;
+        let mut seen = HashSet::new();
+        let mut input = None;
+        let mut trace = None;
+        let mut traces = None;
+        let mut span = None;
+        let mut expected = None;
+        let mut metadata = None;
+        let mut tags = None;
+        for decl in decls {
+            let ast::Decl::Attr(attr) = decl else {
+                self.dataset_error("case contains a nested block".to_owned(), range);
+                continue;
+            };
+            let Some(field) = desc.field(&attr.key) else {
+                self.dataset_error(format!("unknown case field {:?}", attr.key), attr.range);
+                continue;
+            };
+            if !seen.insert(field.id) {
+                self.dataset_error(format!("duplicate case field {:?}", attr.key), attr.range);
+                continue;
+            }
+            let Some(folded) = self.fold_expr(attr.value) else { continue };
+            if matches!(field.id, id if id == spec::ids::METADATA || id == spec::ids::TAGS)
+                && !self.defers_to_generation(&folded)
+                && !self.folded_reaches_block_ref(&folded)
+                && !self.validate_value(&folded, desc.id, field.id, field.value)
+            {
+                continue;
+            }
+            let value = folded.into_value();
+            match field.id {
+                id if id == spec::ids::INPUT => input = Some(value),
+                id if id == spec::ids::EXPECTED => expected = Some(value),
+                id if id == spec::ids::METADATA => metadata = Some(value),
+                id if id == spec::ids::TAGS => tags = Some(value),
+                id if id == spec::ids::TRACE_SOURCE || id == spec::ids::SPAN => {
+                    if let Value::BlockRef { ref_id, .. } = value {
+                        if id == spec::ids::SPAN {
+                            span = Some(ref_id);
+                        } else {
+                            trace = Some(ref_id);
+                        }
+                    } else {
+                        self.dataset_error(format!("{} must be a block reference", attr.key), attr.range);
+                    }
+                }
+                id if id == spec::ids::TRACES => {
+                    if let Value::Array(array) = value {
+                        let ids = array
+                            .elem
+                            .into_iter()
+                            .map(|item| match item {
+                                ArrayElem::Item(Value::BlockRef { ref_id, .. }) => Some(ref_id),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(ids) = ids.filter(|ids| ids.len() >= 2) {
+                            traces = Some(ids);
+                        } else {
+                            self.dataset_error("traces requires at least two trace block references".to_owned(), attr.range);
+                        }
+                    } else {
+                        self.dataset_error("traces must be an array of trace block references".to_owned(), attr.range);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        let source_count = [input.is_some(), trace.is_some(), traces.is_some(), span.is_some()]
+            .into_iter()
+            .filter(|v| *v)
+            .count();
+        if source_count != 1 {
+            self.dataset_error("case must set exactly one of input, trace, traces, or span".to_owned(), range);
+            return None;
+        }
+        let source = if let Some(input) = input {
+            DatasetSource::Inline(input)
+        } else if let Some(trace) = trace {
+            DatasetSource::Trace(trace)
+        } else if let Some(traces) = traces {
+            DatasetSource::Group(traces)
+        } else {
+            DatasetSource::Span(span.unwrap())
+        };
+        Some(DatasetCase {
+            name,
+            source,
+            expected,
+            metadata,
+            tags,
+        })
     }
 
     fn model_automation(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Automation> {
@@ -1498,21 +1736,19 @@ impl Modeler {
                         continue;
                     }
 
-                    // a root var evaluates before any trace exists, so block
-                    // references inside one have nothing to anchor to
-                    if owner.is_none()
-                        && let Some(def) = &def
-                        && self.folded_reaches_block_ref(&def.value)
-                    {
-                        self.errors.push(Error::new(
-                            ErrorKind::RootVarBlockRef {
-                                rule: spec::ids::STATIC_STRUCTURE,
-                                name: attr.key.clone(),
-                            },
-                            attr.range,
-                        ));
-                        continue;
-                    }
+                    // identity aliases substitute their opaque handle, preserving
+                    // the reference target through subsequent selections
+                    let def = def.map(|mut def| {
+                        if identity_value(&def.value.clone().into_value(), &self.pending) {
+                            let mut ids = Vec::new();
+                            collect_refs(&def.value.clone().into_value(), &mut ids);
+                            if !ids.is_empty() {
+                                def.constant = true;
+                                self.identity_aliases.extend(ids);
+                            }
+                        }
+                        def
+                    });
 
                     // dynamic defs lower once here; references share the binding
                     if let Some(def) = &def
@@ -1594,7 +1830,7 @@ impl Modeler {
             let def = self.lookup_var(name.clone(), range)?;
             // scorer expressions only substitute constants; a dynamic root
             // binding is a legal declaration but an illegal use here
-            if self.in_scorer && !def.constant {
+            if self.in_scorer && (!def.constant || self.folded_reaches_block_ref(&def.value)) {
                 self.errors.push(Error::new(
                     ErrorKind::ScorerDynamicVar {
                         rule: spec::ids::SCORER_EXPRS,
@@ -1771,6 +2007,9 @@ impl Modeler {
     // to the same pending reference
     fn extend_block_ref(&mut self, ref_id: RefId, segment: Segment, range: SrcRange) -> Folded {
         let mut pending = self.pending[ref_id.0 as usize].clone();
+        if matches!(pending.head, Head::Trace) && pending.segments.is_empty() && matches!(segment, Segment::Name { .. }) {
+            pending.head = Head::ModuleTrace;
+        }
         pending.segments.push(segment);
         pending.range = range;
         let extended = RefId(self.pending.len() as u32);
@@ -3646,6 +3885,7 @@ impl Modeler {
     #[allow(clippy::unnecessary_fold)]
     fn validate_value(&mut self, folded: &Folded, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) -> bool {
         let valid = match expected {
+            spec::ExprType::BlockRef { .. } => matches!(folded.kind, FoldedKind::Value(Value::BlockRef { .. })),
             spec::ExprType::Any => true,
             spec::ExprType::String => matches!(folded.kind, FoldedKind::Value(Value::Str(_) | Value::Template(_))),
             spec::ExprType::Number => matches!(folded.kind, FoldedKind::Value(Value::Num(_))),
@@ -4540,6 +4780,7 @@ impl Modeler {
                     self.resolve_ref(pending)
                 } else {
                     ResolvedRef {
+                        module: None,
                         up: 0,
                         steps: Vec::new(),
                         accessor: Accessor::Field(Field::Input),
@@ -4560,6 +4801,7 @@ impl Modeler {
             range,
         } = pending;
         let placeholder = || ResolvedRef {
+            module: None,
             up: 0,
             steps: Vec::new(),
             accessor: Accessor::Field(Field::Input),
@@ -4568,6 +4810,7 @@ impl Modeler {
         };
         let mut segments = segments.into_iter().peekable();
         let mut steps: Vec<Step> = Vec::new();
+        let mut module = None;
 
         // the anchor the up-walk lands on; kind heads anchor at the scope
         // whose children matched and descend from there
@@ -4579,12 +4822,44 @@ impl Modeler {
                     .expect("self anchors on its own origin chain");
                 (origin.len() - 1 - position, Some(node))
             }
-            Head::Trace => {
-                let Some(&trace) = origin.first() else {
-                    // a root var holding this ref was already rejected
-                    return placeholder();
-                };
-                (origin.len().saturating_sub(1), Some(trace))
+            Head::Trace | Head::ModuleTrace => {
+                let named = matches!(head, Head::ModuleTrace)
+                    || (segments.len() >= 2 || origin.is_empty())
+                        && matches!(segments.peek(), Some(Segment::Name { value, .. }) if field_by_name(value).is_none());
+                if named || origin.is_empty() {
+                    let name = if named {
+                        match segments.next().unwrap() {
+                            Segment::Name { value, .. } => Some(value),
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        None
+                    };
+                    let candidates: Vec<NodeId> = self
+                        .syms
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, sym)| {
+                            sym.kind == BlockKind::Trace && name.as_ref().is_none_or(|name| sym.name.as_ref() == Some(name))
+                        })
+                        .map(|(index, _)| NodeId(index as u32))
+                        .collect();
+                    if candidates.len() != 1 {
+                        self.errors.push(Error::new(
+                            ErrorKind::UnknownBlockRef {
+                                rule: spec::ids::BLOCK_REFS,
+                                keyword: "trace",
+                                name: name.unwrap_or_else(|| "<implicit module trace>".to_owned()),
+                            },
+                            range,
+                        ));
+                        return placeholder();
+                    }
+                    module = Some(candidates[0]);
+                    (0, Some(candidates[0]))
+                } else {
+                    (origin.len().saturating_sub(1), origin.first().copied())
+                }
             }
             Head::Kind(kind) => {
                 let name = match segments.next() {
@@ -4639,7 +4914,7 @@ impl Modeler {
         let mut kind = match head {
             Head::Kind(kind) => kind,
             Head::SelfBlock(node) => self.syms[node.0 as usize].kind,
-            Head::Trace => BlockKind::Trace,
+            Head::Trace | Head::ModuleTrace => BlockKind::Trace,
         };
         // a repeat cursor must select an iteration before descending
         let mut selected = false;
@@ -4799,17 +5074,13 @@ impl Modeler {
                     return placeholder();
                 }
                 None => {
-                    self.errors.push(Error::new(
-                        ErrorKind::IncompleteBlockRef {
-                            rule: spec::ids::BLOCK_REFS,
-                            keyword: match head {
-                                Head::Kind(kind) => kind.keyword(),
-                                Head::SelfBlock(_) => "self",
-                                Head::Trace => "trace",
-                            },
-                        },
-                        range,
-                    ));
+                    if let Some(node) = target {
+                        break Accessor::Block {
+                            node,
+                            kind: kind.keyword(),
+                        };
+                    }
+                    self.dataset_error("block identity requires a statically known target".to_owned(), range);
                     return placeholder();
                 }
             }
@@ -4844,6 +5115,7 @@ impl Modeler {
         }
 
         ResolvedRef {
+            module,
             up,
             steps,
             accessor,
@@ -5049,9 +5321,15 @@ impl Modeler {
 // marks the pending references the model actually stores: extension leaves
 // dead intermediates behind (llm.chat inside llm.chat[0].output), and only a
 // stored reference must resolve
-fn live_refs(pending: &[PendingRef], traces: &[Trace], bindings: &[Binding]) -> Vec<bool> {
+fn live_refs(
+    pending: &[PendingRef],
+    traces: &[Trace],
+    bindings: &[Binding],
+    datasets: &[(Dataset, SrcRange)],
+    aliases: &[RefId],
+) -> Vec<bool> {
     let mut live = vec![false; pending.len()];
-    let mut found = Vec::new();
+    let mut found = aliases.to_vec();
 
     for binding in bindings {
         collect_refs(&binding.value, &mut found);
@@ -5060,6 +5338,18 @@ fn live_refs(pending: &[PendingRef], traces: &[Trace], bindings: &[Binding]) -> 
         collect_trace_refs(trace, &mut found);
     }
 
+    for (dataset, _) in datasets {
+        for case in &dataset.cases {
+            match &case.source {
+                DatasetSource::Inline(value) => collect_refs(value, &mut found),
+                DatasetSource::Trace(id) | DatasetSource::Span(id) => found.push(*id),
+                DatasetSource::Group(ids) => found.extend(ids),
+            }
+            for value in [&case.expected, &case.metadata, &case.tags].into_iter().flatten() {
+                collect_refs(value, &mut found);
+            }
+        }
+    }
     // segment expressions can hold nested references of their own
     while let Some(RefId(id)) = found.pop() {
         let id = id as usize;
@@ -5439,6 +5729,40 @@ fn type_name(required: StaticType) -> &'static str {
     }
 }
 
+// identity handles and containers of handles substitute just like literals;
+// any field read still requires evaluation in its owning instance
+fn identity_value(value: &Value, pending: &[PendingRef]) -> bool {
+    match value {
+        Value::BlockRef { ref_id, .. } => {
+            let reference = &pending[ref_id.0 as usize];
+            let Some(names) = reference
+                .segments
+                .iter()
+                .map(|segment| match segment {
+                    Segment::Name { value, .. } => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+            let implicit = matches!(reference.head, Head::SelfBlock(_))
+                || matches!(reference.head, Head::Trace) && names.first().is_none_or(|name| field_by_name(name).is_some());
+            if implicit {
+                names.len() % 2 == 0 && names.iter().step_by(2).all(|name| child_kind_by_name(name).is_some())
+            } else {
+                names.len() % 2 == 1 && names.iter().skip(1).step_by(2).all(|name| child_kind_by_name(name).is_some())
+            }
+        }
+        Value::Array(array) => array.elem.iter().all(|elem| match elem {
+            ArrayElem::Item(value) => identity_value(value, pending),
+            _ => false,
+        }),
+        Value::Object(object) => object.elem.iter().all(|field| identity_value(&field.value, pending)),
+        value => value_is_constant(value),
+    }
+}
+
 // no funcs or per-instantiation refs anywhere beneath; all-literal templates
 // already folded to strings, so a surviving template is dynamic
 fn is_constant(folded: &Folded) -> bool {
@@ -5752,10 +6076,6 @@ pub(super) enum ErrorKind {
     SelfOutsideBlock {
         rule: spec::Id,
     },
-    RootVarBlockRef {
-        rule: spec::Id,
-        name: String,
-    },
     StructuralBlockRef {
         rule: spec::Id,
         field: &'static str,
@@ -5947,6 +6267,10 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
         reason: String,
     },
+    InvalidDataset {
+        rule: spec::Id,
+        reason: String,
+    },
 }
 
 impl fmt::Display for ErrorKind {
@@ -6122,10 +6446,6 @@ impl fmt::Display for ErrorKind {
             Self::SelfOutsideBlock { rule } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "`self` has no enclosing span or trace here; {}", rule.summary)
-            }
-            Self::RootVarBlockRef { rule, name } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "root var `{name}` cannot hold a block reference; {}", rule.summary)
             }
             Self::StructuralBlockRef { rule, field } => {
                 let rule = rule_desc(*rule);
@@ -6428,6 +6748,9 @@ impl fmt::Display for ErrorKind {
                 )
             }
             Self::InvalidAutomation { rule, reason } => {
+                write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
+            }
+            Self::InvalidDataset { rule, reason } => {
                 write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
             }
         }
@@ -9408,13 +9731,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_self_outside_a_block_and_refs_in_root_vars() {
+    fn rejects_self_outside_a_block_and_allows_module_field_aliases() {
         let errors = model(r#"vars { x = self.output } trace "t" { input = var.x }"#).unwrap_err();
         assert!(matches!(errors[0].kind(), ErrorKind::SelfOutsideBlock { .. }));
 
         let errors =
             model(r#"vars { x = llm.chat.output } trace "t" { input = var.x llm "chat" { output = 1 } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::RootVarBlockRef { .. }));
+        assert!(matches!(errors[0].kind(), ErrorKind::UnknownBlockRef { .. }));
     }
 
     #[test]

@@ -10,7 +10,7 @@ pub(crate) struct CommandDesc {
 }
 
 pub(crate) static SPEC: Spec = Spec {
-    summary: "Use the `bts` CLI to validate shapes, generate traces, build scorer functions, and sync scoring automations.",
+    summary: "Use the `bts` CLI to validate shapes, generate traces, build scorer functions, and sync Braintrust resources.",
     commands: &[
         CommandDesc {
             path: &["check", "syntax"],
@@ -44,6 +44,13 @@ pub(crate) static SPEC: Spec = Spec {
                 "Push scorer functions before syncing automations that reference them. Use `--dry-run` to review the proposed changes.",
             ],
             examples: &["bts sync automations --from shape.bt --dry-run"],
+        },
+        CommandDesc {
+            path: &["sync", "datasets"],
+            guidance: &[
+                "A dataset block may set `description` and contain named cases. Use typed module references such as `trace[\"name\"]` for sources. Sync reconciles all rows, including deleting cases absent locally, and writes changed source traces before their rows. Use `--dry-run` to review changes.",
+            ],
+            examples: &["bts sync datasets --from shape.bt --dry-run"],
         },
         CommandDesc {
             path: &["check", "perf"],

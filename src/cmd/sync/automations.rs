@@ -1,8 +1,8 @@
+use crate::cmd::client::Client;
 use crate::cmd::render_diags;
 use crate::conf::{Braintrust, Settings};
 use crate::dsl::{self, Automation};
 use crate::scg;
-use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use std::{collections::HashMap, fmt, fs, path::PathBuf};
 
@@ -39,10 +39,7 @@ impl Args {
 
         let config = Braintrust::load()?;
         let settings = Settings::load()?;
-        let client = Client::builder()
-            .timeout(settings.request_timeout)
-            .build()
-            .map_err(Error::Http)?;
+        let client = Client::configured(config.clone(), &settings).map_err(|error| Error::Http(error.into()))?;
         let base = config.api_url.trim_end_matches('/');
         let project_id = config.project_id.to_string();
 
@@ -149,8 +146,8 @@ impl Args {
                     } else {
                         let response = client
                             .put(format!("{base}/v1/project_score"))
-                            .bearer_auth(&config.api_key)
                             .json(&payload)
+                            .retryable()
                             .send()
                             .map_err(Error::Http)?;
                         check_response(response, &format!("sync automation {name:?}"))?;
@@ -202,13 +199,8 @@ fn online_matches(rule: &Value, desired: &Value) -> bool {
         && online["scope"].get("type").and_then(Value::as_str).unwrap_or("span") == "span"
 }
 
-fn get_objects(client: &Client, config: &Braintrust, url: &str, query: &[(&str, &str)]) -> Result<Vec<Value>, Error> {
-    let response = client
-        .get(url)
-        .bearer_auth(&config.api_key)
-        .query(query)
-        .send()
-        .map_err(Error::Http)?;
+fn get_objects(client: &Client, _config: &Braintrust, url: &str, query: &[(&str, &str)]) -> Result<Vec<Value>, Error> {
+    let response = client.get(url).query(query).send().map_err(Error::Http)?;
     let value = check_response(response, url)?;
     value["objects"]
         .as_array()
@@ -223,16 +215,16 @@ fn single(mut objects: Vec<Value>, kind: &str, name: &str) -> Result<Option<Valu
     Ok(objects.pop())
 }
 
-fn check_response(response: reqwest::blocking::Response, context: &str) -> Result<Value, Error> {
+fn check_response(response: crate::cmd::client::Response, context: &str) -> Result<Value, Error> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().map_err(Error::Http)?;
+        let body = response.text().map_err(|error| Error::Http(error.into()))?;
         return Err(Error::Api(format!(
             "{context}: HTTP {status}: {}",
             body.chars().take(500).collect::<String>()
         )));
     }
-    response.json().map_err(Error::Http)
+    response.json().map_err(|error| Error::Http(error.into()))
 }
 
 #[derive(Debug)]
@@ -242,7 +234,7 @@ pub enum Error {
     NoAutomations,
     ScorerPlan(scg::Error),
     Config(crate::conf::Error),
-    Http(reqwest::Error),
+    Http(crate::cmd::client::Error),
     MissingScorer(String),
     Api(String),
 }

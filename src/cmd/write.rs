@@ -186,14 +186,12 @@ impl Args {
             return Ok(());
         }
 
-        let mut config = Braintrust::load()?;
-        config.request_timeout = settings.request_timeout;
-        config.write_concurrency = settings.write_concurrency;
-        config.max_attachment_uploads = settings.max_attachment_uploads;
-        config.max_attachment_file_bytes = settings.max_attachment_file_bytes;
-        config.max_attachment_total_bytes = settings.max_attachment_total_bytes;
+        let client = crate::cmd::client::Client::configured(Braintrust::load()?, settings)
+            .map_err(|error| Error::Write(crate::cmd::client::writer::client_error(error)))?;
+        let config = &client.config;
         tracing::info!(project_id = %config.project_id, api_url = %config.api_url, "writing to braintrust");
-        let inserted = tracing::info_span!("write").in_scope(|| sdg::write(&config, &events))?;
+        let inserted =
+            tracing::info_span!("write").in_scope(|| crate::cmd::client::writer::write_with_client(&client, &events))?;
         tracing::info!(
             traces = events.trace_count(),
             events = events.event_count(),
@@ -281,7 +279,7 @@ pub enum Error {
     FailedGeneration { details: String },
     Generate(sdg::Error),
     Config(crate::conf::Error),
-    Write(sdg::writer::Error),
+    Write(crate::cmd::client::writer::Error),
     Encode(serde_json::Error),
 }
 
@@ -325,8 +323,8 @@ impl From<crate::conf::Error> for Error {
     }
 }
 
-impl From<sdg::writer::Error> for Error {
-    fn from(source: sdg::writer::Error) -> Self {
+impl From<crate::cmd::client::writer::Error> for Error {
+    fn from(source: crate::cmd::client::writer::Error) -> Self {
         Self::Write(source)
     }
 }

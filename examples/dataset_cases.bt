@@ -1,0 +1,51 @@
+# dataset cases can use inline input, field values, a whole trace, or a nested span
+vars { support = trace["support-lookup"] }
+trace "support-lookup" {
+    input = { question = "Where can I download my invoices?" }
+    output = task["answer-request"].output
+
+    task "answer-request" {
+        input = trace.input
+        output = llm["draft-answer"].output.content
+
+        tool "search-kb" {
+            input = { query = trace.input.question }
+            output = { article = "Billing > Invoices", url = "/billing/invoices" }
+        }
+
+        llm "draft-answer" {
+            input = { question = trace.input.question, article = tool["search-kb"].output.article }
+            output = { role = "assistant", content = "Download invoices from Billing > Invoices." }
+        }
+    }
+}
+
+dataset "support-regressions" {
+    description = "Billing support examples from authored inputs and trace spans"
+
+    case "inline" {
+        input = { question = "Can I export my invoices?" }
+        expected = "Export invoices from Billing > Invoices."
+        metadata = { topic = "invoices", source = "authored" }
+        tags = ["billing", "inline"]
+    }
+
+    case "whole-trace" {
+        trace = trace["support-lookup"]
+        tags = ["billing", "trace"]
+    }
+
+    case "field-values" {
+        input = var.support.input
+        expected = var.support.output
+        tags = ["billing", "fields"]
+    }
+
+    case "search" {
+        span = trace["support-lookup"].task["answer-request"].tool["search-kb"]
+    }
+
+    case "answer" {
+        span = trace["support-lookup"].task["answer-request"].llm["draft-answer"]
+    }
+}

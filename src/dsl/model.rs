@@ -11,6 +11,7 @@ pub(crate) struct Model {
     // root scorer blocks in declaration order, consumed by scg rather than sdg
     pub(crate) scorers: Vec<Scorer>,
     pub(crate) automations: Vec<Automation>,
+    pub(crate) datasets: Vec<Dataset>,
 }
 
 // a block's identity, assigned in walk order; stable across a compile so both
@@ -26,6 +27,8 @@ pub(crate) struct RefId(pub(crate) u32);
 // to the anchor, descend the steps, read the accessor, then drill into the json
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedRef {
+    // absolute module anchor, or None for a reference relative to its instance
+    pub(crate) module: Option<NodeId>,
     pub(crate) up: usize,
     pub(crate) steps: Vec<Step>,
     pub(crate) accessor: Accessor,
@@ -60,6 +63,7 @@ pub(crate) enum Step {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Accessor {
+    Block { node: NodeId, kind: &'static str },
     Field(Field),
     // the current iteration of an enclosing named repeat
     Index,
@@ -172,7 +176,7 @@ pub(crate) enum SpanKind {
     Function,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SpanFields {
     pub(crate) input: Option<Value>,
     pub(crate) output: Option<Value>,
@@ -207,6 +211,30 @@ pub(crate) struct Automation {
     pub(crate) span_names: Vec<String>,
     pub(crate) sampling_rate: f64,
     pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Dataset {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) cases: Vec<DatasetCase>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DatasetCase {
+    pub(crate) name: String,
+    pub(crate) source: DatasetSource,
+    pub(crate) expected: Option<Value>,
+    pub(crate) metadata: Option<Value>,
+    pub(crate) tags: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum DatasetSource {
+    Inline(Value),
+    Trace(RefId),
+    Span(RefId),
+    Group(Vec<RefId>),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

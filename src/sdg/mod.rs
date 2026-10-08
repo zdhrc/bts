@@ -1,16 +1,13 @@
-mod materializer;
-mod planner;
-pub(crate) mod writer;
+pub(crate) mod materializer;
+pub(crate) mod planner;
 
-use crate::{
-    conf::Braintrust,
-    dsl::{Model, WriteFilter},
-};
+use crate::dsl::{Model, WriteFilter};
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+pub(crate) use materializer::stable_uuid;
 pub(crate) use materializer::{Distribution, EventBatch};
-pub(crate) use writer::{InsertResponse, PackStats};
+pub(crate) use planner::Attachment;
 
 pub(crate) fn generate(
     model: Model,
@@ -24,7 +21,7 @@ pub(crate) fn generate(
 }
 
 pub(crate) fn generate_filtered(
-    mut model: Model,
+    model: Model,
     count: usize,
     over: Duration,
     distribution: Distribution,
@@ -35,8 +32,7 @@ pub(crate) fn generate_filtered(
     if model.traces.is_empty() {
         return Err(Error::EmptyShape);
     }
-    model.traces.retain(|trace| filter.matches("trace", Some(&trace.name)));
-    if model.traces.is_empty() {
+    if !model.traces.iter().any(|trace| filter.matches("trace", Some(&trace.name))) {
         return Err(Error::NoMatchingTraces);
     }
 
@@ -46,14 +42,6 @@ pub(crate) fn generate_filtered(
     tracing::info_span!("materialize")
         .in_scope(|| materializer::materialize(plan, over, distribution, now))
         .map_err(Error::Materialize)
-}
-
-pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, writer::Error> {
-    writer::write(config, events)
-}
-
-pub(crate) fn pack_stats(events: &EventBatch) -> Result<PackStats, writer::Error> {
-    writer::pack_stats(events)
 }
 
 #[derive(Debug)]
@@ -76,3 +64,29 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+pub(crate) fn case_data(model: &Model, case: &crate::dsl::DatasetCase, seed: u64) -> Result<EventBatch, Error> {
+    use crate::dsl::{DatasetSource, Object, ObjectField, Value};
+    let mut fields = Vec::new();
+    if let DatasetSource::Inline(input) = &case.source {
+        fields.push(ObjectField {
+            key: "input".to_owned(),
+            value: input.clone(),
+        });
+    }
+    for (key, value) in [
+        ("expected", &case.expected),
+        ("metadata", &case.metadata),
+        ("tags", &case.tags),
+    ] {
+        if let Some(value) = value {
+            fields.push(ObjectField {
+                key: key.to_owned(),
+                value: value.clone(),
+            });
+        }
+    }
+    let plan = planner::plan_case_data(model, Value::Object(Object { elem: fields }), seed).map_err(Error::Plan)?;
+    materializer::materialize(plan, Duration::from_secs(3600), Distribution::Linear, SystemTime::now())
+        .map_err(Error::Materialize)
+}
