@@ -94,6 +94,7 @@ pub(crate) struct FuncDesc {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ExprType {
+    BlockRef { kinds: &'static [&'static str] },
     Any,
     String,
     Number,
@@ -105,6 +106,7 @@ pub(crate) enum ExprType {
 impl fmt::Display for ExprType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BlockRef { kinds } => write!(formatter, "reference to {} block", kinds.join(" or ")),
             Self::Any => formatter.write_str("any value"),
             Self::String => formatter.write_str("string"),
             Self::Number => formatter.write_str("number"),
@@ -211,6 +213,8 @@ pub(crate) mod ids {
     pub(crate) const SCORER: Id = Id::new("block.scorer");
     pub(crate) const SCORER_SPAN: Id = Id::new("block.scorer-span");
     pub(crate) const AUTOMATION: Id = Id::new("block.automation");
+    pub(crate) const DATASET: Id = Id::new("block.dataset");
+    pub(crate) const CASE: Id = Id::new("block.case");
     pub(crate) const CODE: Id = Id::new("block.code");
     pub(crate) const JUDGE: Id = Id::new("block.judge");
     pub(crate) const WHEN: Id = Id::new("block.when");
@@ -240,6 +244,10 @@ pub(crate) mod ids {
     pub(crate) const ROOT: Id = Id::new("field.root");
     pub(crate) const SAMPLING_RATE: Id = Id::new("field.sampling-rate");
     pub(crate) const ENABLED: Id = Id::new("field.enabled");
+    pub(crate) const DESCRIPTION: Id = Id::new("field.description");
+    pub(crate) const TRACE_SOURCE: Id = Id::new("field.trace-source");
+    pub(crate) const TRACES: Id = Id::new("field.traces");
+    pub(crate) const SPAN: Id = Id::new("field.span");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
@@ -364,6 +372,7 @@ pub(crate) mod ids {
     pub(crate) const JUDGE_PROMPT: Id = Id::new("rule.judge-prompt");
     pub(crate) const JUDGE_OPTIONS: Id = Id::new("rule.judge-options");
     pub(crate) const AUTOMATION_BINDING: Id = Id::new("rule.automation-binding");
+    pub(crate) const DATASET_CASE: Id = Id::new("rule.dataset-case");
 
     pub(crate) const MULTI_TURN_CONVERSATION: Id = Id::new("example.multi-turn-conversation");
     pub(crate) const AGENT_TOOL_LOOP: Id = Id::new("example.agent-tool-loop");
@@ -468,6 +477,7 @@ const IN_TRACE_SPAN_OR_DYNAMIC: &[Place] = &[
     Place::Block { id: ids::MAYBE },
 ];
 const IN_SCORER: &[Place] = &[Place::Block { id: ids::SCORER }];
+const IN_DATASET: &[Place] = &[Place::Block { id: ids::DATASET }];
 const IN_SCORER_CONTROL: &[Place] = &[
     Place::Block { id: ids::CODE },
     Place::Block { id: ids::SCORER_REPEAT },
@@ -587,6 +597,75 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
 const AUTOMATION_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::AUTOMATION_BINDING,
     summary: "A scorer automation names local scorer blocks and targets either root spans or named spans.",
+}];
+
+const DATASET_FIELDS: &[FieldDesc] = &[FieldDesc {
+    id: ids::DESCRIPTION,
+    keyword: "description",
+    summary: "Description of the Braintrust dataset.",
+    value: &STRING,
+    cardinality: Cardinality::Optional,
+}];
+
+const CASE_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::INPUT,
+        keyword: "input",
+        summary: "Inline case input.",
+        value: &ANY,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::TRACE_SOURCE,
+        keyword: "trace",
+        summary: "A module trace block reference, for example trace[\"support-lookup\"].",
+        value: &ExprType::BlockRef { kinds: &["trace"] },
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::TRACES,
+        keyword: "traces",
+        summary: "Module trace block references grouped into one case.",
+        value: &ExprType::Array {
+            items: &ExprType::BlockRef { kinds: &["trace"] },
+        },
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::SPAN,
+        keyword: "span",
+        summary: "A module reference to a task, llm, tool, or function block.",
+        value: &ExprType::BlockRef {
+            kinds: &["task", "llm", "tool", "function"],
+        },
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::EXPECTED,
+        keyword: "expected",
+        summary: "Expected output for this case.",
+        value: &ANY,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::METADATA,
+        keyword: "metadata",
+        summary: "Case metadata.",
+        value: &OBJECT,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::TAGS,
+        keyword: "tags",
+        summary: "Case tags.",
+        value: &STRING_ARRAY,
+        cardinality: Cardinality::Optional,
+    },
+];
+
+const DATASET_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::DATASET_CASE,
+    summary: "Each case has exactly one source: input, trace, traces, or span; named trace sources and span paths must exist in this module.",
 }];
 
 const CODE_FIELDS: &[FieldDesc] = &[FieldDesc {
@@ -767,7 +846,7 @@ const KNOWN_REFERENCES_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE];
 const BLOCK_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::BLOCK_REFS,
-        summary: "A block reference resolves lexically: walking up the enclosing blocks, the nearest scope whose children include a matching kind and name wins. `self` addresses the innermost enclosing span or trace; `trace` addresses the enclosing trace's own fields. A reference must end in a field and never crosses trace boundaries.",
+        summary: "A block reference resolves lexically: walking up the enclosing blocks, the nearest scope whose children include a matching kind and name wins. `self` addresses the innermost enclosing span or trace; `trace` addresses the enclosing trace's fields, while `trace[\"name\"]` selects a module trace. A reference may retain a block identity for a compatible source field, or select a field to read data. Variables preserve reference targets.",
     },
     RuleDesc {
         id: ids::REF_COLLECTIONS,
@@ -783,7 +862,7 @@ const BLOCK_REF_RULES: &[RuleDesc] = &[
     },
     RuleDesc {
         id: ids::STATIC_STRUCTURE,
-        summary: "Structure stays independent of generated data: `count`, `chance`, and `for` collections cannot reach a block reference, directly or through variables, and root-scope vars cannot hold block references at all.",
+        summary: "Structure stays independent of generated data: `count`, `chance`, and `for` collections cannot reach a block reference, directly or through variables, while variables may retain block identities or read fields in their evaluation context.",
     },
     RuleDesc {
         id: ids::RESERVED_REPEAT_NAMES,
@@ -1652,6 +1731,34 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        id: ids::DATASET,
+        keyword: "dataset",
+        summary: "A named Braintrust dataset with an optional description and named cases.",
+        syntax: "dataset \"<name>\" { [description = <string>] case \"<name>\" { ... } ... }",
+        name: NamePolicy::Required,
+        allowed_in: ROOT_ONLY,
+        body: BodyDesc {
+            fields: DATASET_FIELDS,
+            open: false,
+        },
+        rules: DATASET_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
+        id: ids::CASE,
+        keyword: "case",
+        summary: "A dataset record, sourced from inline input, a trace, a span, or a trace group.",
+        syntax: "case \"<name>\" { (input = <value> | trace = trace[\"<name>\"] | traces = [trace[\"<name>\"], ...] | span = trace.<trace-name>.<kind>.<span-name>[.<kind>.<span-name>...]) [expected = <value>] [metadata = <object>] [tags = <strings>] }",
+        name: NamePolicy::Required,
+        allowed_in: IN_DATASET,
+        body: BodyDesc {
+            fields: CASE_FIELDS,
+            open: false,
+        },
+        rules: DATASET_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
         id: ids::CODE,
         keyword: "code",
         summary: "A code scorer body; `when` and `repeat` blocks run in order and return on the first matching score, with `score` as the fallback.",
@@ -1714,7 +1821,7 @@ pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
 const RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::NONEMPTY_SHAPE,
-        summary: "A shape must declare at least one trace, scorer, or automation block.",
+        summary: "A shape must declare at least one trace, scorer, automation, or dataset block.",
     },
     RuleDesc {
         id: ids::RESERVED_METRICS,

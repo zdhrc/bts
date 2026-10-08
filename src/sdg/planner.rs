@@ -530,7 +530,14 @@ impl<'m> Ctx<'m> {
         let reference = self.refs[ref_id.0 as usize].clone();
         self.last_ref = Some(reference.range);
 
-        let mut at = self.site;
+        let mut at = if let Some(node) = reference.module {
+            self.instances
+                .iter()
+                .position(|instance| instance.node == node && instance.parent.is_none())
+                .ok_or(Error::new(ErrorKind::RefShapeMismatch, reference.range))?
+        } else {
+            self.site
+        };
         for _ in 0..reference.up {
             at = self
                 .scope_parent(at)
@@ -630,6 +637,7 @@ impl<'m> Ctx<'m> {
         range: SrcRange,
     ) -> Result<JsonValue, Error> {
         match accessor {
+            Accessor::Block { .. } => Err(Error::new(ErrorKind::RefShapeMismatch, range)),
             Accessor::Field(field) => self.read_field(at, *field, path.to_vec(), range),
             // the current iteration of the repeat collection `at`, found on
             // the referencing site's own chain
@@ -1993,13 +2001,16 @@ pub(crate) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
 }
 
 pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &WriteFilter) -> Result<Plan, Error> {
-    debug_assert!(!model.traces.is_empty());
+    let selected: Vec<&ModelTrace> = model
+        .traces
+        .iter()
+        .filter(|trace| filter.matches("trace", Some(&trace.name)))
+        .collect();
+    debug_assert!(!selected.is_empty());
 
     let scorer_postlude = model.traces.iter().any(|trace| trace.children.iter().any(has_scorer));
 
-    let capacity = (0..count)
-        .map(|index| trace_len(&model.traces[index % model.traces.len()]))
-        .sum();
+    let capacity = (0..count).map(|index| trace_len(selected[index % selected.len()])).sum();
 
     let mut planner = Planner {
         events: Vec::with_capacity(capacity),
@@ -2011,7 +2022,19 @@ pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &W
         // every draw is addressed by seed, trace index, and instance path, so
         // a trace's values depend on nothing planned before it
         let mut ctx = Ctx::new(&model.refs, seed, index);
-        ctx.instantiate_trace(&model.traces[index % model.traces.len()], &model.bindings)?;
+        let chosen = selected[index % selected.len()];
+        ctx.instantiate_trace(chosen, &model.bindings)?;
+        if model
+            .refs
+            .iter()
+            .any(|reference| reference.module.is_some() && !matches!(reference.accessor, Accessor::Block { .. }))
+        {
+            for trace in &model.traces {
+                if trace.node != chosen.node {
+                    ctx.instantiate_trace(trace, &model.bindings)?;
+                }
+            }
+        }
         planner.emit_trace(&mut ctx, filter)?;
         planner.attachments.extend(ctx.attachments);
     }
@@ -2021,6 +2044,44 @@ pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &W
         traces: planner.traces.into_boxed_slice(),
         attachments: planner.attachments.into_boxed_slice(),
         scorer_postlude,
+    })
+}
+
+// case values share the trace evaluator and its attachment collection, with
+// a private evaluation instance that never becomes a module declaration
+pub(crate) fn plan_case_data(model: &Model, input: ModelValue, seed: u64) -> Result<Plan, Error> {
+    let mut ctx = Ctx::new(&model.refs, seed, 0);
+    let case = ModelTrace {
+        node: NodeId(u32::MAX),
+        name: "dataset case".to_owned(),
+        fields: ModelSpanFields {
+            input: Some(input),
+            ..Default::default()
+        },
+        bindings: Vec::new(),
+        children: Vec::new(),
+    };
+    ctx.instantiate_trace(&case, &model.bindings)?;
+    if model
+        .refs
+        .iter()
+        .any(|reference| reference.module.is_some() && !matches!(reference.accessor, Accessor::Block { .. }))
+    {
+        for trace in &model.traces {
+            ctx.instantiate_trace(trace, &model.bindings)?;
+        }
+    }
+    let mut planner = Planner {
+        events: Vec::new(),
+        traces: Vec::new(),
+        attachments: Vec::new(),
+    };
+    planner.emit_trace(&mut ctx, &WriteFilter::default())?;
+    Ok(Plan {
+        events: planner.events.into_boxed_slice(),
+        traces: planner.traces.into_boxed_slice(),
+        attachments: ctx.attachments.into_boxed_slice(),
+        scorer_postlude: false,
     })
 }
 
