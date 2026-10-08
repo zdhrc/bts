@@ -1,7 +1,7 @@
 [package]
 name = "bts"
 repository = "https://github.com/zdhrc/bts"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "another synthetics generator"
 license = "AGPL-3.0-only"
