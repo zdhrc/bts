@@ -8,6 +8,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+pub(crate) fn stable_uuid(key: &str) -> Uuid {
+    fn hash(bytes: &[u8], seed: u64) -> u64 {
+        bytes
+            .iter()
+            .fold(seed, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+    }
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hash(key.as_bytes(), 0xcbf29ce484222325).to_be_bytes());
+    bytes[8..].copy_from_slice(&hash(key.as_bytes(), 0x84222325cbf29ce4).to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x80; // UUID version 8: custom deterministic payload
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 const EVENT_SLOT: Duration = Duration::from_millis(100);
 
 // how trace volume spreads across the window; each variant maps an even 0..=1
@@ -42,6 +56,23 @@ pub(crate) struct EventBatch {
 }
 
 impl EventBatch {
+    pub(crate) fn assign_stable_ids(&mut self, key: &str) {
+        let old_to_new: HashMap<String, String> = self
+            .events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (event.span_id.clone(), stable_uuid(&format!("{key}/span/{index}")).to_string()))
+            .collect();
+        for (index, event) in self.events.iter_mut().enumerate() {
+            event.id = stable_uuid(&format!("{key}/row/{index}")).to_string();
+            event.span_id = old_to_new[&event.span_id].clone();
+            event.root_span_id = old_to_new[&event.root_span_id].clone();
+            for parent in event.span_parents.iter_mut() {
+                *parent = old_to_new[parent].clone();
+            }
+        }
+    }
+
     pub(crate) fn resolve_attachment_paths(&mut self, shape_file: &Path) -> std::io::Result<()> {
         if self.attachments.is_empty() {
             return Ok(());

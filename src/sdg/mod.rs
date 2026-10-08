@@ -5,6 +5,7 @@ use crate::dsl::{Model, WriteFilter};
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+pub(crate) use materializer::stable_uuid;
 pub(crate) use materializer::{Distribution, EventBatch};
 pub(crate) use planner::Attachment;
 

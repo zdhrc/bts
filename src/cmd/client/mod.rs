@@ -81,6 +81,9 @@ impl Client {
     pub(crate) fn put(&self, url: impl AsRef<str>) -> Request {
         self.request(Method::PUT, url)
     }
+    pub(crate) fn patch(&self, url: impl AsRef<str>) -> Request {
+        self.request(Method::PATCH, url)
+    }
     pub(crate) fn signed_get(&self, url: &str) -> Request {
         Request {
             client: self.clone(),
@@ -275,6 +278,9 @@ pub(crate) struct Response {
 impl Response {
     pub(crate) fn status(&self) -> StatusCode {
         self.inner.status()
+    }
+    pub(crate) fn headers(&self) -> &reqwest::header::HeaderMap {
+        self.inner.headers()
     }
     pub(crate) fn text(self) -> Result<String, reqwest::Error> {
         self.inner.text()

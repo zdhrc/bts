@@ -642,6 +642,71 @@ pub(crate) fn write_with_client(client: &Client, events: &EventBatch) -> Result<
     }
     .write(events)
 }
+pub(crate) fn validate_attachments(client: &Client, attachments: &[Attachment]) -> Result<(), Error> {
+    let writer = Writer {
+        client: client.clone(),
+        config: &client.config,
+        backoff_base: BACKOFF_BASE,
+    };
+    if attachments.len() > client.config.max_attachment_uploads {
+        return Err(Error::new(ErrorKind::Attachment(format!(
+            "{} attachments exceed attachments.max_uploads ({})",
+            attachments.len(),
+            client.config.max_attachment_uploads
+        ))));
+    }
+    let mut total = 0;
+    for attachment in attachments {
+        let size = fs::metadata(&attachment.path)
+            .map_err(|error| Error::new(ErrorKind::Attachment(format!("{}: {error}", attachment.path))))?
+            .len();
+        writer.check_attachment_size(attachment, size, total)?;
+        total += size;
+    }
+    Ok(())
+}
+
+pub(crate) fn upload(client: &Client, attachments: &[Attachment]) -> Result<(), Error> {
+    let writer = Writer {
+        client: client.clone(),
+        config: &client.config,
+        backoff_base: BACKOFF_BASE,
+    };
+    let contents = writer.preflight_attachments(attachments)?;
+    if !attachments.is_empty() {
+        writer.upload_attachments(attachments, &contents)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn insert_events(client: &Client, url: &str, events: &[serde_json::Value]) -> Result<InsertResponse, Error> {
+    let writer = Writer {
+        client: client.clone(),
+        config: &client.config,
+        backoff_base: BACKOFF_BASE,
+    };
+    let mut payloads = Vec::new();
+    let mut payload = Payload::new(Vec::new());
+    for event in events {
+        let encoded = serde_json::to_vec(event).map_err(|error| Error::new(ErrorKind::EncodeEvent(error)))?;
+        if PAYLOAD_OPEN.len() + encoded.len() + PAYLOAD_CLOSE.len() > MAX_PAYLOAD_BYTES {
+            return Err(Error::new(ErrorKind::EventTooLarge {
+                size: encoded.len(),
+                limit: MAX_PAYLOAD_BYTES,
+            }));
+        }
+        if !payload.fits(encoded.len(), MAX_PAYLOAD_BYTES) {
+            payloads.push(payload);
+            payload = Payload::new(Vec::new());
+        }
+        payload.push(encoded);
+    }
+    if payload.event_count() > 0 {
+        payloads.push(payload);
+    }
+    writer.insert_payloads(url, payloads)
+}
+
 // what a write would send, without sending it
 pub(crate) struct PackStats {
     pub(crate) payload_count: usize,

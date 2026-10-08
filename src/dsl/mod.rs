@@ -10,7 +10,7 @@ pub(crate) mod spec;
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use filter::WriteFilter;
 pub(crate) use model::{
-    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, DatasetCase, DatasetSource, Field,
+    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase, DatasetSource, Field,
     Func, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer,
     ScorerArg, ScorerKind, ScorerLang, ScorerStep, Selection, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value,
 };
