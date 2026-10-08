@@ -384,6 +384,7 @@ pub(crate) mod ids {
     pub(crate) const CODE_SCORER: Id = Id::new("example.code-scorer");
     pub(crate) const JUDGE_SCORER: Id = Id::new("example.judge-scorer");
     pub(crate) const SCORING_AUTOMATIONS: Id = Id::new("example.scoring-automations");
+    pub(crate) const DATASET_CASES: Id = Id::new("example.dataset-cases");
 }
 
 const ANY: ExprType = ExprType::Any;
@@ -1902,6 +1903,13 @@ const EXAMPLES: &[Example] = &[
         summary: "Synthetic support responses with code and judge scorers bound to their spans.",
         note: "Build and push the scorers, then sync the automations before writing traces.",
         source: include_str!("../../examples/scoring_automations.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::DATASET_CASES,
+        summary: "A dataset with inline, whole-trace, and nested-span cases.",
+        note: "Sync writes referenced traces and reconciles every case in the dataset.",
+        source: include_str!("../../examples/dataset_cases.bt"),
         valid: true,
     },
 ];

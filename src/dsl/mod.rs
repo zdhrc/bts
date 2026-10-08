@@ -85,6 +85,29 @@ mod tests {
     }
 
     #[test]
+    fn dataset_example_covers_inline_trace_and_span_cases() {
+        let model = compile(include_str!("../../examples/dataset_cases.bt")).unwrap();
+        let dataset = &model.datasets[0];
+        assert_eq!(
+            dataset.description.as_deref(),
+            Some("Billing support examples from authored inputs and trace spans")
+        );
+        assert!(
+            dataset
+                .cases
+                .iter()
+                .any(|case| matches!(case.source, DatasetSource::Inline(_)))
+        );
+        assert!(
+            dataset
+                .cases
+                .iter()
+                .any(|case| matches!(case.source, DatasetSource::Trace(_)))
+        );
+        assert!(dataset.cases.iter().any(|case| matches!(case.source, DatasetSource::Span(_))));
+    }
+
+    #[test]
     fn rejects_dataset_span_paths_missing_from_the_module() {
         let source = r#"
             trace "run" { task "step" { tool "lookup" { output = "found" } } }
