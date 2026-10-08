@@ -1,3 +1,4 @@
+pub(crate) mod attachments;
 pub(crate) mod writer;
 
 use crate::conf::{Braintrust, Settings};
@@ -79,6 +80,14 @@ impl Client {
     }
     pub(crate) fn put(&self, url: impl AsRef<str>) -> Request {
         self.request(Method::PUT, url)
+    }
+    pub(crate) fn signed_get(&self, url: &str) -> Request {
+        Request {
+            client: self.clone(),
+            inner: self.http.get(url),
+            safe: true,
+            backoff: Duration::from_millis(500),
+        }
     }
     pub(crate) fn signed_put(&self, url: &str) -> Request {
         Request {
@@ -212,6 +221,17 @@ fn retry_after(response: &HttpResponse) -> Option<Duration> {
         .map(|date| SystemTime::from(date).duration_since(SystemTime::now()).unwrap_or_default())
 }
 
+pub(crate) fn checked(response: Response, context: &str) -> Result<serde_json::Value, String> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "{context}: HTTP {status}: {}",
+            response.text().unwrap_or_default().chars().take(500).collect::<String>()
+        ));
+    }
+    response.json().map_err(|error| format!("{context}: {}", error.without_url()))
+}
+
 #[derive(Debug)]
 pub(crate) enum Error {
     Http(reqwest::Error),
@@ -263,6 +283,12 @@ impl Response {
         self.inner.json()
     }
 }
+impl std::io::Read for Response {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.inner, buffer)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -393,5 +419,10 @@ pub(crate) mod tests {
         assert!(matches!(client.get("/second").send(), Err(Error::Deadline)));
         assert!(start.elapsed() < Duration::from_secs(1));
     }
-
+    #[test]
+    fn signed_requests_omit_api_auth_even_on_the_api_origin() {
+        let (client, requests) = serve(vec![Reply::json(serde_json::json!({}))]);
+        client.signed_get(&format!("{}/blob", client.config.api_url)).send().unwrap();
+        assert!(!requests.recv().unwrap().to_ascii_lowercase().contains("authorization:"));
+    }
 }

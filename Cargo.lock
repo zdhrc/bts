@@ -211,6 +211,7 @@ dependencies = [
  "rand 0.9.5",
  "rand_distr",
  "reqwest 0.12.28",
+ "ring",
  "serde",
  "serde_json",
  "tiktoken-rs",

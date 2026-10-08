@@ -91,6 +91,28 @@ impl EventBatch {
         Ok(())
     }
 
+    pub(crate) fn reuse_attachments(&mut self, keys: &HashMap<String, String>) {
+        self.attachments = std::mem::take(&mut self.attachments)
+            .into_vec()
+            .into_iter()
+            .filter(|attachment| !keys.contains_key(&attachment.key))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        for event in &mut self.events {
+            for value in [&mut event.input, &mut event.output, &mut event.expected, &mut event.error]
+                .into_iter()
+                .flatten()
+            {
+                replace_attachment_keys(value, keys);
+            }
+            if let Some(metadata) = &mut event.metadata {
+                for value in metadata.values_mut() {
+                    replace_attachment_keys(value, keys);
+                }
+            }
+        }
+    }
+
     pub(crate) fn event_count(&self) -> usize {
         self.events.len()
     }
