@@ -847,7 +847,7 @@ const KNOWN_REFERENCES_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE];
 const BLOCK_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::BLOCK_REFS,
-        summary: "A block reference resolves lexically: walking up the enclosing blocks, the nearest scope whose children include a matching kind and name wins. `self` addresses the innermost enclosing span or trace; `trace` addresses the enclosing trace's fields, while `trace[\"name\"]` selects a module trace. A reference may retain a block identity for a compatible source field, or select a field to read data. Variables preserve reference targets.",
+        summary: "A block reference resolves lexically: walking up the enclosing blocks, the nearest scope whose children include a matching kind and name wins. `self` addresses the innermost enclosing span or trace; `trace` addresses the enclosing trace's fields, while `trace[\"name\"]` selects a module trace. At each block selection, `<kind>.<name>` and `<kind>[\"name\"]` are interchangeable when the label can be written as an identifier. Use a quoted bracket selector for labels containing spaces, hyphens, or other characters invalid in a dot segment. Both forms may be mixed in one traversal, such as `trace.support.task[\"answer-request\"].tool.lookup.output`. A reference may retain a block identity for a compatible source field, or select a field to read data. Variables preserve reference targets.",
     },
     RuleDesc {
         id: ids::REF_COLLECTIONS,
@@ -1144,6 +1144,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         examples: &[
             "llm.chat.output.content",
             "llm[\"Chat Completion\"].metrics.tokens",
+            "trace.support.task[\"answer-request\"].tool.lookup.output",
             "trace.input",
             "repeat.rounds[repeat.index - 1].llm.chat.output",
             "[...repeat.rounds[:repeat.index].llm.chat.output]",
