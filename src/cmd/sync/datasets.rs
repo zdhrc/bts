@@ -5,9 +5,10 @@ use crate::cmd::{
 use crate::conf::{Braintrust, Settings};
 use crate::dsl::{self, Accessor, Child, Dataset, DatasetSource, Model, NodeId, RefId, WriteFilter};
 use crate::sdg::{self, EventBatch};
-use serde_json::{Map, Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
@@ -50,6 +51,7 @@ struct Source {
     events: Vec<Value>,
     changed: bool,
     stale: Vec<Value>,
+    repairs: Vec<Value>,
 }
 struct Case {
     name: String,
@@ -138,6 +140,7 @@ fn prepare(dataset: &Dataset, model: &Model, config: &Braintrust, path: &Path) -
                     events,
                     changed: false,
                     stale: Vec::new(),
+                    repairs: Vec::new(),
                 });
             }
             let span_path = if let DatasetSource::Span(id) = case.source {
@@ -263,22 +266,14 @@ fn reconcile(
                 );
             }
             source.batch.reuse_attachments(&replacements);
-            source.stale = stale_source_rows(&source.events, remote);
-            source.changed = !source.stale.is_empty() || !trace_equal(&source.events, remote);
-            if source.changed {
-                for event in &mut source.events {
-                    // replacement writes clear fields removed locally; keep
-                    // asynchronous score keys not authored by this module
-                    let current = by_id.get(event["id"].as_str().unwrap()).copied();
-                    if let Some(scores) = current.and_then(|event| event["scores"].as_object()) {
-                        let mut merged = scores.clone();
-                        if let Some(local) = event["scores"].as_object() {
-                            merged.extend(local.clone());
-                        }
-                        event["scores"] = Value::Object(merged);
-                    }
-                    event["_is_merge"] = json!(false);
-                }
+            source.stale = stale(&source.events, remote).map_err(other)?;
+            source.repairs = reparent(&source.events, remote, &source.stale).map_err(other)?;
+            source.changed = !source.stale.is_empty() || !source.repairs.is_empty();
+            for event in &mut source.events {
+                let current = by_id.get(event["id"].as_str().unwrap()).copied().unwrap_or(&Value::Null);
+                let (changed, patch) = update(event, current).map_err(other)?;
+                source.changed |= changed;
+                *event = patch;
             }
         }
         finish_row(case, &client.config)?;
@@ -366,6 +361,9 @@ fn reconcile(
             if source.changed {
                 writer::upload(client, &source.batch.attachments).map_err(other)?;
                 writer::insert_events(client, &logs_url, &source.events).map_err(other)?;
+                if !source.repairs.is_empty() {
+                    writer::insert_events(client, &logs_url, &source.repairs).map_err(other)?;
+                }
                 if !source.stale.is_empty() {
                     writer::insert_events(client, &logs_url, &source.stale).map_err(other)?;
                 }
@@ -498,69 +496,6 @@ fn fetch_traces(client: &Client, roots: &[String]) -> Result<HashMap<String, Vec
     }
     Ok(traces)
 }
-fn stale_source_rows(local: &[Value], remote: &[Value]) -> Vec<Value> {
-    let desired_ids: HashSet<&str> = local.iter().filter_map(|event| event["id"].as_str()).collect();
-    // dataset sources use our deterministic UUID v8 rows within their owned
-    // root. online spans have separate ids and stay outside reconciliation.
-    remote
-        .iter()
-        .filter_map(|event| event["id"].as_str())
-        .filter(|id| !desired_ids.contains(id) && uuid::Uuid::parse_str(id).is_ok_and(|id| id.get_version_num() == 8))
-        .map(|id| json!({"id":id,"_object_delete":true}))
-        .collect()
-}
-
-fn trace_equal(local: &[Value], remote: &[Value]) -> bool {
-    let by_id: HashMap<&str, &Value> = remote
-        .iter()
-        .filter_map(|event| event["id"].as_str().map(|id| (id, event)))
-        .collect();
-    local.iter().all(|event| {
-        event["id"].as_str().and_then(|id| by_id.get(id)).is_some_and(|found| {
-            canonical(event) == canonical(found)
-                && event["scores"]
-                    .as_object()
-                    .is_none_or(|scores| scores.iter().all(|(key, value)| found["scores"][key] == *value))
-        })
-    })
-}
-fn canonical(event: &Value) -> Value {
-    let mut fields = Map::new();
-    for key in [
-        "span_id",
-        "root_span_id",
-        "span_parents",
-        "input",
-        "output",
-        "expected",
-        "error",
-        "metadata",
-        "tags",
-    ] {
-        if let Some(value) = event.get(key).filter(|value| !value.is_null()) {
-            fields.insert(key.to_owned(), value.clone());
-        }
-    }
-    if !fields.contains_key("span_parents") {
-        fields.insert("span_parents".to_owned(), json!([]));
-    }
-    if let Some(attrs) = event.get("span_attributes") {
-        fields.insert(
-            "span_attributes".to_owned(),
-            json!({"name":attrs["name"],"type":attrs["type"]}),
-        );
-    }
-    if let Some(metrics) = event["metrics"].as_object() {
-        let mut metrics = metrics.clone();
-        for key in ["start", "end", "duration"] {
-            metrics.remove(key);
-        }
-        if !metrics.is_empty() {
-            fields.insert("metrics".to_owned(), Value::Object(metrics));
-        }
-    }
-    Value::Object(fields)
-}
 fn row_equal(current: &Value, desired: &Value) -> bool {
     ["input", "expected", "metadata", "tags", "origin"]
         .iter()
@@ -569,23 +504,35 @@ fn row_equal(current: &Value, desired: &Value) -> bool {
 fn fetch_rows(client: &Client, id: &str) -> Result<HashMap<String, Value>, Error> {
     let mut rows = HashMap::new();
     let mut cursor: Option<String> = None;
+    let mut version: Option<String> = None;
     let mut seen = HashSet::new();
     loop {
         let mut query = vec![("limit", "1000")];
         if let Some(cursor) = &cursor {
             query.push(("cursor", cursor));
         }
+        if let Some(version) = &version {
+            query.push(("version", version));
+        }
         let page = client::checked(
             client.get(format!("/v1/dataset/{id}/fetch")).query(&query).send()?,
             "fetch dataset rows",
         )
         .map_err(other)?;
-        for row in page["events"]
+        let events = page["events"]
             .as_array()
-            .ok_or_else(|| other("dataset fetch returned no events"))?
-        {
+            .ok_or_else(|| other("dataset fetch returned no events"))?;
+        if version.is_none() {
+            version = events
+                .iter()
+                .filter_map(|event| event["_xact_id"].as_str())
+                .max_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)))
+                .map(str::to_owned);
+        }
+        for row in events {
             let id = row["id"].as_str().ok_or_else(|| other("dataset row has no id"))?;
-            rows.insert(id.to_owned(), row.clone());
+            // fetch walks newest to oldest, including earlier versions of rows
+            rows.entry(id.to_owned()).or_insert_with(|| row.clone());
         }
         cursor = page["cursor"].as_str().filter(|value| !value.is_empty()).map(str::to_owned);
         let Some(token) = &cursor else { break };
@@ -631,6 +578,257 @@ impl From<client::Error> for Error {
     }
 }
 
+const OWNER: &str = "_bts_dataset_source";
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Ownership {
+    version: u8,
+    root_span_id: String,
+    fields: BTreeSet<Vec<String>>,
+    tags: BTreeSet<String>,
+}
+
+fn ownership(event: &Value) -> Result<Option<Ownership>, String> {
+    let Some(value) = event["metadata"].get(OWNER) else {
+        return Ok(None);
+    };
+    let owner: Ownership = serde_json::from_value(value.clone()).map_err(|error| format!("source ownership: {error}"))?;
+    if owner.version != 1
+        || event["root_span_id"] != owner.root_span_id
+        || owner.fields.iter().any(|path| {
+            path.is_empty()
+                || !matches!(
+                    path[0].as_str(),
+                    "span_id"
+                        | "root_span_id"
+                        | "span_parents"
+                        | "input"
+                        | "output"
+                        | "expected"
+                        | "error"
+                        | "metadata"
+                        | "metrics"
+                        | "scores"
+                        | "span_attributes"
+                )
+                || (matches!(path[0].as_str(), "metadata" | "metrics" | "scores" | "span_attributes") && path.len() < 2)
+                || (path[0] == "metadata" && path[1] == OWNER)
+        })
+    {
+        return Err("source ownership does not match its span".to_owned());
+    }
+    Ok(Some(owner))
+}
+
+fn fields(value: &Value, path: Vec<String>, paths: &mut BTreeSet<Vec<String>>) {
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            let mut path = path.clone();
+            path.push(key.clone());
+            fields(value, path, paths);
+        }
+    } else {
+        paths.insert(path);
+    }
+}
+
+fn read<'a>(event: &'a Value, path: &[String]) -> &'a Value {
+    path.iter().fold(event, |value, key| &value[key])
+}
+
+fn set(event: &mut Value, path: &[String], value: Value) {
+    let mut at = event;
+    for key in &path[..path.len() - 1] {
+        if !at.is_object() {
+            *at = json!({});
+        }
+        at = &mut at[key];
+    }
+    if !at.is_object() {
+        *at = json!({});
+    }
+    at[&path[path.len() - 1]] = value;
+}
+
+// own the module's fields; leave server additions out of the update entirely
+fn update(local: &Value, remote: &Value) -> Result<(bool, Value), String> {
+    if local["metadata"].get(OWNER).is_some() {
+        return Err(format!("metadata.{OWNER} is reserved for dataset source ownership"));
+    }
+    let mut paths = BTreeSet::new();
+    for key in [
+        "span_id",
+        "root_span_id",
+        "span_parents",
+        "input",
+        "output",
+        "expected",
+        "error",
+    ] {
+        if local.get(key).is_some() {
+            paths.insert(vec![key.to_owned()]);
+        }
+    }
+    for key in ["metadata", "metrics", "scores", "span_attributes"] {
+        if let Some(object) = local[key].as_object() {
+            for (name, value) in object {
+                if key == "metrics" && matches!(name.as_str(), "start" | "end" | "duration") {
+                    continue;
+                }
+                fields(value, vec![key.to_owned(), name.clone()], &mut paths);
+            }
+        }
+    }
+    let tags: BTreeSet<String> = local["tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tag| tag.as_str().map(str::to_owned))
+        .collect();
+    let desired = Ownership {
+        version: 1,
+        root_span_id: local["root_span_id"].as_str().ok_or("source has no root_span_id")?.to_owned(),
+        fields: paths,
+        tags,
+    };
+    let previous = ownership(remote)?;
+    let mut changed = previous.as_ref() != Some(&desired);
+    let mut patch = local.clone();
+    let mut merge_paths = desired.fields.clone();
+    for path in &desired.fields {
+        let left = read(local, path);
+        let right = read(remote, path);
+        let empty_parents = path == &["span_parents"] && left.as_array().is_some_and(Vec::is_empty) && right.is_null();
+        changed |= !empty_parents && left != right;
+    }
+    let mut deleted_tags = BTreeSet::new();
+    if let Some(previous) = previous {
+        for path in previous.fields.difference(&desired.fields) {
+            // a new ancestor replaces this field; a new descendant is written
+            // below after clearing the old value
+            changed |= !read(remote, path).is_null();
+            set(&mut patch, path, Value::Null);
+            merge_paths.insert(path.clone());
+        }
+        deleted_tags = previous.tags.difference(&desired.tags).cloned().collect();
+    }
+    for path in &desired.fields {
+        set(&mut patch, path, read(local, path).clone());
+    }
+    let remote_tags: BTreeSet<String> = remote["tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tag| tag.as_str().map(str::to_owned))
+        .collect();
+    changed |= !desired.tags.is_subset(&remote_tags) || !deleted_tags.is_disjoint(&remote_tags);
+    if !deleted_tags.is_empty() {
+        patch["_array_delete"] = json!([{"path":["tags"],"delete":deleted_tags}]);
+    }
+    if !remote.is_null() {
+        patch.as_object_mut().unwrap().remove("created");
+        if let Some(metrics) = patch["metrics"].as_object_mut() {
+            for key in ["start", "end", "duration"] {
+                metrics.remove(key);
+            }
+        }
+    }
+    set(&mut patch, &["metadata".to_owned(), OWNER.to_owned()], json!(desired));
+    merge_paths.insert(vec!["metadata".to_owned(), OWNER.to_owned()]);
+    patch["_is_merge"] = json!(true);
+    patch["_merge_paths"] = json!(merge_paths);
+    Ok((changed, patch))
+}
+
+fn stale(local: &[Value], remote: &[Value]) -> Result<Vec<Value>, String> {
+    let ids: BTreeSet<&str> = local.iter().filter_map(|event| event["id"].as_str()).collect();
+    let root = local
+        .first()
+        .and_then(|event| event["root_span_id"].as_str())
+        .ok_or("source has no root")?;
+    let mut stale = Vec::new();
+    for event in remote {
+        let id = event["id"].as_str().ok_or("remote span has no id")?;
+        if !ids.contains(id) && ownership(event)?.is_some_and(|owner| owner.root_span_id == root) {
+            stale.push(json!({"id":id,"_object_delete":true}));
+        }
+    }
+    Ok(stale)
+}
+
+// an enrichment span can outlive an authored parent; reconnect it before
+// deleting that parent so the trace still has a complete tree
+fn reparent(local: &[Value], remote: &[Value], deleted: &[Value]) -> Result<Vec<Value>, String> {
+    let root = local
+        .first()
+        .and_then(|event| event["root_span_id"].as_str())
+        .ok_or("source has no root")?;
+    let deleted_ids: BTreeSet<&str> = deleted.iter().filter_map(|event| event["id"].as_str()).collect();
+    let removed: std::collections::HashMap<&str, &Value> = remote
+        .iter()
+        .filter(|event| event["id"].as_str().is_some_and(|id| deleted_ids.contains(id)))
+        .map(|event| Ok((event["span_id"].as_str().ok_or("removed source span has no span_id")?, event)))
+        .collect::<Result<_, String>>()?;
+    fn ancestors<'a>(
+        parent: &'a str,
+        removed: &std::collections::HashMap<&str, &'a Value>,
+        visiting: &mut BTreeSet<&'a str>,
+        root: &'a str,
+        out: &mut BTreeSet<&'a str>,
+    ) -> Result<(), String> {
+        let Some(event) = removed.get(parent) else {
+            out.insert(parent);
+            return Ok(());
+        };
+        if !visiting.insert(parent) {
+            return Err("removed source spans have cyclic parent links".to_owned());
+        }
+        if let Some(parents) = event["span_parents"].as_array().filter(|parents| !parents.is_empty()) {
+            for parent in parents {
+                ancestors(
+                    parent.as_str().ok_or("source parent is not a span id")?,
+                    removed,
+                    visiting,
+                    root,
+                    out,
+                )?;
+            }
+        } else {
+            out.insert(root);
+        }
+        visiting.remove(parent);
+        Ok(())
+    }
+    let mut updates = Vec::new();
+    for event in remote {
+        if ownership(event)?.is_some() {
+            continue;
+        }
+        let Some(parents) = event["span_parents"].as_array() else {
+            continue;
+        };
+        if !parents
+            .iter()
+            .any(|parent| parent.as_str().is_some_and(|id| removed.contains_key(id)))
+        {
+            continue;
+        }
+        let mut surviving = BTreeSet::new();
+        for parent in parents {
+            ancestors(
+                parent.as_str().ok_or("enrichment parent is not a span id")?,
+                &removed,
+                &mut BTreeSet::new(),
+                root,
+                &mut surviving,
+            )?;
+        }
+        updates.push(json!({"id":event["id"],"span_parents":surviving,"_is_merge":true,"_merge_paths":[["span_parents"]]}));
+    }
+    Ok(updates)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +851,43 @@ mod tests {
         assert_eq!(traces["two"].len(), 1);
         assert!(requests.recv().unwrap().contains("root_span_id IN ('one','two')"));
         assert!(requests.recv().unwrap().contains("OFFSET 'next-page'"));
+    }
+
+    #[test]
+    fn dataset_pagination_keeps_the_newest_row_and_pins_its_snapshot() {
+        let (client, requests) = serve(vec![
+            Reply::json(json!({"events":[{"id":"one","input":"new","_xact_id":"100"}],"cursor":"next"})),
+            Reply::json(
+                json!({"events":[{"id":"one","input":"old","_xact_id":"90"},{"id":"two","input":"other","_xact_id":"80"}]}),
+            ),
+        ]);
+        let rows = fetch_rows(&client, "dataset").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows["one"]["input"], "new");
+        assert!(!requests.recv().unwrap().contains("version="));
+        let second = requests.recv().unwrap();
+        assert!(second.contains("cursor=next"));
+        assert!(second.contains("version=100"));
+    }
+
+    #[test]
+    fn grouped_sources_keep_order_and_have_distinct_native_trace_references() {
+        let config = Braintrust::new("test".to_owned(), uuid::Uuid::nil());
+        let model = dsl::compile(
+            r#"trace "one" { input = "question" } dataset "cases" { case "group" { traces = [trace["one"], trace["one"]] } }"#,
+        )
+        .unwrap();
+        let mut plans = prepare(&model.datasets[0], &model, &config, Path::new("/tmp/cases.bt")).unwrap();
+        let case = &mut plans[0];
+        finish_row(case, &config).unwrap();
+        let refs = case.row["input"].as_array().unwrap();
+        assert_eq!(refs.len(), 2);
+        for (reference, source) in refs.iter().zip(&case.sources) {
+            assert_eq!(reference["trace_ref"]["object_type"], "project_logs");
+            assert_eq!(reference["trace_ref"]["object_id"], config.project_id.to_string());
+            assert_eq!(reference["trace_ref"]["root_span_id"], root(&source.events).unwrap());
+        }
+        assert_ne!(refs[0]["trace_ref"]["root_span_id"], refs[1]["trace_ref"]["root_span_id"]);
     }
     fn inline_plan(client: &Client) -> (Dataset, Vec<Case>) {
         let model = dsl::compile(r#"dataset "cases" { case "one" { input = "new" } }"#).unwrap();
@@ -698,17 +933,37 @@ mod tests {
         }
         assert!(requests.recv_timeout(Duration::from_millis(20)).is_err());
     }
+
     #[test]
-    fn removes_sparse_owned_rows_without_deleting_online_spans() {
-        let current = sdg::stable_uuid("source/row/0").to_string();
-        let removed = sdg::stable_uuid("source/row/100000").to_string();
-        let online = uuid::Uuid::new_v4().to_string();
-        let local = vec![json!({"id":current})];
-        let remote = vec![json!({"id":current}), json!({"id":removed}), json!({"id":online})];
-        assert_eq!(
-            stale_source_rows(&local, &remote),
-            vec![json!({"id":removed,"_object_delete":true})]
-        );
+    fn failed_enrichment_repairs_do_not_delete_their_authored_parents() {
+        let model = dsl::compile(r#"trace "one" {} dataset "cases" { case "one" { trace = trace["one"] } }"#).unwrap();
+        let config = Braintrust::new("test".to_owned(), uuid::Uuid::nil());
+        let mut plans = prepare(&model.datasets[0], &model, &config, Path::new("/tmp/cases.bt")).unwrap();
+        let local = &plans[0].sources[0].events[0];
+        let (_, current) = update(local, &Value::Null).unwrap();
+        let (_, old) = update(
+            &json!({"id":"old-source","span_id":"old-span","root_span_id":local["root_span_id"],"span_parents":[local["span_id"]]}),
+            &Value::Null,
+        )
+        .unwrap();
+        let enrichment = json!({"id":"enrichment","root_span_id":local["root_span_id"],"span_parents":["old-span"]});
+        let (mut client, requests) = serve(vec![
+            Reply::json(json!({"objects":[{"id":"dataset","project_id":"$PROJECT","name":"cases"}]})),
+            Reply::json(json!({"events":[]})),
+            Reply::json(json!({"data":[current,old,enrichment]})),
+            Reply::json(json!({"row_ids":[local["id"]]})),
+            Reply {
+                status: 500,
+                body: "{}".to_owned(),
+                headers: String::new(),
+            },
+        ]);
+        client.config.retry_attempts = 1;
+        assert!(reconcile(&model.datasets[0], &mut plans, &client, &mut Comparison::default(), false).is_err());
+        for _ in 0..5 {
+            assert!(!requests.recv().unwrap().contains("_object_delete"));
+        }
+        assert!(requests.recv_timeout(Duration::from_millis(20)).is_err());
     }
     #[test]
     fn span_path_uses_parentage_when_names_repeat() {
@@ -724,5 +979,124 @@ mod tests {
             ("tool".to_owned(), "lookup".to_owned()),
         ];
         assert_eq!(select_span(&events, &path)[0]["id"], "right");
+    }
+
+    fn saved(local: &Value) -> Value {
+        let (_, mut event) = update(local, &Value::Null).unwrap();
+        event.as_object_mut().unwrap().remove("_is_merge");
+        event.as_object_mut().unwrap().remove("_merge_paths");
+        event
+    }
+
+    #[test]
+    fn clears_removed_scores_and_preserves_online_scores() {
+        let before = json!({"id":"row","root_span_id":"root","scores":{"local":0.7}});
+        let mut remote = saved(&before);
+        remote["scores"]["online"] = json!(0.9);
+        let local = json!({"id":"row","root_span_id":"root"});
+        let (changed, patch) = update(&local, &remote).unwrap();
+        assert!(changed);
+        assert_eq!(patch["scores"]["local"], Value::Null);
+        assert!(patch["scores"].get("online").is_none());
+        assert_eq!(patch["_is_merge"], true);
+        assert!(!patch["_merge_paths"].as_array().unwrap().contains(&json!(["scores"])));
+        remote["scores"]["local"] = Value::Null;
+        remote["metadata"][OWNER] = patch["metadata"][OWNER].clone();
+        assert!(!update(&local, &remote).unwrap().0);
+    }
+
+    #[test]
+    fn ignores_enrichment_and_only_clears_previously_owned_fields() {
+        let local = json!({"id":"row","root_span_id":"root","metadata":{"nested":{"authored":1}},"metrics":{"tokens":4},"tags":["local"],"span_attributes":{"name":"run","type":"task"}});
+        let mut remote = saved(&local);
+        remote["metadata"]["nested"]["topics"] = json!(["billing"]);
+        remote["metadata"]["patterns"] = json!(["pattern"]);
+        remote["metrics"]["enrichment_cost"] = json!(0.01);
+        remote["tags"] = json!(["local", "server"]);
+        remote["span_attributes"]["enrichment"] = json!(true);
+        assert!(!update(&local, &remote).unwrap().0);
+        let after = json!({"id":"row","root_span_id":"root","output":"new","span_attributes":{"name":"run","type":"task"}});
+        let (_, patch) = update(&after, &remote).unwrap();
+        assert_eq!(patch["metadata"]["nested"]["authored"], Value::Null);
+        assert!(patch["metadata"]["nested"].get("topics").is_none());
+        assert!(patch["metadata"].get("patterns").is_none());
+        assert!(patch["metrics"].get("enrichment_cost").is_none());
+        assert!(patch["span_attributes"].get("enrichment").is_none());
+        assert_eq!(patch["_array_delete"], json!([{"path":["tags"],"delete":["local"]}]));
+    }
+
+    #[test]
+    fn deletes_only_marked_source_rows_regardless_of_uuid_version() {
+        let current = saved(&json!({"id":"current","root_span_id":"root"}));
+        let removed = saved(&json!({"id":"old","root_span_id":"root"}));
+        let enrichment = json!({"id":crate::sdg::stable_uuid("enrichment").to_string(),"root_span_id":"root"});
+        let remote = vec![current.clone(), removed, enrichment];
+        assert_eq!(
+            stale(std::slice::from_ref(&current), &remote).unwrap(),
+            vec![json!({"id":"old","_object_delete":true})]
+        );
+    }
+
+    #[test]
+    fn legacy_sources_are_adopted_without_claiming_unknown_scores() {
+        let local = json!({"id":"row","root_span_id":"root","scores":{"local":0.5}});
+        let mut remote = local.clone();
+        remote["scores"]["online"] = json!(0.9);
+        let (changed, patch) = update(&local, &remote).unwrap();
+        assert!(changed);
+        assert_eq!(
+            patch["metadata"][OWNER]["fields"],
+            json!([["root_span_id"], ["scores", "local"]])
+        );
+        assert!(patch["scores"].get("online").is_none());
+    }
+
+    #[test]
+    fn rejects_reserved_or_invalid_ownership_before_writing() {
+        let local = json!({"id":"row","root_span_id":"root"});
+        let mut remote = saved(&local);
+        remote["metadata"][OWNER]["fields"] = json!([["metadata"]]);
+        assert!(update(&local, &remote).is_err());
+        assert!(update(&remote, &Value::Null).is_err());
+    }
+
+    #[test]
+    fn accepts_null_root_parents_returned_by_braintrust() {
+        let local = json!({"id":"root","root_span_id":"root","span_parents":[]});
+        let mut remote = saved(&local);
+        remote["span_parents"] = Value::Null;
+        assert!(!update(&local, &remote).unwrap().0);
+    }
+
+    #[test]
+    fn empty_authored_objects_leave_room_for_enrichment() {
+        let local = json!({"id":"row","root_span_id":"root","metadata":{"nested":{}}});
+        let mut remote = saved(&local);
+        remote["metadata"]["nested"]["topics"] = json!(["billing"]);
+        assert!(!update(&local, &remote).unwrap().0);
+        let (_, patch) = update(&local, &remote).unwrap();
+        assert!(
+            !patch["_merge_paths"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(["metadata", "nested"]))
+        );
+    }
+
+    #[test]
+    fn reconnects_enrichment_to_the_nearest_surviving_ancestor() {
+        let root = saved(&json!({"id":"root-row","span_id":"root","root_span_id":"root"}));
+        let parent = saved(&json!({"id":"parent-row","span_id":"parent","root_span_id":"root","span_parents":["root"]}));
+        let child = saved(&json!({"id":"child-row","span_id":"child","root_span_id":"root","span_parents":["parent"]}));
+        let enrichment = json!({"id":"enrichment","span_id":"enrichment","root_span_id":"root","span_parents":["child","other"],"metadata":{"topics":["billing"]}});
+        let remote = vec![root.clone(), parent, child, enrichment];
+        let local = std::slice::from_ref(&root);
+        let deleted = stale(local, &remote).unwrap();
+        let updates = reparent(local, &remote, &deleted).unwrap();
+        assert_eq!(
+            updates,
+            vec![json!({"id":"enrichment","span_parents":["other","root"],"_is_merge":true,"_merge_paths":[["span_parents"]]})]
+        );
+        assert!(updates[0].get("metadata").is_none());
     }
 }
