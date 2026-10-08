@@ -19,7 +19,7 @@ use uuid::Uuid;
 static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expect("the embedded vocab parses"));
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct Plan {
+pub(crate) struct Plan {
     pub(super) events: Box<[EventPlan]>,
     pub(super) traces: Box<[Range<usize>]>,
     pub(super) attachments: Box<[Attachment]>,
@@ -28,11 +28,11 @@ pub(super) struct Plan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct Attachment {
-    pub(super) path: String,
-    pub(super) filename: String,
-    pub(super) content_type: String,
-    pub(super) key: String,
+pub(crate) struct Attachment {
+    pub(crate) path: String,
+    pub(crate) filename: String,
+    pub(crate) content_type: String,
+    pub(crate) key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,7 +83,7 @@ pub(super) struct EventFields {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct Planner {
+pub(crate) struct Planner {
     events: Vec<EventPlan>,
     traces: Vec<Range<usize>>,
     attachments: Vec<Attachment>,
@@ -1988,7 +1988,7 @@ fn resolve_template(template: ModelTemplate, ctx: &mut Ctx) -> Result<String, Er
 
 // multiple trace templates cycle in source order
 #[cfg(test)]
-pub(super) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error> {
+pub(crate) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error> {
     plan_with_filter(model, count, seed, &WriteFilter::default())
 }
 

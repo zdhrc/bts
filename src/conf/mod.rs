@@ -21,6 +21,8 @@ pub(crate) struct Braintrust {
     pub(crate) project_id: Uuid,
     pub(crate) request_timeout: Duration,
     pub(crate) write_concurrency: usize,
+    pub(crate) retry_attempts: u32,
+    pub(crate) retry_max_elapsed: Duration,
     pub(crate) max_attachment_uploads: usize,
     pub(crate) max_attachment_file_bytes: u64,
     pub(crate) max_attachment_total_bytes: u64,
@@ -34,6 +36,8 @@ impl Braintrust {
             project_id,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             write_concurrency: DEFAULT_WRITE_CONCURRENCY,
+            retry_attempts: 8,
+            retry_max_elapsed: Duration::from_secs(120),
             max_attachment_uploads: DEFAULT_MAX_ATTACHMENT_UPLOADS,
             max_attachment_file_bytes: DEFAULT_MAX_ATTACHMENT_FILE_BYTES,
             max_attachment_total_bytes: DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES,
@@ -60,6 +64,8 @@ pub(crate) struct Settings {
     pub(crate) keep_runs: usize,
     pub(crate) request_timeout: Duration,
     pub(crate) write_concurrency: usize,
+    pub(crate) retry_attempts: u32,
+    pub(crate) retry_max_elapsed: Duration,
     pub(crate) max_attachment_uploads: usize,
     pub(crate) max_attachment_file_bytes: u64,
     pub(crate) max_attachment_total_bytes: u64,
@@ -72,6 +78,8 @@ impl Default for Settings {
             keep_runs: DEFAULT_KEPT_RUNS,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             write_concurrency: DEFAULT_WRITE_CONCURRENCY,
+            retry_attempts: 8,
+            retry_max_elapsed: Duration::from_secs(120),
             max_attachment_uploads: DEFAULT_MAX_ATTACHMENT_UPLOADS,
             max_attachment_file_bytes: DEFAULT_MAX_ATTACHMENT_FILE_BYTES,
             max_attachment_total_bytes: DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES,
@@ -123,6 +131,19 @@ impl Settings {
                 return Err(Error::InvalidConcurrency { path: path.to_owned() });
             }
             settings.write_concurrency = concurrency;
+        }
+        if let Some(attempts) = file.http.retry_attempts {
+            if attempts == 0 {
+                return Err(Error::InvalidRetryAttempts { path: path.to_owned() });
+            }
+            settings.retry_attempts = attempts;
+        }
+        if let Some(timeout) = file.http.retry_max_elapsed {
+            settings.retry_max_elapsed = parse_duration(&timeout).map_err(|reason| Error::InvalidTimeout {
+                path: path.to_owned(),
+                value: timeout,
+                reason,
+            })?;
         }
         if let Some(value) = file.attachments.max_uploads {
             if value == 0 {
@@ -189,6 +210,8 @@ struct LogSection {
 struct HttpSection {
     request_timeout: Option<String>,
     write_concurrency: Option<usize>,
+    retry_attempts: Option<u32>,
+    retry_max_elapsed: Option<String>,
 }
 
 // bare values must be real levels so typos fail; the env-filter parser alone would accept
@@ -300,6 +323,7 @@ pub(crate) enum Error {
     InvalidLogLevel { path: PathBuf, value: String, reason: String },
     InvalidTimeout { path: PathBuf, value: String, reason: String },
     InvalidConcurrency { path: PathBuf },
+    InvalidRetryAttempts { path: PathBuf },
     InvalidAttachmentLimit { path: PathBuf, name: &'static str },
 }
 
@@ -353,6 +377,11 @@ impl fmt::Display for Error {
                     path.display()
                 )
             }
+            Self::InvalidRetryAttempts { path } => write!(
+                formatter,
+                "invalid http.retry_attempts in {}: must be greater than zero",
+                path.display()
+            ),
             Self::InvalidConcurrency { path } => {
                 write!(
                     formatter,
@@ -392,6 +421,8 @@ mod tests {
             [http]
             request_timeout = "2m"
             write_concurrency = 4
+            retry_attempts = 5
+            retry_max_elapsed = "90s"
 
             [attachments]
             max_uploads = 3
@@ -405,6 +436,8 @@ mod tests {
         assert_eq!(settings.keep_runs, 5);
         assert_eq!(settings.request_timeout, Duration::from_secs(120));
         assert_eq!(settings.write_concurrency, 4);
+        assert_eq!(settings.retry_attempts, 5);
+        assert_eq!(settings.retry_max_elapsed, Duration::from_secs(90));
         assert_eq!(settings.max_attachment_uploads, 3);
         assert_eq!(settings.max_attachment_file_bytes, 1024);
         assert_eq!(settings.max_attachment_total_bytes, 2048);

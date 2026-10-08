@@ -32,13 +32,13 @@ impl Distribution {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct EventBatch {
-    pub(super) events: Box<[Event]>,
+    pub(crate) events: Box<[Event]>,
 
     #[serde(skip)]
-    pub(super) trace_count: usize,
+    pub(crate) trace_count: usize,
 
     #[serde(skip)]
-    pub(super) attachments: Box<[Attachment]>,
+    pub(crate) attachments: Box<[Attachment]>,
 }
 
 impl EventBatch {
@@ -119,36 +119,36 @@ fn replace_attachment_keys(value: &mut JsonValue, keys: &HashMap<String, String>
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct Event {
-    pub(super) id: String,
-    pub(super) span_id: String,
-    pub(super) root_span_id: String,
-    pub(super) span_parents: Box<[String]>,
-    pub(super) created: String,
-    pub(super) span_attributes: SpanAttributes,
+pub(crate) struct Event {
+    pub(crate) id: String,
+    pub(crate) span_id: String,
+    pub(crate) root_span_id: String,
+    pub(crate) span_parents: Box<[String]>,
+    pub(crate) created: String,
+    pub(crate) span_attributes: SpanAttributes,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) input: Option<JsonValue>,
+    pub(crate) input: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) output: Option<JsonValue>,
+    pub(crate) output: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) expected: Option<JsonValue>,
+    pub(crate) expected: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<JsonValue>,
+    pub(crate) error: Option<JsonValue>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) metadata: Option<JsonMap<String, JsonValue>>,
+    pub(crate) metadata: Option<JsonMap<String, JsonValue>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) scores: Option<JsonMap<String, JsonValue>>,
+    pub(crate) scores: Option<JsonMap<String, JsonValue>>,
 
-    pub(super) metrics: JsonMap<String, JsonValue>,
+    pub(crate) metrics: JsonMap<String, JsonValue>,
 
     #[serde(skip_serializing_if = "tags_are_empty")]
-    pub(super) tags: Box<[String]>,
+    pub(crate) tags: Box<[String]>,
 }
 
 fn tags_are_empty(tags: &[String]) -> bool {
@@ -156,14 +156,14 @@ fn tags_are_empty(tags: &[String]) -> bool {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct SpanAttributes {
-    pub(super) name: String,
+pub(crate) struct SpanAttributes {
+    pub(crate) name: String,
 
     #[serde(rename = "type")]
-    pub(super) kind: String,
+    pub(crate) kind: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) purpose: Option<&'static str>,
+    pub(crate) purpose: Option<&'static str>,
 }
 
 struct Materializer {
@@ -377,7 +377,7 @@ fn format_timestamp(timestamp: SystemTime) -> String {
     DateTime::<Utc>::from(timestamp).to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-pub(super) fn materialize(
+pub(crate) fn materialize(
     plan: Plan,
     over: Duration,
     distribution: Distribution,
@@ -393,7 +393,7 @@ pub(crate) struct Error {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum ErrorKind {
+pub(crate) enum ErrorKind {
     ReservedMetric(&'static str),
     WindowTooShort,
     TimestampOutOfRange,

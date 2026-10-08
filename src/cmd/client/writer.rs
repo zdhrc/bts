@@ -1,12 +1,10 @@
+use super::{Client, Response};
 use crate::{
     conf::Braintrust,
-    sdg::{materializer::EventBatch, planner::Attachment},
+    sdg::{Attachment, EventBatch},
 };
-use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
-use reqwest::{
-    StatusCode,
-    blocking::{Client, Response},
-};
+use reqwest::StatusCode;
+use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use std::fs;
 use std::io::Read;
@@ -21,13 +19,9 @@ const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024 / 2;
 const PAYLOAD_OPEN: &[u8] = b"{\"events\":[";
 const PAYLOAD_CLOSE: &[u8] = b"]}";
 
-// transient failures (timeouts, 429s, 5xx) back off exponentially before giving up; the
-// server's Retry-After wins over the computed backoff when present, capped so a run never stalls
-const MAX_SEND_ATTEMPTS: u32 = 4;
-const MAX_ATTACHMENT_STATUS_ATTEMPTS: u32 = 3;
+// status reconciliation checks whether an uncertain upload reached storage
 const MAX_ATTACHMENT_RECONCILE_ATTEMPTS: u32 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_ATTACHMENT_ERROR_CHARS: usize = 512;
 
 #[derive(Debug, Deserialize)]
@@ -79,11 +73,9 @@ struct Writer<'config> {
 }
 
 impl<'config> Writer<'config> {
+    #[cfg(test)]
     fn new(config: &'config Braintrust) -> Result<Self, Error> {
-        let client = Client::builder()
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|error| Error::new(ErrorKind::BuildClient(error)))?;
+        let client = Client::new(config).map_err(|error| Error::new(ErrorKind::BuildClient(error)))?;
 
         Ok(Self {
             client,
@@ -105,6 +97,19 @@ impl<'config> Writer<'config> {
         if !events.attachments.is_empty() {
             self.upload_attachments(&events.attachments, &attachment_bytes)?;
         }
+        self.insert_payloads(&url, payloads).map_err(|source| {
+            if events.attachments.is_empty() {
+                source
+            } else {
+                Error::new(ErrorKind::InsertAfterAttachments {
+                    uploaded: events.attachments.len(),
+                    source: Box::new(source),
+                })
+            }
+        })
+    }
+
+    fn insert_payloads(&self, url: &str, payloads: Vec<Payload>) -> Result<InsertResponse, Error> {
         let workers = self.config.write_concurrency.min(payloads.len()).max(1);
         // payloads are indexed so acknowledged row ids reassemble in submission
         // order no matter which worker finishes first
@@ -121,7 +126,7 @@ impl<'config> Writer<'config> {
                 .map(|_| {
                     scope.spawn(|| {
                         let _guard = span.enter();
-                        self.drain(&url, &pending, &slots, &failed)
+                        self.drain(url, &pending, &slots, &failed)
                     })
                 })
                 .collect();
@@ -130,18 +135,9 @@ impl<'config> Writer<'config> {
                 .into_iter()
                 .try_for_each(|handle| handle.join().expect("writer worker panicked"))
         });
-        if let Err(source) = insert_result {
-            return Err(if events.attachments.is_empty() {
-                source
-            } else {
-                Error::new(ErrorKind::InsertAfterAttachments {
-                    uploaded: events.attachments.len(),
-                    source: Box::new(source),
-                })
-            });
-        }
+        insert_result?;
 
-        let mut row_ids = Vec::with_capacity(events.event_count());
+        let mut row_ids = Vec::new();
         for slot in slots.into_inner().unwrap() {
             row_ids.extend(slot.expect("every payload has a result when no worker failed"));
         }
@@ -227,17 +223,12 @@ impl<'config> Writer<'config> {
             self.config.api_url.trim_end_matches('/'),
             self.config.project_id,
         );
-        let response = self
-            .client
-            .get(project_url)
-            .bearer_auth(&self.config.api_key)
-            .send()
-            .map_err(|source| {
-                Error::new(ErrorKind::Attachment(format!(
-                    "project lookup failed: {}",
-                    source.without_url()
-                )))
-            })?;
+        let response = self.client.get(project_url).send().map_err(|source| {
+            Error::new(ErrorKind::Attachment(format!(
+                "project lookup failed: {}",
+                source.without_url()
+            )))
+        })?;
         let project: ProjectResponse = successful_attachment_response(response)
             .and_then(|response| {
                 response
@@ -273,7 +264,6 @@ impl<'config> Writer<'config> {
         let response = self
             .client
             .post(format!("{api_url}/attachment"))
-            .bearer_auth(&self.config.api_key)
             .json(&serde_json::json!({
                 "key": attachment.key,
                 "filename": attachment.filename,
@@ -295,7 +285,7 @@ impl<'config> Writer<'config> {
             })
             .map_err(|detail| format!("initialization failed: {detail}"))?;
 
-        let mut upload = self.client.put(&init.signed_url);
+        let mut upload = self.client.signed_put(&init.signed_url);
         for (name, value) in init.headers {
             upload = upload.header(name, value);
         }
@@ -334,7 +324,6 @@ impl<'config> Writer<'config> {
             let response = self
                 .client
                 .get(&url)
-                .bearer_auth(&self.config.api_key)
                 .query(&[
                     ("key", attachment.key.as_str()),
                     ("filename", attachment.filename.as_str()),
@@ -399,32 +388,15 @@ impl<'config> Writer<'config> {
             Some(message) => serde_json::json!({ "upload_status": upload_status, "error_message": message }),
             None => serde_json::json!({ "upload_status": upload_status }),
         };
-        for attempt in 1..=MAX_ATTACHMENT_STATUS_ATTEMPTS {
-            let result = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.config.api_key)
-                .json(&serde_json::json!({ "key": attachment.key, "org_id": org_id, "status": status }))
-                .send();
-            let (retry, failure) = match result {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) => {
-                    let retry = response.status().is_server_error() || response.status() == StatusCode::TOO_MANY_REQUESTS;
-                    (retry, attachment_http_error(response))
-                }
-                Err(source) => {
-                    let retry = source.is_timeout() || source.is_connect();
-                    (retry, source.without_url().to_string())
-                }
-            };
-            if !retry || attempt == MAX_ATTACHMENT_STATUS_ATTEMPTS {
-                return Err(format!(
-                    "POST /attachment/status failed after {attempt} attempt(s): {failure}"
-                ));
-            }
-            thread::sleep(self.backoff_base);
-        }
-        unreachable!("the final status attempt either succeeds or returns an error")
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "key": attachment.key, "org_id": org_id, "status": status }))
+            .retryable()
+            .retry_base(self.backoff_base)
+            .send()
+            .map_err(|error| error.without_url().to_string())?;
+        successful_attachment_response(response).map(|_| ())
     }
 
     // pulls the next unsent payload until the queue drains or any worker fails
@@ -481,64 +453,35 @@ impl<'config> Writer<'config> {
     }
 
     fn send_with_retry(&self, url: &str, payload: &Payload) -> Result<InsertResponse, Error> {
-        let mut backoff = self.backoff_base;
-
-        for attempt in 1..=MAX_SEND_ATTEMPTS {
-            let error = match self.send(url, payload) {
-                Ok(inserted) => return Ok(inserted),
-                Err(error) => error,
-            };
-            if !error.is_transient() {
-                return Err(error);
-            }
-            if attempt == MAX_SEND_ATTEMPTS {
-                return Err(Error::new(ErrorKind::RetriesExhausted {
-                    attempts: attempt,
+        self.send(url, payload).map_err(|error| {
+            if error.is_transient() {
+                Error::new(ErrorKind::RetriesExhausted {
+                    attempts: self.config.retry_attempts,
                     source: Box::new(error),
-                }));
+                })
+            } else {
+                error
             }
-            let delay = error.retry_after().unwrap_or(backoff).min(MAX_BACKOFF);
-            tracing::warn!(
-                attempt,
-                max_attempts = MAX_SEND_ATTEMPTS,
-                delay = ?delay,
-                events = payload.event_count(),
-                %error,
-                "transient insert failure, backing off and retrying",
-            );
-            thread::sleep(delay);
-            backoff = (backoff * 2).min(MAX_BACKOFF);
-        }
-
-        unreachable!("the final attempt either returns its result or the exhausted error")
+        })
     }
 
     fn send(&self, url: &str, payload: &Payload) -> Result<InsertResponse, Error> {
         let response = self
             .client
             .post(url)
-            .bearer_auth(&self.config.api_key)
-            .header(CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE.as_str(), "application/json")
             .body(payload.body())
+            .retryable()
+            .retry_base(self.backoff_base)
             .send()
             .map_err(|error| Error::new(ErrorKind::SendRequest(error)))?;
         let status = response.status();
 
         if !status.is_success() {
-            let retry_after = response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_secs);
             let body = response
                 .text()
                 .unwrap_or_else(|error| format!("failed to read response body: {error}"));
-            return Err(Error::new(ErrorKind::Rejected {
-                status,
-                body,
-                retry_after,
-            }));
+            return Err(Error::new(ErrorKind::Rejected { status, body }));
         }
 
         let inserted: InsertResponse = response
@@ -687,17 +630,25 @@ fn payloads(events: &EventBatch, limit: usize) -> Result<Vec<Payload>, Error> {
     Ok(payloads)
 }
 
-pub(super) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, Error> {
+#[cfg(test)]
+pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, Error> {
     Writer::new(config)?.write(events)
 }
-
+pub(crate) fn write_with_client(client: &Client, events: &EventBatch) -> Result<InsertResponse, Error> {
+    Writer {
+        client: client.clone(),
+        config: &client.config,
+        backoff_base: BACKOFF_BASE,
+    }
+    .write(events)
+}
 // what a write would send, without sending it
 pub(crate) struct PackStats {
     pub(crate) payload_count: usize,
     pub(crate) body_bytes: usize,
 }
 
-pub(super) fn pack_stats(events: &EventBatch) -> Result<PackStats, Error> {
+pub(crate) fn pack_stats(events: &EventBatch) -> Result<PackStats, Error> {
     let payloads = payloads(events, MAX_PAYLOAD_BYTES)?;
 
     Ok(PackStats {
@@ -714,31 +665,15 @@ pub(crate) struct Error {
 #[derive(Debug)]
 enum ErrorKind {
     Attachment(String),
-    InsertAfterAttachments {
-        uploaded: usize,
-        source: Box<Error>,
-    },
+    InsertAfterAttachments { uploaded: usize, source: Box<Error> },
     BuildClient(reqwest::Error),
     EncodeEvent(serde_json::Error),
-    EventTooLarge {
-        size: usize,
-        limit: usize,
-    },
-    SendRequest(reqwest::Error),
-    Rejected {
-        status: StatusCode,
-        body: String,
-        retry_after: Option<Duration>,
-    },
+    EventTooLarge { size: usize, limit: usize },
+    SendRequest(super::Error),
+    Rejected { status: StatusCode, body: String },
     DecodeResponse(reqwest::Error),
-    UnexpectedRowCount {
-        expected: usize,
-        actual: usize,
-    },
-    RetriesExhausted {
-        attempts: u32,
-        source: Box<Error>,
-    },
+    UnexpectedRowCount { expected: usize, actual: usize },
+    RetriesExhausted { attempts: u32, source: Box<Error> },
 }
 
 impl fmt::Display for ErrorKind {
@@ -802,17 +737,14 @@ impl Error {
         }
     }
 
-    fn retry_after(&self) -> Option<Duration> {
-        match &self.kind {
-            ErrorKind::Rejected { retry_after, .. } => *retry_after,
-            _ => None,
-        }
-    }
-
     #[cfg(test)]
     fn kind(&self) -> &ErrorKind {
         &self.kind
     }
+}
+
+pub(crate) fn client_error(error: reqwest::Error) -> Error {
+    Error::new(ErrorKind::BuildClient(error))
 }
 
 #[cfg(test)]
@@ -839,7 +771,7 @@ mod tests {
         let mut config = Braintrust::new("secret".to_owned(), project_id);
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(1);
-        let model = compile(include_str!("../../tests/fixtures/simple.bt")).unwrap();
+        let model = compile(include_str!("../../../tests/fixtures/simple.bt")).unwrap();
         let events = materialize(
             plan(model, 1, 0).unwrap(),
             Duration::from_secs(3_600),
@@ -1017,6 +949,7 @@ mod tests {
         let (api_url, _requests) = serve(vec![(StatusCode::BAD_GATEWAY, "{}".to_owned()); 4]);
         let mut config = Braintrust::new("secret".to_owned(), project_id);
         config.api_url = api_url;
+        config.retry_attempts = 4;
         config.request_timeout = Duration::from_secs(5);
         let mut writer = Writer::new(&config).unwrap();
         writer.backoff_base = Duration::from_millis(1);

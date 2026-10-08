@@ -1,16 +1,12 @@
-mod materializer;
-mod planner;
-pub(crate) mod writer;
+pub(crate) mod materializer;
+pub(crate) mod planner;
 
-use crate::{
-    conf::Braintrust,
-    dsl::{Model, WriteFilter},
-};
+use crate::dsl::{Model, WriteFilter};
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
 pub(crate) use materializer::{Distribution, EventBatch};
-pub(crate) use writer::{InsertResponse, PackStats};
+pub(crate) use planner::Attachment;
 
 pub(crate) fn generate(
     model: Model,
@@ -46,14 +42,6 @@ pub(crate) fn generate_filtered(
     tracing::info_span!("materialize")
         .in_scope(|| materializer::materialize(plan, over, distribution, now))
         .map_err(Error::Materialize)
-}
-
-pub(crate) fn write(config: &Braintrust, events: &EventBatch) -> Result<InsertResponse, writer::Error> {
-    writer::write(config, events)
-}
-
-pub(crate) fn pack_stats(events: &EventBatch) -> Result<PackStats, writer::Error> {
-    writer::pack_stats(events)
 }
 
 #[derive(Debug)]
