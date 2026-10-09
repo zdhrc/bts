@@ -1,7 +1,7 @@
-use crate::cmd::shared::client::Client;
 use crate::cmd::render_diags;
+use crate::cmd::shared::client::Client;
 use crate::conf::{Braintrust, Settings};
-use crate::dsl::{self, Automation};
+use crate::dsl::{self, Automation, AutomationKind};
 use crate::scg;
 use serde_json::{Value, json};
 use std::{collections::HashMap, fmt, fs, path::PathBuf};
@@ -26,7 +26,12 @@ impl Args {
         let model = dsl::compile(&source).map_err(|diags| Error::InvalidShape {
             details: render_diags(&self.from.display().to_string(), &source, &diags),
         })?;
-        if model.automations.is_empty() {
+        let automations: Vec<_> = model
+            .automations
+            .iter()
+            .filter(|automation| matches!(automation.kind, AutomationKind::Scorer { .. }))
+            .collect();
+        if automations.is_empty() {
             return Err(Error::NoAutomations);
         }
         let slugs = scg::resolve_slugs(&model.scorers).map_err(Error::ScorerPlan)?;
@@ -43,10 +48,12 @@ impl Args {
         let base = config.api_url.trim_end_matches('/');
         let project_id = config.project_id.to_string();
 
-        // Resolve every dependency before writing any rule, so a missing push
-        // cannot leave the file half-synced.
+        // check that all the scorers are pushed before writing
         let mut function_ids = HashMap::new();
-        for scorer in model.automations.iter().flat_map(|automation| &automation.scorers) {
+        for scorer in automations.iter().flat_map(|automation| match &automation.kind {
+            AutomationKind::Scorer { scorers, .. } => scorers,
+            _ => unreachable!(),
+        }) {
             if function_ids.contains_key(scorer) {
                 continue;
             }
@@ -70,7 +77,7 @@ impl Args {
         }
 
         let mut plans = Vec::new();
-        for automation in &model.automations {
+        for automation in &automations {
             let objects = get_objects(
                 &client,
                 &config,
@@ -168,12 +175,20 @@ enum Action {
 }
 
 fn desired_online(automation: &Automation, ids: &HashMap<String, String>) -> Value {
+    let AutomationKind::Scorer {
+        scorers,
+        root,
+        span_names,
+    } = &automation.kind
+    else {
+        unreachable!()
+    };
     json!({
         "sampling_rate": automation.sampling_rate,
-        "scorers": automation.scorers.iter().map(|slug| json!({ "type": "function", "id": ids[slug] })).collect::<Vec<_>>(),
+        "scorers": scorers.iter().map(|slug| json!({ "type": "function", "id": ids[slug] })).collect::<Vec<_>>(),
         "status": if automation.enabled { "active" } else { "paused" },
-        "apply_to_root_span": automation.root,
-        "apply_to_span_names": automation.span_names,
+        "apply_to_root_span": root,
+        "apply_to_span_names": span_names,
         "scope": { "type": "span" },
     })
 }

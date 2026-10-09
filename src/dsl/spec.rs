@@ -212,6 +212,7 @@ pub(crate) mod ids {
     pub(crate) const MAYBE: Id = Id::new("block.maybe");
     pub(crate) const SCORER: Id = Id::new("block.scorer");
     pub(crate) const SCORER_SPAN: Id = Id::new("block.scorer-span");
+    pub(crate) const FACET: Id = Id::new("block.facet");
     pub(crate) const AUTOMATION: Id = Id::new("block.automation");
     pub(crate) const DATASET: Id = Id::new("block.dataset");
     pub(crate) const CASE: Id = Id::new("block.case");
@@ -238,6 +239,8 @@ pub(crate) mod ids {
     pub(crate) const PROMPT: Id = Id::new("field.prompt");
     pub(crate) const OPTIONS: Id = Id::new("field.options");
     pub(crate) const TYPE: Id = Id::new("field.type");
+    pub(crate) const FACETS: Id = Id::new("field.facets");
+    pub(crate) const NO_MATCH_PATTERN: Id = Id::new("field.no-match-pattern");
     pub(crate) const SCORERS: Id = Id::new("field.scorers");
     pub(crate) const SCOPE: Id = Id::new("field.scope");
     pub(crate) const SPAN_NAMES: Id = Id::new("field.span-names");
@@ -371,6 +374,7 @@ pub(crate) mod ids {
     pub(crate) const JUDGE_MODEL: Id = Id::new("rule.judge-model");
     pub(crate) const JUDGE_PROMPT: Id = Id::new("rule.judge-prompt");
     pub(crate) const JUDGE_OPTIONS: Id = Id::new("rule.judge-options");
+    pub(crate) const FACET_DEFINITION: Id = Id::new("rule.facet-definition");
     pub(crate) const AUTOMATION_BINDING: Id = Id::new("rule.automation-binding");
     pub(crate) const DATASET_CASE: Id = Id::new("rule.dataset-case");
 
@@ -543,11 +547,40 @@ const SCORER_SPAN_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+const FACET_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::PROMPT,
+        keyword: "prompt",
+        summary: "Constant extraction instructions; trace context is supplied by the default preprocessor.",
+        value: &STRING,
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::DESCRIPTION,
+        keyword: "description",
+        summary: "Description of the Braintrust facet.",
+        value: &STRING,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::NO_MATCH_PATTERN,
+        keyword: "no_match_pattern",
+        summary: "Optional RE2-compatible exclusion pattern for facet summaries.",
+        value: &STRING,
+        cardinality: Cardinality::Optional,
+    },
+];
+
+const FACET_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::FACET_DEFINITION,
+    summary: "Facets have unique names and constant nonempty prompts; sync uses the project default preprocessor, falling back to Thread.",
+}];
+
 const AUTOMATION_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         id: ids::TYPE,
         keyword: "type",
-        summary: "Automation kind; currently only the constant string \"scorer\".",
+        summary: "Automation kind: the constant string \"scorer\" or \"topics\".",
         value: &STRING,
         cardinality: Cardinality::Required,
     },
@@ -556,12 +589,19 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         keyword: "scorers",
         summary: "One or more names of scorer blocks in this source, deployed with `bt functions push`.",
         value: &STRING_ARRAY,
-        cardinality: Cardinality::Required,
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::FACETS,
+        keyword: "facets",
+        summary: "Names of local facet blocks required by a Topics automation.",
+        value: &STRING_ARRAY,
+        cardinality: Cardinality::Optional,
     },
     FieldDesc {
         id: ids::SCOPE,
         keyword: "scope",
-        summary: "Scoring scope; currently only the constant string \"span\".",
+        summary: "Execution scope: span for scorers, trace for topics.",
         value: &STRING,
         cardinality: Cardinality::Required,
     },
@@ -582,14 +622,14 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         id: ids::SAMPLING_RATE,
         keyword: "sampling_rate",
-        summary: "Fraction of matching spans to score, from 0 to 1; defaults to 1.",
+        summary: "Fraction of matching spans or traces to process, from 0 to 1; defaults to 1.",
         value: &NUMBER,
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
         id: ids::ENABLED,
         keyword: "enabled",
-        summary: "Whether online scoring is active; defaults to true.",
+        summary: "Whether the automation is active; defaults to true.",
         value: &BOOLEAN,
         cardinality: Cardinality::Optional,
     },
@@ -597,7 +637,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
 
 const AUTOMATION_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::AUTOMATION_BINDING,
-    summary: "A scorer automation names local scorer blocks and targets either root spans or named spans.",
+    summary: "Scorer automations require scorers, scope = \"span\", and either root = true or span_names. Topics automations require facets and scope = \"trace\"; scorer-specific fields are forbidden.",
 }];
 
 const DATASET_FIELDS: &[FieldDesc] = &[FieldDesc {
@@ -1719,10 +1759,24 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        id: ids::FACET,
+        keyword: "facet",
+        summary: "A named Topics facet with extraction instructions.",
+        syntax: "facet \"<name>\" { prompt = <string> [description = <string>] [no_match_pattern = <string>] }",
+        name: NamePolicy::Required,
+        allowed_in: ROOT_ONLY,
+        body: BodyDesc {
+            fields: FACET_FIELDS,
+            open: false,
+        },
+        rules: FACET_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
         id: ids::AUTOMATION,
         keyword: "automation",
-        summary: "A named online scoring rule binding pushed scorer functions to root or named spans.",
-        syntax: "automation \"<name>\" { type = \"scorer\" scorers = [\"<scorer>\"] scope = \"span\" (root = true | span_names = [\"<span>\"]) [sampling_rate = <number>] [enabled = <boolean>] }",
+        summary: "A named scorer or Topics automation.",
+        syntax: "automation \"<name>\" { type = \"scorer\" scorers = [\"<scorer>\"] scope = \"span\" (root = true | span_names = [\"<span>\"]) [sampling_rate = <number>] [enabled = <boolean>] } | automation \"<name>\" { type = \"topics\" facets = [\"<facet>\"] scope = \"trace\" [sampling_rate = <number>] [enabled = <boolean>] }",
         name: NamePolicy::Required,
         allowed_in: ROOT_ONLY,
         body: BodyDesc {
@@ -1823,7 +1877,7 @@ pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
 const RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::NONEMPTY_SHAPE,
-        summary: "A shape must declare at least one trace, scorer, automation, or dataset block.",
+        summary: "A shape must declare at least one trace, scorer, facet, automation, or dataset block.",
     },
     RuleDesc {
         id: ids::RESERVED_METRICS,
