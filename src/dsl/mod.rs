@@ -10,17 +10,49 @@ pub(crate) mod spec;
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use filter::WriteFilter;
 pub(crate) use model::{
-    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase, DatasetSource, Field,
-    Func, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer,
-    ScorerArg, ScorerKind, ScorerLang, ScorerStep, Selection, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value,
+    Accessor, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
+    DatasetSource, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat,
+    ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerStep, Selection, SpanFields, SpanKind, Step, Template, Trace,
+    UnaryOp, Value,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
 
 pub(crate) fn compile(src: &str) -> Result<Model, Diags> {
+    compile_module(src, false)
+}
+
+pub(crate) fn compile_module(src: &str, allow_empty: bool) -> Result<Model, Diags> {
     let tokens = tracing::info_span!("lex").in_scope(|| lex(src))?;
     let ast = tracing::info_span!("parse").in_scope(|| parse(tokens, src))?;
+    if allow_empty && ast.decls.is_empty() {
+        return Ok(Model::default());
+    }
     tracing::info_span!("model").in_scope(|| model(ast))
+}
+
+// just read the path, the caller decides what it means
+pub(crate) fn parse_traversal(src: &str) -> Result<Vec<String>, Diags> {
+    fn segments(expr: ast::Expr) -> Result<Vec<String>, Diags> {
+        let range = expr.range;
+        match expr.kind {
+            ast::ExprKind::Ref { path } => Ok(path),
+            ast::ExprKind::Index { target, index } if matches!(index.kind, ast::ExprKind::Str(_)) => {
+                let mut path = segments(*target)?;
+                let ast::ExprKind::Str(name) = index.kind else {
+                    unreachable!()
+                };
+                path.push(name);
+                Ok(path)
+            }
+            _ => Err(vec![Diag {
+                when: DiagPhase::Parsing,
+                what: "expected a traversal with dotted or quoted bracket segments".to_owned(),
+                r#where: range,
+            }]),
+        }
+    }
+    segments(parser::parse_expression(lex(src)?, src)?)
 }
 
 #[cfg(test)]
@@ -55,6 +87,45 @@ mod tests {
         let errors = compile(source).unwrap_err();
         assert!(errors.iter().any(|error| error.what.contains("unknown scorer \"missing\"")));
         assert!(errors.iter().any(|error| error.what.contains("set either root = true")));
+    }
+
+    #[test]
+    fn models_facets_and_topics_automations() {
+        let model = compile(
+            r#"
+            facet "Churn risk" { prompt = "Summarize risk." description = "Retention" no_match_pattern = "^NONE$" }
+            automation "topics" { type = "topics" facets = ["Churn risk"] scope = "trace" enabled = false sampling_rate = 0.25 }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(model.facets[0].prompt, "Summarize risk.");
+        assert_eq!(model.facets[0].description.as_deref(), Some("Retention"));
+        assert_eq!(model.facets[0].no_match_pattern.as_deref(), Some("^NONE$"));
+        assert!(matches!(&model.automations[0].kind, AutomationKind::Topics { facets } if facets == &["Churn risk"]));
+        assert!(!model.automations[0].enabled);
+        assert_eq!(model.automations[0].sampling_rate, 0.25);
+        assert!(compile(r#"facet "only" { prompt = "Extract." }"#).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_facets_and_type_specific_automation_fields() {
+        for source in [
+            r#"facet "f" { prompt = "" }"#,
+            r#"facet "f" { prompt = uuid() }"#,
+            r#"facet "f" { description = "No prompt" }"#,
+            r#"facet "f" { prompt = "x" prompt = "y" }"#,
+            r#"facet "f" { prompt = "x" } facet "f" { prompt = "y" }"#,
+            r#"automation "a" { type = "topics" facets = ["missing"] scope = "trace" }"#,
+            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f"] scope = "span" }"#,
+            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f"] scope = "trace" root = false }"#,
+            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = [] scope = "trace" }"#,
+            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f", "f"] scope = "trace" }"#,
+            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f"] }"#,
+            r#"automation "a" { type = "topics" scope = "trace" }"#,
+            r#"scorer "s" { code { score = 1 } } automation "a" { type = "scorer" scorers = ["s"] facets = ["f"] scope = "span" root = true }"#,
+        ] {
+            assert!(compile(source).is_err(), "{source}");
+        }
     }
 
     #[test]

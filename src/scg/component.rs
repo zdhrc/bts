@@ -2,7 +2,7 @@ use super::emit;
 use crate::dsl::{Part, Value};
 
 // braintrust function slugs: lowercase alphanumeric runs joined by hyphens
-pub(super) fn slugify(name: &str) -> Option<String> {
+pub(crate) fn slugify(name: &str) -> Option<String> {
     let mut slug = String::with_capacity(name.len());
     let mut gap = false;
     for part in name.chars() {

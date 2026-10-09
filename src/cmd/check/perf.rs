@@ -91,7 +91,7 @@ impl Args {
                             },
                             other => Error::Generate(other),
                         })?;
-                    let stats = crate::cmd::client::writer::pack_stats(&events).map_err(Error::Pack)?;
+                    let stats = crate::cmd::shared::client::writer::pack_stats(&events).map_err(Error::Pack)?;
                     recorder.record("total", started.elapsed());
                     summary = Some(Summary {
                         event_count: events.event_count(),
@@ -298,7 +298,7 @@ pub enum Error {
     Invalid { details: String },
     FailedGeneration { details: String },
     Generate(sdg::Error),
-    Pack(crate::cmd::client::writer::Error),
+    Pack(crate::cmd::shared::client::writer::Error),
 }
 
 impl fmt::Display for Error {

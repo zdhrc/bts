@@ -56,10 +56,13 @@ impl Client {
         } else {
             url.to_owned()
         };
-        let authenticated = match (reqwest::Url::parse(&url), reqwest::Url::parse(&self.config.api_url)) {
-            (Ok(target), Ok(api)) => target.origin() == api.origin(),
-            _ => false,
-        };
+        let authenticated = reqwest::Url::parse(&url).ok().is_some_and(|target| {
+            [&self.config.api_url, &self.config.app_url].iter().any(|base| {
+                reqwest::Url::parse(base)
+                    .ok()
+                    .is_some_and(|configured| target.origin() == configured.origin())
+            })
+        });
         let safe = method == Method::GET || method == Method::HEAD;
         let mut inner = self.http.request(method, url);
         if authenticated {
@@ -83,6 +86,9 @@ impl Client {
     }
     pub(crate) fn patch(&self, url: impl AsRef<str>) -> Request {
         self.request(Method::PATCH, url)
+    }
+    pub(crate) fn delete(&self, url: impl AsRef<str>) -> Request {
+        self.request(Method::DELETE, url)
     }
     pub(crate) fn signed_get(&self, url: &str) -> Request {
         Request {
@@ -425,6 +431,27 @@ pub(crate) mod tests {
         assert!(matches!(client.get("/second").send(), Err(Error::Deadline)));
         assert!(start.elapsed() < Duration::from_secs(1));
     }
+    #[test]
+    fn configured_app_origin_receives_auth_but_unrelated_origins_do_not() {
+        for trusted in [true, false] {
+            let (mut client, requests) = serve(vec![Reply::json(serde_json::json!({}))]);
+            let url = client.config.api_url.clone();
+            client.config.api_url = "http://127.0.0.1:1".to_owned();
+            if trusted {
+                client.config.app_url = url.clone();
+            }
+            client
+                .post(format!("{url}/api/project_automation/get"))
+                .json(&serde_json::json!({}))
+                .send()
+                .unwrap();
+            assert_eq!(
+                requests.recv().unwrap().to_ascii_lowercase().contains("authorization:"),
+                trusted
+            );
+        }
+    }
+
     #[test]
     fn signed_requests_omit_api_auth_even_on_the_api_origin() {
         let (client, requests) = serve(vec![Reply::json(serde_json::json!({}))]);

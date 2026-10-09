@@ -1,10 +1,10 @@
 use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
-    Accessor, Array, ArrayElem, Automation, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase, DatasetSource, Field,
-    Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat,
-    ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan, ScorerStep, Selection, Span, SpanFields, SpanKind,
-    Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
+    Accessor, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
+    DatasetSource, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part,
+    Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan, ScorerStep, Selection, Span,
+    SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
 };
 use crate::dsl::spec;
 use std::{
@@ -337,6 +337,7 @@ impl Modeler {
         let mut scorers = Vec::new();
         let mut scorer_names_seen = HashSet::new();
         let mut automations = Vec::new();
+        let mut facets = Vec::new();
         let mut datasets = Vec::new();
 
         // collect vars first so refs work no matter the decl order
@@ -383,6 +384,11 @@ impl Modeler {
                             }
                             scorers.push(scorer);
                         }
+                    } else if desc.id == spec::ids::FACET && desc.allows(spec::Place::Root) {
+                        let range = block.range;
+                        if let Some(facet) = self.model_facet(block, desc) {
+                            facets.push((facet, range));
+                        }
                     } else if desc.id == spec::ids::AUTOMATION && desc.allows(spec::Place::Root) {
                         let range = block.range;
                         if let Some(automation) = self.model_automation(block, desc) {
@@ -421,20 +427,31 @@ impl Modeler {
                     .push(Error::new(ErrorKind::UnknownScorerReference { name: name.clone() }, *range));
             }
         }
+        let mut facet_names = HashSet::new();
+        for (facet, range) in &facets {
+            if !facet_names.insert(facet.name.as_str()) {
+                self.facet_error(format!("duplicate facet name {:?}", facet.name), *range);
+            }
+        }
         let mut automation_names = HashSet::new();
         for (automation, range) in &automations {
             if !automation_names.insert(automation.name.as_str()) {
                 self.automation_error(format!("duplicate automation name {:?}", automation.name), *range);
             }
-            for scorer in &automation.scorers {
-                if !scorer_names.contains(scorer.as_str()) {
+            let (names, known, label) = match &automation.kind {
+                AutomationKind::Scorer { scorers, .. } => (scorers, &scorer_names, "scorer"),
+                AutomationKind::Topics { facets } => (facets, &facet_names, "facet"),
+            };
+            for name in names {
+                if !known.contains(name.as_str()) {
                     self.automation_error(
-                        format!("unknown scorer {scorer:?}; declare a scorer block in this source"),
+                        format!("unknown {label} {name:?}; declare a {label} block in this source"),
                         *range,
                     );
                 }
             }
         }
+
         let mut dataset_names = HashSet::new();
         for (dataset, range) in &datasets {
             if !dataset_names.insert(dataset.name.as_str()) {
@@ -527,7 +544,13 @@ impl Modeler {
             }
         });
 
-        if traces.is_empty() && scorers.is_empty() && automations.is_empty() && datasets.is_empty() && self.errors.is_empty() {
+        if traces.is_empty()
+            && scorers.is_empty()
+            && facets.is_empty()
+            && automations.is_empty()
+            && datasets.is_empty()
+            && self.errors.is_empty()
+        {
             self.errors.push(Error::new(
                 ErrorKind::EmptyShape {
                     rule: spec::ids::NONEMPTY_SHAPE,
@@ -542,6 +565,7 @@ impl Modeler {
                 bindings,
                 refs,
                 scorers,
+                facets: facets.into_iter().map(|(facet, _)| facet).collect(),
                 automations: automations.into_iter().map(|(automation, _)| automation).collect(),
                 datasets: datasets.into_iter().map(|(dataset, _)| dataset).collect(),
             })
@@ -570,6 +594,82 @@ impl Modeler {
             fields,
             bindings,
             children,
+        })
+    }
+
+    fn facet_error(&mut self, reason: String, range: SrcRange) {
+        self.errors.push(Error::new(
+            ErrorKind::InvalidFacet {
+                rule: spec::ids::FACET_DEFINITION,
+                reason,
+            },
+            range,
+        ));
+    }
+
+    fn model_facet(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Facet> {
+        let ast::Block { name, decls, range, .. } = block;
+        let name = self.model_name(name, range, desc);
+        let mut seen = HashSet::new();
+        let mut values = HashMap::new();
+        for decl in decls {
+            let ast::Decl::Attr(attr) = decl else {
+                self.facet_error("facet blocks cannot contain child blocks".to_owned(), range);
+                continue;
+            };
+            let Some(field) = desc.field(&attr.key) else {
+                self.errors.push(Error::new(
+                    ErrorKind::UnknownField {
+                        block: desc.id,
+                        keyword: attr.key,
+                    },
+                    attr.range,
+                ));
+                continue;
+            };
+            if !seen.insert(field.id) {
+                self.errors.push(Error::new(
+                    ErrorKind::DuplicateField {
+                        block: desc.id,
+                        field: field.id,
+                    },
+                    attr.range,
+                ));
+                continue;
+            }
+            let Some(value) = self.fold_expr(attr.value) else { continue };
+            match value.into_value() {
+                Value::Str(value) if field.id != spec::ids::PROMPT || !value.trim().is_empty() => {
+                    values.insert(field.id, value);
+                }
+                _ => self.facet_error(
+                    format!(
+                        "{} must be a constant string{}",
+                        field.keyword,
+                        if field.id == spec::ids::PROMPT {
+                            " and must not be empty"
+                        } else {
+                            ""
+                        }
+                    ),
+                    attr.range,
+                ),
+            }
+        }
+        if !seen.contains(&spec::ids::PROMPT) {
+            self.errors.push(Error::new(
+                ErrorKind::MissingField {
+                    block: desc.id,
+                    field: spec::ids::PROMPT,
+                },
+                range,
+            ));
+        }
+        Some(Facet {
+            name: name?,
+            prompt: values.remove(&spec::ids::PROMPT)?,
+            description: values.remove(&spec::ids::DESCRIPTION),
+            no_match_pattern: values.remove(&spec::ids::NO_MATCH_PATTERN),
         })
     }
 
@@ -736,6 +836,7 @@ impl Modeler {
         let mut seen = HashSet::new();
         let mut kind = None;
         let mut scorers = None;
+        let mut facets = None;
         let mut scope = None;
         let mut root = None;
         let mut span_names = None;
@@ -790,6 +891,7 @@ impl Modeler {
             match field.id {
                 id if id == spec::ids::TYPE => kind = self.automation_string(value, field.keyword, attr.range),
                 id if id == spec::ids::SCORERS => scorers = self.automation_strings(value, field.keyword, attr.range),
+                id if id == spec::ids::FACETS => facets = self.automation_strings(value, field.keyword, attr.range),
                 id if id == spec::ids::SCOPE => scope = self.automation_string(value, field.keyword, attr.range),
                 id if id == spec::ids::ROOT => root = self.automation_bool(value, field.keyword, attr.range),
                 id if id == spec::ids::SPAN_NAMES => span_names = self.automation_strings(value, field.keyword, attr.range),
@@ -823,27 +925,63 @@ impl Modeler {
                 ));
             }
         }
-        if kind.as_deref().is_some_and(|value| value != "scorer") {
-            self.automation_error("type must be \"scorer\"".to_owned(), range);
-        }
-        if scope.as_deref().is_some_and(|value| value != "span") {
-            self.automation_error("scope must be \"span\"".to_owned(), range);
-        }
-        if root == Some(true) && span_names.is_some() || root != Some(true) && span_names.is_none() {
-            self.automation_error("set either root = true or a nonempty span_names array".to_owned(), range);
-        }
-
-        match (name, kind, scorers, scope) {
-            (Some(name), Some(kind), Some(scorers), Some(scope)) if kind == "scorer" && scope == "span" => Some(Automation {
-                name,
-                scorers,
-                root: root.unwrap_or(false),
-                span_names: span_names.unwrap_or_default(),
-                sampling_rate: sampling_rate.unwrap_or(1.0),
-                enabled: enabled.unwrap_or(true),
-            }),
-            _ => None,
-        }
+        let automation_kind = match kind.as_deref() {
+            Some("scorer") => {
+                if seen.contains(&spec::ids::FACETS) {
+                    self.automation_error("facets is only valid for topics automations".to_owned(), range);
+                }
+                if scope.as_deref().is_some_and(|value| value != "span") {
+                    self.automation_error("scorer scope must be \"span\"".to_owned(), range);
+                }
+                if root == Some(true) && span_names.is_some() || root != Some(true) && span_names.is_none() {
+                    self.automation_error("set either root = true or a nonempty span_names array".to_owned(), range);
+                }
+                if !seen.contains(&spec::ids::SCORERS) {
+                    self.automation_error("scorer automations require scorers".to_owned(), range);
+                }
+                scorers.map(|scorers| AutomationKind::Scorer {
+                    scorers,
+                    root: root.unwrap_or(false),
+                    span_names: span_names.unwrap_or_default(),
+                })
+            }
+            Some("topics") => {
+                for field in [spec::ids::SCORERS, spec::ids::ROOT, spec::ids::SPAN_NAMES] {
+                    if seen.contains(&field) {
+                        self.automation_error(
+                            format!(
+                                "{} is only valid for scorer automations",
+                                desc.body
+                                    .fields
+                                    .iter()
+                                    .find(|candidate| candidate.id == field)
+                                    .expect("automation field")
+                                    .keyword
+                            ),
+                            range,
+                        );
+                    }
+                }
+                if scope.as_deref().is_some_and(|value| value != "trace") {
+                    self.automation_error("topics scope must be \"trace\"".to_owned(), range);
+                }
+                if !seen.contains(&spec::ids::FACETS) {
+                    self.automation_error("topics automations require facets".to_owned(), range);
+                }
+                facets.map(|facets| AutomationKind::Topics { facets })
+            }
+            Some(_) => {
+                self.automation_error("type must be \"scorer\" or \"topics\"".to_owned(), range);
+                None
+            }
+            None => None,
+        };
+        Some(Automation {
+            name: name?,
+            kind: automation_kind?,
+            sampling_rate: sampling_rate.unwrap_or(1.0),
+            enabled: enabled.unwrap_or(true),
+        })
     }
 
     fn automation_string(&mut self, value: Value, field: &str, range: SrcRange) -> Option<String> {
@@ -6263,6 +6401,10 @@ pub(super) enum ErrorKind {
     InvalidJudgeOptions {
         rule: spec::Id,
     },
+    InvalidFacet {
+        rule: spec::Id,
+        reason: String,
+    },
     InvalidAutomation {
         rule: spec::Id,
         reason: String,
@@ -6463,7 +6605,7 @@ impl fmt::Display for ErrorKind {
                 let rule = rule_desc(*rule);
                 write!(
                     formatter,
-                    "shape declares no traces, scorers, or automations; {}",
+                    "shape declares no traces, scorers, facets, automations, or datasets; {}",
                     rule.summary
                 )
             }
@@ -6747,7 +6889,7 @@ impl fmt::Display for ErrorKind {
                     rule.summary
                 )
             }
-            Self::InvalidAutomation { rule, reason } => {
+            Self::InvalidFacet { rule, reason } | Self::InvalidAutomation { rule, reason } => {
                 write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
             }
             Self::InvalidDataset { rule, reason } => {

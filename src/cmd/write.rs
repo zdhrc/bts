@@ -186,12 +186,12 @@ impl Args {
             return Ok(());
         }
 
-        let client = crate::cmd::client::Client::configured(Braintrust::load()?, settings)
-            .map_err(|error| Error::Write(crate::cmd::client::writer::client_error(error)))?;
+        let client = crate::cmd::shared::client::Client::configured(Braintrust::load()?, settings)
+            .map_err(|error| Error::Write(crate::cmd::shared::client::writer::client_error(error)))?;
         let config = &client.config;
         tracing::info!(project_id = %config.project_id, api_url = %config.api_url, "writing to braintrust");
-        let inserted =
-            tracing::info_span!("write").in_scope(|| crate::cmd::client::writer::write_with_client(&client, &events))?;
+        let inserted = tracing::info_span!("write")
+            .in_scope(|| crate::cmd::shared::client::writer::write_with_client(&client, &events))?;
         tracing::info!(
             traces = events.trace_count(),
             events = events.event_count(),
@@ -279,7 +279,7 @@ pub enum Error {
     FailedGeneration { details: String },
     Generate(sdg::Error),
     Config(crate::conf::Error),
-    Write(crate::cmd::client::writer::Error),
+    Write(crate::cmd::shared::client::writer::Error),
     Encode(serde_json::Error),
 }
 
@@ -323,8 +323,8 @@ impl From<crate::conf::Error> for Error {
     }
 }
 
-impl From<crate::cmd::client::writer::Error> for Error {
-    fn from(source: crate::cmd::client::writer::Error) -> Self {
+impl From<crate::cmd::shared::client::writer::Error> for Error {
+    fn from(source: crate::cmd::shared::client::writer::Error) -> Self {
         Self::Write(source)
     }
 }

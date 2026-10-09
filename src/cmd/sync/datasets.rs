@@ -1,6 +1,10 @@
 use crate::cmd::{
-    client::{self, Client, attachments::Comparison, writer},
     render_diags,
+    shared::{
+        client::{self, Client, attachments::Comparison, writer},
+        select,
+        state::{ResourceKind, SyncState, TrackedResource},
+    },
 };
 use crate::conf::{Braintrust, Settings};
 use crate::dsl::{self, Accessor, Child, Dataset, DatasetSource, Model, NodeId, RefId, WriteFilter};
@@ -22,25 +26,38 @@ pub struct Args {
     /// show the reconciliation without writing to Braintrust
     #[arg(long)]
     dry_run: bool,
+    /// select a dataset, repeat for more
+    #[arg(long, value_name = "TRAVERSAL")]
+    select: Vec<select::ResourceSelector>,
 }
 impl Args {
     pub fn run(self) -> Result<(), Error> {
         let source = fs::read_to_string(&self.from).map_err(other)?;
-        let model =
-            dsl::compile(&source).map_err(|diags| other(render_diags(&self.from.display().to_string(), &source, &diags)))?;
-        if model.datasets.is_empty() {
+        let model = dsl::compile_module(&source, true)
+            .map_err(|diags| other(render_diags(&self.from.display().to_string(), &source, &diags)))?;
+        let client = Client::configured(Braintrust::load().map_err(other)?, &Settings::load().map_err(other)?)?;
+        let mut state = SyncState::load(&self.from, &client.config.project_id.to_string(), self.dry_run).map_err(other)?;
+        let (datasets, selected) = state.datasets(&model, &self.select).map_err(other)?;
+        let removals = state.removals(&model, &ResourceKind::Dataset, &selected, self.select.is_empty());
+        if datasets.is_empty() && removals.is_empty() {
             return Err(other("module declares no dataset blocks"));
         }
-        let client = Client::configured(Braintrust::load().map_err(other)?, &Settings::load().map_err(other)?)?;
         // prepare every local case before accessing remote state
-        let mut prepared = model
-            .datasets
+        let mut prepared = datasets
             .iter()
             .map(|dataset| prepare(dataset, &model, &client.config, &self.from))
             .collect::<Result<Vec<_>, _>>()?;
         let mut comparison = Comparison::default();
-        for (dataset, plans) in model.datasets.iter().zip(&mut prepared) {
-            reconcile(dataset, plans, &client, &mut comparison, self.dry_run)?;
+        for (dataset, plans) in datasets.iter().zip(&mut prepared) {
+            reconcile(dataset, plans, &client, &mut comparison, self.dry_run, Some(&mut state))?;
+        }
+        for resource in &removals {
+            state.delete(&client, resource, self.dry_run).map_err(other)?;
+        }
+        if !self.dry_run {
+            state
+                .removed(&removals, &model, &ResourceKind::Dataset, &selected)
+                .map_err(other)?;
         }
         Ok(())
     }
@@ -199,6 +216,7 @@ fn reconcile(
     client: &Client,
     comparison: &mut Comparison,
     dry_run: bool,
+    mut state: Option<&mut SyncState>,
 ) -> Result<(), Error> {
     for case in plans.iter() {
         writer::validate_attachments(client, &case.data.attachments).map_err(other)?;
@@ -233,10 +251,26 @@ fn reconcile(
         .map(|remote| {
             remote["id"]
                 .as_str()
+                .filter(|id| !id.is_empty())
                 .map(str::to_owned)
                 .ok_or_else(|| other("dataset has no id"))
         })
         .transpose()?;
+    if let Some(state) = state.as_deref_mut() {
+        state
+            .stage(TrackedResource {
+                kind: ResourceKind::Dataset,
+                name: dataset.name.clone(),
+                slug: None,
+                id: dataset_id.clone(),
+                dependencies: Vec::new(),
+                pending: None,
+            })
+            .map_err(other)?;
+        if !dry_run {
+            state.save().map_err(other)?;
+        }
+    }
     let rows = match &dataset_id {
         Some(id) => fetch_rows(client, id)?,
         None => HashMap::new(),
@@ -334,10 +368,20 @@ fn reconcile(
         dataset_id = Some(
             created["id"]
                 .as_str()
+                .filter(|id| !id.is_empty())
                 .ok_or_else(|| other("created dataset has no id"))?
                 .to_owned(),
         );
         println!("created dataset {:?}", dataset.name);
+        if let Some(state) = state {
+            state
+                .complete(
+                    &ResourceKind::Dataset,
+                    &dataset.name,
+                    dataset_id.as_deref().expect("created dataset id"),
+                )
+                .map_err(other)?;
+        }
     } else if description_changed {
         client::checked(
             client
@@ -832,7 +876,7 @@ fn reparent(local: &[Value], remote: &[Value], deleted: &[Value]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::client::tests::{Reply, serve};
+    use crate::cmd::shared::client::tests::{Reply, serve};
     #[test]
     fn batches_trace_reads_and_follows_header_cursors_past_one_thousand_spans() {
         let first = (0..1000)
@@ -904,7 +948,7 @@ mod tests {
         ]);
         client.config.project_id = uuid::Uuid::nil();
         let (dataset, mut plans) = inline_plan(&client);
-        reconcile(&dataset, &mut plans, &client, &mut Comparison::default(), false).unwrap();
+        reconcile(&dataset, &mut plans, &client, &mut Comparison::default(), false, None).unwrap();
         assert!(requests.recv().unwrap().starts_with("GET /v1/dataset?"));
         assert!(requests.recv().unwrap().starts_with("GET /v1/dataset/dataset/fetch?"));
         let upsert = requests.recv().unwrap();
@@ -927,7 +971,7 @@ mod tests {
         ]);
         client.config.retry_attempts = 1;
         let (dataset, mut plans) = inline_plan(&client);
-        assert!(reconcile(&dataset, &mut plans, &client, &mut Comparison::default(), false).is_err());
+        assert!(reconcile(&dataset, &mut plans, &client, &mut Comparison::default(), false, None).is_err());
         for _ in 0..3 {
             assert!(!requests.recv().unwrap().contains("_object_delete"));
         }
@@ -959,7 +1003,17 @@ mod tests {
             },
         ]);
         client.config.retry_attempts = 1;
-        assert!(reconcile(&model.datasets[0], &mut plans, &client, &mut Comparison::default(), false).is_err());
+        assert!(
+            reconcile(
+                &model.datasets[0],
+                &mut plans,
+                &client,
+                &mut Comparison::default(),
+                false,
+                None
+            )
+            .is_err()
+        );
         for _ in 0..5 {
             assert!(!requests.recv().unwrap().contains("_object_delete"));
         }

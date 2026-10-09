@@ -836,7 +836,7 @@ mod tests {
         let mut config = Braintrust::new("secret".to_owned(), project_id);
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(1);
-        let model = compile(include_str!("../../../tests/fixtures/simple.bt")).unwrap();
+        let model = compile(include_str!("../../../../tests/fixtures/simple.bt")).unwrap();
         let events = materialize(
             plan(model, 1, 0).unwrap(),
             Duration::from_secs(3_600),

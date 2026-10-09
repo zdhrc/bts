@@ -1,6 +1,6 @@
 use crate::dsl::diag::SrcRange;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Model {
     pub(crate) traces: Vec<Trace>,
     // root-scope bindings, evaluated once per generated trace before its own
@@ -11,6 +11,7 @@ pub(crate) struct Model {
     // root scorer blocks in declaration order, consumed by scg rather than sdg
     pub(crate) scorers: Vec<Scorer>,
     pub(crate) automations: Vec<Automation>,
+    pub(crate) facets: Vec<Facet>,
     pub(crate) datasets: Vec<Dataset>,
 }
 
@@ -204,13 +205,31 @@ pub(crate) struct Scorer {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct Facet {
+    pub(crate) name: String,
+    pub(crate) prompt: String,
+    pub(crate) description: Option<String>,
+    pub(crate) no_match_pattern: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct Automation {
     pub(crate) name: String,
-    pub(crate) scorers: Vec<String>,
-    pub(crate) root: bool,
-    pub(crate) span_names: Vec<String>,
+    pub(crate) kind: AutomationKind,
     pub(crate) sampling_rate: f64,
     pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum AutomationKind {
+    Scorer {
+        scorers: Vec<String>,
+        root: bool,
+        span_names: Vec<String>,
+    },
+    Topics {
+        facets: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
