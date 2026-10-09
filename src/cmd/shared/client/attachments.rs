@@ -154,7 +154,7 @@ fn hash(mut reader: impl Read) -> Result<(u64, Vec<u8>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::client::tests::{Reply, serve};
+    use crate::cmd::shared::client::tests::{Reply, serve};
     use serde_json::json;
     fn attachment() -> Attachment {
         let path = std::env::temp_dir().join(format!("bts-compare-{}", uuid::Uuid::new_v4()));

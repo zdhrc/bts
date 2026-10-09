@@ -1,9 +1,9 @@
 mod build;
 mod check;
-pub(crate) mod client;
 mod init;
 mod logging;
 mod setup;
+pub(crate) mod shared;
 mod spec;
 mod sync;
 mod update;

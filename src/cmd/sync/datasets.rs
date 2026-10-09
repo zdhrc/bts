@@ -1,5 +1,5 @@
 use crate::cmd::{
-    client::{self, Client, attachments::Comparison, writer},
+    shared::client::{self, Client, attachments::Comparison, writer},
     render_diags,
 };
 use crate::conf::{Braintrust, Settings};
@@ -832,7 +832,7 @@ fn reparent(local: &[Value], remote: &[Value], deleted: &[Value]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::client::tests::{Reply, serve};
+    use crate::cmd::shared::client::tests::{Reply, serve};
     #[test]
     fn batches_trace_reads_and_follows_header_cursors_past_one_thousand_spans() {
         let first = (0..1000)

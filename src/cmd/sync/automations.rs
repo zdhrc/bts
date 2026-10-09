@@ -1,4 +1,4 @@
-use crate::cmd::client::Client;
+use crate::cmd::shared::client::Client;
 use crate::cmd::render_diags;
 use crate::conf::{Braintrust, Settings};
 use crate::dsl::{self, Automation};
@@ -215,7 +215,7 @@ fn single(mut objects: Vec<Value>, kind: &str, name: &str) -> Result<Option<Valu
     Ok(objects.pop())
 }
 
-fn check_response(response: crate::cmd::client::Response, context: &str) -> Result<Value, Error> {
+fn check_response(response: crate::cmd::shared::client::Response, context: &str) -> Result<Value, Error> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().map_err(|error| Error::Http(error.into()))?;
@@ -234,7 +234,7 @@ pub enum Error {
     NoAutomations,
     ScorerPlan(scg::Error),
     Config(crate::conf::Error),
-    Http(crate::cmd::client::Error),
+    Http(crate::cmd::shared::client::Error),
     MissingScorer(String),
     Api(String),
 }
