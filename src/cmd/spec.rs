@@ -39,18 +39,29 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts build --from shape.bt"],
         },
         CommandDesc {
-            path: &["sync", "automations"],
+            path: &["sync", "automation", "scorers"],
             guidance: &[
-                "Push scorer functions before syncing automations that reference them. Use `--dry-run` to review the proposed changes.",
+                "Push scorer functions before syncing automations that reference them. Use `--dry-run` to review the proposed changes. --select accepts scorer or automation traversals; repeat it to select multiple resources. Matching automations are synced in full.",
             ],
-            examples: &["bts sync automations --from shape.bt --dry-run"],
+            examples: &["bts sync automation scorers --from shape.bt --select 'scorer.brand' --dry-run"],
+        },
+        CommandDesc {
+            path: &["sync", "automation", "topics"],
+            guidance: &[
+                "Sync referenced facet definitions, their topic maps, and Topics automations. No scorer build or push is required. Use --dry-run to review without writes.",
+                "Sync reconciles resources previously managed from the same source path and selected project; locally removed definitions are deleted remotely after successful updates. All sync commands share .bt/bts/state.json, grouped by project ID and shape path. Keep this state for removal and recovery tracking; content comparisons read Braintrust.",
+                "Prompt changes apply to future traces by default. Add --regenerate to reprocess the existing Topics lookback window for automations whose referenced facet prompt changed. Interrupted regeneration is resumed on the next sync.",
+                "--select accepts facet or automation traversals; repeat it to select multiple resources. Matching automations are synced in full, with all their dependencies. Omitting --select syncs all Topics automations.",
+            ],
+            examples: &["bts sync automation topics --from shape.bt --select 'facet[\"Churn risk\"]' --dry-run"],
         },
         CommandDesc {
             path: &["sync", "datasets"],
             guidance: &[
-                "A dataset block may set `description` and contain named cases. Use typed module references such as `trace[\"name\"]` for sources. Sync reconciles all rows, including deleting cases absent locally, and writes changed source traces before their rows. Use `--dry-run` to review changes.",
+                "Removing a previously synced dataset block deletes its remote dataset on the next sync. .bt/bts/state.json tracks ownership by project ID and shape path. Definitions shared by another shape are retained. An empty shape can remove all datasets previously synced from it; --select can address a previously synced dataset that is now absent locally. Dry runs do not write state.",
+                "A dataset block may set `description` and contain named cases. Use typed module references such as `trace[\"name\"]` for sources. Sync reconciles all rows, including deleting cases absent locally, and writes changed source traces before their rows. Use `--dry-run` to review changes. --select accepts a dataset traversal, such as dataset.regressions or dataset[\"Regression cases\"]; repeat it to select multiple datasets. Only selected datasets and their required source traces are reconciled.",
             ],
-            examples: &["bts sync datasets --from shape.bt --dry-run"],
+            examples: &["bts sync datasets --from shape.bt --select 'dataset.regressions' --dry-run"],
         },
         CommandDesc {
             path: &["check", "perf"],

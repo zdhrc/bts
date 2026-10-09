@@ -1,16 +1,16 @@
-mod automations;
+mod automation;
 mod datasets;
 
 #[derive(Debug)]
 pub enum Error {
-    Automations(automations::Error),
+    Automation(automation::Error),
     Datasets(datasets::Error),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Automations(error) => error.fmt(f),
+            Self::Automation(error) => error.fmt(f),
             Self::Datasets(error) => error.fmt(f),
         }
     }
@@ -27,8 +27,8 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Cmd {
-    /// create or update online scoring rules for pushed scorers
-    Automations(automations::Args),
+    /// sync scorer or Topics automations
+    Automation(automation::Command),
     /// create or update datasets and their generated trace sources
     Datasets(datasets::Args),
 }
@@ -36,7 +36,7 @@ enum Cmd {
 impl Args {
     pub fn run(self) -> Result<(), Error> {
         match self.command {
-            Cmd::Automations(args) => args.run().map_err(Error::Automations),
+            Cmd::Automation(args) => args.run().map_err(Error::Automation),
             Cmd::Datasets(args) => args.run().map_err(Error::Datasets),
         }
     }

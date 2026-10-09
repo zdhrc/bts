@@ -17,6 +17,7 @@ const DEFAULT_KEPT_RUNS: usize = 20;
 #[derive(Clone)]
 pub(crate) struct Braintrust {
     pub(crate) api_url: String,
+    pub(crate) app_url: String,
     pub(crate) api_key: String,
     pub(crate) project_id: Uuid,
     pub(crate) request_timeout: Duration,
@@ -32,6 +33,7 @@ impl Braintrust {
     pub(crate) fn new(api_key: String, project_id: Uuid) -> Self {
         Self {
             api_url: BRAINTRUST_API_URL.to_owned(),
+            app_url: "https://www.braintrust.dev".to_owned(),
             api_key,
             project_id,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -51,6 +53,10 @@ impl Braintrust {
 
         if let Some(api_url) = env::var_os("BRAINTRUST_API_URL").filter(|value| !value.is_empty()) {
             config.api_url = api_url.to_string_lossy().into_owned();
+        }
+
+        if let Some(app_url) = env::var_os("BRAINTRUST_APP_URL").filter(|value| !value.is_empty()) {
+            config.app_url = app_url.to_string_lossy().into_owned();
         }
 
         Ok(config)

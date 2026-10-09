@@ -825,7 +825,7 @@ fn sync_automations_resolves_pushed_scorers_and_creates_rules() {
     let (api_url, requests) = serve_json_sequence(replies);
     let output = bts()
         .current_dir(&root)
-        .args(["sync", "automations", "--from"])
+        .args(["sync", "automation", "scorers", "--from"])
         .arg(&shape)
         .env("BRAINTRUST_API_KEY", "test-secret")
         .env("BRAINTRUST_API_URL", api_url)
@@ -870,7 +870,7 @@ fn sync_automations_dry_run_does_not_put_rules() {
     let (api_url, requests) = serve_json_sequence(replies);
     let output = bts()
         .current_dir(&root)
-        .args(["sync", "automations", "--from"])
+        .args(["sync", "automation", "scorers", "--from"])
         .arg(&shape)
         .arg("--dry-run")
         .env("BRAINTRUST_API_KEY", "test-secret")
@@ -916,7 +916,7 @@ fn sync_automations_skips_unchanged_rules_and_updates_changed_bindings() {
     let (api_url, requests) = serve_json_sequence(replies);
     let output = bts()
         .current_dir(&root)
-        .args(["sync", "automations", "--from"])
+        .args(["sync", "automation", "scorers", "--from"])
         .arg(&shape)
         .env("BRAINTRUST_API_KEY", "test-secret")
         .env("BRAINTRUST_API_URL", api_url)
@@ -1078,4 +1078,632 @@ fn split_request(request: &[u8]) -> (&str, &[u8]) {
     let header_end = request.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
     let headers = std::str::from_utf8(&request[..header_end + 4]).unwrap();
     (headers, &request[header_end + 4..])
+}
+
+const TOPICS_SYNC_SHAPE: &str = r#"
+facet "Churn risk" { prompt = "Summarize churn risk." description = "Retention" no_match_pattern = "^NONE$" }
+facet "Ignored" { prompt = "Do not sync this facet." }
+scorer "not-pushed" { code { score = 1 } }
+automation "support-topics" { type = "topics" facets = ["Churn risk"] scope = "trace" }
+automation "other-topics" { type = "topics" facets = ["Ignored"] scope = "trace" }
+automation "score" { type = "scorer" scorers = ["not-pushed"] scope = "span" root = true }
+"#;
+
+fn topic_function(project: Uuid, id: &str, map: bool) -> JsonValue {
+    serde_json::json!({
+        "id": id, "project_id": project.to_string(),
+        "name": if map { "Churn risk topics" } else { "Churn risk" },
+        "slug": if map { "bts-churn-risk-topic-map" } else { "churn-risk" },
+        "function_type": if map { "classifier" } else { "facet" },
+        "description": if map { JsonValue::Null } else { serde_json::json!("Retention") },
+        "function_data": if map {
+            serde_json::json!({ "type": "topic_map", "source_facet": "Churn risk",
+                "source_facet_function": { "type": "function", "id": "facet-id" }, "embedding_model": "brain-embedding-1" })
+        } else {
+            serde_json::json!({ "type": "facet", "prompt": "Summarize churn risk.", "no_match_pattern": "^NONE$" })
+        },
+    })
+}
+
+fn topic_rule(project: Uuid) -> JsonValue {
+    serde_json::json!({ "id": "automation-id", "project_id": project.to_string(), "name": "support-topics",
+        "description": "Keep this description",
+        "config": { "event_type": "topic", "sampling_rate": 1.0, "status": "active",
+            "scope": { "type": "trace", "idle_seconds": 600 }, "data_scope": { "type": "project_logs" },
+            "facet_functions": [{ "type": "function", "id": "facet-id" }],
+            "topic_map_functions": [{ "function": { "type": "function", "id": "map-id" } }],
+            "rerun_seconds": 86400, "backfill_time_range": "1d", "relabel_overlap_seconds": 3600,
+        }
+    })
+}
+
+fn run_topic_sync(project: Uuid, api: &str, dry_run: bool) -> std::process::Output {
+    let root = write_project_context(project);
+    let shape = write_shape(TOPICS_SYNC_SHAPE);
+    let mut command = bts();
+    command
+        .current_dir(&root)
+        .args(["sync", "automation", "topics", "--from"])
+        .arg(&shape)
+        .args([
+            "--select",
+            "facet[\"Churn risk\"]",
+            "--select",
+            "automation[\"support-topics\"]",
+        ])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api)
+        .env("BRAINTRUST_APP_URL", api);
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    let output = command.output().unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    output
+}
+
+#[test]
+fn sync_topics_creates_selected_facets_maps_and_automation_with_real_ids() {
+    let project = Uuid::new_v4();
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!([]),
+        topic_function(project, "facet-id", false),
+        topic_function(project, "map-id", true),
+        serde_json::json!({ "project_automation": topic_rule(project), "found_existing": false }),
+    ]);
+    let output = run_topic_sync(project, &api, false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 6);
+    for (index, path) in [
+        (0, "GET /v1/function?"),
+        (1, "GET /v1/function?"),
+        (2, "POST /api/project_automation/get "),
+        (3, "PUT /v1/function "),
+        (4, "PUT /v1/function "),
+        (5, "POST /api/project_automation/register "),
+    ] {
+        let (headers, _) = split_request(&requests[index]);
+        assert!(headers.starts_with(path), "{headers}");
+        assert!(headers.to_ascii_lowercase().contains("authorization: bearer test-secret"));
+    }
+    let map: JsonValue = serde_json::from_slice(split_request(&requests[4]).1).unwrap();
+    assert_eq!(map["function_data"]["source_facet_function"]["id"], "facet-id");
+    let rule: JsonValue = serde_json::from_slice(split_request(&requests[5]).1).unwrap();
+    assert_eq!(rule["config"]["facet_functions"][0]["id"], "facet-id");
+    assert_eq!(rule["config"]["topic_map_functions"][0]["function"]["id"], "map-id");
+    assert_eq!(rule["config"]["scope"]["type"], "trace");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Ignored"));
+}
+
+#[test]
+fn sync_topics_dry_run_only_reads_and_reports_all_creates() {
+    let project = Uuid::new_v4();
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!([]),
+    ]);
+    let output = run_topic_sync(project, &api, true);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for name in ["Churn risk", "Churn risk topics", "support-topics"] {
+        assert!(stdout.contains(&format!("would create {name}")));
+    }
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(split_request(&requests[2]).0.starts_with("POST /api/project_automation/get "));
+}
+
+#[test]
+fn sync_topics_skips_unchanged_resources_and_preserves_generated_maps() {
+    let project = Uuid::new_v4();
+    let mut facet = topic_function(project, "facet-id", false);
+    facet["function_data"]["preprocessor"] =
+        serde_json::json!({ "type": "global", "name": "thread", "function_type": "preprocessor" });
+    let mut map = topic_function(project, "map-id", true);
+    map["function_data"]["bundle_key"] = serde_json::json!("existing-bundle");
+    map["function_data"]["report_key"] = serde_json::json!("existing-report");
+    map["function_data"]["generation_settings"] =
+        serde_json::json!({ "algorithm": "kmeans", "dimension_reduction": "pca", "n_clusters": 8 });
+    let mut rule = topic_rule(project);
+    rule["config"]["sampling_rate"] = serde_json::json!(1);
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({ "objects": [facet] }),
+        serde_json::json!({ "objects": [map] }),
+        serde_json::json!([rule]),
+    ]);
+    let output = run_topic_sync(project, &api, false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 3);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).matches("unchanged ").count(), 3);
+}
+
+#[test]
+fn sync_topics_updates_map_references_without_losing_artifacts_or_rule_settings() {
+    let project = Uuid::new_v4();
+    let facet = topic_function(project, "facet-id", false);
+    let mut map = topic_function(project, "map-id", true);
+    map["function_data"].as_object_mut().unwrap().remove("source_facet_function");
+    map["function_data"]["bundle_key"] = serde_json::json!("existing-bundle");
+    map["function_data"]["report_key"] = serde_json::json!("existing-report");
+    map["function_data"]["topic_names"] = serde_json::json!({ "t": "Existing topic" });
+    let mut rule = topic_rule(project);
+    rule["config"]["sampling_rate"] = serde_json::json!(0.25);
+    rule["config"]["rerun_seconds"] = serde_json::json!(43200);
+    rule["config"]["btql_filter"] = serde_json::json!("metadata.production = true");
+    rule["config"]["topic_map_functions"][0]["btql_filter"] = serde_json::json!("metadata.segment = 'enterprise'");
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({ "objects": [facet] }),
+        serde_json::json!({ "objects": [map] }),
+        serde_json::json!([rule]),
+        topic_function(project, "map-id", true),
+        topic_rule(project),
+    ]);
+    let output = run_topic_sync(project, &api, false);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(split_request(&requests[3]).0.starts_with("PATCH /v1/function/map-id "));
+    let map: JsonValue = serde_json::from_slice(split_request(&requests[3]).1).unwrap();
+    assert_eq!(map["function_data"]["bundle_key"], "existing-bundle");
+    assert_eq!(map["function_data"]["report_key"], "existing-report");
+    assert_eq!(map["function_data"]["topic_names"]["t"], "Existing topic");
+    let rule: JsonValue = serde_json::from_slice(split_request(&requests[4]).1).unwrap();
+    assert_eq!(rule["config"]["sampling_rate"], 1.0);
+    assert_eq!(rule["config"]["rerun_seconds"], 43200);
+    assert_eq!(rule["config"]["btql_filter"], "metadata.production = true");
+    assert_eq!(
+        rule["config"]["topic_map_functions"][0]["btql_filter"],
+        "metadata.segment = 'enterprise'"
+    );
+    assert!(rule.get("description").is_none());
+}
+
+#[test]
+fn sync_topics_rejects_conflicts_before_writing_any_resource() {
+    let project = Uuid::new_v4();
+    let mut map = topic_function(project, "map-id", true);
+    map["function_type"] = serde_json::json!("scorer");
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!({ "objects": [map] }),
+    ]);
+    let output = run_topic_sync(project, &api, false);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts"));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(requests.iter().all(|request| split_request(request).0.starts_with("GET ")));
+}
+
+fn topic_sync_command(root: &std::path::Path, shape: &std::path::Path, api: &str) -> Command {
+    let mut command = bts();
+    command
+        .current_dir(root)
+        .args(["sync", "automation", "topics", "--from"])
+        .arg(shape)
+        .args(["--select", "automation[\"support-topics\"]"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api)
+        .env("BRAINTRUST_APP_URL", api);
+    command
+}
+
+fn existing_topics(project: Uuid) -> Vec<JsonValue> {
+    vec![
+        serde_json::json!({"objects":[topic_function(project, "facet-id", false)]}),
+        serde_json::json!({"objects":[topic_function(project, "map-id", true)]}),
+        serde_json::json!([topic_rule(project)]),
+    ]
+}
+
+#[test]
+fn sync_topics_prompt_changes_only_regenerate_when_requested() {
+    for regenerate in [false, true] {
+        let project = Uuid::new_v4();
+        let root = write_project_context(project);
+        let shape = root.join("shape.bt");
+        fs::write(
+            &shape,
+            TOPICS_SYNC_SHAPE.replace("Summarize churn risk.", "Summarize current churn intent."),
+        )
+        .unwrap();
+        let mut replies = existing_topics(project);
+        replies.push(topic_function(project, "facet-id", false));
+        if regenerate {
+            replies.extend([serde_json::json!({"success":true}), serde_json::json!({"success":true})]);
+        }
+        let (api, requests) = serve_json_sequence(replies);
+        let mut command = topic_sync_command(&root, &shape, &api);
+        if regenerate {
+            command.arg("--regenerate");
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(requests.len(), if regenerate { 6 } else { 4 });
+        assert!(split_request(&requests[3]).0.starts_with("PATCH /v1/function/facet-id "));
+        if regenerate {
+            assert!(
+                split_request(&requests[5])
+                    .0
+                    .starts_with("POST /brainstore/automation/reset-cursors ")
+            );
+            let reset: JsonValue = serde_json::from_slice(split_request(&requests[5]).1).unwrap();
+            assert_eq!(reset["automation_id"], "automation-id");
+            assert_eq!(reset["object_id"], format!("project_logs:{project}"));
+            let xact = reset["start_xact_id"].as_str().unwrap().parse::<u64>().unwrap();
+            let seconds = (xact >> 16) & 0xffffffff;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            assert!((86390..86410).contains(&(now - seconds)));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn sync_topics_dry_run_does_not_save_or_queue_regeneration() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(&shape, TOPICS_SYNC_SHAPE.replace("Summarize churn risk.", "Updated prompt.")).unwrap();
+    let (api, requests) = serve_json_sequence(existing_topics(project));
+    let output = topic_sync_command(&root, &shape, &api)
+        .args(["--dry-run", "--regenerate"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("would regenerate"));
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 3);
+    assert!(!root.join(".bt/bts/state.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_topics_recovers_regeneration_after_the_prompt_was_saved() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(&shape, TOPICS_SYNC_SHAPE.replace("Summarize churn risk.", "Updated prompt.")).unwrap();
+    let mut replies = existing_topics(project);
+    replies.extend([
+        topic_function(project, "facet-id", false),
+        serde_json::json!({"success":true}),
+        serde_json::json!({"success":false}),
+    ]);
+    let (api, requests) = serve_json_sequence(replies);
+    let output = topic_sync_command(&root, &shape, &api).arg("--regenerate").output().unwrap();
+    assert!(!output.status.success());
+    let first = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    let first_reset: JsonValue = serde_json::from_slice(split_request(&first[5]).1).unwrap();
+    let mut replies = existing_topics(project);
+    replies[0]["objects"][0]["function_data"]["prompt"] = serde_json::json!("Updated prompt.");
+    replies.extend([serde_json::json!({"success":true}), serde_json::json!({"success":true})]);
+    let (api, requests) = serve_json_sequence(replies);
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let second = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(second.len(), 5);
+    let second_reset: JsonValue = serde_json::from_slice(split_request(&second[4]).1).unwrap();
+    assert_eq!(first_reset["start_xact_id"], second_reset["start_xact_id"]);
+    let mut replies = existing_topics(project);
+    replies[0]["objects"][0]["function_data"]["prompt"] = serde_json::json!("Updated prompt.");
+    let (api, requests) = serve_json_sequence(replies);
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 3);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_topics_recovers_a_partially_created_rule_without_duplicate_functions() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(&shape, TOPICS_SYNC_SHAPE).unwrap();
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({"objects":[]}),
+        serde_json::json!({"objects":[]}),
+        serde_json::json!([]),
+        topic_function(project, "facet-id", false),
+        topic_function(project, "map-id", true),
+        serde_json::json!({}),
+    ]);
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 6);
+    let (api, requests) = serve_json_sequence(existing_topics(project));
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 3);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).matches("unchanged").count(), 3);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_topics_removes_local_definitions_and_recovers_interrupted_deletions() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(&shape, TOPICS_SYNC_SHAPE).unwrap();
+    let (api, requests) = serve_json_sequence(existing_topics(project));
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success());
+    requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    fs::write(&shape, "# everything was removed\n").unwrap();
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!([topic_rule(project)]),
+        serde_json::json!({"objects":[topic_function(project,"map-id",true)]}),
+        serde_json::json!({"objects":[topic_function(project,"facet-id",false)]}),
+    ]);
+    let output = topic_sync_command(&root, &shape, &api).arg("--dry-run").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).matches("would delete").count(), 3);
+    requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut wrong = topic_function(project, "replacement-id", false);
+    wrong["function_type"] = serde_json::json!("scorer");
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!([topic_rule(project)]),
+        topic_rule(project),
+        serde_json::json!({"objects":[topic_function(project,"map-id",true)]}),
+        serde_json::json!({}),
+        serde_json::json!({"objects":[wrong]}),
+    ]);
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(!output.status.success());
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        split_request(&requests[1])
+            .0
+            .starts_with("POST /api/project_automation/delete_id ")
+    );
+    assert!(split_request(&requests[3]).0.starts_with("DELETE /v1/function/map-id "));
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!([]),
+        serde_json::json!({"objects":[]}),
+        serde_json::json!({"objects":[topic_function(project,"facet-id",false)]}),
+        serde_json::json!({}),
+    ]);
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(split_request(&requests[3]).0.starts_with("DELETE /v1/function/facet-id "));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_scorers_removes_owned_rules_without_deleting_pushed_functions() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(&shape, r#"scorer "brand" { code { score = 1 } } automation "rule" { type = "scorer" scorers = ["brand"] scope = "span" root = true }"#).unwrap();
+    let rule = serde_json::json!({"id":"rule-id","project_id":project.to_string(),"name":"rule","score_type":"online","config":{"online":{"sampling_rate":1,"scorers":[{"type":"function","id":"fn-id"}],"status":"active","apply_to_root_span":true,"apply_to_span_names":[],"scope":{"type":"span"}}}});
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({"objects":[{"id":"fn-id","project_id":project.to_string(),"slug":"brand","function_type":"scorer"}]}),
+        serde_json::json!({"objects":[rule.clone()]}),
+    ]);
+    let output = bts()
+        .current_dir(&root)
+        .args(["sync", "automation", "scorers", "--from"])
+        .arg(&shape)
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", &api)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 2);
+    fs::write(&shape, "").unwrap();
+    let (api, requests) = serve_json_sequence(vec![serde_json::json!({"objects":[rule]}), serde_json::json!({})]);
+    let output = bts()
+        .current_dir(&root)
+        .args(["sync", "automation", "scorers", "--from"])
+        .arg(&shape)
+        .args(["--select", "automation.rule"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", &api)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(split_request(&requests[1]).0.starts_with("DELETE /v1/project_score/rule-id "));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_scorer_selection_keeps_all_functions_in_shared_automation() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let source = AUTOMATION_SYNC_SHAPE.replace(
+        "scorers = [\"reset-instructions\"]",
+        "scorers = [\"reset-instructions\", \"response-helpfulness\"]",
+    );
+    let shape = write_shape(&source);
+    let functions = ["reset-instructions", "response-helpfulness"].map(|slug| serde_json::json!({ "objects": [{ "id": slug, "project_id": project.to_string(), "slug": slug, "function_type": "scorer" }] }));
+    let (api, requests) = serve_json_sequence(vec![
+        functions[0].clone(),
+        functions[1].clone(),
+        serde_json::json!({ "objects": [] }),
+        serde_json::json!({ "id": "rule-id" }),
+    ]);
+    let output = bts()
+        .current_dir(&root)
+        .args(["sync", "automation", "scorers", "--from"])
+        .arg(&shape)
+        .args(["--select", "scorer[\"reset-instructions\"]"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 4);
+    let payload: JsonValue = serde_json::from_slice(split_request(&requests[3]).1).unwrap();
+    assert_eq!(payload["config"]["online"]["scorers"].as_array().unwrap().len(), 2);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("judge-final-response"));
+}
+
+#[test]
+fn sync_dataset_selection_skips_unselected_source_generation() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = write_shape(
+        r#"
+        trace "unavailable" { input = attachment("missing-selection.jpg", "image/jpeg") }
+        dataset "keep" { case "inline" { input = "hello" } }
+        dataset "skip" { case "source" { trace = trace.unavailable } }
+    "#,
+    );
+    let (api, requests) = serve_json_sequence(vec![serde_json::json!({ "objects": [] })]);
+    let output = bts()
+        .current_dir(&root)
+        .args(["sync", "datasets", "--from"])
+        .arg(&shape)
+        .args(["--select", "dataset.keep", "--dry-run"])
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api)
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(split_request(&requests[0]).0.contains("dataset_name=keep"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("skip"));
+}
+
+fn dataset_sync_command(root: &std::path::Path, shape: &std::path::Path, api: &str) -> Command {
+    let mut command = bts();
+    command
+        .current_dir(root)
+        .args(["sync", "datasets", "--from"])
+        .arg(shape)
+        .env("BRAINTRUST_API_KEY", "test-secret")
+        .env("BRAINTRUST_API_URL", api);
+    command
+}
+
+#[test]
+fn sync_commands_share_one_state_file_and_remove_dataset_blocks() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(
+        &shape,
+        format!("{TOPICS_SYNC_SHAPE}\ndataset \"cases\" {{ case \"one\" {{ input = \"hello\" }} }}"),
+    )
+    .unwrap();
+    let (api, requests) = serve_json_sequence(existing_topics(project));
+    let output = topic_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    let dataset = serde_json::json!({"id":"dataset-id","name":"cases","project_id":project.to_string()});
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({"objects":[]}),
+        dataset.clone(),
+        serde_json::json!({"row_ids":["one"]}),
+    ]);
+    let output = dataset_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 3);
+    let state_path = root.join(".bt/bts/state.json");
+    let state: JsonValue = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let resources = state["projects"][project.to_string()]["shape.bt"]["resources"]
+        .as_array()
+        .unwrap();
+    assert_eq!(resources.len(), 4);
+    assert!(resources.iter().any(|r| r["kind"] == "dataset" && r["id"] == "dataset-id"));
+    assert!(!root.join(".bt/bts/sync").exists());
+    fs::write(&shape, TOPICS_SYNC_SHAPE).unwrap();
+    let before = fs::read(&state_path).unwrap();
+    let (api, requests) = serve_json_sequence(vec![serde_json::json!({"objects":[dataset.clone()]})]);
+    let output = dataset_sync_command(&root, &shape, &api)
+        .args(["--select", "dataset.cases", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("would delete dataset"));
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 1);
+    assert_eq!(fs::read(&state_path).unwrap(), before);
+    let (api, requests) = serve_json_sequence(vec![serde_json::json!({"objects":[dataset]}), serde_json::json!({})]);
+    let output = dataset_sync_command(&root, &shape, &api)
+        .args(["--select", "dataset.cases"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(split_request(&requests[1]).0.starts_with("DELETE /v1/dataset/dataset-id "));
+    let state: JsonValue = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let resources = state["projects"][project.to_string()]["shape.bt"]["resources"]
+        .as_array()
+        .unwrap();
+    assert_eq!(resources.len(), 3);
+    assert!(resources.iter().all(|r| r["kind"] != "dataset"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_datasets_keeps_shared_datasets_until_the_last_shape_removes_them() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let first = root.join("first.bt");
+    let second = root.join("second.bt");
+    let dataset = serde_json::json!({"id":"dataset-id","name":"cases","project_id":project.to_string()});
+    for shape in [&first, &second] {
+        fs::write(shape, "dataset \"cases\" {}").unwrap();
+        let (api, requests) = serve_json_sequence(vec![
+            serde_json::json!({"objects":[dataset.clone()]}),
+            serde_json::json!({"events":[]}),
+        ]);
+        let output = dataset_sync_command(&root, shape, &api).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 2);
+    }
+    fs::write(&first, "").unwrap();
+    let output = dataset_sync_command(&root, &first, "http://127.0.0.1:1").output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("kept shared resource"));
+    fs::write(&second, "# removed\n").unwrap();
+    let (api, requests) = serve_json_sequence(vec![serde_json::json!({"objects":[dataset]}), serde_json::json!({})]);
+    let output = dataset_sync_command(&root, &second, &api).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sync_datasets_recovers_an_ambiguous_create_without_creating_a_duplicate() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(&shape, "dataset \"cases\" {}").unwrap();
+    let (api, requests) = serve_json_sequence(vec![serde_json::json!({"objects":[]}), serde_json::json!({})]);
+    let output = dataset_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 2);
+    let dataset = serde_json::json!({"id":"dataset-id","name":"cases","project_id":project.to_string()});
+    let (api, requests) = serve_json_sequence(vec![
+        serde_json::json!({"objects":[dataset]}),
+        serde_json::json!({"events":[]}),
+    ]);
+    let output = dataset_sync_command(&root, &shape, &api).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| split_request(r).0.starts_with("GET ")));
+    let state: JsonValue = serde_json::from_slice(&fs::read(root.join(".bt/bts/state.json")).unwrap()).unwrap();
+    assert_eq!(
+        state["projects"][project.to_string()]["shape.bt"]["resources"][0]["id"],
+        "dataset-id"
+    );
+    fs::remove_dir_all(root).unwrap();
 }

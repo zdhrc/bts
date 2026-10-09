@@ -19,9 +19,40 @@ pub(crate) use model::{
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
 
 pub(crate) fn compile(src: &str) -> Result<Model, Diags> {
+    compile_module(src, false)
+}
+
+pub(crate) fn compile_module(src: &str, allow_empty: bool) -> Result<Model, Diags> {
     let tokens = tracing::info_span!("lex").in_scope(|| lex(src))?;
     let ast = tracing::info_span!("parse").in_scope(|| parse(tokens, src))?;
+    if allow_empty && ast.decls.is_empty() {
+        return Ok(Model::default());
+    }
     tracing::info_span!("model").in_scope(|| model(ast))
+}
+
+// just read the path, the caller decides what it means
+pub(crate) fn parse_traversal(src: &str) -> Result<Vec<String>, Diags> {
+    fn segments(expr: ast::Expr) -> Result<Vec<String>, Diags> {
+        let range = expr.range;
+        match expr.kind {
+            ast::ExprKind::Ref { path } => Ok(path),
+            ast::ExprKind::Index { target, index } if matches!(index.kind, ast::ExprKind::Str(_)) => {
+                let mut path = segments(*target)?;
+                let ast::ExprKind::Str(name) = index.kind else {
+                    unreachable!()
+                };
+                path.push(name);
+                Ok(path)
+            }
+            _ => Err(vec![Diag {
+                when: DiagPhase::Parsing,
+                what: "expected a traversal with dotted or quoted bracket segments".to_owned(),
+                r#where: range,
+            }]),
+        }
+    }
+    segments(parser::parse_expression(lex(src)?, src)?)
 }
 
 #[cfg(test)]

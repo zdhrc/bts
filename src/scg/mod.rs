@@ -1,5 +1,6 @@
 pub(crate) mod building;
 mod component;
+pub(crate) use component::slugify;
 mod diff;
 mod emit;
 
