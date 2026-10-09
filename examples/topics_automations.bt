@@ -1,0 +1,89 @@
+# support conversations where frustration doesn't always mean someone will leave
+vars {
+    conversations = [
+        [
+            { role = "user", content = "Can you put our VAT number on future invoices?" },
+            { role = "assistant", content = "Yes, add it under Billing Settings > Tax IDs. It will appear on your next invoice." },
+            { role = "user", content = "Found it, thanks. That's all I needed." },
+            { role = "assistant", content = "You're welcome. Your tax ID is saved." },
+        ],
+        [
+            { role = "user", content = "We've been charged for the same seats twice. This is my third ticket about it." },
+            { role = "assistant", content = "I can see the duplicate charge. I've reopened the billing investigation." },
+            { role = "user", content = "You said that last week. If this isn't refunded before renewal, we're moving to another provider." },
+            { role = "assistant", content = "I've escalated the refund request to billing. I can't confirm a refund date yet." },
+        ],
+        [
+            { role = "user", content = "Nobody can sign in after we enabled SSO. We're losing time and I'm ready to cancel." },
+            { role = "assistant", content = "The SAML audience doesn't match your workspace URL. I'll help you update it." },
+            { role = "user", content = "That fixed it. Everyone is back in now." },
+            { role = "assistant", content = "Great. I also checked the remaining SSO settings; they match your identity provider." },
+            { role = "user", content = "Thanks for sticking with us. We'll keep the rollout going." },
+            { role = "assistant", content = "Glad we could get your team working again." },
+        ],
+        [
+            { role = "user", content = "Our renewal is 40% higher, but half those seats haven't been used in months." },
+            { role = "assistant", content = "You can remove unused seats before renewal. The workspace owner can make that change." },
+            { role = "user", content = "We're comparing a cheaper competitor. Can someone discuss a smaller plan before Friday?" },
+            { role = "assistant", content = "I've asked your account manager to review the plan and contact you before Friday." },
+        ],
+        [
+            { role = "user", content = "We decided to leave. Please export our conversation history and cancel the subscription at month end." },
+            { role = "assistant", content = "I've started the export and scheduled cancellation for the end of your billing period." },
+            { role = "user", content = "Will the export include attachments? We need them for our migration." },
+            { role = "assistant", content = "Yes. You'll receive the conversations and their attachments before cancellation takes effect." },
+        ],
+    ]
+}
+
+trace "subscription-support" {
+    vars {
+        turns = var.conversations[range(0, 4)]
+    }
+    input = var.turns[0]
+    output = var.turns[len(var.turns) - 1]
+    metadata = { conversation_id = uuid(), channel = "web-chat" }
+    tags = ["support", "subscriptions", "simulated"]
+
+    repeat "conversation" {
+        count = len(var.turns) / 2
+
+        task "turn" {
+            input = var.turns[repeat.conversation.index * 2]
+            output = var.turns[repeat.conversation.index * 2 + 1]
+
+            llm "draft-reply" {
+                input = var.turns[:repeat.conversation.index * 2 + 1]
+                output = task.turn.output
+                metadata = { model = "glm-5.2" }
+                duration = lognormal(0.8, 0.35)
+                metrics = {
+                    prompt_tokens = tokens(self.input)
+                    completion_tokens = tokens(self.output)
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                }
+            }
+        }
+    }
+}
+
+facet "Retention signals" {
+    description = "Why customers might leave, and whether support changed their mind."
+    prompt = <<-PROMPT
+        Read the whole conversation and summarize any concrete signal that the customer may leave or reduce their subscription.
+        Describe the underlying reason, such as repeated billing mistakes, an unresolved outage, renewal cost, or a planned migration.
+        Include the customer's intent and whether the issue was resolved, remains open, or led to a confirmed cancellation.
+        Give more weight to later messages. If an initial cancellation threat was withdrawn after a fix, describe that recovery instead of reporting an active threat.
+        Frustration alone is not cancellation intent. For a routine request with no retention signal, return exactly NONE.
+        Otherwise return one short, specific sentence. Do not include customer identifiers or ticket numbers.
+    PROMPT
+    no_match_pattern = "^NONE$"
+}
+
+automation "subscription-topics" {
+    type = "topics"
+    facets = ["Retention signals"]
+    scope = "trace"
+    sampling_rate = 1
+    enabled = true
+}

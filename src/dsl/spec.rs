@@ -387,6 +387,7 @@ pub(crate) mod ids {
     pub(crate) const ERROR_AND_ESCALATION: Id = Id::new("example.error-and-escalation");
     pub(crate) const CODE_SCORER: Id = Id::new("example.code-scorer");
     pub(crate) const JUDGE_SCORER: Id = Id::new("example.judge-scorer");
+    pub(crate) const TOPICS_AUTOMATIONS: Id = Id::new("example.topics-automations");
     pub(crate) const SCORING_AUTOMATIONS: Id = Id::new("example.scoring-automations");
     pub(crate) const DATASET_CASES: Id = Id::new("example.dataset-cases");
 }
@@ -1958,6 +1959,13 @@ const EXAMPLES: &[Example] = &[
         summary: "Synthetic support responses with code and judge scorers bound to their spans.",
         note: "Build and push the scorers, then sync the automations before writing traces.",
         source: include_str!("../../examples/scoring_automations.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::TOPICS_AUTOMATIONS,
+        summary: "Varied support conversations with a retention facet attached to a Topics automation.",
+        note: "Use bts sync automation topics; sync creates the facet and its topic map directly.",
+        source: include_str!("../../examples/topics_automations.bt"),
         valid: true,
     },
     Example {
