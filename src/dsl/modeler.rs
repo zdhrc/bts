@@ -2,9 +2,9 @@ use crate::dsl::ast;
 use crate::dsl::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::dsl::model::{
     Accessor, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
-    DatasetSource, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part,
-    Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan, ScorerStep, Selection, Span,
-    SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
+    DatasetSource, Experiment, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object,
+    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan, ScorerStep,
+    Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
 };
 use crate::dsl::spec;
 use std::{
@@ -339,6 +339,7 @@ impl Modeler {
         let mut automations = Vec::new();
         let mut facets = Vec::new();
         let mut datasets = Vec::new();
+        let mut experiments = Vec::new();
 
         // collect vars first so refs work no matter the decl order
         let (vars_blocks, rest) = split_vars(std::mem::take(&mut self.ast.decls));
@@ -394,6 +395,11 @@ impl Modeler {
                         if let Some(automation) = self.model_automation(block, desc) {
                             automations.push((automation, range));
                         }
+                    } else if desc.id == spec::ids::EXPERIMENT && desc.allows(spec::Place::Root) {
+                        let range = block.range;
+                        if let Some(experiment) = self.model_experiment(block, desc) {
+                            experiments.push((experiment, range));
+                        }
                     } else if desc.id == spec::ids::DATASET && desc.allows(spec::Place::Root) {
                         let range = block.range;
                         if let Some(dataset) = self.model_dataset(block, desc) {
@@ -416,7 +422,9 @@ impl Modeler {
         // this iterates collected records only, never the ast; extension
         // leaves dead intermediate records behind, so only references the
         // model actually stores resolve
-        let live = live_refs(&self.pending, &traces, &bindings, &datasets, &self.identity_aliases);
+        let mut aliases = self.identity_aliases.clone();
+        aliases.extend(experiments.iter().map(|(experiment, _)| experiment.task));
+        let live = live_refs(&self.pending, &traces, &bindings, &datasets, &aliases);
         let refs = self.resolve_pending(&live);
         self.detect_cycles();
 
@@ -510,6 +518,59 @@ impl Modeler {
                 }
             }
         }
+        let mut experiment_names = HashSet::new();
+        for (experiment, range) in &experiments {
+            if !experiment_names.insert(experiment.name.as_str()) {
+                self.experiment_error(format!("duplicate experiment name {:?}", experiment.name), *range);
+            }
+            if !dataset_names.contains(experiment.dataset.as_str()) {
+                self.experiment_error(format!("unknown dataset {:?}", experiment.dataset), *range);
+            }
+            for name in &experiment.scorers {
+                if !scorer_names.contains(name.as_str()) {
+                    self.experiment_error(format!("unknown scorer {name:?}"), *range);
+                }
+            }
+            let reference = &refs[experiment.task.0 as usize];
+            if !matches!(
+                reference.accessor,
+                Accessor::Block {
+                    kind: "trace" | "task" | "llm" | "tool" | "function",
+                    ..
+                }
+            ) {
+                self.experiment_error("task requires a trace or span block reference".to_owned(), reference.range);
+            } else if reference.module.is_none()
+                || reference.steps.iter().any(|step| match step {
+                    Step::Child { candidates, position } => {
+                        position.is_some()
+                            || candidates.len() != 1
+                            || candidates.iter().any(|node| !self.syms[node.0 as usize].kind.has_fields())
+                    }
+                    _ => true,
+                })
+            {
+                self.experiment_error(
+                    "experiment task requires a static trace or span path".to_owned(),
+                    reference.range,
+                );
+            }
+        }
+        for (experiment, range) in &experiments {
+            let mut seen = HashSet::from([experiment.name.as_str()]);
+            let mut next = experiment.baseline.as_deref();
+            while let Some(name) = next {
+                if !seen.insert(name) {
+                    self.experiment_error(format!("baseline cycle involving {name:?}"), *range);
+                    break;
+                }
+                let Some((baseline, _)) = experiments.iter().find(|(candidate, _)| candidate.name == name) else {
+                    self.experiment_error(format!("unknown baseline experiment {name:?}"), *range);
+                    break;
+                };
+                next = baseline.baseline.as_deref();
+            }
+        }
         let mut data_refs = Vec::new();
         for trace in &traces {
             collect_trace_refs(trace, &mut data_refs);
@@ -549,6 +610,7 @@ impl Modeler {
             && facets.is_empty()
             && automations.is_empty()
             && datasets.is_empty()
+            && experiments.is_empty()
             && self.errors.is_empty()
         {
             self.errors.push(Error::new(
@@ -568,6 +630,7 @@ impl Modeler {
                 facets: facets.into_iter().map(|(facet, _)| facet).collect(),
                 automations: automations.into_iter().map(|(automation, _)| automation).collect(),
                 datasets: datasets.into_iter().map(|(dataset, _)| dataset).collect(),
+                experiments: experiments.into_iter().map(|(experiment, _)| experiment).collect(),
             })
         } else {
             Err(self.errors)
@@ -691,6 +754,109 @@ impl Modeler {
             },
             range,
         ));
+    }
+
+    fn experiment_error(&mut self, reason: String, range: SrcRange) {
+        self.errors.push(Error::new(
+            ErrorKind::InvalidExperiment {
+                rule: spec::ids::EXPERIMENT_BINDING,
+                reason,
+            },
+            range,
+        ));
+    }
+
+    fn resource_reference(&mut self, expr: ast::Expr, kind: &str) -> Option<String> {
+        let range = expr.range;
+        let name = match expr.kind {
+            ast::ExprKind::Ref { path } if path.len() == 2 && path[0] == kind => Some(path[1].clone()),
+            ast::ExprKind::Index { target, index } => match (target.kind, index.kind) {
+                (ast::ExprKind::Ref { path }, ast::ExprKind::Str(name)) if path == [kind] => Some(name),
+                _ => None,
+            },
+            _ => None,
+        };
+        if name.as_ref().is_none_or(|name| name.is_empty()) {
+            self.experiment_error(format!("expected a named {kind} reference, such as {kind}[\"name\"]"), range);
+            None
+        } else {
+            name
+        }
+    }
+
+    fn model_experiment(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Experiment> {
+        let ast::Block { name, decls, range, .. } = block;
+        let name = self.model_name(name, range, desc)?;
+        let mut dataset = None;
+        let mut task = None;
+        let mut scorers = None;
+        let mut baseline = None;
+        let mut description = None;
+        let mut seen = HashSet::new();
+        for decl in decls {
+            let ast::Decl::Attr(attr) = decl else {
+                self.experiment_error("experiment contains a nested block".to_owned(), range);
+                continue;
+            };
+            if desc.field(&attr.key).is_none() || !seen.insert(attr.key.clone()) {
+                self.experiment_error(format!("unknown or duplicate experiment field {:?}", attr.key), attr.range);
+                continue;
+            }
+            match attr.key.as_str() {
+                "dataset" => dataset = self.resource_reference(attr.value, "dataset"),
+                "baseline" => baseline = self.resource_reference(attr.value, "experiment"),
+                "task" => {
+                    if let Some(folded) = self.fold_expr(attr.value) {
+                        if let Value::BlockRef { ref_id, .. } = folded.into_value() {
+                            task = Some(ref_id);
+                        } else {
+                            self.experiment_error("task must be a block reference".to_owned(), attr.range);
+                        }
+                    }
+                }
+                "scorers" => {
+                    if let ast::ExprKind::Array(values) = attr.value.kind {
+                        let mut names = Vec::new();
+                        for value in values {
+                            if let Some(name) = self.resource_reference(value, "scorer") {
+                                if names.contains(&name) {
+                                    self.experiment_error(format!("duplicate scorer {name:?}"), attr.range);
+                                }
+                                names.push(name);
+                            }
+                        }
+                        if names.is_empty() {
+                            self.experiment_error("scorers requires at least one scorer reference".to_owned(), attr.range);
+                        }
+                        scorers = Some(names);
+                    } else {
+                        self.experiment_error("scorers must be an array of scorer references".to_owned(), attr.range);
+                    }
+                }
+                "description" => {
+                    if let Some(value) = self.fold_expr(attr.value) {
+                        if let Value::Str(value) = value.into_value() {
+                            description = Some(value);
+                        } else {
+                            self.experiment_error("description must be a constant string".to_owned(), attr.range);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        if dataset.is_none() || task.is_none() || scorers.is_none() {
+            self.experiment_error("experiment requires dataset, task, and scorers".to_owned(), range);
+            return None;
+        }
+        Some(Experiment {
+            name,
+            description,
+            dataset: dataset.unwrap(),
+            task: task.unwrap(),
+            scorers: scorers.unwrap(),
+            baseline,
+        })
     }
 
     fn model_dataset(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Dataset> {
@@ -6409,6 +6575,10 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
         reason: String,
     },
+    InvalidExperiment {
+        rule: spec::Id,
+        reason: String,
+    },
     InvalidDataset {
         rule: spec::Id,
         reason: String,
@@ -6892,7 +7062,7 @@ impl fmt::Display for ErrorKind {
             Self::InvalidFacet { rule, reason } | Self::InvalidAutomation { rule, reason } => {
                 write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
             }
-            Self::InvalidDataset { rule, reason } => {
+            Self::InvalidDataset { rule, reason } | Self::InvalidExperiment { rule, reason } => {
                 write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
             }
         }

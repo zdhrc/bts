@@ -13,6 +13,7 @@ pub(crate) struct Model {
     pub(crate) automations: Vec<Automation>,
     pub(crate) facets: Vec<Facet>,
     pub(crate) datasets: Vec<Dataset>,
+    pub(crate) experiments: Vec<Experiment>,
 }
 
 // a block's identity, assigned in walk order; stable across a compile so both
@@ -237,6 +238,16 @@ pub(crate) struct Dataset {
     pub(crate) name: String,
     pub(crate) description: Option<String>,
     pub(crate) cases: Vec<DatasetCase>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Experiment {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) dataset: String,
+    pub(crate) task: RefId,
+    pub(crate) scorers: Vec<String>,
+    pub(crate) baseline: Option<String>,
 }
 
 #[derive(Debug, Clone)]

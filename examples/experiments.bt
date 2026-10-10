@@ -1,0 +1,143 @@
+# compare basic and improved account recovery flows
+
+trace "account-recovery" {
+    task "basic-flow" {
+        # the experiment replaces this fallback input with each dataset row
+        input = { message = "I forgot my password.", email_verified = true, account_locked = false, mfa_available = true }
+        output = {
+            action = self.input.email_verified ? "send_reset" : "verify_email"
+            reply = llm["draft-reply"].output.content
+        }
+        metadata = { version = "basic", channel = "chat" }
+
+        tool "lookup-account" {
+            duration = range(0.05, 0.15)
+            input = { request = task["basic-flow"].input.message }
+            output = {
+                email_verified = task["basic-flow"].input.email_verified
+                account_locked = task["basic-flow"].input.account_locked
+                mfa_available = task["basic-flow"].input.mfa_available
+            }
+        }
+
+        llm "draft-reply" {
+            duration = range(0.4, 0.8)
+            input = { request = task["basic-flow"].input.message, account = tool["lookup-account"].output }
+            output = {
+                role = "assistant"
+                content = tool["lookup-account"].output.email_verified
+                    ? "I've sent a password reset link to your verified email. The link expires in 15 minutes."
+                    : "Please verify your email address before we can help you recover the account."
+            }
+            metadata = { model = "gpt-4o-mini", provider = "openai" }
+        }
+    }
+
+    task "recovery-flow" {
+        input = { message = "I forgot my password.", email_verified = true, account_locked = false, mfa_available = true }
+        output = {
+            action = !self.input.email_verified ? "verify_email"
+                : self.input.account_locked ? "escalate_locked"
+                : !self.input.mfa_available ? "recover_mfa"
+                : "send_reset"
+            reply = llm["draft-reply"].output.content
+        }
+        metadata = { version = "improved", channel = "chat" }
+
+        tool "lookup-account" {
+            duration = range(0.05, 0.15)
+            input = { request = task["recovery-flow"].input.message }
+            output = {
+                email_verified = task["recovery-flow"].input.email_verified
+                account_locked = task["recovery-flow"].input.account_locked
+                mfa_available = task["recovery-flow"].input.mfa_available
+            }
+        }
+
+        llm "draft-reply" {
+            duration = range(0.4, 0.8)
+            input = { request = task["recovery-flow"].input.message, account = tool["lookup-account"].output }
+            output = {
+                role = "assistant"
+                content = !tool["lookup-account"].output.email_verified
+                    ? "Please verify your email address before we can help you recover the account."
+                    : tool["lookup-account"].output.account_locked
+                    ? "Your account is locked. I've escalated this to our account security team; they'll contact your verified email."
+                    : !tool["lookup-account"].output.mfa_available
+                    ? "A password reset won't restore your MFA access. Use a backup code, or start identity verification with our recovery team."
+                    : "I've sent a password reset link to your verified email. The link expires in 15 minutes."
+            }
+            metadata = { model = "gpt-4o-mini", provider = "openai" }
+        }
+    }
+}
+
+dataset "account-recovery-regressions" {
+    description = "Ordinary resets, unverified email, locked accounts, and lost MFA devices"
+
+    case "forgot-password" {
+        input = { message = "I forgot my password. Can you help me sign in?", email_verified = true, account_locked = false, mfa_available = true }
+        expected = { action = "send_reset", reply_phrase = "password reset link" }
+        metadata = { scenario = "password_reset", customer_tier = "free" }
+        tags = ["routine"]
+    }
+
+    case "expired-reset-link" {
+        input = { message = "The reset link from yesterday expired. Can you send another?", email_verified = true, account_locked = false, mfa_available = true }
+        expected = { action = "send_reset", reply_phrase = "password reset link" }
+        metadata = { scenario = "expired_link", customer_tier = "pro" }
+        tags = ["routine"]
+    }
+
+    case "unverified-email" {
+        input = { message = "I never verified my email and now I can't remember my password.", email_verified = false, account_locked = false, mfa_available = true }
+        expected = { action = "verify_email", reply_phrase = "verify your email" }
+        metadata = { scenario = "unverified_email", customer_tier = "free" }
+        tags = ["verification"]
+    }
+
+    case "locked-account" {
+        input = { message = "Too many sign-in attempts locked me out. I need access before our customer call.", email_verified = true, account_locked = true, mfa_available = true }
+        expected = { action = "escalate_locked", reply_phrase = "account security team" }
+        metadata = { scenario = "locked_account", customer_tier = "enterprise" }
+        tags = ["edge-case", "urgent"]
+    }
+
+    case "lost-mfa-device" {
+        input = { message = "I replaced my phone and lost my authenticator. Resetting my password didn't help.", email_verified = true, account_locked = false, mfa_available = false }
+        expected = { action = "recover_mfa", reply_phrase = "backup code" }
+        metadata = { scenario = "lost_mfa", customer_tier = "pro" }
+        tags = ["edge-case", "mfa"]
+    }
+}
+
+# scores come from these deployed functions; the task has no authored scores
+scorer "recovery-action-correctness" {
+    file = "recovery"
+    code { score = output.action == expected.action ? 1 : 0 }
+}
+
+scorer "recovery-verification-gate" {
+    file = "recovery"
+    code { score = output.action != "send_reset" || input.email_verified ? 1 : 0 }
+}
+
+scorer "recovery-next-step-clarity" {
+    file = "recovery"
+    code { score = contains(output.reply, expected.reply_phrase) ? 1 : 0 }
+}
+
+experiment "recovery-baseline" {
+    description = "Basic email reset flow; misses locked accounts and lost MFA devices"
+    dataset = dataset["account-recovery-regressions"]
+    task = trace["account-recovery"].task["basic-flow"]
+    scorers = [scorer["recovery-action-correctness"], scorer["recovery-verification-gate"], scorer["recovery-next-step-clarity"]]
+}
+
+experiment "recovery-improved" {
+    description = "Recovery flow with locked-account escalation and MFA recovery guidance"
+    dataset = dataset["account-recovery-regressions"]
+    task = trace["account-recovery"].task["recovery-flow"]
+    scorers = [scorer["recovery-action-correctness"], scorer["recovery-verification-gate"], scorer["recovery-next-step-clarity"]]
+    baseline = experiment["recovery-baseline"]
+}

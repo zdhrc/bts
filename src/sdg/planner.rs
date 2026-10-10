@@ -198,6 +198,7 @@ struct Instance {
     node: NodeId,
     parent: Option<usize>,
     children: Vec<usize>,
+    deferred_children: Vec<ModelChild>,
     shape: Shape,
     // the stable address of this instantiation, the basis for its slots' rngs
     path: u64,
@@ -229,6 +230,8 @@ struct ScorerShape {
 #[derive(Debug)]
 struct Ctx<'m> {
     refs: &'m [ResolvedRef],
+    lazy_model: Option<&'m Model>,
+    row: Option<(NodeId, &'m JsonValue)>,
     trace_index: usize,
     // the address every instance path derives from: seed and trace index
     base: u64,
@@ -247,6 +250,8 @@ impl<'m> Ctx<'m> {
         let base = mix(mix(FNV_BASIS, seed), trace_index as u64);
         Self {
             refs,
+            lazy_model: None,
+            row: None,
             trace_index,
             base,
             rng: SmallRng::seed_from_u64(base),
@@ -278,14 +283,37 @@ impl<'m> Ctx<'m> {
         shape: Shape,
         salt: u64,
         bindings: &[ModelBinding],
-        fields: FieldSlots,
+        mut fields: FieldSlots,
     ) -> usize {
+        if let Some((target, row)) = self.row
+            && target == node
+        {
+            fields.input = Some(JsonSlot::Done(row.get("input").cloned().unwrap_or(JsonValue::Null)));
+            fields.expected = Some(JsonSlot::Done(row.get("expected").cloned().unwrap_or(JsonValue::Null)));
+            if let Some(metadata) = row.get("metadata").and_then(JsonValue::as_object) {
+                let keys = fields.metadata.get_or_insert_with(Vec::new);
+                keys.retain(|(key, _)| !metadata.contains_key(key));
+                keys.extend(
+                    metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), JsonSlot::Done(value.clone()))),
+                );
+            }
+            if let Some(tags) = row.get("tags").and_then(JsonValue::as_array) {
+                fields.tags.extend(
+                    tags.iter()
+                        .filter_map(JsonValue::as_str)
+                        .map(|tag| TagSlot::Done(tag.to_owned())),
+                );
+            }
+        }
         let parent_path = parent.map_or(self.base, |parent| self.instances[parent].path);
         let path = mix(mix(parent_path, node.0 as u64), salt);
         let instance = Instance {
             node,
             parent,
             children: Vec::new(),
+            deferred_children: Vec::new(),
             shape,
             path,
             bindings: bindings
@@ -316,8 +344,48 @@ impl<'m> Ctx<'m> {
             &bindings,
             field_slots(&trace.fields),
         );
-        for child in &trace.children {
-            self.instantiate_child(child, instance)?;
+        self.add_children(instance, &trace.children)
+    }
+
+    fn add_children(&mut self, instance: usize, children: &[ModelChild]) -> Result<(), Error> {
+        if self.lazy_model.is_some() {
+            self.instances[instance].deferred_children = children.to_vec();
+        } else {
+            for child in children {
+                self.instantiate_child(child, instance)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_child(&mut self, instance: usize, node: NodeId) -> Result<(), Error> {
+        if self.instances[instance]
+            .children
+            .iter()
+            .any(|&child| self.instances[child].node == node)
+        {
+            return Ok(());
+        }
+        let child = self.instances[instance]
+            .deferred_children
+            .iter()
+            .find(|child| child_node(child) == node)
+            .cloned();
+        if let Some(child) = child {
+            self.instantiate_child(&child, instance)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_children(&mut self, instance: usize) -> Result<(), Error> {
+        let nodes: Vec<_> = self.instances[instance].deferred_children.iter().map(child_node).collect();
+        for &node in &nodes {
+            self.ensure_child(instance, node)?;
+        }
+        if !nodes.is_empty() {
+            let mut children = self.instances[instance].children.clone();
+            children.sort_by_key(|&child| nodes.iter().position(|&node| node == self.instances[child].node));
+            self.instances[instance].children = children;
         }
         Ok(())
     }
@@ -344,10 +412,7 @@ impl<'m> Ctx<'m> {
                     &span.bindings,
                     field_slots(&span.fields),
                 );
-                for child in &span.children {
-                    self.instantiate_child(child, instance)?;
-                }
-                Ok(())
+                self.add_children(instance, &span.children)
             }
 
             ModelChild::Scorer(scorer) => {
@@ -396,9 +461,7 @@ impl<'m> Ctx<'m> {
                         bindings,
                         FieldSlots::default(),
                     );
-                    for child in children {
-                        self.instantiate_child(child, iteration)?;
-                    }
+                    self.add_children(iteration, children)?;
                 }
                 Ok(())
             }
@@ -424,7 +487,7 @@ impl<'m> Ctx<'m> {
                     bindings,
                     FieldSlots::default(),
                 );
-                self.instantiate_child(&children[pick], instance)
+                self.add_children(instance, &children[pick..=pick])
             }
 
             ModelChild::Maybe(ModelMaybe {
@@ -454,9 +517,7 @@ impl<'m> Ctx<'m> {
                     FieldSlots::default(),
                 );
                 if included {
-                    for child in children {
-                        self.instantiate_child(child, instance)?;
-                    }
+                    self.add_children(instance, children)?;
                 }
                 Ok(())
             }
@@ -531,6 +592,19 @@ impl<'m> Ctx<'m> {
         self.last_ref = Some(reference.range);
 
         let mut at = if let Some(node) = reference.module {
+            if let Some(model) = self.lazy_model
+                && !self
+                    .instances
+                    .iter()
+                    .any(|instance| instance.node == node && instance.parent.is_none())
+            {
+                let trace = model
+                    .traces
+                    .iter()
+                    .find(|trace| trace.node == node)
+                    .expect("resolved module trace");
+                self.instantiate_trace(trace, &model.bindings)?;
+            }
             self.instances
                 .iter()
                 .position(|instance| instance.node == node && instance.parent.is_none())
@@ -579,6 +653,7 @@ impl<'m> Ctx<'m> {
                         candidates[position]
                     }
                 };
+                self.ensure_child(at, node)?;
                 let child = self.instances[at]
                     .children
                     .iter()
@@ -1046,6 +1121,7 @@ impl Planner {
             None => parent,
         };
 
+        ctx.ensure_children(instance)?;
         let children = ctx.instances[instance].children.clone();
         for child in children {
             self.emit_instance(child, root, parent, ctx, filter)?;
@@ -1116,6 +1192,16 @@ fn child_len(child: &ModelChild) -> usize {
         ModelChild::Repeat(repeat) => repeat.children.iter().map(child_len).sum(),
         ModelChild::Maybe(maybe) => maybe.children.iter().map(child_len).sum(),
         ModelChild::Choice(choice) => choice.children.iter().map(child_len).max().unwrap_or(0),
+    }
+}
+
+fn child_node(child: &ModelChild) -> NodeId {
+    match child {
+        ModelChild::Span(span) => span.node,
+        ModelChild::Scorer(scorer) => scorer.node,
+        ModelChild::Repeat(repeat) => repeat.node,
+        ModelChild::Choice(choice) => choice.node,
+        ModelChild::Maybe(maybe) => maybe.node,
     }
 }
 
@@ -2000,6 +2086,49 @@ pub(crate) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
     plan_with_filter(model, count, seed, &WriteFilter::default())
 }
 
+pub(crate) fn plan_experiment(model: &Model, task: RefId, row: &JsonValue, index: usize, seed: u64) -> Result<Plan, Error> {
+    let reference = &model.refs[task.0 as usize];
+    let Accessor::Block { node, .. } = reference.accessor else {
+        unreachable!("validated experiment task")
+    };
+    let trace = model
+        .traces
+        .iter()
+        .find(|trace| Some(trace.node) == reference.module)
+        .expect("validated module trace");
+    let mut ctx = Ctx::new(&model.refs, seed, index);
+    ctx.lazy_model = Some(model);
+    ctx.row = Some((node, row));
+    ctx.instantiate_trace(trace, &model.bindings)?;
+    let mut instance = 0;
+    for step in &reference.steps {
+        let Step::Child { candidates, .. } = step else {
+            unreachable!("validated static task path")
+        };
+        ctx.ensure_child(instance, candidates[0])?;
+        instance = *ctx.instances[instance]
+            .children
+            .iter()
+            .find(|&&child| ctx.instances[child].node == candidates[0])
+            .expect("static selected task");
+    }
+    let mut planner = Planner {
+        events: Vec::new(),
+        traces: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let filter = "block.kind != \"scorer\"".parse().expect("valid scorer filter");
+    planner.emit_instance(instance, EventRef(0), None, &mut ctx, &filter)?;
+    planner.traces.push(0..planner.events.len());
+    planner.attachments.extend(ctx.attachments);
+    Ok(Plan {
+        events: planner.events.into_boxed_slice(),
+        traces: planner.traces.into_boxed_slice(),
+        attachments: planner.attachments.into_boxed_slice(),
+        scorer_postlude: false,
+    })
+}
+
 pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &WriteFilter) -> Result<Plan, Error> {
     let selected: Vec<&ModelTrace> = model
         .traces
@@ -2051,6 +2180,7 @@ pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &W
 // a private evaluation instance that never becomes a module declaration
 pub(crate) fn plan_case_data(model: &Model, input: ModelValue, seed: u64) -> Result<Plan, Error> {
     let mut ctx = Ctx::new(&model.refs, seed, 0);
+    ctx.lazy_model = Some(model);
     let case = ModelTrace {
         node: NodeId(u32::MAX),
         name: "dataset case".to_owned(),
@@ -2062,15 +2192,6 @@ pub(crate) fn plan_case_data(model: &Model, input: ModelValue, seed: u64) -> Res
         children: Vec::new(),
     };
     ctx.instantiate_trace(&case, &model.bindings)?;
-    if model
-        .refs
-        .iter()
-        .any(|reference| reference.module.is_some() && !matches!(reference.accessor, Accessor::Block { .. }))
-    {
-        for trace in &model.traces {
-            ctx.instantiate_trace(trace, &model.bindings)?;
-        }
-    }
     let mut planner = Planner {
         events: Vec::new(),
         traces: Vec::new(),

@@ -216,6 +216,7 @@ pub(crate) mod ids {
     pub(crate) const AUTOMATION: Id = Id::new("block.automation");
     pub(crate) const DATASET: Id = Id::new("block.dataset");
     pub(crate) const CASE: Id = Id::new("block.case");
+    pub(crate) const EXPERIMENT: Id = Id::new("block.experiment");
     pub(crate) const CODE: Id = Id::new("block.code");
     pub(crate) const JUDGE: Id = Id::new("block.judge");
     pub(crate) const WHEN: Id = Id::new("block.when");
@@ -251,6 +252,9 @@ pub(crate) mod ids {
     pub(crate) const TRACE_SOURCE: Id = Id::new("field.trace-source");
     pub(crate) const TRACES: Id = Id::new("field.traces");
     pub(crate) const SPAN: Id = Id::new("field.span");
+    pub(crate) const DATASET_REF: Id = Id::new("field.dataset");
+    pub(crate) const TASK_REF: Id = Id::new("field.task");
+    pub(crate) const BASELINE: Id = Id::new("field.baseline");
 
     pub(crate) const STRING: Id = Id::new("expr.string");
     pub(crate) const TEMPLATE: Id = Id::new("expr.template");
@@ -377,6 +381,7 @@ pub(crate) mod ids {
     pub(crate) const FACET_DEFINITION: Id = Id::new("rule.facet-definition");
     pub(crate) const AUTOMATION_BINDING: Id = Id::new("rule.automation-binding");
     pub(crate) const DATASET_CASE: Id = Id::new("rule.dataset-case");
+    pub(crate) const EXPERIMENT_BINDING: Id = Id::new("rule.experiment-binding");
 
     pub(crate) const MULTI_TURN_CONVERSATION: Id = Id::new("example.multi-turn-conversation");
     pub(crate) const AGENT_TOOL_LOOP: Id = Id::new("example.agent-tool-loop");
@@ -390,6 +395,7 @@ pub(crate) mod ids {
     pub(crate) const TOPICS_AUTOMATIONS: Id = Id::new("example.topics-automations");
     pub(crate) const SCORING_AUTOMATIONS: Id = Id::new("example.scoring-automations");
     pub(crate) const DATASET_CASES: Id = Id::new("example.dataset-cases");
+    pub(crate) const EXPERIMENTS: Id = Id::new("example.experiments");
 }
 
 const ANY: ExprType = ExprType::Any;
@@ -639,6 +645,52 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
 const AUTOMATION_RULES: &[RuleDesc] = &[RuleDesc {
     id: ids::AUTOMATION_BINDING,
     summary: "Scorer automations require scorers, scope = \"span\", and either root = true or span_names. Topics automations require facets and scope = \"trace\"; scorer-specific fields are forbidden.",
+}];
+
+const EXPERIMENT_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        id: ids::DATASET_REF,
+        keyword: "dataset",
+        summary: "A dataset declared in this module; live writes consume its synced rows.",
+        value: &ExprType::BlockRef { kinds: &["dataset"] },
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::TASK_REF,
+        keyword: "task",
+        summary: "A whole trace or a static span subtree to generate once per dataset row. Row input and expected replace the selected root's fields; row metadata overrides matching root keys.",
+        value: &ExprType::BlockRef {
+            kinds: &["trace", "task", "llm", "tool", "function"],
+        },
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::SCORERS,
+        keyword: "scorers",
+        summary: "Scorer references invoked against each generated result. Build and push the referenced definitions before a live write.",
+        value: &ExprType::Array {
+            items: &ExprType::BlockRef { kinds: &["scorer"] },
+        },
+        cardinality: Cardinality::Required,
+    },
+    FieldDesc {
+        id: ids::BASELINE,
+        keyword: "baseline",
+        summary: "An experiment in this module to compare against; include it in the same write, where it is generated first.",
+        value: &ExprType::BlockRef { kinds: &["experiment"] },
+        cardinality: Cardinality::Optional,
+    },
+    FieldDesc {
+        id: ids::DESCRIPTION,
+        keyword: "description",
+        summary: "Description of the Braintrust experiment.",
+        value: &STRING,
+        cardinality: Cardinality::Optional,
+    },
+];
+const EXPERIMENT_RULES: &[RuleDesc] = &[RuleDesc {
+    id: ids::EXPERIMENT_BINDING,
+    summary: "An experiment requires dataset, task, and a nonempty scorers array. Named resources must exist, task selection must be static, and baseline references must be acyclic. Generation omits authored synthetic scorer spans; scores come from invoking the referenced deployed scorers. Dry runs generate local cases without scorer execution.",
 }];
 
 const DATASET_FIELDS: &[FieldDesc] = &[FieldDesc {
@@ -1788,6 +1840,20 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        id: ids::EXPERIMENT,
+        keyword: "experiment",
+        summary: "A synthetic task evaluated over a dataset by deployed scorers and written as a Braintrust experiment.",
+        syntax: "experiment \"<name>\" { dataset = dataset[\"<name>\"] task = trace[\"<name>\"][.<kind>.<name>...] scorers = [scorer[\"<name>\"], ...] [baseline = experiment[\"<name>\"]] [description = <string>] }",
+        name: NamePolicy::Required,
+        allowed_in: ROOT_ONLY,
+        body: BodyDesc {
+            fields: EXPERIMENT_FIELDS,
+            open: false,
+        },
+        rules: EXPERIMENT_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
         id: ids::DATASET,
         keyword: "dataset",
         summary: "A named Braintrust dataset with an optional description and named cases.",
@@ -1878,7 +1944,7 @@ pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
 const RULES: &[RuleDesc] = &[
     RuleDesc {
         id: ids::NONEMPTY_SHAPE,
-        summary: "A shape must declare at least one trace, scorer, facet, automation, or dataset block.",
+        summary: "A shape must declare at least one trace, scorer, facet, automation, dataset, or experiment block.",
     },
     RuleDesc {
         id: ids::RESERVED_METRICS,
@@ -1973,6 +2039,13 @@ const EXAMPLES: &[Example] = &[
         summary: "A dataset with inline, whole-trace, and nested-span cases.",
         note: "Sync writes referenced traces and reconciles every case in the dataset.",
         source: include_str!("../../examples/dataset_cases.bt"),
+        valid: true,
+    },
+    Example {
+        id: ids::EXPERIMENTS,
+        summary: "Baseline and improved account recovery flows evaluated over the same dataset.",
+        note: "Sync the dataset and build/push the scorers, then write both experiments together.",
+        source: include_str!("../../examples/experiments.bt"),
         valid: true,
     },
 ];
