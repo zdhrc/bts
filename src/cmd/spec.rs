@@ -18,7 +18,7 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts check syntax shape.bt"],
         },
         CommandDesc {
-            path: &["write"],
+            path: &["write", "traces"],
             guidance: &[
                 "Choose one volume form (`--count` or `--rate`) and one window form (`--over`, optionally with `--offset`, or `--start` with `--end`).",
                 "Use `--dry-run` to inspect the Braintrust event payload before writing. Pass `--seed` to reproduce sampled values.",
@@ -26,9 +26,20 @@ pub(crate) static SPEC: Spec = Spec {
                 "For a live write, select the Braintrust project with `bt switch` and set `BRAINTRUST_API_KEY`. The selected project name and ID come from `.bt/config.json`.",
             ],
             examples: &[
-                "bts write --from shape.bt --count 100 --over 1h --dry-run",
-                "bts write --from shape.bt --count 100 --over 1h --filter 'block.kind != \"scorer\"'",
+                "bts write traces --from shape.bt --count 100 --over 1h --dry-run",
+                "bts write traces --from shape.bt --count 100 --over 1h --filter 'block.kind != \"scorer\"'",
             ],
+        },
+        CommandDesc {
+            path: &["write", "experiments"],
+            guidance: &[
+                "An experiment selects a dataset, a whole trace or static span subtree, and scorer references. Sync its dataset and build/push its scorers before a live write. Live generation consumes the synced dataset snapshot, including reviewed row changes.",
+                "Each row replaces the selected root's input and expected fields. Its metadata overrides matching root keys, and tags are appended. Use self.input or the selected block's input in output expressions. The selected subtree retains its original reference scopes.",
+                "--select accepts experiment traversals; repeat it to choose several. Omitting it writes all experiments. Referenced baselines must be selected in the same write and are written first. Every invocation creates new runs with a shared generated name suffix.",
+                "Upload summaries retain created experiment IDs on failure. --json includes an error and per-experiment status (complete or incomplete); incomplete uploads may contain some results. Scorer failures identify the experiment, dataset row, and scorer.",
+                "--dry-run previews local cases and tasks without API access or scorer invocation; uploaded dataset corrections are only consumed by live writes. Authored synthetic scorer spans are excluded. Live writes invoke deployed scorers, so judge scorers incur model costs. --seed controls generation, not scorer randomness.",
+            ],
+            examples: &["bts write experiments --from shape.bt --select 'experiment.baseline' --seed 42 --dry-run"],
         },
         CommandDesc {
             path: &["build"],

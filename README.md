@@ -2,7 +2,7 @@
 
 It's "another synthetics generator".
 
-`bts` generates synthetic traces from a declarative shape file and writes them to [Braintrust](https://braintrust.dev). Describe what a trace looks like once, then generate as many as you want, spread over a historical time window, with per-trace variation.
+`bts` creates synthetic workflows in [Braintrust](https://braintrust.dev): traces, datasets, scorer-backed experiments, and Topics automations. Describe a workflow in a shape file, then generate varied traffic over a historical time window, build regression cases, and compare versions with real scorer results.
 
 ## Install
 
@@ -45,30 +45,180 @@ and API key are not needed for `check` or `--dry-run`.
 Then describe a trace in a shape file (see [The shape language](#the-shape-language)) and write a batch:
 
 ```sh
-bts write --from shape.bt --count 200 --over 24h
+bts write traces --from shape.bt --count 200 --over 24h
 ```
+
+## The shape language
+
+A shape file (`.bt`) describes a workflow and the data around it. Save this small example as `shape.bt`:
+
+```bts
+vars { answer = "Download invoices from Billing > Invoices." }
+
+trace "support" {
+    input = { question = "Where can I download my invoices?" }
+    output = llm.reply.output
+    tags = ["billing"]
+
+    tool "search" {
+        input = trace.input.question
+        output = var.answer
+    }
+    llm "reply" {
+        input = { question = trace.input.question, article = tool.search.output }
+        output = tool.search.output
+        duration = range(0.4, 1.2)
+    }
+}
+
+scorer "answer-correctness" {
+    code { score = output == expected ? 1 : 0 }
+}
+
+dataset "support-cases" {
+    case "invoices" {
+        input = { question = "Where can I download my invoices?" }
+        expected = var.answer
+    }
+}
+
+facet "Request type" {
+    prompt = "Describe the customer's request in a short phrase."
+}
+automation "support-topics" {
+    type = "topics"
+    facets = ["Request type"]
+    scope = "trace"
+}
+
+experiment "support-check" {
+    dataset = dataset["support-cases"]
+    task = trace.support
+    scorers = [scorer["answer-correctness"]]
+}
+```
+
+The trace's inputs and outputs are synthetic. Scorers and Topics run in Braintrust against that data. Here's what you can do with each part.
+
+### Traces
+
+Nest `task`, `llm`, `tool`, and `function` spans to show a workflow. References connect their inputs and outputs; expressions vary durations, token counts, metadata, and content. Use `repeat`, `choice`, and `maybe` to vary the structure too:
+
+```bts
+trace "support-session" {
+    repeat "turns" {
+        count = range(1, 4)
+        task "turn" {
+            input = "question ${repeat.index}"
+            output = "answer ${repeat.index}"
+        }
+    }
+    maybe "escalation" {
+        chance = 0.25
+        task "handoff" { output = "Escalated to tier 2." }
+    }
+}
+```
+
+```sh
+bts write traces --from shape.bt --count 200 --over 24h
+```
+
+See [multi-turn conversations](examples/multi_turn_conversation.bt), [agent tool loops](examples/agent_tool_loop.bt), and [supervisors and subagents](examples/supervisor_and_subagents.bt) for richer workflows.
+
+### Scorers
+
+Code scorers evaluate `input`, `output`, `expected`, and `metadata`. You can also use an LLM judge:
+
+```bts
+scorer "helpfulness" {
+    judge {
+        model = "gpt-4o-mini"
+        prompt = "Rate the response to this request. Request: ${input}. Response: ${output}."
+        options = { helpful = 1, unhelpful = 0 }
+    }
+}
+```
+
+Build scorers into Python or TypeScript SDK source files:
+
+```sh
+bts build --from shape.bt --lang typescript
+```
+
+The build prints the `bt functions push` command and directory to run it from. Once deployed, functions can score experiments or incoming traces. Add an automation to apply the judge to replies:
+
+```bts
+automation "review-replies" {
+    type = "scorer"
+    scorers = ["helpfulness"]
+    scope = "span"
+    span_names = ["reply"]
+}
+```
+
+```sh
+bts sync automation scorers --from shape.bt
+```
+
+See [code scorers](examples/code_scorer.bt), [LLM judges](examples/judge_scorer.bt), and [online scoring](examples/scoring_automations.bt).
+
+### Datasets
+
+Author cases with inputs, expected results, metadata, and tags, or capture a whole trace or selected span as a case:
+
+```bts
+dataset "search-cases" {
+    case "invoice-lookup" {
+        span = trace.support.tool.search
+        tags = ["billing"]
+    }
+}
+```
+
+```sh
+bts sync datasets --from shape.bt
+```
+
+Sync keeps Braintrust datasets aligned with the cases in your file as you add, change, or remove them. See [dataset cases](examples/dataset_cases.bt) for the different ways to create rows.
+
+### Topics
+
+Facets describe the signals you want to discover. Topics automations use them to group conversations in Braintrust, such as billing requests or reasons customers might leave:
+
+```sh
+bts sync automation topics --from shape.bt
+```
+
+Sync the automation before writing traces. See [Topics automations](examples/topics_automations.bt) for conversations covering renewal costs, unresolved issues, and customers who change their minds after a fix.
+
+### Experiments
+
+An experiment connects a dataset, a trace or span to generate, and deployed scorers. Each row supplies the task's input; the task generates a synthetic result and the scorers produce its scores.
+
+After syncing the dataset and deploying the scorers:
+
+```sh
+bts write experiments --from shape.bt --select 'experiment["support-check"]'
+```
+
+Repeat `--select` to choose several experiments, or omit it to write all. Add `baseline = experiment["baseline-name"]` to compare against another experiment in the same write. `--dry-run` previews local cases and generated tasks without invoking scorers.
+
+See [the account recovery comparison](examples/experiments.bt) for baseline and improved flows, five cases, and three scorers.
+
+The full language reference is generated by `bts setup skill`; [examples/](examples/) has complete workflows to start from.
 
 ## Handy commands
 
 ```sh
-bts check syntax shape.bt                                 # validate a shape file (`-` reads stdin)
-bts write --from shape.bt --count 5 --over 1h --dry-run   # preview without writing anything
-bts write --from shape.bt --count 200 --over 24h          # generate and write to Braintrust
-bts check logs                                            # list recent runs with ok / failed verdicts
-bts update                                                # update bts to the latest release
+bts check syntax shape.bt                                    # validate a shape file (`-` reads stdin)
+bts write traces --from shape.bt --count 5 --over 1h --dry-run # preview traces
+bts write experiments --from shape.bt --dry-run               # preview experiment tasks
+bts check logs --last                                        # inspect the most recent run
+bts update                                                  # update to the latest release
 ```
 
-The generation window ends at now by default; `--offset 1d` slides it back, and `--start`/`--end` (RFC 3339 timestamps) pin it absolutely in place of `--over`. Volume is either an exact `--count` or a `--rate` over the window, like `20/h`. Trace volume is spread linearly by default; pass `--dist sine` for a wavier load pattern. Generation is seeded — every run prints its seed, and passing `--seed <n>` reproduces a run exactly. Pass `--json` to get the final summary (seed, counts, duration, run log path) as a single JSON line on stdout, for scripts and agents.
-
-Every `write` run also writes a JSON-lines log to `.bt/bts/logs/` (next to the nearest `.bt` project directory, or the current directory) with phase timings, the seed, per-batch insert results, retry warnings, and any failure. The last 20 runs are kept, the directory gitignores itself, and a failed run prints the path to its log. Pass `--profile` to also stream phase timings to stderr. Transient write failures (timeouts, 429s, 5xx) are retried with exponential backoff before the run gives up.
-
-Inspect past runs without digging through the JSONL yourself:
-
-```sh
-bts check logs                   # list recent runs, each with an ok / failed verdict
-bts check logs --last            # render the most recent run, one readable line per event
-bts check logs <run-file-name>   # render a specific run from the listing
-```
+Use `--rate 20/h` instead of `--count` for a traffic rate, and `--offset 1d` to move a trace window into the past. `--seed` reproduces sampled values; it doesn't control deployed scorer randomness. Live writes print a summary; `--json` makes it machine-readable. Run logs live under `.bt/bts/logs/`.
 
 ## Configuration
 
@@ -87,59 +237,6 @@ request_timeout = "30s"   # per-request timeout for Braintrust API calls
 ```
 
 Everything is optional and shown here with its default. The `BTS_LOG` environment variable overrides `log.level` for a single run — `BTS_LOG=debug bts write ...` — and `off` disables the run log entirely.
-
-## The shape language
-
-Shape files (`.bt`) declare the structure of a trace: its spans, their inputs and outputs, metadata, and how each generated trace should vary. A small example:
-
-```bts
-vars {
-    model = "gpt-4o-mini"
-}
-
-trace "support-sessions" {
-    repeat "turns" {
-        count = range(1, 4)
-
-        task "turn" {
-            input = "question ${repeat.index}"
-            output = "answer ${repeat.index}"
-
-            llm "Chat Completion" {
-                input = [{ role = "user", content = task.turn.input }]
-                output = { role = "assistant", content = task.turn.output }
-                metadata = { model = var.model, provider = "openai" }
-                metrics = {
-                    prompt_tokens = tokens(self.input)
-                    completion_tokens = tokens(self.output)
-                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                }
-            }
-        }
-    }
-
-    maybe "escalation" {
-        chance = 0.25
-
-        task "escalation" {
-            output = "escalated to tier 2"
-        }
-    }
-
-    metadata = { escalated = maybe.escalation.included }
-    tags = ["support"]
-}
-```
-
-The building blocks:
-
-- **Span blocks** — `trace`, `task`, `llm`, `tool`, and `function` nest to form the span tree, with fields like `input`, `output`, `metadata`, `metrics`, and `tags`. A `duration` field (seconds, any numeric expression) controls each span's place on the timeline; parents stretch to cover their children.
-- **Dynamic blocks** — `repeat`, `choice`, and `maybe` vary the shape of each generated trace: repeated sections, one-of alternatives, and probabilistic inclusion.
-- **Expressions** — full expression language with arithmetic, comparisons, conditionals, string interpolation (`"${...}"`), arrays, objects, spreads, slices, and shared values via `vars`. A `vars` block can sit at the root or inside any block; each value is drawn once per instantiation of that block, so a sampled value stays consistent everywhere it's referenced.
-- **References** — spans read each other's fields, so generated data stays coherent: block references like `task.turn_0.output` or `llm["Chat Completion"].metrics.tokens` thread one span's values into another, `self` reads the enclosing span's own fields, and `choice.<name>.chosen` / `maybe.<name>.included` expose what a dynamic block did. Slices project over repeat iterations — `...repeat.rounds[:repeat.index].llm.chat.output` replays an agent loop's history.
-- **Functions** — a library of ~30 built-ins for randomness and data munging: samplers like `range`, `choice`, `weighted`, `normal`, and `poisson`, string helpers, math helpers, exact token counting with `tokens`, and id generators like `uuid` and `hex`.
-
-The complete language reference (grammar, every block, field, and function) is generated by `bts setup skill`; the fixtures in `tests/fixtures/` are also worked examples.
 
 ## License
 

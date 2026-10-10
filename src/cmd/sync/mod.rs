@@ -1,5 +1,5 @@
 mod automation;
-mod datasets;
+pub(crate) mod datasets;
 
 #[derive(Debug)]
 pub enum Error {

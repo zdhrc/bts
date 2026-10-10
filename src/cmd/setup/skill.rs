@@ -560,7 +560,7 @@ mod tests {
         assert!(skill.starts_with("---\nname: bts\ndescription:"));
         assert!(skill.contains(GENERATED_MARKER));
         assert!(skill.contains("bts check syntax <path>"));
-        assert!(skill.contains("bts write --from shape.bt --count 100 --over 1h --dry-run"));
+        assert!(skill.contains("bts write traces --from shape.bt --count 100 --over 1h --dry-run"));
         assert!(skill.contains(DSL_SPEC.summary));
         assert!(skill.contains(DSL_SPEC.surface.grammar.trim()));
         for expression in DSL_SPEC.expressions {

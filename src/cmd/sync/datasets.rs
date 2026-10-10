@@ -82,15 +82,15 @@ fn seed(key: &str) -> u64 {
     u64::from_le_bytes(sdg::stable_uuid(key).as_bytes()[..8].try_into().unwrap())
 }
 fn prepare(dataset: &Dataset, model: &Model, config: &Braintrust, path: &Path) -> Result<Vec<Case>, Error> {
+    prepare_for_project(dataset, model, &config.project_id.to_string(), path)
+}
+fn prepare_for_project(dataset: &Dataset, model: &Model, project_id: &str, path: &Path) -> Result<Vec<Case>, Error> {
     dataset
         .cases
         .iter()
         .map(|case| {
-            let row_id = sdg::stable_uuid(&format!(
-                "bts/dataset/{}/{}/{}/row",
-                config.project_id, dataset.name, case.name
-            ))
-            .to_string();
+            let row_id =
+                sdg::stable_uuid(&format!("bts/dataset/{}/{}/{}/row", project_id, dataset.name, case.name)).to_string();
             let mut data = sdg::case_data(model, case, seed(&row_id)).map_err(other)?;
             data.resolve_attachment_paths(path).map_err(other)?;
             let mut row = serde_json::to_value(&data)?["events"][0]["input"].clone();
@@ -144,7 +144,7 @@ fn prepare(dataset: &Dataset, model: &Model, config: &Braintrust, path: &Path) -
                     &filter,
                 )
                 .map_err(other)?;
-                let key = format!("bts/dataset/{}/{source_key}", config.project_id);
+                let key = format!("bts/dataset/{project_id}/{source_key}");
                 batch.assign_stable_ids(&key);
                 batch.resolve_attachment_paths(path).map_err(other)?;
                 let events = serde_json::to_value(&batch)?["events"]
@@ -441,6 +441,9 @@ fn reconcile(
     Ok(())
 }
 fn finish_row(case: &mut Case, config: &Braintrust) -> Result<(), Error> {
+    finish_row_for_project(case, &config.project_id.to_string())
+}
+fn finish_row_for_project(case: &mut Case, project_id: &str) -> Result<(), Error> {
     if let Some(path) = &case.span_path {
         let selected = select_span(&case.sources[0].events, path);
         if selected.len() != 1 {
@@ -456,10 +459,9 @@ fn finish_row(case: &mut Case, config: &Braintrust) -> Result<(), Error> {
         {
             case.row["expected"] = output.clone();
         }
-        case.row["origin"] =
-            json!({"object_type":"project_logs","object_id":config.project_id.to_string(),"id":selected[0]["id"]});
+        case.row["origin"] = json!({"object_type":"project_logs","object_id":project_id,"id":selected[0]["id"]});
     } else if !case.sources.is_empty() {
-        let refs = case.sources.iter().map(|source| Ok(json!({"trace_ref":{"object_type":"project_logs","object_id":config.project_id.to_string(),"root_span_id":root(&source.events)?}}))).collect::<Result<Vec<_>, Error>>()?;
+        let refs = case.sources.iter().map(|source| Ok(json!({"trace_ref":{"object_type":"project_logs","object_id":project_id,"root_span_id":root(&source.events)?}}))).collect::<Result<Vec<_>, Error>>()?;
         case.row["input"] = if refs.len() == 1 {
             refs.into_iter().next().unwrap()
         } else {
@@ -545,7 +547,10 @@ fn row_equal(current: &Value, desired: &Value) -> bool {
         .iter()
         .all(|key| current.get(*key).unwrap_or(&Value::Null) == desired.get(*key).unwrap_or(&Value::Null))
 }
-fn fetch_rows(client: &Client, id: &str) -> Result<HashMap<String, Value>, Error> {
+pub(crate) fn fetch_rows(client: &Client, id: &str) -> Result<HashMap<String, Value>, Error> {
+    fetch_snapshot(client, id).map(|(_, rows)| rows)
+}
+pub(crate) fn fetch_snapshot(client: &Client, id: &str) -> Result<(Option<String>, HashMap<String, Value>), Error> {
     let mut rows = HashMap::new();
     let mut cursor: Option<String> = None;
     let mut version: Option<String> = None;
@@ -584,7 +589,15 @@ fn fetch_rows(client: &Client, id: &str) -> Result<HashMap<String, Value>, Error
             return Err(other("dataset fetch repeated its pagination cursor"));
         }
     }
-    Ok(rows)
+    Ok((version, rows))
+}
+
+pub(crate) fn preview_rows(dataset: &Dataset, model: &Model, path: &Path) -> Result<Vec<Value>, Error> {
+    let mut cases = prepare_for_project(dataset, model, "preview", path)?;
+    for case in &mut cases {
+        finish_row_for_project(case, "preview")?;
+    }
+    Ok(cases.into_iter().map(|case| case.row).collect())
 }
 fn other(error: impl fmt::Display) -> Error {
     Error::Other(error.to_string())

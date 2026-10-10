@@ -23,6 +23,146 @@ trace "conversation" {
 "#;
 
 #[test]
+fn experiment_dry_run_selects_tasks_without_auth_or_scorer_calls() {
+    let shape = write_shape(
+        r#"
+        trace "workflow" {
+            repeat "unused" { count = range(-2, -1) tool "unused" { output = "unused" } }
+            task "answer" {
+                input = "fallback"
+                output = self.input == "blocked" ? "Cannot recover this account" : "Recovery instructions sent"
+                llm "reply" { input = task.answer.input output = task.answer.output }
+                scorer "quality" { score = 0 }
+            }
+        }
+        trace "unrelated" { repeat "unused" { count = range(-2, -1) tool "unused" { output = "unused" } } }
+        scorer "quality" { code { score = output == expected ? 1 : 0 } }
+        dataset "cases" {
+            case "blocked" { input = "blocked" expected = "Cannot recover this account" }
+            case "normal" { input = "normal" expected = "Recovery instructions sent" }
+        }
+        experiment "selected" { dataset = dataset.cases task = trace.workflow.task.answer scorers = [scorer.quality] }
+        experiment "other" { dataset = dataset.cases task = trace.workflow scorers = [scorer.quality] }
+    "#,
+    );
+    let output = bts()
+        .args(["write", "experiments", "--from"])
+        .arg(&shape)
+        .args(["--select", "experiment.selected", "--seed", "42", "--dry-run"])
+        .env_remove("BRAINTRUST_API_KEY")
+        .env("BRAINTRUST_API_URL", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["scorers_executed"], false);
+    assert_eq!(payload["dataset_source"], "local");
+    let experiments = payload["experiments"].as_array().unwrap();
+    assert_eq!(experiments.len(), 1);
+    assert_eq!(experiments[0]["name"], "selected");
+    let results = experiments[0]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    for result in results {
+        let events = result["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["output"], events[0]["expected"]);
+        assert_eq!(events[0]["output"], events[1]["output"]);
+        assert!(events.iter().all(|event| event.get("scores").is_none()));
+    }
+}
+
+#[test]
+fn experiment_upload_failure_reports_completed_runs_in_human_and_json_output() {
+    let project = Uuid::new_v4();
+    let root = write_project_context(project);
+    let shape = root.join("shape.bt");
+    fs::write(
+        &shape,
+        r#"
+        trace "t" { input = "fallback" output = trace.input }
+        dataset "cases" { case "one" { input = "question" } }
+        scorer "quality" { code { score = 1 } }
+        experiment "baseline" { dataset = dataset.cases task = trace.t scorers = [scorer.quality] }
+        experiment "fixed" { dataset = dataset.cases task = trace.t scorers = [scorer.quality] baseline = experiment.baseline }
+    "#,
+    )
+    .unwrap();
+    for json in [false, true] {
+        let (api, requests) = serve_json_sequence(vec![
+            serde_json::json!({"objects":[{"id":"function","project_id":project.to_string(),"slug":"quality","function_type":"scorer","_xact_id":"20"}]}),
+            serde_json::json!({"objects":[{"id":"dataset","project_id":project.to_string(),"name":"cases"}]}),
+            serde_json::json!({"events":[{"id":"one","input":"question","_xact_id":"10"}]}),
+            serde_json::json!({"name":"quality","score":1}),
+            serde_json::json!({"name":"quality","score":1}),
+            serde_json::json!({"id":"baseline-id"}),
+            serde_json::json!({"row_ids":["root","scorer"]}),
+            serde_json::json!({}),
+        ]);
+        let mut command = bts();
+        command
+            .current_dir(&root)
+            .args(["write", "experiments", "--from"])
+            .arg(&shape)
+            .env("BRAINTRUST_API_KEY", "test-key")
+            .env("BRAINTRUST_API_URL", &api)
+            .env("BTS_LOG", "off");
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("experiment \"fixed\""), "{stderr}");
+        if json {
+            let report: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["experiments"].as_array().unwrap().len(), 1);
+            assert_eq!(report["experiments"][0]["id"], "baseline-id");
+            assert_eq!(report["experiments"][0]["status"], "complete");
+            assert_eq!(report["experiments"][0]["results"], 1);
+            assert!(report["error"].as_str().unwrap().contains("experiment \"fixed\""));
+        } else {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("wrote baseline-"), "{stdout}");
+            assert!(stdout.contains("experiment baseline-id"), "{stdout}");
+        }
+        assert_eq!(requests.recv_timeout(Duration::from_secs(2)).unwrap().len(), 8);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn explicit_trace_write_matches_legacy_write_generation() {
+    let shape = write_shape(SIMPLE_SHAPE);
+    let run = |explicit: bool| {
+        let mut command = bts();
+        command.arg("write");
+        if explicit {
+            command.arg("traces");
+        }
+        let output = command
+            .arg("--from")
+            .arg(&shape)
+            .args(["--count", "2", "--over", "1h", "--seed", "42", "--dry-run"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+        payload["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(json_input_output)
+            .collect::<Vec<_>>()
+    };
+    fn json_input_output(event: &JsonValue) -> JsonValue {
+        serde_json::json!([event["span_attributes"], event["input"], event["output"]])
+    }
+    assert_eq!(run(true), run(false));
+    fs::remove_file(shape).unwrap();
+}
+
+#[test]
 fn dry_run_expands_a_shape_into_the_requested_window() {
     let shape = write_shape(SIMPLE_SHAPE);
     let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();

@@ -11,9 +11,9 @@ pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use filter::WriteFilter;
 pub(crate) use model::{
     Accessor, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
-    DatasetSource, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range, RefId, Repeat,
-    ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerStep, Selection, SpanFields, SpanKind, Step, Template, Trace,
-    UnaryOp, Value,
+    DatasetSource, Experiment, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range,
+    RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerStep, Selection, SpanFields, SpanKind, Step,
+    Template, Trace, UnaryOp, Value,
 };
 
 use crate::dsl::{lexer::lex, modeler::model, parser::parse};
@@ -153,6 +153,54 @@ mod tests {
         assert_eq!(model.datasets.len(), 1);
         assert_eq!(model.datasets[0].description.as_deref(), Some("Regression cases"));
         assert_eq!(model.datasets[0].cases.len(), 6);
+    }
+
+    #[test]
+    fn models_experiments_with_forward_typed_references() {
+        let model = compile(r#"
+            experiment "fixed" { dataset = dataset["cases"] task = trace.workflow.task.answer scorers = [scorer.correct] baseline = experiment["baseline"] }
+            experiment "baseline" { dataset = dataset.cases task = trace["workflow"] scorers = [scorer["correct"]] description = "Before the fix" }
+            dataset "cases" { case "one" { input = "question" } }
+            scorer "correct" { code { score = 1 } }
+            trace "workflow" { input = "question" task "answer" { output = "answer" } }
+        "#).unwrap();
+        assert_eq!(model.experiments.len(), 2);
+        assert_eq!(model.experiments[0].baseline.as_deref(), Some("baseline"));
+        assert_eq!(model.experiments[0].dataset, "cases");
+        let reference = &model.refs[model.experiments[0].task.0 as usize];
+        assert!(matches!(reference.accessor, Accessor::Block { kind: "task", .. }));
+    }
+
+    #[test]
+    fn rejects_invalid_experiment_bindings_and_baseline_cycles() {
+        let resources = r#"dataset "cases" { case "one" { input = "x" } } scorer "correct" { code { score = 1 } } trace "t" { input = "x" task "answer" { output = "y" } choice "route" { task "branch" { output = "z" } } }"#;
+        for fields in [
+            "dataset = dataset.missing task = trace.t scorers = [scorer.correct]",
+            "dataset = dataset.cases task = trace.t scorers = [scorer.missing]",
+            "dataset = dataset.cases task = trace.t.output scorers = [scorer.correct]",
+            "dataset = dataset.cases task = trace.t.choice.route.task.branch scorers = [scorer.correct]",
+            "dataset = dataset.cases task = trace.t scorers = []",
+            "dataset = dataset.cases task = trace.t scorers = [scorer.correct, scorer.correct]",
+            "dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.e",
+            "dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.missing",
+            "dataset = dataset.cases task = trace.t scorers = [\"correct\"]",
+            "dataset = \"cases\" task = trace.t scorers = [scorer.correct]",
+            "dataset = dataset.cases task = trace.t",
+        ] {
+            assert!(
+                compile(&format!("{resources} experiment \"e\" {{ {fields} }}")).is_err(),
+                "{fields}"
+            );
+        }
+        assert!(
+            compile(&format!(
+                r#"{resources}
+            experiment "a" {{ dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.b }}
+            experiment "b" {{ dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.a }}
+        "#
+            ))
+            .is_err()
+        );
     }
 
     #[test]
