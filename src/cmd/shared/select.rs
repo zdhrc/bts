@@ -39,8 +39,8 @@ impl FromStr for ResourceSelector {
         }
         let name = path.pop().expect("two traversal segments");
         let kind = path.pop().expect("two traversal segments");
-        if !matches!(kind.as_str(), "scorer" | "facet" | "automation" | "dataset") || name.is_empty() {
-            return Err("--select expects a named scorer, facet, automation, or dataset".to_owned());
+        if !matches!(kind.as_str(), "scorer" | "facet" | "automation" | "dataset" | "experiment") || name.is_empty() {
+            return Err("--select expects a named scorer, facet, automation, dataset, or experiment".to_owned());
         }
         Ok(Self { kind, name })
     }

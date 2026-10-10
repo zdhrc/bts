@@ -8,11 +8,37 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+mod experiments;
+
+#[derive(Debug, clap::Args)]
+#[command(about = "generate and write synthetic Braintrust data")]
+pub struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// generate production traces over a time window
+    Traces(TraceArgs),
+    /// generate dataset results and evaluate them with deployed scorers
+    Experiments(experiments::Args),
+}
+
+impl Args {
+    pub fn run(self) -> Result<(), Error> {
+        match self.command {
+            Command::Traces(args) => args.run(),
+            Command::Experiments(args) => args.run().map_err(|error| Error::Experiment(error.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, clap::Args)]
 #[command(about = "generate synthetic traces from a bts shape and write them to Braintrust")]
 #[command(group = clap::ArgGroup::new("window").required(true).args(["over", "start"]))]
 #[command(group = clap::ArgGroup::new("volume").required(true).args(["count", "rate"]))]
-pub struct Args {
+pub struct TraceArgs {
     /// bts shape file to generate from
     #[arg(long, value_name = "PATH")]
     from: PathBuf,
@@ -66,7 +92,7 @@ pub struct Args {
     profile: bool,
 }
 
-impl Args {
+impl TraceArgs {
     pub fn run(self) -> Result<(), Error> {
         let settings = Settings::load()?;
         let log_path = logging::init("write", self.profile, &settings);
@@ -270,6 +296,7 @@ struct Summary {
 
 #[derive(Debug)]
 pub enum Error {
+    Experiment(String),
     EmptyWindow,
     OffsetOutOfRange,
     NoTracesAtRate,
@@ -286,6 +313,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Experiment(message) => formatter.write_str(message),
             Self::EmptyWindow => formatter.write_str("window end must be after its start"),
             Self::OffsetOutOfRange => formatter.write_str("offset reaches further back than timestamps can represent"),
             Self::NoTracesAtRate => formatter.write_str("rate over this window rounds to zero traces"),
@@ -341,16 +369,29 @@ mod tests {
     use crate::cmd::{Cli, Cmd};
     use clap::Parser as _;
 
-    fn parse_write(argv: &[&str]) -> Result<Args, clap::Error> {
+    fn parse_write(argv: &[&str]) -> Result<TraceArgs, clap::Error> {
         Cli::try_parse_from(argv).map(|cli| match cli.command {
-            Cmd::Write(args) => args,
+            Cmd::Write(Args {
+                command: Command::Traces(args),
+            }) => args,
             other => panic!("expected a write command, parsed {other:?}"),
         })
     }
 
     #[test]
     fn parses_requested_command_shape() {
-        let args = parse_write(&["bts", "write", "--from", "simple.bt", "--count", "25", "--over", "1h"]).unwrap();
+        let args = parse_write(&[
+            "bts",
+            "write",
+            "traces",
+            "--from",
+            "simple.bt",
+            "--count",
+            "25",
+            "--over",
+            "1h",
+        ])
+        .unwrap();
 
         assert_eq!(args.from, PathBuf::from("simple.bt"));
         assert_eq!(args.count.unwrap().get(), 25);
@@ -366,6 +407,7 @@ mod tests {
         let args = parse_write(&[
             "bts",
             "write",
+            "traces",
             "--from",
             "simple.bt",
             "--rate",
@@ -394,6 +436,7 @@ mod tests {
         let args = parse_write(&[
             "bts",
             "write",
+            "traces",
             "--from",
             "simple.bt",
             "--count",
@@ -414,14 +457,15 @@ mod tests {
     #[test]
     fn requires_exactly_one_window_and_volume_form() {
         // a member of each group is required
-        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "1"]).is_err());
-        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--over", "1h"]).is_err());
+        assert!(parse_write(&["bts", "write", "traces", "--from", "simple.bt", "--count", "1"]).is_err());
+        assert!(parse_write(&["bts", "write", "traces", "--from", "simple.bt", "--over", "1h"]).is_err());
 
         // the forms are mutually exclusive
         assert!(
             parse_write(&[
                 "bts",
                 "write",
+                "traces",
                 "--from",
                 "simple.bt",
                 "--count",
@@ -437,6 +481,7 @@ mod tests {
             parse_write(&[
                 "bts",
                 "write",
+                "traces",
                 "--from",
                 "simple.bt",
                 "--count",
@@ -456,6 +501,7 @@ mod tests {
             parse_write(&[
                 "bts",
                 "write",
+                "traces",
                 "--from",
                 "simple.bt",
                 "--count",
@@ -465,7 +511,20 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "1", "--offset", "1d"]).is_err());
+        assert!(
+            parse_write(&[
+                "bts",
+                "write",
+                "traces",
+                "--from",
+                "simple.bt",
+                "--count",
+                "1",
+                "--offset",
+                "1d"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -473,6 +532,7 @@ mod tests {
         let args = parse_write(&[
             "bts",
             "write",
+            "traces",
             "--from",
             "simple.bt",
             "--count",
@@ -488,6 +548,7 @@ mod tests {
         let args = parse_write(&[
             "bts",
             "write",
+            "traces",
             "--from",
             "simple.bt",
             "--rate",
@@ -529,6 +590,7 @@ mod tests {
             parse_write(&[
                 "bts",
                 "write",
+                "traces",
                 "--from",
                 "simple.bt",
                 "--count",
@@ -547,6 +609,7 @@ mod tests {
         let args = parse_write(&[
             "bts",
             "write",
+            "traces",
             "--from",
             "simple.bt",
             "--count",
@@ -563,12 +626,39 @@ mod tests {
 
     #[test]
     fn rejects_zero_counts_and_invalid_durations() {
-        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "0", "--over", "1h"]).is_err());
-        assert!(parse_write(&["bts", "write", "--from", "simple.bt", "--count", "1", "--over", "hour"]).is_err());
         assert!(
             parse_write(&[
                 "bts",
                 "write",
+                "traces",
+                "--from",
+                "simple.bt",
+                "--count",
+                "0",
+                "--over",
+                "1h"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_write(&[
+                "bts",
+                "write",
+                "traces",
+                "--from",
+                "simple.bt",
+                "--count",
+                "1",
+                "--over",
+                "hour"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_write(&[
+                "bts",
+                "write",
+                "traces",
                 "--from",
                 "simple.bt",
                 "--count",

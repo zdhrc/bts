@@ -31,6 +31,19 @@ enum Cmd {
 }
 
 impl Cli {
+    pub fn parse_compatible() -> Self {
+        use clap::Parser as _;
+        let mut args: Vec<_> = std::env::args_os().collect();
+        if args.get(1).is_some_and(|arg| arg == "write")
+            && args
+                .get(2)
+                .is_some_and(|arg| arg != "traces" && arg != "experiments" && arg != "--help" && arg != "-h")
+        {
+            args.insert(2, "traces".into());
+        }
+        Self::parse_from(args)
+    }
+
     pub fn run(self) -> Result<(), Error> {
         match self.command {
             Cmd::Build(args) => args.run()?,
