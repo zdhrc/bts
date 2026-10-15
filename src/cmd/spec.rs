@@ -4,6 +4,8 @@ pub(crate) struct Spec {
 }
 
 pub(crate) struct CommandDesc {
+    #[allow(dead_code)]
+    pub(crate) tags: &'static [&'static str],
     pub(crate) path: &'static [&'static str],
     pub(crate) guidance: &'static [&'static str],
     pub(crate) examples: &'static [&'static str],
@@ -13,11 +15,13 @@ pub(crate) static SPEC: Spec = Spec {
     summary: "Use the `bts` CLI to validate shapes, generate traces, build scorer functions, and sync Braintrust resources.",
     commands: &[
         CommandDesc {
+            tags: &[],
             path: &["check", "syntax"],
             guidance: &["Validate a shape after changing it. Pass `-` to read source from stdin."],
             examples: &["bts check syntax shape.bt"],
         },
         CommandDesc {
+            tags: &[],
             path: &["write", "traces"],
             guidance: &[
                 "Choose one volume form (`--count` or `--rate`) and one window form (`--over`, optionally with `--offset`, or `--start` with `--end`).",
@@ -31,6 +35,7 @@ pub(crate) static SPEC: Spec = Spec {
             ],
         },
         CommandDesc {
+            tags: &["preview"],
             path: &["write", "experiments"],
             guidance: &[
                 "An experiment selects a dataset, a whole trace or static span subtree, and scorer references. Sync its dataset and build/push its scorers before a live write. Live generation consumes the synced dataset snapshot, including reviewed row changes.",
@@ -42,6 +47,7 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts write experiments --from shape.bt --select 'experiment.baseline' --seed 42 --dry-run"],
         },
         CommandDesc {
+            tags: &["preview"],
             path: &["build"],
             guidance: &[
                 "Build top-level scorer blocks into SDK source files. Then change into the emitted `<out>/src/scorers` directory and run the `bt functions push --if-exists replace ...` command printed by `bts build`, passing the generated filenames from that directory.",
@@ -50,6 +56,7 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts build --from shape.bt"],
         },
         CommandDesc {
+            tags: &["preview"],
             path: &["sync", "automation", "scorers"],
             guidance: &[
                 "Push scorer functions before syncing automations that reference them. Use `--dry-run` to review the proposed changes. --select accepts scorer or automation traversals; repeat it to select multiple resources. Matching automations are synced in full.",
@@ -57,6 +64,7 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts sync automation scorers --from shape.bt --select 'scorer.brand' --dry-run"],
         },
         CommandDesc {
+            tags: &["preview"],
             path: &["sync", "automation", "topics"],
             guidance: &[
                 "Sync referenced facet definitions, their topic maps, and Topics automations. No scorer build or push is required. Use --dry-run to review without writes.",
@@ -67,6 +75,7 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts sync automation topics --from shape.bt --select 'facet[\"Churn risk\"]' --dry-run"],
         },
         CommandDesc {
+            tags: &["preview"],
             path: &["sync", "datasets"],
             guidance: &[
                 "Removing a previously synced dataset block deletes its remote dataset on the next sync. .bt/bts/state.json tracks ownership by project ID and shape path. Definitions shared by another shape are retained. An empty shape can remove all datasets previously synced from it; --select can address a previously synced dataset that is now absent locally. Dry runs do not write state.",
@@ -75,16 +84,19 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts sync datasets --from shape.bt --select 'dataset.regressions' --dry-run"],
         },
         CommandDesc {
+            tags: &[],
             path: &["check", "perf"],
             guidance: &["Measure local generation and payload size without writing traces."],
             examples: &["bts check perf shape.bt --count 100 --over 1h"],
         },
         CommandDesc {
+            tags: &[],
             path: &["check", "logs"],
             guidance: &["List recent run logs, or use `--last` to inspect the newest run."],
             examples: &["bts check logs --last"],
         },
         CommandDesc {
+            tags: &[],
             path: &["setup", "skill"],
             guidance: &[
                 "Generate and install the combined DSL and CLI skill for an agent. Existing generated skills can be replaced; unmanaged skills are preserved.",
@@ -92,11 +104,13 @@ pub(crate) static SPEC: Spec = Spec {
             examples: &["bts setup skill codex"],
         },
         CommandDesc {
+            tags: &[],
             path: &["init"],
             guidance: &["Initialize the local `bts` configuration without replacing an existing one."],
             examples: &["bts init"],
         },
         CommandDesc {
+            tags: &[],
             path: &["update"],
             guidance: &["Update the installed `bts` binary to its latest released version."],
             examples: &["bts update"],

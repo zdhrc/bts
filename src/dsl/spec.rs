@@ -71,6 +71,7 @@ pub(crate) struct SurfaceDesc {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct ExprDesc {
+    pub(crate) tags: &'static [&'static str],
     pub(crate) id: Id,
     pub(crate) syntax: &'static str,
     pub(crate) summary: &'static str,
@@ -80,6 +81,7 @@ pub(crate) struct ExprDesc {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct FuncDesc {
+    pub(crate) tags: &'static [&'static str],
     pub(crate) id: Id,
     pub(crate) name: &'static str,
     pub(crate) syntax: &'static str,
@@ -120,6 +122,7 @@ impl fmt::Display for ExprType {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct BlockDesc {
+    pub(crate) tags: &'static [&'static str],
     pub(crate) id: Id,
     pub(crate) keyword: &'static str,
     pub(crate) summary: &'static str,
@@ -149,6 +152,7 @@ pub(crate) struct BodyDesc {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct FieldDesc {
+    pub(crate) tags: &'static [&'static str],
     pub(crate) id: Id,
     pub(crate) keyword: &'static str,
     pub(crate) summary: &'static str,
@@ -184,12 +188,14 @@ pub(crate) enum Place {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct RuleDesc {
+    pub(crate) tags: &'static [&'static str],
     pub(crate) id: Id,
     pub(crate) summary: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub(crate) struct Example {
+    pub(crate) tags: &'static [&'static str],
     pub(crate) id: Id,
     pub(crate) summary: &'static str,
     pub(crate) note: &'static str,
@@ -408,6 +414,7 @@ const STRING_ARRAY: ExprType = ExprType::Array { items: &STRING };
 
 const SPAN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::INPUT,
         keyword: "input",
         summary: "Input associated with the trace or span.",
@@ -415,6 +422,7 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::OUTPUT,
         keyword: "output",
         summary: "Output associated with the trace or span.",
@@ -422,6 +430,7 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::EXPECTED,
         keyword: "expected",
         summary: "Expected output associated with the trace or span.",
@@ -429,6 +438,7 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::ERROR,
         keyword: "error",
         summary: "Error associated with the trace or span.",
@@ -436,6 +446,7 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::METADATA,
         keyword: "metadata",
         summary: "Arbitrary metadata attached to the trace or span.",
@@ -443,6 +454,7 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::METRICS,
         keyword: "metrics",
         summary: "Arbitrary metric values attached to the trace or span.",
@@ -450,6 +462,7 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::TAGS,
         keyword: "tags",
         summary: "String labels attached to the trace or span.",
@@ -457,6 +470,7 @@ const SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::DURATION,
         keyword: "duration",
         summary: "Total duration of the trace or span in seconds, evaluated per generated trace; a span with children ends at the later of this duration or its last child's end. Defaults to 0.1.",
@@ -497,6 +511,7 @@ const IN_SCORER_CONTROL: &[Place] = &[
 ];
 
 const REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
+    tags: &[],
     id: ids::COUNT,
     keyword: "count",
     summary: "Number of times the child blocks are stamped out, evaluated per generated trace.",
@@ -505,6 +520,7 @@ const REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
 }];
 
 const SCORER_REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
+    tags: &[],
     id: ids::COUNT,
     keyword: "count",
     summary: "Number of scorer iterations; evaluated once when the repeat is reached.",
@@ -513,6 +529,7 @@ const SCORER_REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
 }];
 
 const MAYBE_FIELDS: &[FieldDesc] = &[FieldDesc {
+    tags: &[],
     id: ids::CHANCE,
     keyword: "chance",
     summary: "Probability between 0 and 1 that the child blocks are included, evaluated per generated trace; defaults to 0.5.",
@@ -522,6 +539,7 @@ const MAYBE_FIELDS: &[FieldDesc] = &[FieldDesc {
 
 const SCORER_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::LANG,
         keyword: "lang",
         summary: "Language of the emitted scorer code, the constant string \"python\" or \"typescript\"; the build command may override it, and judge scorers ignore it. Defaults to python.",
@@ -529,6 +547,7 @@ const SCORER_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::FILE,
         keyword: "file",
         summary: "Optional output file stem for packing code scorers; defaults to the scorer slug. Judge scorers ignore this field.",
@@ -539,6 +558,7 @@ const SCORER_FIELDS: &[FieldDesc] = &[
 
 const SCORER_SPAN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::SCORE,
         keyword: "score",
         summary: "Synthetic score from 0 to 1 for the named top-level scorer.",
@@ -546,6 +566,7 @@ const SCORER_SPAN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::REASON,
         keyword: "reason",
         summary: "Optional explanation recorded on the synthetic scorer span.",
@@ -556,6 +577,7 @@ const SCORER_SPAN_FIELDS: &[FieldDesc] = &[
 
 const FACET_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::PROMPT,
         keyword: "prompt",
         summary: "Constant extraction instructions; trace context is supplied by the default preprocessor.",
@@ -563,6 +585,7 @@ const FACET_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::DESCRIPTION,
         keyword: "description",
         summary: "Description of the Braintrust facet.",
@@ -570,6 +593,7 @@ const FACET_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::NO_MATCH_PATTERN,
         keyword: "no_match_pattern",
         summary: "Optional RE2-compatible exclusion pattern for facet summaries.",
@@ -579,12 +603,14 @@ const FACET_FIELDS: &[FieldDesc] = &[
 ];
 
 const FACET_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::FACET_DEFINITION,
     summary: "Facets have unique names and constant nonempty prompts; sync uses the project default preprocessor, falling back to Thread.",
 }];
 
 const AUTOMATION_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::TYPE,
         keyword: "type",
         summary: "Automation kind: the constant string \"scorer\" or \"topics\".",
@@ -592,6 +618,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::SCORERS,
         keyword: "scorers",
         summary: "One or more names of scorer blocks in this source, deployed with `bt functions push`.",
@@ -599,6 +626,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::FACETS,
         keyword: "facets",
         summary: "Names of local facet blocks required by a Topics automation.",
@@ -606,6 +634,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::SCOPE,
         keyword: "scope",
         summary: "Execution scope: span for scorers, trace for topics.",
@@ -613,6 +642,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::ROOT,
         keyword: "root",
         summary: "Apply to root spans when true; use either this or `span_names`.",
@@ -620,6 +650,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::SPAN_NAMES,
         keyword: "span_names",
         summary: "Apply to spans with these names; use either this or `root`.",
@@ -627,6 +658,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::SAMPLING_RATE,
         keyword: "sampling_rate",
         summary: "Fraction of matching spans or traces to process, from 0 to 1; defaults to 1.",
@@ -634,6 +666,7 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::ENABLED,
         keyword: "enabled",
         summary: "Whether the automation is active; defaults to true.",
@@ -643,12 +676,14 @@ const AUTOMATION_FIELDS: &[FieldDesc] = &[
 ];
 
 const AUTOMATION_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::AUTOMATION_BINDING,
     summary: "Scorer automations require scorers, scope = \"span\", and either root = true or span_names. Topics automations require facets and scope = \"trace\"; scorer-specific fields are forbidden.",
 }];
 
 const EXPERIMENT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::DATASET_REF,
         keyword: "dataset",
         summary: "A dataset declared in this module; live writes consume its synced rows.",
@@ -656,6 +691,7 @@ const EXPERIMENT_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::TASK_REF,
         keyword: "task",
         summary: "A whole trace or a static span subtree to generate once per dataset row. Row input and expected replace the selected root's fields; row metadata overrides matching root keys.",
@@ -665,6 +701,7 @@ const EXPERIMENT_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::SCORERS,
         keyword: "scorers",
         summary: "Scorer references invoked against each generated result. Build and push the referenced definitions before a live write.",
@@ -674,6 +711,7 @@ const EXPERIMENT_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::BASELINE,
         keyword: "baseline",
         summary: "An experiment in this module to compare against; include it in the same write, where it is generated first.",
@@ -681,6 +719,7 @@ const EXPERIMENT_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::DESCRIPTION,
         keyword: "description",
         summary: "Description of the Braintrust experiment.",
@@ -689,11 +728,13 @@ const EXPERIMENT_FIELDS: &[FieldDesc] = &[
     },
 ];
 const EXPERIMENT_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::EXPERIMENT_BINDING,
     summary: "An experiment requires dataset, task, and a nonempty scorers array. Named resources must exist, task selection must be static, and baseline references must be acyclic. Generation omits authored synthetic scorer spans; scores come from invoking the referenced deployed scorers. Dry runs generate local cases without scorer execution.",
 }];
 
 const DATASET_FIELDS: &[FieldDesc] = &[FieldDesc {
+    tags: &[],
     id: ids::DESCRIPTION,
     keyword: "description",
     summary: "Description of the Braintrust dataset.",
@@ -703,6 +744,7 @@ const DATASET_FIELDS: &[FieldDesc] = &[FieldDesc {
 
 const CASE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::INPUT,
         keyword: "input",
         summary: "Inline case input.",
@@ -710,6 +752,7 @@ const CASE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &["preview"],
         id: ids::TRACE_SOURCE,
         keyword: "trace",
         summary: "A module trace block reference, for example trace[\"support-lookup\"].",
@@ -717,6 +760,7 @@ const CASE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &["preview"],
         id: ids::TRACES,
         keyword: "traces",
         summary: "Module trace block references grouped into one case.",
@@ -726,6 +770,7 @@ const CASE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &["preview"],
         id: ids::SPAN,
         keyword: "span",
         summary: "A module reference to a task, llm, tool, or function block.",
@@ -735,6 +780,7 @@ const CASE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::EXPECTED,
         keyword: "expected",
         summary: "Expected output for this case.",
@@ -742,6 +788,7 @@ const CASE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::METADATA,
         keyword: "metadata",
         summary: "Case metadata.",
@@ -749,6 +796,7 @@ const CASE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Optional,
     },
     FieldDesc {
+        tags: &[],
         id: ids::TAGS,
         keyword: "tags",
         summary: "Case tags.",
@@ -758,11 +806,13 @@ const CASE_FIELDS: &[FieldDesc] = &[
 ];
 
 const DATASET_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::DATASET_CASE,
     summary: "Each case has exactly one source: input, trace, traces, or span; named trace sources and span paths must exist in this module.",
 }];
 
 const CODE_FIELDS: &[FieldDesc] = &[FieldDesc {
+    tags: &[],
     id: ids::SCORE,
     keyword: "score",
     summary: "Fallback score expression, a number between 0 and 1, used when no `when` case matches.",
@@ -772,6 +822,7 @@ const CODE_FIELDS: &[FieldDesc] = &[FieldDesc {
 
 const WHEN_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::COND,
         keyword: "cond",
         summary: "Boolean condition over the scorer arguments; cases are checked in order and the first match wins.",
@@ -779,6 +830,7 @@ const WHEN_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::SCORE,
         keyword: "score",
         summary: "Optional score returned after nested blocks when the condition matches; required if there are no nested blocks.",
@@ -789,6 +841,7 @@ const WHEN_FIELDS: &[FieldDesc] = &[
 
 const JUDGE_FIELDS: &[FieldDesc] = &[
     FieldDesc {
+        tags: &[],
         id: ids::MODEL,
         keyword: "model",
         summary: "Constant string naming the judge model, a registered model id like `gpt-4o-mini`.",
@@ -796,6 +849,7 @@ const JUDGE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::PROMPT,
         keyword: "prompt",
         summary: "Judge prompt; `${input}`, `${output}`, `${expected}`, and `${metadata}` interpolate the scorer arguments.",
@@ -803,6 +857,7 @@ const JUDGE_FIELDS: &[FieldDesc] = &[
         cardinality: Cardinality::Required,
     },
     FieldDesc {
+        tags: &[],
         id: ids::OPTIONS,
         keyword: "options",
         summary: "Object mapping each choice label the judge may answer to the constant score it yields.",
@@ -872,30 +927,37 @@ const JUDGE_CONVENTIONS: &[&str] = &[
 ];
 
 const SCORER_KIND_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::SCORER_KIND,
     summary: "A scorer declares exactly one `code` or `judge` block.",
 };
 const SCORER_ARGS_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::SCORER_ARGS,
     summary: "Inside a scorer, bare `input`, `output`, `expected`, and `metadata` are the arguments Braintrust passes at runtime. `repeat.index` and `repeat.count` are available inside a scorer repeat; generation block references, `self`, and `trace.index` are not.",
 };
 const SCORER_EXPRS_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::SCORER_EXPRS,
     summary: "Scorer expressions must translate to the emitted Python or TypeScript: `tokens`, `noise`, and `attachment` are unavailable, and a referenced variable must have a constant value.",
 };
 const SCORER_LANG_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::SCORER_LANG,
     summary: "`lang` is the constant string \"python\" or \"typescript\".",
 };
 const SCORER_FILE_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::SCORER_FILE,
     summary: "`file` is a constant string naming a bare file stem, without path separators or extensions; scorers packed into one file must resolve to the same language.",
 };
 const SCORER_SOURCE_FILES_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::SCORER_SOURCE_FILES,
     summary: "Python scorer source filenames normalize the effective code file stem or judge slug to lowercase ASCII alphanumeric runs joined by underscores, prefix a leading digit with an underscore, and append `_scorer.py`. TypeScript scorer filenames use `<stem>.scorer.ts`.",
 };
 const SCORE_RANGE_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::SCORE_RANGE,
     summary: "A constant `score` must be between 0 and 1; keep sampled scores in range with `clamp`.",
 };
@@ -911,99 +973,121 @@ const CODE_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
 const WHEN_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
 const JUDGE_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::JUDGE_MODEL,
         summary: "`model` is a constant string.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::JUDGE_PROMPT,
         summary: "`prompt` is a string whose interpolations may only be scorer argument paths like `${input}` or `${metadata.tier}`, since the pushed judge renders them as prompt template slots.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::JUDGE_OPTIONS,
         summary: "`options` maps at least two labels to constant scores between 0 and 1.",
     },
 ];
 const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::FINITE_NUMBERS,
     summary: "Every number must be representable as a finite integer or floating-point value.",
 };
 const FINITE_NUMBER_RULE: &[RuleDesc] = &[FINITE_NUMBERS_RULE];
 const UNIQUE_OBJECT_KEYS_RULE: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::UNIQUE_OBJECT_KEYS,
     summary: "An object key may appear at most once in an object.",
 }];
 const KNOWN_REFERENCES_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::KNOWN_REFERENCES,
     summary: "A reference must be documented; currently `trace.index`, the 0-based index of the generated trace, `repeat.index` and `repeat.count`, the 0-based iteration and total count of the innermost enclosing repeat block, `var.<name>` for a defined variable, block references rooted at a block kind or `trace`, and `self` for the enclosing span or trace.",
 };
 const KNOWN_REFERENCES_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE];
 const BLOCK_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::BLOCK_REFS,
         summary: "A block reference resolves lexically: walking up the enclosing blocks, the nearest scope whose children include a matching kind and name wins. `self` addresses the innermost enclosing span or trace; `trace` addresses the enclosing trace's fields, while `trace[\"name\"]` selects a module trace. At each block selection, `<kind>.<name>` and `<kind>[\"name\"]` are interchangeable when the label can be written as an identifier. Use a quoted bracket selector for labels containing spaces, hyphens, or other characters invalid in a dot segment. Both forms may be mixed in one traversal, such as `trace.support.task[\"answer-request\"].tool.lookup.output`. A reference may retain a block identity for a compatible source field, or select a field to read data. Variables preserve reference targets.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::REF_COLLECTIONS,
         summary: "Same-kind siblings sharing a name form an ordered positional collection: a lone match is addressed directly (an explicit `[0]` also works); several matches require an index segment before the field.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::REF_FIELDS,
         summary: "The referenceable surface of a block is its fields — input, output, expected, error, metadata, metrics, and tags — plus key and index selections into them; vars stay private to their scopes, and a reference to a field the target never sets is rejected.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::ACYCLIC_REFS,
         summary: "References work regardless of where they are written, as long as the value dataflow stays acyclic; a reference cycle is rejected during validation when it is visible statically and fails generation otherwise.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::STATIC_STRUCTURE,
         summary: "Structure stays independent of generated data: `count`, `chance`, and `for` collections cannot reach a block reference, directly or through variables, while variables may retain block identities or read fields in their evaluation context.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::RESERVED_REPEAT_NAMES,
         summary: "`index` and `count` cannot name a repeat block: under `repeat.<name>` they address the named enclosing repeat's current iteration and total count.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::REF_EXISTENCE,
         summary: "A reference crossing a named choice or maybe evaluates to null when that branch was not picked or did not fire; guard with `!= null` or read `choice.<name>.chosen` and `maybe.<name>.included`. An out-of-range iteration or position index fails generation instead.",
     },
 ];
 const SELF_REF_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::SELF_REFS,
     summary: "`self` addresses the innermost enclosing span or trace, skipping repeat, choice, and maybe blocks; it takes no name segment and works regardless of duplicate names.",
 }];
 const VARS_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::UNIQUE_VARS,
         summary: "A variable name may be defined at most once across all vars blocks.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::SCOPED_VARS,
         summary: "A variable is evaluated once per instantiation of the block that declares it — the root scope once per generated trace, a repeat scope once per iteration, a choice or maybe scope once per inclusion — and every reference sees that one value.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::VISIBLE_VARS,
         summary: "A variable may be referenced anywhere inside the block that declares it, nested blocks included; a variable's own value may only reference variables declared in an enclosing block.",
     },
 ];
 const FUNC_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::KNOWN_FUNCTIONS,
         summary: "A function call may only use the documented functions listed in this spec.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::FUNC_POSITIONS,
         summary: "A non-constant expression (a function call, a reference to a variable holding one, or an operator expression containing either) may only appear where any value is accepted; fields with a specific type must use values known before generation.",
     },
 ];
 const OPERAND_TYPES_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::OPERAND_TYPES,
     summary: "Operator operands must have a known type: `+ - * / %` and `< <= > >=` take numbers, `== !=` compare two strings, two numbers, or two booleans, and `&& || !` take booleans.",
 };
 const NONZERO_DIVISORS_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::NONZERO_DIVISORS,
     summary: "Division and remainder require a nonzero divisor; a constant zero divisor is rejected during validation, and a divisor that evaluates to zero fails generation.",
 };
 const BOOLEAN_CONDITIONS_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::BOOLEAN_CONDITIONS,
     summary: "The condition of `?:` must be a boolean.",
 };
@@ -1013,22 +1097,27 @@ const COMPARISON_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
 const LOGICAL_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
 const CONDITIONAL_RULES: &[RuleDesc] = &[BOOLEAN_CONDITIONS_RULE];
 const CHOICE_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::CHOICE_ALTERNATIVES,
     summary: "`choice` takes at least one alternative.",
 }];
 const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::RANGE_BOUNDS,
     summary: "`range` takes exactly two finite numbers with min <= max.",
 }];
 const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::FUNC_ARITY,
     summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number.",
 };
 const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::FUNC_ARG_TYPES,
     summary: "A function argument must have the documented type, known before generation; an argument whose type is only known during generation (e.g. a `choice` with mixed alternatives) is rejected.",
 };
 const DIST_PARAMS_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::DIST_PARAMS,
     summary: "Distribution parameters are constant finite numbers: `normal` takes stddev >= 0, `lognormal` takes median > 0 and sigma >= 0, `exponential` and `poisson` take mean > 0, `pareto` takes min > 0 and shape > 0, `beta` takes alpha > 0 and beta > 0, and `chance` takes a probability between 0 and 1.",
 };
@@ -1036,6 +1125,7 @@ const SAMPLING_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, DIST_PARAMS_RULE, FINITE_
 const WEIGHTED_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::WEIGHTED_OPTIONS,
         summary: "`weighted` takes at least one `[value, weight]` pair; weights are constant non-negative finite numbers, at least one of them positive.",
     },
@@ -1045,6 +1135,7 @@ const SPLIT_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::SPLIT_SEPARATOR,
         summary: "`split` requires a non-empty separator; a constant empty separator is rejected during validation, and a dynamic one fails the run during generation.",
     },
@@ -1053,6 +1144,7 @@ const JOIN_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::JOIN_ELEMENTS,
         summary: "`join` stringifies string, number, and boolean elements; any other element fails the run during generation.",
     },
@@ -1061,6 +1153,7 @@ const FORMAT_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::FORMAT_TEMPLATE,
         summary: "`format` takes a constant string template with exactly one `{}` placeholder per remaining argument, replaced in order.",
     },
@@ -1070,6 +1163,7 @@ const CLAMP_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::CLAMP_BOUNDS,
         summary: "`clamp` bounds must satisfy min <= max; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
     },
@@ -1078,6 +1172,7 @@ const ROUNDING_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::INTEGER_RESULTS,
         summary: "`round`, `floor`, and `ceil` produce integers; a result outside the 64-bit integer range fails the run during generation.",
     },
@@ -1085,6 +1180,7 @@ const ROUNDING_FUNC_RULES: &[RuleDesc] = &[
 const RANDOM_STRING_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::RANDOM_LENGTH,
         summary: "`hex` and `alphanum` take a constant non-negative integer length.",
     },
@@ -1094,90 +1190,108 @@ const NOISE_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
+        tags: &[],
         id: ids::NOISE_SIZE,
         summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
     },
 ];
 const INDEX_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::INDEXABLE_TARGETS,
         summary: "Indexing requires an array or object target: arrays take an integer index, objects take a string key.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::INDEX_BOUNDS,
         summary: "An array index must be within bounds and an object key must be present; constant violations are rejected during validation, dynamic ones fail the run during generation.",
     },
 ];
 const SLICE_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::SLICEABLE_TARGETS,
         summary: "Slicing requires an array target; slice bounds are numbers.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::SLICE_BOUNDS,
         summary: "Slice bounds are non-negative integers, clamped to the array length; a start at or past the end produces an empty array. Constant violations are rejected during validation, dynamic ones fail the run during generation.",
     },
 ];
 const SPREAD_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::SPREAD_OPERANDS,
     summary: "A spread operand must be an array (inside arrays) or an object (inside objects) whose shape is known before generation. Later object entries override keys introduced by a spread, but two explicit keys may still not collide.",
 }];
 const FOR_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::FOR_COLLECTIONS,
         summary: "A for expression iterates an array or object whose shape is known before generation; element values may still be dynamic.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::STATIC_FOR,
         summary: "For expressions unroll during validation: a filter condition must resolve to a constant boolean and an object key to a constant string.",
     },
 ];
 const MULTILINE_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::MULTILINE_DELIMITERS,
         summary: "Multi-line content starts on the line after the opening `\"\"\"` and ends on the line before the closing `\"\"\"`, which sits alone on its own line; the final newline is not part of the value, so leave a blank line to keep one.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::MULTILINE_INDENT,
         summary: "The closing delimiter's leading whitespace is stripped from every content line; blank lines are exempt, and no other line may be indented less.",
     },
 ];
 const HEREDOC_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::HEREDOC_DELIMITERS,
         summary: "Heredoc content starts on the line after the introducer and ends at the first line holding only the delimiter word (surrounding whitespace allowed); unlike `\"\"\"` strings, the newline ending the last content line is part of the value.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::HEREDOC_INDENT,
         summary: "`<<` keeps every content line verbatim; `<<-` strips the longest whitespace prefix shared by the non-blank content lines, and blank lines keep only their newline.",
     },
 ];
 const REPEAT_REFS_RULE: RuleDesc = RuleDesc {
+    tags: &[],
     id: ids::REPEAT_REFS,
     summary: "`repeat.index` (the 0-based iteration) and `repeat.count` (the total number of iterations) resolve against the innermost enclosing repeat block and are only valid inside one.",
 };
 const REPEAT_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::REPEAT_COUNT,
         summary: "`count` must evaluate to a non-negative integer; a constant violation is rejected during validation, and a dynamic one fails when the repeat runs.",
     },
     REPEAT_REFS_RULE,
 ];
 const SPAN_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::SPAN_DURATION,
     summary: "`duration` must evaluate to a finite number of seconds greater than zero; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
 }];
 const CTX_REF_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE, REPEAT_REFS_RULE];
 const MAYBE_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
     id: ids::MAYBE_CHANCE,
     summary: "`chance` must evaluate to a number between 0 and 1 inclusive; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
 }];
 const VAR_REF_RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::DEFINED_VARS,
         summary: "A variable reference must name a variable defined in a vars block.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::SCALAR_INTERPOLATION,
         summary: "An interpolated variable must be a string, number, or boolean; a dynamic variable must have one of those types known before generation.",
     },
@@ -1185,6 +1299,7 @@ const VAR_REF_RULES: &[RuleDesc] = &[
 
 const EXPR_TYPES: &[ExprDesc] = &[
     ExprDesc {
+        tags: &[],
         id: ids::STRING,
         syntax: "\"text\"",
         summary: "A double-quoted string. `$${` escapes a literal `${`; other escape sequences are not currently supported.",
@@ -1192,6 +1307,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: NO_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::TEMPLATE,
         syntax: "\"text ${reference} text\"",
         summary: "A string containing `${...}` interpolations resolved for each generated trace. Valid anywhere a string is, except block names.",
@@ -1199,6 +1315,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: KNOWN_REFERENCES_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::MULTILINE,
         syntax: "\"\"\"\ntext\n\"\"\"",
         summary: "A triple-quoted string spanning multiple lines. Quotes are literal inside it, and `$${` and `${...}` interpolation work as in single-line strings. Valid anywhere a string is.",
@@ -1206,6 +1323,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: MULTILINE_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::HEREDOC,
         syntax: "<<DELIM\ntext\nDELIM | <<-DELIM\ntext\nDELIM",
         summary: "A heredoc string closed by a line holding only its delimiter word. Quotes are literal inside it, and `$${` and `${...}` interpolation work as in single-line strings. Valid anywhere a string is.",
@@ -1213,6 +1331,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: HEREDOC_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::VAR_REF,
         syntax: "var.<name>",
         summary: "A reference to a variable defined in a vars block in scope. Constant values resolve during validation; a value that varies per trace is evaluated once per instantiation of its declaring block, so every reference sees the same value. Usable as any value, or interpolated with `${var.<name>}`.",
@@ -1220,6 +1339,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: VAR_REF_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::CTX_REF,
         syntax: "trace.index | repeat.index | repeat.count",
         summary: "A context reference resolved for each generated trace: `trace.index` is the 0-based index of the trace being generated; `repeat.index` and `repeat.count` are the 0-based iteration and total count of the innermost enclosing repeat block. All are integers, usable as any number or interpolated with `${...}`.",
@@ -1231,6 +1351,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: CTX_REF_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::BLOCK_REF,
         syntax: "<kind>.<name>.<field> | <kind>[\"name\"].<field> | trace.<field> | repeat.<name>[i]... | choice.<name>.chosen | maybe.<name>.included",
         summary: "A reference to another block's field, resolved for each generated trace: the head names a block kind, the name segment picks the block among the enclosing scopes' children, and the path ends in one of its fields, optionally followed by key or index selections into the field's value. `trace.<field>` reads the enclosing trace's own fields. `repeat.<name>` addresses a repeat's iterations: `[i]` selects one, a slice like `[:repeat.index]` projects the rest of the path over each selected iteration and yields an array, and `.index`/`.count` read the named enclosing repeat's current iteration. `choice.<name>.chosen` is the 0-based pick and `maybe.<name>.included` whether it fired; a reference crossing an unchosen branch reads as null. Usable as any value, or interpolated with `${...}`.",
@@ -1246,6 +1367,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: BLOCK_REF_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::SELF_REF,
         syntax: "self.<field>",
         summary: "A reference to the innermost enclosing span or trace's own fields, for derivations that read the block's other values. Skips enclosing repeat, choice, and maybe blocks, and stays unambiguous under duplicate names.",
@@ -1256,6 +1378,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: SELF_REF_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::NUMBER,
         syntax: "digits[.digits]",
         summary: "An integer or finite decimal number. A leading `-` is unary negation, not part of the literal.",
@@ -1263,6 +1386,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: FINITE_NUMBER_RULE,
     },
     ExprDesc {
+        tags: &[],
         id: ids::BOOLEAN,
         syntax: "true | false",
         summary: "A boolean literal.",
@@ -1270,6 +1394,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: NO_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::NULL,
         syntax: "null",
         summary: "A null literal representing an explicitly absent value.",
@@ -1277,6 +1402,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: NO_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::ARRAY,
         syntax: "[value, ...]",
         summary: "A comma-separated sequence of expressions with an optional trailing comma.",
@@ -1284,6 +1410,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: NO_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::OBJECT,
         syntax: "{ key = value, ... }",
         summary: "An object with unique identifier keys and expression values. Items on the same line are separated by commas, with an optional trailing comma; a line break also separates items.",
@@ -1291,6 +1418,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: UNIQUE_OBJECT_KEYS_RULE,
     },
     ExprDesc {
+        tags: &[],
         id: ids::FUNC,
         syntax: "name(arg, ...)",
         summary: "A call to a documented function, evaluated once per generated trace.",
@@ -1298,6 +1426,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: FUNC_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::INDEX,
         syntax: "value[index] | value.field",
         summary: "Selects an array element by 0-based integer index or an object value by string key. `value.field` is shorthand for `value[\"field\"]`; the bracketed index may be any expression, evaluated per generated trace.",
@@ -1310,6 +1439,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: INDEX_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::SLICE,
         syntax: "value[start:end]",
         summary: "Selects a sub-range of an array: 0-based, start inclusive, end exclusive. Either bound may be omitted to default to that end of the array, and bounds may be any number expressions, evaluated per generated trace.",
@@ -1317,6 +1447,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: SLICE_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::SPREAD,
         syntax: "[...array] | { ...object }",
         summary: "Splices the elements of an array or the entries of an object into a surrounding literal, resolved during validation. Later object entries override keys a spread introduced.",
@@ -1324,6 +1455,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: SPREAD_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::FOR,
         syntax: "[for x in collection : body if cond] | { for k, v in collection : key => value if cond }",
         summary: "Maps and filters a collection into a new array or object, unrolled during validation. One binding names the element (arrays) or key (objects); two name index/element or key/value. A binding referenced twice re-evaluates a dynamic element each time, like variables.",
@@ -1335,6 +1467,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: FOR_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::GROUPING,
         syntax: "(expression)",
         summary: "Parentheses group a sub-expression to override operator precedence.",
@@ -1342,6 +1475,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: NO_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::UNARY,
         syntax: "-value | !value",
         summary: "Negates a number or inverts a boolean.",
@@ -1349,6 +1483,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: UNARY_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::ARITHMETIC,
         syntax: "a + b | a - b | a * b | a / b | a % b",
         summary: "Arithmetic over numbers. Two integer operands produce an integer (`/` truncates toward zero); any float operand produces a float. Constant expressions are evaluated during validation; a divisor that evaluates to zero during generation fails the run.",
@@ -1356,6 +1491,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: ARITHMETIC_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::COMPARISON,
         syntax: "a == b | a != b | a < b | a <= b | a > b | a >= b",
         summary: "Equality over two strings, two numbers, or two booleans; ordering over numbers. Produces a boolean.",
@@ -1363,6 +1499,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: COMPARISON_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::LOGICAL,
         syntax: "a && b | a || b",
         summary: "Boolean and/or. Short-circuits: the right operand is only evaluated when the left doesn't decide the result.",
@@ -1370,6 +1507,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
         rules: LOGICAL_RULES,
     },
     ExprDesc {
+        tags: &[],
         id: ids::CONDITIONAL,
         syntax: "cond ? then : else",
         summary: "Picks `then` when the condition is true, `else` otherwise. Right-associative; only the taken branch is evaluated for each generated trace.",
@@ -1380,6 +1518,7 @@ const EXPR_TYPES: &[ExprDesc] = &[
 
 const FUNCS: &[FuncDesc] = &[
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_CHOICE,
         name: "choice",
         syntax: "choice(value, ...)",
@@ -1388,6 +1527,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: CHOICE_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_RANGE,
         name: "range",
         syntax: "range(min, max)",
@@ -1396,6 +1536,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: RANGE_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_WEIGHTED,
         name: "weighted",
         syntax: "weighted([value, weight], ...)",
@@ -1407,6 +1548,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: WEIGHTED_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_NORMAL,
         name: "normal",
         syntax: "normal(mean, stddev)",
@@ -1415,6 +1557,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SAMPLING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_LOGNORMAL,
         name: "lognormal",
         syntax: "lognormal(median, sigma)",
@@ -1423,6 +1566,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SAMPLING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_EXPONENTIAL,
         name: "exponential",
         syntax: "exponential(mean)",
@@ -1431,6 +1575,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SAMPLING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_PARETO,
         name: "pareto",
         syntax: "pareto(min, shape)",
@@ -1439,6 +1584,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SAMPLING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_BETA,
         name: "beta",
         syntax: "beta(alpha, beta)",
@@ -1447,6 +1593,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SAMPLING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_POISSON,
         name: "poisson",
         syntax: "poisson(mean)",
@@ -1455,6 +1602,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SAMPLING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_CHANCE,
         name: "chance",
         syntax: "chance(probability)",
@@ -1463,6 +1611,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SAMPLING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_UPPER,
         name: "upper",
         syntax: "upper(text)",
@@ -1471,6 +1620,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_LOWER,
         name: "lower",
         syntax: "lower(text)",
@@ -1479,6 +1629,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_TRIM,
         name: "trim",
         syntax: "trim(text)",
@@ -1487,6 +1638,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_REPLACE,
         name: "replace",
         syntax: "replace(text, from, to)",
@@ -1495,6 +1647,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_SPLIT,
         name: "split",
         syntax: "split(text, separator)",
@@ -1503,6 +1656,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: SPLIT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_JOIN,
         name: "join",
         syntax: "join(array, separator)",
@@ -1511,6 +1665,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: JOIN_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_CONTAINS,
         name: "contains",
         syntax: "contains(target, needle)",
@@ -1519,6 +1674,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_STARTS_WITH,
         name: "starts_with",
         syntax: "starts_with(text, prefix)",
@@ -1527,6 +1683,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_ENDS_WITH,
         name: "ends_with",
         syntax: "ends_with(text, suffix)",
@@ -1535,6 +1692,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_LEN,
         name: "len",
         syntax: "len(value)",
@@ -1543,6 +1701,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_TOKENS,
         name: "tokens",
         syntax: "tokens(value)",
@@ -1551,6 +1710,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_FORMAT,
         name: "format",
         syntax: "format(template, value, ...)",
@@ -1559,6 +1719,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: FORMAT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_CLAMP,
         name: "clamp",
         syntax: "clamp(value, min, max)",
@@ -1567,6 +1728,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: CLAMP_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_ROUND,
         name: "round",
         syntax: "round(value)",
@@ -1575,6 +1737,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: ROUNDING_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_FLOOR,
         name: "floor",
         syntax: "floor(value)",
@@ -1583,6 +1746,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: ROUNDING_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_CEIL,
         name: "ceil",
         syntax: "ceil(value)",
@@ -1591,6 +1755,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: ROUNDING_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_ABS,
         name: "abs",
         syntax: "abs(value)",
@@ -1599,6 +1764,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: NUMERIC_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_MIN,
         name: "min",
         syntax: "min(value, value, ...)",
@@ -1607,6 +1773,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: NUMERIC_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_MAX,
         name: "max",
         syntax: "max(value, value, ...)",
@@ -1615,6 +1782,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: NUMERIC_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_UUID,
         name: "uuid",
         syntax: "uuid()",
@@ -1623,6 +1791,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: UUID_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_HEX,
         name: "hex",
         syntax: "hex(length)",
@@ -1631,6 +1800,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: RANDOM_STRING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_ALPHANUM,
         name: "alphanum",
         syntax: "alphanum(length)",
@@ -1639,6 +1809,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: RANDOM_STRING_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_ATTACHMENT,
         name: "attachment",
         syntax: "attachment(path, content_type)",
@@ -1650,6 +1821,7 @@ const FUNCS: &[FuncDesc] = &[
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
+        tags: &[],
         id: ids::FUNC_NOISE,
         name: "noise",
         syntax: "noise(size)",
@@ -1661,6 +1833,7 @@ const FUNCS: &[FuncDesc] = &[
 
 const BLOCKS: &[BlockDesc] = &[
     BlockDesc {
+        tags: &[],
         id: ids::VARS,
         keyword: "vars",
         summary: "A block of named values scoped to the block that contains it and shared via `var.<name>` references; each value is evaluated once per instantiation of that block.",
@@ -1672,6 +1845,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::TRACE,
         keyword: "trace",
         summary: "A named root trace containing fields and nested spans.",
@@ -1686,6 +1860,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: TRACE_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::TASK,
         keyword: "task",
         summary: "A named task span containing fields and nested spans.",
@@ -1700,6 +1875,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: TASK_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::LLM,
         keyword: "llm",
         summary: "A named LLM span containing fields and nested spans.",
@@ -1714,6 +1890,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: LLM_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::TOOL,
         keyword: "tool",
         summary: "A named tool span containing fields and nested spans.",
@@ -1728,6 +1905,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: TOOL_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::FUNCTION,
         keyword: "function",
         summary: "A named function span containing fields and nested spans.",
@@ -1742,6 +1920,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: FUNCTION_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::REPEAT,
         keyword: "repeat",
         summary: "A dynamic block that stamps out its child blocks `count` times for each generated trace.",
@@ -1756,6 +1935,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: REPEAT_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::CHOICE,
         keyword: "choice",
         summary: "A dynamic block that includes exactly one of its child blocks, picked uniformly at random for each generated trace.",
@@ -1770,6 +1950,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: CHOICE_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::MAYBE,
         keyword: "maybe",
         summary: "A dynamic block that includes its child blocks with probability `chance` for each generated trace.",
@@ -1784,6 +1965,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: MAYBE_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::SCORER,
         keyword: "scorer",
         summary: "A named scorer built into a Braintrust SDK definition for `bt functions push` rather than generated as spans.",
@@ -1798,6 +1980,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: SCORER_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::SCORER_SPAN,
         keyword: "scorer",
         summary: "A synthetic scorer span whose name references a top-level scorer definition in this shape.",
@@ -1812,6 +1995,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::FACET,
         keyword: "facet",
         summary: "A named Topics facet with extraction instructions.",
@@ -1826,6 +2010,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::AUTOMATION,
         keyword: "automation",
         summary: "A named scorer or Topics automation.",
@@ -1840,6 +2025,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::EXPERIMENT,
         keyword: "experiment",
         summary: "A synthetic task evaluated over a dataset by deployed scorers and written as a Braintrust experiment.",
@@ -1854,6 +2040,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::DATASET,
         keyword: "dataset",
         summary: "A named Braintrust dataset with an optional description and named cases.",
@@ -1868,6 +2055,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &[],
         id: ids::CASE,
         keyword: "case",
         summary: "A dataset record, sourced from inline input, a trace, a span, or a trace group.",
@@ -1882,6 +2070,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::CODE,
         keyword: "code",
         summary: "A code scorer body; `when` and `repeat` blocks run in order and return on the first matching score, with `score` as the fallback.",
@@ -1896,6 +2085,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: CODE_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::SCORER_REPEAT,
         keyword: "repeat",
         summary: "Runs its scorer child blocks `count` times. `repeat.index` and `repeat.count` refer to the innermost scorer repeat.",
@@ -1910,6 +2100,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::WHEN,
         keyword: "when",
         summary: "A conditional scorer branch. When `cond` holds, nested blocks run in order, then its optional `score` is returned.",
@@ -1924,6 +2115,7 @@ const BLOCKS: &[BlockDesc] = &[
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {
+        tags: &["preview"],
         id: ids::JUDGE,
         keyword: "judge",
         summary: "An LLM-as-a-judge scorer body built as a Braintrust SDK prompt scorer: the model grades against the prompt and its answer maps to a score through `options`.",
@@ -1943,14 +2135,17 @@ pub(crate) const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
 
 const RULES: &[RuleDesc] = &[
     RuleDesc {
+        tags: &[],
         id: ids::NONEMPTY_SHAPE,
         summary: "A shape must declare at least one trace, scorer, facet, automation, dataset, or experiment block.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::RESERVED_METRICS,
         summary: "Metric keys `start` and `end` are reserved for generated timestamps.",
     },
     RuleDesc {
+        tags: &[],
         id: ids::DYNAMIC_CHILDREN,
         summary: "A `repeat`, `choice`, or `maybe` block must contain at least one child block.",
     },
@@ -1958,6 +2153,7 @@ const RULES: &[RuleDesc] = &[
 
 const EXAMPLES: &[Example] = &[
     Example {
+        tags: &[],
         id: ids::MULTI_TURN_CONVERSATION,
         summary: "A multi-turn conversation drawn from a pool of authored alternatives.",
         note: "A starting point, not a template: widen the pool with more choice alternatives and let their lengths differ — real sessions cluster short with a long tail of long ones.",
@@ -1965,6 +2161,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::AGENT_TOOL_LOOP,
         summary: "An agent loop running a sampled number of think-then-tool rounds.",
         note: "Expand along loop iterations and the set of tools; every tool the agent could realistically call deserves an alternative in the choice.",
@@ -1972,6 +2169,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::SUPERVISOR_AND_SUBAGENTS,
         summary: "A supervisor delegating to subagent task spans and synthesizing their results.",
         note: "Expand along the number of subagents and the delegation depth — a subagent can nest task, tool, and llm spans of its own.",
@@ -1979,6 +2177,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::FANOUT_PARALLEL_WORKERS,
         summary: "A fanout stamping a sampled number of parallel workers, then reducing.",
         note: "Expand along fan width and worker heterogeneity; add choice alternatives so stamped workers stop being clones of each other.",
@@ -1986,6 +2185,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::WINDOWED_SESSION,
         summary: "One window of a longer session, with earlier windows summarized into context.",
         note: "Expand along window position and carried context: more window variants, richer summaries, sessions that reference older windows.",
@@ -1993,6 +2193,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::RAG_PIPELINE,
         summary: "A retrieve, rerank, and generate pipeline grounding an answer in documents.",
         note: "Expand along retrieved document count, hit-versus-miss retrieval quality, and extra stages like query rewriting or guardrails.",
@@ -2000,6 +2201,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::ERROR_AND_ESCALATION,
         summary: "A happy path with a maybe-gated failure, retry, and human escalation.",
         note: "Expand along failure rate and failure variety — declines, timeouts, empty outputs — keeping each correlated failure inside one maybe block.",
@@ -2007,6 +2209,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::CODE_SCORER,
         summary: "A code scorer reacting to the scored output through ordered when cases.",
         note: "Expand along failure modes: each way an output can be wrong deserves its own when case with a matching score range.",
@@ -2014,6 +2217,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::JUDGE_SCORER,
         summary: "An LLM-as-a-judge scorer grading responses against labeled options.",
         note: "Expand along rubric granularity: more options give the judge finer distinctions to award.",
@@ -2021,6 +2225,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::SCORING_AUTOMATIONS,
         summary: "Synthetic support responses with code and judge scorers bound to their spans.",
         note: "Build and push the scorers, then sync the automations before writing traces.",
@@ -2028,6 +2233,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::TOPICS_AUTOMATIONS,
         summary: "Varied support conversations with a retention facet attached to a Topics automation.",
         note: "Use bts sync automation topics; sync creates the facet and its topic map directly.",
@@ -2035,6 +2241,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::DATASET_CASES,
         summary: "A dataset with inline, whole-trace, and nested-span cases.",
         note: "Sync writes referenced traces and reconciles every case in the dataset.",
@@ -2042,6 +2249,7 @@ const EXAMPLES: &[Example] = &[
         valid: true,
     },
     Example {
+        tags: &[],
         id: ids::EXPERIMENTS,
         summary: "Baseline and improved account recovery flows evaluated over the same dataset.",
         note: "Sync the dataset and build/push the scorers, then write both experiments together.",
