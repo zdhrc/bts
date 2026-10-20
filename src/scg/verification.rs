@@ -1,6 +1,37 @@
 //! Cross-stage generation checks. Execution tests also live in tests/end_to_end.rs.
 
 #[cfg(test)]
+mod agents {
+    use crate::dsl::ScorerLang;
+    use crate::scg::assembly::agents as assemble;
+
+    #[test]
+    fn rejects_unsupported_behavior_and_filename_collisions() {
+        for source in [
+            r#"agent "a-b" { entrypoint = trace.t } agent "a_b" { entrypoint = trace.t } trace "t" { output = "ok" }"#,
+            r#"trace "t" { output = "ok" }"#,
+        ] {
+            for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+                assert!(assemble(&crate::dsl::compile(source).unwrap(), lang).is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn typescript_rejects_integers_that_would_lose_precision() {
+        let model =
+            crate::dsl::compile(r#"agent "a" { entrypoint = trace.t } trace "t" { output = 9007199254740993 }"#).unwrap();
+        assert!(assemble(&model, ScorerLang::Python).is_ok());
+        assert!(
+            assemble(&model, ScorerLang::Typescript)
+                .err()
+                .unwrap()
+                .contains("safe integer")
+        );
+    }
+}
+
+#[cfg(test)]
 mod scorers {
     use crate::dsl::ScorerLang;
     use crate::dsl::compile;

@@ -3,7 +3,6 @@ use crate::dsl::diag::SrcRange;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Model {
     pub(crate) traces: Vec<Trace>,
-    #[allow(dead_code)] // Consumed when agent code generation is introduced.
     pub(crate) agents: Vec<Agent>,
     // root-scope bindings, evaluated once per generated trace before its own
     pub(crate) bindings: Vec<Binding>,

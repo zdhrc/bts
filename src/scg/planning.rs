@@ -1,7 +1,7 @@
 //! Select generation targets and resolve their names and dependencies.
 
 use super::assembly::Error;
-use crate::dsl::{Scorer, ScorerKind, ScorerLang};
+use crate::dsl::{Accessor, Model, Scorer, ScorerKind, ScorerLang, Trace};
 use std::collections::{HashMap, HashSet};
 
 // braintrust function slugs: lowercase alphanumeric runs joined by hyphens
@@ -76,6 +76,58 @@ pub(crate) fn callable_name(stem: &str, lang: ScorerLang) -> String {
     }
 }
 
+pub(super) struct Agent<'m> {
+    pub name: &'m str,
+    pub file: String,
+    pub trace: &'m Trace,
+}
+
+pub(super) fn agents(model: &Model, lang: ScorerLang) -> Result<Vec<Agent<'_>>, String> {
+    if model.agents.is_empty() {
+        return Err("the shape declares no agent blocks".into());
+    }
+    let mut names = HashSet::new();
+    model
+        .agents
+        .iter()
+        .map(|agent| {
+            let stem = agent_stem(&agent.name)?;
+            let extension = if lang == ScorerLang::Python { "py" } else { "mts" };
+            let file = format!("src/agents/{stem}.{extension}");
+            if !names.insert(file.clone()) {
+                return Err(format!("multiple agents generate {file}"));
+            }
+            let Accessor::Block { node, .. } = model.refs[agent.entrypoint.0 as usize].accessor else {
+                unreachable!("validated agent entrypoint")
+            };
+            let trace = model.traces.iter().find(|trace| trace.node == node).expect("validated trace");
+            Ok(Agent {
+                name: &agent.name,
+                file,
+                trace,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn agent_stem(name: &str) -> Result<String, String> {
+    let stem = module_stem(name)?;
+    Ok(if stem.ends_with("_agent") {
+        stem
+    } else {
+        format!("{stem}_agent")
+    })
+}
+pub(super) fn module_stem(name: &str) -> Result<String, String> {
+    let slug = crate::scg::slugify(name).ok_or_else(|| format!("{name:?} needs an alphanumeric name"))?;
+    let stem = slug.replace('-', "_");
+    Ok(if stem.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("_{stem}")
+    } else {
+        stem
+    })
+}
+
 pub(super) struct ScorerGroup {
     pub stem: String,
     pub members: Vec<usize>,
@@ -118,13 +170,78 @@ pub(super) fn scorer_groups(scorers: &[Scorer], slugs: &[String], lang: Option<S
         .collect()
 }
 
-#[allow(dead_code)]
+pub(super) struct Evaluation<'m> {
+    pub experiment: &'m crate::dsl::Experiment,
+    pub dataset: &'m crate::dsl::Dataset,
+    pub agent: String,
+    pub module: String,
+    pub scorers: Vec<&'m Scorer>,
+}
+
+pub(super) fn evals(model: &Model) -> Result<Vec<Evaluation<'_>>, String> {
+    let mut plans = Vec::new();
+    let mut names = HashSet::new();
+    for experiment in &model.experiments {
+        if experiment.baseline.is_some() {
+            return Err("generated eval baselines are not supported yet".into());
+        }
+        let task = &model.refs[experiment.task.0 as usize].accessor;
+        let matches = model
+            .agents
+            .iter()
+            .filter(|agent| {
+                matches!((task, &model.refs[agent.entrypoint.0 as usize].accessor),
+                (Accessor::Block {node: a, ..}, Accessor::Block {node: b, ..}) if a == b)
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(format!(
+                "experiment {:?} must target exactly one agent's trace entrypoint",
+                experiment.name
+            ));
+        }
+        let stem = module_stem(&matches[0].name)?;
+        let stem = if stem.ends_with("_agent") {
+            stem
+        } else {
+            format!("{stem}_agent")
+        };
+        let eval_stem = module_stem(&experiment.name)?;
+        if !names.insert(eval_stem.clone()) {
+            return Err(format!("multiple experiments generate {eval_stem}"));
+        }
+        let dataset = model
+            .datasets
+            .iter()
+            .find(|d| d.name == experiment.dataset)
+            .expect("validated dataset");
+        let scorers = experiment
+            .scorers
+            .iter()
+            .map(|name| {
+                let scorer = model.scorers.iter().find(|s| &s.name == name).expect("validated scorer");
+                if !matches!(scorer.kind, ScorerKind::Code { .. }) {
+                    return Err(format!("generated evals support code scorers only; {name:?} is a judge"));
+                }
+                Ok(scorer)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        plans.push(Evaluation {
+            experiment,
+            dataset,
+            agent: stem,
+            module: eval_stem,
+            scorers,
+        });
+    }
+    Ok(plans)
+}
+
 pub(super) struct Operation {
     pub key: super::lowering::code::Dependency,
     pub reads: HashSet<super::lowering::code::Dependency>,
     pub code: Vec<super::lowering::code::Statement>,
 }
-#[allow(dead_code)]
 pub(super) fn order(mut operations: Vec<Operation>, frame: &str) -> Result<Vec<super::lowering::code::Statement>, String> {
     let mut ordered = Vec::new();
     while !operations.is_empty() {
@@ -142,7 +259,6 @@ pub(super) fn order(mut operations: Vec<Operation>, frame: &str) -> Result<Vec<s
     Ok(ordered)
 }
 
-#[allow(dead_code)]
 pub(in crate::scg) fn mentions(source: &str, symbol: &str) -> bool {
     source.match_indices(symbol).any(|(index, _)| {
         let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';

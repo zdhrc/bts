@@ -4,13 +4,17 @@ use crate::{dsl, scg};
 use std::{env, fmt, fs, path::PathBuf};
 
 #[derive(Debug, clap::Args)]
-#[command(about = "build Braintrust SDK scorer files for `bt functions push`")]
+#[command(about = "build scorer files or a callable mock agent")]
 pub struct Args {
-    /// bts shape file whose scorer blocks should be built
+    /// artifact to generate; defaults to scorers
+    #[arg(value_enum, default_value = "scorers")]
+    target: Target,
+
+    /// bts shape file to build
     #[arg(long, value_name = "PATH")]
     from: PathBuf,
 
-    /// force the emitted language for scorers, overriding each code block's lang
+    /// output language; overrides scorer code languages and defaults to Python for agents
     #[arg(long, value_name = "LANG", value_enum)]
     lang: Option<Lang>,
 
@@ -21,6 +25,12 @@ pub struct Args {
     /// print phase timings to stderr while running
     #[arg(long)]
     profile: bool,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Target {
+    Scorers,
+    Agent,
 }
 
 // clap-facing mirror so the dsl stays clap-free
@@ -71,6 +81,33 @@ impl Args {
             .map_err(|diags| Error::InvalidShape {
                 details: render_diags(&source_name, &source, &diags),
             })?;
+        if matches!(self.target, Target::Agent) {
+            let lang = self.lang.map(Lang::into_model).unwrap_or(dsl::ScorerLang::Python);
+            let mut sources = scg::assembly::agents(&model, lang).map_err(Error::Agent)?;
+            if !model.experiments.is_empty() {
+                let project = crate::conf::ProjectContext::load()?.name;
+                sources.extend(scg::assembly::evals(&model, lang, &project).map_err(Error::Agent)?);
+            }
+            scg::emission::format_sources(&mut sources, lang).map_err(Error::Agent)?;
+            let project = scg::assembly::project(sources, lang, &self.out).map_err(|error| Error::Agent(error.to_string()))?;
+            scg::emission::write_project(
+                &project,
+                |path, diff| {
+                    println!("updating {}:\n{diff}", path.display());
+                },
+                |path, action| {
+                    let verb = match action {
+                        scg::emission::Action::Created => "created",
+                        scg::emission::Action::Updated => "updated",
+                        scg::emission::Action::Unchanged => "unchanged",
+                    };
+                    println!("{verb} {}", path.display());
+                },
+                |path| println!("removed migrated {}", path.display()),
+            )
+            .map_err(Error::Build)?;
+            return Ok(());
+        }
         if model.scorers.is_empty() {
             return Err(Error::NoScorers);
         }
@@ -134,6 +171,7 @@ pub enum Error {
     ReadShape { path: PathBuf, source: std::io::Error },
     InvalidShape { details: String },
     NoScorers,
+    Agent(String),
     Format(String),
     Plan(scg::Error),
     Config(crate::conf::Error),
@@ -148,6 +186,7 @@ impl fmt::Display for Error {
             }
             Self::InvalidShape { details } => write!(formatter, "invalid shape:\n{details}"),
             Self::Format(reason) => write!(formatter, "failed to format generated code: {reason}"),
+            Self::Agent(reason) => write!(formatter, "failed to build agents: {reason}"),
             Self::NoScorers => formatter.write_str("the shape declares no scorer blocks"),
             Self::Plan(source) => write!(formatter, "failed to build the scorers: {source}"),
             Self::Config(source) => source.fmt(formatter),
