@@ -238,6 +238,13 @@ request_timeout = "30s"   # per-request timeout for Braintrust API calls
 
 Everything is optional and shown here with its default. The `BTS_LOG` environment variable overrides `log.level` for a single run — `BTS_LOG=debug bts write ...` — and `off` disables the run log entirely.
 
+## Browser / WebAssembly
+
+Use BTS directly from JavaScript or TypeScript without a subprocess. The optional
+WASM build exposes version, generated language reference, diagnostics, and event
+generation with explicit count, seed, and time window. See [browser build and usage](web/README.md)
+for reproducible builds, TypeScript and Web Worker examples, and compatibility details.
+
 ## License
 
 [GNU AGPL-3.0](LICENSE). Free to use, modify, and share — but any software built on it, including software offered as a network service, must be released under the AGPL as well.

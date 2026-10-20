@@ -5,9 +5,11 @@ use crate::dsl::{
     RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
     Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue, WriteFilter,
 };
-use rand::rngs::SmallRng;
+// Fix the RNG algorithm across architectures while preserving the existing
+// 64-bit native SmallRng sequence. SmallRng itself is platform-dependent.
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
+use rand_xoshiro::Xoshiro256PlusPlus as SmallRng;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::fmt;
 use std::ops::Range;
@@ -2281,6 +2283,20 @@ impl std::error::Error for Error {}
 mod tests {
     use super::*;
     use crate::dsl::compile;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn portable_rng_preserves_native_small_rng_sequence() {
+        use rand::RngCore;
+        for seed in [0, 1, 42, u64::MAX] {
+            let mut before = rand::rngs::SmallRng::seed_from_u64(seed);
+            let mut after = SmallRng::seed_from_u64(seed);
+            for _ in 0..100 {
+                assert_eq!(before.next_u64(), after.next_u64());
+                assert_eq!(before.next_u32(), after.next_u32());
+            }
+        }
+    }
 
     #[test]
     fn prints_plan() {
