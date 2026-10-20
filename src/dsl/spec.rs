@@ -222,6 +222,9 @@ pub(crate) mod ids {
     pub(crate) const AUTOMATION: Id = Id::new("block.automation");
     pub(crate) const DATASET: Id = Id::new("block.dataset");
     pub(crate) const CASE: Id = Id::new("block.case");
+    pub(crate) const AGENT: Id = Id::new("block.agent");
+    pub(crate) const ENTRYPOINT: Id = Id::new("field.entrypoint");
+    pub(crate) const AGENT_BINDING: Id = Id::new("rule.agent-binding");
     pub(crate) const EXPERIMENT: Id = Id::new("block.experiment");
     pub(crate) const CODE: Id = Id::new("block.code");
     pub(crate) const JUDGE: Id = Id::new("block.judge");
@@ -679,6 +682,21 @@ const AUTOMATION_RULES: &[RuleDesc] = &[RuleDesc {
     tags: &[],
     id: ids::AUTOMATION_BINDING,
     summary: "Scorer automations require scorers, scope = \"span\", and either root = true or span_names. Topics automations require facets and scope = \"trace\"; scorer-specific fields are forbidden.",
+}];
+
+const AGENT_FIELDS: &[FieldDesc] = &[FieldDesc {
+    tags: &[],
+    id: ids::ENTRYPOINT,
+    keyword: "entrypoint",
+    summary: "The whole trace executed by this generated agent.",
+    value: &ExprType::BlockRef { kinds: &["trace"] },
+    cardinality: Cardinality::Required,
+}];
+
+const AGENT_RULES: &[RuleDesc] = &[RuleDesc {
+    tags: &[],
+    id: ids::AGENT_BINDING,
+    summary: "An agent requires a unique name and an entrypoint referencing a whole trace.",
 }];
 
 const EXPERIMENT_FIELDS: &[FieldDesc] = &[
@@ -2022,6 +2040,21 @@ const BLOCKS: &[BlockDesc] = &[
             open: false,
         },
         rules: AUTOMATION_RULES,
+        conventions: NO_CONVENTIONS,
+    },
+    BlockDesc {
+        tags: &["preview"],
+        id: ids::AGENT,
+        keyword: "agent",
+        summary: "A callable mock agent generated from a trace.",
+        syntax: "agent \"<name>\" { entrypoint = trace[\"<name>\"] }",
+        name: NamePolicy::Required,
+        allowed_in: ROOT_ONLY,
+        body: BodyDesc {
+            fields: AGENT_FIELDS,
+            open: false,
+        },
+        rules: AGENT_RULES,
         conventions: NO_CONVENTIONS,
     },
     BlockDesc {

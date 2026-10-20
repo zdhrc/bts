@@ -3,6 +3,8 @@ use crate::dsl::diag::SrcRange;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Model {
     pub(crate) traces: Vec<Trace>,
+    #[allow(dead_code)] // Consumed when agent code generation is introduced.
+    pub(crate) agents: Vec<Agent>,
     // root-scope bindings, evaluated once per generated trace before its own
     pub(crate) bindings: Vec<Binding>,
     // resolved block references, indexed by RefId; Value::BlockRef stays an
@@ -588,4 +590,10 @@ pub(crate) struct Object {
 pub(crate) struct ObjectField {
     pub(crate) key: String,
     pub(crate) value: Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Agent {
+    pub(crate) name: String,
+    pub(crate) entrypoint: RefId,
 }
