@@ -5,9 +5,11 @@ use crate::dsl::{
     RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
     Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue, WriteFilter,
 };
-use rand::rngs::SmallRng;
+// Match the existing 64-bit native SmallRng algorithm on wasm32 too.
+// SmallRng itself selects a different algorithm on 32-bit targets.
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
+use rand_xoshiro::Xoshiro256PlusPlus as SmallRng;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::fmt;
 use std::ops::Range;
@@ -2086,6 +2088,7 @@ pub(crate) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
     plan_with_filter(model, count, seed, &WriteFilter::default())
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn plan_experiment(model: &Model, task: RefId, row: &JsonValue, index: usize, seed: u64) -> Result<Plan, Error> {
     let reference = &model.refs[task.0 as usize];
     let Accessor::Block { node, .. } = reference.accessor else {
@@ -2178,6 +2181,7 @@ pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &W
 
 // case values share the trace evaluator and its attachment collection, with
 // a private evaluation instance that never becomes a module declaration
+#[cfg(feature = "native")]
 pub(crate) fn plan_case_data(model: &Model, input: ModelValue, seed: u64) -> Result<Plan, Error> {
     let mut ctx = Ctx::new(&model.refs, seed, 0);
     ctx.lazy_model = Some(model);
@@ -2281,6 +2285,20 @@ impl std::error::Error for Error {}
 mod tests {
     use super::*;
     use crate::dsl::compile;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn portable_rng_preserves_native_small_rng_sequence() {
+        use rand::RngCore;
+        for seed in [0, 1, 42, u64::MAX] {
+            let mut before = rand::rngs::SmallRng::seed_from_u64(seed);
+            let mut after = SmallRng::seed_from_u64(seed);
+            for _ in 0..100 {
+                assert_eq!(before.next_u64(), after.next_u64());
+                assert_eq!(before.next_u32(), after.next_u32());
+            }
+        }
+    }
 
     #[test]
     fn prints_plan() {

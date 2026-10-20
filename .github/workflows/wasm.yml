@@ -1,0 +1,42 @@
+name: Browser WASM
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+      - run: cargo clippy --locked --lib --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings
+      - run: ./scripts/build-wasm.sh
+      - run: cargo build --locked
+      - run: npm ci --prefix web
+      - run: npx --prefix web playwright install --with-deps chromium
+      - run: node web/smoke.mjs
+      - run: npm --prefix web run typecheck
+      # Prepare versioned release assets; maintainers choose when to publish them.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bts-wasm
+          path: |
+            target/wasm/*.tar.gz
+            target/wasm/*.sha256

@@ -2,12 +2,15 @@ use crate::sdg::planner::{Attachment, EventFields, EventRef, Plan};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+#[cfg(feature = "native")]
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+#[cfg(feature = "native")]
 pub(crate) fn stable_uuid(key: &str) -> Uuid {
     fn hash(bytes: &[u8], seed: u64) -> u64 {
         bytes
@@ -26,7 +29,8 @@ const EVENT_SLOT: Duration = Duration::from_millis(100);
 
 // how trace volume spreads across the window; each variant maps an even 0..=1
 // ratio through its inverse cdf so placement stays deterministic
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "native", derive(clap::ValueEnum))]
 pub(crate) enum Distribution {
     #[default]
     Linear,
@@ -49,6 +53,7 @@ pub(crate) struct EventBatch {
     pub(crate) events: Box<[Event]>,
 
     #[serde(skip)]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub(crate) trace_count: usize,
 
     #[serde(skip)]
@@ -56,6 +61,11 @@ pub(crate) struct EventBatch {
 }
 
 impl EventBatch {
+    pub(crate) fn has_attachments(&self) -> bool {
+        !self.attachments.is_empty()
+    }
+
+    #[cfg(feature = "native")]
     pub(crate) fn assign_stable_ids(&mut self, key: &str) {
         let old_to_new: HashMap<String, String> = self
             .events
@@ -73,6 +83,7 @@ impl EventBatch {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn resolve_attachment_paths(&mut self, shape_file: &Path) -> std::io::Result<()> {
         if self.attachments.is_empty() {
             return Ok(());
@@ -122,6 +133,7 @@ impl EventBatch {
         Ok(())
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn reuse_attachments(&mut self, keys: &HashMap<String, String>) {
         self.attachments = std::mem::take(&mut self.attachments)
             .into_vec()
@@ -144,15 +156,18 @@ impl EventBatch {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn event_count(&self) -> usize {
         self.events.len()
     }
 
+    #[cfg(feature = "native")]
     pub(crate) fn trace_count(&self) -> usize {
         self.trace_count
     }
 }
 
+#[cfg(feature = "native")]
 fn replace_attachment_keys(value: &mut JsonValue, keys: &HashMap<String, String>) {
     match value {
         JsonValue::Object(fields) => {

@@ -84,3 +84,6 @@
 /.coverage
 coverage.lcov
 lcov.info
+
+# Browser verification dependencies
+/web/node_modules/

@@ -5,8 +5,10 @@ use crate::dsl::{Model, WriteFilter};
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+#[cfg(feature = "native")]
 pub(crate) use materializer::stable_uuid;
 pub(crate) use materializer::{Distribution, EventBatch};
+#[cfg(feature = "native")]
 pub(crate) use planner::Attachment;
 
 pub(crate) fn generate(
@@ -44,6 +46,7 @@ pub(crate) fn generate_filtered(
         .map_err(Error::Materialize)
 }
 
+#[cfg(feature = "native")]
 pub(crate) fn experiment_result(
     model: &Model,
     task: crate::dsl::RefId,
@@ -77,6 +80,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[cfg(feature = "native")]
 pub(crate) fn case_data(model: &Model, case: &crate::dsl::DatasetCase, seed: u64) -> Result<EventBatch, Error> {
     use crate::dsl::{DatasetSource, Object, ObjectField, Value};
     let mut fields = Vec::new();
@@ -103,7 +107,7 @@ pub(crate) fn case_data(model: &Model, case: &crate::dsl::DatasetCase, seed: u64
         .map_err(Error::Materialize)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod experiment_tests {
     use super::*;
     use serde_json::{Value, json};
