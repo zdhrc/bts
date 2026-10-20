@@ -1983,6 +1983,309 @@ assert.equal(literals().values.length, 6);
 }
 
 #[test]
+fn agent_example_preserves_child_data_flow_in_both_languages() {
+    let root = write_project_context(Uuid::new_v4());
+    fs::create_dir_all(&root).unwrap();
+    let source = include_str!("../examples/customer_support_agent.bt");
+    let shape = root.join("customer_support_agent.bt");
+    fs::write(&shape, source).unwrap();
+    for lang in ["python", "typescript"] {
+        let built = bts()
+            .current_dir(&root)
+            .args([
+                "build",
+                "agent",
+                "--from",
+                "customer_support_agent.bt",
+                "--lang",
+                lang,
+                "--out",
+                lang,
+            ])
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        let extension = if lang == "python" { "py" } else { "mts" };
+        let generated =
+            fs::read_to_string(root.join(lang).join(format!("src/agents/customer_support_agent.{extension}"))).unwrap();
+        let declaration = if lang == "python" { "def " } else { "function " };
+        assert!(
+            generated
+                .lines()
+                .filter(|line| line.trim_start().starts_with(declaration))
+                .all(|line| line.starts_with(declaration)),
+            "agent functions must be module-level: {generated}"
+        );
+        let (policy, next) = if lang == "python" {
+            ("def check_arrival_policy(", "def front_desk_message(")
+        } else {
+            ("function checkArrivalPolicy(", "function frontDeskMessage(")
+        };
+        let policy = generated.split(policy).nth(1).unwrap().split(next).next().unwrap();
+        assert!(!policy.contains("_at("), "policy should consume ordinary results: {policy}");
+        assert!(
+            !policy.contains(".children"),
+            "policy should not traverse trace data: {policy}"
+        );
+        for scaffolding in ["_lazy(", " _at(", "(_at(", ".children", "Span_included", "span_included"] {
+            assert!(
+                !generated.contains(scaffolding),
+                "unexpected execution scaffolding {scaffolding}: {generated}"
+            );
+        }
+        assert!(generated.contains("context.trace("));
+        assert!(generated.contains("context.choose("));
+        let scorers = bts()
+            .current_dir(&root)
+            .args([
+                "build",
+                "scorers",
+                "--from",
+                "customer_support_agent.bt",
+                "--lang",
+                lang,
+                "--out",
+                lang,
+            ])
+            .output()
+            .unwrap();
+        assert!(scorers.status.success(), "{}", String::from_utf8_lossy(&scorers.stderr));
+        assert!(root.join(lang).join("src/scorers").is_dir());
+        let rebuilt = bts()
+            .current_dir(&root)
+            .args([
+                "build",
+                "agent",
+                "--from",
+                "customer_support_agent.bt",
+                "--lang",
+                lang,
+                "--out",
+                lang,
+            ])
+            .output()
+            .unwrap();
+        assert!(rebuilt.status.success(), "{}", String::from_utf8_lossy(&rebuilt.stderr));
+        let report = String::from_utf8_lossy(&rebuilt.stdout);
+        assert!(report.lines().all(|line| line.starts_with("unchanged ")), "{report}");
+    }
+
+    for lang in ["python", "typescript"] {
+        let (program, args): (&str, &[&str]) = if lang == "python" {
+            (
+                "python3",
+                &[
+                    "-c",
+                    r#"
+from evals.customer_support_eval import CASES, SCORERS, task
+from types import SimpleNamespace
+class Span:
+    def start_span(self, **kwargs): return self
+    def log(self, **kwargs): pass
+    def end(self, **kwargs): pass
+assert len(CASES) == 3 and len(SCORERS) == 2
+for case in CASES:
+    output = task(case['input'], SimpleNamespace(span=Span()))
+    for score in SCORERS:
+        assert score(output=output, expected=case['expected'])['score'] == 1
+        wrong = [dict(row, next_step='incorrect', needs_staff=not row['needs_staff']) for row in output]
+        assert score(output=wrong, expected=case['expected'])['score'] == 0
+"#,
+                ],
+            )
+        } else {
+            (
+                "node",
+                &[
+                    "--input-type=module",
+                    "-e",
+                    r#"
+import assert from 'node:assert/strict';
+import {stripTypeScriptTypes} from 'node:module';
+import {readFileSync,writeFileSync} from 'node:fs';
+const {cases,scorers,task}=await import('./evals/customer_support.eval.mts');
+const span={startSpan(){return this;},log(){},end(){}};
+assert.equal(cases.length,3); assert.equal(scorers.length,2);
+for(const row of cases){
+    const output=task(row.input,{span});
+    for(const score of scorers){
+        assert.equal(score({output,expected:row.expected}).score,1);
+        const wrong=output.map(r=>({...r,next_step:'incorrect',needs_staff:!r.needs_staff}));
+        assert.equal(score({output:wrong,expected:row.expected}).score,0);
+    }
+}
+"#,
+                ],
+            )
+        };
+        let checked = Command::new(program)
+            .args(args)
+            .current_dir(root.join(lang).join("src"))
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{lang}: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+
+    let cases = serde_json::json!([
+        {"name": "Maya", "reservation_id": "HTL-4821", "arrival_hour": 25, "message": "My flight is delayed."},
+        {"name": "Sam", "reservation_id": "UNKNOWN", "arrival_hour": 25, "message": "Can I check in after midnight?"},
+        {"name": "Taylor", "reservation_id": null, "arrival_hour": 25, "message": "I lost my confirmation."},
+        {"name": "Riley", "reservation_id": "HTL-7390", "arrival_hour": 26, "message": "Can I arrive at 1 a.m.?"},
+        {"name": "Jordan", "reservation_id": "HTL-4821", "arrival_hour": 25, "message": "I will arrive late."},
+        {"name": "Casey", "reservation_id": "HTL-7390", "arrival_hour": 23, "message": "Before midnight."},
+        {"name": "Avery", "reservation_id": "HTL-9102", "arrival_hour": 25, "message": "Is my booking active?"},
+        {"name": "Morgan", "reservation_id": "HTL-4821", "arrival_hour": 14, "message": "Early arrival."},
+        {"name": "Quinn", "reservation_id": "HTL-4821", "arrival_hour": 30, "message": "Next morning."},
+        {"name": "Lee", "reservation_id": "HTL-7390", "arrival_hour": 24, "message": "Midnight."},
+        {"name": "Zoë", "reservation_id": "HTL-7390", "arrival_hour": 15, "message": "Afternoon."},
+        {"name": "Drew", "reservation_id": "HTL-7390", "arrival_hour": 29, "message": "Early morning."},
+    ]);
+    let mut expected = Vec::new();
+    for case in cases.as_array().unwrap() {
+        let case_source = source
+            .replacen("name = \"Maya\"", &format!("name = {}", case["name"]), 1)
+            .replacen("arrival_hour = 25", &format!("arrival_hour = {}", case["arrival_hour"]), 1)
+            .replacen(
+                "reservation_id = \"HTL-4821\"",
+                &format!("reservation_id = {}", case["reservation_id"]),
+                1,
+            );
+        fs::write(&shape, case_source).unwrap();
+        let preview = bts()
+            .current_dir(&root)
+            .args([
+                "write",
+                "traces",
+                "--from",
+                "customer_support_agent.bt",
+                "--count",
+                "1",
+                "--over",
+                "1h",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap();
+        assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
+        let payload: JsonValue = serde_json::from_slice(&preview.stdout).unwrap();
+        assert!((16..=19).contains(&payload["events"].as_array().unwrap().len()));
+        let mut reply = payload["events"][0]["output"][0].clone();
+        reply.as_object_mut().unwrap().remove("retried");
+        reply.as_object_mut().unwrap().remove("handoff");
+        expected.push(reply);
+    }
+    assert_eq!(expected[0]["next_step"], "check-in-on-arrival");
+    assert_eq!(expected[1]["next_step"], "verify-reservation-number");
+    assert_eq!(expected[2]["reservation_id"], JsonValue::Null);
+    assert_eq!(expected[3]["next_step"], "contact-front-desk");
+    assert_eq!(expected[3]["reservation_id"], "HTL-7390");
+    assert_eq!(expected[4]["next_step"], "check-in-on-arrival");
+    assert_eq!(expected[5]["next_step"], "check-in-on-arrival");
+    assert_eq!(expected[6]["next_step"], "contact-reservations");
+    assert_eq!(expected[7]["next_step"], "verify-arrival-time");
+    assert_eq!(expected[8]["next_step"], "verify-arrival-time");
+    assert_eq!(expected[9]["next_step"], "contact-front-desk");
+    assert_eq!(expected[10]["next_step"], "check-in-on-arrival");
+    assert_eq!(expected[11]["next_step"], "contact-front-desk");
+    assert!(expected[3]["content"].as_str().unwrap().contains("120 minutes"));
+    assert_eq!(expected[6]["needs_staff"], true);
+    assert_eq!(expected[1]["needs_staff"], false);
+
+    for lang in ["python", "typescript"] {
+        let mut command = if lang == "python" {
+            let mut command = Command::new("python3");
+            command.args([
+                "-c",
+                r#"
+import json, os, itertools
+from customer_support_agent import run
+cases = json.loads(os.environ['AGENT_TEST_CASES'])
+def execute(batch, draw, channel_draw=None):
+    channel_draw = draw if channel_draw is None else channel_draw
+    draws = itertools.chain([draw, channel_draw, 0.5, 0.5, 0.5, 0.5] * 3, itertools.repeat(0.5))
+    replies = run(batch, random_source=lambda: next(draws))
+    for reply in replies:
+        assert reply.pop('retried') == (draw < 0.15)
+        handoff = reply.pop('handoff')
+        assert handoff['channel'] == ('front-desk-message' if channel_draw < 0.5 else 'callback')
+        assert handoff['status'] == ('queued' if reply['needs_staff'] else 'not-required')
+    return replies
+results = [reply for offset in range(0, len(cases), 3) for reply in execute(cases[offset:offset + 3], 0)]
+assert [execute([case, case, case], 0.99)[0] for case in cases] == results
+assert execute(cases[:3], 0) == results[:3]
+for retry_draw in [0, 0.99]:
+    for channel_draw in [0, 0.99]:
+        for offset in range(0, len(cases), 3):
+            assert execute(cases[offset:offset + 3], retry_draw, channel_draw) == results[offset:offset + 3]
+print(json.dumps(results))
+assert run()[0]['next_step'] == 'check-in-on-arrival'
+for value in [{}, None, [None], [{'name': 'Maya', 'reservation_id': 123, 'message': 'hello'}]]:
+    try:
+        run(value)
+    except (KeyError, TypeError):
+        pass
+    else:
+        raise AssertionError('invalid input unexpectedly succeeded')
+"#,
+            ]);
+            command
+        } else {
+            let mut command = Command::new("node");
+            command.args([
+                "--input-type=module",
+                "-e",
+                r#"
+import assert from 'node:assert/strict';
+import { run } from './customer_support_agent.mts';
+const cases = JSON.parse(process.env.AGENT_TEST_CASES);
+function execute(batch, draw, channelDraw = draw) {
+    const draws = Array.from({length: 3}, () => [draw, channelDraw, 0.5, 0.5, 0.5, 0.5]).flat();
+    const replies = run(batch, () => draws.shift() ?? 0.5);
+    for (const reply of replies) {
+        assert.equal(reply.retried, draw < 0.15);
+        assert.equal(reply.handoff.channel, channelDraw < 0.5 ? 'front-desk-message' : 'callback');
+        assert.equal(reply.handoff.status, reply.needs_staff ? 'queued' : 'not-required');
+        delete reply.retried;
+        delete reply.handoff;
+    }
+    return replies;
+}
+const results = cases.flatMap((_, index) => index % 3 === 0 ? execute(cases.slice(index, index + 3), 0) : []);
+assert.deepEqual(cases.map(value => execute([value, value, value], 0.99)[0]), results);
+assert.deepEqual(execute(cases.slice(0, 3), 0), results.slice(0, 3));
+for (const retryDraw of [0, 0.99]) {
+    for (const channelDraw of [0, 0.99]) {
+        for (let offset = 0; offset < cases.length; offset += 3) {
+            assert.deepEqual(execute(cases.slice(offset, offset + 3), retryDraw, channelDraw), results.slice(offset, offset + 3));
+        }
+    }
+}
+console.log(JSON.stringify(results));
+assert.equal(run()[0].next_step, 'check-in-on-arrival');
+for (const value of [{}, null, [null], [{name: 'Maya', reservation_id: 123, message: 'hello'}]]) {
+    assert.throws(() => run(value));
+}
+"#,
+            ]);
+            command
+        };
+        let ran = command
+            .current_dir(root.join(lang).join("src/agents"))
+            .env("AGENT_TEST_CASES", cases.to_string())
+            .output()
+            .unwrap();
+        assert!(ran.status.success(), "{lang}: {}", String::from_utf8_lossy(&ran.stderr));
+        let actual: JsonValue = serde_json::from_slice(&ran.stdout).unwrap();
+        assert_eq!(actual, serde_json::json!(expected), "{lang} differs from the trace planner");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn agent_scalar_expressions_preserve_integer_and_short_circuit_semantics() {
     let root = std::env::temp_dir().join(format!("bts-agent-expressions-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
