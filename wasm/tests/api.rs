@@ -1,8 +1,8 @@
-use bts::browser::{GenerationOptions, check, generate, language_reference, version};
+use bts_wasm::api::{GenerationOptions, check, generate, language_reference, version};
 
 #[test]
 fn browser_api_validates_and_generates() {
-    let source = include_str!("fixtures/dynamic.bt");
+    let source = include_str!("../../tests/fixtures/dynamic.bt");
     assert!(check(source).is_empty());
     let options = GenerationOptions {
         count: 3,
@@ -11,7 +11,7 @@ fn browser_api_validates_and_generates() {
         end: "2026-09-01T01:00:00Z".into(),
         distribution: Default::default(),
     };
-    let events = generate(source, options).unwrap();
+    let events = serde_json::to_value(generate(source, options).unwrap()).unwrap();
     assert!(!events["events"].as_array().unwrap().is_empty());
     assert!(language_reference().contains(version()));
     let errors = check("trace \"t\" {\n input = }\n}");
@@ -75,11 +75,11 @@ fn rejects_filesystem_dependent_attachments_and_reports_materialization_errors()
 
 #[test]
 fn validates_existing_fixtures_and_embeds_the_release_version() {
-    assert!(language_reference().contains(concat!("BTS release ", env!("CARGO_PKG_VERSION"))));
+    assert!(language_reference().contains(&format!("BTS release {}", version())));
     for source in [
-        include_str!("fixtures/simple.bt"),
-        include_str!("fixtures/dynamic.bt"),
-        include_str!("fixtures/scorers.bt"),
+        include_str!("../../tests/fixtures/simple.bt"),
+        include_str!("../../tests/fixtures/dynamic.bt"),
+        include_str!("../../tests/fixtures/scorers.bt"),
     ] {
         assert!(check(source).is_empty());
     }

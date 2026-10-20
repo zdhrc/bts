@@ -7,12 +7,12 @@ if [[ $(wasm-bindgen --version) != 'wasm-bindgen 0.2.126' ]]; then
   echo 'requires wasm-bindgen-cli 0.2.126 (matching Cargo.lock)' >&2
   exit 1
 fi
-cargo build --locked --release --lib --target wasm32-unknown-unknown --no-default-features --features wasm
-version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+cargo build --locked --release -p bts-wasm --target wasm32-unknown-unknown
+version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "bts"))')
 package="bts-v${version}-wasm"
 output="target/wasm/${package}"
 mkdir -p "$output"
-wasm-bindgen --target web --typescript --out-name bts --out-dir "$output" target/wasm32-unknown-unknown/release/bts.wasm
+wasm-bindgen --target web --typescript --out-name bts --out-dir "$output" target/wasm32-unknown-unknown/release/bts_wasm.wasm
 cp LICENSE "$output/"
 cp web/example.ts "$output/"
 cp web/README.md "$output/README.md"

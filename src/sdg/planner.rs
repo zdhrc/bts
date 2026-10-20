@@ -5,8 +5,8 @@ use crate::dsl::{
     RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
     Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue, WriteFilter,
 };
-// Match the existing 64-bit native SmallRng algorithm on wasm32 too.
-// SmallRng itself selects a different algorithm on 32-bit targets.
+// Fix the RNG algorithm across architectures while preserving the existing
+// 64-bit native SmallRng sequence. SmallRng itself is platform-dependent.
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
 use rand_xoshiro::Xoshiro256PlusPlus as SmallRng;
@@ -2088,7 +2088,6 @@ pub(crate) fn plan(model: Model, count: usize, seed: u64) -> Result<Plan, Error>
     plan_with_filter(model, count, seed, &WriteFilter::default())
 }
 
-#[cfg(feature = "native")]
 pub(crate) fn plan_experiment(model: &Model, task: RefId, row: &JsonValue, index: usize, seed: u64) -> Result<Plan, Error> {
     let reference = &model.refs[task.0 as usize];
     let Accessor::Block { node, .. } = reference.accessor else {
@@ -2181,7 +2180,6 @@ pub(super) fn plan_with_filter(model: Model, count: usize, seed: u64, filter: &W
 
 // case values share the trace evaluator and its attachment collection, with
 // a private evaluation instance that never becomes a module declaration
-#[cfg(feature = "native")]
 pub(crate) fn plan_case_data(model: &Model, input: ModelValue, seed: u64) -> Result<Plan, Error> {
     let mut ctx = Ctx::new(&model.refs, seed, 0);
     ctx.lazy_model = Some(model);

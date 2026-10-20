@@ -2,7 +2,6 @@ mod ast;
 mod diag;
 mod filter;
 mod lexer;
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
 mod model;
 mod modeler;
 mod parser;
@@ -10,7 +9,6 @@ pub(crate) mod spec;
 
 pub(crate) use diag::{Diag, DiagPhase, Diags, SrcRange};
 pub(crate) use filter::WriteFilter;
-#[cfg_attr(not(feature = "native"), allow(unused_imports))]
 pub(crate) use model::{
     Accessor, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
     DatasetSource, Experiment, Field, Func, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object, ObjectField, Part, Range,
@@ -34,7 +32,6 @@ pub(crate) fn compile_module(src: &str, allow_empty: bool) -> Result<Model, Diag
 }
 
 // just read the path, the caller decides what it means
-#[cfg(feature = "native")]
 pub(crate) fn parse_traversal(src: &str) -> Result<Vec<String>, Diags> {
     fn segments(expr: ast::Expr) -> Result<Vec<String>, Diags> {
         let range = expr.range;

@@ -1,7 +1,6 @@
-//! Filesystem-free API shared by native parity tests and the WebAssembly bindings.
+//! In-memory library API over the existing compiler, planner, and materializer.
 use crate::{dsl, sdg};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
 use std::time::SystemTime;
 
 pub fn version() -> &'static str {
@@ -70,24 +69,33 @@ pub fn check(source: &str) -> Vec<Diagnostic> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum Distribution {
     #[default]
     Linear,
     Sine,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Explicit generation inputs; no clock, configuration, or environment is consulted.
+#[derive(Debug)]
 pub struct GenerationOptions {
-    pub count: u32,
-    /// Decimal u64 string, preserving all 64 bits across JavaScript's number boundary.
-    pub seed: String,
-    pub start: String,
-    pub end: String,
-    #[serde(default)]
+    pub count: usize,
+    pub seed: u64,
+    pub start: SystemTime,
+    pub end: SystemTime,
     pub distribution: Distribution,
+}
+
+/// The generator's native event batch, before any filesystem or publication work.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct EventBatch(sdg::EventBatch);
+
+impl EventBatch {
+    /// Consumers decide how to handle unresolved file attachments.
+    pub fn has_attachments(&self) -> bool {
+        !self.0.attachments.is_empty()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -112,25 +120,17 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
-pub fn generate(source: &str, options: GenerationOptions) -> Result<Value, Error> {
+pub fn generate(source: &str, options: GenerationOptions) -> Result<EventBatch, Error> {
     if options.count == 0 {
         return Err(Error::message("count must be greater than zero"));
     }
-    if options.seed.is_empty() || !options.seed.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(Error::message("seed must be a decimal u64 string"));
-    }
-    let seed = options.seed.parse::<u64>().map_err(Error::message)?;
-    let timestamp = |value: &str| -> Result<SystemTime, Error> {
-        let date = chrono::DateTime::parse_from_rfc3339(value)
-            .map_err(|_| Error::message("timestamp must be RFC 3339 with an explicit offset"))?;
-        // Keep conversion, arithmetic, and formatting in a portable, supported range.
-        if !(0..=253_402_300_799).contains(&date.timestamp()) {
-            return Err(Error::message("timestamp must be between 1970 and 9999 UTC"));
-        }
-        Ok(SystemTime::from(date))
-    };
-    let start = timestamp(&options.start)?;
-    let end = timestamp(&options.end)?;
+    let GenerationOptions {
+        count,
+        seed,
+        start,
+        end,
+        distribution,
+    } = options;
     let over = end
         .duration_since(start)
         .ok()
@@ -140,11 +140,11 @@ pub fn generate(source: &str, options: GenerationOptions) -> Result<Value, Error
         message: "source is invalid".into(),
         diagnostics: diags.into_iter().map(|diag| diagnostic(source, diag)).collect(),
     })?;
-    let distribution = match options.distribution {
+    let distribution = match distribution {
         Distribution::Linear => sdg::Distribution::Linear,
         Distribution::Sine => sdg::Distribution::Sine,
     };
-    let events = sdg::generate(model, options.count as usize, over, distribution, end, seed).map_err(|error| match error {
+    let events = sdg::generate(model, count, over, distribution, end, seed).map_err(|error| match error {
         sdg::Error::Plan(error) => Error {
             message: error.to_string(),
             diagnostics: vec![diagnostic(
@@ -158,10 +158,5 @@ pub fn generate(source: &str, options: GenerationOptions) -> Result<Value, Error
         },
         other => Error::message(other),
     })?;
-    if events.has_attachments() {
-        return Err(Error::message(
-            "file attachments require native BTS; browser generation cannot resolve local files",
-        ));
-    }
-    serde_json::to_value(events).map_err(Error::message)
+    Ok(EventBatch(events))
 }

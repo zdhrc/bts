@@ -83,7 +83,11 @@ this interface is not a resource sandbox, and memory exhaustion can still trap.
 
 ## Compatibility
 
-The shared parser, planner, materializer, and spec renderer define behavior. The
+The separate `wasm/` crate depends on the public `bts::api` library API. It owns
+JavaScript option encodings, bindings, browser crypto selection, and attachment
+policy. Core code has no WASM dependencies or browser conditionals; the optional
+`cli` feature composes the native CLI at the library entry point. The parser,
+planner, materializer, and spec renderer define behavior. The
 reference embeds the BTS release version and language/schema versions; CLI help
 is omitted. Feed that reference to the caller's LLM, then validate its source.
 
@@ -107,6 +111,7 @@ No check or generate function accesses the host clock, environment, or config.
 ```sh
 npm ci --prefix web
 npx --prefix web playwright install chromium
+cargo test --locked -p bts-wasm
 cargo build --locked
 ./scripts/build-wasm.sh
 node web/smoke.mjs

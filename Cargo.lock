@@ -208,7 +208,6 @@ dependencies = [
  "axoupdater",
  "chrono",
  "clap",
- "js-sys",
  "rand 0.9.5",
  "rand_distr",
  "rand_xoshiro",
@@ -220,6 +219,18 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "bts-wasm"
+version = "0.0.0"
+dependencies = [
+ "bts",
+ "chrono",
+ "js-sys",
+ "serde",
+ "serde_json",
  "uuid",
  "wasm-bindgen",
 ]
