@@ -14,7 +14,7 @@ pub struct Args {
     #[arg(long, value_name = "LANG", value_enum)]
     lang: Option<Lang>,
 
-    /// codebase root; scorer files are written under src/scorers
+    /// project root; generated code is organized under src/
     #[arg(long, value_name = "DIR", default_value = ".")]
     out: PathBuf,
 
@@ -77,8 +77,11 @@ impl Args {
 
         let project = crate::conf::ProjectContext::load()?.name;
         let lang = self.lang.map(Lang::into_model);
-        let assembly =
+        let mut assembly =
             tracing::info_span!("assemble").in_scope(|| scg::assemble(&model.scorers, lang, &project).map_err(Error::Plan))?;
+        for source in &mut assembly.files {
+            source.contents = scg::format(&source.contents, source.lang).map_err(Error::Format)?;
+        }
         let built = tracing::info_span!("build")
             .in_scope(|| {
                 scg::build(&assembly, &self.out, |path, diff| {
@@ -89,9 +92,9 @@ impl Args {
 
         for source in &built {
             let verb = match source.action {
-                scg::building::Action::Created => "created",
-                scg::building::Action::Updated => "updated",
-                scg::building::Action::Unchanged => "unchanged",
+                scg::emission::Action::Created => "created",
+                scg::emission::Action::Updated => "updated",
+                scg::emission::Action::Unchanged => "unchanged",
             };
             if source.slugs.is_empty() {
                 println!("{verb} {}", source.path.display());
@@ -101,7 +104,7 @@ impl Args {
         }
         let written = built
             .iter()
-            .filter(|source| source.action != scg::building::Action::Unchanged)
+            .filter(|source| source.action != scg::emission::Action::Unchanged)
             .count();
         tracing::info!(written, scorers = model.scorers.len(), "build finished");
         let names = built
@@ -131,9 +134,10 @@ pub enum Error {
     ReadShape { path: PathBuf, source: std::io::Error },
     InvalidShape { details: String },
     NoScorers,
+    Format(String),
     Plan(scg::Error),
     Config(crate::conf::Error),
-    Build(scg::building::Error),
+    Build(scg::emission::Error),
 }
 
 impl fmt::Display for Error {
@@ -143,6 +147,7 @@ impl fmt::Display for Error {
                 write!(formatter, "failed to read shape {}: {source}", path.display())
             }
             Self::InvalidShape { details } => write!(formatter, "invalid shape:\n{details}"),
+            Self::Format(reason) => write!(formatter, "failed to format generated code: {reason}"),
             Self::NoScorers => formatter.write_str("the shape declares no scorer blocks"),
             Self::Plan(source) => write!(formatter, "failed to build the scorers: {source}"),
             Self::Config(source) => source.fmt(formatter),
