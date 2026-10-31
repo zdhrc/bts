@@ -206,8 +206,25 @@ name = "bts"
 version = "0.1.6"
 dependencies = [
  "axoupdater",
+ "bts-core",
+ "bts-lang",
  "chrono",
  "clap",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "bts-core"
+version = "0.1.6"
+dependencies = [
+ "bts-lang",
+ "chrono",
  "rand 0.9.5",
  "rand_distr",
  "reqwest 0.12.28",
@@ -219,6 +236,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "bts-lang"
+version = "0.1.6"
+dependencies = [
+ "serde",
+ "tracing",
 ]
 
 [[package]]

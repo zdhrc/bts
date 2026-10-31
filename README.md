@@ -14,7 +14,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/zdhrc/bts/releases/late
 
 Verify with `bts --version`. Later, `bts update` fetches and installs the latest release in place.
 
-To build from source instead, `cargo install --path .` from a clone of this repo (edition 2024, so Rust 1.85 or newer). Source builds have no install receipt, so `bts update` only works for installer-managed installs.
+To build from source instead, `cargo install --path crates/cli` from a clone of this repo (edition 2024, so Rust 1.85 or newer). Source builds have no install receipt, so `bts update` only works for installer-managed installs.
 
 ## Quickstart
 

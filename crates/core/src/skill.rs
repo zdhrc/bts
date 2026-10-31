@@ -1,0 +1,295 @@
+use bts_lang::spec::{Cardinality, NamePolicy, Place, RuleDesc, Spec as DslSpec};
+use std::fmt::Write as _;
+
+const REALISM_LEAD: &str = "One shape generates every trace in a run: anything literal is byte-identical across all of them. \
+Before calling a shape done, ask what differs between trace 0 and trace 99 — if the answer is only `uuid()` and timestamps, keep going.";
+const REALISM_POINTS: &[&str] = &[
+    "Structure: real trace populations vary in shape. Vary turn and step counts with `repeat` and a sampled `count`, alternative subtrees with `choice`, and rare paths with `maybe`. Skew counts the way traffic skews — most sessions short, a long tail — using `weighted` or a distribution function rather than a uniform `range`.",
+    "Conversation content: author a pool of distinct, realistic user intents and select between them with `choice` blocks wrapping whole subtrees, or index and slice trace-scope vars of authored turns by `repeat.index`; both keep content coherent across a turn's fields. Never ship placeholder content like `\"question ${repeat.index}\"` — indices are for ids, labels, and selection, not user-visible text.",
+    "Coherence: block references carry generated content between spans instead of duplicating it. Reuse the question with `trace.input`, feed one span's output into the next span's input (`llm.chat.output.content`), and let the trace's own `output` read the closing span's answer — a sampled value then threads through everything that mentions it.",
+    "History: inside a `repeat`, grow each round's message list from the earlier iterations — `input = [{...}, ...repeat.rounds[:repeat.index].llm.chat.output]` — and reach the previous round with `repeat.rounds[repeat.index - 1]`. Correlate branches from outside with `choice.<name>.chosen`, `maybe.<name>.included`, or a `!= null` probe on a branch field.",
+    "LLM metrics: token counts are long-tailed and never round; real prompts don't cost exactly 500 tokens. Sample `prompt_tokens` and `completion_tokens`, then keep the sum exact with `tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens` — or compute exact counts from the content itself with `tokens(self.input)`. Vary `time_to_first_token`, keeping it under the span duration.",
+    "Metadata: model and provider stay consistent within a trace; vary them across traces by putting alternatives in `choice` branches, not by sampling each span independently.",
+    "Errors: a few percent of real traces fail. Gate an `error` field, an empty output, or an escalation span behind `maybe` with a single-digit `chance`.",
+    "Latency: every span defaults to a 100ms slot; real ones don't. Set `duration` (seconds) with long-tailed samples — `duration = lognormal(2.0, 0.6)` on llm spans — and share the sample through a var when `time_to_first_token` must stay under it. A parent stretches to cover its children, so set durations on leaves and pin a parent's only when the span should outlast them.",
+    "Tags: to mix tagged populations, interpolate a per-trace var into the tag (`vars { env = weighted(...) }`, `tags = [\"${var.env}\"]`) instead of duplicating the shape.",
+    "Populations: one shape file with one trace block covers a whole population — `choice`, `maybe`, and `repeat` capture every case as alternative subtrees, so never fan out into near-duplicate shape files or separate batches. Use separate runs only for populations needing disjoint time windows or volumes.",
+];
+const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
+Steal the structure, replace the content, and expand along the axis each one names.";
+
+/// Generates a standalone language skill without interface commands or file access.
+pub fn render(spec: &DslSpec) -> String {
+    format!(
+        "---\nname: bts\ndescription: Write, review, explain, and debug bts language source.\n---\n\n{}",
+        reference(spec)
+    )
+}
+
+/// Renders the language guidance for inclusion in an interface's own skill.
+pub fn reference(spec: &DslSpec) -> String {
+    let mut output = String::new();
+    writeln!(output, "# `{}` language\n", spec.name).unwrap();
+    writeln!(output, "{}\n", spec.summary).unwrap();
+    writeln!(output, "## Shape authoring workflow\n").unwrap();
+    writeln!(
+        output,
+        "1. Read the language reference below before creating or changing `bts` source."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "2. Use only the documented blocks, fields, expressions, placements, and rules."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "3. Preserve the user's intent while making the smallest valid change."
+    )
+    .unwrap();
+    writeln!(output, "4. Validate the syntax and semantic definitions after editing.\n").unwrap();
+    writeln!(
+        output,
+        "Treat this generated reference as authoritative for `bts` language version {} (specification schema version {}).\n",
+        spec.language_version, spec.schema_version
+    )
+    .unwrap();
+
+    writeln!(output, "## Authoring for realism\n").unwrap();
+    writeln!(output, "{REALISM_LEAD}\n").unwrap();
+    for point in REALISM_POINTS {
+        writeln!(output, "- {point}").unwrap();
+    }
+    writeln!(output).unwrap();
+
+    writeln!(output, "## Surface grammar\n").unwrap();
+    writeln!(output, "Notation: {}\n", spec.surface.notation).unwrap();
+    writeln!(output, "{}", fenced_code("ebnf", spec.surface.grammar.trim())).unwrap();
+
+    if !spec.surface.notes.is_empty() {
+        writeln!(output, "### Syntax notes\n").unwrap();
+        for note in spec.surface.notes {
+            writeln!(output, "- {note}").unwrap();
+        }
+        writeln!(output).unwrap();
+    }
+
+    writeln!(output, "## Expression forms\n").unwrap();
+    for expression in spec.expressions {
+        writeln!(output, "### {}\n", inline_code(expression.id.as_str())).unwrap();
+        writeln!(output, "{}\n", expression.summary).unwrap();
+        writeln!(output, "Syntax: {}\n", inline_code(expression.syntax)).unwrap();
+        if !expression.examples.is_empty() {
+            writeln!(output, "Examples:").unwrap();
+            for example in expression.examples {
+                writeln!(output, "- {}", inline_code(example)).unwrap();
+            }
+            writeln!(output).unwrap();
+        }
+        render_rules(&mut output, expression.rules);
+    }
+
+    if !spec.functions.is_empty() {
+        writeln!(output, "## Functions\n").unwrap();
+        for function in spec.functions {
+            writeln!(output, "### {}\n", inline_code(function.name)).unwrap();
+            writeln!(output, "{}\n", function.summary).unwrap();
+            writeln!(output, "Syntax: {}\n", inline_code(function.syntax)).unwrap();
+            if !function.examples.is_empty() {
+                writeln!(output, "Examples:").unwrap();
+                for example in function.examples {
+                    writeln!(output, "- {}", inline_code(example)).unwrap();
+                }
+                writeln!(output).unwrap();
+            }
+            render_rules(&mut output, function.rules);
+        }
+    }
+
+    writeln!(output, "## Blocks\n").unwrap();
+    for block in spec.blocks {
+        writeln!(output, "### {}\n", inline_code(block.keyword)).unwrap();
+        writeln!(output, "{}\n", block.summary).unwrap();
+        writeln!(output, "- Syntax: {}", inline_code(block.syntax)).unwrap();
+        writeln!(output, "- Name: {}", name_requirement(block.name)).unwrap();
+        writeln!(output, "- Allowed in: {}", placements(spec, block.allowed_in)).unwrap();
+        writeln!(
+            output,
+            "- Unlisted fields: {}\n",
+            if block.body.open { "allowed" } else { "rejected" }
+        )
+        .unwrap();
+
+        if !block.body.fields.is_empty() {
+            writeln!(output, "| Field | Value | Cardinality | Description |").unwrap();
+            writeln!(output, "| --- | --- | --- | --- |").unwrap();
+            for field in block.body.fields {
+                writeln!(
+                    output,
+                    "| {} | {} | {} | {} |",
+                    inline_code(field.keyword),
+                    markdown_cell(&inline_code(&field.value.to_string())),
+                    cardinality(field.cardinality),
+                    markdown_cell(field.summary),
+                )
+                .unwrap();
+            }
+            writeln!(output).unwrap();
+        }
+
+        if !block.conventions.is_empty() {
+            writeln!(output, "Conventions:").unwrap();
+            for convention in block.conventions {
+                writeln!(output, "- {convention}").unwrap();
+            }
+            writeln!(output).unwrap();
+        }
+
+        render_rules(&mut output, block.rules);
+    }
+
+    writeln!(output, "## Global rules\n").unwrap();
+    if spec.rules.is_empty() {
+        writeln!(output, "No additional global validation rules are defined.\n").unwrap();
+    } else {
+        render_rules(&mut output, spec.rules);
+    }
+
+    if !spec.examples.is_empty() {
+        writeln!(output, "## Complete examples\n").unwrap();
+        writeln!(output, "{EXAMPLES_PREAMBLE}\n").unwrap();
+        for example in spec.examples {
+            let validity = if example.valid { "Valid" } else { "Invalid" };
+            writeln!(output, "### {}: {}\n", validity, example.summary).unwrap();
+            if !example.note.is_empty() {
+                writeln!(output, "{}\n", example.note).unwrap();
+            }
+            writeln!(output, "{}", fenced_code("bts", example.source.trim())).unwrap();
+        }
+    }
+
+    output
+}
+
+fn render_rules(output: &mut String, rules: &[RuleDesc]) {
+    if rules.is_empty() {
+        return;
+    }
+
+    writeln!(output, "Rules:").unwrap();
+    for rule in rules {
+        writeln!(output, "- {}: {}", inline_code(rule.id.as_str()), rule.summary).unwrap();
+    }
+    writeln!(output).unwrap();
+}
+
+fn name_requirement(name: NamePolicy) -> &'static str {
+    match name {
+        NamePolicy::Forbidden => "forbidden",
+        NamePolicy::Optional => "optional",
+        NamePolicy::Required => "required",
+    }
+}
+
+fn cardinality(cardinality: Cardinality) -> &'static str {
+    match cardinality {
+        Cardinality::Optional => "optional",
+        Cardinality::Required => "required",
+        Cardinality::Repeated => "repeated",
+    }
+}
+
+fn placements(spec: &DslSpec, allowed_in: &[Place]) -> String {
+    allowed_in
+        .iter()
+        .map(|place| match *place {
+            Place::Root => "document root".to_owned(),
+            Place::Block { id } => spec
+                .block_by_id(id)
+                .map(|block| inline_code(block.keyword))
+                .unwrap_or_else(|| inline_code(id.as_str())),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+fn inline_code(value: &str) -> String {
+    let longest_run = value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat(longest_run + 1);
+
+    format!("{fence}{value}{fence}")
+}
+
+fn fenced_code(language: &str, value: &str) -> String {
+    let longest_run = value
+        .lines()
+        .flat_map(|line| line.split(|character| character != '`'))
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat((longest_run + 1).max(3));
+
+    format!("{fence}{language}\n{value}\n{fence}\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bts_lang::spec::SPEC as DSL_SPEC;
+    #[test]
+    fn renders_the_language_spec_without_interface_dependencies() {
+        let skill = render(&DSL_SPEC);
+
+        assert!(skill.starts_with("---\nname: bts\ndescription:"));
+        assert!(skill.contains(DSL_SPEC.summary));
+        assert!(skill.contains(DSL_SPEC.surface.grammar.trim()));
+        for expression in DSL_SPEC.expressions {
+            assert!(skill.contains(expression.id.as_str()));
+            assert!(skill.contains(expression.syntax));
+            assert!(skill.contains(expression.summary));
+        }
+        for function in DSL_SPEC.functions {
+            assert!(skill.contains(function.name));
+            assert!(skill.contains(function.syntax));
+            assert!(skill.contains(function.summary));
+        }
+        for block in DSL_SPEC.blocks {
+            assert!(skill.contains(block.keyword));
+            assert!(skill.contains(block.syntax));
+            assert!(skill.contains(block.summary));
+            for field in block.body.fields {
+                assert!(skill.contains(field.keyword));
+                assert!(skill.contains(field.summary));
+            }
+            for convention in block.conventions {
+                assert!(skill.contains(convention));
+            }
+        }
+        assert!(skill.contains("## Authoring for realism"));
+        assert!(skill.contains(REALISM_LEAD));
+        for point in REALISM_POINTS {
+            assert!(skill.contains(point));
+        }
+        assert!(skill.contains(EXAMPLES_PREAMBLE));
+        for example in DSL_SPEC.examples {
+            assert!(skill.contains(example.summary));
+            assert!(skill.contains(example.note));
+            assert!(skill.contains(example.source.trim()));
+        }
+        for rule in DSL_SPEC.rules {
+            assert!(skill.contains(rule.id.as_str()));
+            assert!(skill.contains(rule.summary));
+        }
+        assert!(!skill.contains("## CLI commands"));
+        assert!(!skill.contains("bts check syntax"));
+        assert!(!skill.contains("--offset"));
+    }
+}

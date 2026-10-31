@@ -1,0 +1,47 @@
+# a session with variable turns, a selected route, and an optional handoff
+vars { product = "billing" }
+
+trace "support-session" {
+    vars { turns = range(2, 4) }
+    input = { request = "Where is my order?", customer = "acct-42" }
+    output = repeat.turns[var.turns - 1].task.turn.output
+    metadata = { product = var.product, escalated = maybe.escalation.included }
+    tags = ["support", "orders"]
+
+    repeat "turns" {
+        count = var.turns
+
+        task "turn" {
+            input = { index = repeat.index, request = trace.input.request }
+            output = format("answer {}", repeat.index)
+
+            llm "draft" {
+                input = task.turn.input
+                output = { role = "assistant", content = task.turn.output }
+                metadata = { model = "gpt-4o-mini", provider = "openai" }
+                metrics = { prompt_tokens = 12, completion_tokens = 4,
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens }
+            }
+        }
+    }
+
+    choice "route" {
+        tool "lookup" {
+            input = trace.input
+            output = { status = "found" }
+        }
+
+        function "fallback" {
+            input = trace.input
+            output = { status = "deferred" }
+        }
+    }
+
+    maybe "escalation" {
+        chance = 0.5
+        task "handoff" {
+            input = trace.input
+            output = "queued"
+        }
+    }
+}
