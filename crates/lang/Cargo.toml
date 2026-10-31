@@ -1,0 +1,11 @@
+[package]
+name = "bts-lang"
+repository = "https://github.com/zdhrc/bts"
+version = "0.1.6"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+tracing = "0.1"

@@ -5,6 +5,7 @@ members = ["cargo:."]
 [dist]
 ci = "github"
 cargo-dist-version = "0.32.0"
+packages = ["bts"]
 
 installers = ["shell"]
 install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
