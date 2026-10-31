@@ -220,6 +220,79 @@ bts update                                                  # update to the late
 
 Use `--rate 20/h` instead of `--count` for a traffic rate, and `--offset 1d` to move a trace window into the past. `--seed` reproduces sampled values; it doesn't control deployed scorer randomness. Live writes print a summary; `--json` makes it machine-readable. Run logs live under `.bt/bts/logs/`.
 
+## Browser (wasm)
+
+The browser package validates shapes, generates Braintrust trace payloads, builds scorer files, and writes traces through a host-supplied transport. For releases that include browser support, download `bts-wasm-web.tar.gz` from the [release assets](https://github.com/zdhrc/bts/releases). To build an unreleased checkout locally with `wasm-pack` 0.15.0 installed:
+
+```sh
+rustup target add wasm32-unknown-unknown
+wasm-pack build crates/wasm --target web --out-dir ../../target/wasm-pkg -- --locked
+```
+
+The package includes JavaScript, wasm, and TypeScript declarations. Keep the JavaScript and `.wasm` files together and serve them over HTTP. This TypeScript example places the package in `bts-wasm/` beside the application module and initializes it once before calling its exports:
+
+```ts
+import init, { generate, validate, type GenerateOptions } from "./bts-wasm/bts_wasm.js";
+
+await init();
+
+const source = 'trace "support" { output = choice("resolved", "escalated") }';
+const validation = validate(source);
+if (!validation.valid) throw new Error(JSON.stringify(validation.diagnostics));
+
+const generationOptions: GenerateOptions = {
+    count: 5,
+    over_ms: 60_000,
+    until_ms: 1_735_689_600_000,
+    seed: "42",
+    id_prefix: "support-batch-1",
+};
+const preview = generate(source, generationOptions);
+if (!preview.ok) throw new Error(`${preview.error.stage}: ${preview.error.message}`);
+console.log(preview.value.payload.events);
+```
+
+Supply the seed as a decimal `u64` string, either `count` or `rate_per_second`, and either `over_ms` or `start_ms`. Time options are integer milliseconds: `start_ms` and `until_ms` are epoch timestamps, while `over_ms` and optional `offset_ms` are durations. `until_ms` defaults to the current time. Repeating a payload requires an explicit time window and `id_prefix` as well as the seed. Use a fresh prefix for each independent write, and reuse it only when intentionally retrying the same batch.
+
+Diagnostic ranges are UTF-8 byte offsets into the source, not JavaScript string indexes. Generation and build failures return `{ ok: false, error }` with a stage, message, and diagnostics. Generated JavaScript numeric values must fit the safe integer range. `spec()` returns the language reference, and `skill()` returns authoring guidance for an agent hosted by your application. For shapes containing scorers, `build(source, { project: "My Project", lang: "typescript", files: {} })` returns planned files for the host to save, using optional existing file contents keyed by relative path.
+
+For delivery, the host owns authentication and supplies an asynchronous transport. This example assumes your application implements `/api/braintrust/*`: the backend authenticates the caller, authorizes the project, adds server-side Braintrust credentials, and forwards the response status, headers, and body. API keys stay out of static browser assets.
+
+```ts
+import { write, type HttpTransport } from "./bts-wasm/bts_wasm.js";
+
+const transport: HttpTransport = async request => {
+    try {
+        const response = await fetch(`/api/braintrust${request.path}`, {
+            method: request.method,
+            headers: request.headers,
+            body: new Uint8Array(request.body),
+            signal: request.signal,
+        });
+        return {
+            status: response.status,
+            headers: Object.fromEntries(response.headers.entries()),
+            body: new Uint8Array(await response.arrayBuffer()),
+        };
+    } catch (error) {
+        throw {
+            message: "Braintrust transport failed",
+            retryable: error instanceof TypeError
+                || (error instanceof DOMException && error.name === "AbortError"),
+        };
+    }
+};
+
+const result = await write(source, generationOptions, { project_id: "YOUR_PROJECT_UUID" }, transport);
+if (!result.ok) {
+    console.error(result.error.stage, result.error.message, result.error.details);
+} else {
+    console.log(result.value.row_ids);
+}
+```
+
+Send the supplied `Uint8Array` body once, honor the abort signal, and consume the response body before resolving. Core handles chunking and retries, including `Retry-After`. A transport rejection can set `retryable: true` for a connection failure or timeout. Write failures report acknowledged row IDs in `error.details`, and interrupted requests may have written additional rows. Browser writes currently reject attachments before sending requests. Generation still returns attachment descriptors for the host to resolve. Dataset, automation, and experiment synchronization are not exposed by the browser package.
+
 ## Configuration
 
 `.bt/config.json` is the shared `bt` project context. Its `project` and `project_id`

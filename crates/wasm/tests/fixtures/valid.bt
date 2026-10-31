@@ -1,0 +1,1 @@
+trace "hello" { input = "world" output = "hello" }

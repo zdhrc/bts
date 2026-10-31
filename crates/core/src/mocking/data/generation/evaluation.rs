@@ -7,9 +7,9 @@ use crate::dsl::{
     Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
 };
 use crate::selection::filter::WriteFilter;
-use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use serde_json::{Number as JsonNumber, Value as InputValue};
 use std::collections::BTreeMap as JsonMap;
 use std::fmt;
@@ -210,7 +210,7 @@ struct Ctx<'m> {
     // the address every instance path derives from: seed and trace index
     base: u64,
     // the rng of the slot evaluating right now, swapped as slots force
-    rng: SmallRng,
+    rng: Xoshiro256PlusPlus,
     // the instance whose expression is evaluating right now
     site: usize,
     // the last reference crossed, for shape errors that surface downstream
@@ -229,7 +229,7 @@ impl<'m> Ctx<'m> {
             row: None,
             trace_index,
             base,
-            rng: SmallRng::seed_from_u64(base),
+            rng: Xoshiro256PlusPlus::seed_from_u64(base),
             site: 0,
             last_ref: None,
             instances: Vec::new(),
@@ -237,12 +237,13 @@ impl<'m> Ctx<'m> {
         }
     }
 
-    fn slot_rng(&self, path: u64, salt: u64) -> SmallRng {
-        SmallRng::seed_from_u64(mix(path, salt))
+    fn slot_rng(&self, path: u64, salt: u64) -> Xoshiro256PlusPlus {
+        // name the algorithm so native and wasm use the same random stream
+        Xoshiro256PlusPlus::seed_from_u64(mix(path, salt))
     }
 
     // evaluates with the site and rng of a slot, restoring the previous ones
-    fn scoped<T>(&mut self, site: usize, rng: SmallRng, eval: impl FnOnce(&mut Self) -> T) -> T {
+    fn scoped<T>(&mut self, site: usize, rng: Xoshiro256PlusPlus, eval: impl FnOnce(&mut Self) -> T) -> T {
         let outer_site = std::mem::replace(&mut self.site, site);
         let outer_rng = std::mem::replace(&mut self.rng, rng);
         let value = eval(self);
@@ -1405,7 +1406,9 @@ fn eval_slice(
 
 fn eval_slice_bound(bound: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<usize, Error> {
     match eval_operand(bound, ctx)? {
-        Scalar::Int(value) => usize::try_from(value).map_err(|_| Error::new(ErrorKind::NegativeSliceBound, range)),
+        // oversized positive bounds still clamp to the array length
+        Scalar::Int(value) if value >= 0 => Ok(usize::try_from(value).unwrap_or(usize::MAX)),
+        Scalar::Int(_) => Err(Error::new(ErrorKind::NegativeSliceBound, range)),
         Scalar::Float(_) => Err(Error::new(ErrorKind::NonIntegerSliceBound, range)),
         _ => Err(Error::new(ErrorKind::RefShapeMismatch, range)),
     }
@@ -3284,7 +3287,11 @@ mod tests {
             trace "t" {
                 input = [1, 2, 3, 4][range(1, 1):range(3, 3)]
                 output = [1, 2][0:range(5, 5)]
-                metadata = { empty = [1, 2][range(1, 1):0] }
+                metadata = {
+                    empty = [1, 2][range(1, 1):0]
+                    large_end = [1, 2][:range(4294967296, 4294967296)]
+                    large_start = [1, 2][range(9223372036854775807, 9223372036854775807):]
+                }
             }
         "#;
         let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
@@ -3293,6 +3300,8 @@ mod tests {
             assert_eq!(event.fields.input, Some(value!([2, 3])));
             assert_eq!(event.fields.output, Some(value!([1, 2])));
             assert_eq!(event.fields.metadata.as_ref().unwrap()["empty"], value!([]));
+            assert_eq!(event.fields.metadata.as_ref().unwrap()["large_end"], value!([1, 2]));
+            assert_eq!(event.fields.metadata.as_ref().unwrap()["large_start"], value!([]));
         }
 
         // same seed, same selections

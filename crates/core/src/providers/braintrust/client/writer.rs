@@ -1,5 +1,7 @@
 use super::attachments::Error as AttachmentError;
 use super::{Client, Response};
+pub use crate::providers::braintrust::mocking::data::traces::InsertResponse;
+use crate::providers::braintrust::mocking::data::traces::{self, MAX_PAYLOAD_BYTES, PackError, Payload};
 use crate::{
     mocking::data::Attachment, providers::braintrust::config::Config as Braintrust,
     providers::braintrust::mocking::data::Batch as EventBatch,
@@ -13,22 +15,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fmt, thread, time::Duration};
 
-// braintrust's lambda-backed api caps request bodies; advertised as logs3_payload_max_bytes (5MiB) on
-// GET /version, but the gateway measures requests after lambda event wrapping inflates them, so bodies
-// near the advertised cap still 413. the official sdk batches at half the advertised limit; match that.
-const MAX_PAYLOAD_BYTES: usize = 5 * 1024 * 1024 / 2;
-const PAYLOAD_OPEN: &[u8] = b"{\"events\":[";
-const PAYLOAD_CLOSE: &[u8] = b"]}";
-
 // status reconciliation checks whether an uncertain upload reached storage
 const MAX_ATTACHMENT_RECONCILE_ATTEMPTS: u32 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 const MAX_ATTACHMENT_ERROR_CHARS: usize = 512;
-
-#[derive(Debug, Deserialize)]
-pub struct InsertResponse {
-    row_ids: Box<[String]>,
-}
 
 #[derive(Deserialize)]
 struct ProjectResponse {
@@ -62,12 +52,6 @@ enum ReconcileError {
         detail: String,
         source: Option<AttachmentError>,
     },
-}
-
-impl InsertResponse {
-    pub fn row_count(&self) -> usize {
-        self.row_ids.len()
-    }
 }
 
 struct Writer<'config> {
@@ -474,7 +458,7 @@ impl<'config> Writer<'config> {
             match sent {
                 Ok(inserted) => row_ids.extend(inserted.row_ids.into_vec()),
                 // the server's effective limit can sit below our cap; split and retry until it takes
-                Err(error) if error.is_payload_too_large() && payload.event_count() > 1 => {
+                Err(error) if error.should_split(payload.event_count()) => {
                     tracing::warn!(
                         events = payload.event_count(),
                         bytes = payload.body_len,
@@ -528,12 +512,8 @@ impl<'config> Writer<'config> {
             .map_err(|error| Error::new(ErrorKind::DecodeResponse(error)))?;
 
         // partial ack means braintrust dropped events, report failure not a fake success
-        if inserted.row_count() != payload.event_count() {
-            return Err(Error::new(ErrorKind::UnexpectedRowCount {
-                expected: payload.event_count(),
-                actual: inserted.row_count(),
-            }));
-        }
+        traces::check_acknowledgment(&inserted, payload.event_count())
+            .map_err(|(expected, actual)| Error::new(ErrorKind::UnexpectedRowCount { expected, actual }))?;
 
         Ok(inserted)
     }
@@ -590,87 +570,16 @@ fn attachment_http_error(response: Response) -> AttachmentError {
     }
 }
 
-#[derive(Debug)]
-struct Payload {
-    events: Vec<Vec<u8>>,
-    body_len: usize,
+fn pack_error(error: PackError) -> Error {
+    Error::new(match error {
+        PackError::Encode(source) => ErrorKind::EncodeEvent(source),
+        PackError::EventTooLarge { size, limit } => ErrorKind::EventTooLarge { size, limit },
+    })
 }
 
-impl Payload {
-    fn new(events: Vec<Vec<u8>>) -> Self {
-        let body_len = PAYLOAD_OPEN.len()
-            + PAYLOAD_CLOSE.len()
-            + events.iter().map(Vec::len).sum::<usize>()
-            + events.len().saturating_sub(1);
-
-        Self { events, body_len }
-    }
-
-    fn event_count(&self) -> usize {
-        self.events.len()
-    }
-
-    fn fits(&self, encoded_length: usize, limit: usize) -> bool {
-        let separator = usize::from(!self.events.is_empty());
-        self.body_len + separator + encoded_length <= limit
-    }
-
-    fn push(&mut self, encoded: Vec<u8>) {
-        self.body_len += usize::from(!self.events.is_empty()) + encoded.len();
-        self.events.push(encoded);
-    }
-
-    fn split(mut self) -> (Self, Self) {
-        let right = self.events.split_off(self.events.len() / 2);
-        (Self::new(self.events), Self::new(right))
-    }
-
-    fn body(&self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(self.body_len);
-        body.extend_from_slice(PAYLOAD_OPEN);
-
-        for (index, event) in self.events.iter().enumerate() {
-            if index > 0 {
-                body.push(b',');
-            }
-            body.extend_from_slice(event);
-        }
-
-        body.extend_from_slice(PAYLOAD_CLOSE);
-        body
-    }
-}
-
-// greedily packs serialized events into payloads that stay under the byte limit
 fn payloads(events: &EventBatch, limit: usize) -> Result<Vec<Payload>, Error> {
     let _span = tracing::info_span!("pack").entered();
-    let mut payloads = Vec::new();
-    let mut current = Payload::new(Vec::new());
-
-    for event in &events.events {
-        let encoded = serde_json::to_vec(event).map_err(|error| Error::new(ErrorKind::EncodeEvent(error)))?;
-
-        // a single event that cannot fit in an empty payload can never be sent
-        if PAYLOAD_OPEN.len() + encoded.len() + PAYLOAD_CLOSE.len() > limit {
-            return Err(Error::new(ErrorKind::EventTooLarge {
-                size: encoded.len(),
-                limit,
-            }));
-        }
-
-        if !current.fits(encoded.len(), limit) {
-            payloads.push(current);
-            current = Payload::new(Vec::new());
-        }
-
-        current.push(encoded);
-    }
-
-    if current.event_count() > 0 {
-        payloads.push(current);
-    }
-
-    Ok(payloads)
+    traces::pack(&events.events, limit).map_err(pack_error)
 }
 
 #[cfg(test)]
@@ -736,25 +645,7 @@ pub fn insert_events(client: &Client, url: &str, events: &[serde_json::Value]) -
         config: client.config(),
         backoff_base: BACKOFF_BASE,
     };
-    let mut payloads = Vec::new();
-    let mut payload = Payload::new(Vec::new());
-    for event in events {
-        let encoded = serde_json::to_vec(event).map_err(|error| Error::new(ErrorKind::EncodeEvent(error)))?;
-        if PAYLOAD_OPEN.len() + encoded.len() + PAYLOAD_CLOSE.len() > MAX_PAYLOAD_BYTES {
-            return Err(Error::new(ErrorKind::EventTooLarge {
-                size: encoded.len(),
-                limit: MAX_PAYLOAD_BYTES,
-            }));
-        }
-        if !payload.fits(encoded.len(), MAX_PAYLOAD_BYTES) {
-            payloads.push(payload);
-            payload = Payload::new(Vec::new());
-        }
-        payload.push(encoded);
-    }
-    if payload.event_count() > 0 {
-        payloads.push(payload);
-    }
+    let payloads = traces::pack(events, MAX_PAYLOAD_BYTES).map_err(pack_error)?;
     writer.insert_payloads(url, payloads)
 }
 
@@ -852,8 +743,8 @@ impl Error {
         Self { kind }
     }
 
-    fn is_payload_too_large(&self) -> bool {
-        matches!(&self.kind, ErrorKind::Rejected { status, .. } if *status == StatusCode::PAYLOAD_TOO_LARGE)
+    fn should_split(&self, event_count: usize) -> bool {
+        matches!(&self.kind, ErrorKind::Rejected { status, .. } if traces::should_split(status.as_u16(), event_count))
     }
 
     // worth retrying: the request never got a verdict, the server was overloaded, or it failed
@@ -1134,7 +1025,7 @@ mod tests {
 
         let error = write(&config, &events).unwrap_err();
 
-        assert!(error.is_payload_too_large());
+        assert!(matches!(error.kind(), ErrorKind::Rejected { status, .. } if *status == StatusCode::PAYLOAD_TOO_LARGE));
     }
 
     #[test]
