@@ -3037,9 +3037,10 @@ impl Modeler {
             return None;
         };
 
-        match usize::try_from(value) {
-            Ok(value) => Some(Some(value)),
-            Err(_) => {
+        match value {
+            // oversized positive bounds still clamp to the array length
+            value if value >= 0 => Some(Some(usize::try_from(value).unwrap_or(usize::MAX))),
+            _ => {
                 self.errors.push(Error::new(
                     ErrorKind::NegativeSliceBound {
                         rule: spec::ids::SLICE_BOUNDS,
@@ -4862,15 +4863,19 @@ impl Modeler {
             }
         };
 
-        match number {
-            Number::Int(value) if value >= 0 => Some(value as usize),
-            _ => {
+        let length = match number {
+            Number::Int(value) => usize::try_from(value).ok(),
+            Number::Float(_) => None,
+        };
+        match length {
+            Some(length) => Some(length),
+            None => {
                 self.errors.push(Error::new(
                     ErrorKind::ParamOutOfRange {
                         rule: spec::ids::RANDOM_LENGTH,
                         func,
                         param: "length",
-                        expected: "a non-negative integer",
+                        expected: "a non-negative integer that fits this platform's length limit",
                     },
                     range,
                 ));
@@ -9125,6 +9130,8 @@ mod tests {
                     all = var.xs[:]
                     clamped = var.xs[1:99]
                     empty = var.xs[3:1]
+                    large_end = var.xs[:4294967296]
+                    large_start = var.xs[9223372036854775807:]
                 }
             }
             "#,
@@ -9139,6 +9146,8 @@ mod tests {
         assert_eq!(ints(&metadata.elem[1].value), [1, 2, 3, 4]);
         assert_eq!(ints(&metadata.elem[2].value), [2, 3, 4]);
         assert!(ints(&metadata.elem[3].value).is_empty());
+        assert_eq!(ints(&metadata.elem[4].value), [1, 2, 3, 4]);
+        assert!(ints(&metadata.elem[5].value).is_empty());
     }
 
     #[test]

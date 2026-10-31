@@ -76,6 +76,10 @@ pub fn generate(
 
 /// Generates events from selected blocks while preserving their reference scopes.
 ///
+/// Native and WebAssembly builds use the same seeded random generator. Floating-point
+/// calculations can still differ slightly between platforms. Event IDs remain fresh
+/// unless the caller applies [`EventBatch::assign_stable_ids`].
+///
 /// Excluding a block also excludes its descendants. Returns an error when the
 /// model has no traces, the filter excludes every trace, evaluation fails, or
 /// the generated events cannot fit the requested window. The same model

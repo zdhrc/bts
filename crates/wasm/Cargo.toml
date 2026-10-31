@@ -1,0 +1,25 @@
+[package]
+name = "bts-wasm"
+repository = "https://github.com/zdhrc/bts"
+version = "0.1.6"
+edition = "2024"
+description = "Browser interfaces for bts authoring and mock generation"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bts-core = { path = "../core", default-features = false }
+bts-lang = { path = "../lang" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1.24.0", features = ["v4", "js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

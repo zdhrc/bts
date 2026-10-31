@@ -5,6 +5,7 @@ pub mod attachments;
 pub mod writer;
 
 use super::config::Config;
+use super::mocking::data::traces;
 use reqwest::{
     Method, StatusCode,
     blocking::{Client as HttpClient, RequestBuilder as HttpRequest, Response as HttpResponse},
@@ -197,19 +198,15 @@ impl Request {
             let result = request.send();
             let (retry, server_delay, throttled) = match &result {
                 Ok(response) => (
-                    response.status() == StatusCode::TOO_MANY_REQUESTS
-                        || (self.safe
-                            && (response.status().is_server_error() || response.status() == StatusCode::REQUEST_TIMEOUT)),
+                    traces::retry_response(response.status().as_u16(), self.safe),
                     retry_after(response),
                     response.status() == StatusCode::TOO_MANY_REQUESTS,
                 ),
                 Err(error) => (self.safe && (error.is_timeout() || error.is_connect()), None, false),
             };
-            let base = self
-                .backoff
-                .saturating_mul(1 << (attempt - 1).min(10))
-                .min(Duration::from_secs(30));
-            let delay = server_delay.unwrap_or_else(|| base + Duration::from_millis(rand::random_range(0..=100)));
+            let delay = server_delay.unwrap_or_else(|| {
+                traces::retry_backoff(self.backoff, attempt, Duration::from_millis(rand::random_range(0..=100)))
+            });
             if throttled {
                 self.client.throttle(delay);
             }
@@ -233,12 +230,7 @@ impl Request {
 }
 fn retry_after(response: &HttpResponse) -> Option<Duration> {
     let value = response.headers().get(RETRY_AFTER)?.to_str().ok()?;
-    if let Ok(seconds) = value.parse::<f64>() {
-        return (seconds.is_finite() && seconds >= 0.0).then(|| Duration::from_secs_f64(seconds.min(86400.0)));
-    }
-    chrono::DateTime::parse_from_rfc2822(value)
-        .ok()
-        .map(|date| SystemTime::from(date).duration_since(SystemTime::now()).unwrap_or_default())
+    traces::retry_after(value, SystemTime::now())
 }
 
 #[derive(Debug)]
