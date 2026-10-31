@@ -5,9 +5,24 @@ members = ["cargo:."]
 [dist]
 ci = "github"
 cargo-dist-version = "0.32.0"
+pr-run-mode = "upload"
 packages = ["bts"]
 
 installers = ["shell"]
 install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
 
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+
+[[dist.extra-artifacts]]
+artifacts = ["target/bts-wasm-web.tar.gz"]
+build = ["sh", "-ec", '''
+rm -f target/bts-wasm-web.tar.gz target/bts-wasm-web.tar.gz.tmp
+rustup target add wasm32-unknown-unknown
+if [ "$(wasm-pack --version 2>/dev/null || true)" != "wasm-pack 0.15.0" ]; then
+    cargo install wasm-pack --version 0.15.0 --locked
+fi
+wasm-pack build crates/wasm --target web --out-dir ../../target/wasm-pkg -- --locked
+cp LICENSE target/wasm-pkg/
+COPYFILE_DISABLE=1 tar --exclude=.gitignore -czf target/bts-wasm-web.tar.gz.tmp -C target/wasm-pkg .
+mv target/bts-wasm-web.tar.gz.tmp target/bts-wasm-web.tar.gz
+''']
