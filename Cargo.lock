@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "bts"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "axoupdater",
  "bts-core",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "bts-core"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "bts-lang",
  "chrono",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "bts-lang"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "serde",
  "tracing",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "bts-wasm"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "bts-core",
  "bts-lang",
