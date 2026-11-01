@@ -128,6 +128,218 @@ fn build_matches_shared_core_planning_for_both_languages() {
             })
             .collect();
         assert_eq!(result["value"]["files"], serde_json::json!(files));
+        assert_eq!(result["value"]["removals"], serde_json::json!([]));
+    }
+}
+
+#[wasm_bindgen_test]
+fn builds_callable_agents_without_a_project_in_both_languages() {
+    use bts_core::mocking::code::{self, AgentTarget};
+    let source = r#"
+agent "hello" { entrypoint = trace.hello }
+trace "hello" {
+    input = { name = "Ada" }
+    output = tool.greet.output
+    tool "greet" { output = "Hello ${trace.input.name}" }
+}
+"#;
+    for (lang, extension, language) in [
+        ("python", "py", bts_lang::ScorerLang::Python),
+        ("typescript", "mts", bts_lang::ScorerLang::Typescript),
+    ] {
+        let result = build_result(source, &serde_json::json!({ "target": "agent", "lang": lang }));
+        assert_eq!(result["ok"], true, "{result}");
+        let files = result["value"]["files"].as_array().unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|file| file["path"] == format!("src/agents/hello_agent.{extension}"))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file["path"] == format!("src/agents/hello_agent_runtime.{extension}"))
+        );
+        let model = bts_lang::semantics::compile(source).unwrap();
+        let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new("");
+        let assembly = code::assemble_agents(&model, language, &target).unwrap();
+        let assembly = target.agent_assembly(&model, language, assembly).unwrap();
+        let existing = BuildTestFiles(Default::default());
+        let context = code::CodebaseContext {
+            root: std::path::Path::new("bts-scorers"),
+            files: &existing,
+        };
+        let plan = target.agent_codebase(&assembly.files, language, &context).unwrap();
+        let expected: Vec<_> = plan
+            .files
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "path": file.path.to_str().unwrap(), "contents": file.contents, "slugs": file.slugs,
+                })
+            })
+            .collect();
+        assert_eq!(files, &expected);
+    }
+}
+
+const AGENT_EVALS: &str = r#"
+agent "helper" { entrypoint = trace.helper }
+agent "first" { entrypoint = trace.first }
+agent "second" { entrypoint = trace.second }
+trace "helper" { output = "helper" }
+trace "first" { input = 1 output = self.input }
+trace "second" { input = 2 output = self.input }
+scorer "quality" { code { score = output == expected ? 1 : 0 } }
+dataset "cases" {
+    case "sampled" { input = range(1, 1000000) expected = 1 }
+}
+experiment "first" { dataset = dataset.cases task = trace.first scorers = [scorer.quality] }
+experiment "second" { dataset = dataset.cases task = trace.second scorers = [scorer.quality] }
+"#;
+
+#[wasm_bindgen_test]
+fn agent_selections_limit_evals_and_seed_the_dataset_snapshot() {
+    let helper = build_result(
+        AGENT_EVALS,
+        &serde_json::json!({ "target": "agent", "select": ["agent.helper"] }),
+    );
+    assert_eq!(helper["ok"], true, "{helper}");
+    let files = helper["value"]["files"].as_array().unwrap();
+    assert!(files.iter().any(|file| file["path"] == "src/agents/helper_agent.py"));
+    assert!(
+        !files
+            .iter()
+            .any(|file| file["path"].as_str().unwrap().starts_with("src/evals/"))
+    );
+    assert!(
+        !files
+            .iter()
+            .any(|file| file["path"].as_str().unwrap().starts_with("src/scorers/"))
+    );
+    let helper_files = files
+        .iter()
+        .map(|file| (file["path"].as_str().unwrap().to_owned(), file["contents"].clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let helper_runtime = files
+        .iter()
+        .find(|file| file["path"].as_str().unwrap().ends_with("_runtime.py"))
+        .unwrap()["path"]
+        .clone();
+    for (lang, extension, eval_path, definition_path) in [
+        ("python", "py", "src/evals/first_eval.py", "src/evals/first_definition.py"),
+        (
+            "typescript",
+            "mts",
+            "src/evals/first.eval.ts",
+            "src/evals/first.definition.ts",
+        ),
+    ] {
+        let options = serde_json::json!({ "target": "agent", "project": "Browser Project", "lang": lang, "select": ["experiment.first"], "files": helper_files });
+        let default = build_result(AGENT_EVALS, &options);
+        assert_eq!(default["ok"], true, "{default}");
+        let mut seeded = options.clone();
+        seeded["seed"] = "42".into();
+        assert_eq!(default, build_result(AGENT_EVALS, &seeded));
+        let files = default["value"]["files"].as_array().unwrap();
+        assert!(!files.iter().any(|file| file["path"] == helper_runtime));
+        assert!(
+            files
+                .iter()
+                .any(|file| file["path"] == format!("src/agents/first_agent.{extension}"))
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|file| file["path"] == format!("src/agents/second_agent.{extension}"))
+        );
+        let entrypoint = files.iter().find(|file| file["path"] == eval_path).unwrap();
+        assert!(entrypoint["contents"].as_str().unwrap().contains("evaluate()"));
+        let evaluation = files.iter().find(|file| file["path"] == definition_path).unwrap();
+        assert!(evaluation["contents"].as_str().unwrap().contains("Eval("));
+        seeded["seed"] = "43".into();
+        let different = build_result(AGENT_EVALS, &seeded);
+        assert_eq!(different["ok"], true, "{different}");
+        let changed = different["value"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == definition_path)
+            .unwrap();
+        assert_ne!(evaluation["contents"], changed["contents"]);
+        seeded["seed"] = u64::MAX.to_string().into();
+        assert_eq!(build_result(AGENT_EVALS, &seeded)["ok"], true);
+    }
+}
+
+#[wasm_bindgen_test]
+fn agent_builds_return_guarded_removals_with_safe_paths() {
+    let previous = "# Generated by bts; edits will be overwritten.\ndef run(): return 'old'\n";
+    let result = build_result(
+        r#"agent "hello" { entrypoint = trace.hello } trace "hello" { output = "hello" }"#,
+        &serde_json::json!({ "target": "agent", "files": { "hello_agent.py": previous, "hello_agent_agent.py": "# user code\n" } }),
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        result["value"]["removals"],
+        serde_json::json!([{ "path": "hello_agent.py", "expected": previous }])
+    );
+    let mut paths = std::collections::BTreeSet::new();
+    for file in result["value"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(result["value"]["removals"].as_array().unwrap())
+    {
+        let path = file["path"].as_str().unwrap();
+        assert!(!path.is_empty() && !path.contains(['\\', ':']));
+        assert!(path.split('/').all(|part| !matches!(part, "" | "." | "..")));
+        assert!(paths.insert(path));
+    }
+}
+
+#[wasm_bindgen_test]
+fn agent_eval_snapshots_enforce_the_output_languages_integer_range() {
+    let source = AGENT_EVALS.replace("range(1, 1000000)", "9007199254740993");
+    for (lang, valid) in [("python", true), ("typescript", false)] {
+        let result = build_result(
+            &source,
+            &serde_json::json!({ "target": "agent", "project": "Browser Project", "lang": lang, "select": ["experiment.first"] }),
+        );
+        assert_eq!(result["ok"], valid, "{result}");
+        if !valid {
+            assert_eq!(result["error"]["stage"], "build");
+            assert!(result["error"]["message"].as_str().unwrap().contains("safe integer"));
+            assert!(result.get("value").is_none());
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn agent_build_errors_do_not_return_partial_files() {
+    for (source, options, stage) in [
+        (r#"trace "unbound" {}"#, serde_json::json!({ "target": "agent" }), "build"),
+        (AGENT_EVALS, serde_json::json!({ "target": "agent" }), "options"),
+        (
+            AGENT_EVALS,
+            serde_json::json!({ "target": "agent", "select": ["agent.missing"] }),
+            "build",
+        ),
+        (
+            AGENT_EVALS,
+            serde_json::json!({ "target": "agent", "select": ["scorer.quality"] }),
+            "build",
+        ),
+        (
+            AGENT_EVALS,
+            serde_json::json!({ "target": "agent", "select": ["agent.first.output"] }),
+            "options",
+        ),
+    ] {
+        let result = build_result(source, &options);
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"]["stage"], stage);
+        assert!(result.get("value").is_none());
     }
 }
 
@@ -172,10 +384,22 @@ fn build_returns_staged_option_errors() {
         serde_json::json!({ "project": "" }),
         serde_json::json!({ "project": "Browser Project", "lang": "rust" }),
         serde_json::json!({ "project": "Browser Project", "files": { "../package.json": "{}" } }),
+        serde_json::json!({ "project": "Browser Project", "files": { "C:\\package.json": "{}" } }),
+        serde_json::json!({ "project": "Browser Project", "files": { "a/../package.json": "{}" } }),
+        serde_json::json!({ "project": "Browser Project", "files": { "bad\u{0000}.json": "{}" } }),
+        serde_json::json!({ "project": "Browser Project", "target": "agents" }),
+        serde_json::json!({ "project": "Browser Project", "select": ["agent.first"] }),
+        serde_json::json!({ "target": "agent", "select": "agent.first" }),
+        serde_json::json!({ "target": "agent", "select": [4] }),
+        serde_json::json!({ "target": "agent", "seed": 42 }),
+        serde_json::json!({ "target": "agent", "seed": "-1" }),
+        serde_json::json!({ "target": "agent", "seed": "+1" }),
+        serde_json::json!({ "target": "agent", "seed": "18446744073709551616" }),
+        serde_json::json!({ "target": "agent", "seeds": "42" }),
     ] {
         let result = build_result(source, &options);
         assert_eq!(result["ok"], false, "{options}");
-        assert_eq!(result["error"]["stage"], "options");
+        assert_eq!(result["error"]["stage"], "options", "{options}: {result}");
         assert!(!result["error"]["message"].as_str().unwrap().is_empty());
         assert!(result.get("value").is_none());
     }

@@ -284,7 +284,7 @@ Use `--rate 20/h` instead of `--count` for a traffic rate, and `--offset 1d` to 
 
 ## Browser (wasm)
 
-The browser package validates shapes, generates Braintrust trace payloads, builds scorer files, and writes traces through a host-supplied transport. For releases that include browser support, download `bts-wasm-web.tar.gz` from the [release assets](https://github.com/zdhrc/bts/releases). To build an unreleased checkout locally with `wasm-pack` 0.15.0 installed:
+The browser package validates shapes, generates Braintrust trace payloads, builds scorer and agent codebases, and writes traces through a host-supplied transport. For releases that include browser support, download `bts-wasm-web.tar.gz` from the [release assets](https://github.com/zdhrc/bts/releases). To build an unreleased checkout locally with `wasm-pack` 0.15.0 installed:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -316,7 +316,20 @@ console.log(preview.value.payload.events);
 
 Supply the seed as a decimal `u64` string, either `count` or `rate_per_second`, and either `over_ms` or `start_ms`. Time options are integer milliseconds: `start_ms` and `until_ms` are epoch timestamps, while `over_ms` and optional `offset_ms` are durations. `until_ms` defaults to the current time. Repeating a payload requires an explicit time window and `id_prefix` as well as the seed. Use a fresh prefix for each independent write, and reuse it only when intentionally retrying the same batch.
 
-Diagnostic ranges are UTF-8 byte offsets into the source, not JavaScript string indexes. Generation and build failures return `{ ok: false, error }` with a stage, message, and diagnostics. Generated JavaScript numeric values must fit the safe integer range. `spec()` returns the language reference, and `skill()` returns authoring guidance for an agent hosted by your application. For shapes containing scorers, `build(source, { project: "My Project", lang: "typescript", files: {} })` returns planned files for the host to save, using optional existing file contents keyed by relative path.
+Diagnostic ranges are UTF-8 byte offsets into the source, not JavaScript string indexes. Generation and build failures return `{ ok: false, error }` with a stage, message, and diagnostics. Generated JavaScript numeric values must fit the safe integer range. `spec()` returns the language reference, and `skill()` returns authoring guidance for an agent hosted by your application. For shapes containing scorers, `build(source, { project: "My Project", lang: "typescript", files: {} })` returns planned files for the host to save. Generate an agent codebase with:
+
+```ts
+const result = build(source, {
+  target: "agent",
+  lang: "typescript",
+  project: "My Project",
+  select: ["agent.support"],
+  seed: "42",
+  files: {},
+});
+```
+
+The browser uses the same agent selection and dataset snapshots as the CLI. `project` is optional when the selected agents have no evals. The optional `files` map contains existing file contents keyed by relative path. A successful plan returns `files` and `removals`. Apply a removal only if the current file content still equals its `expected` value. Generated Python and TypeScript run in their respective runtimes. Browser generation does not invoke native formatters or execute agents.
 
 For delivery, the host owns authentication and supplies an asynchronous transport. This example assumes your application implements `/api/braintrust/*`: the backend authenticates the caller, authorizes the project, adds server-side Braintrust credentials, and forwards the response status, headers, and body. API keys stay out of static browser assets.
 
