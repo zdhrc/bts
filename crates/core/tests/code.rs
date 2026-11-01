@@ -60,7 +60,7 @@ impl Target for UncalledTarget {
         PlainTarget.slug(name)
     }
 
-    fn code(&self, _: CodeGroup<'_>, _: Module) -> Result<SourceFile, Self::Error> {
+    fn code(&self, _: CodeGroup<'_>, _: Module) -> Result<Vec<SourceFile>, Self::Error> {
         panic!("invalid exports must fail before reaching the target")
     }
 
@@ -81,13 +81,13 @@ impl Target for PlainTarget {
         Some(name.to_ascii_lowercase().replace(' ', "_"))
     }
 
-    fn code(&self, group: CodeGroup<'_>, module: Module) -> Result<SourceFile, Self::Error> {
-        Ok(SourceFile {
+    fn code(&self, group: CodeGroup<'_>, module: Module) -> Result<Vec<SourceFile>, Self::Error> {
+        Ok(vec![SourceFile {
             name: format!("{}.py", group.stem),
             contents: format!("{}\nexports = [{}]\n", module.source, module.functions.join(", ")),
             slugs: group.items.iter().map(|item| item.slug.to_owned()).collect(),
             lang: group.lang,
-        })
+        }])
     }
 
     fn judge(&self, _: Judge<'_>) -> Result<SourceFile, Self::Error> {
@@ -115,7 +115,10 @@ impl Target for PlainTarget {
                 slugs: Vec::new(),
             });
         }
-        Ok(CodebasePlan { files })
+        Ok(CodebasePlan {
+            files,
+            removals: Vec::new(),
+        })
     }
 }
 
@@ -179,12 +182,15 @@ fn braintrust_target_accepts_an_external_emitters_source_and_exports() {
     .unwrap();
     let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new("test-project");
     let assembly = code::assemble(&model.scorers, None, &ConstantEmitter, &target).unwrap();
-    assert_eq!(assembly.files.len(), 1);
-    assert_eq!(assembly.files[0].slugs, ["quality", "coverage"]);
+    assert_eq!(assembly.files.len(), 2);
+    assert_eq!(assembly.files[1].slugs, ["quality", "coverage"]);
     let source = &assembly.files[0].contents;
     assert!(source.contains("def exported_0(output):\n    return 0.5\n"));
     assert!(source.contains("def exported_1(output):\n    return 0.9\n"));
-    let registrations: Vec<_> = source.split("project.scorers.create(").skip(1).collect();
+    let wrapper = &assembly.files[1].contents;
+    assert!(wrapper.contains("from .packed_impl import exported_0, exported_1"));
+    assert!(!wrapper.contains("def exported_"));
+    let registrations: Vec<_> = wrapper.split("project.scorers.create(").skip(1).collect();
     assert_eq!(registrations.len(), 2);
     assert!(registrations[0].contains("name=\"Quality\","));
     assert!(registrations[0].contains("handler=exported_0,"));
@@ -295,6 +301,7 @@ fn assembly_rejects_invalid_exports_before_invoking_the_target() {
 fn codebase_paths_are_checked_before_any_file_is_written() {
     let out = std::env::temp_dir().join(format!("bts-code-target-{}", uuid::Uuid::new_v4()));
     let plan = CodebasePlan {
+        removals: Vec::new(),
         files: vec![
             CodebaseFile {
                 path: "valid.py".into(),
@@ -313,4 +320,80 @@ fn codebase_paths_are_checked_before_any_file_is_written() {
         Err(code::writing::Error::InvalidPath { .. })
     ));
     assert!(!out.exists());
+}
+
+impl code::AgentTarget for PlainTarget {
+    fn tracing(&self, lang: ScorerLang) -> &str {
+        match lang {
+            ScorerLang::Python => {
+                "def start_trace(events, name, kind):\n    events.append({'name': name, 'kind': kind})\n    return events\ndef log_trace(events, fields):\n    events.append(fields)\ndef end_trace(events):\n    pass\n"
+            }
+            ScorerLang::Typescript => {
+                "function startTrace(events: unknown[], name: string, kind: string): unknown[] { events.push({name, kind}); return events; }\nfunction logTrace(events: unknown[], fields: Record<string, unknown>): void { events.push(fields); }\nfunction endTrace(events: unknown[]): void {}\n"
+            }
+        }
+    }
+
+    fn agent_codebase(
+        &self,
+        sources: &[SourceFile],
+        _: ScorerLang,
+        context: &CodebaseContext<'_>,
+    ) -> Result<CodebasePlan, Self::Error> {
+        let assembly = Assembly {
+            files: sources
+                .iter()
+                .map(|source| SourceFile {
+                    name: source.name.clone(),
+                    contents: source.contents.clone(),
+                    slugs: source.slugs.clone(),
+                    lang: source.lang,
+                })
+                .collect(),
+        };
+        self.codebase(&assembly, context)
+    }
+}
+
+#[test]
+fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access() {
+    use code::AgentTarget;
+
+    let model = compile(r#"agent "support" { entrypoint = trace.request } trace "request" { output = "hello" }"#).unwrap();
+    let out = std::env::temp_dir().join(format!("bts-agent-target-{}", uuid::Uuid::new_v4()));
+    let existing = MemoryFiles(BTreeMap::from([("settings.json".to_owned(), "{\"keep\":true}".to_owned())]));
+    let context = CodebaseContext {
+        root: &out,
+        files: &existing,
+    };
+    for (lang, extension, tracing) in [
+        (ScorerLang::Python, "py", "events.append"),
+        (ScorerLang::Typescript, "mts", "events.push"),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &PlainTarget).unwrap();
+        let plan = PlainTarget.agent_codebase(&assembly.files, lang, &context).unwrap();
+        assert!(!out.exists());
+        assert!(plan.removals.is_empty());
+        let source = plan
+            .files
+            .iter()
+            .find(|file| file.path == Path::new(&format!("generated/src/agents/support_agent.{extension}")))
+            .unwrap();
+        assert!(source.contents.contains("hello"));
+        let runtime = plan
+            .files
+            .iter()
+            .find(|file| file.path == Path::new(&format!("generated/src/agents/support_agent_runtime.{extension}")))
+            .unwrap();
+        assert!(runtime.contents.contains(tracing));
+        assert!(plan.files.iter().all(|file| !file.contents.contains("braintrust")));
+        assert_eq!(
+            plan.files
+                .iter()
+                .find(|file| file.path == Path::new("settings.json"))
+                .unwrap()
+                .contents,
+            "{\"keep\":true}"
+        );
+    }
 }

@@ -12,7 +12,7 @@ pub(crate) struct CommandDesc {
 }
 
 pub(crate) static SPEC: Spec = Spec {
-    summary: "Use the `bts` CLI to validate shapes, generate traces, build scorer functions, and sync Braintrust resources.",
+    summary: "Use the `bts` CLI to validate shapes, generate traces, build scorer functions and runnable agents, and sync Braintrust resources.",
     commands: &[
         CommandDesc {
             tags: &[],
@@ -51,10 +51,24 @@ pub(crate) static SPEC: Spec = Spec {
             tags: &["preview"],
             path: &["build"],
             guidance: &[
+                "The optional target is scorers (the default) or agent. Agent builds create runnable python or typescript modules under <out>/src/agents, with eval entrypoints when experiments are present.",
+                "Both build targets require uvx for Python formatting or npx for TypeScript formatting. The first uncached build downloads pinned Ruff or Prettier. Generated agents require Python 3.10+ or Node.js 24.2+.",
+                "Declare an agent with `agent \"support\" { entrypoint = trace.support }`. The entrypoint must be a whole trace. Call the generated run(input) function with an input, or run() for the authored input. run_details/runDetails returns span details, and run_traced/runTraced attaches execution to a parent span.",
+                "For Python, run uv sync in the output directory, then uv run python to import agents.<name>_agent. For TypeScript, run npm install and npm run build, then import ./src/agents/<name>_agent.mts with Node. Agent-only shapes need no project or API key to build or run.",
+                "Shapes with experiments require the project selected by bt switch. From the output directory, use `uv run bt eval --runner python src/evals/<experiment>_eval.py --no-send-logs` or `bt eval --runner node src/evals/<experiment>.eval.ts --no-send-logs`. Install bt separately. Omit --no-send-logs to upload with configured credentials, or use --dev for the eval development server.",
+                "Generated eval entrypoints register during CLI discovery and execute during a normal import. The *_definition.py and *.definition.ts modules can be imported without starting a run. Import agent or scorer implementation modules for standalone functions. Eval tasks receive only case input, while expected answers stay available to scorers.",
+                "Use repeatable --select agent or experiment traversals to choose a build. Agent selection includes matching evals; experiment selection includes its baseline chain and required agents, datasets, and scorers. Omitting --select builds all agents and experiments.",
+                "Generated evals snapshot dynamic inline, trace, span, and grouped dataset cases at build time. --seed defaults to 42. Source input becomes case input, source output becomes expected unless overridden, and groups become ordered arrays. References within one case share the same sampled instance. Metadata and tags are preserved.",
+                "Generated evals support code and judge scorers. Judges use autoevals locally without a separate deployment. Judge inference requires model credentials and incurs costs even with --no-send-logs. Rebuild agents to refresh local judges after edits; build scorers generates deployment registrations. Eval builds include src/evals/run_evals.py or src/evals/run-evals.mts for ordered execution linked by the returned experiment IDs. The suite accepts --no-send-logs for local execution without uploaded comparisons. Individual bt eval entrypoints resolve baselines by their existing experiment names.",
+                "Local attachments and nested scorer spans remain unsupported in generated agents. Generated agents execute mock behavior without calling LLMs or tools.",
+                "Generated agents accept an injectable random source but do not reproduce bts write traces --seed sampling. Authored durations appear in detailed results without delaying execution, while traced spans use actual execution time.",
                 "Build top-level scorer blocks into SDK source files. Then change into the emitted `<out>/src/scorers` directory and run the `bt functions push --if-exists replace ...` command printed by `bts build`, passing the generated filenames from that directory.",
                 "For Python scorers, the directory used to run `bt functions push` determines the bundle's import path. Passing paths from a parent directory can produce an import that fails remotely when a path component contains a hyphen.",
             ],
-            examples: &["bts build --from shape.bt"],
+            examples: &[
+                "bts build --from shape.bt",
+                "bts build agent --from shape.bt --lang python --out generated",
+            ],
         },
         CommandDesc {
             tags: &["preview"],

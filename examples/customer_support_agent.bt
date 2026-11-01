@@ -1,0 +1,223 @@
+agent "customer-support-agent" {
+    entrypoint = trace["late-arrival"]
+}
+
+trace "late-arrival" {
+    vars { case_batch_id = hex(8) }
+    metadata = {
+        batch_id = var.case_batch_id
+        correlation_id = var.case_batch_id
+        reply_count = len(self.output)
+    }
+    metrics = { requests = len(self.input) }
+    tags = ["customer-support", "late-arrival"]
+    expected = { replies = 3 }
+    duration = 0.1
+    input = [{
+        name = "Maya"
+        reservation_id = "HTL-4821"
+        # Hours since midnight on the check-in date: 25 means 1 a.m. the next day.
+        arrival_hour = 25
+        message = "My flight is delayed. Can I still check in when I arrive?"
+    }, {
+        name = "Riley"
+        reservation_id = "HTL-7390"
+        arrival_hour = 26
+        message = "Will the front desk still be open?"
+    }, {
+        name = "Avery"
+        reservation_id = "HTL-9102"
+        arrival_hour = 25
+        message = "Can you check that my booking is active?"
+    }]
+    output = repeat.requests[:].task["handle-late-arrival"].output
+
+    repeat "requests" {
+        count = 3
+        task "handle-late-arrival" {
+            input = trace.input[:repeat.count][repeat.index]
+            vars { planned_hour = self.input.arrival_hour }
+            output = llm["draft-reply"].output
+
+            maybe "reservation-retry" {
+                chance = 0.15
+                tool "retry-reservation" {
+                    input = tool["lookup-reservation"].input
+                    output = tool["lookup-reservation"].output
+                }
+            }
+
+            function "check-arrival-policy" {
+                duration = 0.02
+                input = {
+                    arrival_hour = task["handle-late-arrival"].input.arrival_hour
+                    reservation = maybe["reservation-retry"].included
+                        ? maybe["reservation-retry"].tool["retry-reservation"].output
+                        : tool["lookup-reservation"].output
+                }
+                vars {
+                    valid_hour = var.planned_hour >= 15 && var.planned_hour < 30
+                    after_midnight = var.planned_hour >= 24
+                    confirmed = self.input.reservation.found && self.input.reservation.booking.status == "confirmed"
+                    can_check_in = self.input.reservation.found
+                        && self.input.reservation.booking.status == "confirmed"
+                        && (var.planned_hour < 24 || self.input.reservation.booking.overnight_check_in)
+                }
+                output = {
+                    action = !var.valid_hour ? "verify-arrival-time"
+                        : !self.input.reservation.found ? "verify-reservation-number"
+                        : !var.confirmed ? "contact-reservations"
+                        : var.can_check_in ? "check-in-on-arrival"
+                        : "contact-front-desk"
+                    clock_hour = var.planned_hour % 24
+                    minutes_after_midnight = var.after_midnight ? (var.planned_hour - 24) * 60 : 0
+                    needs_staff = var.valid_hour && self.input.reservation.found
+                        && (!var.confirmed || !var.can_check_in)
+                }
+            }
+
+            tool "lookup-reservation" {
+                input = {
+                    reservation_id = task["handle-late-arrival"].input.reservation_id == null
+                        ? null : upper(trim(task["handle-late-arrival"].input.reservation_id))
+                }
+                error = self.output.found ? null : "reservation-not-found"
+                metadata = { lookup = "reservation-number" }
+                duration = 0.05
+                output = self.input.reservation_id == "HTL-4821"
+                    ? { found = true, booking = { status = "confirmed", overnight_check_in = true } }
+                    : self.input.reservation_id == "HTL-7390"
+                    ? { found = true, booking = { status = "confirmed", overnight_check_in = false } }
+                    : self.input.reservation_id == "HTL-9102"
+                    ? { found = true, booking = { status = "cancelled", overnight_check_in = true } }
+                    : { found = false, booking = null }
+            }
+
+            choice "handoff" {
+                task "front-desk-message" {
+                    input = function["check-arrival-policy"].output
+                    output = {
+                        channel = "front-desk-message"
+                        status = self.input.needs_staff ? "queued" : "not-required"
+                    }
+                }
+                task "callback-request" {
+                    input = function["check-arrival-policy"].output
+                    output = {
+                        channel = "callback"
+                        status = self.input.needs_staff ? "queued" : "not-required"
+                    }
+                }
+            }
+
+            llm "draft-reply" {
+                duration = lognormal(0.6, 0.25)
+                metadata = { language = "en", style = choice("concise", "reassuring") }
+                metrics = {
+                    message_characters = len(self.input.message)
+                    reply_characters = len(self.output.content)
+                    confidence = weighted([0.96, 8], [0.81, 2])
+                }
+                input = {
+                    name = task["handle-late-arrival"].input.name
+                    reservation_id = task["handle-late-arrival"].input.reservation_id
+                    message = trim(task["handle-late-arrival"].input.message)
+                    policy = function["check-arrival-policy"].output
+                    retried = maybe["reservation-retry"].included
+                    handoff = choice.handoff.chosen == 0
+                        ? choice.handoff.task["front-desk-message"].output
+                        : choice.handoff.task["callback-request"].output
+                }
+                vars {
+                    greeting = "Hi ${self.input.name}."
+                    reply_action = self.input.policy.action
+                }
+                output = {
+                    retried = self.input.retried
+                    handoff = self.input.handoff
+                    role = "assistant"
+                    recipient = self.input.name
+                    content = var.reply_action == "check-in-on-arrival"
+                        ? "${var.greeting} Your booking is confirmed and check-in at ${self.input.policy.clock_hour}:00 is available. Bring your ID and booking confirmation."
+                        : var.reply_action == "contact-front-desk"
+                        ? "${var.greeting} Your booking is confirmed, but arriving ${self.input.policy.minutes_after_midnight} minutes after midnight needs an arrangement with the front desk. Please contact them before travelling; overnight access is not confirmed yet."
+                        : var.reply_action == "contact-reservations"
+                        ? "${var.greeting} This booking is cancelled. Please contact reservations to arrange a new stay before travelling."
+                        : var.reply_action == "verify-arrival-time"
+                        ? "${var.greeting} Please confirm your arrival date and time so we can check the correct arrival window."
+                        : "${var.greeting} I couldn't find that reservation. Please double-check the number in your confirmation email."
+                    reservation_id = self.input.reservation_id
+                    next_step = var.reply_action
+                    needs_staff = self.input.policy.needs_staff
+                }
+            }
+        }
+    }
+}
+
+
+dataset "customer-support-cases" {
+    case "standard-arrivals" {
+        input = [
+            { name = "Maya", reservation_id = "HTL-4821", arrival_hour = 25, message = "My flight is delayed. Can I check in at 1 a.m.?" },
+            { name = "Riley", reservation_id = "HTL-7390", arrival_hour = 26, message = "Will the front desk still be open at 2 a.m.?" },
+            { name = "Avery", reservation_id = "HTL-9102", arrival_hour = 25, message = "Can you check that my booking is active?" }
+        ]
+        expected = [
+            { next_step = "check-in-on-arrival", needs_staff = false },
+            { next_step = "contact-front-desk", needs_staff = true },
+            { next_step = "contact-reservations", needs_staff = true }
+        ]
+        tags = ["standard-arrivals"]
+    }
+    case "reservation-recovery" {
+        input = [
+            { name = "Sam", reservation_id = "UNKNOWN", arrival_hour = 25, message = "Can you find my booking?" },
+            { name = "Taylor", reservation_id = null, arrival_hour = 25, message = "I lost my confirmation email." },
+            { name = "Jordan", reservation_id = " htl-4821 ", arrival_hour = 25, message = "Please confirm late check-in." }
+        ]
+        expected = [
+            { next_step = "verify-reservation-number", needs_staff = false },
+            { next_step = "verify-reservation-number", needs_staff = false },
+            { next_step = "check-in-on-arrival", needs_staff = false }
+        ]
+        tags = ["reservation-recovery"]
+    }
+    case "arrival-window" {
+        input = [
+            { name = "Morgan", reservation_id = "HTL-4821", arrival_hour = 14, message = "Can I arrive early?" },
+            { name = "Casey", reservation_id = "HTL-7390", arrival_hour = 23, message = "I should arrive before midnight." },
+            { name = "Quinn", reservation_id = "HTL-4821", arrival_hour = 30, message = "My flight arrives the next morning." }
+        ]
+        expected = [
+            { next_step = "verify-arrival-time", needs_staff = false },
+            { next_step = "check-in-on-arrival", needs_staff = false },
+            { next_step = "verify-arrival-time", needs_staff = false }
+        ]
+        tags = ["arrival-window"]
+    }
+}
+
+scorer "next-step-correctness" {
+    code {
+        score = len(output) == len(expected) && len(output) == 3
+            && output[0].next_step == expected[0].next_step
+            && output[1].next_step == expected[1].next_step
+            && output[2].next_step == expected[2].next_step ? 1 : 0
+    }
+}
+
+scorer "staff-escalation-correctness" {
+    code {
+        score = len(output) == len(expected) && len(output) == 3
+            && output[0].needs_staff == expected[0].needs_staff
+            && output[1].needs_staff == expected[1].needs_staff
+            && output[2].needs_staff == expected[2].needs_staff ? 1 : 0
+    }
+}
+
+experiment "customer-support" {
+    dataset = dataset["customer-support-cases"]
+    task = trace["late-arrival"]
+    scorers = [scorer["next-step-correctness"], scorer["staff-escalation-correctness"]]
+}

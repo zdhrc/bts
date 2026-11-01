@@ -40,3 +40,24 @@ pub trait CodeAdapter {
     fn config(&self) -> Result<<Self::Provider as CodeProvider>::CodeConfig, Self::Error>;
     fn report_build(&self, out: &Path, built: &[code::writing::Built]);
 }
+
+/// Adds runnable agent generation without requiring scorer-only adapters to support it.
+pub trait AgentAdapter: CodeAdapter
+where
+    <Self::Provider as CodeProvider>::Target: code::AgentTarget,
+{
+    fn agent_target(
+        &self,
+        model: &crate::dsl::Model,
+        seed: u64,
+    ) -> Result<<Self::Provider as CodeProvider>::Target, Self::Error>;
+
+    fn assemble_agents(
+        &self,
+        model: &crate::dsl::Model,
+        lang: crate::dsl::ScorerLang,
+        target: &<Self::Provider as CodeProvider>::Target,
+    ) -> Result<code::Assembly, String> {
+        code::assemble_agents(model, lang, target)
+    }
+}

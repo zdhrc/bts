@@ -1,7 +1,7 @@
 use crate::ast;
 use crate::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::model::{
-    Accessor, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
+    Accessor, Agent, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
     DatasetSource, Experiment, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object,
     ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan, ScorerStep,
     Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
@@ -340,6 +340,7 @@ impl Modeler {
         let mut facets = Vec::new();
         let mut datasets = Vec::new();
         let mut experiments = Vec::new();
+        let mut agents = Vec::new();
 
         // collect vars first so refs work no matter the decl order
         let (vars_blocks, rest) = split_vars(std::mem::take(&mut self.ast.decls));
@@ -395,6 +396,11 @@ impl Modeler {
                         if let Some(automation) = self.model_automation(block, desc) {
                             automations.push((automation, range));
                         }
+                    } else if desc.id == spec::ids::AGENT && desc.allows(spec::Place::Root) {
+                        let range = block.range;
+                        if let Some(agent) = self.model_agent(block, desc) {
+                            agents.push((agent, range));
+                        }
                     } else if desc.id == spec::ids::EXPERIMENT && desc.allows(spec::Place::Root) {
                         let range = block.range;
                         if let Some(experiment) = self.model_experiment(block, desc) {
@@ -424,6 +430,7 @@ impl Modeler {
         // model actually stores resolve
         let mut aliases = self.identity_aliases.clone();
         aliases.extend(experiments.iter().map(|(experiment, _)| experiment.task));
+        aliases.extend(agents.iter().map(|(agent, _)| agent.entrypoint));
         let live = live_refs(&self.pending, &traces, &bindings, &datasets, &aliases);
         let refs = self.resolve_pending(&live);
         self.detect_cycles();
@@ -516,6 +523,19 @@ impl Modeler {
                         );
                     }
                 }
+            }
+        }
+        let mut agent_names = HashSet::new();
+        for (agent, range) in &agents {
+            if !agent_names.insert(&agent.name) {
+                self.agent_error(format!("duplicate agent name {:?}", agent.name), *range);
+            }
+            let reference = &refs[agent.entrypoint.0 as usize];
+            if !matches!(reference.accessor, Accessor::Block { kind: "trace", .. })
+                || !reference.steps.is_empty()
+                || !reference.path.is_empty()
+            {
+                self.agent_error("entrypoint must reference a whole trace".to_owned(), *range);
             }
         }
         let mut experiment_names = HashSet::new();
@@ -624,6 +644,7 @@ impl Modeler {
         if self.errors.is_empty() {
             Ok(Model {
                 traces,
+                agents: agents.into_iter().map(|(agent, _)| agent).collect(),
                 bindings,
                 refs,
                 scorers,
@@ -782,6 +803,48 @@ impl Modeler {
         } else {
             name
         }
+    }
+
+    fn agent_error(&mut self, reason: String, range: SrcRange) {
+        self.errors.push(Error::new(
+            ErrorKind::InvalidAgent {
+                rule: spec::ids::AGENT_BINDING,
+                reason,
+            },
+            range,
+        ));
+    }
+
+    fn model_agent(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Agent> {
+        let ast::Block { name, decls, range, .. } = block;
+        let name = self.model_name(name, range, desc)?;
+        let mut entrypoint = None;
+        let mut seen = false;
+        for decl in decls {
+            let ast::Decl::Attr(attr) = decl else {
+                self.agent_error("agent contains a nested block".to_owned(), range);
+                continue;
+            };
+            if attr.key != "entrypoint" || seen {
+                self.agent_error(format!("unknown or duplicate agent field {:?}", attr.key), attr.range);
+                continue;
+            }
+            seen = true;
+            if let Some(folded) = self.fold_expr(attr.value) {
+                if let Value::BlockRef { ref_id, .. } = folded.into_value() {
+                    entrypoint = Some(ref_id);
+                } else {
+                    self.agent_error("entrypoint must be a trace reference".to_owned(), attr.range);
+                }
+            }
+        }
+        if !seen {
+            self.agent_error("agent requires entrypoint".to_owned(), range);
+        }
+        Some(Agent {
+            name,
+            entrypoint: entrypoint?,
+        })
     }
 
     fn model_experiment(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Experiment> {
@@ -6580,6 +6643,10 @@ pub(super) enum ErrorKind {
         rule: spec::Id,
         reason: String,
     },
+    InvalidAgent {
+        rule: spec::Id,
+        reason: String,
+    },
     InvalidExperiment {
         rule: spec::Id,
         reason: String,
@@ -7067,7 +7134,9 @@ impl fmt::Display for ErrorKind {
             Self::InvalidFacet { rule, reason } | Self::InvalidAutomation { rule, reason } => {
                 write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
             }
-            Self::InvalidDataset { rule, reason } | Self::InvalidExperiment { rule, reason } => {
+            Self::InvalidAgent { rule, reason }
+            | Self::InvalidDataset { rule, reason }
+            | Self::InvalidExperiment { rule, reason } => {
                 write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
             }
         }
@@ -10753,5 +10822,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(model.traces.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    #[test]
+    fn validates_agent_declarations() {
+        for source in [
+            r#"agent "a" {}"#,
+            r#"agent "a" { entrypoint = "t" } trace "t" {}"#,
+            r#"agent "a" { entrypoint = trace.missing } trace "t" {}"#,
+            r#"agent "a" { entrypoint = trace.t.output } trace "t" { output = "x" }"#,
+            r#"agent "a" { entrypoint = trace.t.tool.child } trace "t" { tool "child" {} }"#,
+            r#"agent "a" { entrypoint = trace.t entrypoint = trace.t } trace "t" {}"#,
+            r#"agent "a" { entrypoint = trace.t unexpected = true } trace "t" {}"#,
+            r#"agent "a" { entrypoint = trace.t } agent "a" { entrypoint = trace.t } trace "t" {}"#,
+        ] {
+            assert!(crate::semantics::compile(source).is_err(), "{source}");
+        }
     }
 }

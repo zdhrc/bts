@@ -1,8 +1,9 @@
-mod python;
-mod typescript;
+pub(in crate::mocking::code) mod python;
+pub(crate) mod rendering;
+pub(in crate::mocking::code) mod typescript;
 
-use super::{Emitter, Item, Module, arg_name};
-use crate::dsl::{Number, ScorerLang};
+use super::{Emitter, Item, Module};
+use crate::dsl::ScorerLang;
 use std::{collections::HashSet, fmt};
 
 /// The built-in Python and TypeScript function emitters.
@@ -39,54 +40,6 @@ impl Emitter for Languages {
             ScorerLang::Typescript => typescript::module(items),
         }
     }
-}
-
-// language-neutral runtime helpers a generated scorer may need; collected
-// during emission so only used snippets appear, in declaration order (normal
-// first, its dependents after)
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub(super) enum Helper {
-    Normal,
-    Gamma,
-    Lognormal,
-    Exponential,
-    Pareto,
-    Beta,
-    Poisson,
-    Choice,
-    Weighted,
-    RandInt,
-    Hex,
-    Alphanum,
-    Round,
-}
-
-// json-style escaping; both languages read the result inside double quotes
-pub(super) fn escape(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for part in text.chars() {
-        match part {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            part => escaped.push(part),
-        }
-    }
-    escaped
-}
-
-// {:?} keeps a trailing .0 on whole floats, valid in both languages
-pub(super) fn num(number: &Number) -> String {
-    match number {
-        Number::Int(value) => value.to_string(),
-        Number::Float(value) => format!("{value:?}"),
-    }
-}
-
-pub(super) fn float(value: f64) -> String {
-    format!("{value:?}")
 }
 
 // validated slugs keep this mapping unique and safe in both languages

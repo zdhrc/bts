@@ -232,3 +232,26 @@ fn consumers_can_name_nested_model_types() {
     let option: &JudgeOption = &options[0];
     assert_eq!(option.label, "good");
 }
+
+#[test]
+fn exposes_agents_with_resolved_trace_entrypoints() {
+    let model = compile(
+        r#"
+        agent "support" { entrypoint = trace.request }
+        trace "request" { output = "hello" }
+        agent "preview" { entrypoint = trace.request }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(model.agents.len(), 2);
+    for (agent, name) in model.agents.iter().zip(["support", "preview"]) {
+        let agent: &bts_lang::Agent = agent;
+        assert_eq!(agent.name, name);
+        let reference = &model.refs[agent.entrypoint.0 as usize];
+        assert_eq!(reference.module, Some(model.traces[0].node));
+        assert!(matches!(reference.accessor, Accessor::Block { node, kind: "trace" }
+            if node == model.traces[0].node));
+        assert!(reference.steps.is_empty());
+        assert!(reference.path.is_empty());
+    }
+}

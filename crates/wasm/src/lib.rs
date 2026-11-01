@@ -160,7 +160,7 @@ Use the tool names supplied by that application. Source is a string, and files a
 2. Author source from the user's requested population, then call validate(source). Fix diagnostics before continuing.\n\
 3. Call generate(source, options) to preview Braintrust trace data. Supply a decimal-string seed, either count or rate_per_second, and either over_ms or start_ms. until_ms defaults to the current time. All time options use milliseconds since the epoch or durations in milliseconds.\n\
 4. Inspect the returned events for realistic variation and coherent relationships. Native and browser builds use the same seeded random generator. Floating-point calculations can still differ slightly between platforms. Repeatable payloads also require an explicit time window and id_prefix for row and span IDs.\n\
-5. Use build(source, options) to produce scorer files with an explicit project name and virtual existing files. The host saves or downloads the returned files.\n\
+5. Use build(source, options) to produce scorer files, or set target to agent for callable mock agents and their evals. Supply a project for scorers and evals, optional agent or experiment selectors, and a decimal-string seed for generated dataset snapshots. Existing files are virtual text. The host saves the returned files and applies a removal only when its current contents still match the returned expected contents.\n\
 6. Use write(source, generationOptions, writeOptions, transport) only when the user requests delivery. The host supplies the asynchronous HTTP transport and authentication.\n\n\
 Execution functions return { ok, value } or { ok, error }. Inspect error.stage, error.message, and error.diagnostics. Diagnostic ranges are UTF-8 byte offsets, not JavaScript string indexes. Generated numeric values must fit JavaScript's safe integer range.\n\n\
 Attachment descriptors are returned for the host to resolve. Browser trace delivery currently rejects local attachments before making requests. Dataset, automation, and experiment synchronization are not exposed by this interface yet.\n");
@@ -362,12 +362,26 @@ pub fn validate(source: &str) -> Result<JsValue, JsValue> {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BuildOptions {
-    project: String,
+    project: Option<String>,
+    #[serde(default)]
+    target: BuildTarget,
     lang: Option<BuildLanguage>,
+    #[serde(default)]
+    select: Vec<String>,
+    #[serde(default = "build_default_seed")]
+    seed: String,
     #[serde(default = "build_default_root")]
     root: String,
     #[serde(default)]
     files: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BuildTarget {
+    #[default]
+    Scorers,
+    Agent,
 }
 
 #[derive(serde::Deserialize)]
@@ -379,6 +393,17 @@ enum BuildLanguage {
 
 fn build_default_root() -> String {
     "bts-scorers".to_owned()
+}
+
+fn build_default_seed() -> String {
+    "42".to_owned()
+}
+
+fn build_safe_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['\\', ':'])
+        && !path.chars().any(char::is_control)
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
 struct BuildExistingFiles(std::collections::BTreeMap<String, String>);
@@ -396,6 +421,19 @@ impl bts_core::mocking::code::ExistingFiles for BuildExistingFiles {
 struct BuildOutput {
     #[serde(serialize_with = "build_serialize_files")]
     files: Vec<bts_core::mocking::code::CodebaseFile>,
+    #[serde(serialize_with = "build_serialize_removals")]
+    removals: Vec<bts_core::mocking::code::CodebaseRemoval>,
+}
+
+fn build_serialize_removals<S: serde::Serializer>(
+    removals: &[bts_core::mocking::code::CodebaseRemoval],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(
+        removals
+            .iter()
+            .map(|removal| serde_json::json!({ "path": removal.path.to_string_lossy(), "expected": removal.expected })),
+    )
 }
 
 fn build_serialize_files<S: serde::Serializer>(
@@ -417,31 +455,55 @@ impl serde::Serialize for BuildFile<'_> {
     }
 }
 
-/// Builds Braintrust scorer source and codebase files without filesystem access.
+/// Builds scorer files or callable mock agents without filesystem access.
 ///
-/// Supply the project name and any existing files as text keyed by relative path.
-/// The optional language overrides authored choices. The root defaults to
-/// `bts-scorers` and supplies the generated package name without selecting a directory.
-/// The result contains planned files for the caller to inspect or save.
+/// Scorers and agent evals require a project name. Agent builds default to Python,
+/// support agent or experiment selectors, and snapshot datasets using seed 42 unless
+/// another decimal-string seed is supplied. Existing files are text keyed by relative
+/// path. The root defaults to `bts-scorers` and only supplies the generated package name.
+/// Save planned files and remove obsolete files only when their contents match `expected`.
 #[wasm_bindgen(unchecked_return_type = "BuildResult")]
 pub fn build(
     source: &str,
     #[wasm_bindgen(unchecked_param_type = "BuildOptions")] build_options: JsValue,
 ) -> Result<JsValue, JsValue> {
+    use bts_core::mocking::code::{self, AgentTarget};
     operation((|| {
-        let build_options = crate::options::<BuildOptions>(build_options)?;
-        if build_options.project.trim().is_empty() {
+        let parsed = crate::options::<BuildOptions>(build_options.clone())?;
+        // serde_wasm_bindgen reads known struct fields without checking other keys
+        for key in js_sys::Object::keys(&js_sys::Object::from(build_options)).iter() {
+            let key = key.as_string().expect("object keys are strings");
+            if !["project", "target", "lang", "select", "seed", "root", "files"].contains(&key.as_str()) {
+                return Err(OperationError::new("options", format!("unknown build option `{key}`")));
+            }
+        }
+        let build_options = parsed;
+        if build_options
+            .project
+            .as_ref()
+            .is_some_and(|project| project.trim().is_empty())
+        {
             return Err(OperationError::new("options", "project must not be empty"));
+        }
+        if matches!(build_options.target, BuildTarget::Scorers) {
+            if build_options.project.is_none() {
+                return Err(OperationError::new("options", "project is required for scorer builds"));
+            }
+            if !build_options.select.is_empty() {
+                return Err(OperationError::new("options", "select is only supported for agent builds"));
+            }
         }
         if build_options.root.trim().is_empty() {
             return Err(OperationError::new("options", "root must not be empty"));
         }
+        let seed = build_options
+            .seed
+            .parse::<u64>()
+            .ok()
+            .filter(|_| build_options.seed.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| OperationError::new("options", "seed must be a decimal u64 string"))?;
         for path in build_options.files.keys() {
-            if path.is_empty()
-                || !std::path::Path::new(path)
-                    .components()
-                    .all(|component| matches!(component, std::path::Component::Normal(_)))
-            {
+            if !build_safe_path(path) {
                 return Err(OperationError::new(
                     "options",
                     format!("virtual file path `{path}` must be relative to the root"),
@@ -449,43 +511,92 @@ pub fn build(
             }
         }
         let model = compile_source(source)?;
-        if model.scorers.is_empty() {
-            return Err(OperationError::new("build", "the shape declares no scorer blocks"));
-        }
         let language = build_options.lang.map(|language| match language {
             BuildLanguage::Python => bts_lang::ScorerLang::Python,
             BuildLanguage::Typescript => bts_lang::ScorerLang::Typescript,
         });
-        let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new(build_options.project);
-        let assembly = bts_core::mocking::code::assemble(
-            &model.scorers,
-            language,
-            &bts_core::mocking::code::languages::Languages,
-            &target,
+        let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new(
+            build_options.project.as_deref().unwrap_or_default(),
         )
-        .map_err(|error| OperationError::new("build", error))?;
+        .with_seed(seed);
         let existing = BuildExistingFiles(build_options.files);
         let context = bts_core::mocking::code::CodebaseContext {
             root: std::path::Path::new(&build_options.root),
             files: &existing,
         };
-        let plan = bts_core::mocking::code::plan_codebase(&assembly, &target, &context)
-            .map_err(|error| OperationError::new("build", error))?;
-        Ok(BuildOutput { files: plan.files })
+        let plan = match build_options.target {
+            BuildTarget::Scorers => {
+                if model.scorers.is_empty() {
+                    return Err(OperationError::new("build", "the shape declares no scorer blocks"));
+                }
+                let assembly = code::assemble(&model.scorers, language, &code::languages::Languages, &target)
+                    .map_err(|error| OperationError::new("build", error))?;
+                code::plan_codebase(&assembly, &target, &context).map_err(|error| OperationError::new("build", error))?
+            }
+            BuildTarget::Agent => {
+                let selectors = build_options
+                    .select
+                    .iter()
+                    .map(|value| value.parse::<bts_core::selection::ResourceSelector>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| OperationError::new("options", error))?;
+                let model =
+                    bts_core::selection::agents(&model, &selectors).map_err(|error| OperationError::new("build", error))?;
+                if !model.experiments.is_empty() && build_options.project.is_none() {
+                    return Err(OperationError::new("options", "project is required for agent evals"));
+                }
+                let language = language.unwrap_or(bts_lang::ScorerLang::Python);
+                let assembly =
+                    code::assemble_agents(&model, language, &target).map_err(|error| OperationError::new("build", error))?;
+                let assembly = target
+                    .agent_assembly(&model, language, assembly)
+                    .map_err(|error| OperationError::new("build", error))?;
+                target
+                    .agent_codebase(&assembly.files, language, &context)
+                    .map_err(|error| OperationError::new("build", error))?
+            }
+        };
+        let mut paths = std::collections::BTreeSet::new();
+        for path in plan
+            .files
+            .iter()
+            .map(|file| &file.path)
+            .chain(plan.removals.iter().map(|removal| &removal.path))
+        {
+            let path = path.to_string_lossy();
+            if !build_safe_path(&path) || !paths.insert(path.to_string()) {
+                return Err(OperationError::new(
+                    "build",
+                    format!("unsafe or duplicate output path `{path}`"),
+                ));
+            }
+        }
+        Ok(BuildOutput {
+            files: plan.files,
+            removals: plan.removals,
+        })
     })())
 }
 
 #[wasm_bindgen(typescript_custom_section)]
 const BUILD_TYPESCRIPT: &str = r#"
 export interface BuildOptions {
-    project: string;
+    /** Required for scorer builds and agent evals. */
+    project?: string;
+    /** Defaults to scorers. */
+    target?: "scorers" | "agent";
     lang?: "python" | "typescript";
+    select?: string[];
+    /** Dataset snapshot seed for agent evals. Defaults to "42". */
+    seed?: string;
     root?: string;
     files?: Record<string, string>;
 }
 
 export interface BuildOutput {
     files: Array<{ path: string; contents: string; slugs: string[] }>;
+    /** Remove each file only if its current contents still match expected. */
+    removals: Array<{ path: string; expected: string }>;
 }
 
 export type BuildResult = OperationResult<BuildOutput>;

@@ -233,13 +233,13 @@ impl code::Target for PlainTarget {
         .then_some(slug)
     }
 
-    fn code(&self, group: code::CodeGroup<'_>, module: code::Module) -> Result<code::SourceFile, Self::Error> {
-        Ok(code::SourceFile {
+    fn code(&self, group: code::CodeGroup<'_>, module: code::Module) -> Result<Vec<code::SourceFile>, Self::Error> {
+        Ok(vec![code::SourceFile {
             name: format!("{}.py", group.stem),
             contents: module.source,
             slugs: group.items.iter().map(|item| item.slug.to_owned()).collect(),
             lang: group.lang,
-        })
+        }])
     }
 
     fn judge(&self, _: code::Judge<'_>) -> Result<code::SourceFile, Self::Error> {
@@ -251,6 +251,7 @@ impl code::Target for PlainTarget {
 
     fn codebase(&self, assembly: &code::Assembly, _: &code::CodebaseContext<'_>) -> Result<code::CodebasePlan, Self::Error> {
         Ok(code::CodebasePlan {
+            removals: Vec::new(),
             files: assembly
                 .files
                 .iter()
@@ -276,6 +277,6 @@ fn one_code_workflow_accepts_braintrust_and_a_code_only_bundle() {
     assert!(local.files[0].contents.contains("\"score\": 0.5"));
 
     let braintrust = assemble(&braintrust::Bundle, &"test-project".to_owned());
-    assert!(braintrust.files[0].contents.contains("test-project"));
-    assert!(braintrust.files[0].contents.contains("handler=scorer_quality,"));
+    assert!(braintrust.files[1].contents.contains("test-project"));
+    assert!(braintrust.files[1].contents.contains("handler=scorer_quality,"));
 }

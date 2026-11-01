@@ -1,4 +1,4 @@
-use super::{CodeAdapter, DataAdapter, TraceRun};
+use super::{AgentAdapter, CodeAdapter, DataAdapter, TraceRun};
 use crate::{code, config::Settings};
 use bts_core::providers::braintrust;
 use std::{fmt, path::Path};
@@ -142,5 +142,28 @@ impl std::error::Error for Error {
             Self::Config(source) => Some(source),
             Self::Encode(source) => Some(source),
         }
+    }
+}
+
+impl AgentAdapter for Adapter {
+    fn agent_target(&self, model: &crate::dsl::Model, seed: u64) -> Result<braintrust::mocking::code::CodeTarget, Error> {
+        let project = if model.experiments.is_empty() {
+            String::new()
+        } else {
+            <Self as CodeAdapter>::config(self)?
+        };
+        Ok(braintrust::mocking::code::CodeTarget::new(project).with_seed(seed))
+    }
+
+    fn assemble_agents(
+        &self,
+        model: &crate::dsl::Model,
+        lang: crate::dsl::ScorerLang,
+        target: &braintrust::mocking::code::CodeTarget,
+    ) -> Result<code::Assembly, String> {
+        let assembly = code::assemble_agents(model, lang, target)?;
+        target
+            .agent_assembly(model, lang, assembly)
+            .map_err(|error| error.to_string())
     }
 }

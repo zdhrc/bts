@@ -55,7 +55,8 @@ pub trait Target {
     ///
     /// Returning `None` rejects the name. Assembly also rejects duplicate slugs.
     fn slug(&self, name: &str) -> Option<String>;
-    fn code(&self, group: CodeGroup<'_>, module: Module) -> Result<SourceFile, Self::Error>;
+    /// Returns the implementation and integration files for one emitted module.
+    fn code(&self, group: CodeGroup<'_>, module: Module) -> Result<Vec<SourceFile>, Self::Error>;
     fn judge(&self, judge: Judge<'_>) -> Result<SourceFile, Self::Error>;
     fn codebase(&self, assembly: &Assembly, context: &CodebaseContext<'_>) -> Result<CodebasePlan, Self::Error>;
 }
@@ -79,4 +80,19 @@ pub fn arg_name(arg: ScorerArg) -> &'static str {
         ScorerArg::Expected => "expected",
         ScorerArg::Metadata => "metadata",
     }
+}
+
+/// Adds agent instrumentation and package conventions without requiring scorer-only targets to implement them.
+pub trait AgentTarget: Target {
+    /// Source implementing the generated runtime's span hooks in the selected language.
+    fn tracing(&self, lang: ScorerLang) -> &str;
+
+    /// Plans agent, evaluation, and supporting source files against caller-supplied existing files.
+    /// Source names are paths relative to the codebase root.
+    fn agent_codebase(
+        &self,
+        sources: &[SourceFile],
+        lang: ScorerLang,
+        context: &CodebaseContext<'_>,
+    ) -> Result<CodebasePlan, Self::Error>;
 }

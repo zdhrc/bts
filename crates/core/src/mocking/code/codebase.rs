@@ -22,8 +22,10 @@ pub struct CodebaseContext<'a> {
 ///
 /// Paths must be nonempty, unique within the plan, and consist only of normal
 /// relative path components. Absolute paths and parent components are rejected.
-/// The filesystem writer checks these requirements before changing any files.
+/// The filesystem writer checks destinations and removals before changing any files.
 pub struct CodebasePlan {
+    /// Obsolete files to remove only if their contents still match the planned snapshot.
+    pub removals: Vec<CodebaseRemoval>,
     pub files: Vec<CodebaseFile>,
 }
 
@@ -45,4 +47,11 @@ pub fn plan_codebase<T: Target + ?Sized>(
     context: &CodebaseContext<'_>,
 ) -> Result<CodebasePlan, T::Error> {
     target.codebase(assembly, context)
+}
+
+/// An obsolete file identified from the caller's existing-file snapshot.
+pub struct CodebaseRemoval {
+    pub path: PathBuf,
+    /// The writer preserves a file changed since planning.
+    pub expected: String,
 }

@@ -13,6 +13,8 @@ pub struct Model {
     pub bindings: Vec<Binding>,
     /// Resolved references indexed by [`RefId`].
     pub refs: Vec<ResolvedRef>,
+    /// Callable agent declarations and their root trace entrypoints.
+    pub agents: Vec<Agent>,
     /// Reusable scorer definitions in declaration order.
     pub scorers: Vec<Scorer>,
     /// Automation definitions in declaration order.
@@ -911,4 +913,13 @@ pub struct ObjectField {
     pub key: String,
     /// The value expression to inspect or evaluate.
     pub value: Value,
+}
+
+/// A named callable agent backed by a whole trace definition.
+#[derive(Debug, Clone)]
+pub struct Agent {
+    /// The name written in source.
+    pub name: String,
+    /// A resolved reference to the whole trace this agent executes.
+    pub entrypoint: RefId,
 }
