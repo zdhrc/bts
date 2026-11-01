@@ -2,7 +2,7 @@
 
 It's "another synthetics generator".
 
-`bts` creates synthetic workflows in [Braintrust](https://braintrust.dev): traces, datasets, scorer-backed experiments, and Topics automations. Describe a workflow in a shape file, then generate varied traffic over a historical time window, build regression cases, and compare versions with real scorer results.
+`bts` creates synthetic workflows in [Braintrust](https://braintrust.dev): traces, runnable mock agents, datasets, scorer-backed experiments, and Topics automations. Describe a workflow in a shape file, then generate varied traffic over a historical time window, build regression cases, and compare versions with real scorer results.
 
 ## Install
 
@@ -140,6 +140,8 @@ scorer "helpfulness" {
 }
 ```
 
+Code builds require `uvx` (installed with `uv`) for Python or `npx` (installed with npm) for TypeScript. Both scorer and agent builds format generated source with pinned Ruff or Prettier versions. The first uncached build needs network access to download the formatter.
+
 Build scorers into Python or TypeScript SDK source files:
 
 ```sh
@@ -162,6 +164,66 @@ bts sync automation scorers --from shape.bt
 ```
 
 See [code scorers](examples/code_scorer.bt), [LLM judges](examples/judge_scorer.bt), and [online scoring](examples/scoring_automations.bt).
+
+### Agents
+
+An `agent` declares a callable mock whose behavior comes from a whole trace:
+
+```bts
+agent "support" { entrypoint = trace.support }
+trace "support" {
+    input = { question = "Where are my invoices?" }
+    output = "You asked: ${self.input.question}"
+}
+```
+
+`bts build agent --from shape.bt --lang python --out generated` emits modules under `src/agents`. Call `run(input)` to supply an input or `run()` to use the authored input. Python also exports `run_details` and `run_traced`, and TypeScript exports `runDetails` and `runTraced`, for inspecting spans or attaching a Braintrust parent span. These agents execute authored mock behavior without making LLM or tool calls.
+
+The [customer-support example](examples/customer_support_agent.bt) includes an agent, inline dataset cases, and code scorers. Select a project with `bt switch` before building its eval entrypoint. A shape without experiments does not require a project or API key to build or run its agent.
+
+For Python 3.10 or newer:
+
+```sh
+bts build agent --from examples/customer_support_agent.bt --lang python --out generated/python
+(
+    cd generated/python
+    uv sync
+    uv run python -c 'from agents.customer_support_agent import run; print(run())'
+    uv run bt eval --runner python src/evals/customer_support_eval.py --no-send-logs
+)
+```
+
+For Node.js 24.2 or newer:
+
+```sh
+bts build agent --from examples/customer_support_agent.bt --lang typescript --out generated/typescript
+(
+    cd generated/typescript
+    npm install
+    npm run build
+    node --input-type=module -e 'import {run} from "./src/agents/customer_support_agent.mts"; console.log(run())'
+    bt eval --runner node src/evals/customer_support.eval.ts --no-send-logs
+)
+```
+
+Install `bt` separately for these eval commands. `--no-send-logs` evaluates the local cases without uploading results. Omit it to create a Braintrust experiment with your configured credentials, or use `--dev` for the eval development server. Generated evals pass only the case input to the agent and keep expected answers available to scorers. Import agent or scorer implementation modules when you only need their functions. Eval entrypoints register during CLI discovery and execute during a normal import. Import `evals/<name>_definition.py` or `evals/<name>.definition.ts` to inspect cases or call `evaluate` without starting a run.
+
+Choose an agent or experiment with repeatable `--select` flags. Selecting an agent includes its evals. Selecting an experiment includes its agent, dataset, scorers, and baseline chain. Omit selection to build every agent and experiment:
+
+```sh
+bts build agent --from shape.bt --select 'agent.support' --lang python --out generated
+bts build agent --from shape.bt --select 'experiment.improved' --seed 42 --lang typescript --out generated
+```
+
+Generated eval datasets support dynamic inline expressions, trace sources, span sources, and ordered groups. Cases are sampled at build time with `--seed` (default `42`), so rebuilding with the same source and seed reproduces the cases. Trace and span sources supply their input and use their output as expected unless the case overrides it. Groups become ordered arrays of inputs and expected outputs. Repeated references within a case share the same sampled instance. Case metadata and tags are preserved.
+
+Both code and judge scorers run locally through the Braintrust SDK. Judge evals use the authored prompt, model, and choice scores through `autoevals`, without a separate scorer deployment. Running judge scorers requires model credentials and incurs inference costs even with `--no-send-logs`. Rebuild with `bts build agent` after changing a local judge. `bts build scorers` generates its deployment registration.
+
+Eval builds also emit an ordered suite runner: `uv run python src/evals/run_evals.py` or `node src/evals/run-evals.mts`. It runs baselines first and links candidates to the experiment IDs returned by those runs. Add `--no-send-logs` to execute the suite locally without uploading comparisons. Individual `bt eval` entrypoints remain available and resolve an authored baseline by its existing experiment name.
+
+Agent entrypoints must be whole traces. Local attachments and nested scorer spans remain unsupported in generated agents. Use the existing trace and experiment commands for those shapes.
+
+Generated agents accept an injectable random source, but do not reproduce `bts write traces --seed` sampling. Authored durations appear in the detailed results without delaying execution. Traced spans use actual execution time.
 
 ### Datasets
 

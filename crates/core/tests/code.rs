@@ -188,7 +188,7 @@ fn braintrust_target_accepts_an_external_emitters_source_and_exports() {
     assert!(source.contains("def exported_0(output):\n    return 0.5\n"));
     assert!(source.contains("def exported_1(output):\n    return 0.9\n"));
     let wrapper = &assembly.files[1].contents;
-    assert!(wrapper.contains("from .packed import exported_0, exported_1"));
+    assert!(wrapper.contains("from .packed_impl import exported_0, exported_1"));
     assert!(!wrapper.contains("def exported_"));
     let registrations: Vec<_> = wrapper.split("project.scorers.create(").skip(1).collect();
     assert_eq!(registrations.len(), 2);
@@ -383,7 +383,7 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
         let runtime = plan
             .files
             .iter()
-            .find(|file| file.path == Path::new(&format!("generated/src/agents/_runtime.{extension}")))
+            .find(|file| file.path == Path::new(&format!("generated/src/agents/support_agent_runtime.{extension}")))
             .unwrap();
         assert!(runtime.contents.contains(tracing));
         assert!(plan.files.iter().all(|file| !file.contents.contains("braintrust")));

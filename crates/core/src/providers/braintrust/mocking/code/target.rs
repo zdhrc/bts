@@ -10,11 +10,21 @@ use std::fmt;
 /// Builds scorer registrations and codebase files for Braintrust.
 pub struct CodeTarget {
     project: String,
+    seed: u64,
 }
 
 impl CodeTarget {
     pub fn new(project: impl Into<String>) -> Self {
-        Self { project: project.into() }
+        Self {
+            project: project.into(),
+            seed: 42,
+        }
+    }
+
+    /// Sets the seed used to snapshot generated eval datasets.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
     }
 }
 
@@ -28,7 +38,7 @@ impl Target for CodeTarget {
     fn code(&self, group: CodeGroup<'_>, module: Module) -> Result<Vec<SourceFile>, Error> {
         let implementation = planning::callable_name(group.stem, group.lang);
         let registration = SourceFile {
-            name: source_name(group.stem, group.lang),
+            name: planning::source_name(group.stem, group.lang),
             contents: registrations::code(group.lang, &self.project, group.items, &module, &implementation),
             slugs: group.items.iter().map(|item| item.slug.to_owned()).collect(),
             lang: group.lang,
@@ -50,7 +60,7 @@ impl Target for CodeTarget {
 
     fn judge(&self, judge: Judge<'_>) -> Result<SourceFile, Error> {
         Ok(SourceFile {
-            name: source_name(judge.slug, judge.lang),
+            name: planning::source_name(judge.slug, judge.lang),
             contents: registrations::judge(
                 judge.lang,
                 &self.project,
@@ -85,7 +95,9 @@ impl Target for CodeTarget {
 
 impl CodeTarget {
     pub fn agent_assembly(&self, model: &Model, lang: ScorerLang, mut assembly: Assembly) -> Result<Assembly, Error> {
-        assembly.files.extend(evaluation::assemble(model, lang, &self.project)?);
+        assembly
+            .files
+            .extend(evaluation::assemble(model, lang, &self.project, self.seed)?);
         Ok(assembly)
     }
 }
@@ -126,17 +138,6 @@ impl AgentTarget for CodeTarget {
                     candidates.insert(format!("{stem}_agent.{extension}").into());
                 }
             }
-            if let Some(name) = source.name.strip_prefix("src/evals/") {
-                let legacy = name
-                    .strip_suffix("_eval.py")
-                    .map(|stem| format!("src/scorers/{stem}.py"))
-                    .or_else(|| name.strip_suffix(".eval.mts").map(|stem| format!("src/scorers/{stem}.mts")));
-                if let Some(legacy) = legacy
-                    && !sources.iter().any(|source| source.name == legacy)
-                {
-                    candidates.insert(legacy.into());
-                }
-            }
         }
         for path in candidates {
             if let Some(contents) = context.files.read(&path).map_err(|source| {
@@ -160,29 +161,6 @@ impl AgentTarget for CodeTarget {
 
 pub fn resolve_slugs(scorers: &[Scorer]) -> Result<Vec<String>, code::Error> {
     code::resolve_slugs(scorers, &CodeTarget::new(""))
-}
-
-fn source_name(stem: &str, lang: ScorerLang) -> String {
-    match lang {
-        ScorerLang::Python => {
-            let mut normalized = String::new();
-            for ch in stem.chars() {
-                if ch.is_ascii_alphanumeric() {
-                    normalized.push(ch.to_ascii_lowercase());
-                } else if !normalized.ends_with('_') && !normalized.is_empty() {
-                    normalized.push('_');
-                }
-            }
-            let normalized = normalized.trim_end_matches('_');
-            let prefix = if normalized.starts_with(|ch: char| ch.is_ascii_digit()) {
-                "_"
-            } else {
-                ""
-            };
-            format!("{prefix}{normalized}_scorer.py")
-        }
-        ScorerLang::Typescript => format!("{stem}.scorer.ts"),
-    }
 }
 
 #[derive(Debug)]
@@ -247,6 +225,58 @@ mod tests {
         assert!(built.files[1].contents.contains("handler: scorer_answer_coverage"));
         assert!(built.files[2].contents.contains("choiceScores:"));
     }
+
+    #[test]
+    fn callable_names_preserve_registrations_without_keywords_or_file_collisions() {
+        let model = compile(
+            r#"scorer "class" { code { score = 1 } }
+               scorer "foo" { code { score = 1 } }
+               scorer "foo-scorer" { code { score = 1 } }
+               scorer "123 Quality" { code { score = 1 } }"#,
+        )
+        .unwrap();
+        let target = CodeTarget::new("test-project");
+        for (lang, expected) in [
+            (
+                ScorerLang::Python,
+                [
+                    ("class", "class_impl.py", "class_scorer.py"),
+                    ("foo", "foo_impl.py", "foo_scorer.py"),
+                    ("foo-scorer", "foo_scorer_impl.py", "foo_scorer_scorer.py"),
+                    ("123-quality", "_123_quality_impl.py", "_123_quality_scorer.py"),
+                ],
+            ),
+            (
+                ScorerLang::Typescript,
+                [
+                    ("class", "class.impl.ts", "class.scorer.ts"),
+                    ("foo", "foo.impl.ts", "foo.scorer.ts"),
+                    ("foo-scorer", "foo-scorer.impl.ts", "foo-scorer.scorer.ts"),
+                    ("123-quality", "123-quality.impl.ts", "123-quality.scorer.ts"),
+                ],
+            ),
+        ] {
+            let assembly = assemble(&model.scorers, Some(lang), &Languages, &target).unwrap();
+            assert_eq!(assembly.files.len(), expected.len() * 2);
+            for (slug, implementation, registration) in expected {
+                let callable = assembly.files.iter().find(|file| file.name == implementation).unwrap();
+                assert!(callable.slugs.is_empty());
+                let registration = assembly.files.iter().find(|file| file.name == registration).unwrap();
+                assert_eq!(registration.slugs, [slug]);
+                match lang {
+                    ScorerLang::Python => {
+                        let module = implementation.strip_suffix(".py").unwrap();
+                        assert!(registration.contents.contains(&format!("from .{module} import ")));
+                        assert!(registration.contents.contains(&format!("from {module} import ")));
+                    }
+                    ScorerLang::Typescript => {
+                        let module = implementation.strip_suffix(".ts").unwrap();
+                        assert!(registration.contents.contains(&format!("from \"./{module}.js\"")));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(test, feature = "native"))]
@@ -309,13 +339,13 @@ mod writing_tests {
         let code = &scorers[0].path;
         assert_eq!(code.file_name().unwrap(), "answer_quality_scorer.py");
         assert!(
-            fs::read_to_string(out.join("src/scorers/answer_quality.py"))
+            fs::read_to_string(out.join("src/scorers/answer_quality_impl.py"))
                 .unwrap()
                 .contains("def scorer_answer_quality(")
         );
         assert_eq!(scorers[0].slugs, ["answer-quality", "answer-coverage"]);
         assert!(
-            fs::read_to_string(out.join("src/scorers/answer_quality.py"))
+            fs::read_to_string(out.join("src/scorers/answer_quality_impl.py"))
                 .unwrap()
                 .contains("def scorer_answer_coverage(")
         );
@@ -339,7 +369,7 @@ mod writing_tests {
         assert_eq!(scorers[0].slugs, ["response-quality", "response-length"]);
         let path = &scorers[0].path;
         assert_eq!(path.file_name().unwrap(), "quality_scorer.py");
-        let contents = fs::read_to_string(out.join("src/scorers/quality.py")).unwrap();
+        let contents = fs::read_to_string(out.join("src/scorers/quality_impl.py")).unwrap();
         assert!(contents.contains("def scorer_response_quality(") && contents.contains("def scorer_response_length("));
 
         fs::remove_dir_all(out).unwrap();
@@ -509,7 +539,7 @@ dependencies = ["braintrust==0.40.0", "requests>=2"]
         assert!(
             plan.files
                 .iter()
-                .any(|file| file.path == Path::new("src/evals/customer_support.eval.mts"))
+                .any(|file| file.path == Path::new("src/evals/customer_support.eval.ts"))
         );
     }
 }

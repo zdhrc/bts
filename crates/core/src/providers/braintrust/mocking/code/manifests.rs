@@ -329,6 +329,10 @@ pub(super) fn plan_agents(
                     if modules.iter().any(|module| module.ends_with(".scorer.ts")) {
                         dependencies.entry("zod").or_insert_with(|| json!("^4.0.0"));
                     }
+                    if modules.iter().any(|module| module.ends_with(".judge.ts")) {
+                        dependencies.entry("autoevals").or_insert_with(|| json!("^0.4.1"));
+                        dependencies.entry("zod").or_insert_with(|| json!("^4.0.0"));
+                    }
                     if tokens {
                         dependencies.entry("js-tiktoken").or_insert_with(|| json!("1.0.21"));
                     }
@@ -351,6 +355,10 @@ pub(super) fn plan_agents(
             let mut dependencies = vec![("braintrust", "braintrust>=0.39,<1")];
             if modules.iter().any(|p| p.ends_with("_scorer.py")) {
                 dependencies.push(("pydantic", "pydantic>=2,<3"));
+            }
+            if modules.iter().any(|p| p.ends_with("_judge.py")) {
+                dependencies.push(("autoevals", "autoevals>=0.4,<0.5"));
+                dependencies.push(("openai", "openai>=2,<3"));
             }
             if tokens {
                 dependencies.push(("tiktoken", "tiktoken>=0.9,<1"));

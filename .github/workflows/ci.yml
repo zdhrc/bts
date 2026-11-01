@@ -21,6 +21,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      - name: Check generated evals with the Braintrust SDKs
+        run: cargo test --locked -p bts --test e2e agent_evals_register_and_run_with_braintrust_sdks -- --ignored --exact
 
   wasm:
     runs-on: ubuntu-latest

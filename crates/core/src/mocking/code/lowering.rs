@@ -4339,8 +4339,10 @@ mod native {
                                 Type::String,
                             );
                         }
+                        // typescript keeps float markers when arithmetic produces a whole number
                         ("_arithmetic", [Expr::String(op), left, right], [_, a, b])
-                            if matches!(a, Type::Number | Type::Integer(..))
+                            if lang == ScorerLang::Python
+                                && matches!(a, Type::Number | Type::Integer(..))
                                 && matches!(b, Type::Number | Type::Integer(..))
                                 && (matches!(a, Type::Number) || matches!(b, Type::Number)) =>
                         {
@@ -5436,55 +5438,42 @@ pub(crate) mod scoring {
     impl std::error::Error for Error {}
 }
 
-pub(crate) fn literal(value: &Value) -> Result<Json, String> {
-    Ok(match value {
-        Value::Str(v) => json!(v),
-        Value::Num(Number::Int(v)) => json!(v),
-        Value::Num(Number::Float(v)) => json!(v),
-        Value::Bool(v) => json!(v),
-        Value::Null => Json::Null,
-        Value::Object(v) => {
-            let mut object = serde_json::Map::new();
-            for field in &v.elem {
-                object.insert(field.key.clone(), literal(&field.value)?);
+pub(crate) fn cases(model: &Model, dataset: &crate::dsl::Dataset, seed: u64, lang: ScorerLang) -> Result<Vec<Json>, String> {
+    fn safe_numbers(value: &Json) -> bool {
+        match value {
+            Json::Number(number) => {
+                number
+                    .as_i64()
+                    .is_none_or(|n| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&n))
+                    && number.as_u64().is_none_or(|n| n <= 9_007_199_254_740_991)
             }
-            Json::Object(object)
+            Json::Array(values) => values.iter().all(safe_numbers),
+            Json::Object(values) => values.values().all(safe_numbers),
+            _ => true,
         }
-        Value::Array(v) => {
-            let mut values = Vec::new();
-            for item in &v.elem {
-                match item {
-                    ArrayElem::Item(v) => values.push(literal(v)?),
-                    ArrayElem::Spread(v) => {
-                        let Json::Array(items) = literal(v)? else {
-                            return Err("eval dataset spread must be an array".into());
-                        };
-                        values.extend(items);
-                    }
-                }
-            }
-            Json::Array(values)
-        }
-        _ => return Err("generated eval cases require literal values; dynamic datasets are not supported yet".into()),
-    })
-}
+    }
 
-pub(crate) fn cases(dataset: &crate::dsl::Dataset) -> Result<Vec<Json>, String> {
-    use crate::dsl::DatasetSource;
     let mut rows = Vec::new();
     for case in &dataset.cases {
-        let DatasetSource::Inline(input) = &case.source else {
-            return Err(format!("generated eval dataset {:?} requires inline cases", dataset.name));
-        };
-        let mut row = json!({"input": literal(input)?});
-        for (key, value) in [
-            ("expected", &case.expected),
-            ("metadata", &case.metadata),
-            ("tags", &case.tags),
-        ] {
-            if let Some(value) = value {
-                row[key] = literal(value)?;
-            }
+        let context = |message: String| format!("generated eval dataset {:?}, case {:?}: {message}", dataset.name, case.name);
+        let key = json!([dataset.name, case.name]).to_string();
+        let hash = crate::mocking::data::stable_uuid(&key);
+        let case_seed = seed ^ u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+        let row = crate::mocking::data::case_snapshot(model, case, case_seed)
+            .map_err(|error| context(error.to_string()))?
+            .project(&())
+            .map_err(|_| context("local attachments cannot be embedded in generated eval cases".into()))?;
+        if row.get("metadata").is_some_and(|metadata| !metadata.is_object()) {
+            return Err(context("metadata must evaluate to an object".into()));
+        }
+        if row
+            .get("tags")
+            .is_some_and(|tags| !tags.as_array().is_some_and(|tags| tags.iter().all(Json::is_string)))
+        {
+            return Err(context("tags must evaluate to an array of strings".into()));
+        }
+        if lang == ScorerLang::Typescript && !safe_numbers(&row) {
+            return Err(context("an integer exceeds TypeScript's safe integer range".into()));
         }
         rows.push(row);
     }

@@ -18,7 +18,7 @@ pub use delivery::{RunError, RunResult, WriteError, Written, run, write};
 pub use events::{Event, EventBatch, EventKind, stable_uuid};
 pub use generation::{
     Distribution, Error, EvaluationError, EvaluationErrorKind, MaterializationError, MaterializationErrorKind, PrepareError,
-    case_data, experiment_result, generate, generate_filtered, prepare,
+    case_data, case_snapshot, experiment_result, generate, generate_filtered, prepare,
 };
 pub use request::Request;
 pub use value::{Attachment, UnsupportedAttachment, Value};

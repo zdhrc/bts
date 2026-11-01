@@ -169,6 +169,12 @@ pub fn case_data(
     seed: u64,
     format: &dyn AttachmentFormat,
 ) -> Result<EventBatch, Error> {
+    let plan = evaluation::plan_case_data(model, case_input(case), seed, format).map_err(Error::Plan)?;
+    materialization::materialize(plan, Duration::from_secs(3600), Distribution::Linear, SystemTime::now())
+        .map_err(Error::Materialize)
+}
+
+fn case_input(case: &crate::dsl::DatasetCase) -> crate::dsl::Value {
     use crate::dsl::{DatasetSource, Object, ObjectField, Value};
     let mut fields = Vec::new();
     if let DatasetSource::Inline(input) = &case.source {
@@ -189,9 +195,244 @@ pub fn case_data(
             });
         }
     }
-    let plan = evaluation::plan_case_data(model, Value::Object(Object { elem: fields }), seed, format).map_err(Error::Plan)?;
-    materialization::materialize(plan, Duration::from_secs(3600), Distribution::Linear, SystemTime::now())
-        .map_err(Error::Materialize)
+    Value::Object(Object { elem: fields })
+}
+
+/// Snapshots an eval case without reading the clock or accessing external services.
+///
+/// Trace and span sources supply their input and, unless overridden, output as
+/// expected. Groups preserve source order as arrays. References within one case
+/// share an instance, so sampled inputs and expected values stay consistent.
+pub fn case_snapshot(model: &Model, case: &crate::dsl::DatasetCase, seed: u64) -> Result<super::Value, Error> {
+    use crate::dsl::{Accessor, Array, ArrayElem, Child, DatasetSource, Field, NodeId, RefId, SpanFields, Value};
+
+    fn child_fields(children: &[Child], node: NodeId) -> Option<&SpanFields> {
+        children.iter().find_map(|child| match child {
+            Child::Span(span) if span.node == node => Some(&span.fields),
+            Child::Span(span) => child_fields(&span.children, node),
+            Child::Repeat(block) => child_fields(&block.children, node),
+            Child::Choice(block) => child_fields(&block.children, node),
+            Child::Maybe(block) => child_fields(&block.children, node),
+            Child::Scorer(_) => None,
+        })
+    }
+
+    fn field(model: &mut Model, id: RefId, field: Field) -> Option<Value> {
+        let mut reference = model.refs[id.0 as usize].clone();
+        let Accessor::Block { node, .. } = reference.accessor else {
+            return None;
+        };
+        let fields = model.traces.iter().find_map(|trace| {
+            if trace.node == node {
+                Some(&trace.fields)
+            } else {
+                child_fields(&trace.children, node)
+            }
+        })?;
+        match field {
+            Field::Input => fields.input.as_ref()?,
+            Field::Output => fields.output.as_ref()?,
+            _ => unreachable!("snapshots only read source input and output"),
+        };
+        reference.accessor = Accessor::Field(field);
+        let range = reference.range;
+        let ref_id = RefId(model.refs.len() as u32);
+        model.refs.push(reference);
+        Some(Value::BlockRef { ref_id, range })
+    }
+
+    let mut model = model.clone();
+    let mut case = case.clone();
+    match &case.source {
+        DatasetSource::Inline(_) => {}
+        DatasetSource::Trace(id) | DatasetSource::Span(id) => {
+            let input = field(&mut model, *id, Field::Input).unwrap_or(Value::Null);
+            if case.expected.is_none() {
+                case.expected = field(&mut model, *id, Field::Output);
+            }
+            case.source = DatasetSource::Inline(input);
+        }
+        DatasetSource::Group(ids) => {
+            let inputs = ids
+                .iter()
+                .map(|id| ArrayElem::Item(field(&mut model, *id, Field::Input).unwrap_or(Value::Null)))
+                .collect();
+            if case.expected.is_none() {
+                let outputs = ids
+                    .iter()
+                    .map(|id| ArrayElem::Item(field(&mut model, *id, Field::Output).unwrap_or(Value::Null)))
+                    .collect();
+                case.expected = Some(Value::Array(Array { elem: outputs }));
+            }
+            case.source = DatasetSource::Inline(Value::Array(Array { elem: inputs }));
+        }
+    }
+    let plan = evaluation::plan_case_data(&model, case_input(&case), seed, &()).map_err(Error::Plan)?;
+    Ok(plan
+        .events
+        .into_vec()
+        .remove(0)
+        .fields
+        .input
+        .expect("case input is always present"))
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::dsl::semantics::compile;
+    use crate::mocking::data::{UnsupportedAttachment, Value};
+    use serde_json::{Value as JsonValue, json};
+
+    fn snapshot(model: &Model, case: usize, seed: u64) -> JsonValue {
+        case_snapshot(model, &model.datasets[0].cases[case], seed)
+            .unwrap()
+            .project(&())
+            .unwrap()
+    }
+
+    #[test]
+    fn inline_references_share_samples_and_respect_the_seed() {
+        let model = compile(
+            r#"trace "sample" {
+                input = { first = range(1, 1000000000), second = range(1, 1000000000) }
+                output = self.input.first + self.input.second
+            }
+            dataset "cases" {
+                case "inline" {
+                    input = trace.sample.input
+                    expected = trace.sample.output
+                    metadata = { first = trace.sample.input.first }
+                    tags = ["sample-${trace.sample.input.second}"]
+                }
+            }"#,
+        )
+        .unwrap();
+        let row = snapshot(&model, 0, 42);
+        let first = row["input"]["first"].as_i64().unwrap();
+        let second = row["input"]["second"].as_i64().unwrap();
+        assert_eq!(row["expected"], first + second);
+        assert_eq!(row["metadata"]["first"], first);
+        assert_eq!(row["tags"], json!([format!("sample-{second}")]));
+        assert_eq!(row, snapshot(&model, 0, 42));
+        assert_ne!(row["input"], snapshot(&model, 0, 43)["input"]);
+    }
+
+    #[test]
+    fn trace_and_nested_span_sources_default_to_output_and_allow_expected_overrides() {
+        let model = compile(
+            r#"trace "support" {
+                input = { request = "question" }
+                output = task.answer.tool.reply.output
+                task "answer" {
+                    input = trace.input.request
+                    tool "reply" {
+                        input = { query = task.answer.input }
+                        output = { answer = "answer", request = self.input.query }
+                    }
+                }
+            }
+            trace "deferred" { input = "question" output = 1 / range(0, 0) }
+            dataset "cases" {
+                case "trace" { trace = trace.support }
+                case "span" { span = trace.support.task.answer.tool.reply }
+                case "trace-override" { trace = trace.support expected = "reviewed trace" }
+                case "span-override" { span = trace.support.task.answer.tool.reply expected = null }
+                case "unused-output" { trace = trace.deferred expected = "reviewed" }
+                case "invalid-default" { trace = trace.deferred }
+            }"#,
+        )
+        .unwrap();
+        let expected = json!({"answer": "answer", "request": "question"});
+        assert_eq!(
+            snapshot(&model, 0, 42),
+            json!({"input": {"request": "question"}, "expected": expected})
+        );
+        assert_eq!(
+            snapshot(&model, 1, 42),
+            json!({"input": {"query": "question"}, "expected": expected})
+        );
+        assert_eq!(snapshot(&model, 2, 42)["expected"], "reviewed trace");
+        assert_eq!(
+            snapshot(&model, 3, 42),
+            json!({"input": {"query": "question"}, "expected": null})
+        );
+        assert_eq!(snapshot(&model, 4, 42), json!({"input": "question", "expected": "reviewed"}));
+        let error = case_snapshot(&model, &model.datasets[0].cases[5], 42).unwrap_err();
+        assert!(matches!(error, Error::Plan(error) if error.kind() == EvaluationErrorKind::DivisionByZero));
+    }
+
+    #[test]
+    fn grouped_sources_preserve_order_and_reuse_repeated_trace_values() {
+        let model = compile(
+            r#"trace "first" { input = { label = "first", number = range(1, 1000000) } output = self.input.number * 2 }
+               trace "second" { input = { label = "second", number = range(1, 1000000) } output = self.input.number * 2 }
+               dataset "cases" {
+                   case "group" { traces = [trace.second, trace.first, trace.second] }
+                   case "override" { traces = [trace.second, trace.first] expected = "reviewed group" }
+               }"#,
+        )
+        .unwrap();
+        let row = snapshot(&model, 0, 17);
+        let inputs = row["input"].as_array().unwrap();
+        let expected = row["expected"].as_array().unwrap();
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|value| value["label"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["second", "first", "second"]
+        );
+        assert_eq!(inputs[0], inputs[2]);
+        assert_eq!(expected[0], expected[2]);
+        for (input, output) in inputs.iter().zip(expected) {
+            assert_eq!(*output, input["number"].as_i64().unwrap() * 2);
+        }
+        assert_eq!(snapshot(&model, 1, 17)["expected"], "reviewed group");
+    }
+
+    #[test]
+    fn missing_source_fields_preserve_null_input_and_absent_expected() {
+        let model = compile(
+            r#"trace "empty" { task "empty" {} }
+               trace "answer" { output = "answer" }
+               dataset "cases" {
+                   case "trace" { trace = trace.empty }
+                   case "span" { span = trace.empty.task.empty }
+                   case "answer" { trace = trace.answer }
+                   case "group" { traces = [trace.empty, trace.answer] }
+               }"#,
+        )
+        .unwrap();
+        assert_eq!(snapshot(&model, 0, 42), json!({"input": null}));
+        assert_eq!(snapshot(&model, 1, 42), json!({"input": null}));
+        assert_eq!(snapshot(&model, 2, 42), json!({"input": null, "expected": "answer"}));
+        assert_eq!(
+            snapshot(&model, 3, 42),
+            json!({"input": [null, null], "expected": [null, "answer"]})
+        );
+    }
+
+    #[test]
+    fn attachments_stay_typed_and_fail_without_a_projection() {
+        let model = compile(
+            r#"trace "document" { input = attachment("report.txt", "text/plain") }
+               dataset "cases" {
+                   case "inline" { input = { files = [attachment("report.txt", "text/plain")] } }
+                   case "trace" { trace = trace.document }
+                   case "projected" { input = trace.document.input.filename }
+               }"#,
+        )
+        .unwrap();
+        let inline = case_snapshot(&model, &model.datasets[0].cases[0], 42).unwrap();
+        assert!(matches!(inline["input"]["files"][0], Value::Attachment(_)));
+        assert_eq!(inline.project(&()).unwrap_err(), UnsupportedAttachment);
+        let trace = case_snapshot(&model, &model.datasets[0].cases[1], 42).unwrap();
+        assert!(matches!(trace["input"], Value::Attachment(_)));
+        assert_eq!(trace.project(&()).unwrap_err(), UnsupportedAttachment);
+        let error = case_snapshot(&model, &model.datasets[0].cases[2], 42).unwrap_err();
+        assert!(matches!(error, Error::Plan(error) if error.kind() == EvaluationErrorKind::UnsupportedAttachment));
+    }
 }
 
 #[cfg(test)]

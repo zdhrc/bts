@@ -928,8 +928,8 @@ function validate_input(value: unknown, schema: any, path = "input"): any {
     throw new TypeError(path + " must be a " + schema.type);
 }
 function checked_number(value: number): number { return _num(value); }
-function remainder(left: number, right: number): number { return checked_number(left % right); }
-function divide(left: number, right: number): number { return checked_number(Number.isInteger(left) && Number.isInteger(right) ? Math.trunc(left / right) : left / right); }
+function remainder(left: unknown, right: unknown): number | _Float { return _arithmetic("%", left, right); }
+function divide(left: unknown, right: unknown): number | _Float { return _arithmetic("/", left, right); }
 
 class ExecutionContext {
     current: Span | null = null;
@@ -955,14 +955,14 @@ class ExecutionContext {
             let parent = span.parent;
             while (parent !== null && !indices.has(parent)) parent = parent.parent;
             return {name: span.name, type: span.kind, parent: parent === null ? null : indices.get(parent),
-                ...Object.fromEntries(Object.entries(span.fields).map(([key, value]) => [key, _value(value)]))};
+                ...Object.fromEntries(Object.entries(span.fields).map(([key, value]) => [key, _serialize(value)]))};
         });
         const children = Array(rows.length).fill(0);
         for (let index = rows.length - 1; index >= 0; index--) {
             const row = rows[index]; row.duration = Math.max(row.duration ?? 0.1, children[index]);
             if (row.parent !== null) children[row.parent] += row.duration;
         }
-        return {output: _value(output), spans: rows};
+        return {output: _serialize(output), spans: rows};
     }
 }
 
@@ -1009,7 +1009,7 @@ class Span {
         Object.assign(this.fields, fields);
         for(const key of ["metadata", "metrics"]) if(key in fields && (fields[key]===null || typeof fields[key]!=="object" || Array.isArray(fields[key]))) throw new TypeError(key+" must be an object");
         if("tags" in fields && (!Array.isArray(fields.tags) || fields.tags.some((tag:unknown)=>typeof tag!=="string"))) throw new TypeError("tags must be strings");
-        if (this.ownsSpan && !this.ended) logTrace(this.span, Object.fromEntries(Object.entries(fields).filter(([key])=>key!=="duration")));
+        if (this.ownsSpan && !this.ended) logTrace(this.span, _serialize(Object.fromEntries(Object.entries(fields).filter(([key])=>key!=="duration"))));
     }
     fail(error: unknown): void {if(this.ownsSpan && !this.ended) logTrace(this.span, {error: error instanceof Error ? error.message : String(error)});}
     close(): void {if(this.ownsSpan && !this.ended){this.ended=true; endTrace(this.span);}}
@@ -1018,9 +1018,16 @@ class Span {
 function _force(value: unknown): any { return typeof value === "function" ? value() : value; }
 function _value(value: unknown): any {
     value = _force(value);
-    if (value instanceof _Float) return value.value;
+    if (value instanceof _Float) return value;
     if (Array.isArray(value)) return value.map(_value);
     if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, _value(item)]));
+    return value;
+}
+function _serialize(value: unknown): any {
+    value = _force(value);
+    if (value instanceof _Float) return value.value;
+    if (Array.isArray(value)) return value.map(_serialize);
+    if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, _serialize(item)]));
     return value;
 }
 function _read(scope: Span, key: string): any {
@@ -1056,7 +1063,7 @@ function _details(root: Span): {output: unknown, spans: Record<string, unknown>[
         }
         if ("tags" in fields && (!Array.isArray(fields.tags) || fields.tags.some((tag: unknown) => typeof tag !== "string"))) throw new TypeError("tags must be strings");
         const index = spans.length;
-        spans.push({name: scope.name, type: scope.kind, parent, ...fields});
+        spans.push({name: scope.name, type: scope.kind, parent, ..._serialize(fields)});
         const childrenDuration = Object.values(scope.children).reduce((sum, child) => sum + visit(_force(child), index), 0);
         const duration = Math.max(fields.duration ?? 0.1, childrenDuration);
         spans[index].duration = duration;
@@ -1065,7 +1072,7 @@ function _details(root: Span): {output: unknown, spans: Record<string, unknown>[
     }
     try {
         visit(root, null);
-        return {output: _value(_read(root, "output")), spans};
+        return {output: _serialize(_read(root, "output")), spans};
     } catch(error) {root.fail(error);throw error;}
     finally {root.closeAll();}
 }
@@ -1390,7 +1397,7 @@ def _tokens(value):
 import { getEncoding as _getEncoding } from "js-tiktoken";
 const _encoding = _getEncoding("o200k_base");
 function _tokens(value: unknown): number {
-    value = _value(value);
+    value = _serialize(value);
     const sorted = (item: any): any => Array.isArray(item) ? item.map(sorted) : item !== null && typeof item === "object" ? Object.fromEntries(Object.keys(item).sort().map(key => [key, sorted(item[key])])) : item;
     return _encoding.encode(typeof value === "string" ? value : JSON.stringify(sorted(value)), [], []).length;
 }

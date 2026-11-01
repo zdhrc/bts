@@ -46,7 +46,11 @@ pub trait AgentAdapter: CodeAdapter
 where
     <Self::Provider as CodeProvider>::Target: code::AgentTarget,
 {
-    fn agent_target(&self, model: &crate::dsl::Model) -> Result<<Self::Provider as CodeProvider>::Target, Self::Error>;
+    fn agent_target(
+        &self,
+        model: &crate::dsl::Model,
+        seed: u64,
+    ) -> Result<<Self::Provider as CodeProvider>::Target, Self::Error>;
 
     fn assemble_agents(
         &self,

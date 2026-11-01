@@ -1,6 +1,6 @@
 //! Select generation targets and resolve their names and dependencies.
 
-use crate::dsl::{Accessor, Model, Scorer, ScorerKind, ScorerLang, Trace};
+use crate::dsl::{Accessor, Model, Scorer, ScorerLang, Trace};
 use std::collections::HashSet;
 
 // Normalize names consistently before constructing language identifiers.
@@ -47,8 +47,8 @@ pub(crate) fn source_name(stem: &str, lang: ScorerLang) -> String {
 pub(crate) fn callable_name(stem: &str, lang: ScorerLang) -> String {
     let registration = source_name(stem, lang);
     match lang {
-        ScorerLang::Python => registration.replace("_scorer.py", ".py"),
-        ScorerLang::Typescript => registration.replace(".scorer.ts", ".ts"),
+        ScorerLang::Python => format!("{}_impl.py", registration.strip_suffix("_scorer.py").unwrap()),
+        ScorerLang::Typescript => format!("{}.impl.ts", registration.strip_suffix(".scorer.ts").unwrap()),
     }
 }
 
@@ -115,9 +115,6 @@ pub(crate) fn evals(model: &Model) -> Result<Vec<Evaluation<'_>>, String> {
     let mut plans = Vec::new();
     let mut names = HashSet::new();
     for experiment in &model.experiments {
-        if experiment.baseline.is_some() {
-            return Err("generated eval baselines are not supported yet".into());
-        }
         let task = &model.refs[experiment.task.0 as usize].accessor;
         let matches = model
             .agents
@@ -151,14 +148,8 @@ pub(crate) fn evals(model: &Model) -> Result<Vec<Evaluation<'_>>, String> {
         let scorers = experiment
             .scorers
             .iter()
-            .map(|name| {
-                let scorer = model.scorers.iter().find(|s| &s.name == name).expect("validated scorer");
-                if !matches!(scorer.kind, ScorerKind::Code { .. }) {
-                    return Err(format!("generated evals support code scorers only; {name:?} is a judge"));
-                }
-                Ok(scorer)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+            .map(|name| model.scorers.iter().find(|s| &s.name == name).expect("validated scorer"))
+            .collect();
         plans.push(Evaluation {
             experiment,
             dataset,
@@ -167,7 +158,23 @@ pub(crate) fn evals(model: &Model) -> Result<Vec<Evaluation<'_>>, String> {
             scorers,
         });
     }
-    Ok(plans)
+    let mut ordered = Vec::with_capacity(plans.len());
+    let mut completed = HashSet::new();
+    while !plans.is_empty() {
+        let next = plans.iter().position(|plan| {
+            plan.experiment
+                .baseline
+                .as_ref()
+                .is_none_or(|baseline| completed.contains(baseline.as_str()))
+        });
+        let Some(index) = next else {
+            return Err("generated eval baselines must be present and have no dependency cycles".into());
+        };
+        let plan = plans.remove(index);
+        completed.insert(plan.experiment.name.as_str());
+        ordered.push(plan);
+    }
+    Ok(ordered)
 }
 
 pub(crate) struct Operation {

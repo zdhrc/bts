@@ -146,13 +146,13 @@ impl std::error::Error for Error {
 }
 
 impl AgentAdapter for Adapter {
-    fn agent_target(&self, model: &crate::dsl::Model) -> Result<braintrust::mocking::code::CodeTarget, Error> {
+    fn agent_target(&self, model: &crate::dsl::Model, seed: u64) -> Result<braintrust::mocking::code::CodeTarget, Error> {
         let project = if model.experiments.is_empty() {
             String::new()
         } else {
             <Self as CodeAdapter>::config(self)?
         };
-        Ok(braintrust::mocking::code::CodeTarget::new(project))
+        Ok(braintrust::mocking::code::CodeTarget::new(project).with_seed(seed))
     }
 
     fn assemble_agents(

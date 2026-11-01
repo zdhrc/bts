@@ -2,7 +2,7 @@ use crate::config::Settings;
 use crate::diag::SourceDiags;
 use crate::logging;
 use crate::providers::{AgentAdapter, CodeAdapter, braintrust};
-use crate::{code, dsl};
+use crate::{code, dsl, selection};
 use bts_core::providers::CodeProvider;
 use code::AgentTarget as _;
 use std::{env, fmt, fs, path::PathBuf};
@@ -25,6 +25,14 @@ pub struct Args {
     /// The codebase root. Generated files are organized under `src/`.
     #[arg(long, value_name = "DIR", default_value = ".")]
     out: PathBuf,
+
+    /// Select an agent or experiment and its dependencies. Repeat to select more.
+    #[arg(long, value_name = "TRAVERSAL", value_parser = crate::cmd::parse_selector)]
+    select: Vec<selection::ResourceSelector>,
+
+    /// The seed for generated evaluation cases. Agent builds default to 42.
+    #[arg(long)]
+    seed: Option<u64>,
 
     /// Print phase timings to standard error while running.
     #[arg(long)]
@@ -78,6 +86,9 @@ impl Args {
     }
 
     fn execute<A: CodeAdapter>(self, adapter: &A) -> Result<(), ExecutionError<A>> {
+        if !self.select.is_empty() || self.seed.is_some() {
+            return Err(BuildError::AgentOptions);
+        }
         let model = self.compile::<A>()?;
         if model.scorers.is_empty() {
             return Err(BuildError::NoScorers);
@@ -103,9 +114,11 @@ impl Args {
     where
         <A::Provider as CodeProvider>::Target: code::AgentTarget,
     {
-        let model = self.compile::<A>()?;
+        let model = selection::agents(&self.compile::<A>()?, &self.select).map_err(BuildError::Selection)?;
         let lang = self.lang.map(Lang::into_model).unwrap_or(dsl::ScorerLang::Python);
-        let target = adapter.agent_target(&model).map_err(BuildError::Adapter)?;
+        let target = adapter
+            .agent_target(&model, self.seed.unwrap_or(42))
+            .map_err(BuildError::Adapter)?;
         let assembly = tracing::info_span!("assemble")
             .in_scope(|| adapter.assemble_agents(&model, lang, &target))
             .map_err(BuildError::Agent)?;
@@ -186,6 +199,8 @@ pub enum BuildError<A, E, T> {
     ReadShape { path: PathBuf, source: std::io::Error },
     InvalidShape { details: SourceDiags },
     NoScorers,
+    AgentOptions,
+    Selection(selection::Error),
     Agent(String),
     Format(String),
     Plan(code::AssemblyError<E, T>),
@@ -205,6 +220,8 @@ impl<A: fmt::Display, E: fmt::Display, T: fmt::Display> fmt::Display for BuildEr
             Self::Agent(reason) => write!(formatter, "failed to build agents: {reason}"),
             Self::Format(reason) => write!(formatter, "failed to format generated code: {reason}"),
             Self::NoScorers => formatter.write_str("the shape declares no scorer blocks"),
+            Self::AgentOptions => formatter.write_str("--select and --seed require the agent build target"),
+            Self::Selection(source) => write!(formatter, "--select: {source}"),
             Self::Plan(source) => {
                 let message = match source {
                     code::AssemblyError::Plan(source) => crate::diag::build_error(source),
@@ -231,6 +248,7 @@ where
             Self::InvalidShape { details } => Some(details),
             Self::ReadShape { source, .. } => Some(source),
             Self::Plan(source) => Some(source),
+            Self::Selection(source) => Some(source),
             Self::Codebase(source) => Some(source),
             Self::Config(source) => Some(source),
             Self::Adapter(source) => Some(source),
@@ -275,6 +293,106 @@ mod tests {
         assert!(matches!(cli.args.target, Artifact::Agent));
         let cli = TestCli::parse_from(["build", "--from", "a.bt"]);
         assert!(matches!(cli.args.target, Artifact::Scorers));
+    }
+
+    #[test]
+    fn parses_agent_selection_and_seed_without_changing_scorer_defaults() {
+        let cli = TestCli::parse_from([
+            "build",
+            "agent",
+            "--from",
+            "a.bt",
+            "--select",
+            "agent.support",
+            "--select",
+            "experiment.baseline",
+            "--seed",
+            "19",
+        ]);
+        assert_eq!(cli.args.select.len(), 2);
+        assert_eq!(cli.args.select[0].kind, "agent");
+        assert_eq!(cli.args.select[1].name, "baseline");
+        assert_eq!(cli.args.seed, Some(19));
+        let cli = TestCli::parse_from(["build", "agent", "--from", "a.bt"]);
+        assert_eq!(cli.args.seed.unwrap_or(42), 42);
+        for flags in [["--select", "agent.support"], ["--seed", "42"]] {
+            let cli = TestCli::parse_from(["build", "--from", "missing.bt", flags[0], flags[1]]);
+            assert!(matches!(
+                cli.args.execute(&braintrust::Adapter),
+                Err(BuildError::AgentOptions)
+            ));
+        }
+    }
+
+    #[test]
+    fn agent_selection_precedes_adapter_configuration_and_passes_the_seed() {
+        struct SelectedAgent;
+        impl CodeAdapter for SelectedAgent {
+            type Provider = bts_core::providers::braintrust::Bundle;
+            type Error = std::io::Error;
+            fn provider(&self) -> Self::Provider {
+                bts_core::providers::braintrust::Bundle
+            }
+            fn config(&self) -> Result<String, Self::Error> {
+                unreachable!()
+            }
+            fn report_build(&self, _: &std::path::Path, _: &[code::writing::Built]) {
+                unreachable!()
+            }
+        }
+        impl AgentAdapter for SelectedAgent {
+            fn agent_target(
+                &self,
+                model: &dsl::Model,
+                seed: u64,
+            ) -> Result<bts_core::providers::braintrust::mocking::code::CodeTarget, Self::Error> {
+                assert_eq!(model.agents.len(), 1);
+                assert_eq!(model.agents[0].name, "standalone");
+                assert!(model.experiments.is_empty());
+                assert_eq!(model.scorers.len(), 1);
+                assert_eq!(model.scorers[0].name, "quality");
+                Err(std::io::Error::other(format!("selected seed {seed}")))
+            }
+        }
+        let path = std::env::temp_dir().join(format!("bts-agent-selection-{}.bt", uuid::Uuid::new_v4()));
+        fs::write(
+            &path,
+            r#"trace "standalone" { output = "hello" }
+               trace "unrelated" { output = "other" }
+               agent "standalone" { entrypoint = trace.standalone }
+               agent "unrelated" { entrypoint = trace.unrelated }
+               dataset "cases" { case "one" { input = "question" } }
+               scorer "quality" { code { score = 1 } }
+               experiment "unrelated" { task = trace.unrelated dataset = dataset.cases scorers = [scorer.quality] }"#,
+        )
+        .unwrap();
+        let cli = TestCli::parse_from([
+            "build",
+            "agent",
+            "--from",
+            path.to_str().unwrap(),
+            "--select",
+            "agent.standalone",
+            "--seed",
+            "19",
+        ]);
+        assert!(matches!(
+            cli.args.execute_agent(&SelectedAgent),
+            Err(BuildError::Adapter(error)) if error.to_string() == "selected seed 19"
+        ));
+        let cli = TestCli::parse_from([
+            "build",
+            "agent",
+            "--from",
+            path.to_str().unwrap(),
+            "--select",
+            "agent.missing",
+        ]);
+        assert!(matches!(
+            cli.args.execute_agent(&SelectedAgent),
+            Err(BuildError::Selection(selection::Error::Unknown { .. }))
+        ));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
