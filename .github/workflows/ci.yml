@@ -18,6 +18,40 @@ jobs:
           node-version: 24
       - uses: astral-sh/setup-uv@v6
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p bts-lang --lib
+      - run: cargo clippy --locked -p bts-wasm --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - run: cargo install wasm-pack --version 0.15.0 --locked
+      - run: |
+          wasm-pack build crates/wasm --target web --out-dir ../../target/wasm-pkg -- --locked
+          cp LICENSE target/wasm-pkg/
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Check browser package from TypeScript
+        run: |
+          npm exec --yes --package=typescript@5.9.3 -- tsc --noEmit --strict --target es2022 --module nodenext --lib es2022,dom crates/wasm/tests/package.mts
+          node --input-type=module <<'JS'
+          import { readFile } from 'node:fs/promises';
+          import { check } from './crates/wasm/tests/package.mts';
+          await check(await readFile('target/wasm-pkg/bts_wasm_bg.wasm'));
+          JS
+      - run: wasm-pack test --headless --chrome crates/wasm --locked
+      - name: Upload browser package
+        uses: actions/upload-artifact@v7
+        with:
+          name: bts-wasm-web
+          path: target/wasm-pkg/
+          if-no-files-found: error

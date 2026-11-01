@@ -1,0 +1,101 @@
+# mix up the trace shape without losing track of who's talking to who
+# scoped vars get drawn once so everyone in that scope sees the same value
+vars {
+    model = "gpt-4o-mini"
+}
+
+trace "support-sessions" {
+    # drawn once per trace: the repeat, the wrapup, and the metadata all see it
+    vars {
+        turns = range(1, 4)
+    }
+
+    repeat "turns" {
+        count = var.turns
+
+        task "turn" {
+            input = "question ${repeat.index}"
+            output = "answer ${repeat.index}"
+
+            llm "Chat Completion" {
+                # the message list replays the enclosing turn's own fields
+                input = [
+                    { role = "system", content = "You are a support agent." },
+                    { role = "user", content = task.turn.input },
+                ]
+                output = { role = "assistant", content = task.turn.output }
+                metadata = { model = var.model, provider = "openai" }
+                # token counts computed from the actual content, summed in place
+                metrics = {
+                    prompt_tokens = tokens(self.input)
+                    completion_tokens = tokens(self.output)
+                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
+                }
+            }
+        }
+    }
+
+    choice {
+        tool "get_order_status" {
+            input = { order_id = format("ord_{}", hex(8)) }
+            output = { status = choice("shipped", "processing", "delayed") }
+        }
+
+        function "summarize_session" {
+            # block references select repeat iterations by index
+            input = { turns = var.turns, last_answer = repeat.turns[var.turns - 1].task.turn.output }
+            output = { summary = "customer asked about an order" }
+        }
+    }
+
+    maybe "escalation" {
+        chance = 0.25
+
+        task "escalation" {
+            input = "customer requested a human agent"
+            output = "escalated to tier 2"
+        }
+    }
+
+    # whether the escalation fired rides along as queryable metadata
+    metadata = { escalated = maybe.escalation.included }
+    tags = ["support"]
+}
+
+dataset "support-cases" {
+    description = "Questions and whole sessions for regression checks"
+
+    case "inline" {
+        input = { question = "Where is my order?" }
+        expected = { status = "shipped" }
+        tags = ["support", "inline"]
+    }
+
+    case "session" {
+        trace = trace["support-sessions"]
+        tags = ["support", "trace"]
+    }
+}
+
+scorer "status-match" {
+    lang = "python"
+    code { score = output.status == expected.status ? 1 : 0 }
+}
+
+experiment "support-regression" {
+    dataset = dataset["support-cases"]
+    task = trace["support-sessions"]
+    scorers = [scorer["status-match"]]
+}
+
+facet "Escalation" {
+    prompt = "Identify sessions that need a human agent."
+    description = "Human handoff"
+}
+
+automation "escalation-topics" {
+    type = "topics"
+    facets = ["Escalation"]
+    scope = "trace"
+    sampling_rate = 0.5
+}

@@ -1,0 +1,23 @@
+[package]
+name = "bts"
+repository = "https://github.com/zdhrc/bts"
+version = "0.2.0"
+edition = "2024"
+description = "another synthetics generator"
+license = "AGPL-3.0-only"
+
+[dependencies]
+bts-core = { path = "../core" }
+bts-lang = { path = "../lang" }
+axoupdater = { version = "0.10.2", default-features = false, features = ["blocking", "github_releases"] }
+chrono = { version = "0.4.41", default-features = false, features = ["std"] }
+clap = { version = "4.6.5", features = ["derive"] }
+rand = { version = "0.9.2", features = ["small_rng"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+
+[dev-dependencies]
+toml = "0.9"
