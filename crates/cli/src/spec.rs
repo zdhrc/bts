@@ -3,6 +3,18 @@ pub(crate) struct Spec {
     pub(crate) commands: &'static [CommandDesc],
 }
 
+pub(crate) const PREAMBLE: &str = r#"## Before using bts
+
+Run this preamble at the start of a bts task, before editing or writing a shape.
+
+1. Check `bts --version` and compare it with the latest release at `https://github.com/zdhrc/bts/releases/latest`. If it is behind, suggest `bts update`; do not run an update without the user's authorization. If the release cannot be checked, say the latest version is unverified. `bts update` works for installer-managed binaries and may not work for source builds.
+2. Read the current skill and the CLI help for the commands you intend to use. Do not assume a command or language feature from an older bts version works in the installed one.
+3. Check whether the selected operation needs a Braintrust project. For live writes, syncs, and builds that require a project, inspect the selected project name and ID in `.bt/config.json`. If selection is missing or wrong, use `bt switch` with the intended project before a live operation. Syntax checks and local trace dry runs do not require a project.
+4. For operations requiring Braintrust access, check that `BRAINTRUST_API_KEY` is set without printing or copying its value. Check other runtime or provider credentials only when the selected build or scorer needs them. Do not request credentials for offline checks.
+5. If bts was updated, check its new version, regenerate the installed skill for the current agent and scope (for example, `bts setup skill codex --scope local`), and read it again. Recheck the relevant command help, language rules, preview status, and existing shape syntax. Reconcile differences with the new version before proceeding; explain any required shape or workflow changes instead of silently rewriting them.
+
+"#;
+
 pub(crate) struct CommandDesc {
     #[allow(dead_code)]
     pub(crate) tags: &'static [&'static str],

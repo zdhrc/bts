@@ -199,14 +199,20 @@ fn render_skill(spec: &DslSpec, cli_spec: &CliSpec) -> String {
     .unwrap();
     writeln!(output, "---\n").unwrap();
     writeln!(output, "{GENERATED_MARKER}\n").unwrap();
-    output.push_str(&bts_core::skill::reference(spec));
-    writeln!(output, "## CLI validation\n").unwrap();
+    let mut cli_reference = String::new();
+    writeln!(cli_reference, "## CLI validation\n").unwrap();
     writeln!(
-        output,
+        cli_reference,
         "Validate file-based source with `bts check syntax <path>` after editing.\n"
     )
     .unwrap();
-    render_cli_spec(&mut output, cli_spec);
+    render_cli_spec(&mut cli_reference, cli_spec);
+    output.push_str(&bts_core::skill::assemble_braintrust(
+        spec,
+        bts_core::skill::FULL_BRAINTRUST,
+        Some(crate::spec::PREAMBLE),
+        Some(&cli_reference),
+    ));
     output
 }
 
@@ -354,6 +360,12 @@ mod tests {
         let skill = render_skill(&DSL_SPEC, &CLI_SPEC);
         assert!(skill.contains(GENERATED_MARKER));
         assert!(skill.contains(&bts_core::skill::reference(&DSL_SPEC)));
+        let preamble = skill.find("## Before using bts").unwrap();
+        let authoring = skill.find("## Authoring realistic Braintrust data").unwrap();
+        let presentation = skill.find("## Braintrust trace presentation").unwrap();
+        let language = skill.find("# `bts` language").unwrap();
+        let cli = skill.find("## CLI commands").unwrap();
+        assert!(preamble < authoring && authoring < presentation && presentation < language && language < cli);
         assert!(skill.contains("bts check syntax <path>"));
         for command in CLI_SPEC.commands {
             assert!(skill.contains(&format!("bts {}", command.path.join(" "))));
