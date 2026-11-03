@@ -6,6 +6,7 @@ pub mod config;
 pub mod features;
 pub mod mocking;
 pub(crate) mod naming;
+pub mod skill;
 #[cfg(feature = "native")]
 pub mod state;
 

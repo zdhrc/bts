@@ -1,29 +1,48 @@
 use bts_lang::spec::{Cardinality, NamePolicy, Place, RuleDesc, Spec as DslSpec};
 use std::fmt::Write as _;
-
-const REALISM_LEAD: &str = "One shape generates every trace in a run: anything literal is byte-identical across all of them. \
-Before calling a shape done, ask what differs between trace 0 and trace 99 — if the answer is only `uuid()` and timestamps, keep going.";
-const REALISM_POINTS: &[&str] = &[
-    "Structure: real trace populations vary in shape. Vary turn and step counts with `repeat` and a sampled `count`, alternative subtrees with `choice`, and rare paths with `maybe`. Skew counts the way traffic skews — most sessions short, a long tail — using `weighted` or a distribution function rather than a uniform `range`.",
-    "Conversation content: author a pool of distinct, realistic user intents and select between them with `choice` blocks wrapping whole subtrees, or index and slice trace-scope vars of authored turns by `repeat.index`; both keep content coherent across a turn's fields. Never ship placeholder content like `\"question ${repeat.index}\"` — indices are for ids, labels, and selection, not user-visible text.",
-    "Coherence: block references carry generated content between spans instead of duplicating it. Reuse the question with `trace.input`, feed one span's output into the next span's input (`llm.chat.output.content`), and let the trace's own `output` read the closing span's answer — a sampled value then threads through everything that mentions it.",
-    "History: inside a `repeat`, grow each round's message list from the earlier iterations — `input = [{...}, ...repeat.rounds[:repeat.index].llm.chat.output]` — and reach the previous round with `repeat.rounds[repeat.index - 1]`. Correlate branches from outside with `choice.<name>.chosen`, `maybe.<name>.included`, or a `!= null` probe on a branch field.",
-    "LLM metrics: token counts are long-tailed and never round; real prompts don't cost exactly 500 tokens. Sample `prompt_tokens` and `completion_tokens`, then keep the sum exact with `tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens` — or compute exact counts from the content itself with `tokens(self.input)`. Vary `time_to_first_token`, keeping it under the span duration.",
-    "Metadata: model and provider stay consistent within a trace; vary them across traces by putting alternatives in `choice` branches, not by sampling each span independently.",
-    "Errors: a few percent of real traces fail. Gate an `error` field, an empty output, or an escalation span behind `maybe` with a single-digit `chance`.",
-    "Latency: every span defaults to a 100ms slot; real ones don't. Set `duration` (seconds) with long-tailed samples — `duration = lognormal(2.0, 0.6)` on llm spans — and share the sample through a var when `time_to_first_token` must stay under it. A parent stretches to cover its children, so set durations on leaves and pin a parent's only when the span should outlast them.",
-    "Tags: to mix tagged populations, interpolate a per-trace var into the tag (`vars { env = weighted(...) }`, `tags = [\"${var.env}\"]`) instead of duplicating the shape.",
-    "Populations: one shape file with one trace block covers a whole population — `choice`, `maybe`, and `repeat` capture every case as alternative subtrees, so never fan out into near-duplicate shape files or separate batches. Use separate runs only for populations needing disjoint time windows or volumes.",
-];
 const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
 Steal the structure, replace the content, and expand along the axis each one names.";
 
-/// Generates a standalone language skill without interface commands or file access.
+/// A selectable section of the generated Braintrust skill.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Part {
+    BraintrustWorkflow,
+    BraintrustPresentation,
+    Language,
+}
+
+pub const FULL_BRAINTRUST: &[Part] = &[Part::BraintrustWorkflow, Part::BraintrustPresentation, Part::Language];
+
+/// Generates a standalone Braintrust skill without interface commands or file access.
 pub fn render(spec: &DslSpec) -> String {
     format!(
         "---\nname: bts\ndescription: Write, review, explain, and debug bts language source.\n---\n\n{}",
-        reference(spec)
+        assemble_braintrust(spec, FULL_BRAINTRUST, None, None)
     )
+}
+
+/// Assembles Braintrust guidance, the language reference, and optional interface instructions.
+pub fn assemble_braintrust(
+    spec: &DslSpec,
+    parts: &[Part],
+    interface_preamble: Option<&str>,
+    interface_reference: Option<&str>,
+) -> String {
+    let mut output = String::new();
+    if let Some(interface_preamble) = interface_preamble {
+        output.push_str(interface_preamble);
+    }
+    for part in parts {
+        match part {
+            Part::BraintrustWorkflow => output.push_str(crate::providers::braintrust::skill::WORKFLOW),
+            Part::BraintrustPresentation => output.push_str(crate::providers::braintrust::skill::PRESENTATION),
+            Part::Language => output.push_str(&reference(spec)),
+        }
+    }
+    if let Some(interface_reference) = interface_reference {
+        output.push_str(interface_reference);
+    }
+    output
 }
 
 /// Renders the language guidance for inclusion in an interface's own skill.
@@ -31,36 +50,12 @@ pub fn reference(spec: &DslSpec) -> String {
     let mut output = String::new();
     writeln!(output, "# `{}` language\n", spec.name).unwrap();
     writeln!(output, "{}\n", spec.summary).unwrap();
-    writeln!(output, "## Shape authoring workflow\n").unwrap();
-    writeln!(
-        output,
-        "1. Read the language reference below before creating or changing `bts` source."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "2. Use only the documented blocks, fields, expressions, placements, and rules."
-    )
-    .unwrap();
-    writeln!(
-        output,
-        "3. Preserve the user's intent while making the smallest valid change."
-    )
-    .unwrap();
-    writeln!(output, "4. Validate the syntax and semantic definitions after editing.\n").unwrap();
     writeln!(
         output,
         "Treat this generated reference as authoritative for `bts` language version {} (specification schema version {}).\n",
         spec.language_version, spec.schema_version
     )
     .unwrap();
-
-    writeln!(output, "## Authoring for realism\n").unwrap();
-    writeln!(output, "{REALISM_LEAD}\n").unwrap();
-    for point in REALISM_POINTS {
-        writeln!(output, "- {point}").unwrap();
-    }
-    writeln!(output).unwrap();
 
     writeln!(output, "## Surface grammar\n").unwrap();
     writeln!(output, "Notation: {}\n", spec.surface.notation).unwrap();
@@ -273,11 +268,9 @@ mod tests {
                 assert!(skill.contains(convention));
             }
         }
-        assert!(skill.contains("## Authoring for realism"));
-        assert!(skill.contains(REALISM_LEAD));
-        for point in REALISM_POINTS {
-            assert!(skill.contains(point));
-        }
+        assert!(skill.contains(crate::providers::braintrust::skill::WORKFLOW));
+        assert!(skill.contains(crate::providers::braintrust::skill::PRESENTATION));
+        assert!(!reference(&DSL_SPEC).contains("## Authoring realistic Braintrust data"));
         assert!(skill.contains(EXAMPLES_PREAMBLE));
         for example in DSL_SPEC.examples {
             assert!(skill.contains(example.summary));
@@ -291,5 +284,22 @@ mod tests {
         assert!(!skill.contains("## CLI commands"));
         assert!(!skill.contains("bts check syntax"));
         assert!(!skill.contains("--offset"));
+    }
+
+    #[test]
+    fn skill_parts_can_be_selected_independently() {
+        let workflow = assemble_braintrust(&DSL_SPEC, &[Part::BraintrustWorkflow], None, None);
+        assert!(workflow.contains("### 1. Choose the viewer's question"));
+        assert!(!workflow.contains("## Braintrust trace presentation"));
+        assert!(!workflow.contains("## Surface grammar"));
+
+        let presentation = assemble_braintrust(&DSL_SPEC, &[Part::BraintrustPresentation], None, None);
+        assert!(presentation.contains("## Braintrust trace presentation"));
+        assert!(!presentation.contains("## Authoring realistic Braintrust data"));
+
+        let language = assemble_braintrust(&DSL_SPEC, &[Part::Language], None, None);
+        assert!(language.contains("## Surface grammar"));
+        assert!(!language.contains("## Authoring realistic Braintrust data"));
+        assert!(!language.contains("## Braintrust trace presentation"));
     }
 }

@@ -1199,7 +1199,7 @@ const TRACE_CONVENTIONS: &[&str] = &[
     "`tags` belong on the trace root, not on child spans.",
 ];
 const TASK_CONVENTIONS: &[&str] = &[
-    "Name task spans like the function or pipeline step real instrumentation would trace (`turn_0`, `agent_node`, `retrieve_context`).",
+    "Name task spans like the function or pipeline step real instrumentation would trace (`turn`, `agent_node`, `retrieve_context`). Repeated turns can share the same name.",
     "Input and output are free-form: typically the text or values the step consumed and produced.",
     "Task spans usually carry no metrics; timestamps are generated.",
 ];
