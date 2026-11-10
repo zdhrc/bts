@@ -1111,6 +1111,11 @@ def _split(text, separator):
     if not separator: raise ValueError("split separator cannot be empty")
     return text.split(separator)
 def _join(array, separator): return _string(separator).join(_text(_force(value)) for value in _array(array))
+def _render(template, values):
+    return _language_render(_string(template), _force(values), lambda value: _text(_force(value)))
+def _compose(parts, separator): return _language_compose(_value(parts), _string(separator))
+def _sample_items(items, count, random_source):
+    return _language_sample(_value(items), _force(count), lambda: _draw(random_source))
 def _contains(target, needle):
     target, needle = _value(target), _force(needle)
     if type(target) is str: return _string(needle) in target
@@ -1269,6 +1274,9 @@ function _split(text: unknown, separator: unknown): string[] {
     return value.split(delimiter);
 }
 function _join(array: unknown, separator: unknown): string { return _array(array).map(value => _text(_force(value))).join(_string(separator)); }
+function _render(template: unknown, values: unknown): string { return _language_render(_string(template), _force(values), value => _text(_force(value))); }
+function _compose(parts: unknown, separator: unknown): string { return _language_compose(_value(parts), _string(separator)); }
+function _sample_items(items: unknown, count: unknown, randomSource: () => number): unknown[] { const value = _force(count); return _language_sample(_value(items), value instanceof _Float ? NaN : value, () => _draw(randomSource)); }
 function _contains(target: unknown, needle: unknown): boolean {
     target = _value(target); needle = _force(needle);
     if (needle instanceof _Float) needle = needle.value;
@@ -1403,6 +1411,102 @@ function _tokens(value: unknown): number {
 }
 "#;
 }
+
+pub(in crate::mocking::code) const PY_LANGUAGE: &str = r#"
+def _language_text(value):
+    if type(value) is str: return value
+    if type(value) is bool: return "true" if value else "false"
+    if type(value) in (int, float): return str(value)
+    raise TypeError("render values must be strings, numbers, or booleans")
+
+def _language_render(template, values, text=_language_text):
+    if type(template) is not str or type(values) is not dict:
+        raise TypeError("render expects a string and an object")
+    result, i = [], 0
+    while i < len(template):
+        ch = template[i]
+        if ch in "{}":
+            if i + 1 < len(template) and template[i + 1] == ch:
+                result.append(ch)
+                i += 2
+                continue
+            if ch == "}": raise ValueError("unmatched render brace")
+            end = template.find("}", i + 1)
+            if end < 0: raise ValueError("unmatched render brace")
+            key = template[i + 1:end]
+            if not key or "{" in key or key not in values:
+                raise ValueError("invalid or missing render name: " + key)
+            result.append(text(values[key]))
+            i = end + 1
+        else:
+            result.append(ch)
+            i += 1
+    return "".join(result)
+
+def _language_compose(parts, separator):
+    if type(parts) is not list or type(separator) is not str:
+        raise TypeError("compose expects an array and a string")
+    result = []
+    for part in parts:
+        if part is None: continue
+        if type(part) is not str: raise TypeError("compose parts must be strings or null")
+        if part != "": result.append(part)
+    return separator.join(result)
+
+def _language_sample(items, count, random_source):
+    if type(items) is not list or type(count) is not int or not 0 <= count <= len(items):
+        raise ValueError("sample count must be an integer between zero and the array length")
+    result, available = [], len(items)
+    for item in items:
+        if count > 0 and (count == available or int(random_source() * available) < count):
+            result.append(item)
+            count -= 1
+        available -= 1
+    return result
+"#;
+
+pub(in crate::mocking::code) const TS_LANGUAGE: &str = r#"
+function _language_text(value: unknown): string {
+    if (typeof value === "string" || typeof value === "boolean" || typeof value === "number") return String(value);
+    throw new TypeError("render values must be strings, numbers, or booleans");
+}
+function _language_render(template: unknown, values: unknown, text: (value: unknown) => string = _language_text): string {
+    if (typeof template !== "string" || values === null || typeof values !== "object" || Array.isArray(values)) throw new TypeError("render expects a string and an object");
+    let result = "";
+    for (let i = 0; i < template.length;) {
+        const ch = template[i];
+        if (ch === "{" || ch === "}") {
+            if (template[i + 1] === ch) { result += ch; i += 2; continue; }
+            if (ch === "}") throw new Error("unmatched render brace");
+            const end = template.indexOf("}", i + 1);
+            if (end < 0) throw new Error("unmatched render brace");
+            const key = template.slice(i + 1, end);
+            if (!key || key.includes("{") || !Object.prototype.hasOwnProperty.call(values, key)) throw new Error("invalid or missing render name: " + key);
+            result += text((values as Record<string, unknown>)[key]);
+            i = end + 1;
+        } else { result += ch; i++; }
+    }
+    return result;
+}
+function _language_compose(parts: unknown, separator: unknown): string {
+    if (!Array.isArray(parts) || typeof separator !== "string") throw new TypeError("compose expects an array and a string");
+    return parts.filter(part => {
+        if (part === null) return false;
+        if (typeof part !== "string") throw new TypeError("compose parts must be strings or null");
+        return part !== "";
+    }).join(separator);
+}
+function _language_sample(items: unknown, count: unknown, randomSource: () => number): unknown[] {
+    if (!Array.isArray(items) || typeof count !== "number" || !Number.isSafeInteger(count) || count < 0 || count > items.length) throw new Error("sample count must be an integer between zero and the array length");
+    const result: unknown[] = [];
+    let remaining = count, available = items.length;
+    for (const item of items) {
+        if (remaining > 0 && (remaining === available || Math.floor(randomSource() * available) < remaining)) { result.push(item); remaining--; }
+        available--;
+    }
+    return result;
+}
+"#;
 
 use runtime::*;
 
@@ -1645,5 +1749,10 @@ fn runtime_helpers(lang: ScorerLang, tokens: bool) -> String {
         ScorerLang::Python => (PYTHON, PY_TOKENS),
         ScorerLang::Typescript => (TYPESCRIPT, TS_TOKENS),
     };
-    format!("{base}\n{}", if tokens { tokenizer } else { "" })
+    let language = if lang == ScorerLang::Python {
+        PY_LANGUAGE
+    } else {
+        TS_LANGUAGE
+    };
+    format!("{base}\n{language}\n{}", if tokens { tokenizer } else { "" })
 }

@@ -1976,7 +1976,13 @@ impl Modeler {
                     self.check_scorer_value(text);
                     self.check_scorer_value(separator);
                 }
-                Func::Join { array, separator } => {
+                Func::Join { array, separator }
+                | Func::Compose { array, separator }
+                | Func::Render {
+                    template: array,
+                    values: separator,
+                }
+                | Func::Sample { array, count: separator } => {
                     self.check_scorer_value(array);
                     self.check_scorer_value(separator);
                 }
@@ -3441,7 +3447,13 @@ impl Modeler {
                 Func::Split { text, separator } => {
                     self.value_reaches_block_ref(text) || self.value_reaches_block_ref(separator)
                 }
-                Func::Join { array, separator } => {
+                Func::Join { array, separator }
+                | Func::Compose { array, separator }
+                | Func::Render {
+                    template: array,
+                    values: separator,
+                }
+                | Func::Sample { array, count: separator } => {
                     self.value_reaches_block_ref(array) || self.value_reaches_block_ref(separator)
                 }
                 Func::Contains { target, needle } => {
@@ -4475,6 +4487,37 @@ impl Modeler {
                     separator: Box::new(separator?),
                 })
             }
+            "render" => {
+                let [template, values] = self.func_args(func, args, "exactly two arguments (template, values)", range)?;
+                let template = self.model_typed_arg(template, func, StaticType::String);
+                let values = self.model_typed_arg(values, func, StaticType::Object);
+                Some(Func::Render {
+                    template: Box::new(template?),
+                    values: Box::new(values?),
+                })
+            }
+            "compose" => {
+                let mut args = args;
+                if args.len() == 1 {
+                    args.push(Folded::value(Value::Str(" ".into()), range));
+                }
+                let [array, separator] = self.func_args(func, args, "one or two arguments (parts, separator)", range)?;
+                let array = self.model_typed_arg(array, func, StaticType::Array);
+                let separator = self.model_typed_arg(separator, func, StaticType::String);
+                Some(Func::Compose {
+                    array: Box::new(array?),
+                    separator: Box::new(separator?),
+                })
+            }
+            "sample" => {
+                let [array, count] = self.func_args(func, args, "exactly two arguments (array, count)", range)?;
+                let array = self.model_typed_arg(array, func, StaticType::Array);
+                let count = self.model_typed_arg(count, func, StaticType::Number);
+                Some(Func::Sample {
+                    array: Box::new(array?),
+                    count: Box::new(count?),
+                })
+            }
             "join" => {
                 let [array, separator] = self.func_args(func, args, "exactly two arguments (array, separator)", range)?;
                 let array = self.model_typed_arg(array, func, StaticType::Array);
@@ -5097,12 +5140,14 @@ impl Modeler {
             | Func::Trim { .. }
             | Func::Replace { .. }
             | Func::Join { .. }
+            | Func::Compose { .. }
+            | Func::Render { .. }
             | Func::Format { .. }
             | Func::Uuid
             | Func::Hex { .. }
             | Func::Alphanum { .. }
             | Func::Noise { .. } => Some(StaticType::String),
-            Func::Split { .. } => Some(StaticType::Array),
+            Func::Split { .. } | Func::Sample { .. } => Some(StaticType::Array),
             Func::Attachment { .. } => Some(StaticType::Object),
         }
     }
@@ -5902,7 +5947,13 @@ fn collect_func_refs(func: &Func, found: &mut Vec<RefId>) {
             collect_refs(text, found);
             collect_refs(separator, found);
         }
-        Func::Join { array, separator } => {
+        Func::Join { array, separator }
+        | Func::Compose { array, separator }
+        | Func::Render {
+            template: array,
+            values: separator,
+        }
+        | Func::Sample { array, count: separator } => {
             collect_refs(array, found);
             collect_refs(separator, found);
         }
@@ -8216,6 +8267,12 @@ mod tests {
             (r#"trace "t" { input = upper(1) }"#, "upper"),
             (r#"trace "t" { input = trim(null) }"#, "trim"),
             (r#"trace "t" { input = split("a", 1) }"#, "split"),
+            (r#"trace "t" { input = render(1, {}) }"#, "render"),
+            (r#"trace "t" { input = render("x", []) }"#, "render"),
+            (r#"trace "t" { input = compose("x") }"#, "compose"),
+            (r#"trace "t" { input = compose([], 1) }"#, "compose"),
+            (r#"trace "t" { input = sample("x", 1) }"#, "sample"),
+            (r#"trace "t" { input = sample([], true) }"#, "sample"),
             (r#"trace "t" { input = join("a", ",") }"#, "join"),
             (r#"trace "t" { input = contains(1, "x") }"#, "contains"),
             (r#"trace "t" { input = len(true) }"#, "len"),

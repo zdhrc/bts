@@ -1619,6 +1619,80 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
                 .collect::<Result<Vec<_>, _>>()?;
             ModelValue::Str(parts.join(&separator))
         }
+        ModelFunc::Render { template, values } => {
+            let template = eval_text(*template, ctx)?;
+            let JsonValue::Object(values) = lower_value(*values, ctx)? else {
+                return Err(Error::new(ErrorKind::InvalidRender, range));
+            };
+            let mut chars = template.chars().peekable();
+            let mut output = String::new();
+            while let Some(ch) = chars.next() {
+                if ch == '{' || ch == '}' {
+                    if chars.peek() == Some(&ch) {
+                        chars.next();
+                        output.push(ch);
+                    } else if ch == '{' {
+                        let mut key = String::new();
+                        loop {
+                            match chars.next() {
+                                Some('}') => break,
+                                Some('{') | None => return Err(Error::new(ErrorKind::InvalidRender, range)),
+                                Some(ch) => key.push(ch),
+                            }
+                        }
+                        let value = values
+                            .get(&key)
+                            .and_then(json_text)
+                            .filter(|_| !key.is_empty())
+                            .ok_or(Error::new(ErrorKind::InvalidRender, range))?;
+                        output.push_str(&value);
+                    } else {
+                        return Err(Error::new(ErrorKind::InvalidRender, range));
+                    }
+                } else {
+                    output.push(ch);
+                }
+            }
+            ModelValue::Str(output)
+        }
+        ModelFunc::Compose { array, separator } => {
+            let JsonValue::Array(values) = lower_value(*array, ctx)? else {
+                return Err(Error::new(ErrorKind::InvalidCompose, range));
+            };
+            let separator = eval_text(*separator, ctx)?;
+            let mut parts = Vec::new();
+            for value in values {
+                match value {
+                    JsonValue::Null => {}
+                    JsonValue::String(text) if text.is_empty() => {}
+                    JsonValue::String(text) => parts.push(text),
+                    _ => return Err(Error::new(ErrorKind::InvalidCompose, range)),
+                }
+            }
+            ModelValue::Str(parts.join(&separator))
+        }
+        ModelFunc::Sample { array, count } => {
+            let JsonValue::Array(values) = lower_value(*array, ctx)? else {
+                return Err(Error::new(ErrorKind::InvalidSample, range));
+            };
+            let Scalar::Int(count) = eval_operand(*count, ctx)? else {
+                return Err(Error::new(ErrorKind::InvalidSample, range));
+            };
+            let mut remaining = usize::try_from(count)
+                .ok()
+                .filter(|count| *count <= values.len())
+                .ok_or(Error::new(ErrorKind::InvalidSample, range))?;
+            let mut available = values.len();
+            let mut selected = Vec::with_capacity(remaining);
+            for value in values {
+                if remaining > 0 && (remaining == available || ctx.rng.random_range(0..available as u64) < remaining as u64) {
+                    selected.push(value);
+                    remaining -= 1;
+                }
+                available -= 1;
+            }
+            json_to_value(JsonValue::Array(selected))
+        }
         ModelFunc::Contains { target, needle } => match lower_value(*target, ctx)? {
             JsonValue::String(text) => {
                 let needle = eval_text(*needle, ctx)?;
@@ -2294,6 +2368,9 @@ pub enum ErrorKind {
     ClampBoundsOutOfOrder,
     EmptySplitSeparator,
     JoinElementNotScalar,
+    InvalidRender,
+    InvalidCompose,
+    InvalidSample,
     CircularReference,
     AbsentRefField,
     RefShapeMismatch,
@@ -2319,6 +2396,9 @@ impl fmt::Display for ErrorKind {
             Self::NoiseSizeOutOfRange => "noise size is not an integer between 0 and 8388608",
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
             Self::EmptySplitSeparator => "split separator is empty",
+            Self::InvalidRender => "render requires balanced braces and named string, number, or boolean values",
+            Self::InvalidCompose => "compose parts must be strings or null",
+            Self::InvalidSample => "sample count must be an integer between zero and the array length",
             Self::JoinElementNotScalar => "join element is not a string, number, or boolean",
             Self::CircularReference => "references form a cycle",
             Self::AbsentRefField => "referenced block does not set the field",

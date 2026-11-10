@@ -397,3 +397,90 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
         );
     }
 }
+
+#[test]
+fn language_functions_execute_in_generated_agents() {
+    let model = compile(
+        r#"
+agent "language" { entrypoint = trace.language }
+trace "language" {
+    input = { template = "{{{name}}}: {n} {ok}", count = 2, parts = [null, "", "Hi!", "there"] }
+    vars { selected = sample([0, 1, 2, 3, 4], self.input.count) }
+    output = {
+        text = render(self.input.template, { name = "Zoë", n = 6.0, ok = true })
+        composed = compose(self.input.parts)
+        selected = var.selected
+        reused = var.selected
+        all = sample(["same", "same"], 2)
+        empty = sample([], 0)
+        nested = compose(["Details:", compose(sample(["one", "two"], 2), ", ")])
+    }
+}
+"#,
+    )
+    .unwrap();
+    let root = std::env::temp_dir().join(format!("bts-language-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    for (lang, program, script) in [
+        (
+            ScorerLang::Python,
+            "python3",
+            r#"
+from language_agent import run
+result = run(random_source=lambda: 0.25)
+assert result['text'] == '{Zoë}: 6.0 true', result
+assert result['composed'] == 'Hi! there'
+assert result['selected'] == result['reused'] == [0, 2]
+assert result['all'] == ['same', 'same'] and result['empty'] == []
+assert result['nested'] == 'Details: one, two'
+assert run(random_source=lambda: 0.99)['selected'] == [3, 4]
+base = {'template':'{name}', 'count':2, 'parts':['hi']}
+for patch in [{'template':'{missing}'}, {'template':'{'}, {'parts':[1]}, {'count':-1}, {'count':6}, {'count':1.0}]:
+    try: run({**base, **patch})
+    except (ValueError, TypeError): pass
+    else: raise AssertionError(patch)
+"#,
+        ),
+        (
+            ScorerLang::Typescript,
+            "node",
+            r#"
+import assert from 'node:assert/strict';
+import {run} from './language_agent.mts';
+const result = run(undefined, () => 0.25);
+assert.equal(result.text, '{Zoë}: 6.0 true');
+assert.equal(result.composed, 'Hi! there');
+assert.deepEqual(result.selected, [0, 2]);
+assert.deepEqual(result.reused, result.selected);
+assert.deepEqual(result.all, ['same', 'same']);
+assert.deepEqual(result.empty, []);
+assert.equal(result.nested, 'Details: one, two');
+assert.deepEqual(run(undefined, () => 0.99).selected, [3, 4]);
+const base = {template:'{name}', count:2, parts:['hi']};
+for (const patch of [{template:'{missing}'}, {template:'{'}, {parts:[1]}, {count:-1}, {count:6}, {count:1.5}]) {
+    assert.throws(() => run({...base, ...patch}));
+}
+"#,
+        ),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &PlainTarget).unwrap();
+        for file in assembly.files {
+            let path = root.join(&file.name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.contents).unwrap();
+        }
+        let mut command = std::process::Command::new(program);
+        if lang == ScorerLang::Python {
+            command.arg("-c");
+        } else {
+            command.args(["--input-type=module", "-e"]);
+        }
+        let output = command.arg(script).current_dir(root.join("src/agents")).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{lang:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}

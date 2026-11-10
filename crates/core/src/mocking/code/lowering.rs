@@ -4482,7 +4482,8 @@ mod native {
                         _ => {}
                     }
                     let kind = match name.as_str() {
-                        "_text" | "_trim" | "_upper" | "_lower" | "_replace" | "_join" | "_random_text" => Type::String,
+                        "_text" | "_trim" | "_upper" | "_lower" | "_replace" | "_join" | "_render" | "_compose"
+                        | "_random_text" => Type::String,
                         "_len" | "_count" | "_pick" => Type::Integer(0, 9_007_199_254_740_991),
                         "_integer" => Type::Integer(-9_007_199_254_740_991, 9_007_199_254_740_991),
                         "_value" => kinds.first().map(normalized).unwrap_or(Type::Value),
@@ -4776,6 +4777,9 @@ mod expressions {
             Func::Replace { text, from, to } => call("_replace", &[text, from, to])?,
             Func::Split { text, separator } => call("_split", &[text, separator])?,
             Func::Join { array, separator } => call("_join", &[array, separator])?,
+            Func::Render { template, values } => call("_render", &[template, values])?,
+            Func::Compose { array, separator } => call("_compose", &[array, separator])?,
+            Func::Sample { array, count } => Expr::call("_sample_items", vec![expr(array)?, expr(count)?, random()]),
             Func::Contains { target, needle } => call("_contains", &[target, needle])?,
             Func::StartsWith { text, prefix } => call("_starts_with", &[text, prefix])?,
             Func::EndsWith { text, suffix } => call("_ends_with", &[text, suffix])?,
@@ -5226,6 +5230,24 @@ pub(crate) mod scoring {
                         method(self.lower(array)?, "join", vec![self.lower(separator)?])
                     }
                 }
+                Func::Render { template, values } => {
+                    self.helpers.insert(Helper::Language);
+                    Expr::call("_language_render", vec![self.lower(template)?, self.lower(values)?])
+                }
+                Func::Compose { array, separator } => {
+                    self.helpers.insert(Helper::Language);
+                    Expr::call("_language_compose", vec![self.lower(array)?, self.lower(separator)?])
+                }
+                Func::Sample { array, count } => {
+                    self.helpers.insert(Helper::Language);
+                    let random = if python {
+                        self.imports.insert("random");
+                        Expr::from("random").member("random")
+                    } else {
+                        Expr::from("Math").member("random")
+                    };
+                    Expr::call("_language_sample", vec![self.lower(array)?, self.lower(count)?, random])
+                }
                 Func::Contains { target, needle } => {
                     Expr::Contains(Box::new(self.lower(needle)?), Box::new(self.lower(target)?))
                 }
@@ -5345,6 +5367,7 @@ pub(crate) mod scoring {
     // first, its dependents after)
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
     pub(in crate::mocking::code) enum Helper {
+        Language,
         Normal,
         Gamma,
         Lognormal,

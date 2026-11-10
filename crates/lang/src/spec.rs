@@ -511,6 +511,12 @@ pub mod ids {
     pub const FUNC_REPLACE: Id = Id::new("func.replace");
     /// Stable identifier for `func.split`.
     pub const FUNC_SPLIT: Id = Id::new("func.split");
+    /// Stable identifier for `func.render`.
+    pub const FUNC_RENDER: Id = Id::new("func.render");
+    /// Stable identifier for `func.compose`.
+    pub const FUNC_COMPOSE: Id = Id::new("func.compose");
+    /// Stable identifier for `func.sample`.
+    pub const FUNC_SAMPLE: Id = Id::new("func.sample");
     /// Stable identifier for `func.join`.
     pub const FUNC_JOIN: Id = Id::new("func.join");
     /// Stable identifier for `func.contains`.
@@ -1431,7 +1437,7 @@ const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
 const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::FUNC_ARITY,
-    summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number.",
+    summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number. `compose` accepts an optional separator.",
 };
 const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
     tags: &[],
@@ -1976,6 +1982,33 @@ const FUNCS: &[FuncDesc] = &[
         summary: "Splits a string around each occurrence of the non-empty separator for each generated trace, producing an array of strings.",
         examples: &["split(\"a,b,c\", \",\")", "split(var.path, \"/\")[0]"],
         rules: SPLIT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_RENDER,
+        name: "render",
+        syntax: "render(template, values)",
+        summary: "Substitutes {name} placeholders with string, number, or boolean values from an object. Double braces escape literal braces. Missing names, non-scalar replacements, empty names, and unmatched braces fail during generation. Extra values are allowed and replacements are not recursively rendered.",
+        examples: &[r#"render("Hello {name}!", { name = "Sam" })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_COMPOSE,
+        name: "compose",
+        syntax: "compose(parts[, separator])",
+        summary: "Joins string parts, skipping null and empty strings. The separator defaults to a space. Whitespace and punctuation are preserved. Other element types fail during generation.",
+        examples: &[r#"compose(["Hi!", null, "How can I help?"])"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_SAMPLE,
+        name: "sample",
+        syntax: "sample(array, count)",
+        summary: "Selects array positions uniformly without replacement and returns their values in source order. Duplicate values remain distinct positions. Count must be an integer from zero through the array length, otherwise generation fails.",
+        examples: &[r#"sample(["parking", "keys", "hours"], 2)"#],
+        rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
         tags: &[],

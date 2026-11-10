@@ -735,6 +735,27 @@ pub enum Func {
         /// The separator used to split or join text.
         separator: Box<Value>,
     },
+    /// Substitutes named values into text.
+    Render {
+        /// The template to render.
+        template: Box<Value>,
+        /// The named scalar values.
+        values: Box<Value>,
+    },
+    /// Joins nonempty text components.
+    Compose {
+        /// The text components, including optional nulls.
+        array: Box<Value>,
+        /// The separator between components.
+        separator: Box<Value>,
+    },
+    /// Samples array positions without replacement in source order.
+    Sample {
+        /// The source array.
+        array: Box<Value>,
+        /// The number of positions to select.
+        count: Box<Value>,
+    },
     /// Tests whether the target contains a value.
     Contains {
         /// The value to index, slice, or inspect.

@@ -57,6 +57,7 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
 
 fn helper_snippet(helper: Helper) -> &'static str {
     match helper {
+        Helper::Language => super::rendering::PY_LANGUAGE,
         // the stdlib covers every other sampler
         Helper::Poisson => {
             "def poisson(mean):\n    # knuth's method; fine for the small means scorers use\n    limit = math.exp(-mean)\n    count = 0\n    product = random.random()\n    while product > limit:\n        count += 1\n        product *= random.random()\n    return count\n"

@@ -53,6 +53,7 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
 
 fn helper_snippet(helper: Helper) -> &'static str {
     match helper {
+        Helper::Language => super::rendering::TS_LANGUAGE,
         Helper::Normal => {
             "// standard normal via box-muller, scaled to the requested distribution\nfunction normal(mean: number, stddev: number): number {\n  let u = 0;\n  let v = 0;\n  while (u === 0) u = Math.random();\n  while (v === 0) v = Math.random();\n  return mean + stddev * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);\n}\n"
         }
