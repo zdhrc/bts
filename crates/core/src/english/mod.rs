@@ -25,9 +25,10 @@ pub mod text;
 pub mod variation;
 
 pub use analysis::{Analysis, AnalyzedText, analyze};
-pub use composition::{Relation, combine};
+pub use composition::{ExpressionCandidate, ExpressionResult, Relation, combine, express, expression, expression_candidates};
 pub use discourse::{
-    Detail, DiscourseContext, Entity, Pronouns, ReferenceForm, ReferenceOptions, ReferenceStyle, refer, remember, unmentioned,
+    Detail, DiscourseContext, Entity, ExpressionContext, Pronouns, ReferenceForm, ReferenceOptions, ReferenceStyle, refer,
+    remember, unmentioned,
 };
 pub use formatting::{
     DateOptions, DateStyle, EnglishLocale, HourCycle, NumberOptions, TimeOptions, format_date, format_number, format_time,
@@ -35,9 +36,9 @@ pub use formatting::{
 pub use model::*;
 pub use realization::realize;
 pub use variation::{
-    CasingStyle, PhraseAlternatives, PunctuationStyle, Style, StyleEdit, StyleOptions, StyleResult, TypoKind, TypoOptions,
-    Variation, VariationOptions, applicable_variations, apply_variation, style_edits, text_alternatives, vary, vary_sentence,
-    vary_sentence_styled, vary_styled,
+    CasingStyle, ExpressionOptions, PhraseAlternatives, PunctuationStyle, SpeakerProfile, Style, StyleEdit, StyleOptions,
+    StyleResult, TypoKind, TypoOptions, Variation, VariationOptions, WeightedPhrase, applicable_variations, apply_variation,
+    style_edits, text_alternatives, vary, vary_sentence, vary_sentence_styled, vary_styled,
 };
 
 pub(crate) fn runtime_data() -> serde_json::Value {
@@ -45,5 +46,5 @@ pub(crate) fn runtime_data() -> serde_json::Value {
         .iter()
         .map(|verb| (verb.base.clone(), serde_json::to_value(verb).expect("packaged verb forms")))
         .collect();
-    serde_json::json!({"verbs": verbs, "negations": negation::FORMS, "styles": variation::style_data()})
+    serde_json::json!({"verbs": verbs, "negations": negation::FORMS, "styles": variation::style_data(), "expressions": composition::expression_data()})
 }

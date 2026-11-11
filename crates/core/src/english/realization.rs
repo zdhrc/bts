@@ -338,6 +338,20 @@ fn sentence_start(text: &str) -> String {
     }
 }
 
+// Nonfinite forms preserve the authored object and particle as a unit.
+pub(crate) fn expression_action(predicate: &Predicate, gerund: bool) -> Result<String, Error> {
+    validate_predicate(predicate)?;
+    let verb = if gerund {
+        &predicate.verb.present_participle
+    } else {
+        &predicate.verb.base
+    };
+    Ok(match &predicate.complement {
+        Some(complement) => format!("{verb} {complement}"),
+        None => verb.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

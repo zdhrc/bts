@@ -247,3 +247,177 @@ impl<'de> Deserialize<'de> for Verb {
         }
     }
 }
+/// Reusable communicative constructions. The author authorizes their use for an intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpressionKind {
+    Request,
+    Desire,
+    Possibility,
+    Procedure,
+    Need,
+    ReasonRequest,
+    FollowUp,
+    Authored,
+    Structured,
+}
+
+/// A compatible verb, object and complement, selected as a single unit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpressionConstruction {
+    pub id: String,
+    pub predicate: Predicate,
+    #[serde(default = "expression_weight")]
+    pub weight: f64,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    /// Supplied facts explicitly expressed by this construction.
+    #[serde(default)]
+    pub mentions: Vec<String>,
+}
+
+/// An author-approved way to communicate the intent.
+/// Empty constructions permits all constructions. Follow-up and authored families
+/// supply complete text instead and do not select a construction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpressionFamily {
+    pub id: String,
+    pub kind: ExpressionKind,
+    #[serde(default = "expression_weight")]
+    pub weight: f64,
+    #[serde(default)]
+    pub constructions: Vec<String>,
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    #[serde(default)]
+    pub context_requires: Vec<String>,
+    #[serde(default)]
+    pub establishes: Vec<String>,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    /// A supplied fact ID, required for reason_request.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Complete authored text, required for authored and follow_up.
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub message: Option<MessagePlan>,
+}
+
+pub(crate) fn expression_weight() -> f64 {
+    1.0
+}
+
+/// Meaning and circumstances are authored, never inferred from a seed sentence.
+/// Intent is an opaque identifier used to scope repetition history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpressionSource {
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub components: Vec<MessageComponent>,
+    pub intent: String,
+    pub families: Vec<ExpressionFamily>,
+    #[serde(default)]
+    pub constructions: Vec<ExpressionConstruction>,
+    #[serde(default)]
+    pub facts: Vec<super::discourse::Detail>,
+    /// Fact IDs permitted as optional additional sentences.
+    #[serde(default)]
+    pub optional_details: Vec<String>,
+    #[serde(default)]
+    pub protected: Vec<String>,
+}
+
+/// Stable identifiers explaining the selected expression, without rendered text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpressionSelection {
+    pub intent: String,
+    pub family: String,
+    pub construction: Option<String>,
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageSelection>,
+}
+
+/// A reusable piece of supplied meaning with compatible authored wordings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageComponent {
+    pub id: String,
+    pub role: String,
+    pub forms: Vec<MessageForm>,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+    #[serde(default)]
+    pub context_requires: Vec<String>,
+    #[serde(default)]
+    pub slot: Option<String>,
+    #[serde(default)]
+    pub option: Option<String>,
+}
+
+/// Shape is complete, fragments, clause or value. Clauses and values are only
+/// inserted into recipes that explicitly require them. Text is never parsed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageForm {
+    pub id: String,
+    pub text: String,
+    #[serde(default = "message_complete")]
+    pub shape: String,
+    #[serde(default = "message_explicit")]
+    pub reference: String,
+    #[serde(default = "expression_weight")]
+    pub weight: f64,
+    #[serde(default)]
+    pub context_requires: Vec<String>,
+}
+fn message_complete() -> String {
+    "complete".into()
+}
+fn message_explicit() -> String {
+    "explicit".into()
+}
+
+/// Binds semantic roles to components. Relationships and apologies require
+/// explicit authorization. Details are additional components, never new facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagePlan {
+    pub layout: String,
+    #[serde(default)]
+    pub bindings: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub relation: Option<String>,
+    #[serde(default)]
+    pub allow_apology: bool,
+    #[serde(default)]
+    pub details: Vec<String>,
+}
+
+/// Explains the structure and component forms used in an utterance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageSelection {
+    pub layout: String,
+    pub recipe: String,
+    pub forms: Vec<String>,
+    pub organization: String,
+    pub elaboration: String,
+    pub sentence_shape: String,
+    pub reference_style: String,
+}

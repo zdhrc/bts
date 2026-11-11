@@ -235,6 +235,41 @@ fn invalid<T>(field: &'static str, reason: &'static str) -> Result<T, Error> {
     Err(Error::InvalidField { field, reason })
 }
 
+/// Explicit context for procedural expression generation. Keep and pass the
+/// returned value between turns. An empty value starts a new conversation.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExpressionContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requested: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub known: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub offered: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_acts: Vec<String>,
+    pub established: Vec<String>,
+    pub recent: Vec<super::ExpressionSelection>,
+}
+
+impl ExpressionContext {
+    pub(crate) fn after(&self, selection: super::ExpressionSelection, established: &[String]) -> Self {
+        let mut next = self.clone();
+        for fact in established {
+            if !next.established.contains(fact) {
+                next.established.push(fact.clone());
+            }
+        }
+        next.recent.push(selection);
+        if next.recent.len() > 32 {
+            next.recent.drain(..next.recent.len() - 32);
+        }
+        next
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

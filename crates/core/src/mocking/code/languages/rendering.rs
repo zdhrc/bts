@@ -2230,8 +2230,9 @@ def _english_time(value, options):
     return result
 
 def _language_english(operation, args, random):
-    arities = {"realize": (1, 2), "vary": (1, 2), "combine": (2, 3), "refer": (2, 3), "remember": (2, 3), "unmentioned": (2, 2), "format_number": (1, 2), "format_date": (1, 2), "format_time": (1, 2)}
+    arities = {"express": (1,2), "expression": (1,2), "expression_candidates": (1,2), "realize": (1, 2), "vary": (1, 2), "combine": (2, 3), "refer": (2, 3), "remember": (2, 3), "unmentioned": (2, 2), "format_number": (1, 2), "format_date": (1, 2), "format_time": (1, 2)}
     if operation not in arities or type(args) is not list or not arities[operation][0] <= len(args) <= arities[operation][1]: raise ValueError("invalid English call")
+    if operation in ["express","expression","expression_candidates"]: return _english_expression(operation, args[0], args[1] if len(args) > 1 else {}, random)
     if operation == "realize": return _english_render(_english_sentence(args[0]), _english_render_options(args[1] if len(args) > 1 else {}))
     if operation == "vary": return _english_vary(args[0], args[1] if len(args) > 1 else {}, random)
     if operation == "combine":
@@ -2496,6 +2497,308 @@ def _english_style(value, options, random, details=False):
             text = text[:start] + replacement + text[end:]
             budget -= 1
     return {'text':text,'edits':edits} if details else text
+
+def _english_expression_ids(values):
+    values = _english_array(values)
+    for value in values: _english_text(value)
+    if len(set(values)) != len(values): raise ValueError('duplicate expression identifiers')
+    return values
+
+def _english_expression_weight(value, maximum=1000000):
+    if type(value) not in [int,float] or not _english_math.isfinite(value) or not 0 <= value <= maximum: raise ValueError('invalid expression weight or probability')
+    return value
+
+def _english_expression_input(source, options):
+    source = _english_object(source, ['intent','families','constructions','facts','optional_details','protected','topic','components'], {'constructions':[],'facts':[],'optional_details':[],'protected':[],'topic':None,'components':[]})
+    _english_text(source.get('intent'))
+    source['constructions'] = [_english_object(c,['id','predicate','weight','requires','excludes','mentions'],{'weight':1,'requires':[],'excludes':[],'mentions':[]}) for c in _english_array(source['constructions'])]
+    for c in source['constructions']:
+        _english_text(c.get('id')); _english_expression_weight(c['weight'])
+        c['predicate'] = _english_object(c.get('predicate'), ['verb','complement'], {'complement':None})
+        c['predicate']['verb'] = _english_verb(c['predicate'].get('verb'))
+        if c['predicate']['complement'] is not None: _english_fragment(c['predicate']['complement'])
+        for key in ['requires','excludes','mentions']: _english_expression_ids(c[key])
+        if any(i in c['excludes'] for i in c['requires']): raise ValueError('conflicting construction conditions')
+    ids = _english_expression_ids([c['id'] for c in source['constructions']])
+    source['facts'] = [_english_object(f,['id','text']) for f in _english_array(source['facts'])]
+    for fact in source['facts']: _english_text(fact.get('id')); _english_text(fact.get('text'))
+    facts = _english_expression_ids([f['id'] for f in source['facts']])
+    if any(i not in facts for i in _english_expression_ids(source['optional_details'])): raise ValueError('unknown optional detail')
+    if any(not _english_string(s) for s in _english_array(source['protected'])): raise ValueError('empty protected term')
+    fields = ['id','kind','weight','constructions','patterns','requires','excludes','context_requires','establishes','mentions','reason','text','message']
+    defaults = {'weight':1,'constructions':[],'patterns':[],'requires':[],'excludes':[],'context_requires':[],'establishes':[],'mentions':[],'reason':None,'text':None,'message':None}
+    source['families'] = [_english_object(f,fields,defaults) for f in _english_array(source.get('families'))]
+    if not source['families']: raise ValueError('no expression families')
+    _english_expression_ids([f.get('id') for f in source['families']])
+    for f in source['families']:
+        _english_enum(f.get('kind'), list(_EnglishData.data['expressions']['patterns']))
+        _english_expression_weight(f['weight'])
+        for key in ['constructions','patterns','requires','excludes','context_requires','establishes','mentions']: _english_expression_ids(f[key])
+        if any(i not in ids for i in f['constructions']) or any(i in f['excludes'] for i in f['requires']): raise ValueError('invalid family conditions')
+        if f['kind'] == 'structured':
+            if f['message'] is None or f['text'] is not None or f['reason'] is not None or f['constructions'] or f['patterns']: raise ValueError('invalid structured family')
+        elif f['kind'] in ['authored','follow_up']:
+            _english_text(f['text'])
+            if f['reason'] is not None or f['constructions'] or f['patterns'] or f['kind'] == 'follow_up' and not f['context_requires']: raise ValueError('invalid authored family')
+        else:
+            if f['text'] is not None or (f['kind'] == 'reason_request') != (f['reason'] is not None): raise ValueError('invalid family text or reason')
+            if f['reason'] is not None: _english_text(f['reason'])
+            if any(i not in [p['id'] for p in _EnglishData.data['expressions']['patterns'][f['kind']]] for i in f['patterns']): raise ValueError('unknown expression pattern')
+    defaults = _EnglishData.data['expressions']['options']
+    options = _english_object(options,['speaker','context','repeat_penalty'],defaults)
+    speaker = _english_object(options['speaker'],list(defaults['speaker']),defaults['speaker'])
+    speaker['wording'] = _english_style_options(speaker['wording'])
+    for key in ['family_weights','pattern_weights']:
+        if type(speaker[key]) is not dict: raise ValueError('expected expression weights')
+        for name,weight in speaker[key].items(): _english_text(name); _english_expression_weight(weight)
+    for key in ['greetings','closings']:
+        speaker[key] = [_english_object(p,['text','weight'],{'weight':1}) for p in _english_array(speaker[key])]
+        for phrase in speaker[key]: _english_text(phrase.get('text')); _english_expression_weight(phrase['weight'])
+    for key in ['greeting_probability','closing_probability','detail_probability']: _english_expression_weight(speaker[key],1)
+    value = speaker['max_details']
+    if type(value) not in [int,float] or not 0 <= value <= 16 or value != int(value): raise ValueError('invalid detail budget')
+    options['speaker'] = speaker
+    _english_expression_weight(options['repeat_penalty'],1)
+    context = _english_object(options['context'],['established','recent','topic','known','requested','offered','allowed_acts'],{'established':[],'recent':[],'topic':None,'known':[],'requested':[],'offered':[],'allowed_acts':[]})
+    _english_expression_ids(context['established'])
+    context['recent'] = [_english_object(r,['intent','family','construction','pattern','message']) for r in _english_array(context['recent'])]
+    if len(context['recent']) > 32: raise ValueError('history exceeds 32 selections')
+    for r in context['recent']:
+        for key in ['intent','family','pattern']: _english_text(r.get(key))
+        if r.get('construction') is not None: _english_text(r['construction'])
+        r.setdefault('construction',None)
+    options['context'] = context
+    _english_message_input(source,options)
+    return source,options
+
+def _english_expression_complete(text):
+    return text if text.endswith(('.', '?', '!')) else text+'.'
+
+def _english_expression_candidates(source, options):
+    facts = {f['id']:f['text'] for f in source['facts']}
+    def applies(value): return all(i in facts for i in value['requires']+value['mentions']) and all(i not in facts for i in value['excludes'])
+    recent = [r for r in options['context']['recent'] if r['intent'] == source['intent']]
+    result, family_total = [], 0.0
+    speaker = options['speaker']
+    for f in source['families']:
+        if not applies(f) or not all(i in options['context']['established'] for i in f['context_requires']) or f['reason'] is not None and f['reason'] not in facts: continue
+        fw = f['weight'] * speaker['family_weights'].get(f['id'],1) * (options['repeat_penalty'] if any(r['family'] == f['id'] for r in recent) else 1)
+        if f['message'] is not None:
+            layout = _EnglishData.data['expressions']['messages']['layouts'][f['message']['layout']]
+            elaboration = _english_message_elaboration(f['message'],layout)
+            fw *= speaker['organization'].get(layout['organization'],1)*speaker['elaboration'].get(elaboration,1)
+        if fw == 0: continue
+        used = list(dict.fromkeys(f['mentions'] + ([f['reason']] if f['reason'] is not None else [])))
+        group, total = [], 0.0
+        def candidate(construction,pattern,text,mentions,weight):
+            return {'selection':{'intent':source['intent'],'family':f['id'],'construction':construction,'pattern':pattern},'text':text,'used_facts':mentions,'establishes':list(f['establishes']),'probability':weight}
+        if f['kind'] in ['authored','follow_up','structured']:
+            if speaker['pattern_weights'].get(f['kind'],1) > 0:
+                total = 1.0
+                group.append(candidate(None,f['kind'],f['text'] or '',used,1.0))
+        else:
+            patterns = [(p,speaker['pattern_weights'].get(p['id'],1)) for p in _EnglishData.data['expressions']['patterns'][f['kind']] if (not f['patterns'] or p['id'] in f['patterns']) and speaker['pattern_weights'].get(p['id'],1) > 0]
+            pattern_total = sum(w for p,w in patterns)
+            if pattern_total == 0: continue
+            for c in source['constructions']:
+                if f['constructions'] and c['id'] not in f['constructions'] or not applies(c): continue
+                weight = c['weight'] * (options['repeat_penalty'] if any(r['construction'] == c['id'] for r in recent) else 1)
+                if weight == 0: continue
+                total += weight
+                mentions = list(dict.fromkeys(c['mentions']+used))
+                for pattern,pw in patterns:
+                    predicate = c['predicate']
+                    action = predicate['verb']['present_participle' if pattern['gerund'] else 'base'] + (' '+predicate['complement'] if predicate['complement'] is not None else '')
+                    text = pattern['prefix']+action+pattern['suffix']
+                    if f['reason'] is not None: text = _english_expression_complete(facts[f['reason']])+' '+text
+                    group.append(candidate(c['id'],pattern['id'],text,mentions,weight*pw/pattern_total))
+        if f['message'] is not None:
+            group = _english_message_expand(source,f,options,group)
+            total = sum(c['probability'] for c in group)
+        if total > 0:
+            family_total += fw
+            for c in group: c['probability'] = c['probability']/total*fw
+            result += group
+    for c in result:
+        c['probability'] /= family_total
+        if c['probability'] in [0,1]: c['probability'] = int(c['probability'])
+    return result
+
+def _english_expression_pick(weights, random):
+    if len(weights) == 1: return 0
+    draw = random()*sum(weights)
+    for i,weight in enumerate(weights):
+        if draw < weight: return i
+        draw -= weight
+    return len(weights)-1
+
+def _english_expression(operation, source, options, random):
+    source, options = _english_expression_input(source,options)
+    candidates = _english_expression_candidates(source,options)
+    if operation == 'expression_candidates': return candidates
+    if not candidates: raise ValueError('no eligible expression with positive weight')
+    chosen = candidates[_english_expression_pick([c['probability'] for c in candidates],random)]
+    speaker, context = options['speaker'], options['context']
+    def chance(p): return p == 1 or p > 0 and random() < p
+    def phrase(key,p):
+        values = [v for v in speaker[key] if v['weight'] > 0]
+        return values[_english_expression_pick([v['weight'] for v in values],random)]['text'] if values and chance(p) else None
+    parts = []
+    greeting = phrase('greetings',speaker['greeting_probability']) if not context['recent'] else None
+    if greeting is not None: parts.append(greeting)
+    parts.append(chosen['text'])
+    used = list(chosen['used_facts'])
+    details = [i for i in source['optional_details'] if i not in used and i not in context['established']]
+    for _ in range(int(speaker['max_details'])):
+        if not details or not chance(speaker['detail_probability']): break
+        id = details.pop(_english_expression_pick([1.0]*len(details),random))
+        parts.append(_english_expression_complete(next(f['text'] for f in source['facts'] if f['id'] == id)))
+        used.append(id)
+    closing = phrase('closings',speaker['closing_probability'])
+    if closing is not None: parts.append(closing)
+    base = ' '.join(parts)
+    wording = dict(speaker['wording'],protected=speaker['wording']['protected']+source['protected'])
+    if 'message' in chosen['selection']: wording['fragments'] = False
+    styled = _english_style(base,wording,random,True)
+    result = {'text':styled['text'],'base_text':base,'selection':chosen['selection'],'used_facts':used,'edits':styled['edits'],'context':{'established':list(dict.fromkeys(context['established']+chosen['establishes']+used)),'recent':(context['recent']+[chosen['selection']])[-32:]}}
+    result['context'] = _english_message_context(source,chosen,used,context,result['context'])
+    return result['text'] if operation == 'express' else result
+
+def _english_message_elaboration(plan, layout):
+    return 'detailed' if plan['details'] else 'minimal' if layout['act'] is not None or plan['layout'] == 'request_only' else 'relevant_context'
+
+def _english_message_input(source, options):
+    data = _EnglishData.data['expressions']['messages']
+    context = options['context']
+    for topic in [source['topic'],context['topic']]:
+        if topic is not None: _english_text(topic)
+    for key in ['known','requested','offered','allowed_acts']: _english_expression_ids(context[key])
+    for act in context['allowed_acts']: _english_enum(act,['answer','correction','acknowledgment','clarification','follow_up_request'])
+    for key,values in data['preferences'].items():
+        weights = options['speaker'][key]
+        if type(weights) is not dict: raise ValueError('invalid message preferences')
+        for name,weight in weights.items(): _english_enum(name,values); _english_expression_weight(weight)
+    source['components'] = [_english_object(c,['id','role','forms','mentions','requires','context_requires','slot','option'],{'mentions':[],'requires':[],'context_requires':[],'slot':None,'option':None}) for c in _english_array(source['components'])]
+    _english_expression_ids([c.get('id') for c in source['components']])
+    for c in source['components']:
+        _english_enum(c.get('role'),data['roles'])
+        for key in ['mentions','requires','context_requires']: _english_expression_ids(c[key])
+        for key in ['slot','option']:
+            if c[key] is not None: _english_text(c[key])
+        c['forms'] = [_english_object(f,['id','text','shape','reference','weight','context_requires'],{'shape':'complete','reference':'explicit','weight':1,'context_requires':[]}) for f in _english_array(c.get('forms'))]
+        if not c['forms']: raise ValueError('empty component forms')
+        _english_expression_ids([f.get('id') for f in c['forms']])
+        for f in c['forms']:
+            _english_text(f.get('text')); _english_expression_weight(f['weight']); _english_expression_ids(f['context_requires'])
+            _english_enum(f['shape'],['complete','fragments','clause','value']); _english_enum(f['reference'],['explicit','contextual'])
+            if f['reference'] == 'contextual' and (source['topic'] is None or not c['context_requires'] and not f['context_requires']) or f['shape'] != 'complete' and f['text'].endswith(('.', '?', '!')): raise ValueError('invalid component grammar or reference guard')
+    components = {c['id']:c for c in source['components']}
+    for f in source['families']:
+        if f['message'] is None: continue
+        p = _english_object(f['message'],['layout','bindings','relation','allow_apology','details'],{'bindings':{},'relation':None,'allow_apology':False,'details':[]})
+        f['message'] = p
+        _english_enum(p.get('layout'),list(data['layouts']))
+        layout = data['layouts'][p['layout']]
+        if type(p['allow_apology']) is not bool: raise ValueError('invalid apology flag')
+        _english_expression_ids(p['details'])
+        if type(p['bindings']) is not dict or set(p['bindings']) != set(layout['roles']) or (f['kind'] == 'structured') != layout['standalone'] or f['kind'] == 'reason_request' or source['optional_details'] or p['allow_apology'] and p['layout'] != 'correction': raise ValueError('incompatible message layout')
+        if p['relation'] is not None and (p['layout'],p['relation']) not in [('request_reason','cause'),('reason_request','cause'),('current_desired','contrast')]: raise ValueError('invalid message relationship')
+        for role,id in p['bindings'].items():
+            _english_text(id)
+            if id not in components or components[id]['role'] != role: raise ValueError('invalid message binding')
+        for id in p['details']:
+            if id not in components or components[id]['role'] != 'detail': raise ValueError('invalid message detail')
+        if layout['act'] is not None and source['topic'] is None: raise ValueError('responses require a topic')
+        if p['layout'] in ['answer','clarification','correction']:
+            bound = [components[id] for id in p['bindings'].values()]
+            if any(c['slot'] is None for c in bound) or len(set(c['slot'] for c in bound)) != 1 or p['layout'] == 'correction' and (any(not c['mentions'] for c in bound) or set(bound[0]['mentions']) & set(bound[1]['mentions'])): raise ValueError('invalid response slots or facts')
+    for r in context['recent']:
+        if r.get('message') is None: r.pop('message',None)
+        if r.get('message') is not None:
+            m = _english_object(r['message'],['layout','recipe','forms','organization','elaboration','sentence_shape','reference_style'])
+            for key in ['layout','recipe','organization','elaboration','sentence_shape','reference_style']: _english_text(m.get(key))
+            _english_expression_ids(m.get('forms'))
+
+def _english_message_expand(source, family, options, bases):
+    data = _EnglishData.data['expressions']['messages']
+    plan, context, speaker = family['message'], options['context'], options['speaker']
+    layout = data['layouts'][plan['layout']]
+    topic_matches = source['topic'] is not None and source['topic'] == context['topic']
+    if layout['act'] is not None and (not topic_matches or layout['act'] not in context['allowed_acts']): return []
+    components = {c['id']:c for c in source['components']}
+    for role,id in plan['bindings'].items():
+        c = components[id]
+        if plan['layout'] in ['answer','clarification'] and c['slot'] not in context['requested'] or role == 'previous' and not all(i in context['established'] for i in c['mentions']): return []
+    facts = [f['id'] for f in source['facts']]+context['known']
+    def applies(c): return all(i in facts for i in c['mentions']+c['requires']) and all(i in context['established'] for i in c['context_requires']) and (c['option'] is None or topic_matches and c['option'] in context['offered'])
+    organization, elaboration = layout['organization'], _english_message_elaboration(plan,layout)
+    preference = speaker['organization'].get(organization,1)*speaker['elaboration'].get(elaboration,1)
+    if preference == 0: return []
+    result = []
+    for base in bases:
+        expanded = []
+        for recipe in data['recipes']:
+            if recipe['layout'] != plan['layout'] or 'relation' in recipe and recipe['relation'] != plan['relation'] or recipe.get('apology',False) and not plan['allow_apology'] or recipe.get('declarative',False) and base['selection']['pattern'] not in ['desire_would_like','desire_want','desire_looking_to','need_need_to']: continue
+            choices = [(list(base['used_facts']),[],recipe.get('reference') == 'contextual',1.0)]
+            slots = [(role,components[plan['bindings'][role]],recipe['forms'][role]) for role in layout['roles']]+[('detail',components[id],'complete') for id in plan['details']]
+            for role,c,shape in slots:
+                if not applies(c): choices = []; break
+                forms = [f for f in c['forms'] if f['shape'] == shape and f['weight'] > 0 and not (role == 'current' and recipe.get('relation') == 'contrast' and f['text'].endswith(('?', '!'))) and all(i in context['established'] for i in f['context_requires']) and (f['reference'] != 'contextual' or topic_matches)]
+                total = sum(f['weight'] for f in forms)
+                if len(choices)*len(forms) > 16384: raise ValueError('message expansion exceeds 16384 choices')
+                following = []
+                for used,selected,contextual,w in choices:
+                    for f in forms:
+                        following.append((list(dict.fromkeys(used+c['mentions'])),selected+[_english_message_form_id(c['id'],f['id'])],contextual or f['reference'] == 'contextual',w*f['weight']/total))
+                choices = following
+            shape = 'short_sentences' if plan['details'] and recipe['shape'] == 'complete' else recipe['shape']
+            for used,forms,contextual,w in choices:
+                text = _english_message_render(recipe,plan,components,layout,base['text'],forms)
+                if contextual and not topic_matches: continue
+                reference = 'contextual' if contextual else 'explicit'
+                probability = w*speaker['sentence_shape'].get(shape,1)*speaker['reference_style'].get(reference,1)
+                if probability == 0: continue
+                selection = dict(base['selection'],message={'layout':plan['layout'],'recipe':recipe['id'],'forms':forms,'organization':organization,'elaboration':elaboration,'sentence_shape':shape,'reference_style':reference})
+                expanded.append(dict(base,text=text,used_facts=used,selection=selection,probability=probability))
+        total = sum(c['probability'] for c in expanded)
+        for c in expanded: c['probability'] = c['probability']/total*base['probability']*preference
+        result += expanded
+        if len(result) > 16384: raise ValueError('message expansion exceeds 16384 choices')
+    return result
+
+def _english_message_context(source, chosen, used, previous, context):
+    for key in ['topic','known','requested','offered','allowed_acts']: context[key] = previous[key] if key == 'topic' else list(previous[key])
+    if source['topic'] is not None:
+        if context['topic'] != source['topic']:
+            for key in ['requested','offered','allowed_acts']: context[key] = []
+        context['topic'] = source['topic']
+        context['known'] = list(dict.fromkeys(context['known']+used))
+    if 'message' in chosen['selection']:
+        plan = next(f['message'] for f in source['families'] if f['id'] == chosen['selection']['family'])
+        def component(role): return next(c for c in source['components'] if c['id'] == plan['bindings'][role])
+        if plan['layout'] == 'answer': context['requested'] = [i for i in context['requested'] if i != component('answer')['slot']]
+        if plan['layout'] == 'correction': context['known'] = [i for i in context['known'] if i not in component('previous')['mentions']]
+        if _EnglishData.data['expressions']['messages']['layouts'][plan['layout']]['act'] is not None: context['allowed_acts'] = []
+    return {k:v for k,v in context.items() if k in ['established','recent'] or v is not None and v != []}
+
+def _english_message_render(recipe, plan, components, layout, request, forms):
+    values = {'request':request,'request_clause':request.rstrip('.')}
+    bindings = [(r,plan['bindings'][r]) for r in layout['roles']]+[('detail',id) for id in plan['details']]
+    details = []
+    for (role,id),selected in zip(bindings,forms):
+        form = next(f for f in components[id]['forms'] if _english_message_form_id(id,f['id']) == selected)
+        value = _english_expression_complete(form['text']) if form['shape'] == 'complete' else form['text']
+        if role == 'detail': details.append(value)
+        else: values[role] = value; values[role+'_clause'] = value.rstrip('.')
+    remaining, rendered = recipe['text'], ''
+    while '{' in remaining:
+        prefix,rest = remaining.split('{',1)
+        key,remaining = rest.split('}',1)
+        rendered += prefix+values[key]
+    return ' '.join([rendered+remaining]+details)
+
+def _english_message_form_id(component, form):
+    return '/'.join(value.replace('~','~0').replace('/','~1') for value in [component,form])
 "#;
 
 const TS_ENGLISH: &str = r#"const _englishSpace = "[\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
@@ -2841,8 +3144,9 @@ function _englishTime(value: any, options: any): string {
     return result;
 }
 function _language_english(operation: string, args: any[], random: () => number): any {
-    const arities: any = {realize: [1, 2], vary: [1, 2], combine: [2, 3], refer: [2, 3], remember: [2, 3], unmentioned: [2, 2], format_number: [1, 2], format_date: [1, 2], format_time: [1, 2]};
+    const arities: any = {express:[1,2], expression:[1,2], expression_candidates:[1,2], realize: [1, 2], vary: [1, 2], combine: [2, 3], refer: [2, 3], remember: [2, 3], unmentioned: [2, 2], format_number: [1, 2], format_date: [1, 2], format_time: [1, 2]};
     if (!Object.hasOwn(arities, operation) || !Array.isArray(args) || args.length < arities[operation][0] || args.length > arities[operation][1]) throw new Error("invalid English call");
+    if (["express","expression","expression_candidates"].includes(operation)) return _englishExpression(operation,args[0],args.length > 1 ? args[1] : {},random);
     if (operation === "realize") return _englishRender(_englishSentence(args[0]), _englishRenderOptions(args.length > 1 ? args[1] : {}));
     if (operation === "vary") return _englishVary(args[0], args.length > 1 ? args[1] : {}, random);
     if (operation === "combine") {
@@ -3115,6 +3419,300 @@ function _englishStyle(value: any, supplied: any, random: () => number, details 
         }
     }
     return details ? {text,edits} : text;
+}
+
+function _englishExpressionIds(values: any): string[] {
+    values = _englishArray(values);
+    for (const value of values) _englishText(value);
+    if (new Set(values).size !== values.length) throw new Error('duplicate expression identifiers');
+    return values;
+}
+function _englishExpressionWeight(value: any, maximum = 1000000): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > maximum) throw new Error('invalid expression weight or probability');
+    return value;
+}
+function _englishExpressionInput(source: any, options: any): [any,any] {
+    source = _englishObject(source,['intent','families','constructions','facts','optional_details','protected','topic','components'],{constructions:[],facts:[],optional_details:[],protected:[],topic:null,components:[]});
+    _englishText(source.intent);
+    source.constructions = _englishArray(source.constructions).map(c => _englishObject(c,['id','predicate','weight','requires','excludes','mentions'],{weight:1,requires:[],excludes:[],mentions:[]}));
+    for (const c of source.constructions) {
+        _englishText(c.id); _englishExpressionWeight(c.weight);
+        c.predicate = _englishObject(c.predicate,['verb','complement'],{complement:null});
+        c.predicate.verb = _englishVerb(c.predicate.verb);
+        if (c.predicate.complement !== null) _englishFragment(c.predicate.complement);
+        for (const key of ['requires','excludes','mentions']) _englishExpressionIds(c[key]);
+        if (c.requires.some((id: string) => c.excludes.includes(id))) throw new Error('conflicting construction conditions');
+    }
+    const ids = _englishExpressionIds(source.constructions.map((c: any) => c.id));
+    source.facts = _englishArray(source.facts).map(f => _englishObject(f,['id','text']));
+    for (const f of source.facts) {_englishText(f.id); _englishText(f.text);}
+    const facts = _englishExpressionIds(source.facts.map((f: any) => f.id));
+    if (_englishExpressionIds(source.optional_details).some(id => !facts.includes(id))) throw new Error('unknown optional detail');
+    if (_englishArray(source.protected).some(s => !_englishString(s))) throw new Error('empty protected term');
+    const fields = ['id','kind','weight','constructions','patterns','requires','excludes','context_requires','establishes','mentions','reason','text','message'];
+    const familyDefaults = {weight:1,constructions:[],patterns:[],requires:[],excludes:[],context_requires:[],establishes:[],mentions:[],reason:null,text:null,message:null};
+    source.families = _englishArray(source.families).map(f => _englishObject(f,fields,familyDefaults));
+    if (!source.families.length) throw new Error('no expression families');
+    _englishExpressionIds(source.families.map((f: any) => f.id));
+    for (const f of source.families) {
+        _englishEnum(f.kind,Object.keys(_englishData.expressions.patterns)); _englishExpressionWeight(f.weight);
+        for (const key of ['constructions','patterns','requires','excludes','context_requires','establishes','mentions']) _englishExpressionIds(f[key]);
+        if (f.constructions.some((id: string) => !ids.includes(id)) || f.requires.some((id: string) => f.excludes.includes(id))) throw new Error('invalid family conditions');
+        if (f.kind === 'structured') {
+            if (f.message === null || f.text !== null || f.reason !== null || f.constructions.length || f.patterns.length) throw new Error('invalid structured family');
+        } else if (['authored','follow_up'].includes(f.kind)) {
+            _englishText(f.text);
+            if (f.reason !== null || f.constructions.length || f.patterns.length || f.kind === 'follow_up' && !f.context_requires.length) throw new Error('invalid authored family');
+        } else {
+            if (f.text !== null || (f.kind === 'reason_request') !== (f.reason !== null)) throw new Error('invalid family text or reason');
+            if (f.reason !== null) _englishText(f.reason);
+            if (f.patterns.some((id: string) => !_englishData.expressions.patterns[f.kind].some((p: any) => p.id === id))) throw new Error('unknown expression pattern');
+        }
+    }
+    const defaults = _englishData.expressions.options;
+    options = _englishObject(options,['speaker','context','repeat_penalty'],defaults);
+    const speaker = _englishObject(options.speaker,Object.keys(defaults.speaker),defaults.speaker);
+    speaker.wording = _englishStyleOptions(speaker.wording);
+    for (const key of ['family_weights','pattern_weights']) {
+        if (speaker[key] === null || typeof speaker[key] !== 'object' || Array.isArray(speaker[key])) throw new Error('expected expression weights');
+        for (const [name,weight] of Object.entries(speaker[key])) {_englishText(name); _englishExpressionWeight(weight);}
+    }
+    for (const key of ['greetings','closings']) {
+        speaker[key] = _englishArray(speaker[key]).map(p => _englishObject(p,['text','weight'],{weight:1}));
+        for (const p of speaker[key]) {_englishText(p.text); _englishExpressionWeight(p.weight);}
+    }
+    for (const key of ['greeting_probability','closing_probability','detail_probability']) _englishExpressionWeight(speaker[key],1);
+    if (typeof speaker.max_details !== 'number' || !Number.isInteger(speaker.max_details) || speaker.max_details < 0 || speaker.max_details > 16) throw new Error('invalid detail budget');
+    options.speaker = speaker;
+    _englishExpressionWeight(options.repeat_penalty,1);
+    const context = _englishObject(options.context,['established','recent','topic','known','requested','offered','allowed_acts'],{established:[],recent:[],topic:null,known:[],requested:[],offered:[],allowed_acts:[]});
+    _englishExpressionIds(context.established);
+    context.recent = _englishArray(context.recent).map(r => _englishObject(r,['intent','family','construction','pattern','message'],{construction:null}));
+    if (context.recent.length > 32) throw new Error('history exceeds 32 selections');
+    for (const r of context.recent) {
+        for (const key of ['intent','family','pattern']) _englishText(r[key]);
+        if (r.construction !== null) _englishText(r.construction);
+    }
+    options.context = context;
+    _englishMessageInput(source,options);
+    return [source,options];
+}
+function _englishExpressionComplete(text: string): string {return /[.?!]$/.test(text) ? text : text+'.';}
+function _englishExpressionPreference(weights: any, key: string): number {return Object.hasOwn(weights,key) ? weights[key] : 1;}
+function _englishExpressionCandidates(source: any, options: any): any[] {
+    const facts = new Map<string,string>(source.facts.map((f: any) => [f.id,f.text]));
+    const applies = (v: any) => [...v.requires,...v.mentions].every(id => facts.has(id)) && v.excludes.every((id: string) => !facts.has(id));
+    const recent = options.context.recent.filter((r: any) => r.intent === source.intent), speaker = options.speaker;
+    const result: any[] = [];
+    let familyTotal = 0;
+    for (const f of source.families) {
+        if (!applies(f) || !f.context_requires.every((id: string) => options.context.established.includes(id)) || f.reason !== null && !facts.has(f.reason)) continue;
+        let fw = f.weight*_englishExpressionPreference(speaker.family_weights,f.id)*(recent.some((r: any) => r.family === f.id) ? options.repeat_penalty : 1);
+        if (f.message !== null) {
+            const layout = _englishData.expressions.messages.layouts[f.message.layout];
+            fw *= _englishExpressionPreference(speaker.organization,layout.organization)*_englishExpressionPreference(speaker.elaboration,_englishMessageElaboration(f.message,layout));
+        }
+        if (!fw) continue;
+        const used = [...new Set([...f.mentions,...(f.reason !== null ? [f.reason] : [])])];
+        let group: any[] = [];
+        let total = 0;
+        const candidate = (construction: string | null,pattern: string,text: string,mentions: any[],weight: number) => ({selection:{intent:source.intent,family:f.id,construction,pattern},text,used_facts:mentions,establishes:[...f.establishes],probability:weight});
+        if (['authored','follow_up','structured'].includes(f.kind)) {
+            if (_englishExpressionPreference(speaker.pattern_weights,f.kind) > 0) {total=1; group.push(candidate(null,f.kind,f.text ?? '',used,1));}
+        } else {
+            const patterns: [any,number][] = _englishData.expressions.patterns[f.kind].filter((p: any) => (!f.patterns.length || f.patterns.includes(p.id)) && _englishExpressionPreference(speaker.pattern_weights,p.id) > 0).map((p: any) => [p,_englishExpressionPreference(speaker.pattern_weights,p.id)]);
+            const patternTotal = patterns.reduce((n,[p,w]) => n+w,0);
+            if (!patternTotal) continue;
+            for (const c of source.constructions) {
+                if (f.constructions.length && !f.constructions.includes(c.id) || !applies(c)) continue;
+                const weight = c.weight*(recent.some((r: any) => r.construction === c.id) ? options.repeat_penalty : 1);
+                if (!weight) continue;
+                total += weight;
+                const mentions = [...new Set([...c.mentions,...used])];
+                for (const [pattern,pw] of patterns) {
+                    const predicate = c.predicate, action = predicate.verb[pattern.gerund ? 'present_participle' : 'base']+(predicate.complement !== null ? ' '+predicate.complement : '');
+                    let text = pattern.prefix+action+pattern.suffix;
+                    if (f.reason !== null) text = _englishExpressionComplete(facts.get(f.reason)!)+' '+text;
+                    group.push(candidate(c.id,pattern.id,text,mentions,weight*pw/patternTotal));
+                }
+            }
+        }
+        if (f.message !== null) {group=_englishMessageExpand(source,f,options,group); total=group.reduce((n,c)=>n+c.probability,0);}
+        if (total > 0) {familyTotal+=fw; for (const c of group) c.probability=c.probability/total*fw; result.push(...group);}
+    }
+    for (const c of result) c.probability/=familyTotal;
+    return result;
+}
+function _englishExpressionPick(weights: number[], random: () => number): number {
+    if (weights.length === 1) return 0;
+    let draw=random()*weights.reduce((n,w)=>n+w,0);
+    for (let i=0;i<weights.length;i++) {if (draw < weights[i]) return i; draw-=weights[i];}
+    return weights.length-1;
+}
+function _englishExpression(operation: string, supplied: any, configuration: any, random: () => number): any {
+    const [source,options] = _englishExpressionInput(supplied,configuration), candidates = _englishExpressionCandidates(source,options);
+    if (operation === 'expression_candidates') return candidates;
+    if (!candidates.length) throw new Error('no eligible expression with positive weight');
+    const chosen=candidates[_englishExpressionPick(candidates.map(c=>c.probability),random)], speaker=options.speaker, context=options.context;
+    const chance=(p: number)=>p===1 || p>0 && random()<p;
+    const phrase=(key: string,p: number): string | null => {const values=speaker[key].filter((v: any)=>v.weight>0); return values.length && chance(p) ? values[_englishExpressionPick(values.map((v: any)=>v.weight),random)].text : null;};
+    const parts: string[] = [], greeting=context.recent.length ? null : phrase('greetings',speaker.greeting_probability);
+    if (greeting !== null) parts.push(greeting);
+    parts.push(chosen.text);
+    const used=[...chosen.used_facts], details=source.optional_details.filter((id: string)=>!used.includes(id) && !context.established.includes(id));
+    for (let i=0;i<speaker.max_details;i++) {
+        if (!details.length || !chance(speaker.detail_probability)) break;
+        const id=details.splice(_englishExpressionPick(details.map(()=>1),random),1)[0];
+        parts.push(_englishExpressionComplete(source.facts.find((f: any)=>f.id===id).text)); used.push(id);
+    }
+    const closing=phrase('closings',speaker.closing_probability);
+    if (closing !== null) parts.push(closing);
+    const base=parts.join(' '), wording={...speaker.wording,protected:[...speaker.wording.protected,...source.protected]};
+    if (chosen.selection.message) wording.fragments=false;
+    const styled=_englishStyle(base,wording,random,true);
+    const result={text:styled.text,base_text:base,selection:chosen.selection,used_facts:used,edits:styled.edits,context:{established:[...new Set([...context.established,...chosen.establishes,...used])],recent:[...context.recent,chosen.selection].slice(-32)}};
+    result.context=_englishMessageContext(source,chosen,used,context,result.context);
+    return operation === 'express' ? result.text : result;
+}
+function _englishMessageElaboration(plan: any, layout: any): string {
+    return plan.details.length ? 'detailed' : layout.act !== null || plan.layout === 'request_only' ? 'minimal' : 'relevant_context';
+}
+function _englishMessageInput(source: any, options: any): void {
+    const data=_englishData.expressions.messages, context=options.context;
+    for (const topic of [source.topic,context.topic]) if (topic !== null) _englishText(topic);
+    for (const key of ['known','requested','offered','allowed_acts']) _englishExpressionIds(context[key]);
+    for (const act of context.allowed_acts) _englishEnum(act,['answer','correction','acknowledgment','clarification','follow_up_request']);
+    for (const key of Object.keys(data.preferences)) {
+        const weights=options.speaker[key];
+        if (weights === null || typeof weights !== 'object' || Array.isArray(weights)) throw new Error('invalid message preferences');
+        for (const [name,weight] of Object.entries(weights)) {_englishEnum(name,data.preferences[key]); _englishExpressionWeight(weight);}
+    }
+    source.components=_englishArray(source.components).map(c=>_englishObject(c,['id','role','forms','mentions','requires','context_requires','slot','option'],{mentions:[],requires:[],context_requires:[],slot:null,option:null}));
+    _englishExpressionIds(source.components.map((c: any)=>c.id));
+    for (const c of source.components) {
+        _englishEnum(c.role,data.roles);
+        for (const key of ['mentions','requires','context_requires']) _englishExpressionIds(c[key]);
+        for (const key of ['slot','option']) if (c[key] !== null) _englishText(c[key]);
+        c.forms=_englishArray(c.forms).map(f=>_englishObject(f,['id','text','shape','reference','weight','context_requires'],{shape:'complete',reference:'explicit',weight:1,context_requires:[]}));
+        if (!c.forms.length) throw new Error('empty component forms');
+        _englishExpressionIds(c.forms.map((f: any)=>f.id));
+        for (const f of c.forms) {
+            _englishText(f.text); _englishExpressionWeight(f.weight); _englishExpressionIds(f.context_requires);
+            _englishEnum(f.shape,['complete','fragments','clause','value']); _englishEnum(f.reference,['explicit','contextual']);
+            if (f.reference === 'contextual' && (source.topic === null || !c.context_requires.length && !f.context_requires.length) || f.shape !== 'complete' && /[.?!]$/.test(f.text)) throw new Error('invalid component grammar or reference guard');
+        }
+    }
+    const components=new Map<string,any>(source.components.map((c: any)=>[c.id,c]));
+    for (const f of source.families) {
+        if (f.message === null) continue;
+        const p=_englishObject(f.message,['layout','bindings','relation','allow_apology','details'],{bindings:{},relation:null,allow_apology:false,details:[]});
+        f.message=p;
+        _englishEnum(p.layout,Object.keys(data.layouts));
+        const layout=data.layouts[p.layout];
+        if (typeof p.allow_apology !== 'boolean') throw new Error('invalid apology flag');
+        _englishExpressionIds(p.details);
+        if (p.bindings === null || typeof p.bindings !== 'object' || Array.isArray(p.bindings) || Object.keys(p.bindings).length !== layout.roles.length || !layout.roles.every((r: string)=>Object.hasOwn(p.bindings,r)) || (f.kind === 'structured') !== layout.standalone || f.kind === 'reason_request' || source.optional_details.length || p.allow_apology && p.layout !== 'correction') throw new Error('incompatible message layout');
+        if (p.relation !== null && !(['request_reason','reason_request'].includes(p.layout) && p.relation === 'cause' || p.layout === 'current_desired' && p.relation === 'contrast')) throw new Error('invalid message relationship');
+        for (const [role,id] of Object.entries(p.bindings)) {
+            _englishText(id);
+            if (!components.has(id as string) || components.get(id as string).role !== role) throw new Error('invalid message binding');
+        }
+        for (const id of p.details) if (!components.has(id) || components.get(id).role !== 'detail') throw new Error('invalid message detail');
+        if (layout.act !== null && source.topic === null) throw new Error('responses require a topic');
+        if (['answer','clarification','correction'].includes(p.layout)) {
+            const bound=Object.values(p.bindings).map(id=>components.get(id as string));
+            if (bound.some(c=>c.slot === null) || new Set(bound.map(c=>c.slot)).size !== 1 || p.layout === 'correction' && (bound.some(c=>!c.mentions.length) || bound[0].mentions.some((id: string)=>bound[1].mentions.includes(id)))) throw new Error('invalid response slots or facts');
+        }
+    }
+    for (const r of context.recent) {
+        if (r.message == null) delete r.message;
+        if (r.message != null) {
+        const m=_englishObject(r.message,['layout','recipe','forms','organization','elaboration','sentence_shape','reference_style']);
+        for (const key of ['layout','recipe','organization','elaboration','sentence_shape','reference_style']) _englishText(m[key]);
+        _englishExpressionIds(m.forms);
+        }
+    }
+}
+function _englishMessageExpand(source: any, family: any, options: any, bases: any[]): any[] {
+    const data=_englishData.expressions.messages, plan=family.message, context=options.context, speaker=options.speaker, layout=data.layouts[plan.layout];
+    const topicMatches=source.topic !== null && source.topic === context.topic;
+    if (layout.act !== null && (!topicMatches || !context.allowed_acts.includes(layout.act))) return [];
+    const components=new Map<string,any>(source.components.map((c: any)=>[c.id,c]));
+    for (const [role,id] of Object.entries(plan.bindings)) {
+        const c=components.get(id as string);
+        if (['answer','clarification'].includes(plan.layout) && !context.requested.includes(c.slot) || role === 'previous' && !c.mentions.every((i: string)=>context.established.includes(i))) return [];
+    }
+    const facts=[...source.facts.map((f: any)=>f.id),...context.known];
+    const applies=(c: any)=>[...c.mentions,...c.requires].every(i=>facts.includes(i)) && c.context_requires.every((i: string)=>context.established.includes(i)) && (c.option === null || topicMatches && context.offered.includes(c.option));
+    const organization=layout.organization, elaboration=_englishMessageElaboration(plan,layout), preference=_englishExpressionPreference(speaker.organization,organization)*_englishExpressionPreference(speaker.elaboration,elaboration);
+    if (!preference) return [];
+    const result: any[]=[];
+    for (const base of bases) {
+        const expanded: any[]=[];
+        for (const recipe of data.recipes) {
+            if (recipe.layout !== plan.layout || recipe.relation !== undefined && recipe.relation !== plan.relation || recipe.apology && !plan.allow_apology || recipe.declarative && !['desire_would_like','desire_want','desire_looking_to','need_need_to'].includes(base.selection.pattern)) continue;
+            let choices: [string[],string[],boolean,number][]=[[[...base.used_facts],[],recipe.reference === 'contextual',1]];
+            const slots: [string,any,string][]=[...layout.roles.map((role: string)=>[role,components.get(plan.bindings[role]),recipe.forms[role]]),...plan.details.map((id: string)=>['detail',components.get(id),'complete'])];
+            for (const [role,c,shape] of slots) {
+                if (!applies(c)) {choices=[]; break;}
+                const forms=c.forms.filter((f: any)=>f.shape === shape && f.weight > 0 && !(role === 'current' && recipe.relation === 'contrast' && /[?!]$/.test(f.text)) && f.context_requires.every((i: string)=>context.established.includes(i)) && (f.reference !== 'contextual' || topicMatches));
+                const total=forms.reduce((n: number,f: any)=>n+f.weight,0);
+                if (choices.length*forms.length > 16384) throw new Error('message expansion exceeds 16384 choices');
+                const following: typeof choices=[];
+                for (const [used,selected,contextual,w] of choices) for (const f of forms) {
+                    following.push([[...new Set([...used,...c.mentions])],[...selected,_englishMessageFormId(c.id,f.id)],contextual || f.reference === 'contextual',w*f.weight/total]);
+                }
+                choices=following;
+            }
+            const shape=plan.details.length && recipe.shape === 'complete' ? 'short_sentences' : recipe.shape;
+            for (const [used,forms,contextual,w] of choices) {
+                const text=_englishMessageRender(recipe,plan,components,layout,base.text,forms);
+                if (contextual && !topicMatches) continue;
+                const reference=contextual ? 'contextual' : 'explicit', probability=w*_englishExpressionPreference(speaker.sentence_shape,shape)*_englishExpressionPreference(speaker.reference_style,reference);
+                if (!probability) continue;
+                const selection={...base.selection,message:{layout:plan.layout,recipe:recipe.id,forms,organization,elaboration,sentence_shape:shape,reference_style:reference}};
+                expanded.push({...base,text,used_facts:used,selection,probability});
+            }
+        }
+        const total=expanded.reduce((n,c)=>n+c.probability,0);
+        for (const c of expanded) c.probability=c.probability/total*base.probability*preference;
+        result.push(...expanded);
+        if (result.length > 16384) throw new Error('message expansion exceeds 16384 choices');
+    }
+    return result;
+}
+function _englishMessageContext(source: any, chosen: any, used: string[], previous: any, context: any): any {
+    for (const key of ['topic','known','requested','offered','allowed_acts']) context[key]=key === 'topic' ? previous[key] : [...previous[key]];
+    if (source.topic !== null) {
+        if (context.topic !== source.topic) for (const key of ['requested','offered','allowed_acts']) context[key]=[];
+        context.topic=source.topic;
+        context.known=[...new Set([...context.known,...used])];
+    }
+    if (chosen.selection.message) {
+        const plan=source.families.find((f: any)=>f.id === chosen.selection.family).message;
+        const component=(role: string)=>source.components.find((c: any)=>c.id === plan.bindings[role]);
+        if (plan.layout === 'answer') context.requested=context.requested.filter((i: string)=>i !== component('answer').slot);
+        if (plan.layout === 'correction') context.known=context.known.filter((i: string)=>!component('previous').mentions.includes(i));
+        if (_englishData.expressions.messages.layouts[plan.layout].act !== null) context.allowed_acts=[];
+    }
+    return Object.fromEntries(Object.entries(context).filter(([k,v])=>['established','recent'].includes(k) || v !== null && !(Array.isArray(v) && !v.length)));
+}
+
+function _englishMessageRender(recipe: any, plan: any, components: Map<string,any>, layout: any, request: string, forms: string[]): string {
+    const values=new Map<string,string>([['request',request],['request_clause',request.replace(/\.+$/,'')]]), details: string[]=[];
+    const bindings: [string,string][]=[...layout.roles.map((r: string)=>[r,plan.bindings[r]]),...plan.details.map((id: string)=>['detail',id])];
+    for (let i=0;i<bindings.length;i++) {
+        const [role,id]=bindings[i], form=components.get(id).forms.find((f: any)=>_englishMessageFormId(id,f.id) === forms[i]);
+        const value=form.shape === 'complete' ? _englishExpressionComplete(form.text) : form.text;
+        if (role === 'detail') details.push(value);
+        else {values.set(role,value); values.set(role+'_clause',value.replace(/\.+$/,''));}
+    }
+    const rendered=recipe.text.replace(/\{([^}]+)\}/g,(_: string,key: string)=>values.get(key)!);
+    return [rendered,...details].join(' ');
+}
+
+function _englishMessageFormId(component: string, form: string): string {
+    return [component,form].map(value=>value.replaceAll('~','~0').replaceAll('/','~1')).join('/');
 }
 "#;
 

@@ -1538,7 +1538,7 @@ fn eval_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue
 fn run_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue], rng: &mut R) -> Result<InputValue, String> {
     use EnglishOperation::*;
     let (min, max) = match operation {
-        Realize | Vary | FormatNumber | FormatDate | FormatTime => (1, 2),
+        Express | Expression | ExpressionCandidates | Realize | Vary | FormatNumber | FormatDate | FormatTime => (1, 2),
         Combine | Refer | Remember => (2, 3),
         Unmentioned => (2, 2),
     };
@@ -1546,6 +1546,24 @@ fn run_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue]
         return Err(format!("expected {min} to {max} arguments"));
     }
     match operation {
+        Express | Expression | ExpressionCandidates => {
+            english_expression_shapes(&args[0], args.get(1))?;
+            let source = decode_english(&args[0])?;
+            let english_options = english_options(args.get(1))?;
+            match operation {
+                Express => english::express(&source, &english_options, rng)
+                    .map(InputValue::String)
+                    .map_err(english_error_message),
+                Expression => {
+                    serde_json::to_value(english::expression(&source, &english_options, rng).map_err(english_error_message)?)
+                        .map_err(english_error_message)
+                }
+                _ => serde_json::to_value(
+                    english::expression_candidates(&source, &english_options).map_err(english_error_message)?,
+                )
+                .map_err(english_error_message),
+            }
+        }
         Realize => {
             let sentence: Sentence = decode_english(&args[0])?;
             let english_options = english_options(args.get(1))?;
@@ -1649,6 +1667,86 @@ fn english_options<T: DeserializeOwned + Default>(value: Option<&InputValue>) ->
 
 fn english_error_message(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+// Serde also accepts struct sequences. The DSL contract requires named objects.
+fn english_expression_shapes(source: &InputValue, english_options: Option<&InputValue>) -> Result<(), String> {
+    fn object(value: &InputValue) -> Result<(), String> {
+        if value.is_object() {
+            Ok(())
+        } else {
+            Err("expected an expression object".into())
+        }
+    }
+    fn objects(value: Option<&InputValue>) -> Result<(), String> {
+        if let Some(InputValue::Array(values)) = value {
+            for value in values {
+                object(value)?;
+            }
+        }
+        Ok(())
+    }
+    object(source)?;
+    for key in ["families", "facts", "constructions", "components"] {
+        objects(source.get(key))?;
+    }
+    if let Some(InputValue::Array(values)) = source.get("components") {
+        for value in values {
+            objects(value.get("forms"))?;
+        }
+    }
+    if let Some(InputValue::Array(values)) = source.get("families") {
+        for value in values {
+            if let Some(message) = value.get("message").filter(|v| !v.is_null()) {
+                object(message)?;
+                if let Some(bindings) = message.get("bindings") {
+                    object(bindings)?;
+                }
+            }
+        }
+    }
+    if let Some(InputValue::Array(values)) = source.get("constructions") {
+        for value in values {
+            if let Some(predicate) = value.get("predicate") {
+                object(predicate)?;
+                if let Some(verb) = predicate.get("verb")
+                    && !verb.is_string()
+                {
+                    object(verb)?;
+                }
+            }
+        }
+    }
+    if let Some(english_options) = english_options {
+        object(english_options)?;
+        if let Some(context) = english_options.get("context") {
+            object(context)?;
+            objects(context.get("recent"))?;
+            if let Some(InputValue::Array(recent)) = context.get("recent") {
+                for selection in recent {
+                    if let Some(message) = selection.get("message").filter(|v| !v.is_null()) {
+                        object(message)?;
+                    }
+                }
+            }
+        }
+        if let Some(speaker) = english_options.get("speaker") {
+            object(speaker)?;
+            for key in ["greetings", "closings"] {
+                objects(speaker.get(key))?;
+            }
+            if let Some(wording) = speaker.get("wording") {
+                object(wording)?;
+                for key in ["typos", "rendering"] {
+                    if let Some(value) = wording.get(key) {
+                        object(value)?;
+                    }
+                }
+                objects(wording.get("alternatives"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result

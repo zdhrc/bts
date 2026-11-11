@@ -507,6 +507,18 @@ for draw in [0.0, 0.5, 0.99]:
     assert result['amount'] == '12,34,567.90', result
     assert result['date'] == '10 November 2026', result
     assert result['time'] == '12:05:09 AM', result
+    assert result['structured']['selection']['message']['layout'] == 'current_desired', result
+    assert result['slot_answer']['text'] == 'Friday', result
+    assert result['candidate_count'] == 18, result
+    assert result['procedural']['selection']['intent'] == 'change_flight', result
+    assert result['followup']['text'] in ['What about Friday?', 'what about Friday?'], result
+    assert result['plain_expression'] == 'What about Friday?', result
+    assert len(result['followup']['context']['recent']) == 2, result
+    assert result['styled'] == "I'll check the file.", result
+    assert result['fragment'] == 'Checking the file.', result
+    assert result['softened'] == 'Could you send the file?', result
+    assert result['shorthand'] == 'Btw, the file is ready.', result
+    assert result['typo'] == 'plese', result
     assert result['wording'] == result['reused'], result
     assert result['wording'] in ['The guest cannot check in.', "The guest can't check in."], result
     assert result['conditional'] in ['If the guest arrives late, can they check in?', 'Can they check in if the guest arrives late?'], result
@@ -536,6 +548,18 @@ for (const draw of [0.0, 0.5, 0.99]) {
     assert.equal(result.amount, '12,34,567.90');
     assert.equal(result.date, '10 November 2026');
     assert.equal(result.time, '12:05:09 AM');
+    assert.equal(result.structured.selection.message.layout,'current_desired');
+    assert.equal(result.slot_answer.text,'Friday');
+    assert.equal(result.candidate_count,18);
+    assert.equal(result.procedural.selection.intent,'change_flight');
+    assert.ok(['What about Friday?', 'what about Friday?'].includes(result.followup.text));
+    assert.equal(result.plain_expression,'What about Friday?');
+    assert.equal(result.followup.context.recent.length,2);
+    assert.equal(result.styled, "I'll check the file.");
+    assert.equal(result.fragment, 'Checking the file.');
+    assert.equal(result.softened, 'Could you send the file?');
+    assert.equal(result.shorthand, 'Btw, the file is ready.');
+    assert.equal(result.typo, 'plese');
     assert.equal(result.wording, result.reused);
     assert.ok(['The guest cannot check in.', "The guest can't check in."].includes(result.wording));
     assert.ok(['If the guest arrives late, can they check in?', 'Can they check in if the guest arrives late?'].includes(result.conditional));

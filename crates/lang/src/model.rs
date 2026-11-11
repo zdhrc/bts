@@ -856,6 +856,12 @@ pub enum Func {
 /// English language operations provided by generation consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnglishOperation {
+    /// Generate a procedural English utterance.
+    Express,
+    /// Generate an utterance with explicit selection and conversation context.
+    Expression,
+    /// Inspect eligible expression choices without sampling.
+    ExpressionCandidates,
     /// Render explicit grammatical features as English text.
     Realize,
     /// Select a supported wording variation.
@@ -880,6 +886,9 @@ impl EnglishOperation {
     /// The corresponding built-in function name.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Express => "express",
+            Self::Expression => "expression",
+            Self::ExpressionCandidates => "expression_candidates",
             Self::Realize => "realize",
             Self::Vary => "vary",
             Self::Combine => "combine",

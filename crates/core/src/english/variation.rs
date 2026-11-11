@@ -1171,6 +1171,79 @@ pub fn vary_sentence_styled<R: Rng + ?Sized>(
     vary_styled(&text, &options, rng)
 }
 
+/// An authored greeting or closing and its relative selection weight.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeightedPhrase {
+    pub text: String,
+    #[serde(default = "super::model::expression_weight")]
+    pub weight: f64,
+}
+
+/// Reuse the same value for a speaker across turns. Directness is expressed by
+/// family weights, verbosity by optional-detail controls, and register by wording.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpeakerProfile {
+    pub wording: StyleOptions,
+    pub family_weights: std::collections::BTreeMap<String, f64>,
+    pub pattern_weights: std::collections::BTreeMap<String, f64>,
+    pub organization: std::collections::BTreeMap<String, f64>,
+    pub elaboration: std::collections::BTreeMap<String, f64>,
+    pub sentence_shape: std::collections::BTreeMap<String, f64>,
+    pub reference_style: std::collections::BTreeMap<String, f64>,
+    pub greetings: Vec<WeightedPhrase>,
+    pub greeting_probability: f64,
+    pub closings: Vec<WeightedPhrase>,
+    pub closing_probability: f64,
+    pub detail_probability: f64,
+    #[serde(deserialize_with = "count_option")]
+    pub max_details: u8,
+}
+
+impl Default for SpeakerProfile {
+    fn default() -> Self {
+        Self {
+            wording: StyleOptions {
+                style: Some(Style::Neutral),
+                ..StyleOptions::default()
+            },
+            family_weights: Default::default(),
+            pattern_weights: Default::default(),
+            organization: Default::default(),
+            elaboration: Default::default(),
+            sentence_shape: Default::default(),
+            reference_style: Default::default(),
+            greetings: vec![],
+            greeting_probability: 0.5,
+            closings: vec![],
+            closing_probability: 0.0,
+            detail_probability: 0.5,
+            max_details: 1,
+        }
+    }
+}
+
+/// Repetition penalties apply to previously used families and constructions of
+/// the same intent. Zero excludes repeats, one leaves their weights unchanged.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExpressionOptions {
+    pub speaker: SpeakerProfile,
+    pub context: super::discourse::ExpressionContext,
+    pub repeat_penalty: f64,
+}
+
+impl Default for ExpressionOptions {
+    fn default() -> Self {
+        Self {
+            speaker: SpeakerProfile::default(),
+            context: Default::default(),
+            repeat_penalty: 0.25,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{RngCore, SeedableRng};

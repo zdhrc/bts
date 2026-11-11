@@ -4487,7 +4487,17 @@ impl Modeler {
                     separator: Box::new(separator?),
                 })
             }
-            "realize" | "vary" | "combine" | "refer" | "remember" | "unmentioned" | "format_number" | "format_date"
+            "express"
+            | "expression"
+            | "expression_candidates"
+            | "realize"
+            | "vary"
+            | "combine"
+            | "refer"
+            | "remember"
+            | "unmentioned"
+            | "format_number"
+            | "format_date"
             | "format_time" => self.model_english_func(func, args, range),
             "render" => {
                 let [template, values] = self.func_args(func, args, "exactly two arguments (template, values)", range)?;
@@ -4851,6 +4861,9 @@ impl Modeler {
     fn model_english_func(&mut self, func: &'static str, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
         use EnglishOperation::*;
         let operation = match func {
+            "express" => Express,
+            "expression" => Expression,
+            "expression_candidates" => ExpressionCandidates,
             "realize" => Realize,
             "vary" => Vary,
             "combine" => Combine,
@@ -4863,7 +4876,9 @@ impl Modeler {
             _ => unreachable!("known English function"),
         };
         let (min, max, expected) = match operation {
-            Realize | Vary | FormatNumber | FormatDate | FormatTime => (1, 2, "one or two arguments (value, options)"),
+            Express | Expression | ExpressionCandidates | Realize | Vary | FormatNumber | FormatDate | FormatTime => {
+                (1, 2, "one or two arguments (value, options)")
+            }
             Combine => (2, 3, "two or three arguments (sentences, relation, options)"),
             Refer => (2, 3, "two or three arguments (entity, context, options)"),
             Remember => (2, 3, "two or three arguments (context, entities, facts)"),
@@ -5234,8 +5249,8 @@ impl Modeler {
             | Func::Noise { .. } => Some(StaticType::String),
             Func::Split { .. } | Func::Sample { .. } => Some(StaticType::Array),
             Func::English { operation, .. } => Some(match operation {
-                EnglishOperation::Remember => StaticType::Object,
-                EnglishOperation::Unmentioned => StaticType::Array,
+                EnglishOperation::Remember | EnglishOperation::Expression => StaticType::Object,
+                EnglishOperation::Unmentioned | EnglishOperation::ExpressionCandidates => StaticType::Array,
                 _ => StaticType::String,
             }),
             Func::Attachment { .. } => Some(StaticType::Object),
@@ -8309,6 +8324,9 @@ mod tests {
     #[test]
     fn models_english_functions_and_preserves_optional_arguments() {
         for (expression, expected, count) in [
+            ("express({})", EnglishOperation::Express, 1),
+            ("expression({}, {})", EnglishOperation::Expression, 2),
+            ("expression_candidates({})", EnglishOperation::ExpressionCandidates, 1),
             ("realize({})", EnglishOperation::Realize, 1),
             ("realize({}, {})", EnglishOperation::Realize, 2),
             ("vary(\"The guest cannot leave.\")", EnglishOperation::Vary, 1),
