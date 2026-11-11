@@ -152,7 +152,7 @@ fn generation_errors_keep_their_kind_range_and_diagnostic_conversion() {
     let evaluation = error.source().unwrap().downcast_ref::<generation::EvaluationError>().unwrap();
     assert_eq!(evaluation.kind(), generation::EvaluationErrorKind::DivisionByZero);
     assert!(source[evaluation.range.start..evaluation.range.end].contains('/'));
-    let diag: bts_lang::Diag = (*evaluation).into();
+    let diag: bts_lang::Diag = evaluation.clone().into();
     assert_eq!(diag.when, bts_lang::DiagPhase::Generation);
     assert_eq!(diag.r#where, evaluation.range);
     assert!(

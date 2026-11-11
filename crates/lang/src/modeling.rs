@@ -2,9 +2,9 @@ use crate::ast;
 use crate::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::model::{
     Accessor, Agent, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
-    DatasetSource, Experiment, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number, Object,
-    ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan, ScorerStep,
-    Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
+    DatasetSource, EnglishOperation, Experiment, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number,
+    Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan,
+    ScorerStep, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
 };
 use crate::spec;
 use std::{
@@ -1976,7 +1976,13 @@ impl Modeler {
                     self.check_scorer_value(text);
                     self.check_scorer_value(separator);
                 }
-                Func::Join { array, separator } => {
+                Func::Join { array, separator }
+                | Func::Compose { array, separator }
+                | Func::Render {
+                    template: array,
+                    values: separator,
+                }
+                | Func::Sample { array, count: separator } => {
                     self.check_scorer_value(array);
                     self.check_scorer_value(separator);
                 }
@@ -1993,7 +1999,7 @@ impl Modeler {
                     self.check_scorer_value(suffix);
                 }
                 Func::Len { target } => self.check_scorer_value(target),
-                Func::Format { args, .. } => {
+                Func::Format { args, .. } | Func::English { args, .. } => {
                     for arg in args {
                         self.check_scorer_value(arg);
                     }
@@ -3441,7 +3447,13 @@ impl Modeler {
                 Func::Split { text, separator } => {
                     self.value_reaches_block_ref(text) || self.value_reaches_block_ref(separator)
                 }
-                Func::Join { array, separator } => {
+                Func::Join { array, separator }
+                | Func::Compose { array, separator }
+                | Func::Render {
+                    template: array,
+                    values: separator,
+                }
+                | Func::Sample { array, count: separator } => {
                     self.value_reaches_block_ref(array) || self.value_reaches_block_ref(separator)
                 }
                 Func::Contains { target, needle } => {
@@ -3451,7 +3463,7 @@ impl Modeler {
                 Func::EndsWith { text, suffix } => self.value_reaches_block_ref(text) || self.value_reaches_block_ref(suffix),
                 Func::Len { target } => self.value_reaches_block_ref(target),
                 Func::Tokens { value } => self.value_reaches_block_ref(value),
-                Func::Format { args, .. } => any(args),
+                Func::Format { args, .. } | Func::English { args, .. } => any(args),
                 Func::Clamp { value, min, max } => {
                     self.value_reaches_block_ref(value)
                         || self.value_reaches_block_ref(min)
@@ -4475,6 +4487,49 @@ impl Modeler {
                     separator: Box::new(separator?),
                 })
             }
+            "express"
+            | "expression"
+            | "expression_candidates"
+            | "realize"
+            | "vary"
+            | "combine"
+            | "refer"
+            | "remember"
+            | "unmentioned"
+            | "format_number"
+            | "format_date"
+            | "format_time" => self.model_english_func(func, args, range),
+            "render" => {
+                let [template, values] = self.func_args(func, args, "exactly two arguments (template, values)", range)?;
+                let template = self.model_typed_arg(template, func, StaticType::String);
+                let values = self.model_typed_arg(values, func, StaticType::Object);
+                Some(Func::Render {
+                    template: Box::new(template?),
+                    values: Box::new(values?),
+                })
+            }
+            "compose" => {
+                let mut args = args;
+                if args.len() == 1 {
+                    args.push(Folded::value(Value::Str(" ".into()), range));
+                }
+                let [array, separator] = self.func_args(func, args, "one or two arguments (parts, separator)", range)?;
+                let array = self.model_typed_arg(array, func, StaticType::Array);
+                let separator = self.model_typed_arg(separator, func, StaticType::String);
+                Some(Func::Compose {
+                    array: Box::new(array?),
+                    separator: Box::new(separator?),
+                })
+            }
+            "sample" => {
+                let [array, count] = self.func_args(func, args, "exactly two arguments (array, count)", range)?;
+                let array = self.model_typed_arg(array, func, StaticType::Array);
+                let count = self.model_typed_arg(count, func, StaticType::Number);
+                Some(Func::Sample {
+                    array: Box::new(array?),
+                    count: Box::new(count?),
+                })
+            }
             "join" => {
                 let [array, separator] = self.func_args(func, args, "exactly two arguments (array, separator)", range)?;
                 let array = self.model_typed_arg(array, func, StaticType::Array);
@@ -4803,6 +4858,94 @@ impl Modeler {
         valid.then_some(Func::Format { pieces, args: values })
     }
 
+    fn model_english_func(&mut self, func: &'static str, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
+        use EnglishOperation::*;
+        let operation = match func {
+            "express" => Express,
+            "expression" => Expression,
+            "expression_candidates" => ExpressionCandidates,
+            "realize" => Realize,
+            "vary" => Vary,
+            "combine" => Combine,
+            "refer" => Refer,
+            "remember" => Remember,
+            "unmentioned" => Unmentioned,
+            "format_number" => FormatNumber,
+            "format_date" => FormatDate,
+            "format_time" => FormatTime,
+            _ => unreachable!("known English function"),
+        };
+        let (min, max, expected) = match operation {
+            Express | Expression | ExpressionCandidates | Realize | Vary | FormatNumber | FormatDate | FormatTime => {
+                (1, 2, "one or two arguments (value, options)")
+            }
+            Combine => (2, 3, "two or three arguments (sentences, relation, options)"),
+            Refer => (2, 3, "two or three arguments (entity, context, options)"),
+            Remember => (2, 3, "two or three arguments (context, entities, facts)"),
+            Unmentioned => (2, 2, "exactly two arguments (details, context)"),
+        };
+        if !(min..=max).contains(&args.len()) {
+            self.errors.push(Error::new(
+                ErrorKind::FuncArity {
+                    rule: spec::ids::FUNC_ARITY,
+                    func,
+                    expected,
+                },
+                range,
+            ));
+            return None;
+        }
+        let mut values = Vec::with_capacity(args.len());
+        let mut valid = true;
+        for (index, arg) in args.into_iter().enumerate() {
+            let (allowed, expected): (&[StaticType], &'static str) = match (operation, index) {
+                (Vary, 0) => (&[StaticType::String, StaticType::Object], "string or object"),
+                (FormatNumber, 0) => (&[StaticType::String, StaticType::Number], "string or number"),
+                (FormatDate | FormatTime, 0) | (Combine, 1) => (&[StaticType::String], "string"),
+                (Combine | Unmentioned, 0) | (Remember, 1 | 2) => (&[StaticType::Array], "array"),
+                _ => (&[StaticType::Object], "object"),
+            };
+            if !self.matches_static_types(&arg, allowed) && !self.defers_to_generation(&arg) {
+                self.push_func_arg_type(&arg, func, expected);
+                valid = false;
+            }
+            values.push(arg.into_value());
+        }
+        valid.then_some(Func::English { operation, args: values })
+    }
+
+    fn matches_static_types(&self, folded: &Folded, allowed: &[StaticType]) -> bool {
+        match self.static_type(folded) {
+            Some(kind) => allowed.contains(&kind),
+            None => match &folded.kind {
+                FoldedKind::Value(value) => self.value_matches_static_types(value, allowed),
+                _ => false,
+            },
+        }
+    }
+
+    fn value_matches_static_types(&self, value: &Value, allowed: &[StaticType]) -> bool {
+        match value {
+            Value::VarRef(name) => self
+                .var_value(name)
+                .is_some_and(|value| self.matches_static_types(value, allowed)),
+            Value::Func {
+                func: Func::Choice(options),
+                ..
+            } => options.iter().all(|value| self.value_matches_static_types(value, allowed)),
+            Value::Func {
+                func: Func::Weighted(options),
+                ..
+            } => options
+                .iter()
+                .all(|option| self.value_matches_static_types(&option.value, allowed)),
+            Value::Cond { then, otherwise, .. } => {
+                self.value_matches_static_types(then, allowed) && self.value_matches_static_types(otherwise, allowed)
+            }
+            _ => self.value_type(value).is_some_and(|kind| allowed.contains(&kind)),
+        }
+    }
+
     fn func_args<const N: usize>(
         &mut self,
         func: &'static str,
@@ -5018,6 +5161,9 @@ impl Modeler {
     }
 
     fn value_type(&self, value: &Value) -> Option<StaticType> {
+        if let Some(shape) = self.result_shape(value) {
+            return Some(shape.value_type());
+        }
         match value {
             Value::Str(_) | Value::Template(_) => Some(StaticType::String),
             Value::Num(_) => Some(StaticType::Number),
@@ -5068,6 +5214,47 @@ impl Modeler {
         }
     }
 
+    // keep known result fields typed through bindings and nested indexes
+    fn result_shape(&self, value: &Value) -> Option<ResultShape> {
+        match value {
+            Value::VarRef(name) => match &self.var_value(name)?.kind {
+                FoldedKind::Value(value) => self.result_shape(value),
+                _ => None,
+            },
+            Value::Func {
+                func: Func::English { operation, .. },
+                ..
+            } => english_result_shape(*operation),
+            Value::Index { target, index, .. } => match self.result_shape(target)? {
+                ResultShape::Object(fields) => {
+                    let Value::Str(key) = &**index else { return None };
+                    fields.iter().find_map(|(name, shape)| (*name == key).then_some(*shape))
+                }
+                ResultShape::Array(element) => Some(*element),
+                ResultShape::Scalar(_) => None,
+            },
+            Value::Slice { target, .. } => {
+                let shape = self.result_shape(target)?;
+                matches!(shape, ResultShape::Array(_)).then_some(shape)
+            }
+            Value::Cond { then, otherwise, .. } => {
+                let shape = self.result_shape(then)?;
+                (Some(shape) == self.result_shape(otherwise)).then_some(shape)
+            }
+            Value::Func {
+                func: Func::Choice(values),
+                ..
+            } => {
+                let shape = self.result_shape(values.first()?)?;
+                values
+                    .iter()
+                    .all(|value| self.result_shape(value) == Some(shape))
+                    .then_some(shape)
+            }
+            _ => None,
+        }
+    }
+
     // result type by function, a pick is typed when its alternatives agree
     fn func_type(&self, func: &Func) -> Option<StaticType> {
         match func {
@@ -5097,12 +5284,19 @@ impl Modeler {
             | Func::Trim { .. }
             | Func::Replace { .. }
             | Func::Join { .. }
+            | Func::Compose { .. }
+            | Func::Render { .. }
             | Func::Format { .. }
             | Func::Uuid
             | Func::Hex { .. }
             | Func::Alphanum { .. }
             | Func::Noise { .. } => Some(StaticType::String),
-            Func::Split { .. } => Some(StaticType::Array),
+            Func::Split { .. } | Func::Sample { .. } => Some(StaticType::Array),
+            Func::English { operation, .. } => Some(match operation {
+                EnglishOperation::Remember | EnglishOperation::Expression => StaticType::Object,
+                EnglishOperation::Unmentioned | EnglishOperation::ExpressionCandidates => StaticType::Array,
+                _ => StaticType::String,
+            }),
             Func::Attachment { .. } => Some(StaticType::Object),
         }
     }
@@ -5902,7 +6096,13 @@ fn collect_func_refs(func: &Func, found: &mut Vec<RefId>) {
             collect_refs(text, found);
             collect_refs(separator, found);
         }
-        Func::Join { array, separator } => {
+        Func::Join { array, separator }
+        | Func::Compose { array, separator }
+        | Func::Render {
+            template: array,
+            values: separator,
+        }
+        | Func::Sample { array, count: separator } => {
             collect_refs(array, found);
             collect_refs(separator, found);
         }
@@ -5920,7 +6120,7 @@ fn collect_func_refs(func: &Func, found: &mut Vec<RefId>) {
         }
         Func::Len { target } => collect_refs(target, found),
         Func::Tokens { value } => collect_refs(value, found),
-        Func::Format { args, .. } => all(args),
+        Func::Format { args, .. } | Func::English { args, .. } => all(args),
         Func::Clamp { value, min, max } => {
             collect_refs(value, found);
             collect_refs(min, found);
@@ -6025,6 +6225,75 @@ enum StaticType {
     Null,
     Array,
     Object,
+}
+
+// result schemas describe existing runtime values without evaluating a function
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ResultShape {
+    Scalar(StaticType),
+    Object(&'static [(&'static str, ResultShape)]),
+    Array(&'static ResultShape),
+}
+
+impl ResultShape {
+    fn value_type(self) -> StaticType {
+        match self {
+            Self::Scalar(kind) => kind,
+            Self::Object(_) => StaticType::Object,
+            Self::Array(_) => StaticType::Array,
+        }
+    }
+}
+
+fn english_result_shape(operation: EnglishOperation) -> Option<ResultShape> {
+    use ResultShape::{Array, Object, Scalar};
+    const TEXT: ResultShape = Scalar(StaticType::String);
+    const NUMBER: ResultShape = Scalar(StaticType::Number);
+    const STRINGS: ResultShape = Array(&TEXT);
+    const MESSAGE: ResultShape = Object(&[
+        ("layout", TEXT),
+        ("recipe", TEXT),
+        ("forms", STRINGS),
+        ("organization", TEXT),
+        ("elaboration", TEXT),
+        ("sentence_shape", TEXT),
+        ("reference_style", TEXT),
+    ]);
+    const SELECTION: ResultShape = Object(&[("intent", TEXT), ("family", TEXT), ("pattern", TEXT), ("message", MESSAGE)]);
+    const CONTEXT: ResultShape = Object(&[
+        ("established", STRINGS),
+        ("recent", Array(&SELECTION)),
+        ("topic", TEXT),
+        ("requested", STRINGS),
+        ("known", STRINGS),
+        ("offered", STRINGS),
+        ("allowed_acts", STRINGS),
+    ]);
+    const EDIT: ResultShape = Object(&[
+        ("rule", TEXT),
+        ("replacement", TEXT),
+        ("stage", NUMBER),
+        ("range", Object(&[("start", NUMBER), ("end", NUMBER)])),
+    ]);
+    const CANDIDATE: ResultShape = Object(&[
+        ("selection", SELECTION),
+        ("text", TEXT),
+        ("used_facts", STRINGS),
+        ("establishes", STRINGS),
+        ("probability", NUMBER),
+    ]);
+    match operation {
+        EnglishOperation::Expression => Some(Object(&[
+            ("text", TEXT),
+            ("base_text", TEXT),
+            ("selection", SELECTION),
+            ("used_facts", STRINGS),
+            ("context", CONTEXT),
+            ("edits", Array(&EDIT)),
+        ])),
+        EnglishOperation::ExpressionCandidates => Some(Array(&CANDIDATE)),
+        _ => None,
+    }
 }
 
 // constant scalar operand pulled out of a folded literal
@@ -8166,6 +8435,186 @@ mod tests {
     }
 
     #[test]
+    fn models_english_functions_and_preserves_optional_arguments() {
+        for (expression, expected, count) in [
+            ("express({})", EnglishOperation::Express, 1),
+            ("expression({}, {})", EnglishOperation::Expression, 2),
+            ("expression_candidates({})", EnglishOperation::ExpressionCandidates, 1),
+            ("realize({})", EnglishOperation::Realize, 1),
+            ("realize({}, {})", EnglishOperation::Realize, 2),
+            ("vary(\"The guest cannot leave.\")", EnglishOperation::Vary, 1),
+            ("vary({}, {})", EnglishOperation::Vary, 2),
+            ("combine([], \"and\")", EnglishOperation::Combine, 2),
+            ("refer({}, {})", EnglishOperation::Refer, 2),
+            ("remember({}, [], [])", EnglishOperation::Remember, 3),
+            ("unmentioned([], {})", EnglishOperation::Unmentioned, 2),
+            ("format_number(1234.5)", EnglishOperation::FormatNumber, 1),
+            ("format_date(\"2026-11-10\", {})", EnglishOperation::FormatDate, 2),
+            ("format_time(\"17:30\")", EnglishOperation::FormatTime, 1),
+        ] {
+            let compiled = model(&format!("trace \"t\" {{ output = {expression} }}")).unwrap();
+            let Some(Value::Func {
+                func: Func::English { operation, args },
+                ..
+            }) = &compiled.traces[0].fields.output
+            else {
+                panic!("expected an English function: {expression}")
+            };
+            assert_eq!(*operation, expected);
+            assert_eq!(args.len(), count);
+            assert_eq!(operation.as_str(), expression.split('(').next().unwrap());
+        }
+    }
+
+    #[test]
+    fn english_results_preserve_nested_field_types() {
+        for expression in [
+            "var.result.selection.family",
+            "var.result.context.recent[0].family",
+            "len(var.result.context.recent)",
+            r#"[...var.result.context.established, "asked"]"#,
+            "var.result.selection.message.forms[0]",
+            "var.result.edits[0].range.start + 1",
+            "var.candidates[0].selection.family",
+            "var.candidates[:1][0].probability + 1",
+            "choice(var.result, var.result).context.recent[0].intent",
+            "(chance(0.5) ? var.result : var.result).selection.family",
+        ] {
+            model(&format!(r#"vars {{ result = expression({{}}) candidates = expression_candidates({{}}) }} trace "t" {{ output = {expression} }}"#)).unwrap();
+        }
+        model(r#"vars { result = expression({}) } trace "t" { vars { saved = var.result.context } output = var.saved.recent[0].family }"#).unwrap();
+        for expression in [
+            "var.result.selection.family[0]",
+            r#"var.result.context.recent["zero"]"#,
+            "var.result.context.recent + 1",
+            "var.result.selection.unknown.field",
+        ] {
+            assert!(
+                model(&format!(
+                    r#"vars {{ result = expression({{}}) }} trace "t" {{ output = {expression} }}"#
+                ))
+                .is_err(),
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn english_functions_validate_outer_types_and_arity() {
+        for expression in [
+            "realize(1)",
+            "realize({}, [])",
+            "vary(false)",
+            "vary(\"x\", true)",
+            "combine({}, \"and\")",
+            "combine([], 1)",
+            "refer({}, [])",
+            "remember({}, {})",
+            "remember({}, [], {})",
+            "unmentioned({}, {})",
+            "format_number(true)",
+            "format_date(42)",
+            "format_time([], {})",
+        ] {
+            let errors = model(&format!("trace \"t\" {{ input = {expression} }}")).unwrap_err();
+            assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { .. }), "{expression}");
+        }
+        for expression in [
+            "realize()",
+            "vary(\"x\", {}, {})",
+            "combine([])",
+            "refer({})",
+            "remember({}, [], [], [])",
+            "unmentioned([])",
+            "format_number()",
+            "format_date(\"2026-11-10\", {}, {})",
+            "format_time()",
+        ] {
+            let errors = model(&format!("trace \"t\" {{ input = {expression} }}")).unwrap_err();
+            assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { .. }), "{expression}");
+        }
+    }
+
+    #[test]
+    fn english_return_types_compose_and_dynamic_arguments_keep_references() {
+        model(
+            r#"
+            trace "t" {
+                input = { sentence = {}, entity = {} }
+                output = compose([
+                    upper(realize(self.input.sentence)),
+                    refer(self.input.entity, remember({}, [self.input.entity])),
+                    format("{}", len(unmentioned([], {})))
+                ])
+            }
+            scorer "english" {
+                code { score = len(vary(output, { negation = false })) }
+            }
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn english_union_arguments_accept_each_supported_alternative() {
+        model(
+            r#"
+            vars { amount = choice(1000, "1000.50") }
+            trace "t" {
+                input = format_number(var.amount)
+                output = vary(choice("The guest cannot check in.", {
+                    clause = { subject = { text = "the guest" }, predicate = { verb = "check", complement = "in" } }
+                }))
+                metadata = { amount = format_number(chance(0.5) ? 1000 : "1000.50") }
+            }
+        "#,
+        )
+        .unwrap();
+        for expression in ["format_number(choice(1000, true))", "vary(choice(1, \"text\"))"] {
+            let source = format!("trace \"t\" {{ output = {expression} }}");
+            assert!(
+                model(&source)
+                    .unwrap_err()
+                    .iter()
+                    .any(|error| matches!(error.kind(), ErrorKind::FuncArgType { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn english_scorer_arguments_are_checked_recursively() {
+        for (expression, forbidden) in [
+            (r#"vary(format("{}", tokens(output)))"#, "tokens"),
+            (
+                r#"realize({ clause = { subject = { text = "the guest" }, predicate = { verb = "check", complement = noise(8) } } })"#,
+                "noise",
+            ),
+        ] {
+            let source = format!("scorer \"t\" {{ code {{ score = len({expression}) }} }}");
+            let errors = model(&source).unwrap_err();
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error.kind(), ErrorKind::ScorerFunc { func, .. } if *func == forbidden)),
+                "{source}"
+            );
+        }
+        model(
+            r#"
+            scorer "english" {
+                code {
+                    score = len(refer(
+                        { id = "guest", label = "Maya" },
+                        remember({}, [{ id = "guest", label = "Maya" }], ["arrival"])
+                    ))
+                }
+            }
+        "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn models_string_funcs() {
         let model = model(
             r#"
@@ -8216,6 +8665,12 @@ mod tests {
             (r#"trace "t" { input = upper(1) }"#, "upper"),
             (r#"trace "t" { input = trim(null) }"#, "trim"),
             (r#"trace "t" { input = split("a", 1) }"#, "split"),
+            (r#"trace "t" { input = render(1, {}) }"#, "render"),
+            (r#"trace "t" { input = render("x", []) }"#, "render"),
+            (r#"trace "t" { input = compose("x") }"#, "compose"),
+            (r#"trace "t" { input = compose([], 1) }"#, "compose"),
+            (r#"trace "t" { input = sample("x", 1) }"#, "sample"),
+            (r#"trace "t" { input = sample([], true) }"#, "sample"),
             (r#"trace "t" { input = join("a", ",") }"#, "join"),
             (r#"trace "t" { input = contains(1, "x") }"#, "contains"),
             (r#"trace "t" { input = len(true) }"#, "len"),

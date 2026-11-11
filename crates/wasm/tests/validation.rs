@@ -1095,3 +1095,37 @@ fn matches_native_seeded_samples() {
         assert_eq!(Value::Array(outputs), expected, "seed {seed}");
     }
 }
+
+#[wasm_bindgen_test]
+fn language_composition_matches_native_samples() {
+    let source = r#"
+trace "language" {
+    vars { selected = sample([0, 1, 2, 3, 4, 5], 3) }
+    output = {
+        rendered = render("{{{name}}}: {n} {ok} {name}", { name = "Zoë", n = 2, ok = true })
+        literal = render("{text}", { text = "{untouched}" })
+        composed = compose([null, "", "hello", " world "])
+        nested = compose(["Hi!", compose(sample(["one", "two"], 2), ", ")])
+        empty = compose([null, ""])
+        selected = var.selected
+        reused = var.selected
+        duplicates = sample(["same", "same"], 2)
+        zero = sample([], 0)
+    }
+}
+"#;
+    let options = serde_json::json!({ "count": 32, "over_ms": 3600000, "until_ms": 86400000, "seed": "42" });
+    let result = generate_result(source, &options);
+    assert_eq!(result["ok"], true, "{result}");
+    let output = &result["value"]["payload"]["events"][0]["output"];
+    assert_eq!(output["selected"], serde_json::json!([1, 2, 5]));
+    assert_eq!(output["selected"], output["reused"]);
+    assert_eq!(output["rendered"], "{Zoë}: 2 true Zoë");
+    assert_eq!(output["composed"], "hello  world ");
+    assert_eq!(output["nested"], "Hi! one, two");
+    for expression in [r#"render("{missing}", {})"#, "compose([1])", "sample([1], 2)"] {
+        let source = format!(r#"trace "t" {{ output = {expression} }}"#);
+        let result = generate_result(&source, &options);
+        assert_eq!(result["ok"], false, "{expression}");
+    }
+}

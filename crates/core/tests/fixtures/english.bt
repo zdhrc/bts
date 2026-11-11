@@ -1,0 +1,105 @@
+agent "language" { entrypoint = trace.language }
+
+vars {
+        speaker = choice({ wording = { style = "conversational" } }, { wording = { style = "text_message" } })
+        flight_intent = {
+            intent = "change_flight"
+            constructions = [
+                { id = "change", predicate = { verb = "change", complement = "my flight" } },
+                { id = "switch", predicate = { verb = "switch", complement = "to a different flight" } }
+            ]
+            families = [
+                { id = "request", kind = "request", establishes = ["flight_requested"] },
+                { id = "desire", kind = "desire", establishes = ["flight_requested"] },
+                { id = "procedure", kind = "procedure", establishes = ["flight_requested"] }
+            ]
+        }
+        followup_intent = {
+            intent = "change_flight"
+            facts = [{ id = "day", text = "Friday" }]
+            families = [{ id = "follow", kind = "follow_up", text = "What about Friday?", context_requires = ["flight_requested"], mentions = ["day"] }]
+        }
+        structured_intent = {
+            intent = "change_flight"
+            topic = "booking_AB42"
+            facts = [{ id = "current", text = "Thursday" }, { id = "outcome", text = "Friday" }]
+            components = [
+                { id = "current", role = "current", mentions = ["current"], forms = [{ id = "sentence", text = "My flight leaves on Thursday" }] },
+                { id = "outcome", role = "outcome", mentions = ["outcome"], forms = [{ id = "sentence", text = "I need to arrive on Friday" }] }
+            ]
+            families = [{ id = "situation", kind = "structured", message = { layout = "current_desired", bindings = { current = "current", outcome = "outcome" } } }]
+        }
+        slot_answer = {
+            intent = "change_flight"
+            topic = "booking_AB42"
+            facts = [{ id = "day", text = "Friday" }]
+            components = [{ id = "day", role = "answer", slot = "departure_day", mentions = ["day"], option = "friday", forms = [
+                { id = "explicit", text = "I would like to leave on Friday" },
+                { id = "contextual", text = "Friday", shape = "fragments", reference = "contextual", context_requires = ["asked_day"] }
+            ] }]
+            families = [{ id = "answer", kind = "structured", message = { layout = "answer", bindings = { answer = "day" } } }]
+        }
+        guest = {
+            id = "guest-42"
+            label = "Maya"
+            pronouns = { subject = "she", object = "her", possessive_determiner = "her", possessive = "hers" }
+        }
+        arrival = {
+            clause = {
+                subject = { text = "the guest" }
+                predicate = { verb = "arrive", complement = "after midnight" }
+                tense = "future"
+            }
+        }
+        access = {
+            clause = {
+                subject = { text = "the desk" }
+                predicate = { verb = "be", complement = "open" }
+                tense = "future"
+            }
+        }
+}
+
+trace "language" {
+    input = { intent = "confirm_arrival" }
+    vars {
+        first_expression = expression(var.flight_intent, { speaker = var.speaker })
+        candidate_options = expression_candidates(var.flight_intent)
+        context = remember({}, [var.guest], ["arrival"])
+        wording = vary("The guest cannot check in.")
+    }
+    output = {
+        structured = expression(var.structured_intent, { speaker = var.speaker })
+        slot_answer = expression(var.slot_answer, {
+            speaker = { reference_style = { explicit = 0, contextual = 1 } }
+            context = { topic = "booking_AB42", established = ["asked_day"], requested = ["departure_day"], offered = ["friday"], allowed_acts = ["answer"] }
+        })
+        family = var.first_expression.selection.family
+        history_family = var.first_expression.context.recent[0].family
+        first_candidate_family = var.candidate_options[0].selection.family
+        procedural = var.first_expression
+        followup = expression(var.followup_intent, { speaker = var.speaker, context = { established = [...var.first_expression.context.established], recent = var.first_expression.context.recent } })
+        candidate_count = len(expression_candidates(var.flight_intent))
+        plain_expression = express(var.followup_intent, { context = var.first_expression.context })
+        action = self.input.intent == "confirm_arrival" ? "confirm_check_in" : "ask_arrival_time"
+        statement = realize(var.arrival)
+        combined = combine([var.arrival, var.access], "and")
+        first_reference = refer(var.guest, {})
+        next_reference = refer(var.guest, var.context)
+        reset_reference = refer(var.guest, {})
+        details = unmentioned([{ id = "arrival", text = "Arrival is after midnight." }, { id = "desk", text = "The desk is open." }], var.context)
+        amount = format_number("1234567.895", { locale = "en-IN", fraction_digits = 2 })
+        date = format_date("2026-11-10", { locale = "en-GB" })
+        time = format_time("00:05:09", { locale = "en-US", seconds = true })
+        wording = var.wording
+        reused = var.wording
+        conditional = vary("If the guest arrives late, can they check in?", { negation = false })
+        register = vary("I won't leave. They cannot stay.")
+        styled = vary("I will check the file.", { style = "conversational" })
+        fragment = vary("I am checking the file.", { fragments = true })
+        softened = vary("Send the file.", { style = "professional", soften_requests = true })
+        shorthand = vary("By the way, the file is ready.", { shorthand = true })
+        typo = vary("please", { typos = { probability = 1, kinds = ["common"] } })
+        identifier = vary("api_v2 does not update résumé_ID-42.")
+    }
+}

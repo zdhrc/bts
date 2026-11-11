@@ -641,6 +641,13 @@ pub enum Value {
 /// cause failures such as an invalid index or numeric overflow.
 #[derive(Debug, Clone)]
 pub enum Func {
+    /// An English language operation evaluated by the consumer.
+    English {
+        /// The English operation to perform.
+        operation: EnglishOperation,
+        /// Arguments in authored order, including optional arguments when supplied.
+        args: Vec<Value>,
+    },
     /// An attachment reference to be materialized by a consumer.
     Attachment {
         /// The attachment path written in source.
@@ -735,6 +742,27 @@ pub enum Func {
         /// The separator used to split or join text.
         separator: Box<Value>,
     },
+    /// Substitutes named values into text.
+    Render {
+        /// The template to render.
+        template: Box<Value>,
+        /// The named scalar values.
+        values: Box<Value>,
+    },
+    /// Joins nonempty text components.
+    Compose {
+        /// The text components, including optional nulls.
+        array: Box<Value>,
+        /// The separator between components.
+        separator: Box<Value>,
+    },
+    /// Samples array positions without replacement in source order.
+    Sample {
+        /// The source array.
+        array: Box<Value>,
+        /// The number of positions to select.
+        count: Box<Value>,
+    },
     /// Tests whether the target contains a value.
     Contains {
         /// The value to index, slice, or inspect.
@@ -823,6 +851,55 @@ pub enum Func {
         /// The requested noise size.
         size: Box<Value>,
     },
+}
+
+/// English language operations provided by generation consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnglishOperation {
+    /// Generate a procedural English utterance.
+    Express,
+    /// Generate an utterance with explicit selection and conversation context.
+    Expression,
+    /// Inspect eligible expression choices without sampling.
+    ExpressionCandidates,
+    /// Render explicit grammatical features as English text.
+    Realize,
+    /// Select a supported wording variation.
+    Vary,
+    /// Combine explicitly related propositions.
+    Combine,
+    /// Refer to an entity using explicit discourse context.
+    Refer,
+    /// Return an updated discourse context.
+    Remember,
+    /// Select details not established in a discourse context.
+    Unmentioned,
+    /// Format a decimal using an English regional convention.
+    FormatNumber,
+    /// Format an explicit date using an English regional convention.
+    FormatDate,
+    /// Format an explicit time using an English regional convention.
+    FormatTime,
+}
+
+impl EnglishOperation {
+    /// The corresponding built-in function name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Express => "express",
+            Self::Expression => "expression",
+            Self::ExpressionCandidates => "expression_candidates",
+            Self::Realize => "realize",
+            Self::Vary => "vary",
+            Self::Combine => "combine",
+            Self::Refer => "refer",
+            Self::Remember => "remember",
+            Self::Unmentioned => "unmentioned",
+            Self::FormatNumber => "format_number",
+            Self::FormatDate => "format_date",
+            Self::FormatTime => "format_time",
+        }
+    }
 }
 /// Maximum permitted noise size, limiting accidental allocations during evaluation.
 pub const NOISE_SIZE_CAP: i64 = 8 << 20;

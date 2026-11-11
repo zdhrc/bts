@@ -191,3 +191,97 @@ fn preserves_native_seeded_samples() {
         assert_eq!(serde_json::Value::Array(outputs), expected, "seed {seed}");
     }
 }
+
+#[test]
+fn language_composition_is_seeded_and_preserves_structure() {
+    let source = r#"
+trace "language" {
+    vars { selected = sample([0, 1, 2, 3, 4, 5], 3) }
+    output = {
+        rendered = render("{{{name}}}: {n} {ok} {name}", { name = "Zoë", n = 2, ok = true })
+        literal = render("{text}", { text = "{untouched}" })
+        composed = compose([null, "", "hello", " world "])
+        nested = compose(["Hi!", compose(sample(["one", "two"], 2), ", ")])
+        empty = compose([null, ""])
+        selected = var.selected
+        reused = var.selected
+        duplicates = sample(["same", "same"], 2)
+        zero = sample([], 0)
+    }
+}
+"#;
+    let generate = || {
+        data::generate(
+            compile(source).unwrap(),
+            32,
+            Duration::from_secs(3600),
+            Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(86400),
+            42,
+            &(),
+        )
+        .unwrap()
+    };
+    let first = generate();
+    let second = generate();
+    let mut selections = HashSet::new();
+    for (a, b) in first.events.iter().zip(&second.events) {
+        assert_eq!(a.output, b.output);
+        let output = a.output.as_ref().unwrap();
+        assert_eq!(output["rendered"], Value::from("{Zoë}: 2 true Zoë"));
+        assert_eq!(output["literal"], Value::from("{untouched}"));
+        assert_eq!(output["composed"], Value::from("hello  world "));
+        assert_eq!(output["nested"], Value::from("Hi! one, two"));
+        assert_eq!(output["empty"], Value::from(""));
+        assert_eq!(output["selected"], output["reused"]);
+        let selected = output["selected"].as_array().unwrap();
+        assert_eq!(selected.len(), 3);
+        assert!(
+            selected
+                .windows(2)
+                .all(|pair| pair[0].as_i64().unwrap() < pair[1].as_i64().unwrap())
+        );
+        selections.insert(format!("{:?}", output["selected"]));
+        assert_eq!(output["duplicates"].as_array().unwrap().len(), 2);
+        assert!(output["zero"].as_array().unwrap().is_empty());
+    }
+    assert!(selections.len() > 1);
+    assert_eq!(
+        first.events[0].output.as_ref().unwrap()["selected"].as_array().unwrap(),
+        &[Value::from(1), Value::from(2), Value::from(5)]
+    );
+}
+
+#[test]
+fn language_composition_rejects_invalid_values() {
+    for expression in [
+        r#"render("{missing}", {})"#,
+        r#"render("{}", {})"#,
+        r#"render("{name", { name = "x" })"#,
+        r#"render("x}", {})"#,
+        r#"render("{name}", { name = null })"#,
+        r#"render("{name}", { name = [] })"#,
+        "compose([false])",
+        "compose([1])",
+        "compose([{}])",
+        "sample([1], -1)",
+        "sample([1], 2)",
+        "sample([1], 1.0)",
+    ] {
+        let source = format!("trace \"t\" {{ output = {expression} }}");
+        let model = compile(&source).unwrap();
+        assert!(
+            data::generate(
+                model,
+                1,
+                Duration::from_secs(3600),
+                Distribution::Linear,
+                UNIX_EPOCH + Duration::from_secs(86400),
+                42,
+                &()
+            )
+            .is_err(),
+            "{expression}"
+        );
+    }
+}

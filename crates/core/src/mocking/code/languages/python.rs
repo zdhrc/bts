@@ -44,19 +44,23 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
         writeln!(source, "import {import}").expect("writing to a string cannot fail");
     }
     source.push_str("\n\n");
-    let blocks: Vec<&str> = emitter
+    let blocks: Vec<String> = emitter
         .helpers
         .iter()
         .map(|helper| helper_snippet(*helper))
-        .chain(functions.iter().map(String::as_str))
+        .chain(functions)
         .collect();
     // pep8 keeps two blank lines between top-level definitions
     source.push_str(&blocks.join("\n\n"));
     Ok(source)
 }
 
-fn helper_snippet(helper: Helper) -> &'static str {
+fn helper_snippet(helper: Helper) -> String {
+    if helper == Helper::English {
+        return super::rendering::english_source(ScorerLang::Python, false);
+    }
     match helper {
+        Helper::Language => super::rendering::PY_LANGUAGE,
         // the stdlib covers every other sampler
         Helper::Poisson => {
             "def poisson(mean):\n    # knuth's method; fine for the small means scorers use\n    limit = math.exp(-mean)\n    count = 0\n    product = random.random()\n    while product > limit:\n        count += 1\n        product *= random.random()\n    return count\n"
@@ -65,7 +69,7 @@ fn helper_snippet(helper: Helper) -> &'static str {
             "def round_away_from_zero(value):\n    return (-1 if value < 0 else 1) * math.floor(abs(value) + 0.5)\n"
         }
         _ => unreachable!("python needs no other helper"),
-    }
+    }.to_owned()
 }
 #[cfg(test)]
 mod tests {

@@ -511,6 +511,36 @@ pub mod ids {
     pub const FUNC_REPLACE: Id = Id::new("func.replace");
     /// Stable identifier for `func.split`.
     pub const FUNC_SPLIT: Id = Id::new("func.split");
+    /// Stable identifier for `func.render`.
+    pub const FUNC_RENDER: Id = Id::new("func.render");
+    /// Stable identifier for `func.compose`.
+    pub const FUNC_COMPOSE: Id = Id::new("func.compose");
+    /// Stable identifier for `func.sample`.
+    pub const FUNC_SAMPLE: Id = Id::new("func.sample");
+    /// Stable identifier for `func.realize`.
+    pub const FUNC_REALIZE: Id = Id::new("func.realize");
+    /// Stable identifier for `func.vary`.
+    pub const FUNC_VARY: Id = Id::new("func.vary");
+    /// Stable identifier for `func.express`.
+    pub const FUNC_EXPRESS: Id = Id::new("func.express");
+    /// Stable identifier for `func.expression`.
+    pub const FUNC_EXPRESSION: Id = Id::new("func.expression");
+    /// Stable identifier for `func.expression_candidates`.
+    pub const FUNC_EXPRESSION_CANDIDATES: Id = Id::new("func.expression_candidates");
+    /// Stable identifier for `func.combine`.
+    pub const FUNC_COMBINE: Id = Id::new("func.combine");
+    /// Stable identifier for `func.refer`.
+    pub const FUNC_REFER: Id = Id::new("func.refer");
+    /// Stable identifier for `func.remember`.
+    pub const FUNC_REMEMBER: Id = Id::new("func.remember");
+    /// Stable identifier for `func.unmentioned`.
+    pub const FUNC_UNMENTIONED: Id = Id::new("func.unmentioned");
+    /// Stable identifier for `func.format_number`.
+    pub const FUNC_FORMAT_NUMBER: Id = Id::new("func.format_number");
+    /// Stable identifier for `func.format_date`.
+    pub const FUNC_FORMAT_DATE: Id = Id::new("func.format_date");
+    /// Stable identifier for `func.format_time`.
+    pub const FUNC_FORMAT_TIME: Id = Id::new("func.format_time");
     /// Stable identifier for `func.join`.
     pub const FUNC_JOIN: Id = Id::new("func.join");
     /// Stable identifier for `func.contains`.
@@ -1431,7 +1461,7 @@ const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
 const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::FUNC_ARITY,
-    summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number.",
+    summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number. `compose` accepts an optional separator.",
 };
 const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
     tags: &[],
@@ -1976,6 +2006,150 @@ const FUNCS: &[FuncDesc] = &[
         summary: "Splits a string around each occurrence of the non-empty separator for each generated trace, producing an array of strings.",
         examples: &["split(\"a,b,c\", \",\")", "split(var.path, \"/\")[0]"],
         rules: SPLIT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_RENDER,
+        name: "render",
+        syntax: "render(template, values)",
+        summary: "Substitutes {name} placeholders with string, number, or boolean values from an object. Double braces escape literal braces. Missing names, non-scalar replacements, empty names, and unmatched braces fail during generation. Extra values are allowed and replacements are not recursively rendered. Numeric rendering preserves authored float types, including a trailing .0 for whole floats and the sign of negative zero. Nonzero floats use scientific notation below 0.00001 in magnitude or at and above 1e16, with no leading zeros in the exponent.",
+        examples: &[r#"render("Hello {name}!", { name = "Sam" })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_COMPOSE,
+        name: "compose",
+        syntax: "compose(parts[, separator])",
+        summary: "Joins string parts, skipping null and empty strings. The separator defaults to a space. Whitespace and punctuation are preserved. Other element types fail during generation.",
+        examples: &[r#"compose(["Hi!", null, "How can I help?"])"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_SAMPLE,
+        name: "sample",
+        syntax: "sample(array, count)",
+        summary: "Selects array positions uniformly without replacement and returns their values in source order. Duplicate values remain distinct positions. Count must be an integer from zero through the array length, otherwise generation fails.",
+        examples: &[r#"sample(["parking", "keys", "hours"], 2)"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_REALIZE,
+        name: "realize",
+        syntax: "realize(sentence[, options])",
+        summary: "Renders English without random choices. The sentence object requires clause and accepts optional condition. A clause requires subject {text: string, person: first|second|third (default third), number: singular|plural (default singular)} and predicate {verb, complement?: string}. Verb is a packaged lowercase base word or an object containing all five lowercase forms: base, third_person_singular, past, past_participle, present_participle. Clause options are tense: present|past|future (present), aspect: simple|progressive|perfect|perfect_progressive (simple), polarity: positive|negative (positive), form: statement|question (statement), and modal: can|could|may|might|must|should|will|would (absent by default). A modal requires tense present, with temporal relationships expressed through the chosen modal and aspect. A condition requires subject and predicate and accepts tense, aspect, and polarity with the same defaults. It is introduced by if. Rendering options are negation: expanded|contracted (expanded) and condition_position: before|after (before). Authored subject agreement and explicit verb forms remain caller-owned. Unsupported structures and unknown fields fail during generation.",
+        examples: &[
+            r#"realize({ clause = { subject = { text = "the guest" }, predicate = { verb = "arrive", complement = "after midnight" }, tense = "future" } })"#,
+        ],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_EXPRESS,
+        name: "express",
+        syntax: "express(source[, options])",
+        summary: "Generates English from author-approved expressions of an intent. source contains intent: nonempty identifier, families: nonempty array, constructions: array (default []), facts: [{id,text}] (default []), optional_details: fact IDs (default []), and protected: literal strings (default []). A construction is {id,predicate:{verb,complement?},weight:1,requires:[],excludes:[],mentions:[]}. Verb accepts the same known base string or explicit five forms as realize. Compatible verbs, objects, particles, and complements stay together as one construction. A family is {id,kind,weight:1,constructions:[],patterns:[],requires:[],excludes:[],context_requires:[],establishes:[],mentions:[],reason:null,text:null}. kind is request, desire, possibility, procedure, need, reason_request, follow_up, or authored. Built-in families use a selected action in request, first-person, or procedural constructions. Empty construction and pattern lists allow all compatible choices. requires and mentions need supplied fact IDs, excludes rejects supplied fact IDs, and context_requires needs established context markers. reason_request needs reason: a supplied fact ID. authored and follow_up need complete text and cannot specify constructions, patterns, or reason. follow_up also requires nonempty context_requires. Author-supplied alternatives are trusted to express the intended meaning. No semantic equivalence or hidden circumstances are inferred. Use render, realize, and ordinary bts choices to prepare domain-specific text and circumstances. options contains speaker, context, and repeat_penalty (default 0.25, range 0..1). speaker contains wording: vary style controls (default neutral), family_weights and pattern_weights: identifier-to-weight objects, greetings and closings: [{text,weight:1}], greeting_probability (0.5), closing_probability (0), detail_probability (0.5), and max_details (1, integer 0..16). All probabilities are in 0..1 and weights in 0..1000000. Profiles are ordinary values that can be sampled once and reused across turns. Greetings apply only with empty history. Optional supplied details are sampled without replacement until max_details or the first failed detail gate, excluding already expressed or established facts. context contains established: identifiers and recent: selection records, both default empty. Family and construction repeats within the same intent are multiplied by repeat_penalty, with zero excluding repeats. Selection normalizes weights by family, construction, and pattern, independent of vocabulary size. Generation fails if no positive-weight choice is eligible. No random draw is consumed for a sole choice or probability zero or one. Uses scoped seeded randomness and performs no network calls. For composable messages, source also accepts topic: an explicit topic or entity identifier and components: [{id,role,forms,mentions:[],requires:[],context_requires:[],slot:null,option:null}]. Roles are current, outcome, reason, constraint, answer, previous, replacement, acknowledgment, clarification, follow_up_request, and detail. Each form is {id,text,shape:complete,reference:explicit,weight:1,context_requires:[]}. Shapes are complete, fragments, clause, and value. Clauses and values must omit terminal punctuation and are only used in recipes requiring them. Use realize to prepare grammatical component text. Contextual forms require a topic and nonempty component or form context_requires. Family message is {layout,bindings:{role:component_id},relation:null,allow_apology:false,details:[]}. Layouts are request_only, request_reason, reason_request, outcome_request, current_desired, constraint_request, answer, correction, acknowledgment, clarification, and follow_up_request. current_desired and response layouts require kind structured with no text, reason, constructions, or patterns. Other layouts wrap a regular action family or authored request. reason_request family kind cannot also use message. Message plans cannot use source optional_details. details explicitly binds detail components, with no added facts. Cause links require relation cause on request_reason or reason_request layouts and declarative first-person actions. Contrast requires relation contrast on current_desired. Without those relationships only separate sentences are eligible. Apology variants require allow_apology on correction. Every binding must match the component role. Speaker maps organization (request_first, circumstance_first, outcome_first, current_then_desired, response), elaboration (minimal, relevant_context, detailed), sentence_shape (complete, short_sentences, fragments), and reference_style (explicit, contextual) independently weight applicable choices. Omitted weights are one, zero excludes. Organization and elaboration multiply family weights. Form weights normalize within each recipe and shape and reference preferences weight eligible recipes and forms. Message plans govern fragments and disable the separate surface fragment rewrite. Context additionally accepts topic, known fact IDs, requested slot IDs, offered option IDs, and allowed_acts (answer, correction, acknowledgment, clarification, follow_up_request), all empty or absent by default. Responses require matching topic and an explicitly allowed act. Answers and clarifications require a requested slot. Component option requires an offered option ID. Corrections require previous and replacement components with matching slots and nonempty, disjoint mentions, and previous facts must already be established. Components may use supplied facts or explicitly known facts. Context never derives meaning from agent text. Message expansion is limited to 16384 choices per family.",
+        examples: &[
+            r#"express({ intent = "change_flight", constructions = [{ id = "change", predicate = { verb = "change", complement = "my flight" } }], families = [{ id = "request", kind = "request" }, { id = "desire", kind = "desire" }] }, { speaker = { wording = { style = "conversational" } } })"#,
+        ],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_EXPRESSION,
+        name: "expression",
+        syntax: "expression(source[, options])",
+        summary: "Uses the same inputs and random choices as express and returns an object with text, base_text before surface styling, selection: {intent,family,construction,pattern}, used_facts, edits, and context. construction is null for authored and follow_up families. edits contain rule, range with UTF-8 byte start/end offsets relative to the text immediately before that edit, replacement, and stage. The returned context adds explicit family establishes and actually expressed fact IDs, then appends the selection to recent, retaining at most 32 entries. Input context is never mutated. Reuse a speaker value and pass the returned context to later turns explicitly. Nothing stores hidden conversation state. Composable selections also contain message: {layout,recipe,forms,organization,elaboration,sentence_shape,reference_style}, with forms recorded as component_id/form_id and each identifier escaping ~ as ~0 and / as ~1. Topic-scoped outputs add expressed facts to known. Answers consume their requested slot and responses consume allowed_acts. Corrections remove previous facts from known while retaining their historical mentions in established. A changed topic clears pending requested slots, offered options, and allowed acts. The caller supplies the next agent turn context explicitly.",
+        examples: &[r#"expression(var.intent, { speaker = var.speaker, context = var.previous.context })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_EXPRESSION_CANDIDATES,
+        name: "expression_candidates",
+        syntax: "expression_candidates(source[, options])",
+        summary: "Validates express inputs and lists applicable base realizations without consuming randomness. Each candidate contains selection, text, used_facts, establishes, and normalized probability. An empty array means no eligible positive-weight choice. Optional greetings, details, closings, and surface edits are not expanded. Pattern IDs can restrict families or configure speaker preferences: request_please, request_could_you, request_would_you, desire_would_like, desire_want, desire_looking_to, possibility_can_i, possibility_possible, possibility_able, procedure_how_do, procedure_how_can, procedure_go_about, need_need_to, reason_request_could_you, reason_request_please, authored, follow_up, and structured. Composable message candidates expand eligible component forms and include message selection metadata. The procedure_go_about pattern uses the supplied verb's present participle. Invalid IDs in a family's patterns or constructions fail. Speaker weight entries for unused IDs are allowed so profiles can be reused across scenarios.",
+        examples: &[r#"expression_candidates(var.intent, { speaker = var.speaker })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_VARY,
+        name: "vary",
+        syntax: "vary(text_or_sentence[, options])",
+        summary: "Varies English prose or a sentence object accepted by realize using scoped seeded randomness. Existing calls using only negation: boolean (true), condition_order: boolean (true), and rendering preserve their original behavior: uniform selection between the original and applicable alternatives, with unsupported prose unchanged. Adding any style control opts into bounded composition. style accepts neutral, professional, conversational, warm, terse, text_message, enthusiastic, or informal_chat. Explicit controls override preset defaults: contractions, shorthand, casual, slang, reductions, fragments, warmth, soften_requests, negation, and condition_order are booleans. New-mode negation only contracts recognized negative statements. All presets disable typos and request softening by default. punctuation accepts preserve, omit_period, exclamation, or expressive and affects the final terminal mark, preserving question marks, abbreviations, and code-like tokens. casing accepts preserve or lowercase and only lowercases reviewed everyday words and pronoun contractions. probability (default 1, range 0..1) gates wording, tone, and presentation once per message. max_changes (default 3, integer 0..16) bounds total edits. typos accepts probability (default 0, per message independently), max_errors (default 1, integer 0..16), and kinds (default all of common, omission, transposition, repetition). Typos apply only to reviewed lowercase words and share max_changes. protected is an array of nonempty case-sensitive literal strings. Quotations, code-like tokens, and authored structured subject references are protected automatically. Arbitrary prose names cannot be inferred reliably. alternatives is an array of {from: nonempty text, to: nonempty array of nonempty text} author-approved phrase families, matched literally at word boundaries. Author-supplied alternatives may authorize meaning changes. Built-in tone rules require warmth or soften_requests and never invent promises, urgency, or apologies. Fragments are limited to supported first-person progressive statements. Reductions require recognized infinitive constructions. Changes run in grammatical, phrase, tone, presentation, and typo stages with nonoverlapping choices within each stage. No draw is consumed for a zero or certain probability gate, a sole candidate, or no eligible edit. rendering applies only to structured input. Invalid options fail during generation.",
+        examples: &[
+            r#"vary("The guest cannot check in.", { negation = true, condition_order = false })"#,
+            r#"vary("I am checking the file. Thank you.", { style = "text_message", max_changes = 6 })"#,
+            r#"vary("please send the message", { style = "neutral", typos = { probability = 0.1, max_errors = 1 } })"#,
+            r#"vary("Send the file.", { style = "professional", soften_requests = true })"#,
+        ],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_COMBINE,
+        name: "combine",
+        syntax: "combine(sentences, relation[, options])",
+        summary: "Combines an array of at least two unconditional structured statements accepted by realize. Relation is and, but, or, or because. And, but, and or preserve input order and retain each subject. Because requires exactly two inputs ordered [effect, cause] and renders Because cause, effect. It does not infer causality or substitute one relation for another. Conditional sentences and questions are rejected to avoid changing their scope. Rendering options match realize. Invalid structures or options fail during generation.",
+        examples: &[r#"combine([var.arrival, var.availability], "and")"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_REFER,
+        name: "refer",
+        syntax: "refer(entity, context[, options])",
+        summary: "Returns an English name or an explicitly supplied pronoun without mutating context. Entity fields are id and label (required nonempty strings), person: first|second|third (third), number: singular|plural (singular), and optional pronouns {subject, object, possessive_determiner, possessive}, all four single-word strings. Context is {entities: entity array, mentioned: entity-id string array, facts: fact-id string array}, with every array defaulting to empty. Entity definitions and ids must agree, mentioned ids must have definitions, and context ids must be unique. Options are form: subject|object|possessive_determiner|possessive (subject) and style: auto|name|pronoun (auto). Auto uses a supplied pronoun only after introduction and when unambiguous among mentioned entities, otherwise the label. Name always uses the label. Pronoun requires introduction and an unambiguous supplied form or fails. No gender or entity identity is inferred.",
+        examples: &[r#"refer(var.guest, var.context)"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_REMEMBER,
+        name: "remember",
+        syntax: "remember(context, entities[, facts])",
+        summary: "Returns a new context object with entities introduced and facts established. Context fields are entities (array of entities accepted by refer), mentioned (array of entity-id strings), and facts (array of fact-id strings), each defaulting to empty. Entities is an array of entity objects. The optional facts argument is an array of nonempty fact-id strings and defaults to []. Existing definitions are retained, identical entities and repeated facts are deduplicated, and conflicting definitions for one id fail. The input context is unchanged. Carry the returned value explicitly across turns. Starting from {} resets the conversation scope. Unknown fields and invalid context references fail during generation.",
+        examples: &[r#"remember({}, [var.guest], ["arrival_time"])"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_UNMENTIONED,
+        name: "unmentioned",
+        syntax: "unmentioned(details, context)",
+        summary: "Returns an array of detail objects whose id is absent from context.facts, preserving source order and text. Each detail is exactly {id: string, text: string}, both nonempty and without surrounding whitespace or control characters. Context has the entities, mentioned, and facts arrays documented by refer, each defaulting to empty. Selection is deterministic and never changes context. Identical repeated details are deduplicated. Conflicting text for one id fails even if that fact was already established. Use remember to mark details established only after they have been communicated.",
+        examples: &[r#"unmentioned([{ id = "arrival_time", text = "Arrival is after midnight." }], var.context)"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_FORMAT_NUMBER,
+        name: "format_number",
+        syntax: "format_number(number_or_decimal_text[, options])",
+        summary: "Formats a number or exact decimal string using a packaged English regional profile. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), grouping: boolean (true), and fraction_digits: integral number from zero through nine, including 1.0 (omitted by default). Explicit precision rounds decimal ties away from zero and pads trailing zeros. Without precision, trailing fractional zeros are trimmed. All profiles use a decimal point and comma grouping. En-IN groups the final three integer digits then pairs, while other profiles use groups of three. Negative zero becomes zero. Decimal strings may contain an exponent and avoid floating-point input ambiguity. Expanded input is bounded to 4096 digits. Invalid values, unknown fields, or unsupported locales fail during generation. No OS locale or external data is consulted.",
+        examples: &[r#"format_number("1234567.50", { locale = "en-IN" })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_FORMAT_DATE,
+        name: "format_date",
+        syntax: "format_date(date[, options])",
+        summary: "Formats a strict YYYY-MM-DD Gregorian date with year 0001 through 9999. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US) and style: short|long (long). Short output uses MM/DD/YYYY for en-US, YYYY-MM-DD for en-CA, and DD/MM/YYYY otherwise. Long output uses English month names, month-first for en-US and en-CA, and day-first otherwise. Invalid calendar dates, unknown fields, or unsupported locales fail during generation. No clock or OS locale is consulted.",
+        examples: &[r#"format_date("2026-11-10", { locale = "en-GB", style = "long" })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_FORMAT_TIME,
+        name: "format_time",
+        syntax: "format_time(time[, options])",
+        summary: "Formats a strict HH:MM or HH:MM:SS local clock value. Hours range from 00 through 23 and minutes and seconds from 00 through 59. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), hour_cycle: h12|h24 (omitted), and seconds: boolean (false). Omitted hour_cycle selects h24 for en-GB and h12 otherwise. H12 includes AM or PM. Seconds are displayed only when requested, with missing seconds treated as 00. No current time, OS locale, or timezone conversion is implied. Invalid times, unknown fields, or unsupported locales fail during generation.",
+        examples: &[r#"format_time("17:30", { locale = "en-US" })"#],
+        rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
         tags: &[],

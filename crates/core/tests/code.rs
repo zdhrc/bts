@@ -397,3 +397,385 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
         );
     }
 }
+
+#[test]
+fn language_functions_execute_in_generated_agents() {
+    let model = compile(
+        r#"
+agent "language" { entrypoint = trace.language }
+trace "language" {
+    input = { template = "{{{name}}}: {n} {ok}", count = 2, parts = [null, "", "Hi!", "there"] }
+    vars { selected = sample([0, 1, 2, 3, 4], self.input.count) }
+    output = {
+        text = render(self.input.template, { name = "Zoë", n = 6.0, ok = true })
+        composed = compose(self.input.parts)
+        selected = var.selected
+        reused = var.selected
+        all = sample(["same", "same"], 2)
+        empty = sample([], 0)
+        nested = compose(["Details:", compose(sample(["one", "two"], 2), ", ")])
+    }
+}
+"#,
+    )
+    .unwrap();
+    let root = std::env::temp_dir().join(format!("bts-language-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    for (lang, program, script) in [
+        (
+            ScorerLang::Python,
+            "python3",
+            r#"
+from language_agent import run
+result = run(random_source=lambda: 0.25)
+assert result['text'] == '{Zoë}: 6.0 true', result
+assert result['composed'] == 'Hi! there'
+assert result['selected'] == result['reused'] == [0, 2]
+assert result['all'] == ['same', 'same'] and result['empty'] == []
+assert result['nested'] == 'Details: one, two'
+assert run(random_source=lambda: 0.99)['selected'] == [3, 4]
+base = {'template':'{name}', 'count':2, 'parts':['hi']}
+for patch in [{'template':'{missing}'}, {'template':'{'}, {'parts':[1]}, {'count':-1}, {'count':6}, {'count':1.0}]:
+    try: run({**base, **patch})
+    except (ValueError, TypeError): pass
+    else: raise AssertionError(patch)
+"#,
+        ),
+        (
+            ScorerLang::Typescript,
+            "node",
+            r#"
+import assert from 'node:assert/strict';
+import {run} from './language_agent.mts';
+const result = run(undefined, () => 0.25);
+assert.equal(result.text, '{Zoë}: 6.0 true');
+assert.equal(result.composed, 'Hi! there');
+assert.deepEqual(result.selected, [0, 2]);
+assert.deepEqual(result.reused, result.selected);
+assert.deepEqual(result.all, ['same', 'same']);
+assert.deepEqual(result.empty, []);
+assert.equal(result.nested, 'Details: one, two');
+assert.deepEqual(run(undefined, () => 0.99).selected, [3, 4]);
+const base = {template:'{name}', count:2, parts:['hi']};
+for (const patch of [{template:'{missing}'}, {template:'{'}, {parts:[1]}, {count:-1}, {count:6}, {count:1.5}]) {
+    assert.throws(() => run({...base, ...patch}));
+}
+"#,
+        ),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &PlainTarget).unwrap();
+        for file in assembly.files {
+            let path = root.join(&file.name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.contents).unwrap();
+        }
+        let mut command = std::process::Command::new(program);
+        if lang == ScorerLang::Python {
+            command.arg("-c");
+        } else {
+            command.args(["--input-type=module", "-e"]);
+        }
+        let output = command.arg(script).current_dir(root.join("src/agents")).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{lang:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn english_toolkit_executes_in_packaged_python_and_typescript_agents() {
+    let model = compile(include_str!("fixtures/english.bt")).unwrap();
+    let root = std::env::temp_dir().join(format!("bts-english-agents-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    for (lang, program, script) in [
+        (
+            ScorerLang::Python,
+            "python3",
+            r#"
+from language_agent import run
+for draw in [0.0, 0.5, 0.99]:
+    result = run(random_source=lambda: draw)
+    assert result['action'] == 'confirm_check_in', result
+    assert result['statement'] == 'The guest will arrive after midnight.', result
+    assert result['combined'] == 'The guest will arrive after midnight, and the desk will be open.', result
+    assert result['first_reference'] == result['reset_reference'] == 'Maya', result
+    assert result['next_reference'] == 'she', result
+    assert result['details'] == [{'id':'desk','text':'The desk is open.'}], result
+    assert result['amount'] == '12,34,567.90', result
+    assert result['date'] == '10 November 2026', result
+    assert result['time'] == '12:05:09 AM', result
+    assert result['structured']['selection']['message']['layout'] == 'current_desired', result
+    assert result['slot_answer']['text'] == 'Friday', result
+    assert result['family'] == result['procedural']['selection']['family'], result
+    assert result['history_family'] == result['family'], result
+    assert result['first_candidate_family'] == 'request', result
+    assert result['candidate_count'] == 18, result
+    assert result['procedural']['selection']['intent'] == 'change_flight', result
+    assert result['followup']['text'] in ['What about Friday?', 'what about Friday?'], result
+    assert result['plain_expression'] == 'What about Friday?', result
+    assert len(result['followup']['context']['recent']) == 2, result
+    assert result['styled'] == "I'll check the file.", result
+    assert result['fragment'] == 'Checking the file.', result
+    assert result['softened'] == 'Could you send the file?', result
+    assert result['shorthand'] == 'Btw, the file is ready.', result
+    assert result['typo'] == 'plese', result
+    assert result['wording'] == result['reused'], result
+    assert result['wording'] in ['The guest cannot check in.', "The guest can't check in."], result
+    assert result['conditional'] in ['If the guest arrives late, can they check in?', 'Can they check in if the guest arrives late?'], result
+    assert result['register'] in ["I won't leave. They cannot stay.", 'I will not leave. They cannot stay.', "I won't leave. They can't stay."], result
+    assert result['identifier'] in ['api_v2 does not update résumé_ID-42.', "api_v2 doesn't update résumé_ID-42."], result
+    assert run({'intent':'unknown'}, random_source=lambda: draw)['action'] == 'ask_arrival_time'
+assert run(random_source=lambda: 0.99)['conditional'] == 'Can they check in if the guest arrives late?'
+assert run(random_source=lambda: 0.99)['register'] == "I won't leave. They can't stay."
+assert run(random_source=lambda: 0.0) == run(random_source=lambda: 0.0)
+"#,
+        ),
+        (
+            ScorerLang::Typescript,
+            "node",
+            r#"
+import assert from 'node:assert/strict';
+import {run} from './language_agent.mts';
+for (const draw of [0.0, 0.5, 0.99]) {
+    const result = run(undefined, () => draw);
+    assert.equal(result.action, 'confirm_check_in');
+    assert.equal(result.statement, 'The guest will arrive after midnight.');
+    assert.equal(result.combined, 'The guest will arrive after midnight, and the desk will be open.');
+    assert.equal(result.first_reference, 'Maya');
+    assert.equal(result.next_reference, 'she');
+    assert.equal(result.reset_reference, 'Maya');
+    assert.deepEqual(result.details, [{id:'desk',text:'The desk is open.'}]);
+    assert.equal(result.amount, '12,34,567.90');
+    assert.equal(result.date, '10 November 2026');
+    assert.equal(result.time, '12:05:09 AM');
+    assert.equal(result.structured.selection.message.layout,'current_desired');
+    assert.equal(result.slot_answer.text,'Friday');
+    assert.equal(result.family,result.procedural.selection.family);
+    assert.equal(result.history_family,result.family);
+    assert.equal(result.first_candidate_family,'request');
+    assert.equal(result.candidate_count,18);
+    assert.equal(result.procedural.selection.intent,'change_flight');
+    assert.ok(['What about Friday?', 'what about Friday?'].includes(result.followup.text));
+    assert.equal(result.plain_expression,'What about Friday?');
+    assert.equal(result.followup.context.recent.length,2);
+    assert.equal(result.styled, "I'll check the file.");
+    assert.equal(result.fragment, 'Checking the file.');
+    assert.equal(result.softened, 'Could you send the file?');
+    assert.equal(result.shorthand, 'Btw, the file is ready.');
+    assert.equal(result.typo, 'plese');
+    assert.equal(result.wording, result.reused);
+    assert.ok(['The guest cannot check in.', "The guest can't check in."].includes(result.wording));
+    assert.ok(['If the guest arrives late, can they check in?', 'Can they check in if the guest arrives late?'].includes(result.conditional));
+    assert.ok(["I won't leave. They cannot stay.", 'I will not leave. They cannot stay.', "I won't leave. They can't stay."].includes(result.register));
+    assert.ok(['api_v2 does not update résumé_ID-42.', "api_v2 doesn't update résumé_ID-42."].includes(result.identifier));
+    assert.equal(run({intent:'unknown'}, () => draw).action, 'ask_arrival_time');
+}
+assert.equal(run(undefined, () => 0.99).conditional, 'Can they check in if the guest arrives late?');
+assert.equal(run(undefined, () => 0.99).register, "I won't leave. They can't stay.");
+assert.deepEqual(run(undefined, () => 0.0), run(undefined, () => 0.0));
+"#,
+        ),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &PlainTarget).unwrap();
+        for file in assembly.files {
+            let path = root.join(&file.name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.contents).unwrap();
+        }
+        let output = std::process::Command::new(program)
+            .args(if lang == ScorerLang::Python {
+                vec!["-c"]
+            } else {
+                vec!["--input-type=module", "-e"]
+            })
+            .arg(script)
+            .current_dir(root.join("src/agents"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{lang:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn language_numeric_contract_matches_native_agents_and_scorers() {
+    use bts_core::mocking::data::{self, Distribution};
+    use bts_lang::ScorerKind;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let cases = [
+        ("6", "6"),
+        ("6.0", "6.0"),
+        ("-0.0", "-0.0"),
+        ("0.0000001", "1e-7"),
+        ("0.00001", "0.00001"),
+        ("0.000001", "1e-6"),
+        ("1000000000000000.0", "1000000000000000.0"),
+        ("10000000000000000.0", "1e+16"),
+        ("123000000000000000000.0", "1.23e+20"),
+        ("self.input.n + 1.0", "3.0"),
+        ("self.input.n / 2", "1"),
+        ("self.input.n / 2.0", "1.0"),
+        ("choice(6.0, 6.0)", "6.0"),
+        ("weighted([6.0, 1], [6.0, 2])", "6.0"),
+        ("range(6.0, 6.0)", "6.0"),
+        ("-self.input.n / 3", "0"),
+        ("-self.input.n % 2", "0"),
+        ("min(self.input.n, 6.0)", "2.0"),
+        ("max(self.input.n, 1.0)", "2.0"),
+        ("clamp(self.input.n, 0, 6.0)", "2.0"),
+        ("abs(-self.input.n * 1.0)", "2.0"),
+        ("[6.0][0]", "6.0"),
+        ("self.input.n == 2 ? 6.0 : 7", "6.0"),
+        ("true", "true"),
+    ];
+    let render = |expression: &str| format!("render(\"{{n}}\", {{ n = {expression} }})");
+    let expected: Vec<_> = cases.iter().map(|(_, expected)| *expected).collect();
+    let generate = |source: &str| {
+        data::generate(
+            compile(source).unwrap(),
+            1,
+            Duration::from_secs(1),
+            Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(1000),
+            42,
+            &(),
+        )
+    };
+    let source = format!(
+        "agent \"numeric\" {{ entrypoint = trace.numeric }} trace \"numeric\" {{ input = {{ n = 2 }} output = [{}] }}",
+        cases
+            .iter()
+            .map(|(expression, _)| render(expression))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let batch = generate(&source).unwrap();
+    assert_eq!(
+        batch.events[0].output.as_ref().unwrap().project(&()).unwrap(),
+        serde_json::json!(expected)
+    );
+    let model = compile(&source).unwrap();
+    let invalid = [
+        "1.0",
+        "choice(1.0, 1.0)",
+        "weighted([1.0, 1], [1.0, 2])",
+        "range(1.0, 1.0)",
+        "self.input.n / 2.0",
+        "min(self.input.n, 1.0)",
+        "[1.0][0]",
+    ];
+    for expression in invalid {
+        assert!(
+            generate(&format!(
+                "trace \"t\" {{ input = {{ n = 2 }} output = sample([1, 2], {expression}) }}"
+            ))
+            .is_err(),
+            "{expression}"
+        );
+    }
+    let mut scorers = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (expression, expected))| {
+            format!(
+                "scorer \"render{index}\" {{ code {{ score = {} == {} ? 1 : 0 }} }}",
+                render(&expression.replace("self.input", "input")),
+                serde_json::to_string(expected).unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, expression) in invalid.iter().enumerate() {
+        scorers.push(format!(
+            "scorer \"sample{index}\" {{ code {{ score = len(sample([1, 2], {})) }} }}",
+            expression.replace("self.input", "input")
+        ));
+    }
+    scorers.push("scorer \"integer\" { code { score = len(sample([1, 2], input.n / 2)) } }".into());
+    let scorer_model = compile(&scorers.join("\n")).unwrap();
+    let items = scorer_model
+        .scorers
+        .iter()
+        .map(|scorer| {
+            let ScorerKind::Code { score, steps } = &scorer.kind else {
+                panic!("code scorer")
+            };
+            Item {
+                name: &scorer.name,
+                slug: &scorer.name,
+                score,
+                steps,
+            }
+        })
+        .collect::<Vec<_>>();
+    let root = std::env::temp_dir().join(format!("bts-numeric-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    for (lang, program, extension) in [(ScorerLang::Python, "python3", "py"), (ScorerLang::Typescript, "node", "mts")] {
+        for file in code::assemble_agents(&model, lang, &PlainTarget).unwrap().files {
+            let path = root.join(file.name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.contents).unwrap();
+        }
+        let expected = serde_json::to_string(&expected).unwrap();
+        let script = if lang == ScorerLang::Python {
+            format!(
+                r#"
+import json
+from numeric_agent import run
+assert run() == json.loads({expected:?})
+for index in range({count}):
+    assert globals()['scorer_render' + str(index)](None, {{'n':2}})['score'] == 1, index
+for index in range({invalid_count}):
+    try: globals()['scorer_sample' + str(index)](None, {{'n':2}})
+    except (TypeError, ValueError): pass
+    else: raise AssertionError(index)
+assert scorer_integer(None, {{'n':2}})['score'] == 1
+"#,
+                count = cases.len(),
+                invalid_count = invalid.len()
+            )
+        } else {
+            let render_names = (0..cases.len())
+                .map(|i| format!("scorer_render{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sample_names = (0..invalid.len())
+                .map(|i| format!("scorer_sample{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                r#"
+import assert from 'node:assert/strict';
+import {{run}} from './numeric_agent.mts';
+assert.deepEqual(run(), {expected});
+for (const scorer of [{render_names}]) assert.equal(scorer({{output:null,input:{{n:2}}}}).score, 1);
+for (const scorer of [{sample_names}]) assert.throws(() => scorer({{output:null,input:{{n:2}}}}));
+assert.equal(scorer_integer({{output:null,input:{{n:2}}}}).score, 1);
+"#
+            )
+        };
+        let emitted = code::languages::Languages.emit(lang, &items).unwrap().source;
+        let path = root.join(format!("src/agents/check.{extension}"));
+        fs::write(&path, format!("{emitted}\n{script}")).unwrap();
+        let output = std::process::Command::new(program).arg(&path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{lang:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
