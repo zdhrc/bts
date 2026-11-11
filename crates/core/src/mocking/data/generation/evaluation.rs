@@ -1,4 +1,5 @@
 use super::super::{Attachment, AttachmentFormat, EventKind, Value as JsonValue};
+use crate::dsl::EnglishOperation;
 use crate::dsl::{
     Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild,
     Choice as ModelChoice, CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NOISE_SIZE_CAP, NodeId,
@@ -6,10 +7,12 @@ use crate::dsl::{
     RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
     Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
 };
+use crate::english::{self, RealizeOptions, Sentence, VariationOptions};
 use crate::selection::filter::WriteFilter;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
 use rand_xoshiro::Xoshiro256PlusPlus;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Number as JsonNumber, Value as InputValue};
 use std::collections::BTreeMap as JsonMap;
 use std::fmt;
@@ -1503,6 +1506,136 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx, at: SrcRange) -> Result<Mode
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnglishVaryOptions {
+    #[serde(default = "english_enabled")]
+    negation: bool,
+    #[serde(default = "english_enabled")]
+    condition_order: bool,
+    #[serde(default)]
+    rendering: RealizeOptions,
+}
+
+fn english_enabled() -> bool {
+    true
+}
+
+impl Default for EnglishVaryOptions {
+    fn default() -> Self {
+        Self {
+            negation: true,
+            condition_order: true,
+            rendering: RealizeOptions::default(),
+        }
+    }
+}
+
+fn eval_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue], rng: &mut R) -> Result<InputValue, String> {
+    run_english(operation, args, rng).map_err(|error| format!("{}: {error}", operation.as_str()))
+}
+
+fn run_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue], rng: &mut R) -> Result<InputValue, String> {
+    use EnglishOperation::*;
+    let (min, max) = match operation {
+        Realize | Vary | FormatNumber | FormatDate | FormatTime => (1, 2),
+        Combine | Refer | Remember => (2, 3),
+        Unmentioned => (2, 2),
+    };
+    if !(min..=max).contains(&args.len()) {
+        return Err(format!("expected {min} to {max} arguments"));
+    }
+    match operation {
+        Realize => {
+            let sentence: Sentence = decode_english(&args[0])?;
+            let english_options = english_options(args.get(1))?;
+            english::realize(&sentence, &english_options)
+                .map(InputValue::String)
+                .map_err(english_error_message)
+        }
+        Vary => {
+            let english_options: EnglishVaryOptions = english_options(args.get(1))?;
+            let variation = VariationOptions {
+                negation: english_options.negation,
+                condition_order: english_options.condition_order,
+            };
+            let output = if let Some(text) = args[0].as_str() {
+                english::vary(text, &variation, rng)
+            } else {
+                let sentence: Sentence = decode_english(&args[0])?;
+                english::vary_sentence(&sentence, &english_options.rendering, &variation, rng)
+            };
+            output.map(InputValue::String).map_err(english_error_message)
+        }
+        Combine => {
+            let sentences: Vec<Sentence> = decode_english(&args[0])?;
+            let relation = decode_english(&args[1])?;
+            let english_options = english_options(args.get(2))?;
+            english::composition::combine(&sentences, relation, &english_options)
+                .map(InputValue::String)
+                .map_err(english_error_message)
+        }
+        Refer => {
+            let entity = decode_english(&args[0])?;
+            let context = decode_english(&args[1])?;
+            let english_options = english_options(args.get(2))?;
+            english::discourse::refer(&entity, &context, &english_options)
+                .map(InputValue::String)
+                .map_err(english_error_message)
+        }
+        Remember => {
+            let context = decode_english(&args[0])?;
+            let entities: Vec<english::discourse::Entity> = decode_english(&args[1])?;
+            let facts: Vec<String> = english_options(args.get(2))?;
+            let context = english::discourse::remember(&context, &entities, &facts).map_err(english_error_message)?;
+            serde_json::to_value(context).map_err(english_error_message)
+        }
+        Unmentioned => {
+            let details: Vec<english::discourse::Detail> = decode_english(&args[0])?;
+            let context = decode_english(&args[1])?;
+            let selected = english::discourse::unmentioned(&details, &context).map_err(english_error_message)?;
+            serde_json::to_value(selected).map_err(english_error_message)
+        }
+        FormatNumber => {
+            let number = match &args[0] {
+                InputValue::String(value) => value.clone(),
+                InputValue::Number(number) => number.to_string(),
+                _ => return Err("expected a number or decimal string".into()),
+            };
+            let english_options = english_options(args.get(1))?;
+            english::formatting::format_number(&number, &english_options)
+                .map(InputValue::String)
+                .map_err(english_error_message)
+        }
+        FormatDate => {
+            let date: String = decode_english(&args[0])?;
+            let english_options = english_options(args.get(1))?;
+            english::formatting::format_date(&date, &english_options)
+                .map(InputValue::String)
+                .map_err(english_error_message)
+        }
+        FormatTime => {
+            let time: String = decode_english(&args[0])?;
+            let english_options = english_options(args.get(1))?;
+            english::formatting::format_time(&time, &english_options)
+                .map(InputValue::String)
+                .map_err(english_error_message)
+        }
+    }
+}
+
+fn decode_english<T: DeserializeOwned>(value: &InputValue) -> Result<T, String> {
+    serde_json::from_value(value.clone()).map_err(english_error_message)
+}
+
+fn english_options<T: DeserializeOwned + Default>(value: Option<&InputValue>) -> Result<T, String> {
+    value.map(decode_english).unwrap_or_else(|| Ok(T::default()))
+}
+
+fn english_error_message(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
@@ -1515,8 +1648,7 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
                         .map_err(|_| Error::english("English functions do not accept attachments".into(), range))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let output =
-                super::english::evaluate(operation, &args, &mut ctx.rng).map_err(|detail| Error::english(detail, range))?;
+            let output = eval_english(operation, &args, &mut ctx.rng).map_err(|detail| Error::english(detail, range))?;
             json_to_value(output.into())
         }
         ModelFunc::Attachment { path, content_type } => {
