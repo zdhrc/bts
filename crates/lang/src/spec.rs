@@ -517,6 +517,24 @@ pub mod ids {
     pub const FUNC_COMPOSE: Id = Id::new("func.compose");
     /// Stable identifier for `func.sample`.
     pub const FUNC_SAMPLE: Id = Id::new("func.sample");
+    /// Stable identifier for `func.realize`.
+    pub const FUNC_REALIZE: Id = Id::new("func.realize");
+    /// Stable identifier for `func.vary`.
+    pub const FUNC_VARY: Id = Id::new("func.vary");
+    /// Stable identifier for `func.combine`.
+    pub const FUNC_COMBINE: Id = Id::new("func.combine");
+    /// Stable identifier for `func.refer`.
+    pub const FUNC_REFER: Id = Id::new("func.refer");
+    /// Stable identifier for `func.remember`.
+    pub const FUNC_REMEMBER: Id = Id::new("func.remember");
+    /// Stable identifier for `func.unmentioned`.
+    pub const FUNC_UNMENTIONED: Id = Id::new("func.unmentioned");
+    /// Stable identifier for `func.format_number`.
+    pub const FUNC_FORMAT_NUMBER: Id = Id::new("func.format_number");
+    /// Stable identifier for `func.format_date`.
+    pub const FUNC_FORMAT_DATE: Id = Id::new("func.format_date");
+    /// Stable identifier for `func.format_time`.
+    pub const FUNC_FORMAT_TIME: Id = Id::new("func.format_time");
     /// Stable identifier for `func.join`.
     pub const FUNC_JOIN: Id = Id::new("func.join");
     /// Stable identifier for `func.contains`.
@@ -2008,6 +2026,89 @@ const FUNCS: &[FuncDesc] = &[
         syntax: "sample(array, count)",
         summary: "Selects array positions uniformly without replacement and returns their values in source order. Duplicate values remain distinct positions. Count must be an integer from zero through the array length, otherwise generation fails.",
         examples: &[r#"sample(["parking", "keys", "hours"], 2)"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_REALIZE,
+        name: "realize",
+        syntax: "realize(sentence[, options])",
+        summary: "Renders English without random choices. The sentence object requires clause and accepts optional condition. A clause requires subject {text: string, person: first|second|third (default third), number: singular|plural (default singular)} and predicate {verb, complement?: string}. Verb is a packaged lowercase base word or an object containing all five lowercase forms: base, third_person_singular, past, past_participle, present_participle. Clause options are tense: present|past|future (present), aspect: simple|progressive|perfect|perfect_progressive (simple), polarity: positive|negative (positive), form: statement|question (statement), and modal: can|could|may|might|must|should|will|would (absent by default). A modal requires tense present, with temporal relationships expressed through the chosen modal and aspect. A condition requires subject and predicate and accepts tense, aspect, and polarity with the same defaults. It is introduced by if. Rendering options are negation: expanded|contracted (expanded) and condition_position: before|after (before). Authored subject agreement and explicit verb forms remain caller-owned. Unsupported structures and unknown fields fail during generation.",
+        examples: &[
+            r#"realize({ clause = { subject = { text = "the guest" }, predicate = { verb = "arrive", complement = "after midnight" }, tense = "future" } })"#,
+        ],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_VARY,
+        name: "vary",
+        syntax: "vary(text_or_sentence[, options])",
+        summary: "Selects uniformly between the original wording and applicable English alternatives using scoped seeded randomness. Accepts prose or a sentence object accepted by realize. Options are negation: boolean (true), condition_order: boolean (true), and rendering: an options object from realize (expanded negation and condition before). Rendering applies only to structured input. Negation alternatives use a consistent register across supported prose sentences. Supported if clauses can move before or after the main clause. Unsupported or ambiguous prose is returned unchanged without consuming randomness. Negation scope, modality, question form, authored references, and identifiers are preserved. Invalid options fail during generation.",
+        examples: &[r#"vary("The guest cannot check in.", { negation = true, condition_order = false })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_COMBINE,
+        name: "combine",
+        syntax: "combine(sentences, relation[, options])",
+        summary: "Combines an array of at least two unconditional structured statements accepted by realize. Relation is and, but, or, or because. And, but, and or preserve input order and retain each subject. Because requires exactly two inputs ordered [effect, cause] and renders Because cause, effect. It does not infer causality or substitute one relation for another. Conditional sentences and questions are rejected to avoid changing their scope. Rendering options match realize. Invalid structures or options fail during generation.",
+        examples: &[r#"combine([var.arrival, var.availability], "and")"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_REFER,
+        name: "refer",
+        syntax: "refer(entity, context[, options])",
+        summary: "Returns an English name or an explicitly supplied pronoun without mutating context. Entity fields are id and label (required nonempty strings), person: first|second|third (third), number: singular|plural (singular), and optional pronouns {subject, object, possessive_determiner, possessive}, all four single-word strings. Context is {entities: entity array, mentioned: entity-id string array, facts: fact-id string array}, with every array defaulting to empty. Entity definitions and ids must agree, mentioned ids must have definitions, and context ids must be unique. Options are form: subject|object|possessive_determiner|possessive (subject) and style: auto|name|pronoun (auto). Auto uses a supplied pronoun only after introduction and when unambiguous among mentioned entities, otherwise the label. Name always uses the label. Pronoun requires introduction and an unambiguous supplied form or fails. No gender or entity identity is inferred.",
+        examples: &[r#"refer(var.guest, var.context)"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_REMEMBER,
+        name: "remember",
+        syntax: "remember(context, entities[, facts])",
+        summary: "Returns a new context object with entities introduced and facts established. Context fields are entities (array of entities accepted by refer), mentioned (array of entity-id strings), and facts (array of fact-id strings), each defaulting to empty. Entities is an array of entity objects. The optional facts argument is an array of nonempty fact-id strings and defaults to []. Existing definitions are retained, identical entities and repeated facts are deduplicated, and conflicting definitions for one id fail. The input context is unchanged. Carry the returned value explicitly across turns. Starting from {} resets the conversation scope. Unknown fields and invalid context references fail during generation.",
+        examples: &[r#"remember({}, [var.guest], ["arrival_time"])"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_UNMENTIONED,
+        name: "unmentioned",
+        syntax: "unmentioned(details, context)",
+        summary: "Returns an array of detail objects whose id is absent from context.facts, preserving source order and text. Each detail is exactly {id: string, text: string}, both nonempty and without surrounding whitespace or control characters. Context has the entities, mentioned, and facts arrays documented by refer, each defaulting to empty. Selection is deterministic and never changes context. Identical repeated details are deduplicated. Conflicting text for one id fails even if that fact was already established. Use remember to mark details established only after they have been communicated.",
+        examples: &[r#"unmentioned([{ id = "arrival_time", text = "Arrival is after midnight." }], var.context)"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_FORMAT_NUMBER,
+        name: "format_number",
+        syntax: "format_number(number_or_decimal_text[, options])",
+        summary: "Formats a number or exact decimal string using a packaged English regional profile. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), grouping: boolean (true), and fraction_digits: integral number from zero through nine, including 1.0 (omitted by default). Explicit precision rounds decimal ties away from zero and pads trailing zeros. Without precision, trailing fractional zeros are trimmed. All profiles use a decimal point and comma grouping. En-IN groups the final three integer digits then pairs, while other profiles use groups of three. Negative zero becomes zero. Decimal strings may contain an exponent and avoid floating-point input ambiguity. Expanded input is bounded to 4096 digits. Invalid values, unknown fields, or unsupported locales fail during generation. No OS locale or external data is consulted.",
+        examples: &[r#"format_number("1234567.50", { locale = "en-IN" })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_FORMAT_DATE,
+        name: "format_date",
+        syntax: "format_date(date[, options])",
+        summary: "Formats a strict YYYY-MM-DD Gregorian date with year 0001 through 9999. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US) and style: short|long (long). Short output uses MM/DD/YYYY for en-US, YYYY-MM-DD for en-CA, and DD/MM/YYYY otherwise. Long output uses English month names, month-first for en-US and en-CA, and day-first otherwise. Invalid calendar dates, unknown fields, or unsupported locales fail during generation. No clock or OS locale is consulted.",
+        examples: &[r#"format_date("2026-11-10", { locale = "en-GB", style = "long" })"#],
+        rules: TEXT_FUNC_RULES,
+    },
+    FuncDesc {
+        tags: &[],
+        id: ids::FUNC_FORMAT_TIME,
+        name: "format_time",
+        syntax: "format_time(time[, options])",
+        summary: "Formats a strict HH:MM or HH:MM:SS local clock value. Hours range from 00 through 23 and minutes and seconds from 00 through 59. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), hour_cycle: h12|h24 (omitted), and seconds: boolean (false). Omitted hour_cycle selects h24 for en-GB and h12 otherwise. H12 includes AM or PM. Seconds are displayed only when requested, with missing seconds treated as 00. No current time, OS locale, or timezone conversion is implied. Invalid times, unknown fields, or unsupported locales fail during generation.",
+        examples: &[r#"format_time("17:30", { locale = "en-US" })"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {

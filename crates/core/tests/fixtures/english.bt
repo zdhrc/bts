@@ -1,0 +1,48 @@
+agent "language" { entrypoint = trace.language }
+
+vars {
+        guest = {
+            id = "guest-42"
+            label = "Maya"
+            pronouns = { subject = "she", object = "her", possessive_determiner = "her", possessive = "hers" }
+        }
+        arrival = {
+            clause = {
+                subject = { text = "the guest" }
+                predicate = { verb = "arrive", complement = "after midnight" }
+                tense = "future"
+            }
+        }
+        access = {
+            clause = {
+                subject = { text = "the desk" }
+                predicate = { verb = "be", complement = "open" }
+                tense = "future"
+            }
+        }
+}
+
+trace "language" {
+    input = { intent = "confirm_arrival" }
+    vars {
+        context = remember({}, [var.guest], ["arrival"])
+        wording = vary("The guest cannot check in.")
+    }
+    output = {
+        action = self.input.intent == "confirm_arrival" ? "confirm_check_in" : "ask_arrival_time"
+        statement = realize(var.arrival)
+        combined = combine([var.arrival, var.access], "and")
+        first_reference = refer(var.guest, {})
+        next_reference = refer(var.guest, var.context)
+        reset_reference = refer(var.guest, {})
+        details = unmentioned([{ id = "arrival", text = "Arrival is after midnight." }, { id = "desk", text = "The desk is open." }], var.context)
+        amount = format_number("1234567.895", { locale = "en-IN", fraction_digits = 2 })
+        date = format_date("2026-11-10", { locale = "en-GB" })
+        time = format_time("00:05:09", { locale = "en-US", seconds = true })
+        wording = var.wording
+        reused = var.wording
+        conditional = vary("If the guest arrives late, can they check in?", { negation = false })
+        register = vary("I won't leave. They cannot stay.")
+        identifier = vary("api_v2 does not update résumé_ID-42.")
+    }
+}

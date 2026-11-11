@@ -1799,7 +1799,11 @@ pub(in crate::mocking::code) fn agent(
         ScorerLang::Python => format!("{PYTHON_HELPERS}\n{PY_RUNTIME}\n{tracing}"),
         ScorerLang::Typescript => format!("{TYPESCRIPT_HELPERS}\n{TS_RUNTIME}\n{tracing}"),
     };
-    let extra = runtime_helpers(lang, agent.tokens);
+    let extra = runtime_helpers(
+        lang,
+        agent.tokens,
+        crate::mocking::code::planning::mentions(&functions, "_english"),
+    );
     let rename = |source: &str| {
         let mut output = String::new();
         let mut word = String::new();
@@ -1832,7 +1836,7 @@ pub(in crate::mocking::code) fn agent(
     };
     (source, types)
 }
-fn runtime_helpers(lang: ScorerLang, tokens: bool) -> String {
+fn runtime_helpers(lang: ScorerLang, tokens: bool, english: bool) -> String {
     let (base, tokenizer) = match lang {
         ScorerLang::Python => (PYTHON, PY_TOKENS),
         ScorerLang::Typescript => (TYPESCRIPT, TS_TOKENS),
@@ -1842,5 +1846,225 @@ fn runtime_helpers(lang: ScorerLang, tokens: bool) -> String {
     } else {
         TS_LANGUAGE
     };
-    format!("{base}\n{language}\n{}", if tokens { tokenizer } else { "" })
+    format!(
+        "{base}\n{language}\n{}\n{}",
+        if tokens { tokenizer } else { "" },
+        if english { english_source(lang, true) } else { String::new() }
+    )
+}
+
+pub(in crate::mocking::code) fn english_source(lang: ScorerLang, agent: bool) -> String {
+    let data = crate::english::runtime_data().to_string();
+    match lang {
+        ScorerLang::Python => format!(
+            "import json as _english_json\nimport re as _english_re\nimport math as _english_math\n\nclass _EnglishData:\n    data = _english_json.loads({})\n\n{}\n{}",
+            serde_json::to_string(&data).unwrap(),
+            include_str!("english.py"),
+            if agent {
+                "def _english(operation, args, random_source):\n    return _language_english(operation, _value(args), lambda: _draw(random_source))\n"
+            } else {
+                ""
+            }
+        ),
+        ScorerLang::Typescript => format!(
+            "const _englishData: any = {data};\n{}\n{}",
+            include_str!("english.ts"),
+            if agent {
+                "function _english(operation: string, args: unknown[], randomSource: any): any { return _language_english(operation, _serialize(args), () => _draw(randomSource)); }\n"
+            } else {
+                ""
+            }
+        ),
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod english_tests {
+    use super::*;
+    use crate::mocking::data::{self, Distribution};
+    use serde_json::{Value, json};
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+        time::{Duration, UNIX_EPOCH},
+    };
+
+    fn literal(value: &Value) -> String {
+        match value {
+            Value::Object(fields) => format!(
+                "{{{}}}",
+                fields
+                    .iter()
+                    .map(|(key, value)| format!("{key} = {}", literal(value)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Value::Array(items) => format!("[{}]", items.iter().map(literal).collect::<Vec<_>>().join(", ")),
+            value => value.to_string(),
+        }
+    }
+
+    fn native(operation: &str, args: &[Value]) -> Value {
+        let source = format!(
+            "trace \"language\" {{ output = {operation}({}) }}",
+            args.iter().map(literal).collect::<Vec<_>>().join(", ")
+        );
+        let model = crate::dsl::semantics::compile(&source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        match data::generate(
+            model,
+            1,
+            Duration::from_secs(1),
+            Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(10),
+            42,
+            &(),
+        ) {
+            Ok(batch) => json!({"value":batch.events[0].output.as_ref().unwrap().project(&()).unwrap()}),
+            Err(_) => json!({"error":true}),
+        }
+    }
+
+    #[test]
+    fn portable_english_matches_native_values_errors_and_text_alternatives() {
+        let sentence = json!({"clause":{"subject":{"text":"constructor"},"predicate":{"verb":"write","complement":"letters"},"tense":"past","aspect":"perfect"}});
+        let cause = json!({"clause":{"subject":{"text":"Maya"},"predicate":{"verb":"arrive"},"tense":"past"}});
+        let entity = json!({"id":"maya","label":"Maya","pronouns":{"subject":"she","object":"her","possessive_determiner":"her","possessive":"hers"}});
+        let context = json!({"entities":[entity.clone()],"mentioned":["maya"],"facts":["arrival"]});
+        let competing = json!({"entities":[entity.clone(),{"id":"other","label":"Chris"}],"mentioned":["maya","other"]});
+        let mut cases = vec![
+            ("realize", vec![sentence.clone()]),
+            ("combine", vec![json!([sentence.clone(), cause.clone()]), json!("because")]),
+            ("refer", vec![entity.clone(), context.clone()]),
+            ("refer", vec![entity.clone(), competing.clone()]),
+            ("refer", vec![entity.clone(), competing, json!({"style":"pronoun"})]),
+            ("remember", vec![json!({}), json!([entity.clone()]), json!(["arrival"])]),
+            (
+                "unmentioned",
+                vec![
+                    json!([{"id":"arrival","text":"late"},{"id":"booking","text":"ZX-42"}]),
+                    context,
+                ],
+            ),
+            (
+                "realize",
+                vec![json!({"clause":{"subject":{"text":"toString"},"predicate":{"verb":"constructor"}}})],
+            ),
+            ("realize", vec![sentence.clone(), json!({"negation":"informal"})]),
+            (
+                "vary",
+                vec![
+                    json!("Constructor is not ready."),
+                    json!({"negation":false,"condition_order":false}),
+                ],
+            ),
+            ("vary", vec![json!("The guest cannot leave."), json!({"negation":null})]),
+        ];
+        for value in ["2024-02-29", "1900-02-29", "0000-01-01", "2026-11-10\n"] {
+            for locale in ["en-US", "en-GB", "en-CA", "en-AU", "en-IN", "fr-FR"] {
+                cases.push(("format_date", vec![json!(value), json!({"locale":locale})]));
+            }
+        }
+        for value in ["00:05:09", "23:59", "24:00", "12:00\n"] {
+            cases.push(("format_time", vec![json!(value), json!({"locale":"en-AU","seconds":true})]));
+        }
+        for value in [
+            "1234567.895",
+            "-0.004",
+            "9.995",
+            "1e-8",
+            "0e4096",
+            "1e-4096",
+            "1\n",
+            ".5",
+            "5.",
+        ] {
+            cases.push((
+                "format_number",
+                vec![json!(value), json!({"locale":"en-IN","fraction_digits":2})],
+            ));
+        }
+        for precision in [json!(true), json!(1.0), json!(1.5), Value::Null, json!(10)] {
+            cases.push(("format_number", vec![json!(2.675), json!({"fraction_digits":precision})]));
+        }
+        for tense in ["present", "past", "future"] {
+            for aspect in ["simple", "progressive", "perfect", "perfect_progressive"] {
+                for form in ["statement", "question"] {
+                    let mut value = sentence.clone();
+                    value["clause"]["tense"] = json!(tense);
+                    value["clause"]["aspect"] = json!(aspect);
+                    value["clause"]["form"] = json!(form);
+                    value["clause"]["polarity"] = json!("negative");
+                    cases.push(("realize", vec![value, json!({"negation":"contracted"})]));
+                }
+            }
+        }
+        let texts = [
+            "I won't leave. They cannot stay.",
+            "I cannot leave.They cannot stay.",
+            "I cannot leave. they cannot stay.",
+            "I cannot leave. api_v2 cannot stay.",
+            "I cannot leave? They cannot stay.",
+            "Can they leave?They cannot stay.",
+            "Can they leave? they cannot stay.",
+            "I cannot leave.\nthey cannot stay.",
+            "I cannot leave.They cannot stay.",
+            "I cannot leave. Καλλιόπη cannot stay.",
+            "If the guest arrives late, can they check in?",
+            "Can they check in if the guest arrives late?",
+            "  If Maya has finished, api_v2 will update résumé_ID-42.\n",
+            "Constructor is not ready.",
+            "They cannot\u{001c}leave.",
+            "\u{feff}They cannot leave.",
+            "\u{0085}They cannot leave.\u{00a0}",
+            "I can't leave. She's gone.",
+        ];
+        let expected = json!({"calls":cases.iter().map(|(op,args)|native(op,args)).collect::<Vec<_>>(),"texts":texts.iter().map(|text|crate::english::text_alternatives(text,&crate::english::VariationOptions{negation:true,condition_order:true})).collect::<Vec<_>>()});
+        let input = json!({"calls":cases,"texts":texts}).to_string();
+        for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+            let trailer = if lang == ScorerLang::Python {
+                r#"
+data = _english_json.load(__import__('sys').stdin)
+results = []
+for operation, args in data['calls']:
+    try: results.append({'value':_language_english(operation,args,lambda:0.0)})
+    except Exception: results.append({'error':True})
+print(_english_json.dumps({'calls':results,'texts':[_english_text_alternatives(text,{'negation':True,'condition_order':True}) for text in data['texts']]}))
+"#
+            } else {
+                r#"
+import {readFileSync} from 'node:fs';
+const data = JSON.parse(readFileSync(0,'utf8'));
+const calls = data.calls.map(([operation,args]: any) => {try {return {value:_language_english(operation,args,()=>0)};} catch {return {error:true};}});
+console.log(JSON.stringify({calls,texts:data.texts.map((text:string)=>_englishTextAlternatives(text,{negation:true,condition_order:true}))}));
+"#
+            };
+            let source = format!("{}\n{trailer}", english_source(lang, false));
+            let path = std::env::temp_dir().join(format!(
+                "bts-english-runtime-{}.{}",
+                uuid::Uuid::new_v4(),
+                if lang == ScorerLang::Python { "py" } else { "mts" }
+            ));
+            std::fs::write(&path, source).unwrap();
+            let mut child = Command::new(if lang == ScorerLang::Python { "python3" } else { "node" })
+                .arg(&path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(
+                output.status.success(),
+                "{lang:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            for (index, case) in cases.iter().enumerate() {
+                assert_eq!(actual["calls"][index], expected["calls"][index], "{lang:?}: {case:?}");
+            }
+            assert_eq!(actual["texts"], expected["texts"], "{lang:?} text alternatives");
+        }
+    }
 }

@@ -486,6 +486,95 @@ for (const patch of [{template:'{missing}'}, {template:'{'}, {parts:[1]}, {count
 }
 
 #[test]
+fn english_toolkit_executes_in_packaged_python_and_typescript_agents() {
+    let model = compile(include_str!("fixtures/english.bt")).unwrap();
+    let root = std::env::temp_dir().join(format!("bts-english-agents-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    for (lang, program, script) in [
+        (
+            ScorerLang::Python,
+            "python3",
+            r#"
+from language_agent import run
+for draw in [0.0, 0.5, 0.99]:
+    result = run(random_source=lambda: draw)
+    assert result['action'] == 'confirm_check_in', result
+    assert result['statement'] == 'The guest will arrive after midnight.', result
+    assert result['combined'] == 'The guest will arrive after midnight, and the desk will be open.', result
+    assert result['first_reference'] == result['reset_reference'] == 'Maya', result
+    assert result['next_reference'] == 'she', result
+    assert result['details'] == [{'id':'desk','text':'The desk is open.'}], result
+    assert result['amount'] == '12,34,567.90', result
+    assert result['date'] == '10 November 2026', result
+    assert result['time'] == '12:05:09 AM', result
+    assert result['wording'] == result['reused'], result
+    assert result['wording'] in ['The guest cannot check in.', "The guest can't check in."], result
+    assert result['conditional'] in ['If the guest arrives late, can they check in?', 'Can they check in if the guest arrives late?'], result
+    assert result['register'] in ["I won't leave. They cannot stay.", 'I will not leave. They cannot stay.', "I won't leave. They can't stay."], result
+    assert result['identifier'] in ['api_v2 does not update résumé_ID-42.', "api_v2 doesn't update résumé_ID-42."], result
+    assert run({'intent':'unknown'}, random_source=lambda: draw)['action'] == 'ask_arrival_time'
+assert run(random_source=lambda: 0.99)['conditional'] == 'Can they check in if the guest arrives late?'
+assert run(random_source=lambda: 0.99)['register'] == "I won't leave. They can't stay."
+assert run(random_source=lambda: 0.0) == run(random_source=lambda: 0.0)
+"#,
+        ),
+        (
+            ScorerLang::Typescript,
+            "node",
+            r#"
+import assert from 'node:assert/strict';
+import {run} from './language_agent.mts';
+for (const draw of [0.0, 0.5, 0.99]) {
+    const result = run(undefined, () => draw);
+    assert.equal(result.action, 'confirm_check_in');
+    assert.equal(result.statement, 'The guest will arrive after midnight.');
+    assert.equal(result.combined, 'The guest will arrive after midnight, and the desk will be open.');
+    assert.equal(result.first_reference, 'Maya');
+    assert.equal(result.next_reference, 'she');
+    assert.equal(result.reset_reference, 'Maya');
+    assert.deepEqual(result.details, [{id:'desk',text:'The desk is open.'}]);
+    assert.equal(result.amount, '12,34,567.90');
+    assert.equal(result.date, '10 November 2026');
+    assert.equal(result.time, '12:05:09 AM');
+    assert.equal(result.wording, result.reused);
+    assert.ok(['The guest cannot check in.', "The guest can't check in."].includes(result.wording));
+    assert.ok(['If the guest arrives late, can they check in?', 'Can they check in if the guest arrives late?'].includes(result.conditional));
+    assert.ok(["I won't leave. They cannot stay.", 'I will not leave. They cannot stay.', "I won't leave. They can't stay."].includes(result.register));
+    assert.ok(['api_v2 does not update résumé_ID-42.', "api_v2 doesn't update résumé_ID-42."].includes(result.identifier));
+    assert.equal(run({intent:'unknown'}, () => draw).action, 'ask_arrival_time');
+}
+assert.equal(run(undefined, () => 0.99).conditional, 'Can they check in if the guest arrives late?');
+assert.equal(run(undefined, () => 0.99).register, "I won't leave. They can't stay.");
+assert.deepEqual(run(undefined, () => 0.0), run(undefined, () => 0.0));
+"#,
+        ),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &PlainTarget).unwrap();
+        for file in assembly.files {
+            let path = root.join(&file.name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.contents).unwrap();
+        }
+        let output = std::process::Command::new(program)
+            .args(if lang == ScorerLang::Python {
+                vec!["-c"]
+            } else {
+                vec!["--input-type=module", "-e"]
+            })
+            .arg(script)
+            .current_dir(root.join("src/agents"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{lang:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn language_numeric_contract_matches_native_agents_and_scorers() {
     use bts_core::mocking::data::{self, Distribution};
     use bts_lang::ScorerKind;

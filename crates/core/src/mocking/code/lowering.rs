@@ -4780,6 +4780,14 @@ mod expressions {
             Func::Render { template, values } => call("_render", &[template, values])?,
             Func::Compose { array, separator } => call("_compose", &[array, separator])?,
             Func::Sample { array, count } => Expr::call("_sample_items", vec![expr(array)?, expr(count)?, random()]),
+            Func::English { operation, args } => Expr::call(
+                "_english",
+                vec![
+                    Expr::string(operation.as_str()),
+                    Expr::Array(args.iter().map(expr).collect::<Result<_, _>>()?),
+                    random(),
+                ],
+            ),
             Func::Contains { target, needle } => call("_contains", &[target, needle])?,
             Func::StartsWith { text, prefix } => call("_starts_with", &[text, prefix])?,
             Func::EndsWith { text, suffix } => call("_ends_with", &[text, suffix])?,
@@ -5442,6 +5450,23 @@ pub(crate) mod scoring {
                         vec![self.lower(array)?, self.language_value(count)?, random],
                     )
                 }
+                Func::English { operation, args } => {
+                    self.helpers.insert(Helper::English);
+                    let random = if python {
+                        self.imports.insert("random");
+                        Expr::from("random").member("random")
+                    } else {
+                        Expr::from("Math").member("random")
+                    };
+                    Expr::call(
+                        "_language_english",
+                        vec![
+                            Expr::string(operation.as_str()),
+                            Expr::Array(args.iter().map(|arg| self.lower(arg)).collect::<Result<_, _>>()?),
+                            random,
+                        ],
+                    )
+                }
                 Func::Contains { target, needle } => {
                     Expr::Contains(Box::new(self.lower(needle)?), Box::new(self.lower(target)?))
                 }
@@ -5562,6 +5587,7 @@ pub(crate) mod scoring {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
     pub(in crate::mocking::code) enum Helper {
         Language,
+        English,
         Normal,
         Gamma,
         Lognormal,

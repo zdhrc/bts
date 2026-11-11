@@ -236,6 +236,7 @@ version = "0.3.1"
 dependencies = [
  "bts-lang",
  "chrono",
+ "pluralizer",
  "rand 0.9.5",
  "rand_distr",
  "rand_xoshiro",
@@ -247,6 +248,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "uuid",
 ]
 
@@ -265,6 +267,8 @@ dependencies = [
  "bts-core",
  "bts-lang",
  "js-sys",
+ "rand 0.9.5",
+ "rand_xoshiro",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -1161,6 +1165,16 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "pluralizer"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b3eba432a00a1f6c16f39147847a870e94e2e9b992759b503e330efec778cbe"
+dependencies = [
+ "once_cell",
+ "regex",
+]
 
 [[package]]
 name = "potential_utf"
@@ -2143,6 +2157,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unicode-width"

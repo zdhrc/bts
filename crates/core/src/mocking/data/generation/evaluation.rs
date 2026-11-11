@@ -1506,6 +1506,19 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx, at: SrcRange) -> Result<Mode
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
+        ModelFunc::English { operation, args } => {
+            let args = args
+                .into_iter()
+                .map(|arg| {
+                    lower_value(arg, ctx)?
+                        .project(&())
+                        .map_err(|_| Error::english("English functions do not accept attachments".into(), range))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let output =
+                super::english::evaluate(operation, &args, &mut ctx.rng).map_err(|detail| Error::english(detail, range))?;
+            json_to_value(output.into())
+        }
         ModelFunc::Attachment { path, content_type } => {
             let filename = std::path::Path::new(&path)
                 .file_name()
@@ -2331,10 +2344,11 @@ pub(super) fn plan_case_data(
     })
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
     pub range: SrcRange,
+    detail: Option<String>,
 }
 
 impl Error {
@@ -2344,7 +2358,19 @@ impl Error {
     }
 
     fn new(kind: ErrorKind, range: SrcRange) -> Self {
-        Self { kind, range }
+        Self {
+            kind,
+            range,
+            detail: None,
+        }
+    }
+
+    fn english(detail: String, range: SrcRange) -> Self {
+        Self {
+            kind: ErrorKind::InvalidEnglish,
+            range,
+            detail: Some(detail),
+        }
     }
 }
 
@@ -2371,6 +2397,7 @@ pub enum ErrorKind {
     InvalidRender,
     InvalidCompose,
     InvalidSample,
+    InvalidEnglish,
     CircularReference,
     AbsentRefField,
     RefShapeMismatch,
@@ -2399,6 +2426,7 @@ impl fmt::Display for ErrorKind {
             Self::InvalidRender => "render requires balanced braces and named string, number, or boolean values",
             Self::InvalidCompose => "compose parts must be strings or null",
             Self::InvalidSample => "sample count must be an integer between zero and the array length",
+            Self::InvalidEnglish => "invalid English language function argument",
             Self::JoinElementNotScalar => "join element is not a string, number, or boolean",
             Self::CircularReference => "references form a cycle",
             Self::AbsentRefField => "referenced block does not set the field",
@@ -2409,7 +2437,10 @@ impl fmt::Display for ErrorKind {
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.kind.fmt(formatter)
+        match &self.detail {
+            Some(detail) => formatter.write_str(detail),
+            None => self.kind.fmt(formatter),
+        }
     }
 }
 
@@ -2419,7 +2450,7 @@ impl From<Error> for crate::dsl::Diag {
     fn from(error: Error) -> Self {
         Self {
             when: crate::dsl::DiagPhase::Generation,
-            what: error.kind.to_string(),
+            what: error.to_string(),
             r#where: error.range,
         }
     }
@@ -3061,6 +3092,108 @@ mod tests {
         let plan = plan(model, 1, 0).unwrap();
 
         assert_eq!(plan.events[0].fields.input, Some(JsonValue::from("n=1 f=0.5 b=true")));
+    }
+
+    #[test]
+    fn english_functions_materialize_composable_grammar_and_explicit_context() {
+        let source = r#"
+            vars {
+                guest = { id = "guest_1", label = "Maya", pronouns = {
+                    subject = "she", object = "her", possessive_determiner = "her", possessive = "hers"
+                } }
+                arrival = { clause = { subject = { text = "the guest" }, predicate = { verb = "arrive" }, tense = "future" } }
+                checkin = { clause = { subject = { text = "the guest" }, predicate = { verb = "check", complement = "in" }, modal = "can" } }
+            }
+            trace "t" {
+                vars { context = remember({}, [var.guest], ["arrival"]) }
+                output = {
+                    sentence = realize(var.arrival)
+                    combined = combine([var.arrival, var.checkin], "and")
+                    first = refer(var.guest, {})
+                    later = refer(var.guest, var.context)
+                    reset = refer(var.guest, {})
+                    context = var.context
+                    details = unmentioned([
+                        { id = "arrival", text = "The arrival is recorded." },
+                        { id = "key", text = "Your key is at reception." }
+                    ], var.context)
+                    amount = format_number("1234567.125", { locale = "en-IN", fraction_digits = 2 })
+                    date = format_date("2026-11-10", { locale = "en-GB" })
+                    time = format_time("17:30", { locale = "en-US" })
+                    composed = compose([render("Hello {name}.", { name = var.guest.label }), realize(var.checkin)])
+                }
+            }
+        "#;
+        let generated = plan(compile(source).unwrap(), 2, 42).unwrap();
+        for event in generated.events.iter() {
+            let output = event.fields.output.as_ref().unwrap();
+            assert_eq!(output["sentence"], JsonValue::from("The guest will arrive."));
+            assert_eq!(
+                output["combined"],
+                JsonValue::from("The guest will arrive, and the guest can check in.")
+            );
+            assert_eq!(output["first"], JsonValue::from("Maya"));
+            assert_eq!(output["later"], JsonValue::from("she"));
+            assert_eq!(output["reset"], JsonValue::from("Maya"));
+            assert_eq!(
+                output["details"],
+                value!([{ "id": "key", "text": "Your key is at reception." }])
+            );
+            assert_eq!(output["amount"], JsonValue::from("12,34,567.13"));
+            assert_eq!(output["date"], JsonValue::from("10 November 2026"));
+            assert_eq!(output["time"], JsonValue::from("5:30 PM"));
+            assert_eq!(output["composed"], JsonValue::from("Hello Maya. The guest can check in."));
+        }
+    }
+
+    #[test]
+    fn english_variation_uses_scoped_randomness_and_binding_caching() {
+        let source = r#"
+            trace "t" {
+                vars { reply = vary("The guest cannot check in.") }
+                input = var.reply
+                output = var.reply
+            }
+        "#;
+        let first = plan(compile(source).unwrap(), 32, 7).unwrap();
+        assert_eq!(first, plan(compile(source).unwrap(), 32, 7).unwrap());
+        let outputs = first
+            .events
+            .iter()
+            .map(|event| {
+                assert_eq!(event.fields.input, event.fields.output);
+                event.fields.output.as_ref().unwrap().as_str().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(outputs.contains(&"The guest cannot check in."));
+        assert!(outputs.contains(&"The guest can't check in."));
+        let with_unrelated = source.replace("output = var.reply", "output = var.reply metadata = { other = choice(1, 2) }");
+        let changed = plan(compile(&with_unrelated).unwrap(), 32, 7).unwrap();
+        for (before, after) in first.events.iter().zip(changed.events.iter()) {
+            assert_eq!(before.fields.output, after.fields.output);
+        }
+    }
+
+    #[test]
+    fn english_argument_errors_keep_the_function_range_and_detail() {
+        for (expression, detail) in [
+            (r#"realize({})"#, "clause"),
+            (r#"vary("The guest cannot leave.", { negation = "yes" })"#, "boolean"),
+            (r#"vary("The guest cannot leave.", { unknown = true })"#, "unknown field"),
+            (r#"format_date("2026-02-30")"#, "date"),
+            (r#"format_time("25:30")"#, "time"),
+            (r#"format_number("12", { locale = "fr-FR" })"#, "en-US"),
+            (r#"combine([], "and")"#, "propositions"),
+        ] {
+            let source = format!("trace \"t\" {{ output = {expression} }}");
+            let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidEnglish);
+            assert_eq!(&source[error.range.start..error.range.end], expression);
+            assert!(error.to_string().contains(detail), "{error}");
+            let diagnostic: crate::dsl::Diag = error.into();
+            assert_eq!(diagnostic.when, crate::dsl::DiagPhase::Generation);
+            assert!(diagnostic.what.contains(detail));
+        }
     }
 
     #[test]
