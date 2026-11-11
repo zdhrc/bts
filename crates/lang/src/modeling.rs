@@ -5161,6 +5161,9 @@ impl Modeler {
     }
 
     fn value_type(&self, value: &Value) -> Option<StaticType> {
+        if let Some(shape) = self.result_shape(value) {
+            return Some(shape.value_type());
+        }
         match value {
             Value::Str(_) | Value::Template(_) => Some(StaticType::String),
             Value::Num(_) => Some(StaticType::Number),
@@ -5208,6 +5211,47 @@ impl Modeler {
             },
             // a residual slice always selects from an array
             Value::Slice { .. } => Some(StaticType::Array),
+        }
+    }
+
+    // keep known result fields typed through bindings and nested indexes
+    fn result_shape(&self, value: &Value) -> Option<ResultShape> {
+        match value {
+            Value::VarRef(name) => match &self.var_value(name)?.kind {
+                FoldedKind::Value(value) => self.result_shape(value),
+                _ => None,
+            },
+            Value::Func {
+                func: Func::English { operation, .. },
+                ..
+            } => english_result_shape(*operation),
+            Value::Index { target, index, .. } => match self.result_shape(target)? {
+                ResultShape::Object(fields) => {
+                    let Value::Str(key) = &**index else { return None };
+                    fields.iter().find_map(|(name, shape)| (*name == key).then_some(*shape))
+                }
+                ResultShape::Array(element) => Some(*element),
+                ResultShape::Scalar(_) => None,
+            },
+            Value::Slice { target, .. } => {
+                let shape = self.result_shape(target)?;
+                matches!(shape, ResultShape::Array(_)).then_some(shape)
+            }
+            Value::Cond { then, otherwise, .. } => {
+                let shape = self.result_shape(then)?;
+                (Some(shape) == self.result_shape(otherwise)).then_some(shape)
+            }
+            Value::Func {
+                func: Func::Choice(values),
+                ..
+            } => {
+                let shape = self.result_shape(values.first()?)?;
+                values
+                    .iter()
+                    .all(|value| self.result_shape(value) == Some(shape))
+                    .then_some(shape)
+            }
+            _ => None,
         }
     }
 
@@ -6181,6 +6225,75 @@ enum StaticType {
     Null,
     Array,
     Object,
+}
+
+// result schemas describe existing runtime values without evaluating a function
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ResultShape {
+    Scalar(StaticType),
+    Object(&'static [(&'static str, ResultShape)]),
+    Array(&'static ResultShape),
+}
+
+impl ResultShape {
+    fn value_type(self) -> StaticType {
+        match self {
+            Self::Scalar(kind) => kind,
+            Self::Object(_) => StaticType::Object,
+            Self::Array(_) => StaticType::Array,
+        }
+    }
+}
+
+fn english_result_shape(operation: EnglishOperation) -> Option<ResultShape> {
+    use ResultShape::{Array, Object, Scalar};
+    const TEXT: ResultShape = Scalar(StaticType::String);
+    const NUMBER: ResultShape = Scalar(StaticType::Number);
+    const STRINGS: ResultShape = Array(&TEXT);
+    const MESSAGE: ResultShape = Object(&[
+        ("layout", TEXT),
+        ("recipe", TEXT),
+        ("forms", STRINGS),
+        ("organization", TEXT),
+        ("elaboration", TEXT),
+        ("sentence_shape", TEXT),
+        ("reference_style", TEXT),
+    ]);
+    const SELECTION: ResultShape = Object(&[("intent", TEXT), ("family", TEXT), ("pattern", TEXT), ("message", MESSAGE)]);
+    const CONTEXT: ResultShape = Object(&[
+        ("established", STRINGS),
+        ("recent", Array(&SELECTION)),
+        ("topic", TEXT),
+        ("requested", STRINGS),
+        ("known", STRINGS),
+        ("offered", STRINGS),
+        ("allowed_acts", STRINGS),
+    ]);
+    const EDIT: ResultShape = Object(&[
+        ("rule", TEXT),
+        ("replacement", TEXT),
+        ("stage", NUMBER),
+        ("range", Object(&[("start", NUMBER), ("end", NUMBER)])),
+    ]);
+    const CANDIDATE: ResultShape = Object(&[
+        ("selection", SELECTION),
+        ("text", TEXT),
+        ("used_facts", STRINGS),
+        ("establishes", STRINGS),
+        ("probability", NUMBER),
+    ]);
+    match operation {
+        EnglishOperation::Expression => Some(Object(&[
+            ("text", TEXT),
+            ("base_text", TEXT),
+            ("selection", SELECTION),
+            ("used_facts", STRINGS),
+            ("context", CONTEXT),
+            ("edits", Array(&EDIT)),
+        ])),
+        EnglishOperation::ExpressionCandidates => Some(Array(&CANDIDATE)),
+        _ => None,
+    }
 }
 
 // constant scalar operand pulled out of a folded literal
@@ -8350,6 +8463,39 @@ mod tests {
             assert_eq!(*operation, expected);
             assert_eq!(args.len(), count);
             assert_eq!(operation.as_str(), expression.split('(').next().unwrap());
+        }
+    }
+
+    #[test]
+    fn english_results_preserve_nested_field_types() {
+        for expression in [
+            "var.result.selection.family",
+            "var.result.context.recent[0].family",
+            "len(var.result.context.recent)",
+            r#"[...var.result.context.established, "asked"]"#,
+            "var.result.selection.message.forms[0]",
+            "var.result.edits[0].range.start + 1",
+            "var.candidates[0].selection.family",
+            "var.candidates[:1][0].probability + 1",
+            "choice(var.result, var.result).context.recent[0].intent",
+            "(chance(0.5) ? var.result : var.result).selection.family",
+        ] {
+            model(&format!(r#"vars {{ result = expression({{}}) candidates = expression_candidates({{}}) }} trace "t" {{ output = {expression} }}"#)).unwrap();
+        }
+        model(r#"vars { result = expression({}) } trace "t" { vars { saved = var.result.context } output = var.saved.recent[0].family }"#).unwrap();
+        for expression in [
+            "var.result.selection.family[0]",
+            r#"var.result.context.recent["zero"]"#,
+            "var.result.context.recent + 1",
+            "var.result.selection.unknown.field",
+        ] {
+            assert!(
+                model(&format!(
+                    r#"vars {{ result = expression({{}}) }} trace "t" {{ output = {expression} }}"#
+                ))
+                .is_err(),
+                "{expression}"
+            );
         }
     }
 

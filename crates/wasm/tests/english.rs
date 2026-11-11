@@ -32,6 +32,9 @@ fn public_browser_api_materializes_the_english_toolkit() {
         assert_eq!(output["time"], "12:05:09 AM");
         assert_eq!(output["structured"]["selection"]["message"]["layout"], "current_desired");
         assert_eq!(output["slot_answer"]["text"], "Friday");
+        assert_eq!(output["family"], output["procedural"]["selection"]["family"]);
+        assert_eq!(output["history_family"], output["family"]);
+        assert_eq!(output["first_candidate_family"], "request");
         assert_eq!(output["candidate_count"], 18);
         assert_eq!(output["procedural"]["selection"]["intent"], "change_flight");
         assert!(["What about Friday?", "what about Friday?"].contains(&output["followup"]["text"].as_str().unwrap()));

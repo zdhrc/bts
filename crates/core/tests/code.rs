@@ -509,6 +509,9 @@ for draw in [0.0, 0.5, 0.99]:
     assert result['time'] == '12:05:09 AM', result
     assert result['structured']['selection']['message']['layout'] == 'current_desired', result
     assert result['slot_answer']['text'] == 'Friday', result
+    assert result['family'] == result['procedural']['selection']['family'], result
+    assert result['history_family'] == result['family'], result
+    assert result['first_candidate_family'] == 'request', result
     assert result['candidate_count'] == 18, result
     assert result['procedural']['selection']['intent'] == 'change_flight', result
     assert result['followup']['text'] in ['What about Friday?', 'what about Friday?'], result
@@ -550,6 +553,9 @@ for (const draw of [0.0, 0.5, 0.99]) {
     assert.equal(result.time, '12:05:09 AM');
     assert.equal(result.structured.selection.message.layout,'current_desired');
     assert.equal(result.slot_answer.text,'Friday');
+    assert.equal(result.family,result.procedural.selection.family);
+    assert.equal(result.history_family,result.family);
+    assert.equal(result.first_candidate_family,'request');
     assert.equal(result.candidate_count,18);
     assert.equal(result.procedural.selection.intent,'change_flight');
     assert.ok(['What about Friday?', 'what about Friday?'].includes(result.followup.text));

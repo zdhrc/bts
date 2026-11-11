@@ -64,6 +64,7 @@ trace "language" {
     input = { intent = "confirm_arrival" }
     vars {
         first_expression = expression(var.flight_intent, { speaker = var.speaker })
+        candidate_options = expression_candidates(var.flight_intent)
         context = remember({}, [var.guest], ["arrival"])
         wording = vary("The guest cannot check in.")
     }
@@ -73,8 +74,11 @@ trace "language" {
             speaker = { reference_style = { explicit = 0, contextual = 1 } }
             context = { topic = "booking_AB42", established = ["asked_day"], requested = ["departure_day"], offered = ["friday"], allowed_acts = ["answer"] }
         })
+        family = var.first_expression.selection.family
+        history_family = var.first_expression.context.recent[0].family
+        first_candidate_family = var.candidate_options[0].selection.family
         procedural = var.first_expression
-        followup = expression(var.followup_intent, { speaker = var.speaker, context = var.first_expression.context })
+        followup = expression(var.followup_intent, { speaker = var.speaker, context = { established = [...var.first_expression.context.established], recent = var.first_expression.context.recent } })
         candidate_count = len(expression_candidates(var.flight_intent))
         plain_expression = express(var.followup_intent, { context = var.first_expression.context })
         action = self.input.intent == "confirm_arrival" ? "confirm_check_in" : "ask_arrival_time"

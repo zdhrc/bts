@@ -574,6 +574,9 @@ fn toolkit_materializes_through_the_dsl_with_explicit_conversation_scope() {
         assert_eq!(output["structured"]["selection"]["message"]["layout"], "current_desired");
         assert_eq!(output["slot_answer"]["text"], "Friday");
         assert!(output["slot_answer"]["context"].get("requested").is_none());
+        assert_eq!(output["family"], output["procedural"]["selection"]["family"]);
+        assert_eq!(output["history_family"], output["family"]);
+        assert_eq!(output["first_candidate_family"], "request");
         assert_eq!(output["candidate_count"], 18);
         assert_eq!(output["procedural"]["selection"]["intent"], "change_flight");
         assert!(["What about Friday?", "what about Friday?"].contains(&output["followup"]["text"].as_str().unwrap()));
