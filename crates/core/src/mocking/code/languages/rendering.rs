@@ -2071,6 +2071,7 @@ def _english_analyze(text):
     return found if found is not None else {"edit": None} if _english_lexical(words) else None
 
 def _english_vary(value, options, random):
+    if type(options) is dict and any(k not in ["negation", "condition_order", "rendering"] for k in options): return _english_style(value, options, random)
     options = _english_object(options, ["negation", "condition_order", "rendering"], {"negation": True, "condition_order": True, "rendering": {}})
     if type(options["negation"]) is not bool or type(options["condition_order"]) is not bool: raise ValueError("variation controls must be booleans")
     rendering = _english_render_options(options["rendering"])
@@ -2318,6 +2319,183 @@ def _english_text_alternatives(text, options):
             if changed != text and changed not in alternatives: alternatives.append(changed)
     if reordered is not None and reordered != text and reordered not in alternatives: alternatives.append(reordered)
     return alternatives
+
+def _english_ascii_lower(text):
+    return text.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
+
+def _english_style_options(options):
+    data = _EnglishData.data['styles']
+    options = _english_object(options, list(data['defaults']))
+    style = options.get('style')
+    if style is not None: _english_enum(style, list(data['presets']))
+    result = dict(data['presets'][style] if style is not None else data['defaults'])
+    optional = ['style', 'negation', 'condition_order', 'contractions', 'shorthand', 'casual', 'slang', 'reductions', 'fragments', 'warmth', 'soften_requests', 'punctuation', 'casing']
+    result.update({k:v for k,v in options.items() if v is not None or k not in optional})
+    for key in optional[1:-2]:
+        if type(result[key]) is not bool: raise ValueError('style controls must be booleans')
+    _english_enum(result['punctuation'], ['preserve', 'omit_period', 'exclamation', 'expressive'])
+    _english_enum(result['casing'], ['preserve', 'lowercase'])
+    result['rendering'] = _english_render_options(result['rendering'])
+    result['typos'] = _english_object(result['typos'], ['probability', 'max_errors', 'kinds'], data['defaults']['typos'])
+    for value in [result['probability'], result['typos']['probability']]:
+        if type(value) not in [int, float] or not 0 <= value <= 1: raise ValueError('invalid style probability')
+    for value in [result['max_changes'], result['typos']['max_errors']]:
+        if type(value) not in [int, float] or not 0 <= value <= 16 or value != int(value): raise ValueError('invalid style budget')
+    for kind in _english_array(result['typos']['kinds']): _english_enum(kind, ['common', 'omission', 'transposition', 'repetition'])
+    result['protected'] = list(_english_array(result['protected']))
+    if any(not _english_string(term) for term in result['protected']): raise ValueError('empty protected term')
+    alternatives = []
+    for family in _english_array(result['alternatives']):
+        family = _english_object(family, ['from', 'to'])
+        if not _english_string(family.get('from')).strip(_english_space) or not _english_array(family.get('to')) or any(not _english_string(value).strip(_english_space) for value in family['to']): raise ValueError('empty phrase alternatives')
+        alternatives.append(family)
+    result['alternatives'] = alternatives
+    return result
+
+def _english_style_protected(text, terms):
+    ranges = []
+    for term in terms:
+        ranges.extend((m.start(), m.end()) for m in _english_re.finditer(_english_re.escape(term), text))
+    quoted = None
+    for i, char in enumerate(text):
+        if quoted is not None:
+            if char == quoted[1]: ranges.append((quoted[0], i+1)); quoted = None
+        elif char in ['"', '`', '“', '‘'] or char == "'" and (i == 0 or not text[i-1].isalnum()):
+            quoted = (i, {'“':'”', '‘':'’'}.get(char, char))
+    if quoted is not None: ranges.append((quoted[0], len(text)))
+    for match in _english_re.finditer('[^' + _english_space_pattern[1:-1] + ']+', text):
+        core = match.group().rstrip('.,!?;)]')
+        if any(c.isnumeric() or c in '@/\\_-:.={}' for c in core): ranges.append((match.start(), match.end()))
+    return ranges
+
+def _english_style_case(source, replacement):
+    return replacement[:1].upper() + replacement[1:] if source[:1].isupper() and replacement and ord(replacement[0]) < 128 else replacement
+
+def _english_style_boundary(text, start, end):
+    def word(c): return ord(c) > 127 or c.isalnum() or c in "_'’-"
+    return (start == 0 or not word(text[start-1])) and (end == len(text) or not word(text[end]))
+
+def _english_style_start(text, start):
+    before = text[:start].rstrip(_english_space)
+    return not before or before[-1] in '.!?\n'
+
+def _english_style_candidates(text, options):
+    data = _EnglishData.data['styles']
+    protected = _english_style_protected(text, options['protected'])
+    edits = []
+    def push(rule, start, end, replacement, stage):
+        if text[start:end] != replacement and not any(start < b and a < end for a,b in protected):
+            edit = {'rule':rule, 'start':start, 'end':end, 'replacement':replacement, 'stage':stage}
+            if edit not in edits: edits.append(edit)
+    lower = _english_ascii_lower(text)
+    for rule in data['rules']:
+        if not options[rule['category']]: continue
+        for match in _english_re.finditer(_english_re.escape(_english_ascii_lower(rule['from'])), lower):
+            start, stop = match.span()
+            source = text[start:stop]
+            if source not in [rule['from'], _english_style_case('A', rule['from']), _english_ascii_lower(rule['from'])]: continue
+            initial = _english_style_start(text, start)
+            if not rule['from'].endswith(' ') and not _english_style_boundary(text, start, stop): continue
+            if rule['from'].endswith(' ') and not initial: continue
+            tail = text[stop:]
+            end = next((i for i,c in enumerate(tail) if c in '.?!\n'), len(tail))
+            body = tail[:end]
+            words = _english_re.findall('[^' + _english_space_pattern[1:-1] + ']+', body)
+            full = not tail.strip(_english_space) or tail.startswith(('.', '!', '?'))
+            guard = rule['guard']
+            valid = False
+            if guard == 'phrase': valid = True
+            elif guard == 'initial': valid = initial
+            elif guard == 'opening': valid = initial and (full or tail.startswith(','))
+            elif guard == 'full': valid = initial and full
+            elif guard == 'base': valid = initial and _english_predicate('will', words) and not any(w in ['if','whether'] for w in words) and (not rule['from'].endswith('going to') or not words or words[0] not in ['work','school','college','church','bed','sleep','shop','practice'])
+            elif guard == 'progressive': valid = initial and _english_predicate('am', words) and tail[end:end+1] != '?' and bool(tail) and tail[0] in 'abcdefghijklmnopqrstuvwxyz' and bool(words) and any(words[0] == v['present_participle'] for v in _EnglishData.data['verbs'].values()) and not any(w in ['not','if','and','but','or','because'] for w in words)
+            elif guard == 'request': valid = initial and bool(words) and tail[end:end+1] == '.' and not any(c in body for c in ',;:') and not any(w in ['if','and','or','not'] for w in words)
+            elif guard.startswith('aux:'): valid = initial and _english_predicate(guard[4:], words)
+            if not valid: continue
+            replacement = _english_style_case(source, rule['to'])
+            if guard == 'progressive': replacement = text[stop:stop+1].upper(); stop += 1
+            if guard == 'request': replacement += body + '?'; stop += end + 1
+            push(rule['id'], start, stop, replacement, rule['stage'])
+    if options['negation']:
+        for match in _english_re.finditer(r'[^.?!\n]*[.?!\n]|[^.?!\n]+$', text):
+            sentence = match.group()
+            analysis = _english_analyze(sentence)
+            if analysis is not None and analysis['edit'] is not None:
+                a,b,replacement = analysis['edit']
+                if "'" in replacement: push('negation:contract', match.start()+a, match.start()+b, replacement, 0)
+    if options['condition_order']:
+        for alternative in _english_text_alternatives(text, {'negation':False, 'condition_order':True}): push('condition:order', 0, len(text), alternative, 0)
+    for index, family in enumerate(options['alternatives']):
+        for match in _english_re.finditer(_english_re.escape(family['from']), text):
+            start, end = match.span()
+            if _english_style_boundary(text, start, end):
+                for choice, replacement in enumerate(family['to']): push(f'authored:{index}:{choice}', start, end, replacement, 1)
+    end = len(text.rstrip(_english_space))
+    if end:
+        mark, before = text[end-1:end], text[:end-1]
+        words = _english_re.findall('[^' + _english_space_pattern[1:-1] + ']+', before)
+        last = words[-1] if words else ''
+        terminal = mark == '.' and bool(last) and '.' not in last and _english_ascii_lower(last) not in data['abbreviations']
+        punctuation = options['punctuation']
+        if punctuation == 'omit_period' and terminal: push('punctuation:omit_period', end-1, end, '', 3)
+        elif punctuation == 'exclamation' and terminal: push('punctuation:exclamation', end-1, end, '!', 3)
+        elif punctuation == 'expressive' and (terminal or mark == '!' and not before.endswith('!')): push('punctuation:expressive', end-1, end, '!!', 3)
+    if options['casing'] == 'lowercase':
+        for pronoun in data['contractions']:
+            for match in _english_re.finditer(_english_re.escape(pronoun), text):
+                if _english_style_boundary(text, *match.span()): push('casing:lowercase', match.start(), match.end(), _english_ascii_lower(pronoun), 3)
+    for match in _english_re.finditer(r'[A-Za-z]+', text):
+        start,end = match.span()
+        word, lower = match.group(), _english_ascii_lower(match.group())
+        if lower not in data['words'] and lower not in data['case_words'] or not _english_style_boundary(text, start, end): continue
+        if options['casing'] == 'lowercase': push('casing:lowercase', start, end, lower, 3)
+        if lower not in data['words'] or word == 'could' or len(word) < 5 or word != lower or options['typos']['probability'] == 0: continue
+        for kind in options['typos']['kinds']:
+            replacement = None
+            if kind == 'common': replacement = next((b for a,b in data['typos'] if a == word), None)
+            elif kind == 'omission': replacement = word[:2] + word[3:]
+            elif kind == 'transposition' and word[1] != word[2]: replacement = word[:1] + word[2] + word[1] + word[3:]
+            elif kind == 'repetition': replacement = word[:2] + word[1] + word[2:]
+            if replacement is not None and replacement not in data['words'] and not any(replacement in v.values() for v in _EnglishData.data['verbs'].values()): push('typo:'+kind, start, end, replacement, 4)
+    return sorted(edits, key=lambda e:(e['stage'],e['start'],e['rule'],e['replacement']))
+
+def _english_style(value, options, random, details=False):
+    options = _english_style_options(options)
+    if type(value) is str: text = value
+    else:
+        sentence = _english_sentence(value)
+        text = _english_render(sentence, options['rendering'])
+        for clause in [sentence['clause']] + ([sentence['condition']] if sentence.get('condition') is not None else []):
+            subject = clause['subject']['text']
+            if _english_ascii_lower(subject) not in ['i','you','he','she','it','we','they']:
+                options['protected'] += [subject, _english_style_case('A', subject)]
+    budget, edits, gate = int(options['max_changes']), [], None
+    for stage in range(5):
+        if budget == 0: break
+        candidates = [e for e in _english_style_candidates(text, options) if e['stage'] == stage]
+        if not candidates: continue
+        limit = budget
+        if stage < 4:
+            if gate is None: gate = options['probability'] == 1 or options['probability'] > 0 and random() < options['probability']
+            if not gate: continue
+        else:
+            limit = min(budget, int(options['typos']['max_errors']))
+            probability = options['typos']['probability']
+            if limit == 0 or probability == 0 or probability < 1 and random() >= probability: continue
+        for _ in range(limit):
+            if not candidates: break
+            index = 0 if len(candidates) == 1 else min(len(candidates)-1, int(random()*len(candidates)))
+            edit = candidates.pop(index)
+            start,end,replacement = edit['start'],edit['end'],edit['replacement']
+            candidates = [e for e in candidates if not (start < e['end'] and e['start'] < end)]
+            difference = len(replacement) - (end-start)
+            for other in candidates:
+                if other['start'] >= end: other['start'] += difference; other['end'] += difference
+            edits.append({'rule':edit['rule'],'range':{'start':len(text[:start].encode('utf-8')),'end':len(text[:end].encode('utf-8'))},'replacement':replacement,'stage':edit['stage']})
+            text = text[:start] + replacement + text[end:]
+            budget -= 1
+    return {'text':text,'edits':edits} if details else text
 "#;
 
 const TS_ENGLISH: &str = r#"const _englishSpace = "[\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
@@ -2518,6 +2696,7 @@ function _englishAnalyze(text: string): any {
     return found ?? (_englishLexical(words) ? {edit: null} : null);
 }
 function _englishVary(value: any, options: any, random: () => number): string {
+    if (options !== null && typeof options === "object" && !Array.isArray(options) && Object.keys(options).some(k => !["negation", "condition_order", "rendering"].includes(k))) return _englishStyle(value, options, random);
     options = _englishObject(options, ["negation", "condition_order", "rendering"], {negation: true, condition_order: true, rendering: {}});
     if (typeof options.negation !== "boolean" || typeof options.condition_order !== "boolean") throw new Error("variation controls must be booleans");
     const rendering = _englishRenderOptions(options.rendering);
@@ -2745,6 +2924,197 @@ function _englishTextAlternatives(text: string, options: any): string[] {
     }
     if (reordered !== null && reordered !== text && !alternatives.includes(reordered)) alternatives.push(reordered);
     return alternatives;
+}
+
+function _englishAsciiLower(text: string): string { return text.replace(/[A-Z]/g, c => c.toLowerCase()); }
+function _englishStyleOptions(value: any): any {
+    const data = _englishData.styles;
+    const options = _englishObject(value, Object.keys(data.defaults));
+    if (options.style != null) _englishEnum(options.style, Object.keys(data.presets));
+    const result = {...(options.style != null ? data.presets[options.style] : data.defaults)};
+    const optional = ['style','negation','condition_order','contractions','shorthand','casual','slang','reductions','fragments','warmth','soften_requests','punctuation','casing'];
+    for (const [key, value] of Object.entries(options)) if (value !== null || !optional.includes(key)) result[key] = value;
+    for (const key of optional.slice(1,-2)) if (typeof result[key] !== 'boolean') throw new Error('style controls must be booleans');
+    _englishEnum(result.punctuation, ['preserve','omit_period','exclamation','expressive']);
+    _englishEnum(result.casing, ['preserve','lowercase']);
+    result.rendering = _englishRenderOptions(result.rendering);
+    result.typos = _englishObject(result.typos, ['probability','max_errors','kinds'], data.defaults.typos);
+    for (const value of [result.probability,result.typos.probability]) if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) throw new Error('invalid style probability');
+    for (const value of [result.max_changes,result.typos.max_errors]) if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 16) throw new Error('invalid style budget');
+    for (const kind of _englishArray(result.typos.kinds)) _englishEnum(kind, ['common','omission','transposition','repetition']);
+    result.protected = [..._englishArray(result.protected)];
+    if (result.protected.some((term: any) => !_englishString(term))) throw new Error('empty protected term');
+    result.alternatives = _englishArray(result.alternatives).map((family: any) => {
+        family = _englishObject(family, ['from','to']);
+        if (!_englishTrim(_englishString(family.from)) || !_englishArray(family.to).length || family.to.some((s: any) => !_englishTrim(_englishString(s)))) throw new Error('empty phrase alternatives');
+        return family;
+    });
+    return result;
+}
+function _englishStyleProtected(text: string, terms: string[]): [number,number][] {
+    const ranges: [number,number][] = [];
+    for (const term of terms) {
+        let start = text.indexOf(term);
+        while (start >= 0) { ranges.push([start,start+term.length]); start = text.indexOf(term,start+term.length); }
+    }
+    let quoted: [number,string] | null = null;
+    for (let i=0; i<text.length;) {
+        const char = String.fromCodePoint(text.codePointAt(i)!);
+        if (quoted !== null) { if (char === quoted[1]) { ranges.push([quoted[0],i+char.length]); quoted = null; } }
+        else if (['"','`','“','‘'].includes(char) || char === "'" && (i === 0 || !/[\p{L}\p{N}]/u.test([...text.slice(0,i)].at(-1)!))) {
+            quoted = [i,char === '“' ? '”' : char === '‘' ? '’' : char];
+        }
+        i += char.length;
+    }
+    if (quoted !== null) ranges.push([quoted[0],text.length]);
+    for (const match of text.matchAll(new RegExp('[^'+_englishSpace.slice(1,-1)+']+', 'gu'))) {
+        const core = match[0].replace(/[.,!?;)\]]+$/u, '');
+        if (/[\p{N}@/\\_\-:.={}]/u.test(core)) ranges.push([match.index!,match.index!+match[0].length]);
+    }
+    return ranges;
+}
+function _englishStyleCase(source: string, replacement: string): string {
+    return source && /\p{Lu}/u.test([...source][0]) && replacement && replacement.charCodeAt(0) < 128 ? replacement[0].toUpperCase()+replacement.slice(1) : replacement;
+}
+function _englishStyleBoundary(text: string, start: number, end: number): boolean {
+    const word = (c: string) => c.codePointAt(0)! > 127 || /[\p{L}\p{N}_'’\-]/u.test(c);
+    return (start === 0 || !word([...text.slice(0,start)].at(-1)!)) && (end === text.length || !word([...text.slice(end)][0]));
+}
+function _englishStyleStart(text: string, start: number): boolean {
+    const before = _englishTrimEnd(text.slice(0,start));
+    return !before || '.!?\n'.includes(before.at(-1)!);
+}
+function _englishStyleCandidates(text: string, options: any): any[] {
+    const data = _englishData.styles, protectedRanges = _englishStyleProtected(text, options.protected), edits: any[] = [];
+    const push = (rule: string, start: number, end: number, replacement: string, stage: number) => {
+        if (text.slice(start,end) !== replacement && !protectedRanges.some(([a,b]) => start < b && a < end)) {
+            const edit = {rule,start,end,replacement,stage};
+            if (!edits.some(e => e.rule === rule && e.start === start && e.end === end && e.replacement === replacement && e.stage === stage)) edits.push(edit);
+        }
+    };
+    const lower = _englishAsciiLower(text);
+    for (const rule of data.rules) {
+        if (!options[rule.category]) continue;
+        let cursor = 0;
+        while (cursor <= text.length) {
+            const start = lower.indexOf(_englishAsciiLower(rule.from),cursor);
+            if (start < 0) break;
+            let stop = start+rule.from.length;
+            cursor = stop;
+            const source = text.slice(start,stop);
+            if (![rule.from,_englishStyleCase('A',rule.from),_englishAsciiLower(rule.from)].includes(source)) continue;
+            const initial = _englishStyleStart(text,start);
+            if (!rule.from.endsWith(' ') && !_englishStyleBoundary(text,start,stop) || rule.from.endsWith(' ') && !initial) continue;
+            const tail = text.slice(stop), found = tail.search(/[.?!\n]/), end = found < 0 ? tail.length : found, body = tail.slice(0,end);
+            const words: string[] = body.match(new RegExp('[^'+_englishSpace.slice(1,-1)+']+', 'gu')) ?? [];
+            const full = !_englishTrim(tail) || /^[.!?]/.test(tail), guard = rule.guard;
+            let valid = false;
+            if (guard === 'phrase') valid = true;
+            else if (guard === 'initial') valid = initial;
+            else if (guard === 'opening') valid = initial && (full || tail.startsWith(','));
+            else if (guard === 'full') valid = initial && full;
+            else if (guard === 'base') valid = initial && _englishPredicate('will',words) && !words.some(w => ['if','whether'].includes(w)) && (!rule.from.endsWith('going to') || !['work','school','college','church','bed','sleep','shop','practice'].includes(words[0]));
+            else if (guard === 'progressive') valid = initial && _englishPredicate('am',words) && tail[end] !== '?' && /^[a-z]/.test(tail) && words.length > 0 && Object.values(_englishData.verbs).some((v: any) => words[0] === v.present_participle) && !words.some(w => ['not','if','and','but','or','because'].includes(w));
+            else if (guard === 'request') valid = initial && words.length > 0 && tail[end] === '.' && !/[,;:]/.test(body) && !words.some(w => ['if','and','or','not'].includes(w));
+            else if (guard.startsWith('aux:')) valid = initial && _englishPredicate(guard.slice(4),words);
+            if (!valid) continue;
+            let replacement = _englishStyleCase(source,rule.to);
+            if (guard === 'progressive') { replacement = text[stop].toUpperCase(); stop++; }
+            if (guard === 'request') { replacement += body+'?'; stop += end+1; }
+            push(rule.id,start,stop,replacement,rule.stage);
+        }
+    }
+    if (options.negation) {
+        for (const match of text.matchAll(/[^.?!\n]*[.?!\n]|[^.?!\n]+$/g)) {
+            const analysis = _englishAnalyze(match[0]);
+            if (analysis?.edit) {
+                const [a,b,replacement] = analysis.edit;
+                if (replacement.includes("'")) push('negation:contract',match.index!+a,match.index!+b,replacement,0);
+            }
+        }
+    }
+    if (options.condition_order) for (const alternative of _englishTextAlternatives(text,{negation:false,condition_order:true})) push('condition:order',0,text.length,alternative,0);
+    options.alternatives.forEach((family: any,index: number) => {
+        let start = text.indexOf(family.from);
+        while (start >= 0) {
+            const end = start+family.from.length;
+            if (_englishStyleBoundary(text,start,end)) family.to.forEach((replacement: string,choice: number) => push(`authored:${index}:${choice}`,start,end,replacement,1));
+            start = text.indexOf(family.from,end);
+        }
+    });
+    const end = _englishTrimEnd(text).length;
+    if (end) {
+        const mark = text[end-1], before = text.slice(0,end-1), words = before.match(new RegExp('[^'+_englishSpace.slice(1,-1)+']+', 'gu')) ?? [], last = words.at(-1) ?? '';
+        const terminal = mark === '.' && !!last && !last.includes('.') && !data.abbreviations.includes(_englishAsciiLower(last));
+        if (options.punctuation === 'omit_period' && terminal) push('punctuation:omit_period',end-1,end,'',3);
+        else if (options.punctuation === 'exclamation' && terminal) push('punctuation:exclamation',end-1,end,'!',3);
+        else if (options.punctuation === 'expressive' && (terminal || mark === '!' && !before.endsWith('!'))) push('punctuation:expressive',end-1,end,'!!',3);
+    }
+    if (options.casing === 'lowercase') for (const pronoun of data.contractions) {
+        let start = text.indexOf(pronoun);
+        while (start >= 0) {
+            const end = start+pronoun.length;
+            if (_englishStyleBoundary(text,start,end)) push('casing:lowercase',start,end,_englishAsciiLower(pronoun),3);
+            start = text.indexOf(pronoun,end);
+        }
+    }
+    for (const match of text.matchAll(/[A-Za-z]+/g)) {
+        const start = match.index!, end = start+match[0].length, word = match[0], lower = _englishAsciiLower(word);
+        if (!(data.words.includes(lower) || data.case_words.includes(lower)) || !_englishStyleBoundary(text,start,end)) continue;
+        if (options.casing === 'lowercase') push('casing:lowercase',start,end,lower,3);
+        if (!data.words.includes(lower) || word === 'could' || word.length < 5 || word !== lower || options.typos.probability === 0) continue;
+        for (const kind of options.typos.kinds) {
+            let replacement: string | undefined;
+            if (kind === 'common') replacement = data.typos.find(([a,b]: string[]) => a === word)?.[1];
+            else if (kind === 'omission') replacement = word.slice(0,2)+word.slice(3);
+            else if (kind === 'transposition' && word[1] !== word[2]) replacement = word[0]+word[2]+word[1]+word.slice(3);
+            else if (kind === 'repetition') replacement = word.slice(0,2)+word[1]+word.slice(2);
+            if (replacement !== undefined && !data.words.includes(replacement) && !Object.values(_englishData.verbs).some((v: any) => Object.values(v).includes(replacement))) push('typo:'+kind,start,end,replacement,4);
+        }
+    }
+    const compare = (a: string,b: string) => a < b ? -1 : a > b ? 1 : 0;
+    return edits.sort((a,b) => a.stage-b.stage || a.start-b.start || compare(a.rule,b.rule) || compare(a.replacement,b.replacement));
+}
+function _englishStyle(value: any, supplied: any, random: () => number, details = false): any {
+    const options = _englishStyleOptions(supplied);
+    let text: string;
+    if (typeof value === 'string') text = value;
+    else {
+        const sentence = _englishSentence(value);
+        text = _englishRender(sentence,options.rendering);
+        for (const clause of [sentence.clause,...(sentence.condition != null ? [sentence.condition] : [])]) {
+            const subject = clause.subject.text;
+            if (!['i','you','he','she','it','we','they'].includes(_englishAsciiLower(subject))) options.protected.push(subject,_englishStyleCase('A',subject));
+        }
+    }
+    const edits: any[] = [];
+    let budget = options.max_changes, gate: boolean | null = null;
+    for (let stage=0; stage<=4; stage++) {
+        if (!budget) break;
+        let candidates = _englishStyleCandidates(text,options).filter(e => e.stage === stage);
+        if (!candidates.length) continue;
+        let limit = budget;
+        if (stage < 4) {
+            if (gate === null) gate = options.probability === 1 || options.probability > 0 && random() < options.probability;
+            if (!gate) continue;
+        } else {
+            limit = Math.min(budget,options.typos.max_errors);
+            const probability = options.typos.probability;
+            if (!limit || probability === 0 || probability < 1 && random() >= probability) continue;
+        }
+        for (let i=0; i<limit; i++) {
+            if (!candidates.length) break;
+            const index = candidates.length === 1 ? 0 : Math.min(candidates.length-1,Math.floor(random()*candidates.length));
+            const edit = candidates.splice(index,1)[0], {start,end,replacement} = edit;
+            candidates = candidates.filter(e => !(start < e.end && e.start < end));
+            const difference = replacement.length-(end-start);
+            for (const other of candidates) if (other.start >= end) {other.start += difference; other.end += difference;}
+            edits.push({rule:edit.rule,range:{start:new TextEncoder().encode(text.slice(0,start)).length,end:new TextEncoder().encode(text.slice(0,end)).length},replacement,stage:edit.stage});
+            text = text.slice(0,start)+replacement+text.slice(end);
+            budget--;
+        }
+    }
+    return details ? {text,edits} : text;
 }
 "#;
 

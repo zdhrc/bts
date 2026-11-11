@@ -35,7 +35,9 @@ pub use formatting::{
 pub use model::*;
 pub use realization::realize;
 pub use variation::{
-    Variation, VariationOptions, applicable_variations, apply_variation, text_alternatives, vary, vary_sentence,
+    CasingStyle, PhraseAlternatives, PunctuationStyle, Style, StyleEdit, StyleOptions, StyleResult, TypoKind, TypoOptions,
+    Variation, VariationOptions, applicable_variations, apply_variation, style_edits, text_alternatives, vary, vary_sentence,
+    vary_sentence_styled, vary_styled,
 };
 
 pub(crate) fn runtime_data() -> serde_json::Value {
@@ -43,5 +45,5 @@ pub(crate) fn runtime_data() -> serde_json::Value {
         .iter()
         .map(|verb| (verb.base.clone(), serde_json::to_value(verb).expect("packaged verb forms")))
         .collect();
-    serde_json::json!({"verbs": verbs, "negations": negation::FORMS})
+    serde_json::json!({"verbs": verbs, "negations": negation::FORMS, "styles": variation::style_data()})
 }

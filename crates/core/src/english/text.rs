@@ -39,6 +39,50 @@ pub fn inflect_noun(noun: &str, number: Number) -> Result<String, Error> {
     Ok(pluralizer::pluralize(noun, count, false))
 }
 
+// Explicit terms, quotations and code-like tokens are opaque to style edits.
+pub(crate) fn protected_ranges(text: &str, terms: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    for term in terms.iter().filter(|term| !term.is_empty()) {
+        ranges.extend(text.match_indices(term).map(|(start, _)| start..start + term.len()));
+    }
+    let mut quoted = None;
+    for (index, c) in text.char_indices() {
+        if let Some((start, close)) = quoted {
+            if c == close {
+                ranges.push(start..index + c.len_utf8());
+                quoted = None;
+            }
+        } else if matches!(c, '"' | '`' | '“' | '‘')
+            || c == '\'' && text[..index].chars().next_back().is_none_or(|p| !p.is_alphanumeric())
+        {
+            quoted = Some((
+                index,
+                match c {
+                    '“' => '”',
+                    '‘' => '’',
+                    _ => c,
+                },
+            ));
+        }
+    }
+    if let Some((start, _)) = quoted {
+        ranges.push(start..text.len());
+    }
+    let mut offset = 0;
+    for token in text.split_whitespace() {
+        let start = offset + text[offset..].find(token).unwrap();
+        let core = token.trim_end_matches(['.', ',', '!', '?', ';', ')', ']']);
+        if core
+            .chars()
+            .any(|c| c.is_numeric() || matches!(c, '@' | '/' | '\\' | '_' | '-' | ':' | '.' | '=' | '{' | '}'))
+        {
+            ranges.push(start..start + token.len());
+        }
+        offset = start + token.len();
+    }
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

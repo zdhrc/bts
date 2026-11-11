@@ -1554,6 +1554,21 @@ fn run_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue]
                 .map_err(english_error_message)
         }
         Vary => {
+            if args.get(1).and_then(InputValue::as_object).is_some_and(|english_options| {
+                english_options
+                    .keys()
+                    .any(|key| !["negation", "condition_order", "rendering"].contains(&key.as_str()))
+            }) {
+                let english_options: english::StyleOptions = english_options(args.get(1))?;
+                let result = if let Some(text) = args[0].as_str() {
+                    english::vary_styled(text, &english_options, rng)
+                } else {
+                    english::vary_sentence_styled(&decode_english(&args[0])?, &english_options, rng)
+                };
+                return result
+                    .map(|result| InputValue::String(result.text))
+                    .map_err(english_error_message);
+            }
             let english_options: EnglishVaryOptions = english_options(args.get(1))?;
             let variation = VariationOptions {
                 negation: english_options.negation,

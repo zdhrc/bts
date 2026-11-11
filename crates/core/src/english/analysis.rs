@@ -409,6 +409,11 @@ fn safe_word(word: &str) -> bool {
         )
 }
 
+// Style rules ask for the same bounded predicate evidence as prose analysis.
+pub(crate) fn style_predicate(auxiliary: &str, body: &str) -> bool {
+    predicate(auxiliary, &tokens(body, 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

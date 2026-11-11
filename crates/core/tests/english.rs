@@ -1083,6 +1083,21 @@ mod parity {
                 json!([value, options]),
             ));
         }
+        cases.push(Case::valid(
+            "style contraction",
+            "vary",
+            json!(["I will check the file.", {"style":"conversational"}]),
+        ));
+        cases.push(Case::valid(
+            "style protected phrase",
+            "vary",
+            json!(["Élodie, please send the message.", {"style":"text_message","protected":["Élodie"]}]),
+        ));
+        cases.push(Case::valid(
+            "controlled typo",
+            "vary",
+            json!(["please", {"typos":{"probability":1,"kinds":["common"]}}]),
+        ));
         cases
     }
 
@@ -1268,4 +1283,267 @@ console.log(JSON.stringify(results));
             assert!(mismatches.is_empty(), "{}", mismatches.join("\n\n"));
         }
     }
+}
+
+fn styled(text: &str, options: serde_json::Value) -> StyleResult {
+    let options: StyleOptions = serde_json::from_value(options).unwrap();
+    vary_styled(text, &options, &mut Xoshiro256PlusPlus::seed_from_u64(42)).unwrap()
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn style_features_have_concrete_outputs_and_explanations() {
+    use serde_json::json;
+    for (source, controls, expected) in [
+        ("I will check the file.", json!({"contractions":true}), "I'll check the file."),
+        (
+            "We have received the file.",
+            json!({"contractions":true}),
+            "We've received the file.",
+        ),
+        (
+            "She has received the file.",
+            json!({"contractions":true}),
+            "She's received the file.",
+        ),
+        (
+            "I had checked the file.",
+            json!({"contractions":true}),
+            "I'd checked the file.",
+        ),
+        (
+            "By the way, the file is ready.",
+            json!({"shorthand":true}),
+            "Btw, the file is ready.",
+        ),
+        ("Thank you for the update.", json!({"casual":true}), "Thanks for the update."),
+        ("Understood.", json!({"casual":true}), "Got it."),
+        ("See you later.", json!({"slang":true}), "Catch you later."),
+        (
+            "I am going to check the file.",
+            json!({"reductions":true}),
+            "I am gonna check the file.",
+        ),
+        (
+            "I want to check the file.",
+            json!({"reductions":true}),
+            "I wanna check the file.",
+        ),
+        ("I am checking the file.", json!({"fragments":true}), "Checking the file."),
+        ("Thanks.", json!({"warmth":true}), "Thanks so much."),
+        ("Send the file.", json!({"soften_requests":true}), "Could you send the file?"),
+        (
+            "Please share the file.",
+            json!({"soften_requests":true}),
+            "Could you please share the file?",
+        ),
+        ("Thanks.", json!({"punctuation":"omit_period"}), "Thanks"),
+        ("Thanks.", json!({"punctuation":"exclamation"}), "Thanks!"),
+        ("Thanks!", json!({"punctuation":"expressive"}), "Thanks!!"),
+        (
+            "I'll check with Maya.",
+            json!({"casing":"lowercase"}),
+            "i'll check with Maya.",
+        ),
+        ("please", json!({"typos":{"probability":1,"kinds":["common"]}}), "plese"),
+        ("please", json!({"typos":{"probability":1,"kinds":["omission"]}}), "plase"),
+        (
+            "please",
+            json!({"typos":{"probability":1,"kinds":["transposition"]}}),
+            "pelase",
+        ),
+        ("please", json!({"typos":{"probability":1,"kinds":["repetition"]}}), "pllease"),
+    ] {
+        let result = styled(source, controls);
+        assert_eq!(result.text, expected, "{source}");
+        assert_eq!(result.edits.len(), 1, "{source}");
+        let edit = &result.edits[0];
+        let mut replay = source.to_owned();
+        replay.replace_range(edit.range.clone(), &edit.replacement);
+        assert_eq!(replay, expected);
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn styles_preserve_ambiguous_grammar_protected_text_and_questions() {
+    use serde_json::json;
+    for (text, options) in [
+        ("I am going to London.", json!({"reductions":true})),
+        ("I have a file.", json!({"contractions":true})),
+        ("I'd check the file.", json!({"contractions":true})),
+        ("I am not checking the file.", json!({"fragments":true,"negation":false})),
+        ("I am checking the file?", json!({"fragments":true})),
+        ("I am checking if the file exists.", json!({"fragments":true})),
+        ("I will thank you tomorrow.", json!({"casual":true})),
+        ("I am.", json!({"contractions":true})),
+        ("Yes?", json!({"punctuation":"expressive"})),
+        ("Wait...", json!({"punctuation":"omit_period"})),
+        ("Ask Dr.", json!({"punctuation":"omit_period"})),
+        ("version_1.2", json!({"punctuation":"exclamation","casing":"lowercase"})),
+        (
+            "https://example.com/thanks.",
+            json!({"punctuation":"omit_period","casual":true}),
+        ),
+        (
+            "\"Thank you.\" `please` ‘thanks’",
+            json!({"casual":true,"typos":{"probability":1}}),
+        ),
+        ("'Thank you.'", json!({"casual":true})),
+        ("checking@example.com please_42 please-id", json!({"typos":{"probability":1}})),
+        ("please", json!({"protected":["please"],"typos":{"probability":1}})),
+        (
+            "Maya Élodie 李雷 👩‍💻 café e\u{301}",
+            json!({"style":"text_message","typos":{"probability":1}}),
+        ),
+        ("cannot must not never 12345", json!({"typos":{"probability":1}})),
+        ("Thanks.", json!({"style":"enthusiastic","max_changes":0})),
+    ] {
+        assert_eq!(styled(text, options).text, text);
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn style_presets_overrides_and_authored_alternatives_are_explicit() {
+    use serde_json::json;
+    for style in [
+        Style::Neutral,
+        Style::Professional,
+        Style::Conversational,
+        Style::Warm,
+        Style::Terse,
+        Style::TextMessage,
+        Style::Enthusiastic,
+        Style::InformalChat,
+    ] {
+        let resolved = StyleOptions {
+            style: Some(style),
+            ..StyleOptions::default()
+        }
+        .resolved()
+        .unwrap();
+        assert_eq!(resolved.typos.probability, 0.0);
+        assert_eq!(resolved.soften_requests, Some(false));
+    }
+    assert_eq!(
+        styled(
+            "I will check the file.",
+            json!({"style":"conversational","contractions":false})
+        )
+        .text,
+        "I will check the file."
+    );
+    assert_eq!(
+        styled("Thanks.", json!({"style":"enthusiastic","warmth":false})).text,
+        "Thanks!"
+    );
+    assert_eq!(
+        styled(
+            "I will check.",
+            json!({"style":"neutral","alternatives":[{"from":"I will check","to":["I will check right away"]}]})
+        )
+        .text,
+        "I will check right away."
+    );
+    assert_eq!(
+        styled("Thanks.", json!({"style":"warm","max_changes":8})).text,
+        "Thanks so much."
+    );
+    let options: StyleOptions = serde_json::from_value(json!({"style":"text_message","max_changes":16})).unwrap();
+    let candidates = style_edits("I am checking the file. Thank you.", &options).unwrap();
+    assert!(candidates.iter().any(|edit| edit.rule.starts_with("fragments:")));
+    assert!(candidates.iter().any(|edit| edit.rule.starts_with("contractions:")));
+    for seed in 0..32 {
+        let source = "I am checking the file. Thank you.";
+        let result = vary_styled(source, &options, &mut Xoshiro256PlusPlus::seed_from_u64(seed)).unwrap();
+        assert!(!result.text.contains("I'm Checking"));
+        let mut replay = source.to_owned();
+        for edit in &result.edits {
+            replay.replace_range(edit.range.clone(), &edit.replacement);
+        }
+        assert_eq!(replay, result.text);
+        assert!(result.edits.len() <= 16);
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn style_probabilities_budgets_and_rng_are_bounded() {
+    use rand::Rng;
+    use serde_json::json;
+    let source = "please send the message tomorrow";
+    let options: StyleOptions =
+        serde_json::from_value(json!({"probability":0,"typos":{"probability":1,"max_errors":2},"max_changes":1})).unwrap();
+    let result = vary_styled(source, &options, &mut Xoshiro256PlusPlus::seed_from_u64(0)).unwrap();
+    assert_eq!(result.edits.len(), 1);
+    assert!(result.edits[0].rule.starts_with("typo:"));
+    for options in [
+        json!({"max_changes":0}),
+        json!({"casual":true,"probability":0}),
+        json!({"style":"neutral"}),
+    ] {
+        let options: StyleOptions = serde_json::from_value(options).unwrap();
+        let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
+        let mut original = rng.clone();
+        let result = vary_styled("Thank you.", &options, &mut rng).unwrap();
+        assert_eq!(result.text, "Thank you.");
+        assert_eq!(rng.random::<u64>(), original.random::<u64>());
+    }
+    let options: StyleOptions = serde_json::from_value(json!({"casual":true,"probability":0.5})).unwrap();
+    let outputs: Vec<_> = (0..128)
+        .map(|seed| {
+            vary_styled("Thank you.", &options, &mut Xoshiro256PlusPlus::seed_from_u64(seed))
+                .unwrap()
+                .text
+        })
+        .collect();
+    assert!(outputs.iter().any(|s| s == "Thanks."));
+    assert!(outputs.iter().any(|s| s == "Thank you."));
+    for options in [
+        json!({"probability":-1}),
+        json!({"max_changes":17}),
+        json!({"typos":{"probability":2}}),
+        json!({"protected":[""]}),
+        json!({"alternatives":[{"from":"x","to":[]}]}),
+    ] {
+        let parsed = serde_json::from_value::<StyleOptions>(options);
+        assert!(parsed.is_err() || parsed.unwrap().resolved().is_err());
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn structured_styles_keep_authored_references_opaque() {
+    use serde_json::json;
+    let sentence: Sentence = serde_json::from_value(
+        json!({"clause":{"subject":{"text":"Please"},"predicate":{"verb":"check","complement":"the file"}}}),
+    )
+    .unwrap();
+    let options: StyleOptions =
+        serde_json::from_value(json!({"style":"text_message","typos":{"probability":1},"max_changes":16})).unwrap();
+    let result = vary_sentence_styled(&sentence, &options, &mut Xoshiro256PlusPlus::seed_from_u64(42)).unwrap();
+    assert!(result.text.starts_with("Please checks"));
+    let mut unicode = sentence.clone();
+    unicode.clause.subject.text = "Élodie".into();
+    assert!(
+        vary_sentence_styled(&unicode, &options, &mut Xoshiro256PlusPlus::seed_from_u64(42))
+            .unwrap()
+            .text
+            .starts_with("Élodie checks")
+    );
+    let sentence: Sentence = serde_json::from_value(json!({"clause":{"subject":{"text":"I","person":"first"},"predicate":{"verb":"check","complement":"the file"},"aspect":"progressive"}})).unwrap();
+    assert_eq!(
+        vary_sentence_styled(
+            &sentence,
+            &StyleOptions {
+                fragments: Some(true),
+                ..StyleOptions::default()
+            },
+            &mut Xoshiro256PlusPlus::seed_from_u64(42)
+        )
+        .unwrap()
+        .text,
+        "Checking the file."
+    );
 }
