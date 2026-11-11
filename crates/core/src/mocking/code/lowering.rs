@@ -5069,6 +5069,197 @@ pub(crate) mod scoring {
                 Value::Attachment { .. } => return Err(Error::Unsupported { what: "`attachment`" }),
             })
         }
+        // keep authored numeric types until render or sample has checked them
+        fn language_value(&mut self, value: &Value) -> Result<Expr, Error> {
+            self.helpers.insert(Helper::Language);
+            Ok(match value {
+                Value::Num(Number::Float(value)) => Expr::call("_language_float", vec![Expr::Number(format!("{value:?}"))]),
+                Value::Object(object) => Expr::Object(
+                    object
+                        .elem
+                        .iter()
+                        .map(|field| Ok((field.key.clone(), self.language_value(&field.value)?)))
+                        .collect::<Result<_, Error>>()?,
+                ),
+                Value::Array(array) => Expr::Array(
+                    array
+                        .elem
+                        .iter()
+                        .map(|item| match item {
+                            ArrayElem::Item(value) => self.language_value(value),
+                            ArrayElem::Spread(value) => self.language_value(value).map(|value| Expr::Spread(Box::new(value))),
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                Value::Cond { cond, then, otherwise } => Expr::Conditional {
+                    condition: Box::new(self.lower(cond)?),
+                    yes: Box::new(self.language_value(then)?),
+                    no: Box::new(self.language_value(otherwise)?),
+                },
+                Value::Index { target, index, .. } => self.language_value(target)?.index(self.lower(index)?),
+                Value::Slice { target, start, end, .. } => Expr::Slice {
+                    value: Box::new(self.language_value(target)?),
+                    start: start.as_deref().map(|value| self.lower(value).map(Box::new)).transpose()?,
+                    end: end.as_deref().map(|value| self.lower(value).map(Box::new)).transpose()?,
+                },
+                Value::Unary {
+                    op: crate::dsl::UnaryOp::Neg,
+                    operand,
+                    ..
+                } => Expr::call(
+                    "_language_math",
+                    vec![Expr::string("neg"), Expr::Array(vec![self.language_value(operand)?])],
+                ),
+                Value::Binary { op, lhs, rhs, .. }
+                    if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) =>
+                {
+                    let op = match op {
+                        BinOp::Add => "+",
+                        BinOp::Sub => "-",
+                        BinOp::Mul => "*",
+                        BinOp::Div => "/",
+                        _ => "%",
+                    };
+                    Expr::call(
+                        "_language_math",
+                        vec![
+                            Expr::string(op),
+                            Expr::Array(vec![self.language_value(lhs)?, self.language_value(rhs)?]),
+                        ],
+                    )
+                }
+                Value::Func {
+                    func: Func::Choice(options),
+                    ..
+                } => {
+                    let values = Expr::Array(
+                        options
+                            .iter()
+                            .map(|value| self.language_value(value))
+                            .collect::<Result<_, _>>()?,
+                    );
+                    if self.lang == ScorerLang::Python {
+                        self.imports.insert("random");
+                        Expr::call(Expr::from("random").member("choice"), vec![values])
+                    } else {
+                        self.need(Helper::Choice);
+                        Expr::call("choice", vec![values])
+                    }
+                }
+                Value::Func {
+                    func: Func::Weighted(options),
+                    ..
+                } => {
+                    if self.lang == ScorerLang::Python {
+                        self.imports.insert("random");
+                        Expr::Call {
+                            function: Box::new(Expr::from("random").member("choices")),
+                            args: vec![Expr::Array(
+                                options
+                                    .iter()
+                                    .map(|option| self.language_value(&option.value))
+                                    .collect::<Result<_, _>>()?,
+                            )],
+                            keywords: vec![(
+                                "weights".into(),
+                                Expr::Array(
+                                    options
+                                        .iter()
+                                        .map(|option| Expr::Number(format!("{:?}", option.weight)))
+                                        .collect(),
+                                ),
+                            )],
+                        }
+                        .index(Expr::number(0))
+                    } else {
+                        self.need(Helper::Weighted);
+                        Expr::call(
+                            "weighted",
+                            vec![Expr::Array(
+                                options
+                                    .iter()
+                                    .map(|option| {
+                                        Ok(Expr::Array(vec![
+                                            self.language_value(&option.value)?,
+                                            Expr::Number(format!("{:?}", option.weight)),
+                                        ]))
+                                    })
+                                    .collect::<Result<_, Error>>()?,
+                            )],
+                        )
+                    }
+                }
+                Value::Func {
+                    func: Func::Abs { value },
+                    ..
+                } => Expr::call(
+                    "_language_math",
+                    vec![Expr::string("abs"), Expr::Array(vec![self.language_value(value)?])],
+                ),
+                Value::Func {
+                    func: Func::Min(values) | Func::Max(values),
+                    ..
+                } => {
+                    let op = if matches!(value, Value::Func { func: Func::Min(_), .. }) {
+                        "min"
+                    } else {
+                        "max"
+                    };
+                    Expr::call(
+                        "_language_math",
+                        vec![
+                            Expr::string(op),
+                            Expr::Array(
+                                values
+                                    .iter()
+                                    .map(|value| self.language_value(value))
+                                    .collect::<Result<_, _>>()?,
+                            ),
+                        ],
+                    )
+                }
+                Value::Func {
+                    func: Func::Clamp { value, min, max },
+                    ..
+                } => Expr::call(
+                    "_language_math",
+                    vec![
+                        Expr::string("clamp"),
+                        Expr::Array(vec![
+                            self.language_value(value)?,
+                            self.language_value(min)?,
+                            self.language_value(max)?,
+                        ]),
+                    ],
+                ),
+                Value::Func {
+                    func:
+                        Func::Range(Range::Float { .. })
+                        | Func::Normal { .. }
+                        | Func::Lognormal { .. }
+                        | Func::Exponential { .. }
+                        | Func::Pareto { .. }
+                        | Func::Beta { .. },
+                    ..
+                } => Expr::call("_language_float", vec![self.lower(value)?]),
+                Value::Func {
+                    func: Func::Sample { array, count },
+                    ..
+                } => {
+                    let random = if self.lang == ScorerLang::Python {
+                        self.imports.insert("random");
+                        Expr::from("random").member("random")
+                    } else {
+                        Expr::from("Math").member("random")
+                    };
+                    Expr::call(
+                        "_language_sample",
+                        vec![self.language_value(array)?, self.language_value(count)?, random],
+                    )
+                }
+                _ => self.lower(value)?,
+            })
+        }
         fn func(&mut self, func: &Func) -> Result<Expr, Error> {
             let python = self.lang == ScorerLang::Python;
             let number = |v: f64| Expr::Number(format!("{v:?}"));
@@ -5232,7 +5423,7 @@ pub(crate) mod scoring {
                 }
                 Func::Render { template, values } => {
                     self.helpers.insert(Helper::Language);
-                    Expr::call("_language_render", vec![self.lower(template)?, self.lower(values)?])
+                    Expr::call("_language_render", vec![self.lower(template)?, self.language_value(values)?])
                 }
                 Func::Compose { array, separator } => {
                     self.helpers.insert(Helper::Language);
@@ -5246,7 +5437,10 @@ pub(crate) mod scoring {
                     } else {
                         Expr::from("Math").member("random")
                     };
-                    Expr::call("_language_sample", vec![self.lower(array)?, self.lower(count)?, random])
+                    Expr::call(
+                        "_language_sample",
+                        vec![self.lower(array)?, self.language_value(count)?, random],
+                    )
                 }
                 Func::Contains { target, needle } => {
                     Expr::Contains(Box::new(self.lower(needle)?), Box::new(self.lower(target)?))

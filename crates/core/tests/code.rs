@@ -484,3 +484,179 @@ for (const patch of [{template:'{missing}'}, {template:'{'}, {parts:[1]}, {count
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn language_numeric_contract_matches_native_agents_and_scorers() {
+    use bts_core::mocking::data::{self, Distribution};
+    use bts_lang::ScorerKind;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let cases = [
+        ("6", "6"),
+        ("6.0", "6.0"),
+        ("-0.0", "-0.0"),
+        ("0.0000001", "1e-7"),
+        ("0.00001", "0.00001"),
+        ("0.000001", "1e-6"),
+        ("1000000000000000.0", "1000000000000000.0"),
+        ("10000000000000000.0", "1e+16"),
+        ("123000000000000000000.0", "1.23e+20"),
+        ("self.input.n + 1.0", "3.0"),
+        ("self.input.n / 2", "1"),
+        ("self.input.n / 2.0", "1.0"),
+        ("choice(6.0, 6.0)", "6.0"),
+        ("weighted([6.0, 1], [6.0, 2])", "6.0"),
+        ("range(6.0, 6.0)", "6.0"),
+        ("-self.input.n / 3", "0"),
+        ("-self.input.n % 2", "0"),
+        ("min(self.input.n, 6.0)", "2.0"),
+        ("max(self.input.n, 1.0)", "2.0"),
+        ("clamp(self.input.n, 0, 6.0)", "2.0"),
+        ("abs(-self.input.n * 1.0)", "2.0"),
+        ("[6.0][0]", "6.0"),
+        ("self.input.n == 2 ? 6.0 : 7", "6.0"),
+        ("true", "true"),
+    ];
+    let render = |expression: &str| format!("render(\"{{n}}\", {{ n = {expression} }})");
+    let expected: Vec<_> = cases.iter().map(|(_, expected)| *expected).collect();
+    let generate = |source: &str| {
+        data::generate(
+            compile(source).unwrap(),
+            1,
+            Duration::from_secs(1),
+            Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(1000),
+            42,
+            &(),
+        )
+    };
+    let source = format!(
+        "agent \"numeric\" {{ entrypoint = trace.numeric }} trace \"numeric\" {{ input = {{ n = 2 }} output = [{}] }}",
+        cases
+            .iter()
+            .map(|(expression, _)| render(expression))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let batch = generate(&source).unwrap();
+    assert_eq!(
+        batch.events[0].output.as_ref().unwrap().project(&()).unwrap(),
+        serde_json::json!(expected)
+    );
+    let model = compile(&source).unwrap();
+    let invalid = [
+        "1.0",
+        "choice(1.0, 1.0)",
+        "weighted([1.0, 1], [1.0, 2])",
+        "range(1.0, 1.0)",
+        "self.input.n / 2.0",
+        "min(self.input.n, 1.0)",
+        "[1.0][0]",
+    ];
+    for expression in invalid {
+        assert!(
+            generate(&format!(
+                "trace \"t\" {{ input = {{ n = 2 }} output = sample([1, 2], {expression}) }}"
+            ))
+            .is_err(),
+            "{expression}"
+        );
+    }
+    let mut scorers = cases
+        .iter()
+        .enumerate()
+        .map(|(index, (expression, expected))| {
+            format!(
+                "scorer \"render{index}\" {{ code {{ score = {} == {} ? 1 : 0 }} }}",
+                render(&expression.replace("self.input", "input")),
+                serde_json::to_string(expected).unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    for (index, expression) in invalid.iter().enumerate() {
+        scorers.push(format!(
+            "scorer \"sample{index}\" {{ code {{ score = len(sample([1, 2], {})) }} }}",
+            expression.replace("self.input", "input")
+        ));
+    }
+    scorers.push("scorer \"integer\" { code { score = len(sample([1, 2], input.n / 2)) } }".into());
+    let scorer_model = compile(&scorers.join("\n")).unwrap();
+    let items = scorer_model
+        .scorers
+        .iter()
+        .map(|scorer| {
+            let ScorerKind::Code { score, steps } = &scorer.kind else {
+                panic!("code scorer")
+            };
+            Item {
+                name: &scorer.name,
+                slug: &scorer.name,
+                score,
+                steps,
+            }
+        })
+        .collect::<Vec<_>>();
+    let root = std::env::temp_dir().join(format!("bts-numeric-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    for (lang, program, extension) in [(ScorerLang::Python, "python3", "py"), (ScorerLang::Typescript, "node", "mts")] {
+        for file in code::assemble_agents(&model, lang, &PlainTarget).unwrap().files {
+            let path = root.join(file.name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, file.contents).unwrap();
+        }
+        let expected = serde_json::to_string(&expected).unwrap();
+        let script = if lang == ScorerLang::Python {
+            format!(
+                r#"
+import json
+from numeric_agent import run
+assert run() == json.loads({expected:?})
+for index in range({count}):
+    assert globals()['scorer_render' + str(index)](None, {{'n':2}})['score'] == 1, index
+for index in range({invalid_count}):
+    try: globals()['scorer_sample' + str(index)](None, {{'n':2}})
+    except (TypeError, ValueError): pass
+    else: raise AssertionError(index)
+assert scorer_integer(None, {{'n':2}})['score'] == 1
+"#,
+                count = cases.len(),
+                invalid_count = invalid.len()
+            )
+        } else {
+            let render_names = (0..cases.len())
+                .map(|i| format!("scorer_render{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sample_names = (0..invalid.len())
+                .map(|i| format!("scorer_sample{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                r#"
+import assert from 'node:assert/strict';
+import {{run}} from './numeric_agent.mts';
+assert.deepEqual(run(), {expected});
+for (const scorer of [{render_names}]) assert.equal(scorer({{output:null,input:{{n:2}}}}).score, 1);
+for (const scorer of [{sample_names}]) assert.throws(() => scorer({{output:null,input:{{n:2}}}}));
+assert.equal(scorer_integer({{output:null,input:{{n:2}}}}).score, 1);
+"#
+            )
+        };
+        let emitted = code::languages::Languages.emit(lang, &items).unwrap().source;
+        let path = root.join(format!("src/agents/check.{extension}"));
+        fs::write(&path, format!("{emitted}\n{script}")).unwrap();
+        let output = std::process::Command::new(program).arg(&path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{lang:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

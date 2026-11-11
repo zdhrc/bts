@@ -1988,7 +1988,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_RENDER,
         name: "render",
         syntax: "render(template, values)",
-        summary: "Substitutes {name} placeholders with string, number, or boolean values from an object. Double braces escape literal braces. Missing names, non-scalar replacements, empty names, and unmatched braces fail during generation. Extra values are allowed and replacements are not recursively rendered.",
+        summary: "Substitutes {name} placeholders with string, number, or boolean values from an object. Double braces escape literal braces. Missing names, non-scalar replacements, empty names, and unmatched braces fail during generation. Extra values are allowed and replacements are not recursively rendered. Numeric rendering preserves authored float types, including a trailing .0 for whole floats and the sign of negative zero. Nonzero floats use scientific notation below 0.00001 in magnitude or at and above 1e16, with no leading zeros in the exponent.",
         examples: &[r#"render("Hello {name}!", { name = "Sam" })"#],
         rules: TEXT_FUNC_RULES,
     },

@@ -1112,7 +1112,7 @@ def _split(text, separator):
     return text.split(separator)
 def _join(array, separator): return _string(separator).join(_text(_force(value)) for value in _array(array))
 def _render(template, values):
-    return _language_render(_string(template), _force(values), lambda value: _text(_force(value)))
+    return _language_render(_string(template), _force(values), lambda value: _language_text(_force(value)))
 def _compose(parts, separator): return _language_compose(_value(parts), _string(separator))
 def _sample_items(items, count, random_source):
     return _language_sample(_value(items), _force(count), lambda: _draw(random_source))
@@ -1274,7 +1274,7 @@ function _split(text: unknown, separator: unknown): string[] {
     return value.split(delimiter);
 }
 function _join(array: unknown, separator: unknown): string { return _array(array).map(value => _text(_force(value))).join(_string(separator)); }
-function _render(template: unknown, values: unknown): string { return _language_render(_string(template), _force(values), value => _text(_force(value))); }
+function _render(template: unknown, values: unknown): string { return _language_render(_string(template), _force(values), value => { value = _force(value); return _language_text(value instanceof _Float ? _language_float(value.value) : value); }); }
 function _compose(parts: unknown, separator: unknown): string { return _language_compose(_value(parts), _string(separator)); }
 function _sample_items(items: unknown, count: unknown, randomSource: () => number): unknown[] { const value = _force(count); return _language_sample(_value(items), value instanceof _Float ? NaN : value, () => _draw(randomSource)); }
 function _contains(target: unknown, needle: unknown): boolean {
@@ -1413,10 +1413,54 @@ function _tokens(value: unknown): number {
 }
 
 pub(in crate::mocking::code) const PY_LANGUAGE: &str = r#"
+def _language_float(value): return float(value)
+
+def _language_float_text(value):
+    if value != value or value in (float("inf"), float("-inf")): raise ValueError("non-finite render number")
+    if value == 0: return "-0.0" if str(value).startswith("-") else "0.0"
+    sign = "-" if value < 0 else ""
+    mantissa, _, power = str(abs(value)).lower().partition("e")
+    whole, _, fraction = mantissa.partition(".")
+    digits = whole + fraction
+    point = len(whole) + int(power or "0")
+    leading = len(digits) - len(digits.lstrip("0"))
+    digits = digits.lstrip("0").rstrip("0")
+    point -= leading
+    exponent = point - 1
+    if exponent < -5 or exponent >= 16:
+        coefficient = digits[0] + ("." + digits[1:] if len(digits) > 1 else "")
+        return sign + coefficient + "e" + ("+" if exponent >= 0 else "") + str(exponent)
+    if point <= 0: return sign + "0." + "0" * -point + digits
+    if point >= len(digits): return sign + digits + "0" * (point - len(digits)) + ".0"
+    return sign + digits[:point] + "." + digits[point:]
+
+def _language_math(op, values):
+    if any(type(value) not in (int, float) for value in values): raise TypeError("expected numbers")
+    floating = any(type(value) is float for value in values)
+    a = values[0]
+    if op == "neg": result = -a
+    elif op == "abs": result = abs(a)
+    elif op == "min": result = min(values)
+    elif op == "max": result = max(values)
+    elif op == "clamp":
+        if values[1] > values[2]: raise ValueError("clamp bounds out of order")
+        result = max(values[1], min(values[2], a))
+    else:
+        b = values[1]
+        if op == "+": result = a + b
+        elif op == "-": result = a - b
+        elif op == "*": result = a * b
+        elif op == "/": result = a / b if floating else (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)
+        else:
+            import math
+            result = math.fmod(a, b) if floating else a - ((abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)) * b
+    return float(result) if floating else result
+
 def _language_text(value):
     if type(value) is str: return value
     if type(value) is bool: return "true" if value else "false"
-    if type(value) in (int, float): return str(value)
+    if type(value) is float: return _language_float_text(value)
+    if type(value) is int: return str(value)
     raise TypeError("render values must be strings, numbers, or booleans")
 
 def _language_render(template, values, text=_language_text):
@@ -1466,8 +1510,52 @@ def _language_sample(items, count, random_source):
 "#;
 
 pub(in crate::mocking::code) const TS_LANGUAGE: &str = r#"
+class _LanguageFloat {
+    readonly value: number;
+    constructor(value: number) { this.value = value; }
+    valueOf(): number { return this.value; }
+}
+function _language_float(value: number): any { return new _LanguageFloat(value); }
+function _language_float_text(value: number): string {
+    if (!Number.isFinite(value)) throw new Error("non-finite render number");
+    if (value === 0) return Object.is(value, -0) ? "-0.0" : "0.0";
+    const sign = value < 0 ? "-" : "", [mantissa, power = "0"] = String(Math.abs(value)).toLowerCase().split("e");
+    const [whole, fraction = ""] = mantissa.split(".");
+    let digits = whole + fraction, point = whole.length + Number(power);
+    point -= digits.length - digits.replace(/^0+/, "").length;
+    digits = digits.replace(/^0+/, "").replace(/0+$/, "");
+    const exponent = point - 1;
+    if (exponent < -5 || exponent >= 16) return sign + digits[0] + (digits.length > 1 ? "." + digits.slice(1) : "") + "e" + (exponent >= 0 ? "+" : "") + exponent;
+    if (point <= 0) return sign + "0." + "0".repeat(-point) + digits;
+    if (point >= digits.length) return sign + digits + "0".repeat(point - digits.length) + ".0";
+    return sign + digits.slice(0, point) + "." + digits.slice(point);
+}
+function _language_math(op: string, values: any[]): any {
+    if (values.some(value => !(value instanceof _LanguageFloat) && typeof value !== "number")) throw new TypeError("expected numbers");
+    const floating = values.some(value => value instanceof _LanguageFloat || !Number.isInteger(value));
+    const numbers = values.map(Number), [a, b] = numbers;
+    let result: number;
+    if (op === "neg") result = -a;
+    else if (op === "abs") result = Math.abs(a);
+    else if (op === "min") result = Math.min(...numbers);
+    else if (op === "max") result = Math.max(...numbers);
+    else if (op === "clamp") {
+        if (b > numbers[2]) throw new Error("clamp bounds out of order");
+        result = Math.max(b, Math.min(numbers[2], a));
+    } else if (op === "+") result = a + b;
+    else if (op === "-") result = a - b;
+    else if (op === "*") result = a * b;
+    else {
+        if (b === 0) throw new Error("division by zero");
+        result = op === "/" ? (floating ? a / b : Math.trunc(a / b)) : a % b;
+    }
+    if (!Number.isFinite(result)) throw new Error("non-finite number");
+    return floating ? _language_float(result) : (result === 0 ? 0 : result);
+}
 function _language_text(value: unknown): string {
-    if (typeof value === "string" || typeof value === "boolean" || typeof value === "number") return String(value);
+    if (value instanceof _LanguageFloat) return _language_float_text(value.value);
+    if (typeof value === "number") return Number.isInteger(value) && !Object.is(value, -0) ? String(value) : _language_float_text(value);
+    if (typeof value === "string" || typeof value === "boolean") return String(value);
     throw new TypeError("render values must be strings, numbers, or booleans");
 }
 function _language_render(template: unknown, values: unknown, text: (value: unknown) => string = _language_text): string {
