@@ -27,8 +27,9 @@ pub use model::{
 /// Compilation parses source, checks language rules, and resolves references.
 /// Runtime-dependent expressions remain in the model for consumers to evaluate.
 /// Use [`crate::syntax`] when only source structure is needed.
+/// The semantic compiler still accepts block syntax while its graph model is migrated.
 pub mod semantics {
-    use crate::{Diags, Model, lexing::lex, modeling::model, parsing::parse};
+    use crate::{Diags, Model, lexing::lex, modeling::model, parsing::parse_blocks as parse};
 
     /// Parses source, resolves references, and checks the language's semantic rules.
     ///
@@ -64,23 +65,24 @@ pub mod semantics {
 /// Source structure before reference resolution and semantic validation.
 ///
 /// Parsing checks structure without checking names, types, or allowed fields.
-/// Use [`crate::semantics::compile`] for semantic checks.
+/// The graph AST is not yet connected to [`crate::semantics::compile`].
 pub mod syntax {
     use crate::{Diag, DiagPhase, Diags, ast};
 
-    pub use crate::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
+    pub use crate::ast::GraphDocument as Ast;
+    pub use crate::ast::{Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
+    pub use crate::ast::{
+        GraphDocument, GraphEdgeStep, GraphFork, GraphHeader, GraphJunction, GraphNode, GraphNodeDecl, GraphOrigin, GraphPath,
+        GraphReferenceKind, GraphStep,
+    };
+    pub use crate::ast::{GraphPattern, GraphPatternConstraint, GraphPatternNode, GraphPatternStep};
 
-    /// Parses a complete source module without checking its meaning.
+    /// Parses a source graph without checking its meaning.
     ///
-    /// Empty source is allowed. Unknown block names and unresolved references can
-    /// appear in the returned tree. Malformed source returns lexing or parsing
-    /// diagnostics with byte ranges into `source`.
-    ///
-    /// ```
-    /// let source = r#"trace "run" { output = task.missing.output }"#;
-    /// assert!(bts_lang::syntax::parse(source).is_ok());
-    /// assert!(bts_lang::semantics::compile(source).is_err());
-    /// ```
+    /// Nodes, connections, forks and junctions retain their authored structure.
+    /// Indentation attaches selectors and junctions to forks. Names, kinds and
+    /// target membership and pattern matches are resolved later.
+    /// The current semantic compiler has not yet migrated to this AST.
     pub fn parse(source: &str) -> Result<Ast, crate::Diags> {
         let tokens = crate::lexing::lex(source)?;
         crate::parsing::parse(tokens, source)

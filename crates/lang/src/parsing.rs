@@ -1,4 +1,9 @@
 use crate::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
+use crate::ast::{
+    GraphDocument, GraphEdgeStep, GraphFork, GraphHeader, GraphJunction, GraphNode, GraphNodeDecl, GraphOrigin, GraphPath,
+    GraphReferenceKind, GraphStep,
+};
+use crate::ast::{GraphPattern, GraphPatternConstraint, GraphPatternNode, GraphPatternStep};
 use crate::diag::{Diag, DiagPhase, Diags, SrcRange};
 use crate::lexing::{Token, TokenKind, Tokens};
 use std::fmt;
@@ -25,6 +30,7 @@ struct Parser<'src> {
     src: &'src str,
     errors: Errors,
     index: usize,
+    graph_syntax: bool,
 }
 
 impl<'src> Parser<'src> {
@@ -34,7 +40,436 @@ impl<'src> Parser<'src> {
             src,
             errors: Vec::new(),
             index: 0,
+            graph_syntax: false,
         }
+    }
+
+    fn parse_graph(mut self) -> Result<GraphDocument, Errors> {
+        self.graph_syntax = true;
+        let mut paths = Vec::new();
+        while !self.eof() {
+            match self.parse_graph_path() {
+                Some(path) => paths.push(path),
+                None => break,
+            }
+        }
+        if self.errors.is_empty() {
+            Ok(GraphDocument { paths })
+        } else {
+            Err(self.errors)
+        }
+    }
+
+    fn parse_graph_path(&mut self) -> Option<GraphPath> {
+        let start_offset = self.peek().range.start;
+        let indent = self.graph_indent()?;
+        let start = if self.check(token!(Junction)) {
+            GraphOrigin::Junction(self.parse_junction()?)
+        } else {
+            GraphOrigin::Node(self.parse_graph_node()?)
+        };
+        let steps = self.parse_graph_steps(indent)?;
+        let end = self.peek().range.end;
+        if matches!(self.peek().kind, TokenKind::Arrow | TokenKind::Junction) {
+            self.errors
+                .push(Error::new(ErrorKind::UnattachedContinuation, self.peek().range));
+            return None;
+        }
+        if matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde | TokenKind::Equals) {
+            let kind = if matches!(steps.last(), Some(GraphStep::Fork(_))) {
+                ErrorKind::ForkNeedsSelection
+            } else {
+                ErrorKind::GraphIndentation
+            };
+            self.errors.push(Error::new(kind, self.peek().range));
+            return None;
+        }
+        self.expect(token!(Semicolon), ErrorKind::ExpectedStatementEnd)?;
+        Some(GraphPath {
+            start,
+            steps,
+            range: SrcRange::new(start_offset, end),
+        })
+    }
+
+    fn parse_graph_steps(&mut self, floor: usize) -> Option<Vec<GraphStep>> {
+        let mut steps = Vec::new();
+        let mut node_indent = floor;
+        loop {
+            if !matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde | TokenKind::Equals) {
+                break;
+            }
+            if self.graph_indent()? < node_indent {
+                break;
+            }
+            if self.check(token!(Equals)) {
+                steps.push(GraphStep::Fork(self.parse_fork()?));
+                break;
+            }
+            let edge = self.parse_graph_edge()?;
+            let start = match &edge.target {
+                GraphNode::Declaration(node) => node.range.start,
+                GraphNode::Reference(expr) => expr.range.start,
+            };
+            let index = self.tokens.partition_point(|token| token.range.start < start);
+            node_indent = self.graph_indent_at(index)?;
+            steps.push(GraphStep::Edge(edge));
+        }
+        Some(steps)
+    }
+
+    fn graph_indent(&mut self) -> Option<usize> {
+        self.graph_indent_at(self.index)
+    }
+
+    fn graph_indent_at(&mut self, index: usize) -> Option<usize> {
+        let token = &self.tokens[index];
+        let prefix = &self.src[token.line_start..token.range.start];
+        let indent = prefix.chars().take_while(|ch| matches!(ch, ' ' | '\t')).count();
+        if prefix[..indent].contains('\t') {
+            self.errors.push(Error::new(ErrorKind::GraphIndentation, token.range));
+            return None;
+        }
+        Some(indent)
+    }
+
+    fn parse_fork(&mut self) -> Option<GraphFork> {
+        let start = self.peek().range.start;
+        let indent = self.graph_indent()?;
+        self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        let header = self.parse_graph_header()?;
+        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(FatArrow), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        let mut entries = Vec::new();
+        loop {
+            if !self.check(token!(Minus)) {
+                self.errors.push(Error::new(ErrorKind::ExpectedForkEntry, self.peek().range));
+                return None;
+            }
+            self.graph_indent()?;
+            entries.push(self.parse_graph_edge()?);
+            if self.consume(token!(Comma)).is_none() {
+                break;
+            }
+            if self.check(token!(RBrack)) {
+                break;
+            }
+        }
+        let closing_line = self.peek().line_start;
+        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        let mut continuations = Vec::new();
+        let mut sibling_indent = None;
+        let mut previous_line = None;
+        while matches!(self.peek().kind, TokenKind::Arrow | TokenKind::Junction) {
+            let line = self.peek().line_start;
+            let child_indent = self.graph_indent()?;
+            if previous_line == Some(line) {
+                self.errors.push(Error::new(ErrorKind::InlineSibling, self.peek().range));
+                return None;
+            }
+            let inline = line == closing_line && continuations.is_empty();
+            if !inline {
+                if child_indent <= indent {
+                    break;
+                }
+                if let Some(level) = sibling_indent {
+                    if child_indent < level {
+                        break;
+                    }
+                    if child_indent != level {
+                        self.errors.push(Error::new(ErrorKind::GraphIndentation, self.peek().range));
+                        return None;
+                    }
+                } else {
+                    sibling_indent = Some(child_indent);
+                }
+            }
+            let start_offset = self.peek().range.start;
+            let origin = if self.consume(token!(Arrow)).is_some() {
+                let range = self.peek().range;
+                let node = self.parse_graph_node()?;
+                let GraphNode::Reference(reference) = node else {
+                    self.errors.push(Error::new(ErrorKind::SelectorDeclaration, range));
+                    return None;
+                };
+                GraphOrigin::Selector(reference)
+            } else {
+                GraphOrigin::Junction(self.parse_junction()?)
+            };
+            let steps = self.parse_graph_steps(child_indent)?;
+            let end = self.tokens[self.index - 1].range.end;
+            previous_line = Some(self.tokens[self.index - 1].line_start);
+            continuations.push(GraphPath {
+                start: origin,
+                steps,
+                range: SrcRange::new(start_offset, end),
+            });
+        }
+        let end = self.tokens[self.index - 1].range.end;
+        Some(GraphFork {
+            header,
+            entries,
+            continuations,
+            range: SrcRange::new(start, end),
+        })
+    }
+
+    fn parse_junction(&mut self) -> Option<GraphJunction> {
+        let start = self.peek().range.start;
+        self.expect(token!(Junction), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        let mut inputs = vec![self.parse_qualified_edge_reference()?];
+        while self.consume(token!(Comma)).is_some() && !self.check(token!(RBrack)) {
+            inputs.push(self.parse_qualified_edge_reference()?);
+        }
+        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Arrow), ErrorKind::UnexpectedToken)?;
+        let target = self.parse_graph_node()?;
+        let end = self.tokens[self.index - 1].range.end;
+        Some(GraphJunction {
+            inputs,
+            target,
+            range: SrcRange::new(start, end),
+        })
+    }
+
+    fn parse_qualified_edge_reference(&mut self) -> Option<Expr> {
+        if self.check(token!(PatternOpen)) {
+            return self.parse_pattern_reference();
+        }
+        let start = self.peek().range.start;
+        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        let mut expr = self.parse_graph_reference(start, GraphReferenceKind::Edge)?;
+        while self.consume(token!(Dot)).is_some() {
+            self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+            let name = self.parse_graph_name()?;
+            let end = self.peek().range.end;
+            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+            expr = Expr::new(
+                ExprKind::GraphMember {
+                    target: Box::new(expr),
+                    name,
+                },
+                SrcRange::new(start, end),
+            );
+        }
+        Some(expr)
+    }
+
+    fn parse_pattern_reference(&mut self) -> Option<Expr> {
+        let start = self.peek().range.start;
+        self.expect(token!(PatternOpen), ErrorKind::UnexpectedToken)?;
+        let first = self.parse_pattern_node()?;
+        let selected_node = |node: &GraphPatternNode| match node {
+            GraphPatternNode::Constraint(constraint) => usize::from(constraint.selected),
+            GraphPatternNode::Reference(_) => 0,
+        };
+        let mut selections = selected_node(&first);
+        let mut steps = Vec::new();
+        while matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde) {
+            let step_start = self.peek().range.start;
+            let cycle = self.next().kind == TokenKind::Tilde;
+            self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+            let mut edges = vec![self.parse_pattern_constraint()?];
+            while self.consume(token!(Comma)).is_some() && !self.check(token!(RBrack)) {
+                edges.push(self.parse_pattern_constraint()?);
+            }
+            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+            if cycle {
+                self.expect(token!(CycleArrow), ErrorKind::UnexpectedToken)?;
+            } else {
+                self.expect(token!(Arrow), ErrorKind::UnexpectedToken)?;
+            }
+            let target = self.parse_pattern_node()?;
+            selections += edges.iter().filter(|edge| edge.selected).count() + selected_node(&target);
+            steps.push(GraphPatternStep {
+                edges,
+                cycle,
+                target,
+                range: SrcRange::new(step_start, self.tokens[self.index - 1].range.end),
+            });
+        }
+        let end = self.peek().range.end;
+        self.expect(token!(PatternClose), ErrorKind::UnexpectedToken)?;
+        let range = SrcRange::new(start, end);
+        if selections != 1 {
+            self.errors.push(Error::new(ErrorKind::PatternSelection, range));
+            return None;
+        }
+        Some(Expr::new(
+            ExprKind::PatternRef(Box::new(GraphPattern {
+                start: first,
+                steps,
+                range,
+            })),
+            range,
+        ))
+    }
+
+    fn parse_pattern_node(&mut self) -> Option<GraphPatternNode> {
+        let start = self.peek().range.start;
+        self.expect(token!(LParen), ErrorKind::ExpectedGraphNode)?;
+        if matches!(self.peek().kind, TokenKind::At | TokenKind::Colon) {
+            let constraint = self.parse_pattern_constraint()?;
+            self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
+            Some(GraphPatternNode::Constraint(constraint))
+        } else {
+            self.parse_graph_reference(start, GraphReferenceKind::Node)
+                .map(GraphPatternNode::Reference)
+        }
+    }
+
+    fn parse_pattern_constraint(&mut self) -> Option<GraphPatternConstraint> {
+        let start = self.peek().range.start;
+        let selected = self.consume(token!(At)).is_some();
+        self.expect(token!(Colon), ErrorKind::ExpectedGraphKind)?;
+        let kind = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
+        let props = if self.check(token!(LBrace)) {
+            Some(self.parse_graph_fields()?)
+        } else {
+            None
+        };
+        let end = self.tokens[self.index - 1].range.end;
+        Some(GraphPatternConstraint {
+            selected,
+            kind,
+            props,
+            range: SrcRange::new(start, end),
+        })
+    }
+
+    fn parse_graph_node(&mut self) -> Option<GraphNode> {
+        self.graph_indent()?;
+        let start = self.peek().range.start;
+        self.expect(token!(LParen), ErrorKind::ExpectedGraphNode)?;
+        let declaration = self.check(token!(Colon))
+            || (matches!(self.peek().kind, TokenKind::Ident(_) | TokenKind::String(_))
+                && self.peek_ahead().kind == TokenKind::Colon);
+        if declaration {
+            let header = self.parse_graph_header()?;
+            let mut end = self.peek().range.end;
+            self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
+            let body = if self.check(token!(LBrace)) {
+                let body = self.parse_graph_fields()?;
+                end = self.tokens[self.index - 1].range.end;
+                Some(body)
+            } else {
+                None
+            };
+            Some(GraphNode::Declaration(GraphNodeDecl {
+                header,
+                body,
+                range: SrcRange::new(start, end),
+            }))
+        } else {
+            let reference = self.parse_graph_reference(start, GraphReferenceKind::Node)?;
+            if self.check(token!(LBrace)) {
+                self.errors.push(Error::new(ErrorKind::ReferenceBody, self.peek().range));
+                return None;
+            }
+            Some(GraphNode::Reference(reference))
+        }
+    }
+
+    fn parse_graph_header(&mut self) -> Option<GraphHeader> {
+        let start = self.peek().range.start;
+        let name_range = (!self.check(token!(Colon))).then_some(self.peek().range);
+        let name = if name_range.is_some() {
+            Some(self.parse_graph_name()?)
+        } else {
+            None
+        };
+        self.expect(token!(Colon), ErrorKind::ExpectedGraphKind)?;
+        let kind = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
+        let props = if self.check(token!(LBrace)) {
+            Some(self.parse_graph_fields()?)
+        } else {
+            None
+        };
+        let end = self.tokens[self.index - 1].range.end;
+        Some(GraphHeader {
+            name,
+            name_range,
+            kind,
+            props,
+            range: SrcRange::new(start, end),
+        })
+    }
+
+    fn parse_graph_name(&mut self) -> Option<String> {
+        self.expect(
+            |kind| match kind {
+                TokenKind::Ident(name) | TokenKind::String(name) => Some(name.clone()),
+                _ => None,
+            },
+            ErrorKind::ExpectedGraphName,
+        )
+    }
+
+    fn parse_graph_fields(&mut self) -> Option<Vec<Attr>> {
+        self.expect(token!(LBrace), ErrorKind::UnexpectedToken)?;
+        let mut fields = Vec::new();
+        while !self.check(token!(RBrace)) && !self.eof() {
+            let range = self.peek().range;
+            let key = self.expect(token!(Ident(value)), ErrorKind::ExpectedIdentifier)?;
+            fields.push(self.parse_attr(key, range)?);
+            if self.consume(token!(Comma)).is_none() && !self.check(token!(RBrace)) {
+                self.errors.push(Error::new(ErrorKind::ExpectedFieldComma, self.peek().range));
+                return None;
+            }
+        }
+        self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
+        Some(fields)
+    }
+
+    fn parse_graph_edge(&mut self) -> Option<GraphEdgeStep> {
+        let start = self.peek().range.start;
+        let cycle = self.next().kind == TokenKind::Tilde;
+        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        let mut edges = vec![self.parse_graph_header()?];
+        while self.consume(token!(Comma)).is_some() && !self.check(token!(RBrack)) {
+            edges.push(self.parse_graph_header()?);
+        }
+        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        if cycle {
+            self.expect(token!(CycleArrow), ErrorKind::UnexpectedToken)?;
+        } else {
+            self.expect(token!(Arrow), ErrorKind::UnexpectedToken)?;
+        }
+        let target = self.parse_graph_node()?;
+        let end = self.tokens[self.index - 1].range.end;
+        Some(GraphEdgeStep {
+            edges,
+            cycle,
+            target,
+            range: SrcRange::new(start, end),
+        })
+    }
+
+    // the opening boundary has already been consumed
+    fn parse_graph_reference(&mut self, start: usize, kind: GraphReferenceKind) -> Option<Expr> {
+        let quoted_node = matches!(self.peek().kind, TokenKind::String(_)) && self.peek_ahead().kind == TokenKind::RParen;
+        let target = if kind == GraphReferenceKind::Edge || quoted_node {
+            let range = self.peek().range;
+            let name = self.parse_graph_name()?;
+            Expr::new(ExprKind::Ref { path: vec![name] }, range)
+        } else {
+            self.parse_expr()?
+        };
+        let end = self.peek().range.end;
+        match kind {
+            GraphReferenceKind::Node => self.expect(token!(RParen), ErrorKind::UnexpectedToken)?,
+            GraphReferenceKind::Edge => self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?,
+        }
+        Some(Expr::new(
+            ExprKind::GraphRef {
+                kind,
+                target: Box::new(target),
+            },
+            SrcRange::new(start, end),
+        ))
     }
 
     fn parse(mut self) -> Result<Ast, Errors> {
@@ -115,8 +550,17 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_attr(&mut self, key: String, range: SrcRange) -> Option<Attr> {
-        self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
+        if self.graph_syntax {
+            self.expect(token!(Colon), ErrorKind::UnexpectedToken)?;
+        } else {
+            self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
+        }
         let value = self.parse_expr()?;
+        let range = if self.graph_syntax {
+            SrcRange::new(range.start, value.range.end)
+        } else {
+            range
+        };
 
         Some(Attr { key, value, range })
     }
@@ -239,6 +683,20 @@ impl<'src> Parser<'src> {
                 }
                 TokenKind::Dot => {
                     self.next();
+                    if self.graph_syntax && self.consume(token!(LBrack)).is_some() {
+                        let name = self.parse_graph_name()?;
+                        let end = self.peek().range.end;
+                        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+                        let start = expr.range.start;
+                        expr = Expr::new(
+                            ExprKind::GraphMember {
+                                target: Box::new(expr),
+                                name,
+                            },
+                            SrcRange::new(start, end),
+                        );
+                        continue;
+                    }
                     let name_range = self.peek().range;
                     let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedAccessorField)?;
 
@@ -265,8 +723,7 @@ impl<'src> Parser<'src> {
         Some(expr)
     }
 
-    // a template arrives flat from the lexer: literal chunks around ${...}
-    // holes; each hole must hold a reference path expression
+    // a template arrives as literal chunks around expression holes
     fn parse_template(&mut self) -> Option<Expr> {
         let start = self.peek().range.start;
         self.expect(token!(TemplateOpen), ErrorKind::ExpectedStringLiteral)?;
@@ -278,7 +735,7 @@ impl<'src> Parser<'src> {
             } else if self.check(token!(InterpOpen)) {
                 let open = self.peek().range;
                 self.next();
-                match self.parse_interpolation_ref() {
+                match self.parse_interpolation() {
                     Some((expr, end)) => parts.push(TemplatePart::Ref {
                         expr,
                         range: SrcRange::new(open.start, end),
@@ -297,10 +754,14 @@ impl<'src> Parser<'src> {
         }
     }
 
-    // a reference head extended by postfix selections, up to the hole's closing
-    // brace; operators and calls stay out of the hole's top level, but bracket
-    // indexes and slice bounds hold full expressions
-    fn parse_interpolation_ref(&mut self) -> Option<(Expr, usize)> {
+    // candidate holes accept expressions, existing syntax still requires a reference
+    fn parse_interpolation(&mut self) -> Option<(Expr, usize)> {
+        if self.graph_syntax {
+            let expr = self.parse_expr()?;
+            let end = self.peek().range.end;
+            self.expect(token!(InterpClose), ErrorKind::UnexpectedToken)?;
+            return Some((expr, end));
+        }
         let range = self.peek().range;
         let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedInterpolationPath)?;
         let head = Expr::new(ExprKind::Ref { path: vec![name] }, range);
@@ -327,9 +788,14 @@ impl<'src> Parser<'src> {
 
     fn parse_primary(&mut self) -> Option<Expr> {
         match &self.peek().kind {
+            TokenKind::PatternOpen if self.graph_syntax => self.parse_pattern_reference(),
             TokenKind::LParen => {
                 let start = self.peek().range.start;
                 self.next();
+
+                if self.graph_syntax {
+                    return self.parse_graph_reference(start, GraphReferenceKind::Node);
+                }
 
                 let inner = self.parse_expr()?;
                 let end = self.peek().range.end;
@@ -337,6 +803,17 @@ impl<'src> Parser<'src> {
 
                 // no ast node for grouping, the widened range keeps diagnostics on the parens
                 Some(Expr::new(inner.kind, SrcRange::new(start, end)))
+            }
+            TokenKind::InterpOpen if self.graph_syntax => {
+                let start = self.next().range.start;
+                let expr = self.parse_expr()?;
+                let end = self.peek().range.end;
+                self.expect(token!(InterpClose), ErrorKind::UnexpectedToken)?;
+                Some(Expr::new(expr.kind, SrcRange::new(start, end)))
+            }
+            TokenKind::LBrack if self.graph_syntax => {
+                let start = self.next().range.start;
+                self.parse_graph_reference(start, GraphReferenceKind::Edge)
             }
             TokenKind::String(_) => {
                 let range = self.peek().range;
@@ -384,16 +861,16 @@ impl<'src> Parser<'src> {
                     Some(Expr::new(ExprKind::Ref { path: vec![name] }, range))
                 }
             }
-            TokenKind::LBrack => {
+            TokenKind::LBrack | TokenKind::ArrayOpen if self.graph_syntax || self.check(token!(LBrack)) => {
                 let start = self.peek().range.start;
-                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+                self.next();
 
                 if self.at_for_keyword() {
                     return self.parse_for(start, false);
                 }
 
                 let mut values = Vec::new();
-                while !self.check(token!(RBrack)) {
+                while !self.at_array_close() {
                     let range = self.peek().range;
                     if self.consume(token!(Ellipsis)).is_some() {
                         let operand = self.parse_expr()?;
@@ -408,7 +885,7 @@ impl<'src> Parser<'src> {
                     }
                 }
                 let end = self.peek().range.end;
-                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+                self.expect_array_close()?;
 
                 Some(Expr::new(ExprKind::Array(values), SrcRange::new(start, end)))
             }
@@ -431,15 +908,19 @@ impl<'src> Parser<'src> {
                         items.push(ObjectItem::Attr(self.parse_attr(key, range)?));
                     }
 
-                    // items on one line need a comma between them; a line
-                    // break separates on its own, and a trailing comma is fine
+                    // candidate fields always need commas between entries
+                    // existing syntax also allows a line break as a separator
                     if self.consume(token!(Comma)).is_none()
                         && !self.check(token!(RBrace))
                         && !self.eof()
-                        && !self.newline_before_peek()
+                        && (self.graph_syntax || !self.newline_before_peek())
                     {
-                        self.errors
-                            .push(Error::new(ErrorKind::ExpectedObjectComma, self.peek().range));
+                        let kind = if self.graph_syntax {
+                            ErrorKind::ExpectedFieldComma
+                        } else {
+                            ErrorKind::ExpectedObjectComma
+                        };
+                        self.errors.push(Error::new(kind, self.peek().range));
                     }
                 }
                 let end = self.peek().range.end;
@@ -458,6 +939,23 @@ impl<'src> Parser<'src> {
     fn at_for_keyword(&self) -> bool {
         matches!(&self.peek().kind, TokenKind::Ident(value) if value == "for")
             && !matches!(self.peek_ahead().kind, TokenKind::Equals)
+            && !(self.graph_syntax && self.peek_ahead().kind == TokenKind::Colon)
+    }
+
+    fn at_array_close(&self) -> bool {
+        if self.graph_syntax {
+            self.check(token!(ArrayClose))
+        } else {
+            self.check(token!(RBrack))
+        }
+    }
+
+    fn expect_array_close(&mut self) -> Option<()> {
+        if self.graph_syntax {
+            self.expect(token!(ArrayClose), ErrorKind::UnexpectedToken)
+        } else {
+            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)
+        }
     }
 
     // [for x in xs : body if cond] and { for k, v in xs : key => value if cond }
@@ -491,7 +989,7 @@ impl<'src> Parser<'src> {
         if object {
             self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
         } else {
-            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+            self.expect_array_close()?;
         }
 
         Some(Expr::new(
@@ -591,7 +1089,7 @@ impl<'src> Parser<'src> {
     }
 }
 
-// binding levels, higher binds tighter; unary and primary sit above all of these
+// binding levels, higher binds tighter, unary and primary sit above all of these
 fn bin_op(kind: &TokenKind) -> Option<(BinOp, u8)> {
     match kind {
         TokenKind::PipePipe => Some((BinOp::Or, 1)),
@@ -611,14 +1109,21 @@ fn bin_op(kind: &TokenKind) -> Option<(BinOp, u8)> {
     }
 }
 
-pub(super) fn parse(tokens: Vec<Token>, src: &str) -> Result<Ast, Diags> {
+pub(super) fn parse_blocks(tokens: Vec<Token>, src: &str) -> Result<Ast, Diags> {
     Parser::new(tokens, src)
         .parse()
         .map_err(|errors| errors.into_iter().map(Diag::from).collect())
 }
 
+pub(super) fn parse(tokens: Vec<Token>, src: &str) -> Result<GraphDocument, Diags> {
+    Parser::new(tokens, src)
+        .parse_graph()
+        .map_err(|errors| errors.into_iter().map(Diag::from).collect())
+}
+
 pub(super) fn parse_expression(tokens: Vec<Token>, src: &str) -> Result<Expr, Diags> {
     let mut parser = Parser::new(tokens, src);
+    parser.graph_syntax = true;
     let expr = parser.parse_expr();
     if !parser.eof() {
         parser
@@ -641,6 +1146,19 @@ pub(super) type Errors = Vec<Error>;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum ErrorKind {
+    ExpectedGraphNode,
+    ExpectedGraphName,
+    ExpectedGraphKind,
+    ExpectedStatementEnd,
+    ExpectedFieldComma,
+    ReferenceBody,
+    UnattachedContinuation,
+    GraphIndentation,
+    InlineSibling,
+    SelectorDeclaration,
+    ExpectedForkEntry,
+    ForkNeedsSelection,
+    PatternSelection,
     UnexpectedToken,
     ExpectedDeclaration,
     ExpectedIdentifier,
@@ -663,6 +1181,19 @@ pub(super) enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::ExpectedGraphNode => "expected a node declaration or reference",
+            Self::ExpectedGraphName => "expected an identifier or plain quoted graph name",
+            Self::ExpectedGraphKind => "expected a required graph kind after `:`",
+            Self::ExpectedStatementEnd => "expected `;` after a graph statement",
+            Self::ExpectedFieldComma => "expected `,` between fields",
+            Self::ReferenceBody => "a node reference cannot attach a body",
+            Self::UnattachedContinuation => "selector or junction has no fork at this indentation level",
+            Self::GraphIndentation => "graph continuations require spaces and aligned sibling indentation",
+            Self::InlineSibling => "sibling continuations must start on separate aligned lines",
+            Self::SelectorDeclaration => "a fork selector must reference a node, not declare one",
+            Self::ExpectedForkEntry => "expected one edge step with a target in the fork entry",
+            Self::ForkNeedsSelection => "select a fork target or add a junction before continuing the path",
+            Self::PatternSelection => "a pattern reference requires exactly one `@` selection marker",
             Self::UnexpectedToken => "unexpected token",
             Self::ExpectedDeclaration => "expected declaration",
             Self::ExpectedIdentifier => "expected identifier",

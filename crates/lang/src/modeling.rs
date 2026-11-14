@@ -2145,6 +2145,10 @@ impl Modeler {
     fn fold_expr(&mut self, expr: ast::Expr) -> Option<Folded> {
         let ast::Expr { kind, range } = expr;
         match kind {
+            ast::ExprKind::GraphRef { .. } | ast::ExprKind::GraphMember { .. } | ast::ExprKind::PatternRef(_) => {
+                self.errors.push(Error::new(ErrorKind::GraphExpression, range));
+                None
+            }
             ast::ExprKind::Str(value) => Some(Folded::value(Value::Str(value), range)),
             ast::ExprKind::Template(parts) => self.fold_template(parts, range),
             ast::ExprKind::Num(raw) => self
@@ -6604,6 +6608,7 @@ pub(super) type Errors = Vec<Error>;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) enum ErrorKind {
+    GraphExpression,
     RootAttribute {
         keyword: String,
     },
@@ -6929,6 +6934,9 @@ pub(super) enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::GraphExpression => {
+                formatter.write_str("candidate graph expressions cannot be compiled by the current modeler")
+            }
             Self::RootAttribute { keyword } => {
                 write!(
                     formatter,
@@ -7508,7 +7516,7 @@ mod tests {
 
     fn model(source: &str) -> Result<Model, Errors> {
         let tokens = crate::lexing::lex(source).unwrap();
-        let ast = crate::parsing::parse(tokens, source).unwrap();
+        let ast = crate::parsing::parse_blocks(tokens, source).unwrap();
         Modeler::new(ast).model()
     }
 
@@ -9100,7 +9108,7 @@ mod tests {
     fn reports_validation_diagnostics_at_the_invalid_source() {
         let source = r#"trace "example" { metadata = true }"#;
         let tokens = crate::lexing::lex(source).unwrap();
-        let ast = crate::parsing::parse(tokens, source).unwrap();
+        let ast = crate::parsing::parse_blocks(tokens, source).unwrap();
 
         let diagnostics = match super::model(ast) {
             Err(diagnostics) => diagnostics,
@@ -10140,7 +10148,15 @@ mod tests {
 
     #[test]
     fn models_dynamic_blocks_with_optional_names() {
-        let model = model(include_str!("../tests/fixtures/compilation.bt")).unwrap();
+        let model = model(
+            r#"trace "run" {
+            vars { turns = range(1, 4) }
+            repeat "turns" { count = var.turns task "turn" {} }
+            choice { tool "lookup" {} function "summarize" {} }
+            maybe "escalation" { chance = 0.25 task "escalate" {} }
+        }"#,
+        )
+        .unwrap();
 
         let children = &model.traces[0].children;
         let Child::Repeat(repeat) = &children[0] else {

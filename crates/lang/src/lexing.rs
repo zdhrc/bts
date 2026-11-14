@@ -41,6 +41,7 @@ pub(super) enum TokenKind {
     Tilde,
     Junction,
     PatternOpen,
+    PatternClose,
     At,
     Semicolon,
 
@@ -179,7 +180,10 @@ impl<'src> Lexer<'src> {
             '#' => self.skip_comment(),
             '%' => tokens.push(Token::new(TokenKind::Percent, idx, idx + ch.len_utf8())),
             '?' => match self.lex_trailing('<') {
-                Some(end) => tokens.push(Token::new(TokenKind::PatternOpen, idx, end)),
+                Some(end) => {
+                    tokens.push(Token::new(TokenKind::PatternOpen, idx, end));
+                    self.lex_pattern(idx, tokens, errors);
+                }
                 None => tokens.push(Token::new(TokenKind::Question, idx, idx + 1)),
             },
             ':' => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
@@ -306,6 +310,42 @@ impl<'src> Lexer<'src> {
         while matches!(self.peek(), Some((_, ch)) if ch != '\n') {
             self.next();
         }
+    }
+
+    // the outer angle closes a pattern, arrows and nested values keep their own tokens
+    fn lex_pattern(&mut self, start: usize, tokens: &mut Tokens, errors: &mut Errors) {
+        let mut boundaries = Vec::new();
+        while let Some((idx, ch)) = self.next() {
+            if ch == '>' && boundaries.is_empty() {
+                tokens.push(Token::new(TokenKind::PatternClose, idx, idx + 1));
+                return;
+            }
+            let closer = match ch {
+                '(' => {
+                    boundaries.push(')');
+                    None
+                }
+                '[' => {
+                    boundaries.push(']');
+                    None
+                }
+                '{' => {
+                    boundaries.push('}');
+                    None
+                }
+                ')' | ']' | '}' => Some(ch),
+                '|' if matches!(self.peek(), Some((_, ']'))) => Some(']'),
+                _ => None,
+            };
+            if closer.is_some() && boundaries.last().copied() == closer {
+                boundaries.pop();
+            }
+            self.lex_token(idx, ch, tokens, errors);
+        }
+        errors.push(Error::new(
+            ErrorKind::UnterminatedPattern,
+            SrcRange::new(start, self.src.len()),
+        ));
     }
 
     fn lex_string(&mut self, start: usize, tokens: &mut Tokens, errors: &mut Errors) {
@@ -817,6 +857,7 @@ pub(super) enum ErrorKind {
     ContentBeforeMultilineCloser,
     UnderindentedMultilineLine,
     UnterminatedInterpolation,
+    UnterminatedPattern,
     InvalidNumber,
     UnpairedOperator(char),
 }
@@ -835,6 +876,7 @@ impl fmt::Display for ErrorKind {
             }
             Self::UnderindentedMultilineLine => formatter.write_str("line is indented less than the closing \"\"\""),
             Self::UnterminatedInterpolation => formatter.write_str("unterminated interpolation"),
+            Self::UnterminatedPattern => formatter.write_str("unterminated pattern reference"),
             Self::InvalidNumber => formatter.write_str("invalid number"),
             Self::UnpairedOperator(op) => write!(formatter, "stray `{op}`; did you mean `{op}{op}`?"),
         }
@@ -881,7 +923,7 @@ mod tests {
 
     #[test]
     fn lexes_graph_punctuation_with_exact_ranges() {
-        let source = "-> ~> ~ >> ?< @ ; [| |] =>";
+        let source = "-> ~> ~ >> ?<> @ ; [| |] =>";
         let tokens = Lexer::new(source).lex().unwrap();
         let expected = [
             (TokenKind::Arrow, "->"),
@@ -889,6 +931,7 @@ mod tests {
             (TokenKind::Tilde, "~"),
             (TokenKind::Junction, ">>"),
             (TokenKind::PatternOpen, "?<"),
+            (TokenKind::PatternClose, ">"),
             (TokenKind::At, "@"),
             (TokenKind::Semicolon, ";"),
             (TokenKind::ArrayOpen, "[|"),
@@ -964,11 +1007,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local candidate fixture in notes/plan/agent.bt"]
-    fn lexes_candidate_agent_fixture() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../notes/plan/agent.bt");
-        let source = std::fs::read_to_string(path).expect("candidate fixture must be present");
-        let tokens = lex(&source).expect("candidate fixture must lex without diagnostics");
+    fn lexes_compilation_fixture() {
+        let source = include_str!("../tests/fixtures/compilation.bt");
+        let tokens = lex(source).expect("compilation fixture must lex without diagnostics");
         assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
         assert_eq!(tokens.last().unwrap().range.start, source.len());
     }
