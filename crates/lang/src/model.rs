@@ -10,12 +10,14 @@ pub struct Model {
     pub kind_names: BTreeMap<String, KindId>,
     /// Node definitions in declaration order.
     pub nodes: Vec<Node>,
-    /// Directed connections, including marked cycle connections.
+    /// Directed and undirected connections, including explicit loop-back edges.
     pub edges: Vec<Edge>,
     /// Fork definitions and their attached continuations.
     pub forks: Vec<Fork>,
     /// Explicit convergence definitions.
     pub junctions: Vec<Junction>,
+    /// Resolved network memberships and structural validation policies.
+    pub networks: Vec<Network>,
     /// Authored root paths.
     pub paths: Vec<GraphPath>,
     /// Field and property expressions indexed by binding identity.
@@ -100,6 +102,105 @@ pub struct FieldSchema {
     pub range: SrcRange,
 }
 
+/// The orientation of an edge instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Direction {
+    /// Ordered source and target endpoints.
+    Directed,
+    /// Unordered connectivity with stable authored left and right endpoints.
+    Undirected,
+}
+
+/// Directions permitted by an edge kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Directions {
+    /// Only directed connections.
+    Directed,
+    /// Only undirected connections.
+    Undirected,
+    /// Either orientation.
+    Either,
+}
+impl Directions {
+    /// Whether this kind permits an instance orientation.
+    pub fn allows(self, direction: Direction) -> bool {
+        self == Self::Either
+            || matches!(
+                (self, direction),
+                (Self::Directed, Direction::Directed) | (Self::Undirected, Direction::Undirected)
+            )
+    }
+}
+
+/// When a network's structural constraints must be checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationStage {
+    /// Check the authored graph during compilation.
+    Definition,
+    /// A consumer must check each materialization group.
+    Materialized,
+    /// Both compilation and materialization checks are required.
+    Both,
+}
+
+/// Which cycles a network prohibits, independently of loop punctuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acyclic {
+    /// Cycles are allowed.
+    None,
+    /// All selected edges must be directed and have no directed cycle.
+    Directed,
+    /// Ignore direction while preserving distinct edges.
+    Underlying,
+}
+
+/// Required reachability within a network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connectivity {
+    /// Disconnected components are allowed.
+    None,
+    /// Ignore direction when testing reachability.
+    Weak,
+    /// Respect direction, traversing undirected edges either way.
+    Strong,
+}
+
+/// Inclusive nonnegative edge-count limits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DegreeBounds {
+    /// Optional minimum.
+    pub min: Option<usize>,
+    /// Optional maximum.
+    pub max: Option<usize>,
+}
+
+/// A network node's resolved selection and enforcement contract.
+#[derive(Debug, Clone)]
+pub struct Network {
+    /// The node carrying this configuration.
+    pub node: NodeId,
+    /// Explicit participating nodes, including isolated nodes.
+    pub nodes: Vec<NodeId>,
+    /// Explicit participating edges.
+    pub edges: Vec<EdgeId>,
+    /// Required validation stage.
+    pub validate: ValidationStage,
+    /// Cycle restriction.
+    pub acyclic: Acyclic,
+    /// Connectivity restriction.
+    pub connected: Connectivity,
+    /// Whether selected edges may connect a node to itself.
+    pub self_loops: bool,
+    /// Optional limit per endpoint pair and direction category.
+    pub max_parallel: Option<usize>,
+    /// Directed incoming degree bounds for every included node.
+    pub incoming: DegreeBounds,
+    /// Directed outgoing degree bounds for every included node.
+    pub outgoing: DegreeBounds,
+    /// Undirected degree bounds, counting a self-loop twice.
+    pub degree: DegreeBounds,
+}
+
 /// A resolved user-defined kind.
 #[derive(Debug, Clone)]
 pub struct Kind {
@@ -113,6 +214,8 @@ pub struct Kind {
     pub base_kind: Option<KindId>,
     /// Inherited primitive or neutral root operation.
     pub primitive: String,
+    /// Edge direction allowance, absent for other constructs.
+    pub direction: Option<Directions>,
     /// Effective property schema, including inherited entries.
     pub props: Vec<FieldSchema>,
     /// Effective node content schema, including inherited entries.
@@ -149,16 +252,18 @@ pub struct Node {
     pub range: SrcRange,
 }
 
-/// A directed connection between two existing node identities.
+/// A connection between two existing node identities.
 #[derive(Debug, Clone)]
 pub struct Edge {
     /// Optional authored name.
     pub name: Option<String>,
     /// Open edge-kind identifier.
     pub kind: String,
-    /// Source node.
+    /// Instance orientation.
+    pub direction: Direction,
+    /// Source or authored left node.
     pub source: NodeId,
-    /// Target node.
+    /// Target or authored right node.
     pub target: NodeId,
     /// Configuration properties.
     pub props: Vec<BindingId>,
@@ -251,6 +356,8 @@ pub struct Binding {
     pub property: bool,
     /// Field path, including nested keys when selected independently.
     pub path: Vec<String>,
+    /// Declared schema type, also required of values supplied at runtime.
+    pub ty: FieldType,
     /// Lowered expression, preserving dynamic evaluation.
     pub value: Value,
     /// Source location.

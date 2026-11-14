@@ -132,6 +132,8 @@ pub struct GraphHeader {
 pub struct GraphEdgeStep {
     /// Authored edge headers in source order.
     pub edges: Vec<GraphHeader>,
+    /// Whether the connection is directed or undirected.
+    pub direction: crate::model::Direction,
     /// Whether this step uses explicit cycle punctuation.
     pub cycle: bool,
     /// The destination declaration or reference.
@@ -187,6 +189,8 @@ pub struct GraphPatternConstraint {
 pub struct GraphPatternStep {
     /// Edge constraints sharing the same endpoints.
     pub edges: Vec<GraphPatternConstraint>,
+    /// Whether the connection is directed or undirected.
+    pub direction: crate::model::Direction,
     /// Whether this step uses explicit cycle punctuation.
     pub cycle: bool,
     /// The destination reference or constraint.

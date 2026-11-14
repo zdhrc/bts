@@ -400,8 +400,10 @@
 }]>>;
 
 # an incoming field is a requirement, its destination reference does not read it
-(patient_request:node) {
-    patient: {id: "p-456"},
+(patient_request:span {name: "Patient request"}) {
+    patient_id: context.patient_id,
+    patient: {id: self.patient_id},
+    description: "Patient ${self.patient_id}",
 }
     -[patient_delivery:patient_data {
         value: source.patient.id,
@@ -422,3 +424,64 @@
             [declared_a],
             [declared_b],
         ]>>(typed_result:span {name: "Collected results"});
+
+# undirected endpoints keep their authored positions when matched in reverse
++-[friendship::link {direction: "undirected", props: {weight: {type: "number"}}}]-;
+(graph_a:node) {affinity: 4, records: [|1, 2, 3|]};
+(graph_b:node) {affinity: 2};
+(graph_c:node);
+(graph_a)-[undirected_ab:friendship {weight: min(left.affinity, right.affinity)}]-(graph_b)
+    -[undirected_bc:friendship]-(graph_c);
+(graph_c)~[return_to_a:next]~>(graph_a);
+(undirected_refs:vars) {
+    connection: ?<(graph_b)-[@:friendship]-(graph_a)>,
+    authored_left: [undirected_ab].left,
+    authored_right: [undirected_ab].right,
+};
+
+# overlapping selections do not create containment or execution
+(undirected_network:network {
+    nodes: [|(graph_a), (graph_b), (graph_c)|],
+    edges: [|[undirected_ab], [undirected_bc]|],
+    acyclic: "underlying",
+    connected: "weak",
+    self_loops: false,
+    max_parallel: 1,
+    degree: {max: 2},
+});
+(materialized_network:network {
+    nodes: [|(graph_a), (graph_b), (graph_c)|],
+    edges: [|[undirected_ab], [undirected_bc], [return_to_a]|],
+    validate: "materialized",
+    connected: "strong",
+});
+
+# one relation identity joins two inputs to one output
+(conversion:relation {participants: {min: 3, max: 3}, inputs: {min: 2}, outputs: {min: 1}});
+(conversion)-[:incidence {role: "input"}]-(graph_a);
+(graph_b)-[:incidence {role: "input"}]-(conversion);
+(conversion)-[:incidence {role: "output"}]-(graph_c);
+
+# consumers sample weighted branches using their seeded evaluation context
+(graph_a)
+    =[:weighted {count: 1}]=>[
+        -[:next {weight: 3}]->(graph_b),
+        -[:next {weight: 1}]->(graph_c),
+    ];
+
+# each occurrence belongs to one group and reduce waits for explicit closure
+(graph_a)
+    =[record_batch:each {items: source.records, concurrency: 2}]=>[
+        -[processed:next]->(processor:node) {
+            value: context.item,
+            index: context.index,
+        },
+    ]
+        >[:reduce {
+            observe: "result",
+            initial: 0,
+            combine: context.accumulator + context.arrival.value,
+            order: "source",
+            on_failure: "fail",
+            on_cancel: "fail",
+        } [processed]]>>(total:node) {value: <-};

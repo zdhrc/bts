@@ -893,17 +893,17 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.declarations"),
-        summary: "The + marker introduces a root kind declaration. Its boundary identifies node, edge, fork or junction, and :: names its base. Bases resolve forward to declared kinds or built-in roots and primitives. Kind names are unique in a namespace separate from instance names, cannot shadow built-ins or reserved names, and cannot form inheritance cycles. Bases and instances must use the same construct category. A declaration-only module is valid. Derived kinds retain their base primitive validation and operation identity.",
+        summary: "The + marker introduces a root kind declaration. Its boundary identifies node, edge, fork or junction, and :: names its base. Bases resolve forward to declared kinds or built-in roots and primitives. Kind names must be unquoted identifiers in declarations, base references and instances. They are unique in a namespace separate from instance names, cannot shadow built-ins or reserved names, and cannot form inheritance cycles. Bases and instances must use the same construct category. A declaration-only module is valid. Derived kinds retain their base primitive validation and operation identity.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.schemas"),
-        summary: "Kind descriptors accept props and, for nodes, fields. Each maps names to descriptors with type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role is descriptive metadata, not an operation binding. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
+        summary: "Kind descriptors accept props and, for nodes, fields. Edge kind descriptors also accept direction with values directed, undirected or either. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. Each maps names to descriptors with type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role is descriptive metadata, not an operation binding. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.inheritance"),
-        summary: "Extensions inherit properties, fields, requiredness, defaults and roles. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict, while content fields remain open and extensible. Described content fields still receive type and requiredness checks. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
+        summary: "Extensions inherit properties, fields, requiredness, defaults and roles. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict, while content fields remain open and extensible. Described content fields still receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
     },
     RuleDesc {
         tags: &[],
@@ -917,18 +917,83 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     },
     RuleDesc {
         tags: &[],
+        id: Id::new("graph.direction"),
+        summary: "Ordinary connectors are -[headers]-> for directed edges and -[headers]- for undirected edges. Each declaration creates a distinct identity, including parallel edges and self-connections. The root edge kind, link and undeclared kinds permit either direction. next, requires, contains and feeds require directed edges. incidence requires undirected edges. Direction is an edge kind descriptor alongside props, not an instance property. Directed and undirected connections can coexist between the same nodes.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.network"),
+        summary: "A network is an ordinary node kind with required nodes and edges arrays of statically resolved references. Membership is explicit and unique. Every selected edge must have both endpoints in the node selection. Isolated nodes are allowed. A network creates no containment, copies, activation or implicit membership for itself. Overlapping selections are allowed. Constraints apply only to selected relationships, so a containment DAG and cyclic behavior may coexist.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.network-policy"),
+        summary: "Network properties are nodes, edges, validate, acyclic, connected, self_loops, max_parallel, incoming, outgoing and degree. validate is definition by default, materialized or both. Compilation always checks configuration and membership. Definition and both enforce structural constraints during compilation. Materialized and both require enforcement within each materialization group by a consumer, which must reject unsupported enforcement rather than silently skip it. Materialized membership expands selected definitions to their occurrences and connections within the same group.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.network-structure"),
+        summary: "acyclic is none by default, directed or underlying. directed requires all selected edges to be directed and prohibits directed cycles. underlying ignores direction but preserves distinct edge identities, so parallel edges and self-connections form cycles. connected is none by default, weak or strong. Weak ignores direction. Strong respects directed edges and traverses undirected edges either way. A singleton satisfies either connectivity requirement. An empty selection fails weak and strong connectivity.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.network-counts"),
+        summary: "self_loops defaults to true. False rejects selected connections from a node to itself, including loop-back edges. max_parallel is an optional nonnegative integer bound. Directed connections count by ordered endpoint pair and undirected connections by unordered pair, in separate categories. Kind and loop marker do not divide these counts. incoming and outgoing contain optional nonnegative integer min and max bounds for every selected node, counting directed edges only. degree has the same shape and counts undirected edges only. Parallel edges count separately. Directed self-connections contribute one to incoming and outgoing. Undirected self-connections contribute two to degree. Bounds are inclusive and min cannot exceed max. Omitted bounds are unrestricted.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.relations"),
+        summary: "relation nodes and incidence edges encode multi-party relationships without a new primitive. Each undirected incidence connects exactly one relation or relation-derived node to one participant. The role property is member by default, input or output. Member-only relationships are undirected. Directed relationships require at least one input and output and cannot mix member roles. Roles express relationship direction without initiating execution. Relation participants, inputs and outputs accept inclusive min and max incidence-count bounds. unique defaults to true and prohibits repeated participant identity within the same role, while allowing one participant to be both input and output. Separate relation nodes preserve distinct identities even with identical participants.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.weighted"),
+        summary: "weighted forks select count eligible branches without replacement. count is a positive integer defaulting to one. A branch weight is a finite nonnegative number specified on its edges, defaulting to one. All edges within one branch must have the same weight. A branch is eligible only when all its edge guards pass. Zero-weight and statically false branches cannot contribute to the available count. Compilation rejects insufficient potentially eligible branches. Known invalid counts and weights fail compilation. A runtime consumer evaluates dynamic counts, weights and guards, enforces the same bounds and branch-weight agreement, checks that enough positive-weight branches remain, then samples proportional to weights using its seeded context. Weighted selection is separate from exclusive guard disjointness.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.each"),
+        summary: "each forks require an items array expression. Known non-array values are rejected and runtime values must be checked by consumers. Every array item creates a distinct occurrence of every branch destination, retaining definition identity and ancestry. Destination context.item and context.index identify its item and zero-based index. Every listed branch participates, so branch guards are prohibited. An optional concurrency property is a positive integer, with runtime-dependent values checked by the consumer. Omission leaves scheduling unconstrained. Empty arrays create no branch occurrences. Compilation preserves the array expression and graph definitions rather than instantiating occurrences.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.observation"),
+        summary: "Built-in junctions accept observe: arrival by default or result. Arrival observes data delivered along a listed edge. Result observes the emitted payload of the destination occurrence reached through that edge, not every occurrence of its node definition. Consumers define payload production through authored values or registered operations. An undirected arrival records which endpoint it reached. Fork context identifies the branch destination. A standalone undirected arrival must carry its destination explicitly.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.groups"),
+        summary: "A fork activation creates an occurrence group. each tracks its item and branch occurrences separately. A group closes explicitly after all contributing occurrences settle, including failures and cancellations. Outside a fork a consumer must supply group identity and a closing event. Silence and elapsed time do not close groups implicitly. Independent groups are never combined implicitly. Definition identity, occurrence identity, ancestry, correlation and observation identity are distinct runtime responsibilities. An accumulate junction takes one observation per listed input within its group. reduce consumes repeated observations, including multiple occurrences of the same listed edge.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.reduce"),
+        summary: "reduce requires initial and combine. Each observation updates context.accumulator using combine, with the observed payload in context.arrival.value. Emit one result on explicit group closure. An empty group emits initial. order is source by default or arrival. Source order follows the stable logical occurrence order assigned by the producer, including each item index and branch position, independent of scheduling. Arrival order uses actual observation order and may vary with scheduling. Consumers must provide that ordering or reject the configuration. Compiler validation does not execute combination or group scheduling.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.failures"),
+        summary: "Built-in junction policies on_failure and on_cancel accept fail by default or skip. A failed required contributor prevents a successful group result under fail. Skip excludes the failed or cancelled contributor. Inactive unselected branches are not failures or cancellations. Skipped contributors cannot satisfy a quorum count, and an impossible quorum must fail when the group closes. A reduce with no surviving contributions emits initial. first and quorum may emit once their criteria are met and do not retroactively retract an emitted result due to unrelated later failures. Waiting junctions must account for inactive inputs explicitly rather than wait for observations that cannot occur.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("kind.contracts"),
+        summary: "Kind schemas describe configuration and data. Primitive validators enforce structural and value rules. Runtime operations are optional and are supplied by consumers. Derived kinds retain inherited validation and operation identity, and may add restrictions. A schema alone cannot give arbitrary properties executable meaning. Provider registry loading, package identity and executable operation registration remain separate integration work. Existing compilation retains the contracts needed by that work without executing consumer operations.",
+    },
+    RuleDesc {
+        tags: &[],
         id: Id::new("graph.lowering"),
         summary: "Compilation registers declarations before resolving endpoints and field dependencies. Each node, edge, fork and junction has a model-local identity. Names and source paths do not create implicit containment edges. Root and attached paths preserve authoring structure alongside the flattened graph tables.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("graph.fields"),
-        summary: "Undeclared kinds remain open identifiers without domain schemas. Declared kinds enforce strict property schemas while allowing additional content fields. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
+        summary: "Undeclared kinds remain open identifiers without domain schemas. The network, relation, incidence, weighted, each and reduce built-ins have fixed configuration properties, with additional properties introduced through kind extension. Declared kinds enforce strict property schemas while allowing additional content fields. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("graph.accessors"),
-        summary: "Node fields use node.field or (node).field, and self refers to the owning node. Every configurable element exposes .props. Edges expose .source, .target and residual .scope. Forks expose .source and .paths, with no singular target. Within edge properties, source and target resolve their endpoint nodes. Fork properties expose source.",
+        summary: "Node fields use node.field or (node).field, and self refers to the owning node. Every configurable element exposes .props. Directed edges expose .source and .target. Undirected edges expose .left and .right in authored order, independent of traversal or pattern orientation. Both expose residual .scope. Forks expose .source and .paths, with no singular target. Within directed edge properties, source and target resolve their endpoints. Within undirected edge properties, left and right resolve their endpoints. Using the wrong orientation accessors is an error. Fork properties expose source.",
     },
     RuleDesc {
         tags: &[],
@@ -948,7 +1013,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.cycles"),
-        summary: "Cycle punctuation preserves an explicit marker on the corresponding edges. Marked self-loops are valid. Compilation does not currently require a marked edge to close a cycle or require unmarked edges to form a DAG. Graph cycles do not permit circular field dependencies.",
+        summary: "Cycle punctuation explicitly marks directed loop-back behavior, independently of mathematical cycles. It always requires ~[headers]~> with an arrowhead. There is no undirected loop-back connector. Ordinary self-connections are allowed in either direction category. Compilation does not require a marked edge to close a topological cycle or require unmarked edges to form a DAG. Network acyclicity checks inspect all selected connections regardless of loop markers. Graph cycles do not permit circular field dependencies.",
     },
     RuleDesc {
         tags: &[],
@@ -958,7 +1023,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.pattern_constraints"),
-        summary: "A pattern contains exactly one @ selection marker on a typed node or edge constraint. Kinds and constant properties filter existing definitions. Runtime-dependent matching is rejected. Each edge constraint in a step matches a distinct edge with the same endpoints, respecting its ordinary or cycle connector. Patterns do not declare graph elements.",
+        summary: "A pattern contains exactly one @ selection marker on a typed node or edge constraint. Kinds and constant properties filter existing definitions. Runtime-dependent matching is rejected. Each edge constraint in a step matches a distinct edge with the same endpoints, respecting its direction and ordinary or loop-back connector. An undirected pattern matches either endpoint orientation while retaining the selected edge identity and authored left and right endpoints. Patterns do not declare graph elements.",
     },
     RuleDesc {
         tags: &[],
@@ -968,7 +1033,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.names"),
-        summary: "Named nodes, edges and forks share one document namespace. Forward references are resolved after declaration registration. The names self, source, target, context, true, false and null are reserved for contextual references and literals, including when quoted. They cannot name graph declarations or comprehension bindings. Property and content keys may use these names.",
+        summary: "Named nodes, edges and forks share one document namespace. Forward references are resolved after declaration registration. The names self, source, target, left, right, context, true, false and null are reserved for contextual references and literals, including when quoted. They cannot name graph declarations or comprehension bindings. Property and content keys may use these names.",
     },
     RuleDesc {
         tags: &[],
@@ -983,7 +1048,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.attachment"),
-        summary: "Indentation attaches selectors and junctions to forks. Selectors must select targets of their attached fork.",
+        summary: "Indentation attaches selectors and junctions to forks. Selectors must select the opposite endpoints of branches in their attached fork. Fork origin determines the branch destination even for undirected edges.",
     },
     RuleDesc {
         tags: &[],
@@ -1133,6 +1198,36 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
 ];
 const PRIMITIVES: &[PrimitiveDesc] = &[
     PrimitiveDesc {
+        name: "network",
+        construct: "node",
+        summary: "An explicit selection of nodes and edges with structural constraints. Definition checks run during compilation. Materialized checks are mandatory consumer obligations within each materialization group.",
+    },
+    PrimitiveDesc {
+        name: "relation",
+        construct: "node",
+        summary: "One multi-party relationship represented by incidence edges. Member incidences form an undirected relationship. Input and output incidences form a directed relationship with at least one of each. Membership does not imply execution.",
+    },
+    PrimitiveDesc {
+        name: "incidence",
+        construct: "edge",
+        summary: "Undirected membership between one relation node and one participant. The role property is member, input or output. Input and output roles describe the direction of the relationship, not execution along the incidence edge.",
+    },
+    PrimitiveDesc {
+        name: "weighted",
+        construct: "fork",
+        summary: "Select count eligible branches without replacement using nonnegative branch weights and the consumer seeded evaluation context. Count defaults to one and omitted weights to one. All edges in a branch must agree on weight and all their guards must pass. Runtime eligibility must leave enough positive-weight branches.",
+    },
+    PrimitiveDesc {
+        name: "each",
+        construct: "fork",
+        summary: "For each array item, instantiate every listed branch with a distinct destination occurrence. Item and index are available as context.item and context.index. Preserve definition identity separately from occurrence identity and group ancestry. The group closes after every contributing occurrence settles.",
+    },
+    PrimitiveDesc {
+        name: "reduce",
+        construct: "junction",
+        summary: "Fold repeated observations within one group using initial and combine. The combine expression reads context.accumulator and context.arrival.value. Emit once at explicit group closure, or initial for an empty group. Observation mode selects edge arrivals or destination occurrence results.",
+    },
+    PrimitiveDesc {
         name: "accumulate",
         construct: "junction",
         summary: "Collect one arrival from every listed input within a correlation group, then emit one grouped arrival to the target. Keep each input edge's data separately addressable. Repeated arrivals from one input do not satisfy another input.",
@@ -1155,7 +1250,7 @@ const PRIMITIVES: &[PrimitiveDesc] = &[
     PrimitiveDesc {
         name: "link",
         construct: "edge",
-        summary: "Directed adjacency between nodes. Establishes a relationship without prescribing activation or data transfer.",
+        summary: "Directed or undirected adjacency between nodes. Establishes a relationship without prescribing activation or data transfer.",
     },
     PrimitiveDesc {
         name: "next",
@@ -1300,13 +1395,13 @@ pub static SPEC: Spec = Spec {
         notation: "Typed graph elements with comma-separated properties and content fields.",
         grammar: r#"document = { (root_path | kind_declaration), ";" }
 kind_declaration = "+(", kind_schema, ")" | "+-[", kind_schema, "]-" | "+=[", kind_schema, "]=" | "+>[", kind_schema, "]>>"
-kind_schema = name, "::", kind, fields
+kind_schema = identifier, "::", kind, fields
 root_path = (node | junction), {edge | cycle}, [fork]
 attached_path = (selector | junction), {edge | cycle}, [fork]
 node = "(", header, ")", [fields] | "(", reference_expression, ")"
 header = [name], ":", kind, [fields]
 headers = header, {",", header}, [","]
-edge = "-[", headers, "]->", node
+edge = "-[", headers, ("]->" | "]-"), node
 cycle = "~[", headers, "]~>", node
 fork = "=[", header, "]=>[", edge, {",", edge}, [","], "]", {attached_path}
 selector = "->(", reference_expression, ")"
@@ -1319,7 +1414,7 @@ kind = identifier
 edge_reference = "[", reference_expression, "]", {".[", name, "]"}
 pattern = "?<", pattern_node, {pattern_step}, ">"
 pattern_node = "(", reference_expression, ")" | "(", ["@"], ":", kind, [fields], ")"
-pattern_step = ("-[", pattern_headers, "]->" | "~[", pattern_headers, "]~>"), pattern_node
+pattern_step = ("-[", pattern_headers, ("]->" | "]-") | "~[", pattern_headers, "]~>"), pattern_node
 pattern_headers = pattern_header, {",", pattern_header}, [","]
 pattern_header = ["@"], ":", kind, [fields]
 array = "[|", [expression, {",", expression}, [","]], "|]"
@@ -1349,10 +1444,10 @@ reference_expression = expression
             "One selector or junction may continue a fork on the same line. Another sibling requires a new aligned line. Its attachment is to the enclosing fork, never the preceding sibling's final node.",
             "The <- marker is legal only as the entire value of a direct instance node content field. It is not an expression and is forbidden in properties, nested objects, arrays and schema descriptors.",
             "Node bodies contain only fields. Node declarations are legal at path origins and connection targets. No declarations occur in expression values or properties. Empty node parentheses are invalid.",
-            "Fork entries contain exactly one ordinary edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
+            "Fork entries contain exactly one ordinary directed or undirected edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
             "Root paths require semicolons. Internal entries require commas between entries on one line or multiple lines. A trailing comma is optional, including for a single entry. Array and object spreads use ...expression in an entry position.",
             "References use parentheses and brackets, arrays use [| |], expression grouping uses ${ }.",
-            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Kind declarations provide local schemas and same-category extension. Package loading and runtime operation registration remain future work.",
+            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Kind declarations provide local schemas and same-category extension. Package loading and runtime operation registration remain future work. Schema declarations do not install executable behavior. Consumers must honor inherited primitive contracts or explicitly reject unsupported capabilities.",
         ],
     },
     expressions: EXPRESSIONS,

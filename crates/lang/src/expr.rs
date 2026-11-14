@@ -137,12 +137,13 @@ enum Iteration {
 #[derive(Clone)]
 pub(crate) struct ReferenceValue {
     pub value: Value,
-    pub bindings: Vec<(BindingId, Value)>,
+    pub bindings: Vec<(BindingId, Value, FieldType)>,
 }
 type Resolver<'a> = dyn FnMut(ast::Expr) -> Result<ReferenceValue, Diags> + 'a;
 struct ExpressionModeler<'a> {
     scopes: Vec<Scope>,
     vars: HashMap<BindingId, Folded>,
+    types: HashMap<BindingId, FieldType>,
     errors: Errors,
     reference_errors: Diags,
     resolve: &'a mut Resolver<'a>,
@@ -165,7 +166,8 @@ impl<'a> ExpressionModeler<'a> {
         let range = expr.range;
         match (self.resolve)(expr) {
             Ok(reference) => {
-                for (id, value) in reference.bindings {
+                for (id, value, ty) in reference.bindings {
+                    self.types.insert(id, ty);
                     self.vars.insert(id, folded_value(value, range));
                 }
                 Some(folded_value(reference.value, range))
@@ -1203,6 +1205,23 @@ impl<'a> ExpressionModeler<'a> {
     }
 
     fn check_operand(&mut self, operand: &Folded, required: StaticType, op: String) -> bool {
+        if let FoldedKind::Value(value) = &operand.kind {
+            match value {
+                Value::Cond { then, otherwise, .. } => {
+                    let then = folded_value((**then).clone(), operand.range);
+                    let otherwise = folded_value((**otherwise).clone(), operand.range);
+                    let left = self.check_operand(&then, required, op.clone());
+                    let right = self.check_operand(&otherwise, required, op);
+                    return left && right;
+                }
+                Value::BindingRef(id) if self.types.get(id).and_then(|ty| schema_static_type(*ty)).is_none() => {
+                    if let Some(value) = self.vars.get(id).cloned() {
+                        return self.check_operand(&value, required, op);
+                    }
+                }
+                _ => {}
+            }
+        }
         if self.static_type(operand) == Some(required) || self.defers_to_evaluation(operand) {
             return true;
         }
@@ -2228,10 +2247,11 @@ impl<'a> ExpressionModeler<'a> {
             Value::Array(_) => Some(StaticType::Array),
             Value::Object(_) | Value::Attachment { .. } => Some(StaticType::Object),
             // a binding is typed by its definition
-            Value::BindingRef(name) => {
-                let value = self.var_value(name)?;
-                self.static_type(value)
-            }
+            Value::BindingRef(name) => self
+                .types
+                .get(name)
+                .and_then(|ty| schema_static_type(*ty))
+                .or_else(|| self.vars.get(name).and_then(|value| self.static_type(value))),
             // a referenced field's shape is only known at evaluation
             Value::GraphRef { .. } => Some(StaticType::Graph),
             Value::Context { .. } => None,
@@ -3054,6 +3074,7 @@ pub(crate) fn lower(expr: ast::Expr, resolve: &mut Resolver<'_>) -> Result<Value
     let mut modeler = ExpressionModeler {
         scopes: Vec::new(),
         vars: HashMap::new(),
+        types: HashMap::new(),
         errors: Vec::new(),
         reference_errors: Vec::new(),
         resolve,
@@ -3110,12 +3131,14 @@ fn with_value(
     let mut modeler = ExpressionModeler {
         scopes: Vec::new(),
         vars: HashMap::new(),
+        types: HashMap::new(),
         errors: Vec::new(),
         reference_errors: Vec::new(),
         resolve: &mut resolve,
     };
     let bindings = value.bindings.clone();
-    for (id, shape) in &bindings {
+    for (id, shape, ty) in &bindings {
+        modeler.types.insert(*id, *ty);
         modeler.vars.insert(*id, folded_value(shape.clone(), range));
     }
     let result = operation(&mut modeler, folded_value(value.value, range));
@@ -3155,14 +3178,20 @@ pub(crate) fn slice(
         )
     })
 }
-pub(crate) fn schema_type(value: ReferenceValue, ty: FieldType, range: SrcRange) -> Result<(), Diags> {
-    let expected = match ty {
-        FieldType::Any => return Ok(()),
+fn schema_static_type(ty: FieldType) -> Option<StaticType> {
+    Some(match ty {
+        FieldType::Any => return None,
         FieldType::String => StaticType::String,
         FieldType::Number => StaticType::Number,
         FieldType::Boolean => StaticType::Boolean,
         FieldType::Array => StaticType::Array,
         FieldType::Object => StaticType::Object,
+    })
+}
+
+pub(crate) fn schema_type(value: ReferenceValue, ty: FieldType, range: SrcRange) -> Result<(), Diags> {
+    let Some(expected) = schema_static_type(ty) else {
+        return Ok(());
     };
     with_value(value, range, |modeler, value| {
         modeler.check_operand(&value, expected, "schema".to_owned()).then_some(value)

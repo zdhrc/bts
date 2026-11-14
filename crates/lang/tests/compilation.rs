@@ -508,7 +508,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 39);
+    assert_eq!(graph.paths.len(), 53);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -687,7 +687,7 @@ fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
                 .join("\n")
         )
     });
-    assert_eq!(model.paths.len(), 39);
+    assert_eq!(model.paths.len(), 53);
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
     assert!(model.forks.len() > 5);
@@ -1123,8 +1123,8 @@ fn resolves_graph_identities_through_collections_and_static_expressions() {
 #[test]
 fn resolves_edge_expressions_and_stored_fork_paths() {
     let model = compiled(
-        r#"(a:task) =[split:parallel]=>[-[left:next {limit: 3}]->(:task), -[right:next]->(:task)];
-        (refs:vars) {paths: [split].paths, edges: [|[left], [right]|], alias: self.edges[0]};
+        r#"(a:task) =[split:parallel]=>[-[input_left:next {limit: 3}]->(:task), -[input_right:next]->(:task)];
+        (refs:vars) {paths: [split].paths, edges: [|[input_left], [input_right]|], alias: self.edges[0]};
         (refs.paths[0][0].target)-[follow:next {limit: [refs.alias].props.limit}]->(b:task);
         >[:accumulate [refs.alias], [refs.edges[1]]]>>(b);"#,
     );
@@ -1145,9 +1145,9 @@ fn resolves_edge_expressions_and_stored_fork_paths() {
 #[test]
 fn keeps_junction_properties_separate_from_destination_properties() {
     let source = r#"(config:vars) {policy: "all"};
-        (a:task) =[f:parallel]=>[-[left:next]->(b:task), -[right:next]->(c:task)]
-            >[:accumulate {mode: config.policy, correlate: context.request_id} [left], [right]]>>(d:task {accumulate: "each"});
-        >[:custom {custom: [right].target} [left]]>>(d);"#;
+        (a:task) =[f:parallel]=>[-[input_left:next]->(b:task), -[input_right:next]->(c:task)]
+            >[:accumulate {mode: config.policy, correlate: context.request_id} [input_left], [input_right]]>>(d:task {accumulate: "each"});
+        >[:custom {custom: [input_right].target} [input_left]]>>(d);"#;
     let ast = parse(source).unwrap();
     let GraphOrigin::Junction(junction) = &fork(&ast.paths[1].steps[0]).continuations[0].start else {
         panic!()
@@ -1255,9 +1255,9 @@ fn proves_common_exclusive_conditions_and_preserves_independent_draws() {
 #[test]
 fn requires_typed_junctions_with_enclosed_properties() {
     for source in [
-        ">[[left], [right]]>>(target);",
-        ">[[left], [right]] {mode: \"all\"}->(target);",
-        ">[:accumulate [left], [right]] {mode: \"all\"}->(target);",
+        ">[[input_left], [input_right]]>>(target);",
+        ">[[input_left], [input_right]] {mode: \"all\"}->(target);",
+        ">[:accumulate [input_left], [input_right]] {mode: \"all\"}->(target);",
         ">[:accumulate {}]>>(target);",
     ] {
         assert!(parse(source).is_err(), "{source}");
@@ -1281,13 +1281,20 @@ fn registers_edge_primitives_without_closing_consumer_kinds() {
 
 #[test]
 fn validates_builtin_junction_configuration() {
-    let definitions = "(a:task)-[left:link]->(b:task); (a)-[right:link]->(c:task);";
+    let definitions = "(a:task)-[input_left:link]->(b:task); (a)-[input_right:link]->(c:task);";
     for kind in ["accumulate", "merge", "first", "quorum"] {
         assert!(bts_lang::spec::SPEC.primitive("junction", kind).is_some());
         let props = if kind == "quorum" { "{count: 2}" } else { "{}" };
-        let model = compiled(&format!("{definitions} >[:{kind} {props} [left], [right]]>>(d:task);"));
+        let model = compiled(&format!(
+            "{definitions} >[:{kind} {props} [input_left], [input_right]]>>(d:task);"
+        ));
         assert_eq!(model.junctions[0].kind, kind);
-        assert!(compile(&format!("{definitions} >[:{kind} {props} [left], [left]]>>(d:task);")).is_err());
+        assert!(
+            compile(&format!(
+                "{definitions} >[:{kind} {props} [input_left], [input_left]]>>(d:task);"
+            ))
+            .is_err()
+        );
     }
     for props in [
         "{}",
@@ -1297,10 +1304,15 @@ fn validates_builtin_junction_configuration() {
         "{count: context.count}",
         "{count: range(1, 2)}",
     ] {
-        assert!(compile(&format!("{definitions} >[:quorum {props} [left], [right]]>>(d:task);")).is_err());
+        assert!(
+            compile(&format!(
+                "{definitions} >[:quorum {props} [input_left], [input_right]]>>(d:task);"
+            ))
+            .is_err()
+        );
     }
     compiled(&format!(
-        "{definitions} (config:vars) {{count: 1 + 1}}; >[:quorum {{count: config.count}} [left], [right]]>>(d:task);"
+        "{definitions} (config:vars) {{count: 1 + 1}}; >[:quorum {{count: config.count}} [input_left], [input_right]]>>(d:task);"
     ));
 }
 
@@ -1308,7 +1320,7 @@ fn validates_builtin_junction_configuration() {
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     use bts_lang::{Construct, ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.kinds.len(), 5);
+    assert_eq!(ast.kinds.len(), 6);
     assert_eq!(ast.kinds[0].construct, Construct::Node);
     assert_eq!(ast.kinds[2].construct, Construct::Edge);
     assert_eq!(ast.kinds[3].construct, Construct::Fork);
@@ -1317,6 +1329,11 @@ fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     assert!(matches!(marker.kind, ExprKind::Upstream));
     assert_eq!(&COMPILATION_SOURCE[marker.range.start..marker.range.end], "<-");
     let model = compiled(COMPILATION_SOURCE);
+    assert_eq!(binding(&model, "patient_request", "patient_id").ty, FieldType::String);
+    assert!(matches!(
+        binding(&model, "patient_request", "description").value,
+        Value::Template(_)
+    ));
     let span = model.kind_names["span"];
     let lookup = &model.kinds[model.kind_names["patient_lookup"].0];
     assert_eq!(lookup.base_kind, Some(span));
@@ -1356,7 +1373,7 @@ fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
             .iter()
             .any(|kind| kind.name == "patient_data" && kind.primitive == "feeds")
     );
-    assert_eq!(model.junctions.last().unwrap().kind, "patient_join");
+    assert!(model.junctions.iter().any(|junction| junction.kind == "patient_join"));
 }
 
 #[test]
@@ -1509,4 +1526,328 @@ fn upstream_requirements_suppress_defaults_and_allow_alternative_suppliers() {
         .collect();
     assert_eq!(destinations[0], destinations[1]);
     assert!(matches!(binding(&model, "b", "text").value, Value::Template(_)));
+}
+
+#[test]
+fn preserves_schema_types_through_context_and_aliases() {
+    let schema = r#"+(record::node {props: {label: {type: "string"}}, fields: {id: {type: "string"}}});"#;
+    let model = compiled(&format!(
+        r#"{schema} (a:record {{label: context.label}}) {{id: context.id, alias: self.id, text: "${{self.alias}} ${{self.props.label}}"}};"#
+    ));
+    assert_eq!(binding(&model, "a", "id").ty, bts_lang::FieldType::String);
+    assert!(matches!(binding(&model, "a", "id").value, Value::Context { .. }));
+    for expression in ["self.id + 1", "self.alias + 1", "self.props.label + 1"] {
+        let source =
+            format!("{schema} (a:record {{label: context.label}}) {{id: context.id, alias: self.id, bad: {expression}}};");
+        let errors = compile(&source).unwrap_err();
+        assert!(
+            errors.iter().any(|error| error.what.contains("number operands")),
+            "{errors:?}"
+        );
+    }
+    let source = format!(
+        r#"{schema} +(receiver::node {{fields: {{id: {{type: "number"}}}}}});
+        (a:record) {{id: context.id}} -[:feeds {{value: source.id, into: target.id}}]->(b:receiver) {{id: <-}};"#
+    );
+    assert!(
+        compile(&source)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.what.contains("number operands"))
+    );
+}
+
+#[test]
+fn checks_every_possible_conditional_type() {
+    let schema = r#"+(record::node {fields: {id: {type: "string"}}});"#;
+    for value in [
+        "context.flag ? \"yes\" : 42",
+        "context.flag ? 42 : \"yes\"",
+        "context.flag ? context.value : 42",
+        "context.flag ? \"yes\" : context.other ? \"no\" : 42",
+    ] {
+        let errors = compile(&format!("{schema} (a:record) {{id: {value}}};")).unwrap_err();
+        assert!(
+            errors.iter().any(|error| error.what.contains("string operands")),
+            "{errors:?}"
+        );
+    }
+    for guard in ["context.flag ? true : 1", "source.guard"] {
+        let source =
+            format!("(a:node) {{guard: context.flag ? true : 1}} =[:conditional]=>[-[:next {{when: {guard}}}]->(b:node)];");
+        assert!(
+            compile(&source)
+                .unwrap_err()
+                .iter()
+                .any(|error| error.what.contains("boolean operands"))
+        );
+    }
+    compiled(&format!("{schema} (a:record) {{id: context.flag ? \"yes\" : context.id}};"));
+    compiled(&format!("{schema} (a:record) {{id: true ? \"yes\" : 42}};"));
+}
+
+#[test]
+fn requires_identifier_kind_names_for_every_construct() {
+    for (open, close, base) in [
+        ("+(", ")", "node"),
+        ("+-[", "]-", "edge"),
+        ("+=[", "]=", "fork"),
+        ("+>[", "]>>", "junction"),
+    ] {
+        compiled(&format!("{open}patient_kind::{base} {{}}{close};"));
+        for name in ["\"patient span\"", "\"patient_kind\""] {
+            let errors = parse(&format!("{open}{name}::{base} {{}}{close};")).unwrap_err();
+            assert!(errors.iter().all(|error| error.when == DiagPhase::Parsing));
+        }
+    }
+}
+
+#[test]
+fn undirected_edges_match_in_reverse_without_changing_endpoint_identity() {
+    use bts_lang::{Direction, ElementId};
+    let source = r#"
+        (a:node) {value: 2}; (b:node) {value: 3};
+        (a)-[ab:link {sum: left.value + right.value}]-(b);
+        (refs:node) {edge: ?<(b)-[@:link]-(a)>, l: [ab].left, r: [ab].right};
+    "#;
+    let ast = parse(source).unwrap();
+    assert_eq!(edge(&ast.paths[2].steps[0]).direction, Direction::Undirected);
+    let model = compiled(source);
+    assert_eq!(model.edges[0].direction, Direction::Undirected);
+    let Value::GraphRef { ref_id, .. } = binding(&model, "refs", "edge").value else {
+        panic!()
+    };
+    assert_eq!(model.refs[ref_id.0].target, model.names["ab"]);
+    for (field, endpoint) in [("l", "a"), ("r", "b")] {
+        let Value::GraphRef { ref_id, .. } = binding(&model, "refs", field).value else {
+            panic!()
+        };
+        assert_eq!(model.refs[ref_id.0].target, model.names[endpoint]);
+    }
+    assert_eq!(model.names["ab"], ElementId::Edge(bts_lang::EdgeId(0)));
+    for wrong in ["[ab].source", "[ab].target"] {
+        assert!(compile(&format!("{source} (bad:node) {{value: {wrong}}};")).is_err());
+    }
+    assert!(compile(&format!("{source} (bad:node) {{value: ?<(a)-[@:link]->(b)>}};")).is_err());
+    compiled("(a:node)-[:link]-(a); (a)~[:link]~>(a);");
+    assert!(parse("(a:node)~[:link]~(a);").is_err());
+    assert!(compile("(a:node)-[:link {value: source} ]-(b:node);").is_err());
+    assert!(compile("(a:node)-[:link {value: left} ]->(b:node);").is_err());
+}
+
+#[test]
+fn inherits_and_narrows_edge_direction_allowances() {
+    use bts_lang::Directions;
+    let model = compiled(
+        r#"
+        +-[friendship::link {direction: "undirected"}]-;
+        +-[close_friend::friendship {}]-;
+        (a:node)-[:close_friend]-(b:node);
+        (a)-[:custom]-(b); (a)-[:custom]->(b);
+    "#,
+    );
+    assert_eq!(
+        model.kinds[model.kind_names["close_friend"].0].direction,
+        Some(Directions::Undirected)
+    );
+    for source in [
+        "+-[bad::next {direction: \"either\"}]-;",
+        "+-[base::link {direction: \"undirected\"}]-; +-[bad::base {direction: \"directed\"}]-;",
+        "+(bad::node {direction: \"either\"});",
+        "+-[bad::link {direction: \"sideways\"}]-;",
+        "(a:node)-[:next]-(b:node);",
+        "(a:node)-[:feeds]-(b:node);",
+        "+-[friendship::link {direction: \"undirected\"}]-; (a:node)~[:friendship]~>(a);",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+    compiled("(a:node) =[:parallel]=>[-[ab:link]-(b:node)] ->(b)-[:next]->(c:node);");
+    compiled("(a:node) =[:parallel]=>[-[ab:link]-(b:node)] >[:accumulate [ab]]>>(c:node);");
+}
+
+#[test]
+fn validates_explicit_network_membership_and_preserves_runtime_obligations() {
+    use bts_lang::ValidationStage;
+    let definitions = "(a:node)-[ab:link]->(b:node); (c:node);";
+    for properties in [
+        "nodes: [|(a)|], edges: [|[ab]|]",
+        "nodes: [|(a), (b), (a)|], edges: [|[ab]|]",
+        "nodes: [|(a), (b)|], edges: [|[ab], [ab]|]",
+        "nodes: [|[ab]|], edges: [||]",
+        "nodes: [|(a), (b)|], edges: [|(a)|]",
+        "nodes: [|(a)|]",
+        "nodes: context.nodes, edges: [||]",
+        "nodes: [|(a)|], edges: [||], connected: \"maybe\"",
+        "nodes: [|(a)|], edges: [||], incoming: {max: -1}",
+        "nodes: [|(a)|], edges: [||], degree: {min: 2, max: 1}",
+        "nodes: [|(a)|], edges: [||], outgoing: {limit: 1}",
+        "nodes: [|(a)|], edges: [||], validate: \"later\"",
+        "nodes: [|(a)|], edges: [||], self_loops: 1",
+        "nodes: [|(a)|], edges: [||], max_parallel: 1.5",
+        "nodes: [|(a)|], edges: [||], unknown: true",
+    ] {
+        let source = format!("{definitions} (g:network {{{properties}}});");
+        assert!(compile(&source).is_err(), "{source}");
+    }
+    for (stage, valid) in [("definition", false), ("both", false), ("materialized", true)] {
+        let source = format!(
+            "{definitions} (g:network {{nodes: [|(a), (b), (c)|], edges: [|[ab]|], connected: \"weak\", validate: \"{stage}\"}});"
+        );
+        let result = compile(&source);
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+        if let Ok(model) = result {
+            assert_eq!(model.networks[0].validate, ValidationStage::Materialized);
+        }
+    }
+    let model = compiled(&format!(
+        "{definitions} (g:network {{nodes: [|(a), (b), (c)|], edges: [|[ab]|]}});"
+    ));
+    assert_eq!(model.networks[0].nodes.len(), 3);
+    assert_eq!(model.networks[0].edges.len(), 1);
+}
+
+#[test]
+fn checks_network_cycles_connectivity_and_multigraph_counts() {
+    for (edges, rule, valid) in [
+        (
+            "(a)-[ab:link]->(b); (b)-[bc:link]->(c);",
+            "acyclic: \"directed\", connected: \"weak\", incoming: {max: 1}",
+            true,
+        ),
+        ("(a)-[ab:link]->(b); (b)-[bc:link]->(c);", "connected: \"strong\"", false),
+        (
+            "(a)-[ab:link]-(b); (b)-[bc:link]-(c);",
+            "acyclic: \"underlying\", connected: \"strong\", degree: {min: 1, max: 2}",
+            true,
+        ),
+        ("(a)-[ab:link]-(b); (b)-[bc:link]-(c);", "acyclic: \"directed\"", false),
+        ("(a)-[ab:link]->(b); (b)~[bc:link]~>(a);", "acyclic: \"directed\"", false),
+        ("(a)-[ab:link]->(b); (a)-[bc:link]->(b);", "acyclic: \"directed\"", true),
+        ("(a)-[ab:link]->(b); (a)-[bc:link]->(b);", "acyclic: \"underlying\"", false),
+        ("(a)-[ab:link]-(b); (b)-[bc:link]-(a);", "max_parallel: 1", false),
+        ("(a)-[ab:link]->(b); (b)-[bc:link]->(a);", "max_parallel: 1", true),
+        ("(a)-[ab:link]->(b); (a)-[bc:link]-(b);", "max_parallel: 1", true),
+        ("(a)-[ab:link]->(c); (b)-[bc:link]->(c);", "incoming: {max: 1}", false),
+        ("(a)-[ab:link]->(b); (a)-[bc:link]->(c);", "outgoing: {max: 1}", false),
+        ("(a)-[ab:link]-(a); (b)-[bc:link]-(c);", "self_loops: false", false),
+        ("(a)-[ab:link]-(a); (b)-[bc:link]-(c);", "degree: {max: 1}", false),
+        ("(a)-[ab:link]-(a); (b)-[bc:link]-(c);", "degree: {max: 2}", true),
+        (
+            "(a)-[ab:link]->(a); (b)-[bc:link]->(c);",
+            "incoming: {max: 1}, outgoing: {max: 1}",
+            true,
+        ),
+    ] {
+        let source = format!(
+            "(a:node); (b:node); (c:node); {edges} (g:network {{nodes: [|(a), (b), (c)|], edges: [|[ab], [bc]|], {rule}}});"
+        );
+        assert_eq!(compile(&source).is_ok(), valid, "{source}");
+    }
+    for connected in ["weak", "strong"] {
+        assert!(
+            compile(&format!(
+                "(g:network {{nodes: [||], edges: [||], connected: \"{connected}\"}});"
+            ))
+            .is_err()
+        );
+        compiled(&format!(
+            "(a:node); (g:network {{nodes: [|(a)|], edges: [||], connected: \"{connected}\"}});"
+        ));
+    }
+    compiled(
+        "(a:node)-[ab:contains]->(b:node)~[:next]~>(a); (g:network {nodes: [|(a), (b)|], edges: [|[ab]|], acyclic: \"directed\"});",
+    );
+}
+
+#[test]
+fn relation_incidence_roles_preserve_hyperedge_identity() {
+    compiled(
+        r#"
+        +(conversion::relation {props: {label: {type: "string"}}});
+        +-[participant::incidence {}]-;
+        (r:conversion {label: "convert", inputs: {min: 2}, outputs: {min: 1}, participants: {max: 3}});
+        (a:node)-[:participant {role: "input"}]-(r);
+        (r)-[:participant {role: "input"}]-(b:node);
+        (r)-[:participant {role: "output"}]-(c:node);
+    "#,
+    );
+    compiled("(r:relation); (r)-[:incidence]-(a:node); (s:relation); (s)-[:incidence]-(a);");
+    for source in [
+        "(a:node)-[:incidence]-(b:node);",
+        "(a:relation)-[:incidence]-(b:relation);",
+        "(r:relation)-[:incidence]->(a:node);",
+        "(r:relation)-[:incidence {role: \"input\"}]-(a:node);",
+        "(r:relation)-[:incidence {role: \"bad\"}]-(a:node);",
+        "(r:relation)-[:incidence]-(a:node); (r)-[:incidence]-(a);",
+        "(r:relation {participants: {min: 1}});",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+    compiled("(r:relation {unique: false})-[:incidence]-(a:node); (r)-[:incidence]-(a);");
+}
+
+#[test]
+fn weighted_each_and_reduce_validate_configuration_without_executing() {
+    for (props, weights, valid) in [
+        ("count: 1", "3", true),
+        ("count: 2", "3", true),
+        ("count: 3", "3", false),
+        ("count: 0", "3", false),
+        ("count: 1", "-1", false),
+        ("count: 2", "0", false),
+        ("count: 1", "\"heavy\"", false),
+        ("count: context.count", "1", true),
+    ] {
+        let source = format!(
+            "(a:node) =[:weighted {{{props}}}]=>[-[:next {{weight: {weights}}}]->(b:node), -[:next {{weight: 1}}]->(c:node)];"
+        );
+        assert_eq!(compile(&source).is_ok(), valid, "{source}");
+    }
+    compiled("(a:node) =[:weighted]=>[-[:link {weight: 2}, :link {weight: 2}]-(b:node)];");
+    compiled("(a:node) =[:weighted {count: context.count}]=>[-[:next {weight: context.weight}]->(b:node)];");
+    compiled("(a:node) =[:weighted]=>[-[:link {when: context.flag}, :link {when: true}]-(b:node)];");
+    compiled("(a:node) =[:each {items: context.items, concurrency: context.limit}]=>[-[:next]->(b:node)];");
+    assert!(compile("(a:node) =[:weighted]=>[-[:next {when: false}]->(b:node)];").is_err());
+    assert!(compile("(a:node) =[:weighted]=>[-[:link {weight: 1}, :link {weight: 2}]-(b:node)];").is_err());
+    for props in ["", "{items: 1}", "{items: [||], concurrency: 0}"] {
+        assert!(compile(&format!("(a:node) =[:each {props}]=>[-[:next]->(b:node)];")).is_err());
+    }
+    let source = r#"
+        +=[batch::each {}]=; +>[sum::reduce {}]>>;
+        (a:node) =[work:batch {items: context.records}]=>[-[done:next]->(b:node) {item: context.item, index: context.index}]
+            >[:sum {observe: "result", initial: 0, combine: context.accumulator + context.arrival.value, on_failure: "skip"} [done]]>>(c:node);
+    "#;
+    let model = compiled(source);
+    assert_eq!(model.nodes.len(), 3);
+    assert_eq!(model.forks[0].kind, "batch");
+    assert_eq!(model.junctions[0].kind, "sum");
+    for props in [
+        "initial: 0",
+        "combine: context.value",
+        "initial: 0, combine: 1, observe: \"node\"",
+        "initial: 0, combine: 1, on_failure: \"ignore\"",
+        "initial: 0, combine: 1, order: \"random\"",
+    ] {
+        let source = format!("(a:node)-[ab:next]->(b:node); >[:reduce {{{props}}} [ab]]>>(c:node);");
+        assert!(compile(&source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn fixture_covers_networks_hyperrelations_and_runtime_kind_contracts() {
+    let model = compiled(COMPILATION_SOURCE);
+    assert_eq!(model.networks.len(), 2);
+    assert_eq!(model.networks[0].acyclic, bts_lang::Acyclic::Underlying);
+    assert_eq!(model.networks[1].validate, bts_lang::ValidationStage::Materialized);
+    assert!(
+        model
+            .edges
+            .iter()
+            .any(|edge| edge.direction == bts_lang::Direction::Undirected)
+    );
+    for kind in ["weighted", "each"] {
+        assert!(model.forks.iter().any(|fork| fork.kind == kind));
+    }
+    assert!(model.junctions.iter().any(|junction| junction.kind == "reduce"));
+    assert_eq!(model.edges.iter().filter(|edge| edge.kind == "incidence").count(), 3);
 }

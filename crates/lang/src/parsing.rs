@@ -25,7 +25,7 @@ macro_rules! token {
 
 // words with meaning in expression positions, rejected as loop binding names
 const RESERVED_WORDS: &[&str] = &[
-    "true", "false", "null", "var", "for", "in", "if", "self", "source", "target", "context",
+    "true", "false", "null", "var", "for", "in", "if", "self", "source", "target", "left", "right", "context",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,7 +96,7 @@ impl<'src> Parser<'src> {
                 return None;
             }
         };
-        let name = self.parse_graph_name()?;
+        let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
         self.expect(token!(DoubleColon), ErrorKind::UnexpectedToken)?;
         let base = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
         let schema = self.parse_graph_fields()?;
@@ -354,15 +354,12 @@ impl<'src> Parser<'src> {
                 edges.push(self.parse_pattern_constraint()?);
             }
             self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
-            if cycle {
-                self.expect(token!(CycleArrow), ErrorKind::UnexpectedToken)?;
-            } else {
-                self.expect(token!(Arrow), ErrorKind::UnexpectedToken)?;
-            }
+            let direction = self.parse_connection_direction(cycle)?;
             let target = self.parse_pattern_node()?;
             selections += edges.iter().filter(|edge| edge.selected).count() + selected_node(&target);
             steps.push(GraphPatternStep {
                 edges,
+                direction,
                 cycle,
                 target,
                 range: SrcRange::new(step_start, self.tokens[self.index - 1].range.end),
@@ -501,6 +498,18 @@ impl<'src> Parser<'src> {
         Some(fields)
     }
 
+    fn parse_connection_direction(&mut self, cycle: bool) -> Option<crate::model::Direction> {
+        if cycle {
+            self.expect(token!(CycleArrow), ErrorKind::UnexpectedToken)?;
+            Some(crate::model::Direction::Directed)
+        } else if self.consume(token!(Minus)).is_some() {
+            Some(crate::model::Direction::Undirected)
+        } else {
+            self.expect(token!(Arrow), ErrorKind::UnexpectedToken)?;
+            Some(crate::model::Direction::Directed)
+        }
+    }
+
     fn parse_graph_edge(&mut self) -> Option<GraphEdgeStep> {
         let start = self.peek().range.start;
         let cycle = self.next().kind == TokenKind::Tilde;
@@ -510,15 +519,12 @@ impl<'src> Parser<'src> {
             edges.push(self.parse_graph_header()?);
         }
         self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
-        if cycle {
-            self.expect(token!(CycleArrow), ErrorKind::UnexpectedToken)?;
-        } else {
-            self.expect(token!(Arrow), ErrorKind::UnexpectedToken)?;
-        }
+        let direction = self.parse_connection_direction(cycle)?;
         let target = self.parse_graph_node()?;
         let end = self.tokens[self.index - 1].range.end;
         Some(GraphEdgeStep {
             edges,
+            direction,
             cycle,
             target,
             range: SrcRange::new(start, end),
