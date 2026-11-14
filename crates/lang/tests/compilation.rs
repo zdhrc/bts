@@ -398,7 +398,7 @@ fn attaches_nested_selectors_to_their_indentation_level() {
 
 #[test]
 fn attaches_overlapping_junctions_as_siblings() {
-    let source = "(a)=[:parallel]=>[\n    -[to_b:next]->(b),\n    -[to_c:next]->(c),\n    -[to_d:next]->(d),\n]\n    >>[[to_b], [to_c]]->(e)\n    >>[[to_c], [to_d]]->(f);";
+    let source = "(a)=[:parallel]=>[\n    -[to_b:next]->(b),\n    -[to_c:next]->(c),\n    -[to_d:next]->(d),\n]\n    >>[:accumulate [to_b], [to_c]]->(e)\n    >>[:accumulate [to_c], [to_d]]->(f);";
     let graph = parse(source).unwrap();
     let fork = fork(&graph.paths[0].steps[0]);
     assert_eq!(fork.entries.len(), 3);
@@ -414,7 +414,8 @@ fn attaches_overlapping_junctions_as_siblings() {
 
 #[test]
 fn parses_root_junctions_with_qualified_inputs_and_following_edges() {
-    let source = ">>[[checks].[coverage], [records],]->(ready:task) {input: [records].scope}\n    -[:next]->(finish);";
+    let source =
+        ">>[:accumulate [checks].[coverage], [records],]->(ready:task) {input: [records].scope}\n    -[:next]->(finish);";
     let graph = parse(source).unwrap();
     let GraphOrigin::Junction(junction) = &graph.paths[0].start else {
         panic!("expected junction")
@@ -427,7 +428,7 @@ fn parses_root_junctions_with_qualified_inputs_and_following_edges() {
 
 #[test]
 fn preserves_mixed_sibling_continuations_and_cycle_selection() {
-    let source = "(a)\n  =[checks:parallel]=>[-[lookup:next]->(:tool), -[note:next]->(b)]\n    ->([lookup].target)~[:again]~>(a)\n    >>[[lookup], [note]]->(done);";
+    let source = "(a)\n  =[checks:parallel]=>[-[lookup:next]->(:tool), -[note:next]->(b)]\n    ->([lookup].target)~[:again]~>(a)\n    >>[:accumulate [lookup], [note]]->(done);";
     let graph = parse(source).unwrap();
     let fork = fork(&graph.paths[0].steps[0]);
     assert_eq!(fork.continuations.len(), 2);
@@ -440,7 +441,7 @@ fn preserves_mixed_sibling_continuations_and_cycle_selection() {
 fn allows_one_inline_selector_or_junction() {
     for source in [
         "(a)=[:parallel]=>[-[work:next]->(b)] ->(b)-[:next]->(c);",
-        "(a)=[:parallel]=>[-[work:next]->(b)] >>[[work]]->(c);",
+        "(a)=[:parallel]=>[-[work:next]->(b)] >>[:accumulate [work]]->(c);",
         "(a)=[:parallel]=>[-[work:next]->(b)] ->(b)~[:again]~>(a);",
         "(a)=[:parallel]=>[-[work:next]->(b)] ->(b)=[:parallel]=>[-[:next]->(c)] ->(c)-[:next]->(d);",
     ] {
@@ -462,8 +463,8 @@ fn rejects_ambiguous_or_unattached_graph_continuations() {
     for source in [
         "(a)->(b);",
         "(a)=[:parallel]=>[-[:next]->(b)] ->(b) ->(b);",
-        "(a)=[:parallel]=>[-[work:next]->(b)] ->(b) >>[[work]]->(c);",
-        "(a)=[:parallel]=>[-[work:next]->(b)] >>[[work]]->(c) ->(b);",
+        "(a)=[:parallel]=>[-[work:next]->(b)] ->(b) >>[:accumulate [work]]->(c);",
+        "(a)=[:parallel]=>[-[work:next]->(b)] >>[:accumulate [work]]->(c) ->(b);",
         "(a)\n    =[:parallel]=>[-[:next]->(b)]\n    ->(b);",
         "(a)\n    =[:parallel]=>[-[:next]->(b)]\n        ->(b)\n      ->(b);",
         "(a)\n    =[:parallel]=>[-[:next]->(b)]\n        ->(b)\n          ->(b);",
@@ -482,10 +483,10 @@ fn requires_single_steps_and_typed_forks_and_exact_junction_inputs() {
         "(a)=[:parallel]=>[-[:next]->(b) -[:next]->(c)];",
         "(a)=[:parallel]=>[-[:next]->(b)=[:parallel]=>[-[:next]->(c)]];",
         "(a)=[:parallel]=>[-[:next]->(b)]-[:next]->(c);",
-        ">>[(a), (b)]->(c);",
-        ">>[[a:next], [b]]->(c);",
-        ">>[[a].target, [b]]->(c);",
-        ">>[[a], [b]];",
+        ">>[:accumulate (a), (b)]->(c);",
+        ">>[:accumulate [a:next], [b]]->(c);",
+        ">>[:accumulate [a].target, [b]]->(c);",
+        ">>[:accumulate [a], [b]];",
     ] {
         assert!(parse(source).is_err(), "unexpectedly accepted {source}");
     }
@@ -507,7 +508,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 30);
+    assert_eq!(graph.paths.len(), 37);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -545,8 +546,7 @@ fn accepts_comments_blank_lines_and_crlf_between_sibling_selectors() {
 
 #[test]
 fn handles_truncated_forks_and_junctions_without_panicking() {
-    let source =
-        "(a)=[work:parallel]=>[-[one:next]->(b), -[two:next]->(c)]\n    ->(b)-[:next]->(d)\n    >>[[one], [two]]->(finish);";
+    let source = "(a)=[work:parallel]=>[-[one:next]->(b), -[two:next]->(c)]\n    ->(b)-[:next]->(d)\n    >>[:accumulate [one], [two]]->(finish);";
     for (end, _) in source.char_indices() {
         let _ = parse(&source[..end]);
     }
@@ -599,7 +599,7 @@ fn patterns_preserve_constraints_chains_edge_lists_and_cycles() {
 
 #[test]
 fn pattern_references_work_in_endpoints_junctions_and_accessors() {
-    let source = "(a)-[:next]->(?<(b)-[:next]->(@:tool)>); >>[?<(a)-[@:next]->(b)>, [other]]->(done); (values:vars) {name: ?<(a)-[:next]->(@:tool)>.props.name, text: \"Found ${?<(@:tool)>.props.name}\"};";
+    let source = "(a)-[:next]->(?<(b)-[:next]->(@:tool)>); >>[:accumulate ?<(a)-[@:next]->(b)>, [other]]->(done); (values:vars) {name: ?<(a)-[:next]->(@:tool)>.props.name, text: \"Found ${?<(@:tool)>.props.name}\"};";
     let graph = parse(source).unwrap();
     let GraphNode::Reference(expr) = &edge(&graph.paths[0].steps[0]).target else {
         panic!("expected reference")
@@ -687,7 +687,7 @@ fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
                 .join("\n")
         )
     });
-    assert_eq!(model.paths.len(), 30);
+    assert_eq!(model.paths.len(), 37);
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
     assert!(model.forks.len() > 5);
@@ -821,7 +821,7 @@ fn resolves_edge_context_against_explicit_endpoints() {
 #[test]
 fn lowers_overlapping_junctions_without_implicit_connections() {
     let model = compiled(
-        "(a:x)\n    =[f:parallel]=>[-[eb:next]->(b:x), -[ec:next]->(c:x), -[ed:next]->(d:x)]\n        >>[[eb], [ec]]->(e:x)\n        >>[[ec], [ed]]->(g:x);",
+        "(a:x)\n    =[f:parallel]=>[-[eb:next]->(b:x), -[ec:next]->(c:x), -[ed:next]->(d:x)]\n        >>[:accumulate [eb], [ec]]->(e:x)\n        >>[:accumulate [ec], [ed]]->(g:x);",
     );
     assert_eq!(model.edges.len(), 3);
     assert_eq!(model.junctions.len(), 2);
@@ -834,7 +834,7 @@ fn lowers_overlapping_junctions_without_implicit_connections() {
 fn enforces_fork_membership() {
     for source in [
         "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] ->(c); (c:x);",
-        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] >>[[ec]]->(d:x); (c:x)-[ec:next]->(b);",
+        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] >>[:accumulate [ec]]->(d:x); (c:x)-[ec:next]->(b);",
         "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)]; (c:x)-[ec:next]->(b); (v:vars) {value: [f].[ec]};",
     ] {
         assert!(compile(source).is_err(), "{source}");
@@ -1068,4 +1068,238 @@ fn retains_dependencies_of_dynamic_indices_and_slice_bounds() {
         "(v:vars) {items: [|10, 20, 30|], index: range(0, 1), selected: self.items[self.index] + 1, slice: self.items[self.index:2]};",
     );
     assert!(compile(r#"(v:vars) {items: [|1, 2|], index: choice("a", "b"), selected: self.items[self.index]};"#).is_err());
+}
+
+#[test]
+fn reserves_contextual_names_without_reserving_field_keys() {
+    for name in ["self", "source", "target", "context", "true", "false", "null"] {
+        for source in [
+            format!("({name}:task);"),
+            format!("(\"{name}\":task);"),
+            format!("(:task)-[{name}:next]->(:task);"),
+            format!("(:task)=[{name}:parallel]=>[-[:next]->(:task)];"),
+        ] {
+            let errors = compile(&source).expect_err(&source);
+            assert!(errors.iter().any(|error| error.what.contains("reserved graph name")));
+        }
+    }
+    for name in ["self", "source", "target", "context"] {
+        assert!(compile(&format!("(a:vars) {{values: [|for {name} in [|1|]: {name}|]}};")).is_err());
+    }
+    compiled("(a:task) {source: 1, target: 2, context: 3, self: 4};");
+}
+
+#[test]
+fn resolves_graph_identities_through_collections_and_static_expressions() {
+    let model = compiled(
+        r#"(a:task) {value: 7}; (b:task);
+        (refs:vars) {
+            nodes: [|(a), (b)|],
+            alias: self.nodes,
+            mixed: [|(a), range(1, 9)|],
+            nested: [|[|(a), range(1, 9)|]|],
+            selected: self.alias[0].value,
+            nested_value: self.nested[0][0].value,
+        };
+        (refs.alias[0])-[:next]->(refs.mixed[0]);
+        (true ? refs.nodes[0] : refs.nodes[1])-[:next]->([|(b)|][0]);"#,
+    );
+    let a = model.names["a"];
+    assert_eq!(bts_lang::ElementId::Node(model.edges[0].source), a);
+    assert_eq!(bts_lang::ElementId::Node(model.edges[0].target), a);
+    assert_eq!(bts_lang::ElementId::Node(model.edges[1].source), a);
+    assert_eq!(bts_lang::ElementId::Node(model.edges[1].target), model.names["b"]);
+    assert!(matches!(
+        binding(&model, "refs", "selected").value,
+        Value::Num(bts_lang::Number::Int(7))
+    ));
+    assert!(matches!(
+        binding(&model, "refs", "nested_value").value,
+        Value::Num(bts_lang::Number::Int(7))
+    ));
+    assert!(compile("(a:task); (v:vars) {nodes: [|(a)|], index: range(0, 1)}; (v.nodes[v.index]);").is_err());
+}
+
+#[test]
+fn resolves_edge_expressions_and_stored_fork_paths() {
+    let model = compiled(
+        r#"(a:task) =[split:parallel]=>[-[left:next {limit: 3}]->(:task), -[right:next]->(:task)];
+        (refs:vars) {paths: [split].paths, edges: [|[left], [right]|], alias: self.edges[0]};
+        (refs.paths[0][0].target)-[follow:next {limit: [refs.alias].props.limit}]->(b:task);
+        >>[:accumulate [refs.alias], [refs.edges[1]]]->(b);"#,
+    );
+    assert_eq!(model.edges[2].source, model.edges[0].target);
+    assert_eq!(model.junctions[0].inputs, [bts_lang::EdgeId(0), bts_lang::EdgeId(1)]);
+    assert!(matches!(
+        model.bindings[model.edges[2].props[0].0].value,
+        Value::Num(bts_lang::Number::Int(3))
+    ));
+    for source in [
+        "(a:task); (v:vars) {node: (a), wrong: [self.node]};",
+        "(a:task)-[edge:next]->(b:task); (v:vars) {edge: [edge]}; (v.edge);",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn keeps_junction_properties_separate_from_destination_properties() {
+    let source = r#"(config:vars) {policy: "all"};
+        (a:task) =[f:parallel]=>[-[left:next]->(b:task), -[right:next]->(c:task)]
+            >>[:accumulate {mode: config.policy, correlate: context.request_id} [left], [right]]->(d:task {accumulate: "each"});
+        >>[:custom {custom: [right].target} [left]]->(d);"#;
+    let ast = parse(source).unwrap();
+    let GraphOrigin::Junction(junction) = &fork(&ast.paths[1].steps[0]).continuations[0].start else {
+        panic!()
+    };
+    assert_eq!(junction.props.as_ref().unwrap().len(), 2);
+    let range = junction.props.as_ref().unwrap()[0].range;
+    assert_eq!(&source[range.start..range.end], "mode: config.policy");
+    let model = compiled(source);
+    let props = &model.junctions[0].props;
+    assert_eq!(props.len(), 2);
+    assert_eq!(
+        model.bindings[props[0].0].owner,
+        bts_lang::ElementId::Junction(bts_lang::JunctionId(0))
+    );
+    assert!(matches!(&model.bindings[props[0].0].value, Value::Str(value) if value == "all"));
+    assert!(
+        matches!(&model.bindings[props[1].0].value, Value::Context {owner: bts_lang::ElementId::Junction(id), path} if id.0 == 0 && path == &["request_id"])
+    );
+    let target = &model.nodes[model.junctions[0].target.0];
+    assert!(matches!(&model.bindings[target.props[0].0].value, Value::Str(value) if value == "each"));
+    assert_eq!(model.junctions[1].props.len(), 1);
+    for props in [
+        "{limit: 1, limit: 2}",
+        "{limit: config.missing}",
+        "{limit: upper(2)}",
+        "{limit: (bad:task)}",
+    ] {
+        let source = format!("(a:task)-[edge:next]->(b:task); >>[:accumulate {props} [edge]]->(c:task);");
+        assert!(compile(&source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn cycle_edges_keep_independent_kinds_properties_and_references() {
+    let model = compiled(
+        r#"(settings:vars) {limit: 3};
+        (a:task)-[advance:next]->(b:task)
+            ~[retry:next {max_attempts: settings.limit}, feedback:feeds {value: source.props}]~>(a);
+        (refs:vars) {retry_edge: [retry], limit: [retry].props.max_attempts};"#,
+    );
+    assert_eq!(model.edges.len(), 3);
+    assert!(!model.edges[0].cycle);
+    assert!(model.edges[1].cycle && model.edges[2].cycle);
+    assert_eq!(model.edges[1].kind, "next");
+    assert_eq!(model.edges[2].kind, "feeds");
+    assert_ne!(model.edges[1].props, model.edges[2].props);
+    assert!(matches!(
+        binding(&model, "refs", "limit").value,
+        Value::Num(bts_lang::Number::Int(3))
+    ));
+}
+
+#[test]
+fn matches_parallel_edges_without_enumerating_permutations() {
+    let headers = (0..16).map(|i| format!("edge_{i}:link")).collect::<Vec<_>>().join(",");
+    let constraints = vec![":link"; 16].join(",");
+    let source = format!("(a:task)-[{headers}]->(b:task); (refs:vars) {{selected: ?<(a)-[{constraints}]->(@:task)>}};");
+    let model = compiled(&source);
+    let Value::GraphRef { ref_id, .. } = binding(&model, "refs", "selected").value else {
+        panic!()
+    };
+    assert_eq!(model.refs[ref_id.0].target, model.names["b"]);
+
+    compiled(
+        "(a:x)-[one:link {special: true}, two:link]->(b:x); (v:vars) {selected: ?<(a)-[:link, @:link {special: true}]->(b)>};",
+    );
+    for source in [
+        "(a:x)-[one:link, two:link]->(b:x); (v:vars) {selected: ?<(a)-[@:link, :link]->(b)>};",
+        "(a:x)-[one:link]->(b:x); (v:vars) {selected: ?<(a)-[:link, :link]->(@:x)>};",
+        "(a:x)-[one:link {p: true}, two:link, three:link]->(b:x); (v:vars) {selected: ?<(a)-[:link {p: true}, :link {p: true}, :link]->(@:x)>};",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn proves_common_exclusive_conditions_and_preserves_independent_draws() {
+    for (left, right, valid) in [
+        ("source.flag", "!source.alias", true),
+        ("source.route == \"billing\"", "source.route == \"appointments\"", true),
+        ("\"billing\" == source.route", "source.route != \"billing\"", true),
+        ("source.n < 5", "source.n >= 5", true),
+        ("source.n > 5", "source.n <= 5", true),
+        ("source.n == 1", "source.n == 2", true),
+        (
+            "source.flag && source.route == \"billing\"",
+            "source.alias && source.route == \"appointments\"",
+            true,
+        ),
+        ("source.n <= 5", "source.n >= 5", false),
+        ("source.route != \"billing\"", "source.route != \"appointments\"", false),
+        ("source.flag", "source.alias", false),
+        ("chance(0.5)", "!chance(0.5)", false),
+        ("source.draw == 1", "source.other_draw == 2", false),
+        ("context.route == \"billing\"", "context.route == \"appointments\"", false),
+    ] {
+        let source = format!(
+            r#"(a:task) {{flag: chance(0.5), alias: self.flag, route: context.route, n: range(0, 10), draw: range(1, 2), other_draw: range(1, 2)}}
+            =[:exclusive]=>[-[:next {{when: {left}}}]->(:task), -[:next {{when: {right}}}]->(:task)];"#
+        );
+        assert_eq!(compile(&source).is_ok(), valid, "{source}\n{:?}", compile(&source));
+    }
+}
+
+#[test]
+fn requires_typed_junctions_with_enclosed_properties() {
+    for source in [
+        ">>[[left], [right]]->(target);",
+        ">>[[left], [right]] {mode: \"all\"}->(target);",
+        ">>[:accumulate [left], [right]] {mode: \"all\"}->(target);",
+        ">>[:accumulate {}]->(target);",
+    ] {
+        assert!(parse(source).is_err(), "{source}");
+    }
+    let model = compiled("(a:x)-[edge:link]->(b:x); >>[:custom {policy: 1} [edge]]->(b);");
+    assert_eq!(model.junctions[0].kind, "custom");
+    assert_eq!(model.junctions[0].props.len(), 1);
+}
+
+#[test]
+fn registers_edge_primitives_without_closing_consumer_kinds() {
+    for kind in ["link", "next", "requires", "contains", "feeds"] {
+        let primitive = bts_lang::spec::SPEC.primitive("edge", kind).unwrap();
+        assert_eq!(primitive.name, kind);
+        let model = compiled(&format!("(a:custom)-[:{kind}]->(b:custom);"));
+        assert_eq!(model.edges[0].kind, kind);
+    }
+    assert!(bts_lang::spec::SPEC.primitive("edge", "parallel").is_none());
+    compiled("(a:custom)-[:consumer_kind {custom: 1}]->(b:custom);");
+}
+
+#[test]
+fn validates_builtin_junction_configuration() {
+    let definitions = "(a:task)-[left:link]->(b:task); (a)-[right:link]->(c:task);";
+    for kind in ["accumulate", "merge", "first", "quorum"] {
+        assert!(bts_lang::spec::SPEC.primitive("junction", kind).is_some());
+        let props = if kind == "quorum" { "{count: 2}" } else { "{}" };
+        let model = compiled(&format!("{definitions} >>[:{kind} {props} [left], [right]]->(d:task);"));
+        assert_eq!(model.junctions[0].kind, kind);
+        assert!(compile(&format!("{definitions} >>[:{kind} {props} [left], [left]]->(d:task);")).is_err());
+    }
+    for props in [
+        "{}",
+        "{count: 0}",
+        "{count: 3}",
+        "{count: 1.5}",
+        "{count: context.count}",
+        "{count: range(1, 2)}",
+    ] {
+        assert!(compile(&format!("{definitions} >>[:quorum {props} [left], [right]]->(d:task);")).is_err());
+    }
+    compiled(&format!(
+        "{definitions} (config:vars) {{count: 1 + 1}}; >>[:quorum {{count: config.count}} [left], [right]]->(d:task);"
+    ));
 }

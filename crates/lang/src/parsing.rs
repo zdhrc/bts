@@ -24,7 +24,9 @@ macro_rules! token {
 }
 
 // words with meaning in expression positions, rejected as loop binding names
-const RESERVED_WORDS: &[&str] = &["true", "false", "null", "var", "for", "in", "if"];
+const RESERVED_WORDS: &[&str] = &[
+    "true", "false", "null", "var", "for", "in", "if", "self", "source", "target", "context",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 struct Parser<'src> {
@@ -222,6 +224,13 @@ impl<'src> Parser<'src> {
         let start = self.peek().range.start;
         self.expect(token!(Junction), ErrorKind::UnexpectedToken)?;
         self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Colon), ErrorKind::ExpectedGraphKind)?;
+        let kind = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
+        let props = if self.check(token!(LBrace)) {
+            Some(self.parse_graph_fields()?)
+        } else {
+            None
+        };
         let mut inputs = vec![self.parse_qualified_edge_reference()?];
         while self.consume(token!(Comma)).is_some() && !self.check(token!(RBrack)) {
             inputs.push(self.parse_qualified_edge_reference()?);
@@ -231,7 +240,9 @@ impl<'src> Parser<'src> {
         let target = self.parse_graph_node()?;
         let end = self.tokens[self.index - 1].range.end;
         Some(GraphJunction {
+            kind,
             inputs,
+            props,
             target,
             range: SrcRange::new(start, end),
         })
@@ -452,8 +463,12 @@ impl<'src> Parser<'src> {
 
     // the opening boundary has already been consumed
     fn parse_graph_reference(&mut self, start: usize, kind: GraphReferenceKind) -> Option<Expr> {
-        let quoted_node = matches!(self.peek().kind, TokenKind::String(_)) && self.peek_ahead().kind == TokenKind::RParen;
-        let target = if kind == GraphReferenceKind::Edge || quoted_node {
+        let closing = match kind {
+            GraphReferenceKind::Node => TokenKind::RParen,
+            GraphReferenceKind::Edge => TokenKind::RBrack,
+        };
+        let quoted_name = matches!(self.peek().kind, TokenKind::String(_)) && self.peek_ahead().kind == closing;
+        let target = if quoted_name {
             let range = self.peek().range;
             let name = self.parse_graph_name()?;
             Expr::new(ExprKind::Ref { path: vec![name] }, range)

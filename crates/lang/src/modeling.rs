@@ -98,6 +98,13 @@ impl Modeler {
 
     fn name(&mut self, name: &Option<String>, id: ElementId, range: SrcRange) {
         if let Some(name) = name {
+            if matches!(
+                name.as_str(),
+                "self" | "source" | "target" | "context" | "true" | "false" | "null"
+            ) {
+                self.errors.extend(error(range, format!("reserved graph name `{name}`")));
+                return;
+            }
             if let Some(previous) = self.declarations.get(name) {
                 self.errors.extend(error(range, format!("duplicate graph name `{name}`")));
                 self.errors
@@ -183,11 +190,14 @@ impl Modeler {
         let id = JunctionId(self.model.junctions.len());
         let target = self.node(&junction.target, fork.map(ElementId::Fork));
         self.model.junctions.push(Junction {
+            kind: junction.kind.clone(),
             inputs: Vec::new(),
+            props: Vec::new(),
             target: NodeId(usize::MAX),
             fork,
             range: junction.range,
         });
+        self.fields(ElementId::Junction(id), true, junction.props.as_deref().unwrap_or(&[]));
         self.raw_junctions.push(RawJunction {
             inputs: junction.inputs.clone(),
             target,
@@ -489,7 +499,7 @@ impl Modeler {
             Cursor::Slot(slot) => {
                 let id = self.binding(slot, range)?;
                 let value = self.model.bindings[id.0].value.clone();
-                if expr::constant(&value) || matches!(value, Value::GraphRef { .. }) {
+                if expr::static_value(&value) {
                     Ok(ReferenceValue {
                         value,
                         bindings: Vec::new(),
@@ -700,7 +710,10 @@ impl Modeler {
                 }
                 Ok(Cursor::Value(expr::slice(value, start, end, expr.range)?))
             }
-            _ => Err(error(expr.range, "graph reference must be statically resolvable")),
+            _ => {
+                let value = expr::lower(expr.clone(), &mut |expr| self.resolve_value(expr, owner))?;
+                Ok(Cursor::Value(self.reference_value(value)))
+            }
         }
     }
 
@@ -769,7 +782,7 @@ impl Modeler {
             }
         }
         for step in &pattern.steps {
-            let mut next = Vec::new();
+            let mut next = BTreeSet::new();
             for (source, selected) in paths {
                 let mut targets: BTreeSet<NodeId> = BTreeSet::new();
                 for i in 0..self.model.edges.len() {
@@ -793,7 +806,7 @@ impl Modeler {
                     } else {
                         selected
                     };
-                    let mut combinations = vec![(HashSet::new(), selected)];
+                    let mut candidates = Vec::new();
                     for constraint in &step.edges {
                         let mut matched = Vec::new();
                         for i in 0..self.model.edges.len() {
@@ -806,30 +819,20 @@ impl Modeler {
                                 matched.push(EdgeId(i));
                             }
                         }
-                        let mut expanded = Vec::new();
-                        for (used, selected) in combinations {
-                            for edge in &matched {
-                                if used.contains(edge) {
-                                    continue;
-                                }
-                                let mut used = used.clone();
-                                used.insert(*edge);
-                                expanded.push((
-                                    used,
-                                    if constraint.selected {
-                                        Some(ElementId::Edge(*edge))
-                                    } else {
-                                        selected
-                                    },
-                                ));
+                        candidates.push(matched);
+                    }
+                    if let Some(index) = step.edges.iter().position(|constraint| constraint.selected) {
+                        for edge in &candidates[index] {
+                            if distinct_edge_assignment(&candidates, Some((index, *edge))) {
+                                next.insert((target, Some(ElementId::Edge(*edge))));
                             }
                         }
-                        combinations = expanded;
+                    } else if distinct_edge_assignment(&candidates, None) {
+                        next.insert((target, selected));
                     }
-                    next.extend(combinations.into_iter().map(|(_, selected)| (target, selected)));
                 }
             }
-            paths = next;
+            paths = next.into_iter().collect();
         }
         let selected: BTreeSet<_> = paths.into_iter().filter_map(|(_, selected)| selected).collect();
         if selected.len() != 1 {
@@ -849,6 +852,7 @@ impl Modeler {
             .map(|i| ElementId::Node(NodeId(i)))
             .chain((0..self.model.edges.len()).map(|i| ElementId::Edge(EdgeId(i))))
             .chain((0..self.model.forks.len()).map(|i| ElementId::Fork(ForkId(i))))
+            .chain((0..self.model.junctions.len()).map(|i| ElementId::Junction(JunctionId(i))))
             .collect();
         let mut errors = Vec::new();
         for owner in owners {
@@ -877,6 +881,7 @@ impl Modeler {
                     }
                     ElementId::Edge(id) if property => self.model.edges[id.0].props = ids,
                     ElementId::Fork(id) if property => self.model.forks[id.0].props = ids,
+                    ElementId::Junction(id) if property => self.model.junctions[id.0].props = ids,
                     _ => {}
                 }
             }
@@ -911,6 +916,32 @@ impl Modeler {
 
     fn validate_primitives(&self) -> Result<()> {
         let mut errors = Vec::new();
+        for (i, junction) in self.model.junctions.iter().enumerate() {
+            if matches!(junction.kind.as_str(), "accumulate" | "merge" | "first" | "quorum") {
+                let distinct: HashSet<_> = junction.inputs.iter().copied().collect();
+                if distinct.len() != junction.inputs.len() {
+                    errors.extend(error(
+                        junction.range,
+                        "built-in junction inputs must reference distinct edges",
+                    ));
+                }
+            }
+            if junction.kind == "quorum" {
+                match self.property(ElementId::Junction(JunctionId(i)), "count") {
+                    Some(id) => {
+                        let binding = &self.model.bindings[id.0];
+                        if !matches!(&binding.value, Value::Num(Number::Int(count)) if *count >= 1 && usize::try_from(*count).is_ok_and(|count| count <= junction.inputs.len()))
+                        {
+                            errors.extend(error(
+                                binding.range,
+                                "quorum count must be a constant integer from one through the number of inputs",
+                            ));
+                        }
+                    }
+                    None => errors.extend(error(junction.range, "quorum junction requires a count property")),
+                }
+            }
+        }
         for (i, node) in self.model.nodes.iter().enumerate() {
             if node.kind == "vars"
                 && let Some(id) = self.property(ElementId::Node(NodeId(i)), "evaluate")
@@ -950,7 +981,7 @@ impl Modeler {
                                         .map(|id| self.model.bindings[id.0].value.clone())
                                         .unwrap_or(Value::Bool(true))
                                 };
-                                if !disjoint(&guard(*left), &guard(*right)) {
+                                if !disjoint(&guard(*left), &guard(*right), &self.model.bindings) {
                                     errors.extend(error(
                                         self.model.edges[right.0].range,
                                         "exclusive fork guards overlap or cannot be proven disjoint",
@@ -964,6 +995,39 @@ impl Modeler {
         }
         if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
+}
+
+// find one distinct edge per constraint without enumerating their permutations
+fn distinct_edge_assignment(candidates: &[Vec<EdgeId>], fixed: Option<(usize, EdgeId)>) -> bool {
+    fn assign(
+        index: usize,
+        candidates: &[Vec<EdgeId>],
+        fixed: Option<(usize, EdgeId)>,
+        owners: &mut HashMap<EdgeId, usize>,
+        visited: &mut HashSet<EdgeId>,
+    ) -> bool {
+        for edge in &candidates[index] {
+            if fixed.is_some_and(|(_, fixed_edge)| *edge == fixed_edge) || !visited.insert(*edge) {
+                continue;
+            }
+            let previous = owners.get(edge).copied();
+            if previous.is_none_or(|previous| assign(previous, candidates, fixed, owners, visited)) {
+                owners.insert(*edge, index);
+                return true;
+            }
+        }
+        false
+    }
+    let mut owners = HashMap::new();
+    for index in 0..candidates.len() {
+        if fixed.is_some_and(|(fixed_index, _)| index == fixed_index) {
+            continue;
+        }
+        if !assign(index, candidates, fixed, &mut owners, &mut HashSet::new()) {
+            return false;
+        }
+    }
+    true
 }
 
 fn same_value(a: &Value, b: &Value) -> bool {
@@ -1017,7 +1081,83 @@ fn predicate_key(value: &Value) -> String {
     }
 }
 
-fn predicate(value: &Value, atoms: &mut Vec<String>) -> Predicate {
+struct PredicateAtom {
+    key: String,
+    equality: Option<(String, Value)>,
+}
+
+fn normalize_predicate(value: &Value, bindings: &[Binding]) -> Value {
+    match value {
+        Value::BindingRef(id) => match &bindings[id.0].value {
+            // a shared draw keeps its identity rather than becoming another call
+            Value::Func { .. } => value.clone(),
+            definition => normalize_predicate(definition, bindings),
+        },
+        Value::Unary { op, operand, range } => Value::Unary {
+            op: *op,
+            operand: Box::new(normalize_predicate(operand, bindings)),
+            range: *range,
+        },
+        Value::Binary { op, lhs, rhs, range } => {
+            let mut lhs = normalize_predicate(lhs, bindings);
+            let mut rhs = normalize_predicate(rhs, bindings);
+            let (op, negate) = match op {
+                BinOp::Ne => (BinOp::Eq, true),
+                BinOp::Ge => (BinOp::Lt, true),
+                BinOp::Gt => {
+                    std::mem::swap(&mut lhs, &mut rhs);
+                    (BinOp::Lt, false)
+                }
+                BinOp::Le => {
+                    std::mem::swap(&mut lhs, &mut rhs);
+                    (BinOp::Lt, true)
+                }
+                op => (*op, false),
+            };
+            if op == BinOp::Eq && predicate_key(&lhs) > predicate_key(&rhs) {
+                std::mem::swap(&mut lhs, &mut rhs);
+            }
+            let comparison = Value::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                range: *range,
+            };
+            if negate {
+                Value::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(comparison),
+                    range: *range,
+                }
+            } else {
+                comparison
+            }
+        }
+        Value::Index { target, index, range } => Value::Index {
+            target: Box::new(normalize_predicate(target, bindings)),
+            index: Box::new(normalize_predicate(index, bindings)),
+            range: *range,
+        },
+        _ => value.clone(),
+    }
+}
+
+fn equality_atom(value: &Value) -> Option<(String, Value)> {
+    let Value::Binary {
+        op: BinOp::Eq, lhs, rhs, ..
+    } = value
+    else {
+        return None;
+    };
+    for (subject, literal) in [(lhs, rhs), (rhs, lhs)] {
+        if matches!(literal.as_ref(), Value::Str(_) | Value::Num(_) | Value::Bool(_)) {
+            return Some((predicate_key(subject), (**literal).clone()));
+        }
+    }
+    None
+}
+
+fn predicate(value: &Value, atoms: &mut Vec<PredicateAtom>) -> Predicate {
     match value {
         Value::Bool(value) => Predicate::Constant(*value),
         Value::Unary {
@@ -1037,8 +1177,11 @@ fn predicate(value: &Value, atoms: &mut Vec<String>) -> Predicate {
         _ => {
             // binding identities are stable, independent dynamic calls retain their source locations
             let key = predicate_key(value);
-            let index = atoms.iter().position(|atom| atom == &key).unwrap_or_else(|| {
-                atoms.push(key);
+            let index = atoms.iter().position(|atom| atom.key == key).unwrap_or_else(|| {
+                atoms.push(PredicateAtom {
+                    key,
+                    equality: equality_atom(value),
+                });
                 atoms.len() - 1
             });
             Predicate::Atom(index)
@@ -1054,11 +1197,29 @@ fn evaluate(predicate: &Predicate, bits: usize) -> bool {
         Predicate::Or(a, b) => evaluate(a, bits) || evaluate(b, bits),
     }
 }
-fn disjoint(a: &Value, b: &Value) -> bool {
+fn disjoint(a: &Value, b: &Value, bindings: &[Binding]) -> bool {
     let mut atoms = Vec::new();
-    let a = predicate(a, &mut atoms);
-    let b = predicate(b, &mut atoms);
-    atoms.len() <= 12 && (0..(1usize << atoms.len())).all(|bits| !evaluate(&a, bits) || !evaluate(&b, bits))
+    let a = predicate(&normalize_predicate(a, bindings), &mut atoms);
+    let b = predicate(&normalize_predicate(b, bindings), &mut atoms);
+    if atoms.len() > 12 {
+        return false;
+    }
+    let mut incompatible = Vec::new();
+    for (i, left) in atoms.iter().enumerate() {
+        for (j, right) in atoms.iter().enumerate().skip(i + 1) {
+            if let (Some((left_subject, left_value)), Some((right_subject, right_value))) = (&left.equality, &right.equality)
+                && left_subject == right_subject
+                && !same_value(left_value, right_value)
+            {
+                incompatible.push((i, j));
+            }
+        }
+    }
+    (0..(1usize << atoms.len())).all(|bits| {
+        incompatible.iter().any(|(i, j)| bits & (1 << i) != 0 && bits & (1 << j) != 0)
+            || !evaluate(&a, bits)
+            || !evaluate(&b, bits)
+    })
 }
 
 pub(super) fn model(ast: ast::GraphDocument) -> Result<Model> {

@@ -516,13 +516,33 @@ impl<'a> ExpressionModeler<'a> {
         ))
     }
 
+    // inspect known collection structure without evaluating its dynamic leaves
+    fn selection_shape(&self, value: &Folded) -> Option<Folded> {
+        match &value.kind {
+            FoldedKind::Value(Value::BindingRef(id)) => self.selection_shape(self.var_value(id)?),
+            FoldedKind::Value(Value::Index { target, index, .. }) => {
+                let target = self.selection_shape(&folded_value((**target).clone(), value.range))?;
+                let selected = match (&target.kind, index.as_ref()) {
+                    (FoldedKind::Array(values), Value::Num(Number::Int(index))) => values.get(usize::try_from(*index).ok()?)?,
+                    (FoldedKind::Object(fields), Value::Str(key)) => &fields.iter().find(|field| &field.key == key)?.value,
+                    _ => return None,
+                };
+                self.selection_shape(selected)
+            }
+            _ => Some(value.clone()),
+        }
+    }
+
     fn fold_index(&mut self, target: Folded, index: Folded, range: SrcRange) -> Option<Folded> {
-        if let FoldedKind::Value(Value::BindingRef(id)) = &target.kind
-            && let Some(definition) = self.var_value(id).cloned()
+        if matches!(&target.kind, FoldedKind::Value(Value::BindingRef(_) | Value::Index { .. }))
+            && let Some(definition) = self.selection_shape(&target)
             && matches!(definition.kind, FoldedKind::Array(_) | FoldedKind::Object(_))
             && is_constant(&index)
         {
-            self.fold_index(definition, index.clone(), range)?;
+            let selected = self.fold_index(definition, index.clone(), range)?;
+            if static_value(&selected.clone().into_value()) {
+                return Some(selected);
+            }
             return Some(Folded::value(
                 Value::Index {
                     target: Box::new(target.into_value()),
@@ -3034,6 +3054,19 @@ pub(crate) fn lower(expr: ast::Expr, resolve: &mut Resolver<'_>) -> Result<Value
 }
 pub(crate) fn constant(value: &Value) -> bool {
     value_is_constant(value)
+}
+
+// graph handles are fixed identities even when they are not literal constants
+pub(crate) fn static_value(value: &Value) -> bool {
+    match value {
+        Value::GraphRef { .. } => true,
+        Value::Array(array) => array.elem.iter().all(|elem| match elem {
+            ArrayElem::Item(value) => static_value(value),
+            ArrayElem::Spread(_) => false,
+        }),
+        Value::Object(object) => object.elem.iter().all(|field| static_value(&field.value)),
+        _ => value_is_constant(value),
+    }
 }
 
 fn rule_desc(id: spec::Id) -> &'static spec::RuleDesc {

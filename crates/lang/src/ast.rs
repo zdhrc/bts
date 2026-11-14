@@ -63,8 +63,12 @@ pub struct GraphFork {
 /// A convergence point with exact edge references and an explicit destination.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphJunction {
+    /// Required junction kind.
+    pub kind: String,
     /// Qualified or unqualified references to input edges.
     pub inputs: Vec<Expr>,
+    /// Configuration properties separate from the destination node.
+    pub props: Option<Vec<Attr>>,
     /// The destination declaration or reference.
     pub target: GraphNode,
     /// The junction range, including its destination.

@@ -1,9 +1,7 @@
-# design examples for the graph language, parsed by syntax::parse
-# design reference: notes/plan/spec.md, rules D01-D21 and decision items O01-O09
-# this fixture illustrates decisions, it does not define or override them
-# do not infer rules from example kind names, schemas, or consumer assumptions
-# deferred cases are explicitly labeled below
-# update the spec rule and affected examples together when a decision changes
+# graph language showcase, parsed and lowered by the compilation tests
+# language rules live in crates/lang/src/spec.rs
+# built-in contracts live in the spec, domain kinds remain illustrative
+# update the spec and affected examples together when a language rule changes
 
 # standalone definitions do not acquire ownership from their use in a path
 # variable lifetime and activation in this graph remain open
@@ -12,10 +10,10 @@
     max_attempts: 3,
     model: "intake-model",
     departments: [|"billing", "appointments", "records"|],
-    department: "appointments",
+    department: choice("billing", "appointments", "records"),
 };
 
-# D17-D20: array/expression and eager-binding examples
+# arrays, expressions, and eager binding configuration
 (examples:vars {evaluate: "eager"}) {
     grouped: ${settings.max_attempts + 1} * 2,
     negative: -2,
@@ -90,7 +88,7 @@
                                     input: {patient_id: collect.output.patient_id},
                                 },
                             ]
-                                >>[[coverage], [records],]->(finish);
+                                >>[:accumulate {correlate: settings.request_id} [coverage], [records]]->(finish);
 
 # additional connections reuse existing definitions without redeclaring them
 (manual_review)-[:next]->(finish);
@@ -101,7 +99,7 @@
 };
 
 # nested exclusive fork uses complementary guards to demonstrate coverage
-# outer exclusive fork also uses complementary guards, defaults remain deferred
+# an exclusive fork may select no branch, no default is required
 # the parallel inputs combine through a junction, not a converge edge
 # entry and next remain candidate edge contracts
 
@@ -116,7 +114,7 @@
     ];
 # optional checks deliberately has no convergence dependency
 
-# D13-D17: graph references, accessors, and value arrays
+# graph references, accessors, and value arrays
 (graph_references:vars {evaluate: "lazy"}) {
     node: (lookup),
     edge: [coverage],
@@ -133,9 +131,14 @@
     first_path_element: [patient_checks].paths[0][0],
     one_element_array: [|[coverage]|],
     edge_array: [|[coverage], [records]|],
+    stored_paths: [patient_checks].paths,
+    stored_target: self.stored_paths[0][0].target,
+    selected_edge: [self.edge_array[0]],
+    node_array: [|(lookup), (finish)|],
+    selected_name: self.node_array[0].props.name,
 };
 
-# D05-D10: indentation attachment, edge lists, and anonymous targets
+# indentation attachment, edge lists, and anonymous targets
 (layout_start:task)
     =[outer_layout:parallel]=>[
         -[outer_work:next]->(layout_work:task),
@@ -147,7 +150,7 @@
                 -[inner_check:next]->(layout_check:tool),
             ]
                 ->([inner_lookup].target)-[:next]->(layout_result:function)
-                >>[[inner_lookup], [inner_check]]->(layout_combined:task)
+                >>[:accumulate [inner_lookup], [inner_check]]->(layout_combined:task)
         ->([outer_layout].[outer_note].target)-[:next]->(layout_finish:function);
 # indenting the last selector under inner_layout would be invalid even qualified
 # selectors and junctions at the same level are siblings, never a hidden chain
@@ -155,7 +158,7 @@
 # one inline continuation is allowed, two inline siblings are not
 (inline_start:task)=[:parallel]=>[-[:next]->(inline_work:task)] ->(inline_work)-[:next]->(inline_finish:task);
 
-# D18-D19: string expressions, escapes, and declaration-aligned indentation
+# string expressions, escapes, and declaration-aligned indentation
 (prompt_examples:vars {evaluate: "lazy"}) {
     calculation: "Attempts: ${settings.max_attempts + 1}",
     function_call: "Request ${hex(8)}",
@@ -180,10 +183,8 @@
 # plain heredoc keeps its content indentation, delimiter indentation is not content
 # exact final-newline treatment for heredocs remains to be specified
 
-# O06/O09: illustrative scope behavior, not a finalized scope schema
-# scope properties and context access below are illustrative, not a schema
-# details defined by a scope propagate along its outgoing paths
-# a shared definition can have independent occurrences with different contexts
+# scope properties illustrate configuration for a future consumer
+# context reads are explicit, propagation and occurrences remain consumer policies
 (patient_summary:task)
     -[:next]->(fetch_patient:tool {name: "fetch_patient"}) {
         input: {patient_id: context.patient_id},
@@ -218,7 +219,7 @@
 })
     -[appointment:next]->(confirm_appointment:task);
 
->>[[appointment], [patient_details],]->(prepare_visit:task) {
+>>[:accumulate {correlate: context.visit_id} [appointment], [patient_details]]->(prepare_visit:task {accumulate: "each"}) {
     input: {
         patient: [patient_details].scope.patient,
         appointment: [appointment].scope.appointment,
@@ -237,8 +238,8 @@
         -[to_insurance:next]->(insurance_check:tool),
         -[to_schedule:next]->(schedule_check:tool),
     ]
-        >>[[to_identity], [to_insurance],]->(eligibility:task)
-        >>[[to_insurance], [to_schedule],]->(booking:task);
+        >>[:accumulate [to_identity], [to_insurance],]->(eligibility:task)
+        >>[:accumulate [to_insurance], [to_schedule],]->(booking:task);
 
 # fork continuation selects a node before a cycle, without creating an edge
 (recheck:task)
@@ -250,11 +251,9 @@
             ~[:repeat]~>(recheck);
 
 # combined scopes remain separate, with no silent field merge
-# accumulation and related policies can apply to both nodes and junctions
+# junction kinds define combination behavior, properties configure it
+# node accumulation properties remain illustrative consumer configuration
 # correlation, occurrence selection, and policy composition remain open
-# superseded: common-target-only junctions, prefix-only junction declarations,
-# converge edges, full chains inside fork entries, and universal default rules
-# removed: targetless default entries and empty () destinations
 
 # fields can expose static graph references without cloning definitions
 (review_interface:task) {
@@ -262,10 +261,11 @@
     exit: (finish),
     advance_edge: [advance],
 };
-(interface_caller:agent)-[:next]->(review_interface.entry);
+(interface_caller:agent)-[:next]->(reference_values.nodes[0]);
 (reference_values:vars {evaluate: "lazy"}) {
     validation_output: review_interface.entry.output,
-    advance_props: review_interface.advance_edge.props,
+    advance_props: [review_interface.advance_edge].props,
+    nodes: [|review_interface.entry, review_interface.exit|],
 };
 
 # edge lists, source/target access, and explicit cycles
@@ -273,19 +273,20 @@
     output: {ready: true, payload: "visit details"},
 }
     -[
-        advance:next {when: source.output.ready},
+        advance:next {when: source.output.ready, max_attempts: settings.max_attempts},
         supply:feeds {value: source.output.payload},
     ]->(validate_request:tool) {
         output: {valid: chance(0.9)},
     }
         ~[
-            retry:next {when: !source.output.valid},
+            retry:next {when: !source.output.valid, max_attempts: [review_interface.advance_edge].props.max_attempts},
             feedback:feeds {value: source.output},
         ]~>(review_request);
 
-# self-loop uses the same cycle notation, policies are not yet specified
+# cycle edges have their own kind, identity and configuration
+# max_attempts is illustrative, the language does not execute retries
 (poll_visit:tool)
-    ~[:repeat]~>(poll_visit);
+    ~[poll_again:repeat {max_attempts: settings.max_attempts}]~>(poll_visit);
 
 # endpoint access works with anonymous nodes too
 (:tool {name: "check_visit"}) {
@@ -296,7 +297,7 @@
         -[:next {when: !source.output.ready}]->(pending_visit:task),
     ];
 
-# O08 accepted: path-pattern references selecting existing nodes or edges
+# path-pattern references select existing nodes or edges
 # ?<...> locates an existing definition, @ marks the one node or edge returned
 # no declarations occur inside a pattern, kind annotations constrain matches
 # require one distinct target, zero/multiple targets are errors
@@ -309,18 +310,10 @@
 };
 # broader collection filtering remains deferred, no match/where clauses
 
-# quoted reference and value access, without an implied intake owner
-# ("register-patient")
-# root qualification for quoted names still needs a rule
-# reverse-only notation could express the same connection from register-patient to finish
-
 # deferred: declarations and graph fragments embedded in field values
 # properties cannot contain declarations, bodies have no bare graph statements
 
-# candidate retry, not yet a defined edge contract
-# lookup could retry on timeout with a cap supplied by settings.max_attempts
-
-# O09 candidate: companion definitions, not finalized kind schemas
+# illustrative companion definitions, domain schemas belong to future providers
 (routing_correct:scorer {lang: "python"}) {
     output: {department: context.output.department},
     expected: {department: "appointments"},
@@ -344,6 +337,24 @@
     scorers: [|(routing_correct)|],
 };
 
-# unresolved syntax and semantics live in notes/plan/spec.md O01-O09
-# the feature coverage table there inventories v1 constructs still to map
-# parsing does not imply consumer parity or accepted kind schemas
+# compilation validates language structure and references
+# provider schemas, kind extension, and execution are future work
+# graph names reserve self, source, target, context, true, false, and null
+
+# distinct literal comparisons share the same sampled department binding
+(route)
+    =[:exclusive]=>[
+        -[:next {when: source.output.department == "billing"}]->(billing:task),
+        -[:next {when: source.output.department == "appointments"}]->(appointments:task),
+        -[:next {when: source.output.department == "records"}]->(records_request:task),
+    ];
+
+# containment, prerequisites, and plain adjacency have distinct contracts
+(intake)-[:contains]->(collect);
+(route)-[:requires]->(lookup);
+(routing_correct)-[:link]->(routing_check);
+
+# each junction kind specifies a different arrival operation
+>>[:merge [appointment], [patient_details]]->(arrival_log:task);
+>>[:first {correlate: settings.request_id} [coverage], [records]]->(first_check:task);
+>>[:quorum {count: 2, correlate: settings.request_id} [to_identity], [to_insurance], [to_schedule]]->(enough_checks:task);

@@ -107,8 +107,12 @@ pub struct Fork {
 /// Explicit convergence of the listed incoming edges.
 #[derive(Debug, Clone)]
 pub struct Junction {
+    /// Authored kind defining how incoming data is combined.
+    pub kind: String,
     /// Exact incoming edge identities.
     pub inputs: Vec<EdgeId>,
+    /// Configuration properties without an implied arrival policy.
+    pub props: Vec<BindingId>,
     /// Destination node.
     pub target: NodeId,
     /// Owning fork for an attached junction.

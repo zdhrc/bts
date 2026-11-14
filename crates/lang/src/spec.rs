@@ -26,6 +26,12 @@ pub struct Spec {
     pub examples: &'static [Example],
 }
 impl Spec {
+    /// Looks up a built-in kind within its graph construct.
+    pub fn primitive(&self, construct: &str, name: &str) -> Option<&PrimitiveDesc> {
+        self.primitives
+            .iter()
+            .find(|primitive| primitive.construct == construct && primitive.name == name)
+    }
     /// Looks up a built-in function.
     pub fn function(&self, name: &str) -> Option<&FuncDesc> {
         self.functions.iter().find(|f| f.name == name)
@@ -907,7 +913,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.junctions"),
-        summary: "A junction preserves only its explicitly listed input edges and destination. Inputs of an attached junction belong to the attached fork. Root junctions can join separately declared edges. Overlapping input sets on sibling junctions are allowed and do not create implicit edges between their destinations.",
+        summary: "A junction requires an open kind and preserves its explicitly listed input edges and destination. Optional properties follow the kind inside the junction brackets, before its input references. Properties belong to the junction, not its destination, and use the ordinary expression rules. Context reads in those properties belong to the junction. Inputs of an attached junction belong to the attached fork. Root junctions can join separately declared edges. Overlapping input sets on sibling junctions are allowed and do not create implicit edges between their destinations. Built-in junction input lists contain distinct edge identities. Grouped junctions use correlate as an explicit group key when supplied, otherwise a runtime consumer must supply the activation group. Independent groups must not be combined implicitly. Buffering repeated arrivals, group lifetime and inactive-input policies remain runtime contract work. The kind determines the combination behavior, properties configure it.",
     },
     RuleDesc {
         tags: &[],
@@ -922,7 +928,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.guards"),
-        summary: "The when edge property requires a boolean value, with context-dependent checks deferred to evaluation. Conditional forks allow overlapping guards. Parallel forks prohibit guards. Exclusive forks require pairwise disjoint branch predicates. The current proof handles constants, negation, conjunction and disjunction over up to twelve distinct atoms. Identical comparisons share atoms, independent function calls do not. Unproved disjointness is a validation error. Exhaustive coverage and defaults are not required.",
+        summary: "The when edge property requires a boolean value, with context-dependent checks deferred to evaluation. Conditional forks allow overlapping guards. Parallel forks prohibit guards. Exclusive forks require pairwise disjoint branch predicates. The current proof handles constants, aliases, negation, conjunction and disjunction over up to twelve distinct atoms. Equality to distinct scalar literals on the same subject is mutually exclusive. Equality and inequality, and complementary numeric comparisons at the same bound, share normalized predicates. Shared bindings retain draw identity and independent function calls remain distinct. General arithmetic interval reasoning is not performed. Unproved disjointness is a validation error. Exhaustive coverage and defaults are not required.",
     },
     RuleDesc {
         tags: &[],
@@ -937,12 +943,12 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.names"),
-        summary: "Named nodes, edges and forks share one document namespace. Forward references are resolved after declaration registration.",
+        summary: "Named nodes, edges and forks share one document namespace. Forward references are resolved after declaration registration. The names self, source, target, context, true, false and null are reserved for contextual references and literals, including when quoted. They cannot name graph declarations or comprehension bindings. Property and content keys may use these names.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("graph.references"),
-        summary: "References preserve graph identity. Node endpoints must resolve statically to nodes, junction inputs to exact edges.",
+        summary: "References preserve graph identity through aliases, statically selected collection elements and constant conditional expressions. Node endpoints must resolve statically to nodes, junction inputs to exact edges. Both node and edge boundaries accept reference expressions, including fields and array indexes. A standalone quoted name inside a boundary looks up that graph name. Dynamic endpoint or input selection is rejected. Referencing an existing edge does not redeclare it or change its endpoints. Properties can read configuration from another edge through its reference.",
     },
     RuleDesc {
         tags: &[],
@@ -1102,6 +1108,51 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
 ];
 const PRIMITIVES: &[PrimitiveDesc] = &[
     PrimitiveDesc {
+        name: "accumulate",
+        construct: "junction",
+        summary: "Collect one arrival from every listed input within a correlation group, then emit one grouped arrival to the target. Keep each input edge's data separately addressable. Repeated arrivals from one input do not satisfy another input.",
+    },
+    PrimitiveDesc {
+        name: "merge",
+        construct: "junction",
+        summary: "Forward each incoming arrival independently to the target with its input identity and data preserved. Do not wait for other inputs or combine their scopes.",
+    },
+    PrimitiveDesc {
+        name: "first",
+        construct: "junction",
+        summary: "Emit the earliest arrival within a correlation group to the target, preserving its input identity and data. Emit at most once per group. This does not implicitly cancel upstream work.",
+    },
+    PrimitiveDesc {
+        name: "quorum",
+        construct: "junction",
+        summary: "Emit one grouped arrival after count distinct listed inputs have arrived within a correlation group. Preserve the contributing input identities and data. count is a required constant integer from one through the number of listed inputs. Repeated arrivals from one input count once.",
+    },
+    PrimitiveDesc {
+        name: "link",
+        construct: "edge",
+        summary: "Directed adjacency between nodes. Establishes a relationship without prescribing activation or data transfer.",
+    },
+    PrimitiveDesc {
+        name: "next",
+        construct: "edge",
+        summary: "Directed progression from source to target. An eligible traversal advances behavior to the target. It does not imply copying source fields into the target.",
+    },
+    PrimitiveDesc {
+        name: "requires",
+        construct: "edge",
+        summary: "The source depends on the target as a prerequisite. This direction expresses dependency rather than progression. The consumer defines how a prerequisite is satisfied.",
+    },
+    PrimitiveDesc {
+        name: "contains",
+        construct: "edge",
+        summary: "The source structurally contains the target. Membership alone does not activate the target, merge scopes, or impose single-parent tree constraints.",
+    },
+    PrimitiveDesc {
+        name: "feeds",
+        construct: "edge",
+        summary: "Directed data transfer from source to target. The value property specifies the payload when supplied. Data transfer does not itself imply progression or automatic copying of all source fields.",
+    },
+    PrimitiveDesc {
         name: "parallel",
         construct: "fork",
         summary: "All branches participate. Edge guards are prohibited.",
@@ -1208,7 +1259,8 @@ edge = "-[", headers, "]->", node
 cycle = "~[", headers, "]~>", node
 fork = "=[", header, "]=>[", edge, {",", edge}, [","], "]", {attached_path}
 selector = "->(", reference_expression, ")"
-junction = ">>[", edge_reference, {",", edge_reference}, [","], "]->", node
+junction = ">>[:", kind, [fields], junction_input, {",", junction_input}, [","], "]->", node
+junction_input = edge_reference | pattern
 fields = "{", [field, {",", field}, [","]], "}"
 field = identifier, ":", expression
 name = identifier | plain_string
@@ -1248,7 +1300,7 @@ reference_expression = expression
             "Fork entries contain exactly one ordinary edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
             "Root paths require semicolons. Internal entries require commas between entries on one line or multiple lines. A trailing comma is optional, including for a single entry. Array and object spreads use ...expression in an entry position.",
             "References use parentheses and brackets, arrays use [| |], expression grouping uses ${ }.",
-            "Node and edge kinds are open identifiers. Domain schemas and execution adapters are outside this language specification.",
+            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Provider-defined schemas and kind extension are future work.",
         ],
     },
     expressions: EXPRESSIONS,
