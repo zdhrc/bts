@@ -4,14 +4,29 @@
     fields: {patient_id: {type: "string", required: true}},
 });
 
-(request:span {name: "intake"}) {
+(intake:agent {name: "Hospital intake", description: "Identify a patient and route their request"}) {
     input: {patient_id: "p-123"},
+    output: format_reply.output,
+    expected: {role: "assistant", content: "I can help with that"},
+};
+
+# membership does not start steps or establish emitted span parents
+(intake)-[:contains]->(request);
+(intake)-[:contains]->(lookup);
+(intake)-[:contains]->(route);
+(intake)-[:contains]->(reply);
+(intake)-[:contains]->(format_reply);
+(intake)-[:contains]->(grade);
+
+# both consumers start here and resolve the same authored field dependencies
+(intake)-[:next]->(request:span {name: "intake"}) {
+    input: intake.input,
     output: {patient_id: self.input.patient_id},
     tags: [|"intake"|],
     metadata: {request_id: "req-123"},
 };
 
-(request)-[:feeds {value: source.output.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
+(request)-[:next, :feeds {value: source.output.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
     patient_id: <-,
     input: {patient_id: self.patient_id},
     output: {found: true},

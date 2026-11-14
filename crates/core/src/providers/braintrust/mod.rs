@@ -20,7 +20,7 @@ use mocking::data;
 pub struct Bundle;
 
 impl Bundle {
-    /// Supplies span schemas for hosts to include explicitly during compilation.
+    /// Supplies agent and span schemas for hosts to include explicitly during compilation.
     pub const DEFINITIONS: bts_lang::semantics::Source<'static> = defs::SOURCE;
 }
 

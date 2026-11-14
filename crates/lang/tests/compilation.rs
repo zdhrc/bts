@@ -56,8 +56,53 @@ fn braintrust_provider_schemas_compile_inherited_spans_and_propagation() {
 }
 
 #[test]
+fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
+    let model = compile_braintrust(BRAINTRUST_FIXTURE).unwrap();
+    let agent = model.kinds.iter().find(|kind| kind.name == "agent").unwrap();
+    assert_eq!(agent.base, "node");
+    assert!(!agent.fields.iter().any(|field| field.name == "duration"));
+    let node = |name: &str| {
+        model
+            .nodes
+            .iter()
+            .position(|node| node.name.as_deref() == Some(name))
+            .unwrap()
+    };
+    let intake = node("intake");
+    let members: Vec<_> = model
+        .edges
+        .iter()
+        .filter(|edge| edge.source.0 == intake && edge.kind == "contains")
+        .collect();
+    assert_eq!(members.len(), 6);
+    for name in ["request", "lookup", "route", "reply", "format_reply", "grade"] {
+        assert!(members.iter().any(|edge| edge.target.0 == node(name)));
+    }
+    let entries: Vec<_> = model
+        .edges
+        .iter()
+        .filter(|edge| edge.source.0 == intake && edge.kind == "next")
+        .collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].target.0, node("request"));
+    for kind in ["next", "feeds"] {
+        assert!(
+            model
+                .edges
+                .iter()
+                .any(|edge| edge.source.0 == node("request") && edge.target.0 == node("lookup") && edge.kind == kind)
+        );
+    }
+    compile_braintrust("+(special_agent::agent {}); (a:special_agent) {input: 1, output: self.input};").unwrap();
+}
+
+#[test]
 fn braintrust_provider_schemas_reject_invalid_known_fields_and_properties() {
     for source in [
+        "(a:agent {name: 42});",
+        "(a:agent {description: false});",
+        "(a:agent {entrypoint: \"request\"});",
+        "(a:agent) {metadata: false};",
         "(a:tool {typo: true});",
         "(a:span {name: 42});",
         "(a:task) {metadata: false};",
