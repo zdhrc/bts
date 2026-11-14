@@ -74,6 +74,7 @@ struct Modeler {
     junction_state: Vec<u8>,
     slots: HashMap<Slot, BindingId>,
     visiting: HashSet<Slot>,
+    defaults: HashMap<Slot, Value>,
     errors: Diags,
 }
 
@@ -92,8 +93,62 @@ impl Modeler {
             junction_state: Vec::new(),
             slots: HashMap::new(),
             visiting: HashSet::new(),
+            defaults: HashMap::new(),
             errors: Vec::new(),
         }
+    }
+
+    fn kinds(&mut self, declarations: &[ast::KindDecl]) -> Result<()> {
+        for (index, declaration) in declarations.iter().enumerate() {
+            if builtin_construct(&declaration.name).is_some() || reserved_name(&declaration.name) {
+                return Err(error(declaration.range, "kind name is reserved"));
+            }
+            if self
+                .model
+                .kind_names
+                .insert(declaration.name.clone(), KindId(index))
+                .is_some()
+            {
+                return Err(error(declaration.range, "duplicate kind name"));
+            }
+        }
+        let mut kinds = vec![None; declarations.len()];
+        let mut states = vec![0; declarations.len()];
+        for index in 0..declarations.len() {
+            resolve_kind(index, declarations, &self.model.kind_names, &mut states, &mut kinds)?;
+        }
+        self.model.kinds = kinds.into_iter().map(|kind| kind.expect("resolved kind")).collect();
+        Ok(())
+    }
+
+    fn element_kind(&self, owner: ElementId) -> (&str, Construct) {
+        match owner {
+            ElementId::Node(id) => (&self.model.nodes[id.0].kind, Construct::Node),
+            ElementId::Edge(id) => (&self.model.edges[id.0].kind, Construct::Edge),
+            ElementId::Fork(id) => (&self.model.forks[id.0].kind, Construct::Fork),
+            ElementId::Junction(id) => (&self.model.junctions[id.0].kind, Construct::Junction),
+        }
+    }
+
+    fn kind_schema(&self, owner: ElementId) -> Option<&Kind> {
+        let (name, _) = self.element_kind(owner);
+        self.model.kind_names.get(name).map(|id| &self.model.kinds[id.0])
+    }
+
+    fn primitive(&self, owner: ElementId) -> &str {
+        self.kind_schema(owner)
+            .map(|kind| kind.primitive.as_str())
+            .unwrap_or_else(|| self.element_kind(owner).0)
+    }
+
+    fn field_type(&self, slot: &Slot) -> FieldType {
+        self.kind_schema(slot.owner)
+            .and_then(|kind| {
+                let fields = if slot.property { &kind.props } else { &kind.fields };
+                fields.iter().find(|field| slot.path.len() == 1 && slot.path[0] == field.name)
+            })
+            .map(|field| field.ty)
+            .unwrap_or(FieldType::Any)
     }
 
     fn name(&mut self, name: &Option<String>, id: ElementId, range: SrcRange) {
@@ -117,8 +172,64 @@ impl Modeler {
     }
 
     fn fields(&mut self, owner: ElementId, property: bool, fields: &[ast::Attr]) {
+        let mut fields = fields.to_vec();
+        let (name, construct) = self.element_kind(owner);
+        let schema = self.kind_schema(owner).cloned();
+        if property
+            && schema
+                .as_ref()
+                .map(|kind| kind.construct)
+                .or_else(|| builtin_construct(name))
+                .is_some_and(|category| category != construct)
+        {
+            self.errors.extend(error(
+                self.element_range(owner),
+                "kind does not belong to this graph construct",
+            ));
+        }
+        if let Some(kind) = schema {
+            let entries = if property { kind.props } else { kind.fields };
+            if property {
+                for field in &fields {
+                    if !entries.iter().any(|entry| entry.name == field.key) {
+                        self.errors.extend(error(
+                            field.range,
+                            format!("unknown property `{}` for declared kind", field.key),
+                        ));
+                    }
+                }
+            }
+            for entry in entries {
+                if !fields.iter().any(|field| field.key == entry.name) {
+                    if let Some(value) = entry.default {
+                        self.defaults.insert(
+                            Slot {
+                                owner,
+                                property,
+                                path: vec![entry.name.clone()],
+                            },
+                            value,
+                        );
+                        fields.push(ast::Attr {
+                            key: entry.name,
+                            value: ast::Expr::new(ast::ExprKind::Null, entry.range),
+                            range: entry.range,
+                        });
+                    } else if entry.required {
+                        self.errors.extend(error(
+                            self.element_range(owner),
+                            format!(
+                                "missing required {} `{}`",
+                                if property { "property" } else { "field" },
+                                entry.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let mut seen = HashMap::new();
-        for field in fields {
+        for field in &fields {
             if let Some(previous) = seen.insert(field.key.clone(), field.range) {
                 self.errors
                     .extend(error(field.range, format!("duplicate field `{}`", field.key)));
@@ -129,7 +240,16 @@ impl Modeler {
                     .extend(error(field.range, "`props` is reserved for graph element properties"));
             }
         }
-        self.fields.insert((owner, property), fields.to_vec());
+        self.fields.insert((owner, property), fields);
+    }
+
+    fn element_range(&self, owner: ElementId) -> SrcRange {
+        match owner {
+            ElementId::Node(id) => self.model.nodes[id.0].range,
+            ElementId::Edge(id) => self.model.edges[id.0].range,
+            ElementId::Fork(id) => self.model.forks[id.0].range,
+            ElementId::Junction(id) => self.model.junctions[id.0].range,
+        }
     }
 
     fn node(&mut self, node: &ast::GraphNode, owner: Option<ElementId>) -> Anchor {
@@ -461,6 +581,11 @@ impl Modeler {
         match result {
             Ok(value) => {
                 self.model.bindings[id.0].value = value;
+                expr::schema_type(
+                    self.reference_value(self.model.bindings[id.0].value.clone()),
+                    self.field_type(&slot),
+                    range,
+                )?;
                 Ok(id)
             }
             Err(errors) => {
@@ -471,6 +596,41 @@ impl Modeler {
     }
 
     fn lower_binding_expr(&mut self, mut expr: ast::Expr, slot: &Slot) -> Result<Value> {
+        if let Some(value) = self.defaults.get(slot) {
+            return Ok(value.clone());
+        }
+        if matches!(expr.kind, ast::ExprKind::Upstream) {
+            if slot.property || !matches!(slot.owner, ElementId::Node(_)) || slot.path.len() != 1 {
+                return Err(error(expr.range, "upstream markers belong on direct node content fields"));
+            }
+            return Ok(Value::Input {
+                binding: self.slots[slot],
+                ty: self.field_type(slot),
+            });
+        }
+        if slot.property && slot.path == ["into"] && self.primitive(slot.owner) == "feeds" {
+            let ElementId::Edge(edge) = slot.owner else {
+                return Err(error(expr.range, "destination requires an edge"));
+            };
+            self.resolve_edge(edge)?;
+            let Cursor::Slot(destination) = self.cursor(&expr, Some(slot.owner))? else {
+                return Err(error(expr.range, "into must reference a target input field"));
+            };
+            if destination.owner != ElementId::Node(self.model.edges[edge.0].target)
+                || destination.property
+                || destination.path.len() != 1
+            {
+                return Err(error(
+                    expr.range,
+                    "into must reference a direct content field on the edge target",
+                ));
+            }
+            let id = self.binding(destination, expr.range)?;
+            if !matches!(self.model.bindings[id.0].value, Value::Input { .. }) {
+                return Err(error(expr.range, "destination field must declare an upstream input with <-"));
+            }
+            return Ok(Value::FieldRef(id));
+        }
         if let ast::ExprKind::Object(items) = &mut expr.kind
             && items.iter().all(|item| matches!(item, ast::ObjectItem::Attr(_)))
         {
@@ -917,7 +1077,10 @@ impl Modeler {
     fn validate_primitives(&self) -> Result<()> {
         let mut errors = Vec::new();
         for (i, junction) in self.model.junctions.iter().enumerate() {
-            if matches!(junction.kind.as_str(), "accumulate" | "merge" | "first" | "quorum") {
+            if matches!(
+                self.primitive(ElementId::Junction(JunctionId(i))),
+                "accumulate" | "merge" | "first" | "quorum"
+            ) {
                 let distinct: HashSet<_> = junction.inputs.iter().copied().collect();
                 if distinct.len() != junction.inputs.len() {
                     errors.extend(error(
@@ -926,7 +1089,7 @@ impl Modeler {
                     ));
                 }
             }
-            if junction.kind == "quorum" {
+            if self.primitive(ElementId::Junction(JunctionId(i))) == "quorum" {
                 match self.property(ElementId::Junction(JunctionId(i)), "count") {
                     Some(id) => {
                         let binding = &self.model.bindings[id.0];
@@ -942,8 +1105,8 @@ impl Modeler {
                 }
             }
         }
-        for (i, node) in self.model.nodes.iter().enumerate() {
-            if node.kind == "vars"
+        for (i, _node) in self.model.nodes.iter().enumerate() {
+            if self.primitive(ElementId::Node(NodeId(i))) == "vars"
                 && let Some(id) = self.property(ElementId::Node(NodeId(i)), "evaluate")
             {
                 let binding = &self.model.bindings[id.0];
@@ -953,6 +1116,28 @@ impl Modeler {
             }
         }
         for i in 0..self.model.edges.len() {
+            let owner = ElementId::Edge(EdgeId(i));
+            if self.primitive(owner) == "feeds"
+                && let Some(into) = self.property(owner, "into")
+            {
+                let destination = &self.model.bindings[into.0];
+                if let Value::FieldRef(target) = destination.value {
+                    if let Some(value) = self.property(owner, "value") {
+                        let target = &self.model.bindings[target.0];
+                        let Value::Input { ty, .. } = target.value else {
+                            unreachable!()
+                        };
+                        let payload = &self.model.bindings[value.0];
+                        if let Err(diags) = expr::schema_type(self.reference_value(payload.value.clone()), ty, payload.range) {
+                            errors.extend(diags);
+                        }
+                    } else {
+                        errors.extend(error(destination.range, "feeds with a destination requires a value property"));
+                    }
+                } else {
+                    errors.extend(error(destination.range, "feeds destination must be a field reference"));
+                }
+            }
             if let Some(id) = self.property(ElementId::Edge(EdgeId(i)), "when") {
                 let binding = &self.model.bindings[id.0];
                 if let Err(diags) = expr::boolean(self.reference_value(binding.value.clone()), binding.range) {
@@ -960,8 +1145,8 @@ impl Modeler {
                 }
             }
         }
-        for fork in &self.model.forks {
-            if fork.kind == "parallel" {
+        for (fork_index, fork) in self.model.forks.iter().enumerate() {
+            if self.primitive(ElementId::Fork(ForkId(fork_index))) == "parallel" {
                 for edge in fork.branches.iter().flatten() {
                     if let Some(id) = self.property(ElementId::Edge(*edge), "when") {
                         errors.extend(error(
@@ -971,7 +1156,7 @@ impl Modeler {
                     }
                 }
             }
-            if fork.kind == "exclusive" {
+            if self.primitive(ElementId::Fork(ForkId(fork_index))) == "exclusive" {
                 for i in 0..fork.branches.len() {
                     for j in i + 1..fork.branches.len() {
                         for left in &fork.branches[i] {
@@ -995,6 +1180,201 @@ impl Modeler {
         }
         if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
+}
+
+fn reserved_name(name: &str) -> bool {
+    matches!(name, "self" | "source" | "target" | "context" | "true" | "false" | "null")
+}
+
+fn builtin_construct(name: &str) -> Option<Construct> {
+    [Construct::Node, Construct::Edge, Construct::Fork, Construct::Junction]
+        .into_iter()
+        .find(|construct| name == construct.name() || crate::spec::SPEC.primitive(construct.name(), name).is_some())
+}
+
+fn schema_entries(expr: &ast::Expr) -> Result<Vec<ast::Attr>> {
+    let ast::ExprKind::Object(items) = &expr.kind else {
+        return Err(error(expr.range, "schema descriptors must be objects"));
+    };
+    let mut seen = HashSet::new();
+    let mut fields = Vec::new();
+    for item in items {
+        let ast::ObjectItem::Attr(field) = item else {
+            return Err(error(expr.range, "schema spreads are not supported"));
+        };
+        if !seen.insert(&field.key) {
+            return Err(error(field.range, "duplicate schema key"));
+        }
+        fields.push(field.clone());
+    }
+    Ok(fields)
+}
+
+fn schema_string(expr: &ast::Expr) -> Result<String> {
+    match &expr.kind {
+        ast::ExprKind::Str(value) => Ok(value.clone()),
+        _ => Err(error(expr.range, "expected a literal schema string")),
+    }
+}
+
+fn schema_fields(expr: &ast::Expr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    for field in schema_entries(expr)? {
+        let previous = inherited.iter().find(|entry| entry.name == field.key).cloned();
+        let mut schema = previous.clone().unwrap_or(FieldSchema {
+            name: field.key.clone(),
+            ty: FieldType::Any,
+            required: false,
+            default: None,
+            role: None,
+            range: field.range,
+        });
+        schema.range = field.range;
+        for descriptor in schema_entries(&field.value)? {
+            match descriptor.key.as_str() {
+                "type" => {
+                    schema.ty = match schema_string(&descriptor.value)?.as_str() {
+                        "any" => FieldType::Any,
+                        "string" => FieldType::String,
+                        "number" => FieldType::Number,
+                        "boolean" => FieldType::Boolean,
+                        "array" => FieldType::Array,
+                        "object" => FieldType::Object,
+                        _ => return Err(error(descriptor.range, "unknown schema value type")),
+                    };
+                }
+                "required" => match descriptor.value.kind {
+                    ast::ExprKind::Bool(value) => schema.required = value,
+                    _ => return Err(error(descriptor.range, "required must be a literal boolean")),
+                },
+                "role" => schema.role = Some(schema_string(&descriptor.value)?),
+                "default" => {
+                    let value = expr::lower(descriptor.value, &mut |expr| {
+                        Err(error(expr.range, "schema defaults cannot reference instances"))
+                    })?;
+                    if !expr::constant(&value) {
+                        return Err(error(descriptor.range, "schema defaults must be constant"));
+                    }
+                    schema.default = Some(value);
+                }
+                _ => {
+                    return Err(error(
+                        descriptor.range,
+                        format!("unknown schema descriptor `{}`", descriptor.key),
+                    ));
+                }
+            }
+        }
+        if let Some(previous) = &previous {
+            if previous.ty != FieldType::Any && schema.ty != previous.ty {
+                return Err(error(field.range, "an extension cannot change an inherited field type"));
+            }
+            if previous.required && !schema.required {
+                return Err(error(field.range, "an extension cannot make a required field optional"));
+            }
+        }
+        if let Some(default) = &schema.default {
+            expr::schema_type(
+                ReferenceValue {
+                    value: default.clone(),
+                    bindings: Vec::new(),
+                },
+                schema.ty,
+                schema.range,
+            )?;
+        }
+        if let Some(index) = inherited.iter().position(|entry| entry.name == schema.name) {
+            inherited[index] = schema;
+        } else {
+            inherited.push(schema);
+        }
+    }
+    Ok(())
+}
+
+fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) -> Vec<FieldSchema> {
+    let mut names = Vec::new();
+    if construct == Construct::Edge {
+        names.push(("when", FieldType::Boolean, false));
+    }
+    match primitive {
+        "feeds" => names.extend([("value", FieldType::Any, false), ("into", FieldType::Any, false)]),
+        "accumulate" | "first" => names.push(("correlate", FieldType::Any, false)),
+        "quorum" => names.extend([("correlate", FieldType::Any, false), ("count", FieldType::Number, true)]),
+        "vars" => names.push(("evaluate", FieldType::String, false)),
+        _ => {}
+    }
+    names
+        .into_iter()
+        .map(|(name, ty, required)| FieldSchema {
+            name: name.to_owned(),
+            ty,
+            required,
+            default: None,
+            role: None,
+            range,
+        })
+        .collect()
+}
+
+fn resolve_kind(
+    index: usize,
+    declarations: &[ast::KindDecl],
+    names: &std::collections::BTreeMap<String, KindId>,
+    states: &mut [u8],
+    kinds: &mut [Option<Kind>],
+) -> Result<Kind> {
+    if let Some(kind) = &kinds[index] {
+        return Ok(kind.clone());
+    }
+    let declaration = &declarations[index];
+    if states[index] == 1 {
+        return Err(error(declaration.range, "circular kind extension"));
+    }
+    states[index] = 1;
+    let mut kind = if let Some(base) = names.get(&declaration.base) {
+        let mut kind = resolve_kind(base.0, declarations, names, states, kinds)?;
+        if kind.construct != declaration.construct {
+            return Err(error(declaration.range, "kind extension crosses graph construct categories"));
+        }
+        kind.base_kind = Some(*base);
+        kind
+    } else {
+        let construct = builtin_construct(&declaration.base)
+            .ok_or_else(|| error(declaration.range, format!("unknown base kind `{}`", declaration.base)))?;
+        if construct != declaration.construct {
+            return Err(error(declaration.range, "kind extension crosses graph construct categories"));
+        }
+        Kind {
+            name: String::new(),
+            base: declaration.base.clone(),
+            base_kind: None,
+            construct,
+            primitive: declaration.base.clone(),
+            props: primitive_properties(construct, &declaration.base, declaration.range),
+            fields: Vec::new(),
+            range: declaration.range,
+        }
+    };
+    kind.name = declaration.name.clone();
+    kind.base = declaration.base.clone();
+    kind.range = declaration.range;
+    let mut seen = HashSet::new();
+    for field in &declaration.schema {
+        if !seen.insert(&field.key) {
+            return Err(error(field.range, "duplicate kind schema section"));
+        }
+        match field.key.as_str() {
+            "props" => schema_fields(&field.value, &mut kind.props)?,
+            "fields" if kind.construct == Construct::Node => schema_fields(&field.value, &mut kind.fields)?,
+            _ => return Err(error(field.range, "expected props, or fields for a node kind")),
+        }
+    }
+    if kind.fields.iter().any(|field| field.name == "props") {
+        return Err(error(kind.range, "props is reserved for node properties"));
+    }
+    states[index] = 2;
+    kinds[index] = Some(kind.clone());
+    Ok(kind)
 }
 
 // find one distinct edge per constraint without enumerating their permutations
@@ -1224,11 +1604,12 @@ fn disjoint(a: &Value, b: &Value, bindings: &[Binding]) -> bool {
 
 pub(super) fn model(ast: ast::GraphDocument) -> Result<Model> {
     let mut modeler = Modeler::new();
+    modeler.kinds(&ast.kinds)?;
     let paths: Vec<_> = ast.paths.iter().map(|path| modeler.path(path, None)).collect();
     if !modeler.errors.is_empty() {
         return Err(modeler.errors);
     }
-    if paths.is_empty() {
+    if paths.is_empty() && ast.kinds.is_empty() {
         return Err(error(SrcRange::new(0, 0), "expected at least one graph statement"));
     }
     let mut resolved = Vec::new();

@@ -12,8 +12,25 @@ pub struct Ast {
 /// Candidate graph paths before semantic validation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphDocument {
+    /// Kind declarations in source order.
+    pub kinds: Vec<KindDecl>,
     /// Root paths in source order.
     pub paths: Vec<GraphPath>,
+}
+
+/// A schema declaration for one graph construct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KindDecl {
+    /// The graph construct this kind specializes.
+    pub construct: crate::model::Construct,
+    /// The new kind name.
+    pub name: String,
+    /// The base kind name.
+    pub base: String,
+    /// Schema descriptors.
+    pub schema: Vec<Attr>,
+    /// Complete declaration location.
+    pub range: SrcRange,
 }
 
 /// A path with its structural attachment preserved.
@@ -227,6 +244,8 @@ pub struct Expr {
 /// The structure of an expression before names and types are checked.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
+    /// A required incoming field value, legal only on instance fields.
+    Upstream,
     /// A path-pattern reference selecting an existing graph element.
     PatternRef(Box<GraphPattern>),
     /// An explicit graph reference whose identity is resolved later.

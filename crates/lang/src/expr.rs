@@ -33,7 +33,9 @@ impl ExprType {
                 Value::Object(_) | Value::Attachment { .. } => Self::Object,
                 Value::Func { .. } => Self::Func,
                 // constant exprs fold to values, only dynamic ones get here
-                Value::BindingRef(_)
+                Value::Input { .. }
+                | Value::FieldRef(_)
+                | Value::BindingRef(_)
                 | Value::GraphRef { .. }
                 | Value::Context { .. }
                 | Value::Unary { .. }
@@ -182,6 +184,14 @@ impl<'a> ExpressionModeler<'a> {
         }
         let ast::Expr { kind, range } = expr;
         match kind {
+            ast::ExprKind::Upstream => {
+                self.reference_errors.push(Diag {
+                    when: DiagPhase::Validation,
+                    what: "upstream markers belong on instance content fields".to_owned(),
+                    r#where: range,
+                });
+                None
+            }
             ast::ExprKind::GraphRef { .. } | ast::ExprKind::GraphMember { .. } | ast::ExprKind::PatternRef(_) => {
                 self.resolve_expr(ast::Expr { kind, range })
             }
@@ -1226,7 +1236,8 @@ impl<'a> ExpressionModeler<'a> {
     fn value_reaches_context(&self, value: &Value) -> bool {
         let any = |values: &[Value]| values.iter().any(|value| self.value_reaches_context(value));
         match value {
-            Value::GraphRef { .. } => false,
+            Value::GraphRef { .. } | Value::FieldRef(_) => false,
+            Value::Input { .. } => true,
             Value::Context { .. } => true,
             Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::Attachment { .. } => false,
             Value::Template(template) => template.parts.iter().any(|part| match part {
@@ -2224,6 +2235,15 @@ impl<'a> ExpressionModeler<'a> {
             // a referenced field's shape is only known at evaluation
             Value::GraphRef { .. } => Some(StaticType::Graph),
             Value::Context { .. } => None,
+            Value::FieldRef(_) => Some(StaticType::Graph),
+            Value::Input { ty, .. } => match ty {
+                FieldType::Any => None,
+                FieldType::String => Some(StaticType::String),
+                FieldType::Number => Some(StaticType::Number),
+                FieldType::Boolean => Some(StaticType::Boolean),
+                FieldType::Array => Some(StaticType::Array),
+                FieldType::Object => Some(StaticType::Object),
+            },
             Value::Func { func, .. } => self.func_type(func),
             Value::Unary { op: UnaryOp::Neg, .. } => Some(StaticType::Number),
             Value::Unary { op: UnaryOp::Not, .. } => Some(StaticType::Boolean),
@@ -2553,6 +2573,8 @@ fn value_is_constant(value: &Value) -> bool {
         | Value::Func { .. }
         | Value::BindingRef(_)
         | Value::GraphRef { .. }
+        | Value::Input { .. }
+        | Value::FieldRef(_)
         | Value::Context { .. }
         | Value::Attachment { .. } => false,
         Value::Unary { .. } | Value::Binary { .. } | Value::Cond { .. } | Value::Index { .. } | Value::Slice { .. } => false,
@@ -3133,6 +3155,21 @@ pub(crate) fn slice(
         )
     })
 }
+pub(crate) fn schema_type(value: ReferenceValue, ty: FieldType, range: SrcRange) -> Result<(), Diags> {
+    let expected = match ty {
+        FieldType::Any => return Ok(()),
+        FieldType::String => StaticType::String,
+        FieldType::Number => StaticType::Number,
+        FieldType::Boolean => StaticType::Boolean,
+        FieldType::Array => StaticType::Array,
+        FieldType::Object => StaticType::Object,
+    };
+    with_value(value, range, |modeler, value| {
+        modeler.check_operand(&value, expected, "schema".to_owned()).then_some(value)
+    })
+    .map(|_| ())
+}
+
 pub(crate) fn boolean(value: ReferenceValue, range: SrcRange) -> Result<(), Diags> {
     with_value(value, range, |modeler, value| {
         modeler
@@ -3159,6 +3196,8 @@ fn collect_refs(value: &Value, found: &mut Vec<BindingId>) {
         | Value::Bool(_)
         | Value::Null
         | Value::GraphRef { .. }
+        | Value::Input { .. }
+        | Value::FieldRef(_)
         | Value::Context { .. }
         | Value::Attachment { .. } => {}
         Value::Template(template) => collect_template_refs(template, found),

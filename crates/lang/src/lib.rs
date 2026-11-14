@@ -45,7 +45,7 @@ pub mod semantics {
     pub fn compile_module(src: &str, allow_empty: bool) -> Result<Model, Diags> {
         let tokens = tracing::info_span!("lex").in_scope(|| lex(src))?;
         let ast = tracing::info_span!("parse").in_scope(|| parse(tokens, src))?;
-        if allow_empty && ast.paths.is_empty() {
+        if allow_empty && ast.paths.is_empty() && ast.kinds.is_empty() {
             return Ok(Model::default());
         }
         tracing::info_span!("model").in_scope(|| model(ast))
@@ -63,7 +63,7 @@ pub mod syntax {
     pub use crate::ast::{Attr, BinOp, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
     pub use crate::ast::{
         GraphDocument, GraphEdgeStep, GraphFork, GraphHeader, GraphJunction, GraphNode, GraphNodeDecl, GraphOrigin, GraphPath,
-        GraphReferenceKind, GraphStep,
+        GraphReferenceKind, GraphStep, KindDecl,
     };
     pub use crate::ast::{GraphPattern, GraphPatternConstraint, GraphPatternNode, GraphPatternStep};
 

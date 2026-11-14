@@ -892,13 +892,38 @@ const FUNCS: &[FuncDesc] = &[
 const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
+        id: Id::new("kind.declarations"),
+        summary: "The + marker introduces a root kind declaration. Its boundary identifies node, edge, fork or junction, and :: names its base. Bases resolve forward to declared kinds or built-in roots and primitives. Kind names are unique in a namespace separate from instance names, cannot shadow built-ins or reserved names, and cannot form inheritance cycles. Bases and instances must use the same construct category. A declaration-only module is valid. Derived kinds retain their base primitive validation and operation identity.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("kind.schemas"),
+        summary: "Kind descriptors accept props and, for nodes, fields. Each maps names to descriptors with type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role is descriptive metadata, not an operation binding. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("kind.inheritance"),
+        summary: "Extensions inherit properties, fields, requiredness, defaults and roles. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict, while content fields remain open and extensible. Described content fields still receive type and requiredness checks. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.inputs"),
+        summary: "A direct node content field with value <- requires upstream data for each occurrence. Lowering preserves an Input with binding identity and the schema type, or any for an undescribed field. Authored expressions may read that input through ordinary references. Runtime data availability is not proven by compilation. Declared inputs suppress schema defaults for that field. Defaults are fallback values for omitted fields, not for undelivered required inputs.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.destinations"),
+        summary: "For feeds and its specializations, into resolves a field identity without reading its value. It must select a direct content field on the edge target explicitly marked <-. Properties, other nodes, missing fields and authored value fields are invalid destinations. The model retains FieldRef separately from Input and BindingRef, so a destination does not add a read dependency. Known payload types are checked against the input type. Multiple suppliers may name the same destination, without defining arrival ordering, merging or runtime delivery.",
+    },
+    RuleDesc {
+        tags: &[],
         id: Id::new("graph.lowering"),
         summary: "Compilation registers declarations before resolving endpoints and field dependencies. Each node, edge, fork and junction has a model-local identity. Names and source paths do not create implicit containment edges. Root and attached paths preserve authoring structure alongside the flattened graph tables.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("graph.fields"),
-        summary: "Kinds are open identifiers and fields have no domain schema. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
+        summary: "Undeclared kinds remain open identifiers without domain schemas. Declared kinds enforce strict property schemas while allowing additional content fields. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
     },
     RuleDesc {
         tags: &[],
@@ -953,7 +978,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.placement"),
-        summary: "Bodies and properties contain fields, never declarations. Properties configure elements, bodies supply contents.",
+        summary: "Instance bodies and properties contain fields, never declarations. Kind declarations are separate root statements. Properties configure elements, bodies supply contents.",
     },
     RuleDesc {
         tags: &[],
@@ -1150,7 +1175,7 @@ const PRIMITIVES: &[PrimitiveDesc] = &[
     PrimitiveDesc {
         name: "feeds",
         construct: "edge",
-        summary: "Directed data transfer from source to target. The value property specifies the payload when supplied. Data transfer does not itself imply progression or automatic copying of all source fields.",
+        summary: "Directed data transfer from source to target. The value property specifies the payload when supplied. With into, the destination is a field reference to a direct content field on this edge's target that declares <-. A destination requires value, whose known type must match the destination schema. Data transfer does not itself imply progression or automatic copying of all source fields.",
     },
     PrimitiveDesc {
         name: "parallel",
@@ -1210,6 +1235,30 @@ const EXPRESSIONS: &[ExprDesc] = &[
 const EXAMPLES: &[Example] = &[
     Example {
         tags: &[],
+        id: Id::new("example.kind-input"),
+        summary: "A typed upstream input and a field destination",
+        note: "Compilation retains the input and destination identities without delivering data.",
+        source: r#"+(receiver::node {fields: {id: {type: "string", required: true}}}); (a:node) {id: "p-1"} -[:feeds {value: source.id, into: target.id}]->(b:receiver) {id: <-};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.kind-property"),
+        summary: "Declared properties are strict",
+        note: "Additional content fields are allowed, additional properties are rejected.",
+        source: r#"+(record::node {props: {name: {type: "string"}}}); (a:record {typo: true});"#,
+        valid: false,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.kind-junction"),
+        summary: "A junction kind retains its base operation",
+        note: "The kind boundary and the instance boundary use the same graph construct.",
+        source: "+>[joined::accumulate {}]>>; (:node)-[e:link]->(:node); >[:joined [e]]>>(:node);",
+        valid: true,
+    },
+    Example {
+        tags: &[],
         id: Id::new("example.graph"),
         summary: "A graph with a forward reference",
         note: "Kinds are open names, with no domain field schemas.",
@@ -1249,7 +1298,9 @@ pub static SPEC: Spec = Spec {
     summary: "A language for defining graphs, references and expressions without domain-specific node schemas.",
     surface: SurfaceDesc {
         notation: "Typed graph elements with comma-separated properties and content fields.",
-        grammar: r#"document = { root_path, ";" }
+        grammar: r#"document = { (root_path | kind_declaration), ";" }
+kind_declaration = "+(", kind_schema, ")" | "+-[", kind_schema, "]-" | "+=[", kind_schema, "]=" | "+>[", kind_schema, "]>>"
+kind_schema = name, "::", kind, fields
 root_path = (node | junction), {edge | cycle}, [fork]
 attached_path = (selector | junction), {edge | cycle}, [fork]
 node = "(", header, ")", [fields] | "(", reference_expression, ")"
@@ -1259,10 +1310,10 @@ edge = "-[", headers, "]->", node
 cycle = "~[", headers, "]~>", node
 fork = "=[", header, "]=>[", edge, {",", edge}, [","], "]", {attached_path}
 selector = "->(", reference_expression, ")"
-junction = ">>[:", kind, [fields], junction_input, {",", junction_input}, [","], "]->", node
+junction = ">[:", kind, [fields], junction_input, {",", junction_input}, [","], "]>>", node
 junction_input = edge_reference | pattern
 fields = "{", [field, {",", field}, [","]], "}"
-field = identifier, ":", expression
+field = identifier, ":", (expression | "<-")
 name = identifier | plain_string
 kind = identifier
 edge_reference = "[", reference_expression, "]", {".[", name, "]"}
@@ -1296,11 +1347,12 @@ reference_expression = expression
             "This grammar describes token forms. The layout rules below constrain attached_path repetition and legal positions. Scalar and template tokenization includes quoted, multiline and heredoc strings, interpolation, finite numbers, booleans and null.",
             "Spaces establish continuation levels, with no fixed width. Sibling selectors and junctions align on separate lines. A dedent returns to an established level. Tabs are not indentation. Delimited values and strings do not create graph scope.",
             "One selector or junction may continue a fork on the same line. Another sibling requires a new aligned line. Its attachment is to the enclosing fork, never the preceding sibling's final node.",
+            "The <- marker is legal only as the entire value of a direct instance node content field. It is not an expression and is forbidden in properties, nested objects, arrays and schema descriptors.",
             "Node bodies contain only fields. Node declarations are legal at path origins and connection targets. No declarations occur in expression values or properties. Empty node parentheses are invalid.",
             "Fork entries contain exactly one ordinary edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
             "Root paths require semicolons. Internal entries require commas between entries on one line or multiple lines. A trailing comma is optional, including for a single entry. Array and object spreads use ...expression in an entry position.",
             "References use parentheses and brackets, arrays use [| |], expression grouping uses ${ }.",
-            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Provider-defined schemas and kind extension are future work.",
+            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Kind declarations provide local schemas and same-category extension. Package loading and runtime operation registration remain future work.",
         ],
     },
     expressions: EXPRESSIONS,

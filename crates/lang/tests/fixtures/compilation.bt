@@ -88,7 +88,7 @@
                                     input: {patient_id: collect.output.patient_id},
                                 },
                             ]
-                                >>[:accumulate {correlate: settings.request_id} [coverage], [records]]->(finish);
+                                >[:accumulate {correlate: settings.request_id} [coverage], [records]]>>(finish);
 
 # additional connections reuse existing definitions without redeclaring them
 (manual_review)-[:next]->(finish);
@@ -150,7 +150,7 @@
                 -[inner_check:next]->(layout_check:tool),
             ]
                 ->([inner_lookup].target)-[:next]->(layout_result:function)
-                >>[:accumulate [inner_lookup], [inner_check]]->(layout_combined:task)
+                >[:accumulate [inner_lookup], [inner_check]]>>(layout_combined:task)
         ->([outer_layout].[outer_note].target)-[:next]->(layout_finish:function);
 # indenting the last selector under inner_layout would be invalid even qualified
 # selectors and junctions at the same level are siblings, never a hidden chain
@@ -219,7 +219,7 @@
 })
     -[appointment:next]->(confirm_appointment:task);
 
->>[:accumulate {correlate: context.visit_id} [appointment], [patient_details]]->(prepare_visit:task {accumulate: "each"}) {
+>[:accumulate {correlate: context.visit_id} [appointment], [patient_details]]>>(prepare_visit:task {accumulate: "each"}) {
     input: {
         patient: [patient_details].scope.patient,
         appointment: [appointment].scope.appointment,
@@ -238,8 +238,8 @@
         -[to_insurance:next]->(insurance_check:tool),
         -[to_schedule:next]->(schedule_check:tool),
     ]
-        >>[:accumulate [to_identity], [to_insurance],]->(eligibility:task)
-        >>[:accumulate [to_insurance], [to_schedule],]->(booking:task);
+        >[:accumulate [to_identity], [to_insurance],]>>(eligibility:task)
+        >[:accumulate [to_insurance], [to_schedule],]>>(booking:task);
 
 # fork continuation selects a node before a cycle, without creating an edge
 (recheck:task)
@@ -355,6 +355,70 @@
 (routing_correct)-[:link]->(routing_check);
 
 # each junction kind specifies a different arrival operation
->>[:merge [appointment], [patient_details]]->(arrival_log:task);
->>[:first {correlate: settings.request_id} [coverage], [records]]->(first_check:task);
->>[:quorum {count: 2, correlate: settings.request_id} [to_identity], [to_insurance], [to_schedule]]->(enough_checks:task);
+>[:merge [appointment], [patient_details]]>>(arrival_log:task);
+>[:first {correlate: settings.request_id} [coverage], [records]]>>(first_check:task);
+>[:quorum {count: 2, correlate: settings.request_id} [to_identity], [to_insurance], [to_schedule]]>>(enough_checks:task);
+
+
+# kind schemas have strict properties and open content fields
++(span::node {
+    props: {
+        name: {type: "string", required: true},
+    },
+    fields: {
+        patient_id: {type: "string"},
+        output: {type: "object", role: "output"},
+        metadata: {type: "object", default: {}},
+    },
+});
+
++(patient_lookup::span {
+    props: {
+        resource: {type: "string", default: "patients"},
+    },
+    fields: {
+        patient_id: {required: true},
+    },
+});
+
++-[patient_data::feeds {
+    props: {
+        label: {type: "string", default: "patient identity"},
+    },
+}]-;
+
++=[patient_checks_kind::parallel {
+    props: {
+        label: {type: "string"},
+    },
+}]=;
+
++>[patient_join::accumulate {
+    props: {
+        label: {type: "string"},
+    },
+}]>>;
+
+# an incoming field is a requirement, its destination reference does not read it
+(patient_request:node) {
+    patient: {id: "p-456"},
+}
+    -[patient_delivery:patient_data {
+        value: source.patient.id,
+        into: target.patient_id,
+    }]->(patient_step:patient_lookup {name: "Look up patient"}) {
+        patient_id: <-,
+        output: {id: self.patient_id},
+        extra_content: "open fields remain available",
+    };
+
+# specializations retain the behavior of their base primitive
+(patient_step)
+    =[declared_checks:patient_checks_kind {label: "checks"}]=>[
+        -[declared_a:next]->(finish),
+        -[declared_b:next]->(lookup),
+    ]
+        >[:patient_join {label: "combined", correlate: settings.request_id}
+            [declared_a],
+            [declared_b],
+        ]>>(typed_result:span {name: "Collected results"});

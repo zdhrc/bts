@@ -4,6 +4,10 @@ use std::collections::BTreeMap;
 /// A compiled graph with stable model-local identities and resolved references.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
+    /// Resolved kind schemas with inherited fields.
+    pub kinds: Vec<Kind>,
+    /// Kind names live separately from graph instance names.
+    pub kind_names: BTreeMap<String, KindId>,
     /// Node definitions in declaration order.
     pub nodes: Vec<Node>,
     /// Directed connections, including marked cycle connections.
@@ -35,6 +39,87 @@ identity!(ForkId, "A fork index within its owning model.");
 identity!(JunctionId, "A junction index within its owning model.");
 identity!(BindingId, "A binding index within its owning model.");
 identity!(RefId, "A reference index within its owning model.");
+
+identity!(KindId, "A kind schema index within its owning model.");
+
+/// The graph construct described by a kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Construct {
+    /// A node.
+    Node,
+    /// An edge.
+    Edge,
+    /// A fork.
+    Fork,
+    /// A junction.
+    Junction,
+}
+impl Construct {
+    /// The root kind name for this construct.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+            Self::Fork => "fork",
+            Self::Junction => "junction",
+        }
+    }
+}
+
+/// A schema value type independent of runtime evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldType {
+    /// Any value.
+    Any,
+    /// A string.
+    String,
+    /// A number.
+    Number,
+    /// A boolean.
+    Boolean,
+    /// An array.
+    Array,
+    /// An object.
+    Object,
+}
+
+/// One property or content field declared by a kind.
+#[derive(Debug, Clone)]
+pub struct FieldSchema {
+    /// Field name.
+    pub name: String,
+    /// Accepted value type.
+    pub ty: FieldType,
+    /// Whether an instance must supply this field.
+    pub required: bool,
+    /// A constant fallback for omitted fields.
+    pub default: Option<Value>,
+    /// Optional descriptive role without an operation binding.
+    pub role: Option<String>,
+    /// Schema field location.
+    pub range: SrcRange,
+}
+
+/// A resolved user-defined kind.
+#[derive(Debug, Clone)]
+pub struct Kind {
+    /// Declared kind name.
+    pub name: String,
+    /// Graph construct category.
+    pub construct: Construct,
+    /// Authored base name.
+    pub base: String,
+    /// Resolved base identity for a user-defined base.
+    pub base_kind: Option<KindId>,
+    /// Inherited primitive or neutral root operation.
+    pub primitive: String,
+    /// Effective property schema, including inherited entries.
+    pub props: Vec<FieldSchema>,
+    /// Effective node content schema, including inherited entries.
+    pub fields: Vec<FieldSchema>,
+    /// Declaration location.
+    pub range: SrcRange,
+}
 
 /// The identity and category of a graph element.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -227,6 +312,15 @@ pub enum BinOp {
 /// This type does not provide an evaluator.
 #[derive(Debug, Clone)]
 pub enum Value {
+    /// A required value delivered for this instance field at runtime.
+    Input {
+        /// Destination binding identity.
+        binding: BindingId,
+        /// Type declared by the owning kind, or any for an open kind.
+        ty: FieldType,
+    },
+    /// A destination field identity, without reading its value.
+    FieldRef(BindingId),
     /// A string value.
     Str(String),
     /// Text containing interpolated values.

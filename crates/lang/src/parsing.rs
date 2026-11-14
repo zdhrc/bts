@@ -51,30 +51,94 @@ impl<'src> Parser<'src> {
     fn parse_graph(mut self) -> Result<GraphDocument, Errors> {
         self.graph_syntax = true;
         let mut paths = Vec::new();
+        let mut kinds = Vec::new();
         while !self.eof() {
+            if self.check(token!(Plus)) {
+                match self.parse_kind() {
+                    Some(kind) => kinds.push(kind),
+                    None => break,
+                }
+                continue;
+            }
             match self.parse_graph_path() {
                 Some(path) => paths.push(path),
                 None => break,
             }
         }
         if self.errors.is_empty() {
-            Ok(GraphDocument { paths })
+            Ok(GraphDocument { paths, kinds })
         } else {
             Err(self.errors)
         }
     }
 
+    fn parse_kind(&mut self) -> Option<crate::ast::KindDecl> {
+        use crate::model::Construct;
+        let start = self.peek().range.start;
+        self.expect(token!(Plus), ErrorKind::UnexpectedToken)?;
+        let construct = match self.next().kind {
+            TokenKind::LParen => Construct::Node,
+            TokenKind::Minus => {
+                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+                Construct::Edge
+            }
+            TokenKind::Equals => {
+                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+                Construct::Fork
+            }
+            TokenKind::Gt => {
+                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+                Construct::Junction
+            }
+            _ => {
+                self.errors
+                    .push(Error::new(ErrorKind::UnexpectedToken, self.tokens[self.index - 1].range));
+                return None;
+            }
+        };
+        let name = self.parse_graph_name()?;
+        self.expect(token!(DoubleColon), ErrorKind::UnexpectedToken)?;
+        let base = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
+        let schema = self.parse_graph_fields()?;
+        match construct {
+            Construct::Node => {
+                self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
+            }
+            Construct::Edge => {
+                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+                self.expect(token!(Minus), ErrorKind::UnexpectedToken)?;
+            }
+            Construct::Fork => {
+                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+                self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
+            }
+            Construct::Junction => {
+                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+                self.expect(token!(Junction), ErrorKind::UnexpectedToken)?;
+            }
+        }
+        let end = self.peek().range.end;
+        self.expect(token!(Semicolon), ErrorKind::ExpectedStatementEnd)?;
+        Some(crate::ast::KindDecl {
+            construct,
+            name,
+            base,
+            schema,
+            range: SrcRange::new(start, end),
+        })
+    }
+
     fn parse_graph_path(&mut self) -> Option<GraphPath> {
         let start_offset = self.peek().range.start;
         let indent = self.graph_indent()?;
-        let start = if self.check(token!(Junction)) {
+        let start = if self.check(token!(Gt)) {
             GraphOrigin::Junction(self.parse_junction()?)
         } else {
             GraphOrigin::Node(self.parse_graph_node()?)
         };
         let steps = self.parse_graph_steps(indent)?;
         let end = self.peek().range.end;
-        if matches!(self.peek().kind, TokenKind::Arrow | TokenKind::Junction) {
+        if matches!(self.peek().kind, TokenKind::Arrow | TokenKind::Gt) {
             self.errors
                 .push(Error::new(ErrorKind::UnattachedContinuation, self.peek().range));
             return None;
@@ -166,7 +230,7 @@ impl<'src> Parser<'src> {
         let mut continuations = Vec::new();
         let mut sibling_indent = None;
         let mut previous_line = None;
-        while matches!(self.peek().kind, TokenKind::Arrow | TokenKind::Junction) {
+        while matches!(self.peek().kind, TokenKind::Arrow | TokenKind::Gt) {
             let line = self.peek().line_start;
             let child_indent = self.graph_indent()?;
             if previous_line == Some(line) {
@@ -222,7 +286,7 @@ impl<'src> Parser<'src> {
 
     fn parse_junction(&mut self) -> Option<GraphJunction> {
         let start = self.peek().range.start;
-        self.expect(token!(Junction), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Gt), ErrorKind::UnexpectedToken)?;
         self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
         self.expect(token!(Colon), ErrorKind::ExpectedGraphKind)?;
         let kind = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
@@ -236,7 +300,7 @@ impl<'src> Parser<'src> {
             inputs.push(self.parse_qualified_edge_reference()?);
         }
         self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
-        self.expect(token!(Arrow), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Junction), ErrorKind::UnexpectedToken)?;
         let target = self.parse_graph_node()?;
         let end = self.tokens[self.index - 1].range.end;
         Some(GraphJunction {
@@ -575,7 +639,12 @@ impl<'src> Parser<'src> {
         } else {
             self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
         }
-        let value = self.parse_expr()?;
+        let value = if self.graph_syntax && self.check(token!(Upstream)) {
+            let token = self.next();
+            Expr::new(ExprKind::Upstream, token.range)
+        } else {
+            self.parse_expr()?
+        };
         let range = if self.graph_syntax {
             SrcRange::new(range.start, value.range.end)
         } else {
