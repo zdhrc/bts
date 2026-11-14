@@ -3,7 +3,7 @@ use bts_lang::syntax::{
     BinOp, Expr, ExprKind, GraphNode, GraphNodeDecl, GraphOrigin, GraphReferenceKind, GraphStep, ObjectItem, TemplatePart,
     parse,
 };
-use bts_lang::{Accessor, Child, DiagPhase, Field, ScorerKind, Value, semantics::compile, syntax::parse_traversal};
+use bts_lang::{DiagPhase, Value, semantics::compile, syntax::parse_traversal};
 
 const COMPILATION_SOURCE: &str = include_str!("fixtures/compilation.bt");
 
@@ -54,30 +54,6 @@ fn parses_agent_fields_references_and_source_ranges() {
 }
 
 #[test]
-fn distinguishes_parent_and_self_reference_scopes() {
-    let model = compile(
-        r#"trace "run" {
-        input = "question"
-        task "answer" { input = trace.input output = self.input }
-    }"#,
-    )
-    .unwrap();
-    let Child::Span(task) = &model.traces[0].children[0] else {
-        panic!("expected task");
-    };
-    for (field, up) in [(&task.fields.input, 1), (&task.fields.output, 0)] {
-        let Some(Value::BlockRef { ref_id, .. }) = field else {
-            panic!("expected reference");
-        };
-        let reference = &model.refs[ref_id.0 as usize];
-        assert_eq!(reference.up, up);
-        assert_eq!(reference.module, None);
-        assert!(reference.steps.is_empty());
-        assert!(matches!(reference.accessor, Accessor::Field(Field::Input)));
-    }
-}
-
-#[test]
 fn separates_graph_syntax_from_semantic_resolution() {
     for source in [
         "(run:agent) {output: missing.output};",
@@ -90,22 +66,7 @@ fn separates_graph_syntax_from_semantic_resolution() {
     assert!(errors.iter().any(|error| error.when == DiagPhase::Parsing));
     assert!(bts_lang::syntax::parse("").unwrap().paths.is_empty());
     assert!(compile("").is_err());
-    assert!(bts_lang::semantics::compile_module("", true).unwrap().traces.is_empty());
-}
-
-#[test]
-fn keeps_dynamic_dataset_source_restrictions_in_validation() {
-    let source = r#"
-        trace "run" { repeat "turns" { count = 2 task "answer" {} } }
-        dataset "cases" { case "answer" { span = trace.run.repeat.turns[0].task.answer } }
-    "#;
-    let errors = compile(source).unwrap_err();
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.when == DiagPhase::Validation && error.what.contains("static path")),
-        "{errors:?}"
-    );
+    assert!(bts_lang::semantics::compile_module("", true).unwrap().nodes.is_empty());
 }
 
 #[test]
@@ -173,106 +134,12 @@ fn parses_companion_definitions_from_the_fixture() {
 }
 
 #[test]
-fn reports_source_locations_for_invalid_source() {
-    let source = "trace \"broken\" {\n    input = }\n}";
-    let errors = compile(source).unwrap_err();
-    let error = errors.iter().find(|error| error.when == DiagPhase::Parsing).unwrap();
-    let rendered = error.render("broken.bt", source);
-
-    assert_eq!(&source[error.r#where.start..error.r#where.end], "}");
-    assert!(rendered.contains("broken.bt:2:13: parsing error:"));
-    assert!(rendered.contains("2 |     input = }"));
-    assert!(rendered.contains("^ (byte 29)"));
-}
-
-#[test]
-fn rejects_a_reference_to_a_missing_span() {
-    let source = "trace \"run\" { output = task.missing.output }";
-    let errors = compile(source).unwrap_err();
-
-    assert!(errors.iter().any(|error| error.when == DiagPhase::Validation));
-    assert!(errors.iter().any(|error| error.what.contains("missing")));
-}
-
-#[test]
 fn parses_public_traversal_paths() {
     assert_eq!(
         parse_traversal("trace[\"run\"].task[\"answer\"].output").unwrap(),
         ["trace", "run", "task", "answer", "output"]
     );
     assert!(parse_traversal("trace[0].output").is_err());
-}
-
-#[test]
-fn consumers_can_name_nested_model_types() {
-    use bts_lang::{Facet, Func, JudgeOption, ScorerSpan, ScorerStep, Span, WeightedOption, When};
-    let model = compile(
-        r#"
-        trace "run" {
-            input = weighted(["question", 2], ["followup", 1])
-            task "answer" {}
-            scorer "quality" { score = 1 }
-        }
-        scorer "quality" { code { score = 1 when { cond = output == null score = 0 } } }
-        scorer "judge" { judge { model = "gpt-4o-mini" prompt = "Evaluate ${output}." options = { good = 1, bad = 0 } } }
-        facet "Topic" { prompt = "Identify the topic." }
-    "#,
-    )
-    .unwrap();
-    let [Child::Span(span), Child::Scorer(score)] = model.traces[0].children.as_slice() else {
-        panic!("expected span and score");
-    };
-    let span: &Span = span;
-    let score: &ScorerSpan = score;
-    assert_eq!(span.name, "answer");
-    assert_eq!(score.name, "quality");
-    let facet: &Facet = &model.facets[0];
-    assert_eq!(facet.prompt, "Identify the topic.");
-    let Some(Value::Func {
-        func: Func::Weighted(options),
-        ..
-    }) = &model.traces[0].fields.input
-    else {
-        panic!("expected weighted input");
-    };
-    let option: &WeightedOption = &options[0];
-    assert_eq!(option.weight, 2.0);
-    let ScorerKind::Code { steps, .. } = &model.scorers[0].kind else {
-        panic!("expected code scorer");
-    };
-    let ScorerStep::When(when) = &steps[0] else {
-        panic!("expected condition");
-    };
-    let when: &When = when;
-    assert!(when.score.is_some());
-    let ScorerKind::Judge { options, .. } = &model.scorers[1].kind else {
-        panic!("expected judge");
-    };
-    let option: &JudgeOption = &options[0];
-    assert_eq!(option.label, "good");
-}
-
-#[test]
-fn exposes_agents_with_resolved_trace_entrypoints() {
-    let model = compile(
-        r#"
-        agent "support" { entrypoint = trace.request }
-        trace "request" { output = "hello" }
-        agent "preview" { entrypoint = trace.request }
-        "#,
-    )
-    .unwrap();
-    assert_eq!(model.agents.len(), 2);
-    for (agent, name) in model.agents.iter().zip(["support", "preview"]) {
-        let agent: &bts_lang::Agent = agent;
-        assert_eq!(agent.name, name);
-        let reference = &model.refs[agent.entrypoint.0 as usize];
-        assert_eq!(reference.module, Some(model.traces[0].node));
-        assert!(matches!(reference.accessor, Accessor::Block { node, kind: "trace" }
-            if node == model.traces[0].node));
-        assert!(reference.steps.is_empty());
-        assert!(reference.path.is_empty());
-    }
 }
 
 fn origin_node(origin: &GraphOrigin) -> &GraphNode {
@@ -806,4 +673,399 @@ fn handles_truncated_pattern_references_without_panicking() {
         let _ = bts_lang::syntax::parse_expression(&source[..end]);
     }
     assert!(bts_lang::syntax::parse_expression(source).is_ok());
+}
+
+#[test]
+fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
+    let model = compile(COMPILATION_SOURCE).unwrap_or_else(|errors| {
+        panic!(
+            "{}",
+            errors
+                .iter()
+                .map(|e| e.render("compilation.bt", COMPILATION_SOURCE))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    });
+    assert_eq!(model.paths.len(), 30);
+    assert!(model.nodes.len() > 30);
+    assert!(model.edges.len() > 30);
+    assert!(model.forks.len() > 5);
+    assert!(model.junctions.len() > 2);
+}
+
+fn compiled(source: &str) -> bts_lang::Model {
+    compile(source).unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"))
+}
+
+fn binding<'a>(model: &'a bts_lang::Model, node: &str, field: &str) -> &'a bts_lang::Binding {
+    let owner = model.names[node];
+    model
+        .bindings
+        .iter()
+        .find(|binding| binding.owner == owner && !binding.property && binding.path == [field])
+        .unwrap()
+}
+
+fn expression(source: &str) -> Value {
+    let model = compiled(&format!("(values:vars) {{value: {source}}};"));
+    binding(&model, "values", "value").value.clone()
+}
+
+#[test]
+fn lowers_open_kinds_forward_references_and_identity_aliases() {
+    let model =
+        compiled("(a:anything {custom: true}) {destination: (b)} -[advance:custom]->(a.destination); (b:other) {value: 42};");
+    let bts_lang::ElementId::Node(a) = model.names["a"] else {
+        panic!()
+    };
+    let bts_lang::ElementId::Node(b) = model.names["b"] else {
+        panic!()
+    };
+    assert_eq!(model.edges[0].source, a);
+    assert_eq!(model.edges[0].target, b);
+    let Value::GraphRef { ref_id, .. } = binding(&model, "a", "destination").value else {
+        panic!()
+    };
+    assert_eq!(model.refs[ref_id.0].target, model.names["b"]);
+}
+
+#[test]
+fn reports_semantic_errors_at_valid_source_ranges() {
+    for (source, message) in [
+        ("(a:x); (a:y);", "duplicate graph name"),
+        ("(a:x)-[a:next]->(:x);", "duplicate graph name"),
+        ("(a:x) {value: 1, value: 2};", "duplicate field"),
+        ("(a:x) {props: 1};", "reserved"),
+        ("(missing);", "unresolved"),
+        ("(a:x)-[e:next]->(:x); (e);", "boundary"),
+        ("(a:x) {value: [a]};", "boundary"),
+        ("(a:x) {value: self.missing};", "unknown field"),
+        ("(a:x) {value: self.value};", "circular field dependency"),
+        ("(a:x) {value: b.value}; (b:x) {value: a.value};", "circular field dependency"),
+        ("(a:x) {value: source.value};", "endpoint"),
+        ("(a:vars {evaluate: \"sometimes\"});", "evaluate"),
+        ("(a:x)-[:next {when: 1}]->(:x);", "boolean"),
+        ("(a:tool); (b:scorer) {value: a.output};", "unknown field"),
+    ] {
+        let errors = compile(source).expect_err(source);
+        assert!(
+            errors.iter().any(|error| error.what.contains(message)),
+            "{source}\n{errors:#?}"
+        );
+        assert!(
+            errors.iter().all(|error| error.when == DiagPhase::Validation
+                && error.r#where.start <= error.r#where.end
+                && error.r#where.end <= source.len()),
+            "{errors:#?}"
+        );
+    }
+    let source = "(first:x);\n(first:y);";
+    let errors = compile(source).unwrap_err();
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors
+            .iter()
+            .all(|error| &source[error.r#where.start..error.r#where.end] == "first")
+    );
+}
+
+#[test]
+fn retains_explicit_cycles_and_independent_field_dependencies() {
+    let model = compiled("(a:x) {metrics: {base: 3, total: self.metrics.base + 2}} -[:next]->(b:x) ~[:retry]~>(a);");
+    assert!(!model.edges[0].cycle);
+    assert!(model.edges[1].cycle);
+    assert_eq!(model.edges[1].target, model.edges[0].source);
+    let Value::Object(object) = &binding(&model, "a", "metrics").value else {
+        panic!()
+    };
+    assert!(matches!(object.elem[1].value, Value::Num(bts_lang::Number::Int(5))));
+}
+
+#[test]
+fn preserves_dynamic_binding_identity_through_aliases() {
+    let model =
+        compiled("(v:vars) {draw: range(1, 9), alias: self.draw, result: self.alias + 1, text: \"draw ${self.alias}\"};");
+    let draw = model.bindings.iter().position(|item| item.path == ["draw"]).unwrap();
+    assert!(matches!(binding(&model,"v","alias").value, Value::BindingRef(id) if id.0 == draw));
+    assert!(matches!(binding(&model, "v", "result").value, Value::Binary { .. }));
+    assert!(matches!(binding(&model, "v", "text").value, Value::Template(_)));
+    compiled(
+        "(v:vars) {draws: [|range(1,9), range(2,5)|], alias: self.draws, result: [|for x in self.alias: x + 1|], selected: self.alias[0] + 1};",
+    );
+}
+
+#[test]
+fn resolves_edge_context_against_explicit_endpoints() {
+    let model = compiled(
+        "(:x) {value: 2} -[e:next {sum: source.value + target.value}]->(:x) {value: 3}; (v:vars) {scope: [e].scope.member, external: context.member};",
+    );
+    let property = &model.bindings[model.edges[0].props[0].0].value;
+    assert!(matches!(property, Value::Num(bts_lang::Number::Int(5))));
+    assert!(matches!(
+        binding(&model, "v", "scope").value,
+        Value::Context {
+            owner: bts_lang::ElementId::Edge(_),
+            ..
+        }
+    ));
+    assert!(matches!(
+        binding(&model, "v", "external").value,
+        Value::Context {
+            owner: bts_lang::ElementId::Node(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn lowers_overlapping_junctions_without_implicit_connections() {
+    let model = compiled(
+        "(a:x)\n    =[f:parallel]=>[-[eb:next]->(b:x), -[ec:next]->(c:x), -[ed:next]->(d:x)]\n        >>[[eb], [ec]]->(e:x)\n        >>[[ec], [ed]]->(g:x);",
+    );
+    assert_eq!(model.edges.len(), 3);
+    assert_eq!(model.junctions.len(), 2);
+    assert_eq!(model.junctions[0].inputs[1], model.junctions[1].inputs[0]);
+    assert_ne!(model.junctions[0].target, model.junctions[1].target);
+    assert_eq!(model.forks[0].continuations.len(), 2);
+}
+
+#[test]
+fn enforces_fork_membership() {
+    for source in [
+        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] ->(c); (c:x);",
+        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] >>[[ec]]->(d:x); (c:x)-[ec:next]->(b);",
+        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)]; (c:x)-[ec:next]->(b); (v:vars) {value: [f].[ec]};",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+    compiled("(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] ->([f].[eb].target)-[:next]->(c:x);");
+}
+
+#[test]
+fn validates_graph_primitives_without_demanding_defaults() {
+    for (kind, guards, valid) in [
+        ("parallel", "-[:next]->(:x), -[:next]->(:x)", true),
+        ("parallel", "-[:next {when: true}]->(:x)", false),
+        (
+            "conditional",
+            "-[:next {when: true}]->(:x), -[:next {when: true}]->(:x)",
+            true,
+        ),
+        (
+            "exclusive",
+            "-[:next {when: false}]->(:x), -[:next {when: false}]->(:x)",
+            true,
+        ),
+        ("exclusive", "-[:next]->(:x), -[:next]->(:x)", false),
+        (
+            "exclusive",
+            "-[:next {when: source.flag}]->(:x), -[:next {when: !source.flag}]->(:x)",
+            true,
+        ),
+        (
+            "exclusive",
+            "-[:next {when: chance(0.5)}]->(:x), -[:next {when: !chance(0.5)}]->(:x)",
+            false,
+        ),
+    ] {
+        let source = format!("(a:x) {{flag: chance(0.5)}} =[:{kind}]=>[{guards}];");
+        assert_eq!(compile(&source).is_ok(), valid, "{source}\n{:?}", compile(&source));
+    }
+}
+
+#[test]
+fn resolves_patterns_by_distinct_identity() {
+    let model = compiled(
+        "(a:x)-[e:next {selected: true}]->(b:tool {selected: true}); (a)-[:next]->(b); (v:vars) {node: ?<(a)-[:next]->(@:tool {selected: true})>, edge: ?<(a)-[@:next {selected: true}]->(b)>};",
+    );
+    let Value::GraphRef { ref_id, .. } = binding(&model, "v", "node").value else {
+        panic!()
+    };
+    assert_eq!(model.refs[ref_id.0].target, model.names["b"]);
+    for source in [
+        "(a:x); (v:vars) {value: ?<(a)-[:next]->(@:tool)>};",
+        "(a:x)-[:next]->(b:tool); (a)-[:next]->(c:tool); (v:vars) {value: ?<(a)-[:next]->(@:tool)>};",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn folds_arithmetic_collections_and_interpolation() {
+    for (source, expected) in [
+        ("1 + 2 * 3", 7),
+        ("${1 + 2} * 3", 9),
+        ("true ? 7 : 9", 7),
+        ("[|2, 7, 9|][1]", 7),
+        ("{x: 7}[\"x\"]", 7),
+    ] {
+        assert!(
+            matches!(expression(source), Value::Num(bts_lang::Number::Int(value)) if value == expected),
+            "{source}"
+        );
+    }
+    assert!(matches!(expression("\"answer ${1 + 2}\""), Value::Str(value) if value == "answer 3"));
+    for source in [
+        "[|1, ...[|2, 3|]|]",
+        "{...{a: 1}, b: 2}",
+        "[|for x in [|1, 2|]: x * 2|]",
+        "{for k, v in {a: 1}: k => v + 1}",
+        "[|1, 2, 3|][1:3]",
+    ] {
+        expression(source);
+    }
+}
+
+#[test]
+fn retains_expression_validation_and_checked_arithmetic() {
+    for source in [
+        "9223372036854775807 + 1",
+        "1 / 0",
+        "1 % 0",
+        "1e309",
+        "[|1|][2]",
+        "[|1|][-1]",
+        "{x: 1}[\"missing\"]",
+        "[|...1|]",
+        "{...1}",
+        "[|for x in 2: x|]",
+        "{x: 1, x: 2}",
+        "unknown_function()",
+        "range(2, 1)",
+        "chance(2)",
+        "hex(-1)",
+        "split(\"x\", \"\")",
+        "clamp(3, 5, 1)",
+        "noise(-1)",
+        "1 + true",
+        "\"${[|1|]}\"",
+    ] {
+        let module = format!("(v:vars) {{value: {source}}};");
+        assert!(compile(&module).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn compiles_spec_examples_and_parses_function_examples() {
+    for example in bts_lang::spec::SPEC.examples {
+        assert_eq!(compile(example.source).is_ok(), example.valid, "{}", example.id.as_str());
+    }
+    let settings = r#"(settings:vars) {
+        model: "example", path: "a/b", tags: [|"prod"|], models: [|"example"|],
+        prompt: "hello", temperature: 0.5, score: 0.5, limit: 10,
+        intent: {}, speaker: {}, previous: {context: {}}, arrival: {},
+        availability: {}, guest: {}, context: {},
+    };"#;
+    for function in bts_lang::spec::SPEC.functions {
+        for example in function.examples {
+            assert!(
+                bts_lang::syntax::parse_expression(example).is_ok(),
+                "{}: {example}",
+                function.name
+            );
+            compiled(&format!("{settings} (example:vars) {{value: {example}}};"));
+        }
+    }
+}
+
+#[test]
+fn shares_nested_dynamic_fields_without_resampling() {
+    let model = compiled("(v:vars) {metrics: {base: range(1, 9), total: self.metrics.base + 2}, alias: self.metrics};");
+    let calls = model
+        .bindings
+        .iter()
+        .filter(|binding| matches!(binding.value, Value::Func { .. }))
+        .count();
+    assert_eq!(calls, 1);
+    let Value::Object(object) = &binding(&model, "v", "metrics").value else {
+        panic!()
+    };
+    assert!(matches!(object.elem[0].value, Value::BindingRef(_)));
+}
+
+#[test]
+fn checks_known_dynamic_collection_indices_without_inlining_draws() {
+    compiled(r#"(v:vars) {mixed: [|range(1,9), "text"|], value: self.mixed[0] + 1};"#);
+    for index in ["3", "-1", "0.5"] {
+        let source = format!("(v:vars) {{items: [|range(1,9)|], selected: self.items[{index}]}};");
+        assert!(compile(&source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn preserves_function_result_types_and_argument_checks() {
+    compiled(
+        r#"(v:vars) {
+        result: expression({}), alias: self.result,
+        text: upper(self.alias.text), count: len(self.alias.used_facts),
+        selected: self.alias.selection.intent,
+    };"#,
+    );
+    for function in bts_lang::spec::SPEC.functions {
+        if function.name != "uuid" {
+            assert!(
+                compile(&format!("(v:vars) {{value: {}()}};", function.name)).is_err(),
+                "{}",
+                function.name
+            );
+        }
+    }
+    for value in [
+        "upper(1)",
+        "range(true, false)",
+        "weighted([|1, -2|])",
+        "normal(0, -1)",
+        "beta(0, 1)",
+        "poisson(-1)",
+        r#"format("{} {}", 1)"#,
+        "uuid(1)",
+    ] {
+        assert!(compile(&format!("(v:vars) {{value: {value}}};")).is_err(), "{value}");
+    }
+}
+
+#[test]
+fn resolves_pattern_endpoints_without_unrelated_dependency_cycles() {
+    let model = compiled("(a:task)-[:next]->(b:task); (c:task)-[:copy]->(?<(a)-[:next]->(@:task)>);");
+    assert_eq!(model.edges[0].target, model.edges[1].target);
+}
+
+#[test]
+fn proves_complementary_comparisons_without_conflating_calls() {
+    compiled(
+        "(a:x) {n: range(1, 9)} =[:exclusive]=>[-[:next {when: source.n > 5}]->(:x), -[:next {when: !${source.n > 5}}]->(:x)];",
+    );
+}
+
+#[test]
+fn preserves_generic_compilation_policy_and_rule_inventory() {
+    assert!(compile(r#"trace "old" {}"#).is_err());
+    assert!(
+        bts_lang::semantics::compile_module("# empty module", true)
+            .unwrap()
+            .nodes
+            .is_empty()
+    );
+    assert!(bts_lang::semantics::compile_module("(missing);", true).is_err());
+    let spec = &bts_lang::spec::SPEC;
+    let mut ids = std::collections::HashSet::new();
+    for rule in spec.rules {
+        assert!(ids.insert(rule.id), "{}", rule.id.as_str());
+        assert_eq!(spec.rule(rule.id), Some(rule));
+    }
+    for function in spec.functions {
+        assert_eq!(spec.function(function.name), Some(function));
+        for rule in function.rules {
+            assert!(spec.rule(rule.id).is_some(), "{}", rule.id.as_str());
+        }
+    }
+}
+
+#[test]
+fn retains_dependencies_of_dynamic_indices_and_slice_bounds() {
+    compiled(
+        "(v:vars) {items: [|10, 20, 30|], index: range(0, 1), selected: self.items[self.index] + 1, slice: self.items[self.index:2]};",
+    );
+    assert!(compile(r#"(v:vars) {items: [|1, 2|], index: choice("a", "b"), selected: self.items[self.index]};"#).is_err());
 }

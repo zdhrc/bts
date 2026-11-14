@@ -1,75 +1,54 @@
-//! Machine-readable descriptions of the language, its rules, and examples.
-
+//! Machine-readable graph language rules and expression contracts.
 use serde::Serialize;
-use std::fmt;
 
 /// The language reference used by documentation and validation tools.
-///
-/// These descriptions explain supported syntax and rules. They do not execute
-/// validation or evaluate source expressions.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct Spec {
-    /// The version of the serialized reference format.
+    /// Serialized reference format version.
     pub schema_version: u32,
-    /// The language version described here.
+    /// Language syntax version.
     pub language_version: u32,
-    /// The name of the language.
+    /// Language name.
     pub name: &'static str,
-    /// A short explanation for readers.
+    /// Language purpose.
     pub summary: &'static str,
-    /// General source notation and grammar.
+    /// Source grammar and layout.
     pub surface: SurfaceDesc,
-    /// Descriptions of the supported expression forms.
+    /// Expression forms.
     pub expressions: &'static [ExprDesc],
-    /// Descriptions of the supported functions.
+    /// Built-in function contracts.
     pub functions: &'static [FuncDesc],
-    /// Descriptions of the supported blocks.
-    pub blocks: &'static [BlockDesc],
-    /// Rules associated with this entry.
+    /// Default graph primitive contracts.
+    pub primitives: &'static [PrimitiveDesc],
+    /// Language-wide validation rules.
     pub rules: &'static [RuleDesc],
-    /// Examples demonstrating this entry.
+    /// Compilation examples and expected outcomes.
     pub examples: &'static [Example],
 }
-
 impl Spec {
-    /// Finds the first block description with this keyword, or returns `None`.
-    pub fn block(&self, keyword: &str) -> Option<&BlockDesc> {
-        self.blocks.iter().find(|block| block.keyword == keyword)
+    /// Looks up a built-in function.
+    pub fn function(&self, name: &str) -> Option<&FuncDesc> {
+        self.functions.iter().find(|f| f.name == name)
     }
-
-    /// Finds a block with this keyword that is allowed at the requested location.
-    pub fn block_in(&self, keyword: &str, place: Place) -> Option<&BlockDesc> {
-        self.blocks
-            .iter()
-            .find(|block| block.keyword == keyword && block.allows(place))
-    }
-
-    /// Finds a block by its stable identifier, or returns `None`.
-    pub fn block_by_id(&self, id: Id) -> Option<&BlockDesc> {
-        self.blocks.iter().find(|block| block.id == id)
-    }
-
-    /// Finds a field by identifier within the specified block.
-    pub fn field(&self, block: Id, field: Id) -> Option<&FieldDesc> {
-        self.block_by_id(block)?.body.fields.iter().find(|desc| desc.id == field)
-    }
-
-    /// Finds a rule across the module, block, expression, and function descriptions.
+    /// Looks up a language rule by its stable identifier.
     pub fn rule(&self, id: Id) -> Option<&RuleDesc> {
         self.rules
             .iter()
-            .chain(self.blocks.iter().flat_map(|block| block.rules))
-            .chain(self.expressions.iter().flat_map(|expr| expr.rules))
-            .chain(self.functions.iter().flat_map(|func| func.rules))
-            .find(|rule| rule.id == id)
-    }
-
-    /// Finds a function by its source name, or returns `None`.
-    pub fn function(&self, name: &str) -> Option<&FuncDesc> {
-        self.functions.iter().find(|func| func.name == name)
+            .chain(self.expressions.iter().flat_map(|e| e.rules))
+            .chain(self.functions.iter().flat_map(|f| f.rules))
+            .find(|r| r.id == id)
     }
 }
-
+/// A default behavior associated with a graph construct.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub struct PrimitiveDesc {
+    /// Kind name.
+    pub name: &'static str,
+    /// Graph construct that recognizes the primitive.
+    pub construct: &'static str,
+    /// Structural and behavioral contract.
+    pub summary: &'static str,
+}
 /// A stable textual identifier for an entry in the language reference.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -134,157 +113,7 @@ pub struct FuncDesc {
     pub rules: &'static [RuleDesc],
 }
 
-// some variants are spec vocab no field descriptor uses yet, kept so field
-// constraints can adopt them without touching the type system
-/// An allowed expression type described by the language reference.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ExprType {
-    /// A reference to one of the allowed block kinds.
-    BlockRef {
-        /// Allowed target block kinds.
-        kinds: &'static [&'static str],
-    },
-    /// Any expression type.
-    Any,
-    /// A string expression.
-    String,
-    /// A numeric expression.
-    Number,
-    /// A boolean expression.
-    Boolean,
-    /// An ordered collection.
-    Array {
-        /// The allowed type of each array element.
-        items: &'static ExprType,
-    },
-    /// A collection of named entries.
-    Object {
-        /// The allowed type of object values.
-        values: &'static ExprType,
-    },
-}
-
-impl fmt::Display for ExprType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BlockRef { kinds } => write!(formatter, "reference to {} block", kinds.join(" or ")),
-            Self::Any => formatter.write_str("any value"),
-            Self::String => formatter.write_str("string"),
-            Self::Number => formatter.write_str("number"),
-            Self::Boolean => formatter.write_str("boolean"),
-            Self::Array { items } => write!(formatter, "array<{items}>"),
-            Self::Object { values } if matches!(**values, Self::Any) => formatter.write_str("object"),
-            Self::Object { values } => write!(formatter, "object<{values}>"),
-        }
-    }
-}
-
-/// Documentation for a block, including placement and allowed fields.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-pub struct BlockDesc {
-    /// Reference labels such as feature availability tags.
-    pub tags: &'static [&'static str],
-    /// The stable reference identifier.
-    pub id: Id,
-    /// The keyword written in source.
-    pub keyword: &'static str,
-    /// A short explanation for readers.
-    pub summary: &'static str,
-    /// The documented source form.
-    pub syntax: &'static str,
-    /// Whether a block name is allowed or required.
-    pub name: NamePolicy,
-    /// The locations where this block may appear.
-    pub allowed_in: &'static [Place],
-    /// The fields permitted within the block.
-    pub body: BodyDesc,
-    /// Rules associated with this entry.
-    pub rules: &'static [RuleDesc],
-    /// Recommended usage beyond required language rules.
-    pub conventions: &'static [&'static str],
-}
-
-impl BlockDesc {
-    /// Reports whether this block is allowed at the specified location.
-    pub fn allows(&self, place: Place) -> bool {
-        self.allowed_in.contains(&place)
-    }
-
-    /// Finds a field by its source keyword, or returns `None`.
-    pub fn field(&self, keyword: &str) -> Option<&FieldDesc> {
-        self.body.fields.iter().find(|field| field.keyword == keyword)
-    }
-}
-
-/// The fields permitted in a block body.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-pub struct BodyDesc {
-    /// Descriptions of the fields permitted in this body.
-    pub fields: &'static [FieldDesc],
-    /// Whether additional field names are allowed.
-    pub open: bool,
-}
-
-/// Documentation for one field within a block.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-pub struct FieldDesc {
-    /// Reference labels such as feature availability tags.
-    pub tags: &'static [&'static str],
-    /// The stable reference identifier.
-    pub id: Id,
-    /// The keyword written in source.
-    pub keyword: &'static str,
-    /// A short explanation for readers.
-    pub summary: &'static str,
-    /// The allowed expression type.
-    pub value: &'static ExprType,
-    /// How many occurrences of this field are allowed.
-    pub cardinality: Cardinality,
-}
-
-/// How many times a field may appear in a block.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Cardinality {
-    /// The field or name may be omitted.
-    Optional,
-    /// The field or name must be supplied.
-    Required,
-    /// The field may occur multiple times.
-    Repeated,
-}
-
-// some variants are spec vocab no block descriptor uses yet, the modeler already
-// enforces all three
-/// Whether a block accepts or requires an authored name.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NamePolicy {
-    /// The block must not have a name.
-    Forbidden,
-    /// The field or name may be omitted.
-    Optional,
-    /// The field or name must be supplied.
-    Required,
-}
-
-/// A location where a block may be declared.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Place {
-    /// The top level of a module.
-    Root,
-    /// Inside the block identified by its language reference ID.
-    Block {
-        /// The stable reference identifier.
-        id: Id,
-    },
-}
-
-/// A documented language rule identified independently of its wording.
+/// A validation rule in the language reference.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct RuleDesc {
     /// Reference labels such as feature availability tags.
@@ -312,1168 +141,202 @@ pub struct Example {
     pub valid: bool,
 }
 
-/// Stable identifiers used to link entries in the language reference.
+/// Stable identifiers for expression and function contracts.
 pub mod ids {
     use super::Id;
-
-    /// Stable identifier for `block.vars`.
-    pub const VARS: Id = Id::new("block.vars");
-    /// Stable identifier for `block.trace`.
-    pub const TRACE: Id = Id::new("block.trace");
-    /// Stable identifier for `block.task`.
-    pub const TASK: Id = Id::new("block.task");
-    /// Stable identifier for `block.llm`.
-    pub const LLM: Id = Id::new("block.llm");
-    /// Stable identifier for `block.tool`.
-    pub const TOOL: Id = Id::new("block.tool");
-    /// Stable identifier for `block.function`.
-    pub const FUNCTION: Id = Id::new("block.function");
-    /// Stable identifier for `block.repeat`.
-    pub const REPEAT: Id = Id::new("block.repeat");
-    /// Stable identifier for `block.scorer-repeat`.
-    pub const SCORER_REPEAT: Id = Id::new("block.scorer-repeat");
-    /// Stable identifier for `block.choice`.
-    pub const CHOICE: Id = Id::new("block.choice");
-    /// Stable identifier for `block.maybe`.
-    pub const MAYBE: Id = Id::new("block.maybe");
-    /// Stable identifier for `block.scorer`.
-    pub const SCORER: Id = Id::new("block.scorer");
-    /// Stable identifier for `block.scorer-span`.
-    pub const SCORER_SPAN: Id = Id::new("block.scorer-span");
-    /// Stable identifier for `block.facet`.
-    pub const FACET: Id = Id::new("block.facet");
-    /// Stable identifier for `block.automation`.
-    pub const AUTOMATION: Id = Id::new("block.automation");
-    /// Stable identifier for `block.dataset`.
-    pub const DATASET: Id = Id::new("block.dataset");
-    /// Stable identifier for `block.case`.
-    pub const CASE: Id = Id::new("block.case");
-    /// Stable identifier for `block.agent`.
-    pub const AGENT: Id = Id::new("block.agent");
-    /// Stable identifier for `field.entrypoint`.
-    pub const ENTRYPOINT: Id = Id::new("field.entrypoint");
-    /// Stable identifier for `rule.agent-binding`.
-    pub const AGENT_BINDING: Id = Id::new("rule.agent-binding");
-    /// Stable identifier for `block.experiment`.
-    pub const EXPERIMENT: Id = Id::new("block.experiment");
-    /// Stable identifier for `block.code`.
-    pub const CODE: Id = Id::new("block.code");
-    /// Stable identifier for `block.judge`.
-    pub const JUDGE: Id = Id::new("block.judge");
-    /// Stable identifier for `block.when`.
-    pub const WHEN: Id = Id::new("block.when");
-
-    /// Stable identifier for `field.input`.
-    pub const INPUT: Id = Id::new("field.input");
-    /// Stable identifier for `field.output`.
-    pub const OUTPUT: Id = Id::new("field.output");
-    /// Stable identifier for `field.expected`.
-    pub const EXPECTED: Id = Id::new("field.expected");
-    /// Stable identifier for `field.error`.
-    pub const ERROR: Id = Id::new("field.error");
-    /// Stable identifier for `field.metadata`.
-    pub const METADATA: Id = Id::new("field.metadata");
-    /// Stable identifier for `field.metrics`.
-    pub const METRICS: Id = Id::new("field.metrics");
-    /// Stable identifier for `field.tags`.
-    pub const TAGS: Id = Id::new("field.tags");
-    /// Stable identifier for `field.count`.
-    pub const COUNT: Id = Id::new("field.count");
-    /// Stable identifier for `field.chance`.
-    pub const CHANCE: Id = Id::new("field.chance");
-    /// Stable identifier for `field.duration`.
-    pub const DURATION: Id = Id::new("field.duration");
-    /// Stable identifier for `field.lang`.
-    pub const LANG: Id = Id::new("field.lang");
-    /// Stable identifier for `field.file`.
-    pub const FILE: Id = Id::new("field.file");
-    /// Stable identifier for `field.score`.
-    pub const SCORE: Id = Id::new("field.score");
-    /// Stable identifier for `field.reason`.
-    pub const REASON: Id = Id::new("field.reason");
-    /// Stable identifier for `field.cond`.
-    pub const COND: Id = Id::new("field.cond");
-    /// Stable identifier for `field.model`.
-    pub const MODEL: Id = Id::new("field.model");
-    /// Stable identifier for `field.prompt`.
-    pub const PROMPT: Id = Id::new("field.prompt");
-    /// Stable identifier for `field.options`.
-    pub const OPTIONS: Id = Id::new("field.options");
-    /// Stable identifier for `field.type`.
-    pub const TYPE: Id = Id::new("field.type");
-    /// Stable identifier for `field.facets`.
-    pub const FACETS: Id = Id::new("field.facets");
-    /// Stable identifier for `field.no-match-pattern`.
-    pub const NO_MATCH_PATTERN: Id = Id::new("field.no-match-pattern");
-    /// Stable identifier for `field.scorers`.
-    pub const SCORERS: Id = Id::new("field.scorers");
-    /// Stable identifier for `field.scope`.
-    pub const SCOPE: Id = Id::new("field.scope");
-    /// Stable identifier for `field.span-names`.
-    pub const SPAN_NAMES: Id = Id::new("field.span-names");
-    /// Stable identifier for `field.root`.
-    pub const ROOT: Id = Id::new("field.root");
-    /// Stable identifier for `field.sampling-rate`.
-    pub const SAMPLING_RATE: Id = Id::new("field.sampling-rate");
-    /// Stable identifier for `field.enabled`.
-    pub const ENABLED: Id = Id::new("field.enabled");
-    /// Stable identifier for `field.description`.
-    pub const DESCRIPTION: Id = Id::new("field.description");
-    /// Stable identifier for `field.trace-source`.
-    pub const TRACE_SOURCE: Id = Id::new("field.trace-source");
-    /// Stable identifier for `field.traces`.
-    pub const TRACES: Id = Id::new("field.traces");
-    /// Stable identifier for `field.span`.
-    pub const SPAN: Id = Id::new("field.span");
-    /// Stable identifier for `field.dataset`.
-    pub const DATASET_REF: Id = Id::new("field.dataset");
-    /// Stable identifier for `field.task`.
-    pub const TASK_REF: Id = Id::new("field.task");
-    /// Stable identifier for `field.baseline`.
-    pub const BASELINE: Id = Id::new("field.baseline");
-
-    /// Stable identifier for `expr.string`.
-    pub const STRING: Id = Id::new("expr.string");
-    /// Stable identifier for `expr.template`.
-    pub const TEMPLATE: Id = Id::new("expr.template");
-    /// Stable identifier for `expr.multiline-string`.
-    pub const MULTILINE: Id = Id::new("expr.multiline-string");
-    /// Stable identifier for `expr.heredoc`.
-    pub const HEREDOC: Id = Id::new("expr.heredoc");
-    /// Stable identifier for `expr.variable-reference`.
-    pub const VAR_REF: Id = Id::new("expr.variable-reference");
-    /// Stable identifier for `expr.context-reference`.
-    pub const CTX_REF: Id = Id::new("expr.context-reference");
-    /// Stable identifier for `expr.block-reference`.
-    pub const BLOCK_REF: Id = Id::new("expr.block-reference");
-    /// Stable identifier for `expr.self-reference`.
-    pub const SELF_REF: Id = Id::new("expr.self-reference");
-    /// Stable identifier for `expr.number`.
-    pub const NUMBER: Id = Id::new("expr.number");
-    /// Stable identifier for `expr.boolean`.
-    pub const BOOLEAN: Id = Id::new("expr.boolean");
-    /// Stable identifier for `expr.null`.
-    pub const NULL: Id = Id::new("expr.null");
-    /// Stable identifier for `expr.array`.
-    pub const ARRAY: Id = Id::new("expr.array");
-    /// Stable identifier for `expr.object`.
-    pub const OBJECT: Id = Id::new("expr.object");
-    /// Stable identifier for `expr.func`.
-    pub const FUNC: Id = Id::new("expr.func");
-    /// Stable identifier for `expr.index`.
-    pub const INDEX: Id = Id::new("expr.index");
-    /// Stable identifier for `expr.slice`.
-    pub const SLICE: Id = Id::new("expr.slice");
-    /// Stable identifier for `expr.spread`.
-    pub const SPREAD: Id = Id::new("expr.spread");
-    /// Stable identifier for `expr.for`.
-    pub const FOR: Id = Id::new("expr.for");
-    /// Stable identifier for `expr.grouping`.
-    pub const GROUPING: Id = Id::new("expr.grouping");
-    /// Stable identifier for `expr.unary`.
-    pub const UNARY: Id = Id::new("expr.unary");
-    /// Stable identifier for `expr.arithmetic`.
-    pub const ARITHMETIC: Id = Id::new("expr.arithmetic");
-    /// Stable identifier for `expr.comparison`.
-    pub const COMPARISON: Id = Id::new("expr.comparison");
-    /// Stable identifier for `expr.logical`.
-    pub const LOGICAL: Id = Id::new("expr.logical");
-    /// Stable identifier for `expr.conditional`.
-    pub const CONDITIONAL: Id = Id::new("expr.conditional");
-
-    /// Stable identifier for `func.choice`.
+    /// Stable language rule or function identifier.
     pub const FUNC_CHOICE: Id = Id::new("func.choice");
-    /// Stable identifier for `func.range`.
+    /// Stable language rule or function identifier.
     pub const FUNC_RANGE: Id = Id::new("func.range");
-    /// Stable identifier for `func.weighted`.
+    /// Stable language rule or function identifier.
     pub const FUNC_WEIGHTED: Id = Id::new("func.weighted");
-    /// Stable identifier for `func.normal`.
+    /// Stable language rule or function identifier.
     pub const FUNC_NORMAL: Id = Id::new("func.normal");
-    /// Stable identifier for `func.lognormal`.
+    /// Stable language rule or function identifier.
     pub const FUNC_LOGNORMAL: Id = Id::new("func.lognormal");
-    /// Stable identifier for `func.exponential`.
+    /// Stable language rule or function identifier.
     pub const FUNC_EXPONENTIAL: Id = Id::new("func.exponential");
-    /// Stable identifier for `func.pareto`.
+    /// Stable language rule or function identifier.
     pub const FUNC_PARETO: Id = Id::new("func.pareto");
-    /// Stable identifier for `func.beta`.
+    /// Stable language rule or function identifier.
     pub const FUNC_BETA: Id = Id::new("func.beta");
-    /// Stable identifier for `func.poisson`.
+    /// Stable language rule or function identifier.
     pub const FUNC_POISSON: Id = Id::new("func.poisson");
-    /// Stable identifier for `func.chance`.
+    /// Stable language rule or function identifier.
     pub const FUNC_CHANCE: Id = Id::new("func.chance");
-    /// Stable identifier for `func.upper`.
+    /// Stable language rule or function identifier.
     pub const FUNC_UPPER: Id = Id::new("func.upper");
-    /// Stable identifier for `func.lower`.
+    /// Stable language rule or function identifier.
     pub const FUNC_LOWER: Id = Id::new("func.lower");
-    /// Stable identifier for `func.trim`.
+    /// Stable language rule or function identifier.
     pub const FUNC_TRIM: Id = Id::new("func.trim");
-    /// Stable identifier for `func.replace`.
+    /// Stable language rule or function identifier.
     pub const FUNC_REPLACE: Id = Id::new("func.replace");
-    /// Stable identifier for `func.split`.
+    /// Stable language rule or function identifier.
     pub const FUNC_SPLIT: Id = Id::new("func.split");
-    /// Stable identifier for `func.render`.
+    /// Stable language rule or function identifier.
     pub const FUNC_RENDER: Id = Id::new("func.render");
-    /// Stable identifier for `func.compose`.
+    /// Stable language rule or function identifier.
     pub const FUNC_COMPOSE: Id = Id::new("func.compose");
-    /// Stable identifier for `func.sample`.
+    /// Stable language rule or function identifier.
     pub const FUNC_SAMPLE: Id = Id::new("func.sample");
-    /// Stable identifier for `func.realize`.
+    /// Stable language rule or function identifier.
     pub const FUNC_REALIZE: Id = Id::new("func.realize");
-    /// Stable identifier for `func.vary`.
+    /// Stable language rule or function identifier.
     pub const FUNC_VARY: Id = Id::new("func.vary");
-    /// Stable identifier for `func.express`.
+    /// Stable language rule or function identifier.
     pub const FUNC_EXPRESS: Id = Id::new("func.express");
-    /// Stable identifier for `func.expression`.
+    /// Stable language rule or function identifier.
     pub const FUNC_EXPRESSION: Id = Id::new("func.expression");
-    /// Stable identifier for `func.expression_candidates`.
+    /// Stable language rule or function identifier.
     pub const FUNC_EXPRESSION_CANDIDATES: Id = Id::new("func.expression_candidates");
-    /// Stable identifier for `func.combine`.
+    /// Stable language rule or function identifier.
     pub const FUNC_COMBINE: Id = Id::new("func.combine");
-    /// Stable identifier for `func.refer`.
+    /// Stable language rule or function identifier.
     pub const FUNC_REFER: Id = Id::new("func.refer");
-    /// Stable identifier for `func.remember`.
+    /// Stable language rule or function identifier.
     pub const FUNC_REMEMBER: Id = Id::new("func.remember");
-    /// Stable identifier for `func.unmentioned`.
+    /// Stable language rule or function identifier.
     pub const FUNC_UNMENTIONED: Id = Id::new("func.unmentioned");
-    /// Stable identifier for `func.format_number`.
+    /// Stable language rule or function identifier.
     pub const FUNC_FORMAT_NUMBER: Id = Id::new("func.format_number");
-    /// Stable identifier for `func.format_date`.
+    /// Stable language rule or function identifier.
     pub const FUNC_FORMAT_DATE: Id = Id::new("func.format_date");
-    /// Stable identifier for `func.format_time`.
+    /// Stable language rule or function identifier.
     pub const FUNC_FORMAT_TIME: Id = Id::new("func.format_time");
-    /// Stable identifier for `func.join`.
+    /// Stable language rule or function identifier.
     pub const FUNC_JOIN: Id = Id::new("func.join");
-    /// Stable identifier for `func.contains`.
+    /// Stable language rule or function identifier.
     pub const FUNC_CONTAINS: Id = Id::new("func.contains");
-    /// Stable identifier for `func.starts_with`.
+    /// Stable language rule or function identifier.
     pub const FUNC_STARTS_WITH: Id = Id::new("func.starts_with");
-    /// Stable identifier for `func.ends_with`.
+    /// Stable language rule or function identifier.
     pub const FUNC_ENDS_WITH: Id = Id::new("func.ends_with");
-    /// Stable identifier for `func.len`.
+    /// Stable language rule or function identifier.
     pub const FUNC_LEN: Id = Id::new("func.len");
-    /// Stable identifier for `func.tokens`.
+    /// Stable language rule or function identifier.
     pub const FUNC_TOKENS: Id = Id::new("func.tokens");
-    /// Stable identifier for `func.format`.
+    /// Stable language rule or function identifier.
     pub const FUNC_FORMAT: Id = Id::new("func.format");
-    /// Stable identifier for `func.clamp`.
+    /// Stable language rule or function identifier.
     pub const FUNC_CLAMP: Id = Id::new("func.clamp");
-    /// Stable identifier for `func.round`.
+    /// Stable language rule or function identifier.
     pub const FUNC_ROUND: Id = Id::new("func.round");
-    /// Stable identifier for `func.floor`.
+    /// Stable language rule or function identifier.
     pub const FUNC_FLOOR: Id = Id::new("func.floor");
-    /// Stable identifier for `func.ceil`.
+    /// Stable language rule or function identifier.
     pub const FUNC_CEIL: Id = Id::new("func.ceil");
-    /// Stable identifier for `func.abs`.
+    /// Stable language rule or function identifier.
     pub const FUNC_ABS: Id = Id::new("func.abs");
-    /// Stable identifier for `func.min`.
+    /// Stable language rule or function identifier.
     pub const FUNC_MIN: Id = Id::new("func.min");
-    /// Stable identifier for `func.max`.
+    /// Stable language rule or function identifier.
     pub const FUNC_MAX: Id = Id::new("func.max");
-    /// Stable identifier for `func.uuid`.
+    /// Stable language rule or function identifier.
     pub const FUNC_UUID: Id = Id::new("func.uuid");
-    /// Stable identifier for `func.hex`.
+    /// Stable language rule or function identifier.
     pub const FUNC_HEX: Id = Id::new("func.hex");
-    /// Stable identifier for `func.alphanum`.
+    /// Stable language rule or function identifier.
     pub const FUNC_ALPHANUM: Id = Id::new("func.alphanum");
-    /// Stable identifier for `func.noise`.
+    /// Stable language rule or function identifier.
     pub const FUNC_NOISE: Id = Id::new("func.noise");
-    /// Stable identifier for `func.attachment`.
+    /// Stable language rule or function identifier.
     pub const FUNC_ATTACHMENT: Id = Id::new("func.attachment");
-
-    /// Stable identifier for `rule.multiline-delimiters`.
-    pub const MULTILINE_DELIMITERS: Id = Id::new("rule.multiline-delimiters");
-    /// Stable identifier for `rule.multiline-indentation`.
-    pub const MULTILINE_INDENT: Id = Id::new("rule.multiline-indentation");
-    /// Stable identifier for `rule.heredoc-delimiters`.
-    pub const HEREDOC_DELIMITERS: Id = Id::new("rule.heredoc-delimiters");
-    /// Stable identifier for `rule.heredoc-indentation`.
-    pub const HEREDOC_INDENT: Id = Id::new("rule.heredoc-indentation");
-    /// Stable identifier for `rule.known-references`.
-    pub const KNOWN_REFERENCES: Id = Id::new("rule.known-references");
-    /// Stable identifier for `rule.unique-vars`.
-    pub const UNIQUE_VARS: Id = Id::new("rule.unique-vars");
-    /// Stable identifier for `rule.scoped-vars`.
-    pub const SCOPED_VARS: Id = Id::new("rule.scoped-vars");
-    /// Stable identifier for `rule.visible-vars`.
-    pub const VISIBLE_VARS: Id = Id::new("rule.visible-vars");
-    /// Stable identifier for `rule.defined-vars`.
-    pub const DEFINED_VARS: Id = Id::new("rule.defined-vars");
-    /// Stable identifier for `rule.scalar-interpolation`.
+    /// Stable language rule or function identifier.
     pub const SCALAR_INTERPOLATION: Id = Id::new("rule.scalar-interpolation");
-    /// Stable identifier for `rule.unique-object-keys`.
+    /// Stable language rule or function identifier.
     pub const UNIQUE_OBJECT_KEYS: Id = Id::new("rule.unique-object-keys");
-    /// Stable identifier for `rule.finite-numbers`.
+    /// Stable language rule or function identifier.
     pub const FINITE_NUMBERS: Id = Id::new("rule.finite-numbers");
-    /// Stable identifier for `rule.nonempty-shape`.
-    pub const NONEMPTY_SHAPE: Id = Id::new("rule.nonempty-shape");
-    /// Stable identifier for `rule.reserved-metrics`.
-    pub const RESERVED_METRICS: Id = Id::new("rule.reserved-metrics");
-    /// Stable identifier for `rule.known-functions`.
+    /// Stable language rule or function identifier.
     pub const KNOWN_FUNCTIONS: Id = Id::new("rule.known-functions");
-    /// Stable identifier for `rule.function-positions`.
-    pub const FUNC_POSITIONS: Id = Id::new("rule.function-positions");
-    /// Stable identifier for `rule.choice-alternatives`.
+    /// Stable language rule or function identifier.
     pub const CHOICE_ALTERNATIVES: Id = Id::new("rule.choice-alternatives");
-    /// Stable identifier for `rule.range-bounds`.
+    /// Stable language rule or function identifier.
     pub const RANGE_BOUNDS: Id = Id::new("rule.range-bounds");
-    /// Stable identifier for `rule.function-arity`.
+    /// Stable language rule or function identifier.
     pub const FUNC_ARITY: Id = Id::new("rule.function-arity");
-    /// Stable identifier for `rule.function-argument-types`.
+    /// Stable language rule or function identifier.
     pub const FUNC_ARG_TYPES: Id = Id::new("rule.function-argument-types");
-    /// Stable identifier for `rule.weighted-options`.
+    /// Stable language rule or function identifier.
     pub const WEIGHTED_OPTIONS: Id = Id::new("rule.weighted-options");
-    /// Stable identifier for `rule.distribution-params`.
+    /// Stable language rule or function identifier.
     pub const DIST_PARAMS: Id = Id::new("rule.distribution-params");
-    /// Stable identifier for `rule.format-template`.
+    /// Stable language rule or function identifier.
     pub const FORMAT_TEMPLATE: Id = Id::new("rule.format-template");
-    /// Stable identifier for `rule.split-separator`.
+    /// Stable language rule or function identifier.
     pub const SPLIT_SEPARATOR: Id = Id::new("rule.split-separator");
-    /// Stable identifier for `rule.join-elements`.
+    /// Stable language rule or function identifier.
     pub const JOIN_ELEMENTS: Id = Id::new("rule.join-elements");
-    /// Stable identifier for `rule.clamp-bounds`.
+    /// Stable language rule or function identifier.
     pub const CLAMP_BOUNDS: Id = Id::new("rule.clamp-bounds");
-    /// Stable identifier for `rule.integer-results`.
+    /// Stable language rule or function identifier.
     pub const INTEGER_RESULTS: Id = Id::new("rule.integer-results");
-    /// Stable identifier for `rule.random-string-length`.
+    /// Stable language rule or function identifier.
     pub const RANDOM_LENGTH: Id = Id::new("rule.random-string-length");
-    /// Stable identifier for `rule.noise-size`.
+    /// Stable language rule or function identifier.
     pub const NOISE_SIZE: Id = Id::new("rule.noise-size");
-    /// Stable identifier for `rule.operand-types`.
+    /// Stable language rule or function identifier.
     pub const OPERAND_TYPES: Id = Id::new("rule.operand-types");
-    /// Stable identifier for `rule.indexable-targets`.
+    /// Stable language rule or function identifier.
     pub const INDEXABLE_TARGETS: Id = Id::new("rule.indexable-targets");
-    /// Stable identifier for `rule.index-bounds`.
+    /// Stable language rule or function identifier.
     pub const INDEX_BOUNDS: Id = Id::new("rule.index-bounds");
-    /// Stable identifier for `rule.sliceable-targets`.
+    /// Stable language rule or function identifier.
     pub const SLICEABLE_TARGETS: Id = Id::new("rule.sliceable-targets");
-    /// Stable identifier for `rule.slice-bounds`.
+    /// Stable language rule or function identifier.
     pub const SLICE_BOUNDS: Id = Id::new("rule.slice-bounds");
-    /// Stable identifier for `rule.spread-operands`.
+    /// Stable language rule or function identifier.
     pub const SPREAD_OPERANDS: Id = Id::new("rule.spread-operands");
-    /// Stable identifier for `rule.for-collections`.
+    /// Stable language rule or function identifier.
     pub const FOR_COLLECTIONS: Id = Id::new("rule.for-collections");
-    /// Stable identifier for `rule.static-for`.
+    /// Stable language rule or function identifier.
     pub const STATIC_FOR: Id = Id::new("rule.static-for");
-    /// Stable identifier for `rule.boolean-conditions`.
+    /// Stable language rule or function identifier.
     pub const BOOLEAN_CONDITIONS: Id = Id::new("rule.boolean-conditions");
-    /// Stable identifier for `rule.nonzero-divisors`.
+    /// Stable language rule or function identifier.
     pub const NONZERO_DIVISORS: Id = Id::new("rule.nonzero-divisors");
-    /// Stable identifier for `rule.repeat-count`.
-    pub const REPEAT_COUNT: Id = Id::new("rule.repeat-count");
-    /// Stable identifier for `rule.repeat-refs`.
-    pub const REPEAT_REFS: Id = Id::new("rule.repeat-refs");
-    /// Stable identifier for `rule.maybe-chance`.
-    pub const MAYBE_CHANCE: Id = Id::new("rule.maybe-chance");
-    /// Stable identifier for `rule.span-duration`.
-    pub const SPAN_DURATION: Id = Id::new("rule.span-duration");
-    /// Stable identifier for `rule.dynamic-children`.
-    pub const DYNAMIC_CHILDREN: Id = Id::new("rule.dynamic-children");
-    /// Stable identifier for `rule.block-references`.
-    pub const BLOCK_REFS: Id = Id::new("rule.block-references");
-    /// Stable identifier for `rule.reference-collections`.
-    pub const REF_COLLECTIONS: Id = Id::new("rule.reference-collections");
-    /// Stable identifier for `rule.reference-fields`.
-    pub const REF_FIELDS: Id = Id::new("rule.reference-fields");
-    /// Stable identifier for `rule.acyclic-references`.
-    pub const ACYCLIC_REFS: Id = Id::new("rule.acyclic-references");
-    /// Stable identifier for `rule.self-reference`.
-    pub const SELF_REFS: Id = Id::new("rule.self-reference");
-    /// Stable identifier for `rule.static-structure`.
+    /// Stable language rule or function identifier.
     pub const STATIC_STRUCTURE: Id = Id::new("rule.static-structure");
-    /// Stable identifier for `rule.reserved-repeat-names`.
-    pub const RESERVED_REPEAT_NAMES: Id = Id::new("rule.reserved-repeat-names");
-    /// Stable identifier for `rule.reference-existence`.
-    pub const REF_EXISTENCE: Id = Id::new("rule.reference-existence");
-    /// Stable identifier for `rule.scorer-kind`.
-    pub const SCORER_KIND: Id = Id::new("rule.scorer-kind");
-    /// Stable identifier for `rule.scorer-arguments`.
-    pub const SCORER_ARGS: Id = Id::new("rule.scorer-arguments");
-    /// Stable identifier for `rule.scorer-expressions`.
-    pub const SCORER_EXPRS: Id = Id::new("rule.scorer-expressions");
-    /// Stable identifier for `rule.scorer-lang`.
-    pub const SCORER_LANG: Id = Id::new("rule.scorer-lang");
-    /// Stable identifier for `rule.scorer-file`.
-    pub const SCORER_FILE: Id = Id::new("rule.scorer-file");
-    /// Stable identifier for `rule.scorer-source-files`.
-    pub const SCORER_SOURCE_FILES: Id = Id::new("rule.scorer-source-files");
-    /// Stable identifier for `rule.score-range`.
-    pub const SCORE_RANGE: Id = Id::new("rule.score-range");
-    /// Stable identifier for `rule.judge-model`.
-    pub const JUDGE_MODEL: Id = Id::new("rule.judge-model");
-    /// Stable identifier for `rule.judge-prompt`.
-    pub const JUDGE_PROMPT: Id = Id::new("rule.judge-prompt");
-    /// Stable identifier for `rule.judge-options`.
-    pub const JUDGE_OPTIONS: Id = Id::new("rule.judge-options");
-    /// Stable identifier for `rule.facet-definition`.
-    pub const FACET_DEFINITION: Id = Id::new("rule.facet-definition");
-    /// Stable identifier for `rule.automation-binding`.
-    pub const AUTOMATION_BINDING: Id = Id::new("rule.automation-binding");
-    /// Stable identifier for `rule.dataset-case`.
-    pub const DATASET_CASE: Id = Id::new("rule.dataset-case");
-    /// Stable identifier for `rule.experiment-binding`.
-    pub const EXPERIMENT_BINDING: Id = Id::new("rule.experiment-binding");
-
-    /// Stable identifier for `example.multi-turn-conversation`.
-    pub const MULTI_TURN_CONVERSATION: Id = Id::new("example.multi-turn-conversation");
-    /// Stable identifier for `example.agent-tool-loop`.
-    pub const AGENT_TOOL_LOOP: Id = Id::new("example.agent-tool-loop");
-    /// Stable identifier for `example.supervisor-and-subagents`.
-    pub const SUPERVISOR_AND_SUBAGENTS: Id = Id::new("example.supervisor-and-subagents");
-    /// Stable identifier for `example.fanout-parallel-workers`.
-    pub const FANOUT_PARALLEL_WORKERS: Id = Id::new("example.fanout-parallel-workers");
-    /// Stable identifier for `example.windowed-session`.
-    pub const WINDOWED_SESSION: Id = Id::new("example.windowed-session");
-    /// Stable identifier for `example.rag-pipeline`.
-    pub const RAG_PIPELINE: Id = Id::new("example.rag-pipeline");
-    /// Stable identifier for `example.error-and-escalation`.
-    pub const ERROR_AND_ESCALATION: Id = Id::new("example.error-and-escalation");
-    /// Stable identifier for `example.code-scorer`.
-    pub const CODE_SCORER: Id = Id::new("example.code-scorer");
-    /// Stable identifier for `example.judge-scorer`.
-    pub const JUDGE_SCORER: Id = Id::new("example.judge-scorer");
-    /// Stable identifier for `example.topics-automations`.
-    pub const TOPICS_AUTOMATIONS: Id = Id::new("example.topics-automations");
-    /// Stable identifier for `example.scoring-automations`.
-    pub const SCORING_AUTOMATIONS: Id = Id::new("example.scoring-automations");
-    /// Stable identifier for `example.dataset-cases`.
-    pub const DATASET_CASES: Id = Id::new("example.dataset-cases");
-    /// Stable identifier for `example.experiments`.
-    pub const EXPERIMENTS: Id = Id::new("example.experiments");
 }
-
-const ANY: ExprType = ExprType::Any;
-const STRING: ExprType = ExprType::String;
-const NUMBER: ExprType = ExprType::Number;
-const BOOLEAN: ExprType = ExprType::Boolean;
-const OBJECT: ExprType = ExprType::Object { values: &ANY };
-const NUMBER_OBJECT: ExprType = ExprType::Object { values: &NUMBER };
-const STRING_ARRAY: ExprType = ExprType::Array { items: &STRING };
-
-const SPAN_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::INPUT,
-        keyword: "input",
-        summary: "Input associated with the trace or span.",
-        value: &ANY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::OUTPUT,
-        keyword: "output",
-        summary: "Output associated with the trace or span.",
-        value: &ANY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::EXPECTED,
-        keyword: "expected",
-        summary: "Expected output associated with the trace or span.",
-        value: &ANY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::ERROR,
-        keyword: "error",
-        summary: "Error associated with the trace or span.",
-        value: &ANY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::METADATA,
-        keyword: "metadata",
-        summary: "Arbitrary metadata attached to the trace or span.",
-        value: &OBJECT,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::METRICS,
-        keyword: "metrics",
-        summary: "Arbitrary metric values attached to the trace or span.",
-        value: &OBJECT,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::TAGS,
-        keyword: "tags",
-        summary: "String labels attached to the trace or span.",
-        value: &STRING_ARRAY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::DURATION,
-        keyword: "duration",
-        summary: "Total duration of the trace or span in seconds, evaluated per generated trace; a span with children ends at the later of this duration or its last child's end. Defaults to 0.1.",
-        value: &ANY,
-        cardinality: Cardinality::Optional,
-    },
-];
-
-const ROOT_ONLY: &[Place] = &[Place::Root];
-const ANYWHERE: &[Place] = &[
-    Place::Root,
-    Place::Block { id: ids::TRACE },
-    Place::Block { id: ids::TASK },
-    Place::Block { id: ids::LLM },
-    Place::Block { id: ids::TOOL },
-    Place::Block { id: ids::FUNCTION },
-    Place::Block { id: ids::REPEAT },
-    Place::Block { id: ids::CHOICE },
-    Place::Block { id: ids::MAYBE },
-    Place::Block { id: ids::SCORER },
-];
-const IN_TRACE_SPAN_OR_DYNAMIC: &[Place] = &[
-    Place::Block { id: ids::TRACE },
-    Place::Block { id: ids::TASK },
-    Place::Block { id: ids::LLM },
-    Place::Block { id: ids::TOOL },
-    Place::Block { id: ids::FUNCTION },
-    Place::Block { id: ids::REPEAT },
-    Place::Block { id: ids::CHOICE },
-    Place::Block { id: ids::MAYBE },
-];
-const IN_SCORER: &[Place] = &[Place::Block { id: ids::SCORER }];
-const IN_DATASET: &[Place] = &[Place::Block { id: ids::DATASET }];
-const IN_SCORER_CONTROL: &[Place] = &[
-    Place::Block { id: ids::CODE },
-    Place::Block { id: ids::SCORER_REPEAT },
-    Place::Block { id: ids::WHEN },
-];
-
-const REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
-    tags: &[],
-    id: ids::COUNT,
-    keyword: "count",
-    summary: "Number of times the child blocks are stamped out, evaluated per generated trace.",
-    value: &ANY,
-    cardinality: Cardinality::Required,
-}];
-
-const SCORER_REPEAT_FIELDS: &[FieldDesc] = &[FieldDesc {
-    tags: &[],
-    id: ids::COUNT,
-    keyword: "count",
-    summary: "Number of scorer iterations; evaluated once when the repeat is reached.",
-    value: &NUMBER,
-    cardinality: Cardinality::Required,
-}];
-
-const MAYBE_FIELDS: &[FieldDesc] = &[FieldDesc {
-    tags: &[],
-    id: ids::CHANCE,
-    keyword: "chance",
-    summary: "Probability between 0 and 1 that the child blocks are included, evaluated per generated trace; defaults to 0.5.",
-    value: &ANY,
-    cardinality: Cardinality::Optional,
-}];
-
-const SCORER_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::LANG,
-        keyword: "lang",
-        summary: "Language of the emitted scorer code, the constant string \"python\" or \"typescript\"; the build command may override it, and judge scorers ignore it. Defaults to python.",
-        value: &STRING,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::FILE,
-        keyword: "file",
-        summary: "Optional output file stem for packing code scorers; defaults to the scorer slug. Judge scorers ignore this field.",
-        value: &STRING,
-        cardinality: Cardinality::Optional,
-    },
-];
-
-const SCORER_SPAN_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::SCORE,
-        keyword: "score",
-        summary: "Synthetic score from 0 to 1 for the named top-level scorer.",
-        value: &NUMBER,
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::REASON,
-        keyword: "reason",
-        summary: "Optional explanation recorded on the synthetic scorer span.",
-        value: &STRING,
-        cardinality: Cardinality::Optional,
-    },
-];
-
-const FACET_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::PROMPT,
-        keyword: "prompt",
-        summary: "Constant extraction instructions; trace context is supplied by the default preprocessor.",
-        value: &STRING,
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::DESCRIPTION,
-        keyword: "description",
-        summary: "Description of the Braintrust facet.",
-        value: &STRING,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::NO_MATCH_PATTERN,
-        keyword: "no_match_pattern",
-        summary: "Optional RE2-compatible exclusion pattern for facet summaries.",
-        value: &STRING,
-        cardinality: Cardinality::Optional,
-    },
-];
-
-const FACET_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::FACET_DEFINITION,
-    summary: "Facets have unique names and constant nonempty prompts; sync uses the project default preprocessor, falling back to Thread.",
-}];
-
-const AUTOMATION_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::TYPE,
-        keyword: "type",
-        summary: "Automation kind: the constant string \"scorer\" or \"topics\".",
-        value: &STRING,
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::SCORERS,
-        keyword: "scorers",
-        summary: "One or more names of scorer blocks in this source that have been deployed to Braintrust.",
-        value: &STRING_ARRAY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::FACETS,
-        keyword: "facets",
-        summary: "Names of local facet blocks required by a Topics automation.",
-        value: &STRING_ARRAY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::SCOPE,
-        keyword: "scope",
-        summary: "Execution scope: span for scorers, trace for topics.",
-        value: &STRING,
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::ROOT,
-        keyword: "root",
-        summary: "Apply to root spans when true; use either this or `span_names`.",
-        value: &BOOLEAN,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::SPAN_NAMES,
-        keyword: "span_names",
-        summary: "Apply to spans with these names; use either this or `root`.",
-        value: &STRING_ARRAY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::SAMPLING_RATE,
-        keyword: "sampling_rate",
-        summary: "Fraction of matching spans or traces to process, from 0 to 1; defaults to 1.",
-        value: &NUMBER,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::ENABLED,
-        keyword: "enabled",
-        summary: "Whether the automation is active; defaults to true.",
-        value: &BOOLEAN,
-        cardinality: Cardinality::Optional,
-    },
-];
-
-const AUTOMATION_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::AUTOMATION_BINDING,
-    summary: "Scorer automations require scorers, scope = \"span\", and either root = true or span_names. Topics automations require facets and scope = \"trace\"; scorer-specific fields are forbidden.",
-}];
-
-const AGENT_FIELDS: &[FieldDesc] = &[FieldDesc {
-    tags: &[],
-    id: ids::ENTRYPOINT,
-    keyword: "entrypoint",
-    summary: "The whole trace executed by this generated agent.",
-    value: &ExprType::BlockRef { kinds: &["trace"] },
-    cardinality: Cardinality::Required,
-}];
-
-const AGENT_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::AGENT_BINDING,
-    summary: "An agent requires a unique name and an entrypoint referencing a whole trace.",
-}];
-
-const EXPERIMENT_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::DATASET_REF,
-        keyword: "dataset",
-        summary: "A dataset declared in this module; live writes consume its synced rows.",
-        value: &ExprType::BlockRef { kinds: &["dataset"] },
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::TASK_REF,
-        keyword: "task",
-        summary: "A whole trace or a static span subtree to generate once per dataset row. Row input and expected replace the selected root's fields; row metadata overrides matching root keys.",
-        value: &ExprType::BlockRef {
-            kinds: &["trace", "task", "llm", "tool", "function"],
-        },
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::SCORERS,
-        keyword: "scorers",
-        summary: "Scorer references invoked against each generated result. Build and push the referenced definitions before a live write.",
-        value: &ExprType::Array {
-            items: &ExprType::BlockRef { kinds: &["scorer"] },
-        },
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::BASELINE,
-        keyword: "baseline",
-        summary: "An experiment in this module to compare against; include it in the same write, where it is generated first.",
-        value: &ExprType::BlockRef { kinds: &["experiment"] },
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::DESCRIPTION,
-        keyword: "description",
-        summary: "Description of the Braintrust experiment.",
-        value: &STRING,
-        cardinality: Cardinality::Optional,
-    },
-];
-const EXPERIMENT_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::EXPERIMENT_BINDING,
-    summary: "An experiment requires dataset, task, and a nonempty scorers array. Named resources must exist, task selection must be static, and baseline references must be acyclic. Generation omits authored synthetic scorer spans; scores come from invoking the referenced deployed scorers. Dry runs generate local cases without scorer execution.",
-}];
-
-const DATASET_FIELDS: &[FieldDesc] = &[FieldDesc {
-    tags: &[],
-    id: ids::DESCRIPTION,
-    keyword: "description",
-    summary: "Description of the Braintrust dataset.",
-    value: &STRING,
-    cardinality: Cardinality::Optional,
-}];
-
-const CASE_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::INPUT,
-        keyword: "input",
-        summary: "Inline case input.",
-        value: &ANY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &["preview"],
-        id: ids::TRACE_SOURCE,
-        keyword: "trace",
-        summary: "A module trace block reference, for example trace[\"support-lookup\"].",
-        value: &ExprType::BlockRef { kinds: &["trace"] },
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &["preview"],
-        id: ids::TRACES,
-        keyword: "traces",
-        summary: "Module trace block references grouped into one case.",
-        value: &ExprType::Array {
-            items: &ExprType::BlockRef { kinds: &["trace"] },
-        },
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &["preview"],
-        id: ids::SPAN,
-        keyword: "span",
-        summary: "A module reference to a task, llm, tool, or function block.",
-        value: &ExprType::BlockRef {
-            kinds: &["task", "llm", "tool", "function"],
-        },
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::EXPECTED,
-        keyword: "expected",
-        summary: "Expected output for this case.",
-        value: &ANY,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::METADATA,
-        keyword: "metadata",
-        summary: "Case metadata.",
-        value: &OBJECT,
-        cardinality: Cardinality::Optional,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::TAGS,
-        keyword: "tags",
-        summary: "Case tags.",
-        value: &STRING_ARRAY,
-        cardinality: Cardinality::Optional,
-    },
-];
-
-const DATASET_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::DATASET_CASE,
-    summary: "Each case has exactly one source: input, trace, traces, or span; named trace sources and span paths must exist in this module.",
-}];
-
-const CODE_FIELDS: &[FieldDesc] = &[FieldDesc {
-    tags: &[],
-    id: ids::SCORE,
-    keyword: "score",
-    summary: "Fallback score expression, a number between 0 and 1, used when no `when` case matches.",
-    value: &NUMBER,
-    cardinality: Cardinality::Required,
-}];
-
-const WHEN_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::COND,
-        keyword: "cond",
-        summary: "Boolean condition over the scorer arguments; cases are checked in order and the first match wins.",
-        value: &BOOLEAN,
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::SCORE,
-        keyword: "score",
-        summary: "Optional score returned after nested blocks when the condition matches; required if there are no nested blocks.",
-        value: &NUMBER,
-        cardinality: Cardinality::Optional,
-    },
-];
-
-const JUDGE_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        tags: &[],
-        id: ids::MODEL,
-        keyword: "model",
-        summary: "Constant string naming the judge model, a registered model id like `gpt-4o-mini`.",
-        value: &STRING,
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::PROMPT,
-        keyword: "prompt",
-        summary: "Judge prompt; `${input}`, `${output}`, `${expected}`, and `${metadata}` interpolate the scorer arguments.",
-        value: &STRING,
-        cardinality: Cardinality::Required,
-    },
-    FieldDesc {
-        tags: &[],
-        id: ids::OPTIONS,
-        keyword: "options",
-        summary: "Object mapping each choice label the judge may answer to the constant score it yields.",
-        value: &NUMBER_OBJECT,
-        cardinality: Cardinality::Required,
-    },
-];
-
-const NO_RULES: &[RuleDesc] = &[];
-const NO_CONVENTIONS: &[&str] = &[];
-
-// conventions mirror what braintrust's own sdk wrappers emit, so generated
-// traces render in the ui like traces from real instrumentation
-const TRACE_CONVENTIONS: &[&str] = &[
-    "Name the root span after the application, session, or entrypoint (e.g. `support-sessions`), the way a top-level traced function would be named; never a prose description.",
-    "The root usually carries the user-facing exchange: the user message(s) as `input`, the final answer as `output`.",
-    "`tags` belong on the trace root, not on child spans.",
-];
-const TASK_CONVENTIONS: &[&str] = &[
-    "Name task spans like the function or pipeline step real instrumentation would trace (`turn`, `agent_node`, `retrieve_context`). Repeated turns can share the same name.",
-    "Input and output are free-form: typically the text or values the step consumed and produced.",
-    "Task spans usually carry no metrics; timestamps are generated.",
-];
-const LLM_CONVENTIONS: &[&str] = &[
-    "Name LLM spans the way SDK wrappers do: `Chat Completion` for OpenAI-style chat calls, `anthropic.messages.create` for Anthropic. Real instrumentation never uses the model name or an action description as the span name.",
-    "`input` is an OpenAI-format message array, system message included: `[{ role = \"system\", content = \"...\" }, { role = \"user\", content = \"...\" }]`. This is what the Braintrust UI renders as a chat transcript and what enables the Try prompt button.",
-    "`output` is an assistant message object: `{ role = \"assistant\", content = \"...\" }`.",
-    "`metadata` holds the request parameters at the top level: `model`, `provider` (e.g. `openai`, `anthropic`), and settings like `temperature`, `max_tokens`, or `tool_choice`. Use a real registered model id so Braintrust can compute cost from token counts.",
-    "`metrics` uses Braintrust's exact field names: `prompt_tokens`, `completion_tokens`, and `tokens` (their sum). These power the token and cost columns in the UI.",
-    "Optional metrics, same exact names: `prompt_cached_tokens` (cache reads) and `prompt_cache_creation_tokens` (cache writes), both already included in `prompt_tokens`; `time_to_first_token` in seconds, smaller than the span duration; `estimated_cost` to override the computed cost.",
-    "Metric keys can reference their siblings, so sampled token counts sum exactly in place: `metrics = { prompt_tokens = round(lognormal(600, 0.4)), completion_tokens = round(lognormal(90, 0.7)), tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens }`. For counts that match the actual content, compute them: `tokens = tokens(self.input) + tokens(self.output)`.",
-];
-const TOOL_CONVENTIONS: &[&str] = &[
-    "Name tool spans exactly the tool's function name (`get_stock_performance`), never a description of what it does.",
-    "`input` is the arguments object (`{ ticker = \"NVDA\" }`); `output` is the result object.",
-    "Tool spans typically carry no metadata or metrics.",
-];
-const FUNCTION_CONVENTIONS: &[&str] = &[
-    "Name function spans after the invoked function, like tool spans.",
-    "`input` is the arguments object; `output` is the return value.",
-];
-const REPEAT_CONVENTIONS: &[&str] = &[
-    "Sample `count` (`weighted`, `poisson`, `range`) so structure differs per trace; a constant count belongs only in a grouping repeat.",
-    "Iterations stamp identical content except where `repeat.index` and `repeat.count` parameterize it. Index into or slice a trace-scope var to vary content per iteration — `input = var.messages[:(repeat.index * 2) + 1]` carries conversation history coherently across turns.",
-    "`repeat` with `count = 1` stamps its children once and adds no span, which groups several blocks into a single `choice` alternative.",
-];
-const CHOICE_CONVENTIONS: &[&str] = &[
-    "The primary tool for varying content coherently: wrap whole alternative subtrees (a full conversation, a full tool round) so every field of the picked branch agrees.",
-    "A handful of fully authored alternatives beats one parameterized template; add alternatives to widen the pool.",
-];
-const MAYBE_CONVENTIONS: &[&str] = &[
-    "Model rare paths — errors, escalations, retries — at realistic single-digit chances.",
-    "Children are included together or not at all, so one maybe block holds a whole correlated failure; nest maybe inside choice branches to give paths different failure rates.",
-];
-const SCORER_CONVENTIONS: &[&str] = &[
-    "Name scorers the way Braintrust scorer functions are named, lowercase and hyphenated (`response-quality`), never a prose description.",
-    "Scorers may share a .bt file with one trace and its automations when testing scoring behavior together.",
-];
-const CODE_CONVENTIONS: &[&str] = &[
-    "Sample scores from a distribution clamped into range (`clamp(normal(0.78, 0.12), 0, 1)`) instead of constants so scores vary realistically.",
-    "Give failure modes their own `when` cases with low score ranges so the scorer reacts to what the output actually says.",
-];
-const JUDGE_CONVENTIONS: &[&str] = &[
-    "Write the prompt as an instruction to a grader and interpolate the arguments it should judge: `${input}`, `${output}`.",
-    "`options` keys are the labels the judge answers with; values are the scores they map to, best first (`{ excellent = 1.0, good = 0.6, poor = 0.2 }`).",
-    "Use a real registered model id for `model` so the pushed scorer can run.",
-];
-
-const SCORER_KIND_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::SCORER_KIND,
-    summary: "A scorer declares exactly one `code` or `judge` block.",
-};
-const SCORER_ARGS_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::SCORER_ARGS,
-    summary: "Inside a scorer, bare `input`, `output`, `expected`, and `metadata` are the arguments Braintrust passes at runtime. `repeat.index` and `repeat.count` are available inside a scorer repeat; generation block references, `self`, and `trace.index` are not.",
-};
-const SCORER_EXPRS_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::SCORER_EXPRS,
-    summary: "Scorer expressions must translate to the emitted Python or TypeScript: `tokens`, `noise`, and `attachment` are unavailable, and a referenced variable must have a constant value.",
-};
-const SCORER_LANG_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::SCORER_LANG,
-    summary: "`lang` is the constant string \"python\" or \"typescript\".",
-};
-const SCORER_FILE_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::SCORER_FILE,
-    summary: "`file` is a constant string naming a bare file stem, without path separators or extensions; scorers packed into one file must resolve to the same language.",
-};
-const SCORER_SOURCE_FILES_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::SCORER_SOURCE_FILES,
-    summary: "Python scorer source filenames normalize the effective code file stem or judge slug to lowercase ASCII alphanumeric runs joined by underscores, prefix a leading digit with an underscore, and append `_scorer.py`. TypeScript scorer filenames use `<stem>.scorer.ts`.",
-};
-const SCORE_RANGE_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::SCORE_RANGE,
-    summary: "A constant `score` must be between 0 and 1; keep sampled scores in range with `clamp`.",
-};
-const SCORER_RULES: &[RuleDesc] = &[
-    SCORER_KIND_RULE,
-    SCORER_ARGS_RULE,
-    SCORER_EXPRS_RULE,
-    SCORER_LANG_RULE,
-    SCORER_FILE_RULE,
-    SCORER_SOURCE_FILES_RULE,
-];
-const CODE_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
-const WHEN_RULES: &[RuleDesc] = &[SCORE_RANGE_RULE];
-const JUDGE_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::JUDGE_MODEL,
-        summary: "`model` is a constant string.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::JUDGE_PROMPT,
-        summary: "`prompt` is a string whose interpolations may only be scorer argument paths like `${input}` or `${metadata.tier}`, since the pushed judge renders them as prompt template slots.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::JUDGE_OPTIONS,
-        summary: "`options` maps at least two labels to constant scores between 0 and 1.",
-    },
-];
 const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::FINITE_NUMBERS,
     summary: "Every number must be representable as a finite integer or floating-point value.",
 };
-const FINITE_NUMBER_RULE: &[RuleDesc] = &[FINITE_NUMBERS_RULE];
-const UNIQUE_OBJECT_KEYS_RULE: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::UNIQUE_OBJECT_KEYS,
-    summary: "An object key may appear at most once in an object.",
-}];
-const KNOWN_REFERENCES_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::KNOWN_REFERENCES,
-    summary: "A reference must be documented; currently `trace.index`, the 0-based index of the generated trace, `repeat.index` and `repeat.count`, the 0-based iteration and total count of the innermost enclosing repeat block, `var.<name>` for a defined variable, block references rooted at a block kind or `trace`, and `self` for the enclosing span or trace.",
-};
-const KNOWN_REFERENCES_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE];
-const BLOCK_REF_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::BLOCK_REFS,
-        summary: "A block reference resolves lexically: walking up the enclosing blocks, the nearest scope whose children include a matching kind and name wins. `self` addresses the innermost enclosing span or trace; `trace` addresses the enclosing trace's fields, while `trace[\"name\"]` selects a module trace. At each block selection, `<kind>.<name>` and `<kind>[\"name\"]` are interchangeable when the label can be written as an identifier. Use a quoted bracket selector for labels containing spaces, hyphens, or other characters invalid in a dot segment. Both forms may be mixed in one traversal, such as `trace.support.task[\"answer-request\"].tool.lookup.output`. A reference may retain a block identity for a compatible source field, or select a field to read data. Variables preserve reference targets.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::REF_COLLECTIONS,
-        summary: "Same-kind siblings sharing a name form an ordered positional collection: a lone match is addressed directly (an explicit `[0]` also works); several matches require an index segment before the field.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::REF_FIELDS,
-        summary: "The referenceable surface of a block is its fields — input, output, expected, error, metadata, metrics, and tags — plus key and index selections into them; vars stay private to their scopes, and a reference to a field the target never sets is rejected.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::ACYCLIC_REFS,
-        summary: "References work regardless of where they are written, as long as the value dataflow stays acyclic; a reference cycle is rejected during validation when it is visible statically and fails generation otherwise.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::STATIC_STRUCTURE,
-        summary: "Structure stays independent of generated data: `count`, `chance`, and `for` collections cannot reach a block reference, directly or through variables, while variables may retain block identities or read fields in their evaluation context.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::RESERVED_REPEAT_NAMES,
-        summary: "`index` and `count` cannot name a repeat block: under `repeat.<name>` they address the named enclosing repeat's current iteration and total count.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::REF_EXISTENCE,
-        summary: "A reference crossing a named choice or maybe evaluates to null when that branch was not picked or did not fire; guard with `!= null` or read `choice.<name>.chosen` and `maybe.<name>.included`. An out-of-range iteration or position index fails generation instead.",
-    },
-];
-const SELF_REF_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::SELF_REFS,
-    summary: "`self` addresses the innermost enclosing span or trace, skipping repeat, choice, and maybe blocks; it takes no name segment and works regardless of duplicate names.",
-}];
-const VARS_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::UNIQUE_VARS,
-        summary: "A variable name may be defined at most once across all vars blocks.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::SCOPED_VARS,
-        summary: "A variable is evaluated once per instantiation of the block that declares it — the root scope once per generated trace, a repeat scope once per iteration, a choice or maybe scope once per inclusion — and every reference sees that one value.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::VISIBLE_VARS,
-        summary: "A variable may be referenced anywhere inside the block that declares it, nested blocks included; a variable's own value may only reference variables declared in an enclosing block.",
-    },
-];
-const FUNC_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::KNOWN_FUNCTIONS,
-        summary: "A function call may only use the documented functions listed in this spec.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::FUNC_POSITIONS,
-        summary: "A non-constant expression (a function call, a reference to a variable holding one, or an operator expression containing either) may only appear where any value is accepted; fields with a specific type must use values known before generation.",
-    },
-];
-const OPERAND_TYPES_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::OPERAND_TYPES,
-    summary: "Operator operands must have a known type: `+ - * / %` and `< <= > >=` take numbers, `== !=` compare two strings, two numbers, or two booleans, and `&& || !` take booleans.",
-};
-const NONZERO_DIVISORS_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::NONZERO_DIVISORS,
-    summary: "Division and remainder require a nonzero divisor; a constant zero divisor is rejected during validation, and a divisor that evaluates to zero fails generation.",
-};
-const BOOLEAN_CONDITIONS_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::BOOLEAN_CONDITIONS,
-    summary: "The condition of `?:` must be a boolean.",
-};
-const UNARY_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
-const ARITHMETIC_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE, NONZERO_DIVISORS_RULE, FINITE_NUMBERS_RULE];
-const COMPARISON_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
-const LOGICAL_RULES: &[RuleDesc] = &[OPERAND_TYPES_RULE];
-const CONDITIONAL_RULES: &[RuleDesc] = &[BOOLEAN_CONDITIONS_RULE];
+
 const CHOICE_RULES: &[RuleDesc] = &[RuleDesc {
     tags: &[],
     id: ids::CHOICE_ALTERNATIVES,
     summary: "`choice` takes at least one alternative.",
 }];
+
 const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
     tags: &[],
     id: ids::RANGE_BOUNDS,
     summary: "`range` takes exactly two finite numbers with min <= max.",
 }];
+
 const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::FUNC_ARITY,
     summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number. `compose` accepts an optional separator.",
 };
+
 const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::FUNC_ARG_TYPES,
-    summary: "A function argument must have the documented type, known before generation; an argument whose type is only known during generation (e.g. a `choice` with mixed alternatives) is rejected.",
+    summary: "A function argument must have the documented type, known before evaluation; an argument whose type is only known during evaluation (e.g. a `choice` with mixed alternatives) is rejected.",
 };
+
 const DIST_PARAMS_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::DIST_PARAMS,
     summary: "Distribution parameters are constant finite numbers: `normal` takes stddev >= 0, `lognormal` takes median > 0 and sigma >= 0, `exponential` and `poisson` take mean > 0, `pareto` takes min > 0 and shape > 0, `beta` takes alpha > 0 and beta > 0, and `chance` takes a probability between 0 and 1.",
 };
+
 const SAMPLING_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, DIST_PARAMS_RULE, FINITE_NUMBERS_RULE];
+
 const WEIGHTED_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     RuleDesc {
@@ -1482,25 +345,29 @@ const WEIGHTED_RULES: &[RuleDesc] = &[
         summary: "`weighted` takes at least one `[value, weight]` pair; weights are constant non-negative finite numbers, at least one of them positive.",
     },
 ];
+
 const TEXT_FUNC_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, FUNC_ARG_TYPES_RULE];
+
 const SPLIT_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
         tags: &[],
         id: ids::SPLIT_SEPARATOR,
-        summary: "`split` requires a non-empty separator; a constant empty separator is rejected during validation, and a dynamic one fails the run during generation.",
+        summary: "`split` requires a non-empty separator; a constant empty separator is rejected during validation, and a dynamic one fails the run during evaluation.",
     },
 ];
+
 const JOIN_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
         tags: &[],
         id: ids::JOIN_ELEMENTS,
-        summary: "`join` stringifies string, number, and boolean elements; any other element fails the run during generation.",
+        summary: "`join` stringifies string, number, and boolean elements; any other element fails the run during evaluation.",
     },
 ];
+
 const FORMAT_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
@@ -1510,25 +377,29 @@ const FORMAT_FUNC_RULES: &[RuleDesc] = &[
         summary: "`format` takes a constant string template with exactly one `{}` placeholder per remaining argument, replaced in order.",
     },
 ];
+
 const NUMERIC_FUNC_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, FUNC_ARG_TYPES_RULE, FINITE_NUMBERS_RULE];
+
 const CLAMP_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
         tags: &[],
         id: ids::CLAMP_BOUNDS,
-        summary: "`clamp` bounds must satisfy min <= max; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
+        summary: "`clamp` bounds must satisfy min <= max; a constant violation is rejected during validation, and a dynamic one fails the run during evaluation.",
     },
 ];
+
 const ROUNDING_FUNC_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
         tags: &[],
         id: ids::INTEGER_RESULTS,
-        summary: "`round`, `floor`, and `ceil` produce integers; a result outside the 64-bit integer range fails the run during generation.",
+        summary: "`round`, `floor`, and `ceil` produce integers; a result outside the 64-bit integer range fails the run during evaluation.",
     },
 ];
+
 const RANDOM_STRING_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     RuleDesc {
@@ -1537,334 +408,16 @@ const RANDOM_STRING_RULES: &[RuleDesc] = &[
         summary: "`hex` and `alphanum` take a constant non-negative integer length.",
     },
 ];
+
 const UUID_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE];
+
 const NOISE_RULES: &[RuleDesc] = &[
     FUNC_ARITY_RULE,
     FUNC_ARG_TYPES_RULE,
     RuleDesc {
         tags: &[],
         id: ids::NOISE_SIZE,
-        summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
-    },
-];
-const INDEX_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::INDEXABLE_TARGETS,
-        summary: "Indexing requires an array or object target: arrays take an integer index, objects take a string key.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::INDEX_BOUNDS,
-        summary: "An array index must be within bounds and an object key must be present; constant violations are rejected during validation, dynamic ones fail the run during generation.",
-    },
-];
-const SLICE_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::SLICEABLE_TARGETS,
-        summary: "Slicing requires an array target; slice bounds are numbers.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::SLICE_BOUNDS,
-        summary: "Slice bounds are non-negative integers, clamped to the array length; a start at or past the end produces an empty array. Constant violations are rejected during validation, dynamic ones fail the run during generation.",
-    },
-];
-const SPREAD_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::SPREAD_OPERANDS,
-    summary: "A spread operand must be an array (inside arrays) or an object (inside objects) whose shape is known before generation. Later object entries override keys introduced by a spread, but two explicit keys may still not collide.",
-}];
-const FOR_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::FOR_COLLECTIONS,
-        summary: "A for expression iterates an array or object whose shape is known before generation; element values may still be dynamic.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::STATIC_FOR,
-        summary: "For expressions unroll during validation: a filter condition must resolve to a constant boolean and an object key to a constant string.",
-    },
-];
-const MULTILINE_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::MULTILINE_DELIMITERS,
-        summary: "Multi-line content starts on the line after the opening `\"\"\"` and ends on the line before the closing `\"\"\"`, which sits alone on its own line; the final newline is not part of the value, so leave a blank line to keep one.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::MULTILINE_INDENT,
-        summary: "The closing delimiter's leading whitespace is stripped from every content line; blank lines are exempt, and no other line may be indented less.",
-    },
-];
-const HEREDOC_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::HEREDOC_DELIMITERS,
-        summary: "Heredoc content starts on the line after the introducer and ends at the first line holding only the delimiter word (surrounding whitespace allowed); unlike `\"\"\"` strings, the newline ending the last content line is part of the value.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::HEREDOC_INDENT,
-        summary: "`<<` keeps every content line verbatim; `<<-` strips the longest whitespace prefix shared by the non-blank content lines, and blank lines keep only their newline.",
-    },
-];
-const REPEAT_REFS_RULE: RuleDesc = RuleDesc {
-    tags: &[],
-    id: ids::REPEAT_REFS,
-    summary: "`repeat.index` (the 0-based iteration) and `repeat.count` (the total number of iterations) resolve against the innermost enclosing repeat block and are only valid inside one.",
-};
-const REPEAT_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::REPEAT_COUNT,
-        summary: "`count` must evaluate to a non-negative integer; a constant violation is rejected during validation, and a dynamic one fails when the repeat runs.",
-    },
-    REPEAT_REFS_RULE,
-];
-const SPAN_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::SPAN_DURATION,
-    summary: "`duration` must evaluate to a finite number of seconds greater than zero; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
-}];
-const CTX_REF_RULES: &[RuleDesc] = &[KNOWN_REFERENCES_RULE, REPEAT_REFS_RULE];
-const MAYBE_RULES: &[RuleDesc] = &[RuleDesc {
-    tags: &[],
-    id: ids::MAYBE_CHANCE,
-    summary: "`chance` must evaluate to a number between 0 and 1 inclusive; a constant violation is rejected during validation, and a dynamic one fails the run during generation.",
-}];
-const VAR_REF_RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::DEFINED_VARS,
-        summary: "A variable reference must name a variable defined in a vars block.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::SCALAR_INTERPOLATION,
-        summary: "An interpolated variable must be a string, number, or boolean; a dynamic variable must have one of those types known before generation.",
-    },
-];
-
-const EXPR_TYPES: &[ExprDesc] = &[
-    ExprDesc {
-        tags: &[],
-        id: ids::STRING,
-        syntax: "\"text\"",
-        summary: "A double-quoted string. `$${` escapes a literal `${`; other escape sequences are not currently supported.",
-        examples: &["\"hello\"", "\"gpt-4o-mini\""],
-        rules: NO_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::TEMPLATE,
-        syntax: "\"text ${reference} text\"",
-        summary: "A string containing `${...}` interpolations resolved for each generated trace. Valid anywhere a string is, except block names.",
-        examples: &["\"question #${trace.index}\""],
-        rules: KNOWN_REFERENCES_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::MULTILINE,
-        syntax: "\"\"\"\ntext\n\"\"\"",
-        summary: "A triple-quoted string spanning multiple lines. Quotes are literal inside it, and `$${` and `${...}` interpolation work as in single-line strings. Valid anywhere a string is.",
-        examples: &["\"\"\"\n    You are ${var.assistant}.\n    Answer briefly.\n    \"\"\""],
-        rules: MULTILINE_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::HEREDOC,
-        syntax: "<<DELIM\ntext\nDELIM | <<-DELIM\ntext\nDELIM",
-        summary: "A heredoc string closed by a line holding only its delimiter word. Quotes are literal inside it, and `$${` and `${...}` interpolation work as in single-line strings. Valid anywhere a string is.",
-        examples: &["<<-PROMPT\n    You are ${var.assistant}.\n    Answer briefly.\nPROMPT"],
-        rules: HEREDOC_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::VAR_REF,
-        syntax: "var.<name>",
-        summary: "A reference to a variable defined in a vars block in scope. Constant values resolve during validation; a value that varies per trace is evaluated once per instantiation of its declaring block, so every reference sees the same value. Usable as any value, or interpolated with `${var.<name>}`.",
-        examples: &["var.temperature", "\"model: ${var.model}\""],
-        rules: VAR_REF_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::CTX_REF,
-        syntax: "trace.index | repeat.index | repeat.count",
-        summary: "A context reference resolved for each generated trace: `trace.index` is the 0-based index of the trace being generated; `repeat.index` and `repeat.count` are the 0-based iteration and total count of the innermost enclosing repeat block. All are integers, usable as any number or interpolated with `${...}`.",
-        examples: &[
-            "repeat.index + 1",
-            "var.messages[:repeat.index + 1]",
-            "\"question #${trace.index}\"",
-        ],
-        rules: CTX_REF_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::BLOCK_REF,
-        syntax: "<kind>.<name>.<field> | <kind>[\"name\"].<field> | trace.<field> | repeat.<name>[i]... | choice.<name>.chosen | maybe.<name>.included",
-        summary: "A reference to another block's field, resolved for each generated trace: the head names a block kind, the name segment picks the block among the enclosing scopes' children, and the path ends in one of its fields, optionally followed by key or index selections into the field's value. `trace.<field>` reads the enclosing trace's own fields. `repeat.<name>` addresses a repeat's iterations: `[i]` selects one, a slice like `[:repeat.index]` projects the rest of the path over each selected iteration and yields an array, and `.index`/`.count` read the named enclosing repeat's current iteration. `choice.<name>.chosen` is the 0-based pick and `maybe.<name>.included` whether it fired; a reference crossing an unchosen branch reads as null. Usable as any value, or interpolated with `${...}`.",
-        examples: &[
-            "llm.chat.output.content",
-            "llm[\"Chat Completion\"].metrics.tokens",
-            "trace.support.task[\"answer-request\"].tool.lookup.output",
-            "trace.input",
-            "repeat.rounds[repeat.index - 1].llm.chat.output",
-            "[...repeat.rounds[:repeat.index].llm.chat.output]",
-            "choice.outcome.chosen",
-        ],
-        rules: BLOCK_REF_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::SELF_REF,
-        syntax: "self.<field>",
-        summary: "A reference to the innermost enclosing span or trace's own fields, for derivations that read the block's other values. Skips enclosing repeat, choice, and maybe blocks, and stays unambiguous under duplicate names.",
-        examples: &[
-            "tokens(self.output)",
-            "self.metrics.prompt_tokens + self.metrics.completion_tokens",
-        ],
-        rules: SELF_REF_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::NUMBER,
-        syntax: "digits[.digits]",
-        summary: "An integer or finite decimal number. A leading `-` is unary negation, not part of the literal.",
-        examples: &["4", "0.2", "-1.5"],
-        rules: FINITE_NUMBER_RULE,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::BOOLEAN,
-        syntax: "true | false",
-        summary: "A boolean literal.",
-        examples: &["true", "false"],
-        rules: NO_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::NULL,
-        syntax: "null",
-        summary: "A null literal representing an explicitly absent value.",
-        examples: &["null"],
-        rules: NO_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::ARRAY,
-        syntax: "[value, ...]",
-        summary: "A comma-separated sequence of expressions with an optional trailing comma.",
-        examples: &["[]", "[\"chat\", \"prod\"]"],
-        rules: NO_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::OBJECT,
-        syntax: "{ key = value, ... }",
-        summary: "An object with unique identifier keys and expression values. Items on the same line are separated by commas, with an optional trailing comma; a line break also separates items.",
-        examples: &["{}", "{ tokens = 4, cached = false }"],
-        rules: UNIQUE_OBJECT_KEYS_RULE,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::FUNC,
-        syntax: "name(arg, ...)",
-        summary: "A call to a documented function, evaluated once per generated trace.",
-        examples: &["choice(\"clear\", \"vague\")", "range(80, 400)"],
-        rules: FUNC_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::INDEX,
-        syntax: "value[index] | value.field",
-        summary: "Selects an array element by 0-based integer index or an object value by string key. `value.field` is shorthand for `value[\"field\"]`; the bracketed index may be any expression, evaluated per generated trace.",
-        examples: &[
-            "var.models[0]",
-            "var.user[\"name\"]",
-            "var.user.name",
-            "var.models[choice(0, 1, 2)]",
-        ],
-        rules: INDEX_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::SLICE,
-        syntax: "value[start:end]",
-        summary: "Selects a sub-range of an array: 0-based, start inclusive, end exclusive. Either bound may be omitted to default to that end of the array, and bounds may be any number expressions, evaluated per generated trace.",
-        examples: &["var.xs[1:3]", "var.xs[:2]", "var.xs[range(0, 2):]"],
-        rules: SLICE_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::SPREAD,
-        syntax: "[...array] | { ...object }",
-        summary: "Splices the elements of an array or the entries of an object into a surrounding literal, resolved during validation. Later object entries override keys a spread introduced.",
-        examples: &["[1, ...var.xs]", "{ ...var.meta, temperature = 0.9 }"],
-        rules: SPREAD_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::FOR,
-        syntax: "[for x in collection : body if cond] | { for k, v in collection : key => value if cond }",
-        summary: "Maps and filters a collection into a new array or object, unrolled during validation. One binding names the element (arrays) or key (objects); two name index/element or key/value. A binding referenced twice re-evaluates a dynamic element each time, like variables.",
-        examples: &[
-            "[for x in var.xs : x * 2]",
-            "[for i, x in var.xs : \"${i}-${x}\" if i > 0]",
-            "{ for k, v in var.meta : k => v if k != \"secret\" }",
-        ],
-        rules: FOR_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::GROUPING,
-        syntax: "(expression)",
-        summary: "Parentheses group a sub-expression to override operator precedence.",
-        examples: &["(1 + 2) * 3"],
-        rules: NO_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::UNARY,
-        syntax: "-value | !value",
-        summary: "Negates a number or inverts a boolean.",
-        examples: &["-4", "!var.cached"],
-        rules: UNARY_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::ARITHMETIC,
-        syntax: "a + b | a - b | a * b | a / b | a % b",
-        summary: "Arithmetic over numbers. Two integer operands produce an integer (`/` truncates toward zero); any float operand produces a float. Constant expressions are evaluated during validation; a divisor that evaluates to zero during generation fails the run.",
-        examples: &["7 / 2", "var.total * 0.5", "range(1, 5) * 100"],
-        rules: ARITHMETIC_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::COMPARISON,
-        syntax: "a == b | a != b | a < b | a <= b | a > b | a >= b",
-        summary: "Equality over two strings, two numbers, or two booleans; ordering over numbers. Produces a boolean.",
-        examples: &["var.model == \"gpt-4o\"", "range(1, 10) > 5"],
-        rules: COMPARISON_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::LOGICAL,
-        syntax: "a && b | a || b",
-        summary: "Boolean and/or. Short-circuits: the right operand is only evaluated when the left doesn't decide the result.",
-        examples: &["var.prod && !var.cached"],
-        rules: LOGICAL_RULES,
-    },
-    ExprDesc {
-        tags: &[],
-        id: ids::CONDITIONAL,
-        syntax: "cond ? then : else",
-        summary: "Picks `then` when the condition is true, `else` otherwise. Right-associative; only the taken branch is evaluated for each generated trace.",
-        examples: &["var.tier == \"pro\" ? range(20, 80) : range(200, 800)"],
-        rules: CONDITIONAL_RULES,
+        summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during evaluation.",
     },
 ];
 
@@ -1874,7 +427,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_CHOICE,
         name: "choice",
         syntax: "choice(value, ...)",
-        summary: "Picks one of its alternatives uniformly at random for each generated trace. Alternatives may be any value, including nested functions.",
+        summary: "Picks one of its alternatives uniformly at random on evaluation. Alternatives may be any value, including nested functions.",
         examples: &["choice(\"gpt-4o\", \"gpt-4o-mini\")", "choice(1, 2, range(5, 9))"],
         rules: CHOICE_RULES,
     },
@@ -1883,7 +436,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_RANGE,
         name: "range",
         syntax: "range(min, max)",
-        summary: "Samples a number uniformly between min and max (inclusive) for each generated trace. Two integer bounds sample an integer; otherwise a float.",
+        summary: "Samples a number uniformly between min and max (inclusive) on evaluation. Two integer bounds sample an integer; otherwise a float.",
         examples: &["range(80, 400)", "range(0.0, 1.0)"],
         rules: RANGE_RULES,
     },
@@ -1892,10 +445,10 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_WEIGHTED,
         name: "weighted",
         syntax: "weighted([value, weight], ...)",
-        summary: "Picks one of its `[value, weight]` pairs at random for each generated trace, with probability proportional to its weight. Values may be any value, including nested functions; weights are constant non-negative numbers that need not sum to 1.",
+        summary: "Picks one of its `[value, weight]` pairs at random on evaluation, with probability proportional to its weight. Values may be any value, including nested functions; weights are constant non-negative numbers that need not sum to 1.",
         examples: &[
-            "weighted([\"gpt-4o\", 8], [\"gpt-4o-mini\", 2])",
-            "weighted([range(1, 3), 0.9], [10, 0.1])",
+            "weighted([|\"gpt-4o\", 8|], [|\"gpt-4o-mini\", 2|])",
+            "weighted([|range(1, 3), 0.9|], [|10, 0.1|])",
         ],
         rules: WEIGHTED_RULES,
     },
@@ -1904,7 +457,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_NORMAL,
         name: "normal",
         syntax: "normal(mean, stddev)",
-        summary: "Samples a float from a normal (Gaussian) distribution with the given mean and standard deviation for each generated trace.",
+        summary: "Samples a float from a normal (Gaussian) distribution with the given mean and standard deviation on evaluation.",
         examples: &["normal(0.7, 0.1)", "clamp(normal(100, 15), 0, 200)"],
         rules: SAMPLING_RULES,
     },
@@ -1913,7 +466,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_LOGNORMAL,
         name: "lognormal",
         syntax: "lognormal(median, sigma)",
-        summary: "Samples a positive float from a log-normal distribution for each generated trace, parameterized by its median and the sigma of the underlying normal; `lognormal(300, 0.5)` centers near 300 with a long right tail.",
+        summary: "Samples a positive float from a log-normal distribution on evaluation, parameterized by its median and the sigma of the underlying normal; `lognormal(300, 0.5)` centers near 300 with a long right tail.",
         examples: &["lognormal(300, 0.5)", "clamp(lognormal(120, 0.8), 10, 30000)"],
         rules: SAMPLING_RULES,
     },
@@ -1922,7 +475,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_EXPONENTIAL,
         name: "exponential",
         syntax: "exponential(mean)",
-        summary: "Samples a positive float from an exponential distribution with the given mean for each generated trace.",
+        summary: "Samples a positive float from an exponential distribution with the given mean on evaluation.",
         examples: &["exponential(250)", "round(exponential(30))"],
         rules: SAMPLING_RULES,
     },
@@ -1931,7 +484,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_PARETO,
         name: "pareto",
         syntax: "pareto(min, shape)",
-        summary: "Samples a heavy-tailed float at least min from a Pareto distribution for each generated trace; smaller shapes produce heavier tails.",
+        summary: "Samples a heavy-tailed float at least min from a Pareto distribution on evaluation; smaller shapes produce heavier tails.",
         examples: &["pareto(100, 1.5)", "round(pareto(50, 2))"],
         rules: SAMPLING_RULES,
     },
@@ -1940,7 +493,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_BETA,
         name: "beta",
         syntax: "beta(alpha, beta)",
-        summary: "Samples a float between 0 and 1 from a beta distribution with the given shape parameters for each generated trace.",
+        summary: "Samples a float between 0 and 1 from a beta distribution with the given shape parameters on evaluation.",
         examples: &["beta(2, 5)", "round(beta(8, 2) * 100)"],
         rules: SAMPLING_RULES,
     },
@@ -1949,7 +502,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_POISSON,
         name: "poisson",
         syntax: "poisson(mean)",
-        summary: "Samples a non-negative integer count from a Poisson distribution with the given mean for each generated trace.",
+        summary: "Samples a non-negative integer count from a Poisson distribution with the given mean on evaluation.",
         examples: &["poisson(3)", "poisson(0.4)"],
         rules: SAMPLING_RULES,
     },
@@ -1958,7 +511,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_CHANCE,
         name: "chance",
         syntax: "chance(probability)",
-        summary: "Produces true with the given probability for each generated trace, false otherwise.",
+        summary: "Produces true with the given probability on evaluation, false otherwise.",
         examples: &["chance(0.1)", "chance(0.9) ? \"hit\" : \"miss\""],
         rules: SAMPLING_RULES,
     },
@@ -1967,7 +520,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_UPPER,
         name: "upper",
         syntax: "upper(text)",
-        summary: "Uppercases a string for each generated trace.",
+        summary: "Uppercases a string on evaluation.",
         examples: &["upper(\"info\")", "upper(choice(\"get\", \"post\"))"],
         rules: TEXT_FUNC_RULES,
     },
@@ -1976,8 +529,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_LOWER,
         name: "lower",
         syntax: "lower(text)",
-        summary: "Lowercases a string for each generated trace.",
-        examples: &["lower(var.model)", "lower(\"WARN\")"],
+        summary: "Lowercases a string on evaluation.",
+        examples: &["lower(settings.model)", "lower(\"WARN\")"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -1985,7 +538,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_TRIM,
         name: "trim",
         syntax: "trim(text)",
-        summary: "Removes leading and trailing whitespace from a string for each generated trace.",
+        summary: "Removes leading and trailing whitespace from a string on evaluation.",
         examples: &["trim(\"  padded  \")"],
         rules: TEXT_FUNC_RULES,
     },
@@ -1994,8 +547,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_REPLACE,
         name: "replace",
         syntax: "replace(text, from, to)",
-        summary: "Replaces every occurrence of from with to in a string for each generated trace; an empty from leaves the string unchanged.",
-        examples: &["replace(var.model, \"gpt-\", \"\")", "replace(\"a b c\", \" \", \"-\")"],
+        summary: "Replaces every occurrence of from with to in a string on evaluation; an empty from leaves the string unchanged.",
+        examples: &["replace(settings.model, \"gpt-\", \"\")", "replace(\"a b c\", \" \", \"-\")"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2003,8 +556,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_SPLIT,
         name: "split",
         syntax: "split(text, separator)",
-        summary: "Splits a string around each occurrence of the non-empty separator for each generated trace, producing an array of strings.",
-        examples: &["split(\"a,b,c\", \",\")", "split(var.path, \"/\")[0]"],
+        summary: "Splits a string around each occurrence of the non-empty separator on evaluation, producing an array of strings.",
+        examples: &["split(\"a,b,c\", \",\")", "split(settings.path, \"/\")[0]"],
         rules: SPLIT_FUNC_RULES,
     },
     FuncDesc {
@@ -2012,8 +565,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_RENDER,
         name: "render",
         syntax: "render(template, values)",
-        summary: "Substitutes {name} placeholders with string, number, or boolean values from an object. Double braces escape literal braces. Missing names, non-scalar replacements, empty names, and unmatched braces fail during generation. Extra values are allowed and replacements are not recursively rendered. Numeric rendering preserves authored float types, including a trailing .0 for whole floats and the sign of negative zero. Nonzero floats use scientific notation below 0.00001 in magnitude or at and above 1e16, with no leading zeros in the exponent.",
-        examples: &[r#"render("Hello {name}!", { name = "Sam" })"#],
+        summary: "Substitutes {name} placeholders with string, number, or boolean values from an object. Double braces escape literal braces. Missing names, non-scalar replacements, empty names, and unmatched braces fail during evaluation. Extra values are allowed and replacements are not recursively rendered. Numeric rendering preserves authored float types, including a trailing .0 for whole floats and the sign of negative zero. Nonzero floats use scientific notation below 0.00001 in magnitude or at and above 1e16, with no leading zeros in the exponent.",
+        examples: &[r#"render("Hello {name}!", { name: "Sam" })"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2021,8 +574,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_COMPOSE,
         name: "compose",
         syntax: "compose(parts[, separator])",
-        summary: "Joins string parts, skipping null and empty strings. The separator defaults to a space. Whitespace and punctuation are preserved. Other element types fail during generation.",
-        examples: &[r#"compose(["Hi!", null, "How can I help?"])"#],
+        summary: "Joins string parts, skipping null and empty strings. The separator defaults to a space. Whitespace and punctuation are preserved. Other element types fail during evaluation.",
+        examples: &[r#"compose([|"Hi!", null, "How can I help?"|])"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2030,8 +583,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_SAMPLE,
         name: "sample",
         syntax: "sample(array, count)",
-        summary: "Selects array positions uniformly without replacement and returns their values in source order. Duplicate values remain distinct positions. Count must be an integer from zero through the array length, otherwise generation fails.",
-        examples: &[r#"sample(["parking", "keys", "hours"], 2)"#],
+        summary: "Selects array positions uniformly without replacement and returns their values in source order. Duplicate values remain distinct positions. Count must be an integer from zero through the array length, otherwise evaluation fails.",
+        examples: &[r#"sample([|"parking", "keys", "hours"|], 2)"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2039,9 +592,9 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_REALIZE,
         name: "realize",
         syntax: "realize(sentence[, options])",
-        summary: "Renders English without random choices. The sentence object requires clause and accepts optional condition. A clause requires subject {text: string, person: first|second|third (default third), number: singular|plural (default singular)} and predicate {verb, complement?: string}. Verb is a packaged lowercase base word or an object containing all five lowercase forms: base, third_person_singular, past, past_participle, present_participle. Clause options are tense: present|past|future (present), aspect: simple|progressive|perfect|perfect_progressive (simple), polarity: positive|negative (positive), form: statement|question (statement), and modal: can|could|may|might|must|should|will|would (absent by default). A modal requires tense present, with temporal relationships expressed through the chosen modal and aspect. A condition requires subject and predicate and accepts tense, aspect, and polarity with the same defaults. It is introduced by if. Rendering options are negation: expanded|contracted (expanded) and condition_position: before|after (before). Authored subject agreement and explicit verb forms remain caller-owned. Unsupported structures and unknown fields fail during generation.",
+        summary: "Renders English without random choices. The sentence object requires clause and accepts optional condition. A clause requires subject {text: string, person: first|second|third (default third), number: singular|plural (default singular)} and predicate {verb, complement?: string}. Verb is a packaged lowercase base word or an object containing all five lowercase forms: base, third_person_singular, past, past_participle, present_participle. Clause options are tense: present|past|future (present), aspect: simple|progressive|perfect|perfect_progressive (simple), polarity: positive|negative (positive), form: statement|question (statement), and modal: can|could|may|might|must|should|will|would (absent by default). A modal requires tense present, with temporal relationships expressed through the chosen modal and aspect. A condition requires subject and predicate and accepts tense, aspect, and polarity with the same defaults. It is introduced by if. Rendering options are negation: expanded|contracted (expanded) and condition_position: before|after (before). Authored subject agreement and explicit verb forms remain caller-owned. Unsupported structures and unknown fields fail during evaluation.",
         examples: &[
-            r#"realize({ clause = { subject = { text = "the guest" }, predicate = { verb = "arrive", complement = "after midnight" }, tense = "future" } })"#,
+            r#"realize({ clause: { subject: { text: "the guest" }, predicate: { verb: "arrive", complement: "after midnight" }, tense: "future" } })"#,
         ],
         rules: TEXT_FUNC_RULES,
     },
@@ -2050,9 +603,9 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_EXPRESS,
         name: "express",
         syntax: "express(source[, options])",
-        summary: "Generates English from author-approved expressions of an intent. source contains intent: nonempty identifier, families: nonempty array, constructions: array (default []), facts: [{id,text}] (default []), optional_details: fact IDs (default []), and protected: literal strings (default []). A construction is {id,predicate:{verb,complement?},weight:1,requires:[],excludes:[],mentions:[]}. Verb accepts the same known base string or explicit five forms as realize. Compatible verbs, objects, particles, and complements stay together as one construction. A family is {id,kind,weight:1,constructions:[],patterns:[],requires:[],excludes:[],context_requires:[],establishes:[],mentions:[],reason:null,text:null}. kind is request, desire, possibility, procedure, need, reason_request, follow_up, or authored. Built-in families use a selected action in request, first-person, or procedural constructions. Empty construction and pattern lists allow all compatible choices. requires and mentions need supplied fact IDs, excludes rejects supplied fact IDs, and context_requires needs established context markers. reason_request needs reason: a supplied fact ID. authored and follow_up need complete text and cannot specify constructions, patterns, or reason. follow_up also requires nonempty context_requires. Author-supplied alternatives are trusted to express the intended meaning. No semantic equivalence or hidden circumstances are inferred. Use render, realize, and ordinary bts choices to prepare domain-specific text and circumstances. options contains speaker, context, and repeat_penalty (default 0.25, range 0..1). speaker contains wording: vary style controls (default neutral), family_weights and pattern_weights: identifier-to-weight objects, greetings and closings: [{text,weight:1}], greeting_probability (0.5), closing_probability (0), detail_probability (0.5), and max_details (1, integer 0..16). All probabilities are in 0..1 and weights in 0..1000000. Profiles are ordinary values that can be sampled once and reused across turns. Greetings apply only with empty history. Optional supplied details are sampled without replacement until max_details or the first failed detail gate, excluding already expressed or established facts. context contains established: identifiers and recent: selection records, both default empty. Family and construction repeats within the same intent are multiplied by repeat_penalty, with zero excluding repeats. Selection normalizes weights by family, construction, and pattern, independent of vocabulary size. Generation fails if no positive-weight choice is eligible. No random draw is consumed for a sole choice or probability zero or one. Uses scoped seeded randomness and performs no network calls. For composable messages, source also accepts topic: an explicit topic or entity identifier and components: [{id,role,forms,mentions:[],requires:[],context_requires:[],slot:null,option:null}]. Roles are current, outcome, reason, constraint, answer, previous, replacement, acknowledgment, clarification, follow_up_request, and detail. Each form is {id,text,shape:complete,reference:explicit,weight:1,context_requires:[]}. Shapes are complete, fragments, clause, and value. Clauses and values must omit terminal punctuation and are only used in recipes requiring them. Use realize to prepare grammatical component text. Contextual forms require a topic and nonempty component or form context_requires. Family message is {layout,bindings:{role:component_id},relation:null,allow_apology:false,details:[]}. Layouts are request_only, request_reason, reason_request, outcome_request, current_desired, constraint_request, answer, correction, acknowledgment, clarification, and follow_up_request. current_desired and response layouts require kind structured with no text, reason, constructions, or patterns. Other layouts wrap a regular action family or authored request. reason_request family kind cannot also use message. Message plans cannot use source optional_details. details explicitly binds detail components, with no added facts. Cause links require relation cause on request_reason or reason_request layouts and declarative first-person actions. Contrast requires relation contrast on current_desired. Without those relationships only separate sentences are eligible. Apology variants require allow_apology on correction. Every binding must match the component role. Speaker maps organization (request_first, circumstance_first, outcome_first, current_then_desired, response), elaboration (minimal, relevant_context, detailed), sentence_shape (complete, short_sentences, fragments), and reference_style (explicit, contextual) independently weight applicable choices. Omitted weights are one, zero excludes. Organization and elaboration multiply family weights. Form weights normalize within each recipe and shape and reference preferences weight eligible recipes and forms. Message plans govern fragments and disable the separate surface fragment rewrite. Context additionally accepts topic, known fact IDs, requested slot IDs, offered option IDs, and allowed_acts (answer, correction, acknowledgment, clarification, follow_up_request), all empty or absent by default. Responses require matching topic and an explicitly allowed act. Answers and clarifications require a requested slot. Component option requires an offered option ID. Corrections require previous and replacement components with matching slots and nonempty, disjoint mentions, and previous facts must already be established. Components may use supplied facts or explicitly known facts. Context never derives meaning from agent text. Message expansion is limited to 16384 choices per family.",
+        summary: "Generates English from author-approved expressions of an intent. source contains intent: nonempty identifier, families: nonempty array, constructions: array (default []), facts: [{id,text}] (default []), optional_details: fact IDs (default []), and protected: literal strings (default []). A construction is {id,predicate:{verb,complement?},weight:1,requires:[],excludes:[],mentions:[]}. Verb accepts the same known base string or explicit five forms as realize. Compatible verbs, objects, particles, and complements stay together as one construction. A family is {id,kind,weight:1,constructions:[],patterns:[],requires:[],excludes:[],context_requires:[],establishes:[],mentions:[],reason:null,text:null}. kind is request, desire, possibility, procedure, need, reason_request, follow_up, or authored. Built-in families use a selected action in request, first-person, or procedural constructions. Empty construction and pattern lists allow all compatible choices. requires and mentions need supplied fact IDs, excludes rejects supplied fact IDs, and context_requires needs established context markers. reason_request needs reason: a supplied fact ID. authored and follow_up need complete text and cannot specify constructions, patterns, or reason. follow_up also requires nonempty context_requires. Author-supplied alternatives are trusted to express the intended meaning. No semantic equivalence or hidden circumstances are inferred. Use render, realize, and ordinary bts choices to prepare domain-specific text and circumstances. options contains speaker, context, and repeat_penalty (default 0.25, range 0..1). speaker contains wording: vary style controls (default neutral), family_weights and pattern_weights: identifier-to-weight objects, greetings and closings: [{text,weight:1}], greeting_probability (0.5), closing_probability (0), detail_probability (0.5), and max_details (1, integer 0..16). All probabilities are in 0..1 and weights in 0..1000000. Profiles are ordinary values that can be sampled once and reused across turns. Greetings apply only with empty history. Optional supplied details are sampled without replacement until max_details or the first failed detail gate, excluding already expressed or established facts. context contains established: identifiers and recent: selection records, both default empty. Family and construction repeats within the same intent are multiplied by repeat_penalty, with zero excluding repeats. Selection normalizes weights by family, construction, and pattern, independent of vocabulary size. Evaluation fails if no positive-weight choice is eligible. No random draw is consumed for a sole choice or probability zero or one. Uses scoped seeded randomness and performs no network calls. For composable messages, source also accepts topic: an explicit topic or entity identifier and components: [{id,role,forms,mentions:[],requires:[],context_requires:[],slot:null,option:null}]. Roles are current, outcome, reason, constraint, answer, previous, replacement, acknowledgment, clarification, follow_up_request, and detail. Each form is {id,text,shape:complete,reference:explicit,weight:1,context_requires:[]}. Shapes are complete, fragments, clause, and value. Clauses and values must omit terminal punctuation and are only used in recipes requiring them. Use realize to prepare grammatical component text. Contextual forms require a topic and nonempty component or form context_requires. Family message is {layout,bindings:{role:component_id},relation:null,allow_apology:false,details:[]}. Layouts are request_only, request_reason, reason_request, outcome_request, current_desired, constraint_request, answer, correction, acknowledgment, clarification, and follow_up_request. current_desired and response layouts require kind structured with no text, reason, constructions, or patterns. Other layouts wrap a regular action family or authored request. reason_request family kind cannot also use message. Message plans cannot use source optional_details. details explicitly binds detail components, with no added facts. Cause links require relation cause on request_reason or reason_request layouts and declarative first-person actions. Contrast requires relation contrast on current_desired. Without those relationships only separate sentences are eligible. Apology variants require allow_apology on correction. Every binding must match the component role. Speaker maps organization (request_first, circumstance_first, outcome_first, current_then_desired, response), elaboration (minimal, relevant_context, detailed), sentence_shape (complete, short_sentences, fragments), and reference_style (explicit, contextual) independently weight applicable choices. Omitted weights are one, zero excludes. Organization and elaboration multiply family weights. Form weights normalize within each recipe and shape and reference preferences weight eligible recipes and forms. Message plans govern fragments and disable the separate surface fragment rewrite. Context additionally accepts topic, known fact IDs, requested slot IDs, offered option IDs, and allowed_acts (answer, correction, acknowledgment, clarification, follow_up_request), all empty or absent by default. Responses require matching topic and an explicitly allowed act. Answers and clarifications require a requested slot. Component option requires an offered option ID. Corrections require previous and replacement components with matching slots and nonempty, disjoint mentions, and previous facts must already be established. Components may use supplied facts or explicitly known facts. Context never derives meaning from agent text. Message expansion is limited to 16384 choices per family.",
         examples: &[
-            r#"express({ intent = "change_flight", constructions = [{ id = "change", predicate = { verb = "change", complement = "my flight" } }], families = [{ id = "request", kind = "request" }, { id = "desire", kind = "desire" }] }, { speaker = { wording = { style = "conversational" } } })"#,
+            r#"express({ intent: "change_flight", constructions: [|{ id: "change", predicate: { verb: "change", complement: "my flight" } }|], families: [|{ id: "request", kind: "request" }, { id: "desire", kind: "desire" }|] }, { speaker: { wording: { style: "conversational" } } })"#,
         ],
         rules: TEXT_FUNC_RULES,
     },
@@ -2062,7 +615,7 @@ const FUNCS: &[FuncDesc] = &[
         name: "expression",
         syntax: "expression(source[, options])",
         summary: "Uses the same inputs and random choices as express and returns an object with text, base_text before surface styling, selection: {intent,family,construction,pattern}, used_facts, edits, and context. construction is null for authored and follow_up families. edits contain rule, range with UTF-8 byte start/end offsets relative to the text immediately before that edit, replacement, and stage. The returned context adds explicit family establishes and actually expressed fact IDs, then appends the selection to recent, retaining at most 32 entries. Input context is never mutated. Reuse a speaker value and pass the returned context to later turns explicitly. Nothing stores hidden conversation state. Composable selections also contain message: {layout,recipe,forms,organization,elaboration,sentence_shape,reference_style}, with forms recorded as component_id/form_id and each identifier escaping ~ as ~0 and / as ~1. Topic-scoped outputs add expressed facts to known. Answers consume their requested slot and responses consume allowed_acts. Corrections remove previous facts from known while retaining their historical mentions in established. A changed topic clears pending requested slots, offered options, and allowed acts. The caller supplies the next agent turn context explicitly.",
-        examples: &[r#"expression(var.intent, { speaker = var.speaker, context = var.previous.context })"#],
+        examples: &[r#"expression(settings.intent, { speaker: settings.speaker, context: settings.previous.context })"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2071,7 +624,7 @@ const FUNCS: &[FuncDesc] = &[
         name: "expression_candidates",
         syntax: "expression_candidates(source[, options])",
         summary: "Validates express inputs and lists applicable base realizations without consuming randomness. Each candidate contains selection, text, used_facts, establishes, and normalized probability. An empty array means no eligible positive-weight choice. Optional greetings, details, closings, and surface edits are not expanded. Pattern IDs can restrict families or configure speaker preferences: request_please, request_could_you, request_would_you, desire_would_like, desire_want, desire_looking_to, possibility_can_i, possibility_possible, possibility_able, procedure_how_do, procedure_how_can, procedure_go_about, need_need_to, reason_request_could_you, reason_request_please, authored, follow_up, and structured. Composable message candidates expand eligible component forms and include message selection metadata. The procedure_go_about pattern uses the supplied verb's present participle. Invalid IDs in a family's patterns or constructions fail. Speaker weight entries for unused IDs are allowed so profiles can be reused across scenarios.",
-        examples: &[r#"expression_candidates(var.intent, { speaker = var.speaker })"#],
+        examples: &[r#"expression_candidates(settings.intent, { speaker: settings.speaker })"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2079,12 +632,12 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_VARY,
         name: "vary",
         syntax: "vary(text_or_sentence[, options])",
-        summary: "Varies English prose or a sentence object accepted by realize using scoped seeded randomness. Existing calls using only negation: boolean (true), condition_order: boolean (true), and rendering preserve their original behavior: uniform selection between the original and applicable alternatives, with unsupported prose unchanged. Adding any style control opts into bounded composition. style accepts neutral, professional, conversational, warm, terse, text_message, enthusiastic, or informal_chat. Explicit controls override preset defaults: contractions, shorthand, casual, slang, reductions, fragments, warmth, soften_requests, negation, and condition_order are booleans. New-mode negation only contracts recognized negative statements. All presets disable typos and request softening by default. punctuation accepts preserve, omit_period, exclamation, or expressive and affects the final terminal mark, preserving question marks, abbreviations, and code-like tokens. casing accepts preserve or lowercase and only lowercases reviewed everyday words and pronoun contractions. probability (default 1, range 0..1) gates wording, tone, and presentation once per message. max_changes (default 3, integer 0..16) bounds total edits. typos accepts probability (default 0, per message independently), max_errors (default 1, integer 0..16), and kinds (default all of common, omission, transposition, repetition). Typos apply only to reviewed lowercase words and share max_changes. protected is an array of nonempty case-sensitive literal strings. Quotations, code-like tokens, and authored structured subject references are protected automatically. Arbitrary prose names cannot be inferred reliably. alternatives is an array of {from: nonempty text, to: nonempty array of nonempty text} author-approved phrase families, matched literally at word boundaries. Author-supplied alternatives may authorize meaning changes. Built-in tone rules require warmth or soften_requests and never invent promises, urgency, or apologies. Fragments are limited to supported first-person progressive statements. Reductions require recognized infinitive constructions. Changes run in grammatical, phrase, tone, presentation, and typo stages with nonoverlapping choices within each stage. No draw is consumed for a zero or certain probability gate, a sole candidate, or no eligible edit. rendering applies only to structured input. Invalid options fail during generation.",
+        summary: "Varies English prose or a sentence object accepted by realize using scoped seeded randomness. Existing calls using only negation: boolean (true), condition_order: boolean (true), and rendering preserve their original behavior: uniform selection between the original and applicable alternatives, with unsupported prose unchanged. Adding any style control opts into bounded composition. style accepts neutral, professional, conversational, warm, terse, text_message, enthusiastic, or informal_chat. Explicit controls override preset defaults: contractions, shorthand, casual, slang, reductions, fragments, warmth, soften_requests, negation, and condition_order are booleans. New-mode negation only contracts recognized negative statements. All presets disable typos and request softening by default. punctuation accepts preserve, omit_period, exclamation, or expressive and affects the final terminal mark, preserving question marks, abbreviations, and code-like tokens. casing accepts preserve or lowercase and only lowercases reviewed everyday words and pronoun contractions. probability (default 1, range 0..1) gates wording, tone, and presentation once per message. max_changes (default 3, integer 0..16) bounds total edits. typos accepts probability (default 0, per message independently), max_errors (default 1, integer 0..16), and kinds (default all of common, omission, transposition, repetition). Typos apply only to reviewed lowercase words and share max_changes. protected is an array of nonempty case-sensitive literal strings. Quotations, code-like tokens, and authored structured subject references are protected automatically. Arbitrary prose names cannot be inferred reliably. alternatives is an array of {from: nonempty text, to: nonempty array of nonempty text} author-approved phrase families, matched literally at word boundaries. Author-supplied alternatives may authorize meaning changes. Built-in tone rules require warmth or soften_requests and never invent promises, urgency, or apologies. Fragments are limited to supported first-person progressive statements. Reductions require recognized infinitive constructions. Changes run in grammatical, phrase, tone, presentation, and typo stages with nonoverlapping choices within each stage. No draw is consumed for a zero or certain probability gate, a sole candidate, or no eligible edit. rendering applies only to structured input. Invalid options fail during evaluation.",
         examples: &[
-            r#"vary("The guest cannot check in.", { negation = true, condition_order = false })"#,
-            r#"vary("I am checking the file. Thank you.", { style = "text_message", max_changes = 6 })"#,
-            r#"vary("please send the message", { style = "neutral", typos = { probability = 0.1, max_errors = 1 } })"#,
-            r#"vary("Send the file.", { style = "professional", soften_requests = true })"#,
+            r#"vary("The guest cannot check in.", { negation: true, condition_order: false })"#,
+            r#"vary("I am checking the file. Thank you.", { style: "text_message", max_changes: 6 })"#,
+            r#"vary("please send the message", { style: "neutral", typos: { probability: 0.1, max_errors: 1 } })"#,
+            r#"vary("Send the file.", { style: "professional", soften_requests: true })"#,
         ],
         rules: TEXT_FUNC_RULES,
     },
@@ -2093,8 +646,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_COMBINE,
         name: "combine",
         syntax: "combine(sentences, relation[, options])",
-        summary: "Combines an array of at least two unconditional structured statements accepted by realize. Relation is and, but, or, or because. And, but, and or preserve input order and retain each subject. Because requires exactly two inputs ordered [effect, cause] and renders Because cause, effect. It does not infer causality or substitute one relation for another. Conditional sentences and questions are rejected to avoid changing their scope. Rendering options match realize. Invalid structures or options fail during generation.",
-        examples: &[r#"combine([var.arrival, var.availability], "and")"#],
+        summary: "Combines an array of at least two unconditional structured statements accepted by realize. Relation is and, but, or, or because. And, but, and or preserve input order and retain each subject. Because requires exactly two inputs ordered [effect, cause] and renders Because cause, effect. It does not infer causality or substitute one relation for another. Conditional sentences and questions are rejected to avoid changing their scope. Rendering options match realize. Invalid structures or options fail during evaluation.",
+        examples: &[r#"combine([|settings.arrival, settings.availability|], "and")"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2103,7 +656,7 @@ const FUNCS: &[FuncDesc] = &[
         name: "refer",
         syntax: "refer(entity, context[, options])",
         summary: "Returns an English name or an explicitly supplied pronoun without mutating context. Entity fields are id and label (required nonempty strings), person: first|second|third (third), number: singular|plural (singular), and optional pronouns {subject, object, possessive_determiner, possessive}, all four single-word strings. Context is {entities: entity array, mentioned: entity-id string array, facts: fact-id string array}, with every array defaulting to empty. Entity definitions and ids must agree, mentioned ids must have definitions, and context ids must be unique. Options are form: subject|object|possessive_determiner|possessive (subject) and style: auto|name|pronoun (auto). Auto uses a supplied pronoun only after introduction and when unambiguous among mentioned entities, otherwise the label. Name always uses the label. Pronoun requires introduction and an unambiguous supplied form or fails. No gender or entity identity is inferred.",
-        examples: &[r#"refer(var.guest, var.context)"#],
+        examples: &[r#"refer(settings.guest, settings.context)"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2111,8 +664,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_REMEMBER,
         name: "remember",
         syntax: "remember(context, entities[, facts])",
-        summary: "Returns a new context object with entities introduced and facts established. Context fields are entities (array of entities accepted by refer), mentioned (array of entity-id strings), and facts (array of fact-id strings), each defaulting to empty. Entities is an array of entity objects. The optional facts argument is an array of nonempty fact-id strings and defaults to []. Existing definitions are retained, identical entities and repeated facts are deduplicated, and conflicting definitions for one id fail. The input context is unchanged. Carry the returned value explicitly across turns. Starting from {} resets the conversation scope. Unknown fields and invalid context references fail during generation.",
-        examples: &[r#"remember({}, [var.guest], ["arrival_time"])"#],
+        summary: "Returns a new context object with entities introduced and facts established. Context fields are entities (array of entities accepted by refer), mentioned (array of entity-id strings), and facts (array of fact-id strings), each defaulting to empty. Entities is an array of entity objects. The optional facts argument is an array of nonempty fact-id strings and defaults to []. Existing definitions are retained, identical entities and repeated facts are deduplicated, and conflicting definitions for one id fail. The input context is unchanged. Carry the returned value explicitly across turns. Starting from {} resets the conversation scope. Unknown fields and invalid context references fail during evaluation.",
+        examples: &[r#"remember({}, [|settings.guest|], [|"arrival_time"|])"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2121,7 +674,7 @@ const FUNCS: &[FuncDesc] = &[
         name: "unmentioned",
         syntax: "unmentioned(details, context)",
         summary: "Returns an array of detail objects whose id is absent from context.facts, preserving source order and text. Each detail is exactly {id: string, text: string}, both nonempty and without surrounding whitespace or control characters. Context has the entities, mentioned, and facts arrays documented by refer, each defaulting to empty. Selection is deterministic and never changes context. Identical repeated details are deduplicated. Conflicting text for one id fails even if that fact was already established. Use remember to mark details established only after they have been communicated.",
-        examples: &[r#"unmentioned([{ id = "arrival_time", text = "Arrival is after midnight." }], var.context)"#],
+        examples: &[r#"unmentioned([|{ id: "arrival_time", text: "Arrival is after midnight." }|], settings.context)"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2129,8 +682,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_FORMAT_NUMBER,
         name: "format_number",
         syntax: "format_number(number_or_decimal_text[, options])",
-        summary: "Formats a number or exact decimal string using a packaged English regional profile. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), grouping: boolean (true), and fraction_digits: integral number from zero through nine, including 1.0 (omitted by default). Explicit precision rounds decimal ties away from zero and pads trailing zeros. Without precision, trailing fractional zeros are trimmed. All profiles use a decimal point and comma grouping. En-IN groups the final three integer digits then pairs, while other profiles use groups of three. Negative zero becomes zero. Decimal strings may contain an exponent and avoid floating-point input ambiguity. Expanded input is bounded to 4096 digits. Invalid values, unknown fields, or unsupported locales fail during generation. No OS locale or external data is consulted.",
-        examples: &[r#"format_number("1234567.50", { locale = "en-IN" })"#],
+        summary: "Formats a number or exact decimal string using a packaged English regional profile. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), grouping: boolean (true), and fraction_digits: integral number from zero through nine, including 1.0 (omitted by default). Explicit precision rounds decimal ties away from zero and pads trailing zeros. Without precision, trailing fractional zeros are trimmed. All profiles use a decimal point and comma grouping. En-IN groups the final three integer digits then pairs, while other profiles use groups of three. Negative zero becomes zero. Decimal strings may contain an exponent and avoid floating-point input ambiguity. Expanded input is bounded to 4096 digits. Invalid values, unknown fields, or unsupported locales fail during evaluation. No OS locale or external data is consulted.",
+        examples: &[r#"format_number("1234567.50", { locale: "en-IN" })"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2138,8 +691,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_FORMAT_DATE,
         name: "format_date",
         syntax: "format_date(date[, options])",
-        summary: "Formats a strict YYYY-MM-DD Gregorian date with year 0001 through 9999. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US) and style: short|long (long). Short output uses MM/DD/YYYY for en-US, YYYY-MM-DD for en-CA, and DD/MM/YYYY otherwise. Long output uses English month names, month-first for en-US and en-CA, and day-first otherwise. Invalid calendar dates, unknown fields, or unsupported locales fail during generation. No clock or OS locale is consulted.",
-        examples: &[r#"format_date("2026-11-10", { locale = "en-GB", style = "long" })"#],
+        summary: "Formats a strict YYYY-MM-DD Gregorian date with year 0001 through 9999. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US) and style: short|long (long). Short output uses MM/DD/YYYY for en-US, YYYY-MM-DD for en-CA, and DD/MM/YYYY otherwise. Long output uses English month names, month-first for en-US and en-CA, and day-first otherwise. Invalid calendar dates, unknown fields, or unsupported locales fail during evaluation. No clock or OS locale is consulted.",
+        examples: &[r#"format_date("2026-11-10", { locale: "en-GB", style: "long" })"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2147,8 +700,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_FORMAT_TIME,
         name: "format_time",
         syntax: "format_time(time[, options])",
-        summary: "Formats a strict HH:MM or HH:MM:SS local clock value. Hours range from 00 through 23 and minutes and seconds from 00 through 59. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), hour_cycle: h12|h24 (omitted), and seconds: boolean (false). Omitted hour_cycle selects h24 for en-GB and h12 otherwise. H12 includes AM or PM. Seconds are displayed only when requested, with missing seconds treated as 00. No current time, OS locale, or timezone conversion is implied. Invalid times, unknown fields, or unsupported locales fail during generation.",
-        examples: &[r#"format_time("17:30", { locale = "en-US" })"#],
+        summary: "Formats a strict HH:MM or HH:MM:SS local clock value. Hours range from 00 through 23 and minutes and seconds from 00 through 59. Options are locale: en-US|en-GB|en-CA|en-AU|en-IN (en-US), hour_cycle: h12|h24 (omitted), and seconds: boolean (false). Omitted hour_cycle selects h24 for en-GB and h12 otherwise. H12 includes AM or PM. Seconds are displayed only when requested, with missing seconds treated as 00. No current time, OS locale, or timezone conversion is implied. Invalid times, unknown fields, or unsupported locales fail during evaluation.",
+        examples: &[r#"format_time("17:30", { locale: "en-US" })"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2156,8 +709,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_JOIN,
         name: "join",
         syntax: "join(array, separator)",
-        summary: "Joins the elements of an array into one string with the separator between them for each generated trace; string, number, and boolean elements are stringified.",
-        examples: &["join(var.tags, \", \")", "join([1, 2, 3], \"-\")"],
+        summary: "Joins the elements of an array into one string with the separator between them on evaluation; string, number, and boolean elements are stringified.",
+        examples: &["join(settings.tags, \", \")", "join([|1, 2, 3|], \"-\")"],
         rules: JOIN_FUNC_RULES,
     },
     FuncDesc {
@@ -2165,8 +718,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_CONTAINS,
         name: "contains",
         syntax: "contains(target, needle)",
-        summary: "True when a string target contains needle as a substring, or an array target contains needle as an element, for each generated trace.",
-        examples: &["contains(var.model, \"mini\")", "contains(var.tags, \"prod\")"],
+        summary: "True when a string target contains needle as a substring, or an array target contains needle as an element, on evaluation.",
+        examples: &["contains(settings.model, \"mini\")", "contains(settings.tags, \"prod\")"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2174,8 +727,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_STARTS_WITH,
         name: "starts_with",
         syntax: "starts_with(text, prefix)",
-        summary: "True when a string starts with the given prefix, for each generated trace.",
-        examples: &["starts_with(var.model, \"gpt\")"],
+        summary: "True when a string starts with the given prefix, on evaluation.",
+        examples: &["starts_with(settings.model, \"gpt\")"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2183,8 +736,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_ENDS_WITH,
         name: "ends_with",
         syntax: "ends_with(text, suffix)",
-        summary: "True when a string ends with the given suffix, for each generated trace.",
-        examples: &["ends_with(var.model, \"-mini\")"],
+        summary: "True when a string ends with the given suffix, on evaluation.",
+        examples: &["ends_with(settings.model, \"-mini\")"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2192,8 +745,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_LEN,
         name: "len",
         syntax: "len(value)",
-        summary: "The number of characters in a string or elements in an array, as an integer, for each generated trace.",
-        examples: &["len(var.models)", "len(\"hello\")"],
+        summary: "The number of characters in a string or elements in an array, as an integer, on evaluation.",
+        examples: &["len(settings.models)", "len(\"hello\")"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2201,8 +754,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_TOKENS,
         name: "tokens",
         syntax: "tokens(value)",
-        summary: "The exact number of tokens in a string, or in the JSON serialization of an array or object, as an integer, for each generated trace. Counts with the o200k_base encoding used by current OpenAI models.",
-        examples: &["tokens(\"What is the weather in Tokyo?\")", "tokens(var.prompt)"],
+        summary: "The exact number of tokens in a string, or in the JSON serialization of an array or object, as an integer, on evaluation. Counts with the o200k_base encoding used by current OpenAI models.",
+        examples: &["tokens(\"What is the weather in Tokyo?\")", "tokens(settings.prompt)"],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -2210,8 +763,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_FORMAT,
         name: "format",
         syntax: "format(template, value, ...)",
-        summary: "Replaces each `{}` placeholder in a constant string template with the corresponding argument, stringified, in order, for each generated trace. Unlike `${...}` interpolation, arguments may be any expression, including functions.",
-        examples: &["format(\"model={} tokens={}\", var.model, range(80, 400))"],
+        summary: "Replaces each `{}` placeholder in a constant string template with the corresponding argument, stringified, in order, on evaluation. Arguments and `${...}` interpolation may contain expressions, including functions.",
+        examples: &["format(\"model={} tokens={}\", settings.model, range(80, 400))"],
         rules: FORMAT_FUNC_RULES,
     },
     FuncDesc {
@@ -2219,8 +772,11 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_CLAMP,
         name: "clamp",
         syntax: "clamp(value, min, max)",
-        summary: "Limits a number to the inclusive range [min, max] for each generated trace. Three integers produce an integer; otherwise a float.",
-        examples: &["clamp(lognormal(300, 0.7), 20, 30000)", "clamp(var.temperature, 0.0, 1.0)"],
+        summary: "Limits a number to the inclusive range [min, max] on evaluation. Three integers produce an integer; otherwise a float.",
+        examples: &[
+            "clamp(lognormal(300, 0.7), 20, 30000)",
+            "clamp(settings.temperature, 0.0, 1.0)",
+        ],
         rules: CLAMP_FUNC_RULES,
     },
     FuncDesc {
@@ -2228,8 +784,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_ROUND,
         name: "round",
         syntax: "round(value)",
-        summary: "Rounds a number to the nearest integer for each generated trace; integers pass through unchanged.",
-        examples: &["round(lognormal(120, 0.5))", "round(var.score * 100)"],
+        summary: "Rounds a number to the nearest integer on evaluation; integers pass through unchanged.",
+        examples: &["round(lognormal(120, 0.5))", "round(settings.score * 100)"],
         rules: ROUNDING_FUNC_RULES,
     },
     FuncDesc {
@@ -2237,7 +793,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_FLOOR,
         name: "floor",
         syntax: "floor(value)",
-        summary: "Rounds a number down to the nearest integer for each generated trace; integers pass through unchanged.",
+        summary: "Rounds a number down to the nearest integer on evaluation; integers pass through unchanged.",
         examples: &["floor(exponential(4))"],
         rules: ROUNDING_FUNC_RULES,
     },
@@ -2246,7 +802,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_CEIL,
         name: "ceil",
         syntax: "ceil(value)",
-        summary: "Rounds a number up to the nearest integer for each generated trace; integers pass through unchanged.",
+        summary: "Rounds a number up to the nearest integer on evaluation; integers pass through unchanged.",
         examples: &["ceil(range(0.1, 4.9))"],
         rules: ROUNDING_FUNC_RULES,
     },
@@ -2255,7 +811,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_ABS,
         name: "abs",
         syntax: "abs(value)",
-        summary: "The absolute value of a number, for each generated trace. An integer produces an integer; a float produces a float.",
+        summary: "The absolute value of a number, on evaluation. An integer produces an integer, a float produces a float.",
         examples: &["abs(normal(0, 5))"],
         rules: NUMERIC_FUNC_RULES,
     },
@@ -2264,8 +820,8 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_MIN,
         name: "min",
         syntax: "min(value, value, ...)",
-        summary: "The smallest of two or more numbers, for each generated trace. All integers produce an integer; otherwise a float.",
-        examples: &["min(range(1, 10), 5)", "min(var.limit, poisson(6), 100)"],
+        summary: "The smallest of two or more numbers, on evaluation. All integers produce an integer; otherwise a float.",
+        examples: &["min(range(1, 10), 5)", "min(settings.limit, poisson(6), 100)"],
         rules: NUMERIC_FUNC_RULES,
     },
     FuncDesc {
@@ -2273,7 +829,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_MAX,
         name: "max",
         syntax: "max(value, value, ...)",
-        summary: "The largest of two or more numbers, for each generated trace. All integers produce an integer; otherwise a float.",
+        summary: "The largest of two or more numbers, on evaluation. All integers produce an integer; otherwise a float.",
         examples: &["max(normal(50, 20), 0)"],
         rules: NUMERIC_FUNC_RULES,
     },
@@ -2282,7 +838,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_UUID,
         name: "uuid",
         syntax: "uuid()",
-        summary: "A random version-4 UUID string for each generated trace, drawn from the seeded generator so runs stay reproducible.",
+        summary: "A random version-4 UUID string on evaluation, drawn from the seeded generator so runs stay reproducible.",
         examples: &["uuid()"],
         rules: UUID_RULES,
     },
@@ -2291,7 +847,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_HEX,
         name: "hex",
         syntax: "hex(length)",
-        summary: "A random lowercase hexadecimal string of the given constant length, for each generated trace.",
+        summary: "A random lowercase hexadecimal string of the given constant length, on evaluation.",
         examples: &["hex(16)", "format(\"req_{}\", hex(8))"],
         rules: RANDOM_STRING_RULES,
     },
@@ -2300,7 +856,7 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_ALPHANUM,
         name: "alphanum",
         syntax: "alphanum(length)",
-        summary: "A random alphanumeric string (0-9, A-Z, a-z) of the given constant length, for each generated trace.",
+        summary: "A random alphanumeric string (0-9, A-Z, a-z) of the given constant length, on evaluation.",
         examples: &["alphanum(12)"],
         rules: RANDOM_STRING_RULES,
     },
@@ -2321,525 +877,383 @@ const FUNCS: &[FuncDesc] = &[
         id: ids::FUNC_NOISE,
         name: "noise",
         syntax: "noise(size)",
-        summary: "An opaque random base64-style string of the given size in bytes, for padding a trace with payload weight where storage size matters; the size may be dynamic, so payloads can vary per trace.",
+        summary: "An opaque random base64-style string of the given size in bytes, for adding payload weight where storage size matters; the size may be dynamic, so payloads can vary per evaluation.",
         examples: &["noise(250000)", "noise(round(lognormal(80000, 0.9)))"],
         rules: NOISE_RULES,
     },
 ];
 
-const BLOCKS: &[BlockDesc] = &[
-    BlockDesc {
+const LANGUAGE_RULES: &[RuleDesc] = &[
+    RuleDesc {
         tags: &[],
-        id: ids::VARS,
-        keyword: "vars",
-        summary: "A block of named values scoped to the block that contains it and shared via `var.<name>` references; each value is evaluated once per instantiation of that block.",
-        syntax: "vars { <name> = <value> ... }",
-        name: NamePolicy::Forbidden,
-        allowed_in: ANYWHERE,
-        body: BodyDesc { fields: &[], open: true },
-        rules: VARS_RULES,
-        conventions: NO_CONVENTIONS,
+        id: Id::new("graph.lowering"),
+        summary: "Compilation registers declarations before resolving endpoints and field dependencies. Each node, edge, fork and junction has a model-local identity. Names and source paths do not create implicit containment edges. Root and attached paths preserve authoring structure alongside the flattened graph tables.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::TRACE,
-        keyword: "trace",
-        summary: "A named root trace containing fields and nested spans.",
-        syntax: "trace \"<name>\" { ... }",
-        name: NamePolicy::Required,
-        allowed_in: ROOT_ONLY,
-        body: BodyDesc {
-            fields: SPAN_FIELDS,
-            open: false,
-        },
-        rules: SPAN_RULES,
-        conventions: TRACE_CONVENTIONS,
+        id: Id::new("graph.fields"),
+        summary: "Kinds are open identifiers and fields have no domain schema. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::TASK,
-        keyword: "task",
-        summary: "A named task span containing fields and nested spans.",
-        syntax: "task \"<name>\" { ... }",
-        name: NamePolicy::Required,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: SPAN_FIELDS,
-            open: false,
-        },
-        rules: SPAN_RULES,
-        conventions: TASK_CONVENTIONS,
+        id: Id::new("graph.accessors"),
+        summary: "Node fields use node.field or (node).field, and self refers to the owning node. Every configurable element exposes .props. Edges expose .source, .target and residual .scope. Forks expose .source and .paths, with no singular target. Within edge properties, source and target resolve their endpoint nodes. Fork properties expose source.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::LLM,
-        keyword: "llm",
-        summary: "A named LLM span containing fields and nested spans.",
-        syntax: "llm \"<name>\" { ... }",
-        name: NamePolicy::Required,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: SPAN_FIELDS,
-            open: false,
-        },
-        rules: SPAN_RULES,
-        conventions: LLM_CONVENTIONS,
+        id: Id::new("graph.paths"),
+        summary: "A fork's .paths is an ordered array of branch arrays containing exact edge handles. Each branch has one connection step with one or more parallel edge declarations. [fork].[edge] requires direct membership in that fork. Selector membership is checked against branch target identities, including statically resolved aliases.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::TOOL,
-        keyword: "tool",
-        summary: "A named tool span containing fields and nested spans.",
-        syntax: "tool \"<name>\" { ... }",
-        name: NamePolicy::Required,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: SPAN_FIELDS,
-            open: false,
-        },
-        rules: SPAN_RULES,
-        conventions: TOOL_CONVENTIONS,
+        id: Id::new("graph.junctions"),
+        summary: "A junction preserves only its explicitly listed input edges and destination. Inputs of an attached junction belong to the attached fork. Root junctions can join separately declared edges. Overlapping input sets on sibling junctions are allowed and do not create implicit edges between their destinations.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::FUNCTION,
-        keyword: "function",
-        summary: "A named function span containing fields and nested spans.",
-        syntax: "function \"<name>\" { ... }",
-        name: NamePolicy::Required,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: SPAN_FIELDS,
-            open: false,
-        },
-        rules: SPAN_RULES,
-        conventions: FUNCTION_CONVENTIONS,
+        id: Id::new("graph.bindings"),
+        summary: "Constant values fold during compilation. Dynamic fields retain binding identities through aliases, collection access and interpolation. Explicit nested object keys have independent bindings, permitting sibling dependencies without duplicate sampling. The model prescribes no activation lifetime, evaluation scheduler or automatic scope merge.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::REPEAT,
-        keyword: "repeat",
-        summary: "A dynamic block that stamps out its child blocks `count` times for each generated trace.",
-        syntax: "repeat [\"<name>\"] { count = <number> ... }",
-        name: NamePolicy::Optional,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: REPEAT_FIELDS,
-            open: false,
-        },
-        rules: REPEAT_RULES,
-        conventions: REPEAT_CONVENTIONS,
+        id: Id::new("graph.cycles"),
+        summary: "Cycle punctuation preserves an explicit marker on the corresponding edges. Marked self-loops are valid. Compilation does not currently require a marked edge to close a cycle or require unmarked edges to form a DAG. Graph cycles do not permit circular field dependencies.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::CHOICE,
-        keyword: "choice",
-        summary: "A dynamic block that includes exactly one of its child blocks, picked uniformly at random for each generated trace.",
-        syntax: "choice [\"<name>\"] { ... }",
-        name: NamePolicy::Optional,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: &[],
-            open: false,
-        },
-        rules: NO_RULES,
-        conventions: CHOICE_CONVENTIONS,
+        id: Id::new("graph.guards"),
+        summary: "The when edge property requires a boolean value, with context-dependent checks deferred to evaluation. Conditional forks allow overlapping guards. Parallel forks prohibit guards. Exclusive forks require pairwise disjoint branch predicates. The current proof handles constants, negation, conjunction and disjunction over up to twelve distinct atoms. Identical comparisons share atoms, independent function calls do not. Unproved disjointness is a validation error. Exhaustive coverage and defaults are not required.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::MAYBE,
-        keyword: "maybe",
-        summary: "A dynamic block that includes its child blocks with probability `chance` for each generated trace.",
-        syntax: "maybe [\"<name>\"] { [chance = <number>] ... }",
-        name: NamePolicy::Optional,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: MAYBE_FIELDS,
-            open: false,
-        },
-        rules: MAYBE_RULES,
-        conventions: MAYBE_CONVENTIONS,
+        id: Id::new("graph.pattern_constraints"),
+        summary: "A pattern contains exactly one @ selection marker on a typed node or edge constraint. Kinds and constant properties filter existing definitions. Runtime-dependent matching is rejected. Each edge constraint in a step matches a distinct edge with the same endpoints, respecting its ordinary or cycle connector. Patterns do not declare graph elements.",
     },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::SCORER,
-        keyword: "scorer",
-        summary: "A named scorer built into a Braintrust SDK definition for deployment rather than generated as spans.",
-        syntax: "scorer \"<name>\" { [lang = <string>] [file = <string>] (code { ... } | judge { ... }) }",
-        name: NamePolicy::Required,
-        allowed_in: ROOT_ONLY,
-        body: BodyDesc {
-            fields: SCORER_FIELDS,
-            open: false,
-        },
-        rules: SCORER_RULES,
-        conventions: SCORER_CONVENTIONS,
-    },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::SCORER_SPAN,
-        keyword: "scorer",
-        summary: "A synthetic scorer span whose name references a top-level scorer definition in this shape.",
-        syntax: "scorer \"<top-level scorer name>\" { score = <number> [reason = <string>] }",
-        name: NamePolicy::Required,
-        allowed_in: IN_TRACE_SPAN_OR_DYNAMIC,
-        body: BodyDesc {
-            fields: SCORER_SPAN_FIELDS,
-            open: false,
-        },
-        rules: &[SCORE_RANGE_RULE],
-        conventions: NO_CONVENTIONS,
-    },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::FACET,
-        keyword: "facet",
-        summary: "A named Topics facet with extraction instructions.",
-        syntax: "facet \"<name>\" { prompt = <string> [description = <string>] [no_match_pattern = <string>] }",
-        name: NamePolicy::Required,
-        allowed_in: ROOT_ONLY,
-        body: BodyDesc {
-            fields: FACET_FIELDS,
-            open: false,
-        },
-        rules: FACET_RULES,
-        conventions: NO_CONVENTIONS,
-    },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::AUTOMATION,
-        keyword: "automation",
-        summary: "A named scorer or Topics automation.",
-        syntax: "automation \"<name>\" { type = \"scorer\" scorers = [\"<scorer>\"] scope = \"span\" (root = true | span_names = [\"<span>\"]) [sampling_rate = <number>] [enabled = <boolean>] } | automation \"<name>\" { type = \"topics\" facets = [\"<facet>\"] scope = \"trace\" [sampling_rate = <number>] [enabled = <boolean>] }",
-        name: NamePolicy::Required,
-        allowed_in: ROOT_ONLY,
-        body: BodyDesc {
-            fields: AUTOMATION_FIELDS,
-            open: false,
-        },
-        rules: AUTOMATION_RULES,
-        conventions: NO_CONVENTIONS,
-    },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::AGENT,
-        keyword: "agent",
-        summary: "A callable mock agent generated from a trace.",
-        syntax: "agent \"<name>\" { entrypoint = trace[\"<name>\"] }",
-        name: NamePolicy::Required,
-        allowed_in: ROOT_ONLY,
-        body: BodyDesc {
-            fields: AGENT_FIELDS,
-            open: false,
-        },
-        rules: AGENT_RULES,
-        conventions: NO_CONVENTIONS,
-    },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::EXPERIMENT,
-        keyword: "experiment",
-        summary: "A synthetic task evaluated over a dataset by deployed scorers and written as a Braintrust experiment.",
-        syntax: "experiment \"<name>\" { dataset = dataset[\"<name>\"] task = trace[\"<name>\"][.<kind>.<name>...] scorers = [scorer[\"<name>\"], ...] [baseline = experiment[\"<name>\"]] [description = <string>] }",
-        name: NamePolicy::Required,
-        allowed_in: ROOT_ONLY,
-        body: BodyDesc {
-            fields: EXPERIMENT_FIELDS,
-            open: false,
-        },
-        rules: EXPERIMENT_RULES,
-        conventions: NO_CONVENTIONS,
-    },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::DATASET,
-        keyword: "dataset",
-        summary: "A named Braintrust dataset with an optional description and named cases.",
-        syntax: "dataset \"<name>\" { [description = <string>] case \"<name>\" { ... } ... }",
-        name: NamePolicy::Required,
-        allowed_in: ROOT_ONLY,
-        body: BodyDesc {
-            fields: DATASET_FIELDS,
-            open: false,
-        },
-        rules: DATASET_RULES,
-        conventions: NO_CONVENTIONS,
+        id: Id::new("expression.validation"),
+        summary: "All operands and conditional arms receive static validation even when runtime evaluation would skip them. Residual logical operators and conditional expressions preserve runtime short-circuit behavior. Function calls remain expressions for an evaluator, including deterministic calls. This crate does not execute functions, load attachments or provide domain validation.",
     },
-    BlockDesc {
+    RuleDesc {
         tags: &[],
-        id: ids::CASE,
-        keyword: "case",
-        summary: "A dataset record, sourced from inline input, a trace, a span, or a trace group.",
-        syntax: "case \"<name>\" { (input = <value> | trace = trace[\"<name>\"] | traces = [trace[\"<name>\"], ...] | span = trace.<trace-name>.<kind>.<span-name>[.<kind>.<span-name>...]) [expected = <value>] [metadata = <object>] [tags = <strings>] }",
-        name: NamePolicy::Required,
-        allowed_in: IN_DATASET,
-        body: BodyDesc {
-            fields: CASE_FIELDS,
-            open: false,
-        },
-        rules: DATASET_RULES,
-        conventions: NO_CONVENTIONS,
+        id: Id::new("graph.names"),
+        summary: "Named nodes, edges and forks share one document namespace. Forward references are resolved after declaration registration.",
     },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::CODE,
-        keyword: "code",
-        summary: "A code scorer body; `when` and `repeat` blocks run in order and return on the first matching score, with `score` as the fallback.",
-        syntax: "code { score = <number> [when { ... } | repeat { ... }] ... }",
-        name: NamePolicy::Forbidden,
-        allowed_in: IN_SCORER,
-        body: BodyDesc {
-            fields: CODE_FIELDS,
-            open: false,
-        },
-        rules: CODE_RULES,
-        conventions: CODE_CONVENTIONS,
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.references"),
+        summary: "References preserve graph identity. Node endpoints must resolve statically to nodes, junction inputs to exact edges.",
     },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::SCORER_REPEAT,
-        keyword: "repeat",
-        summary: "Runs its scorer child blocks `count` times. `repeat.index` and `repeat.count` refer to the innermost scorer repeat.",
-        syntax: "repeat { count = <number> (when { ... } | repeat { ... }) ... }",
-        name: NamePolicy::Forbidden,
-        allowed_in: IN_SCORER_CONTROL,
-        body: BodyDesc {
-            fields: SCORER_REPEAT_FIELDS,
-            open: false,
-        },
-        rules: REPEAT_RULES,
-        conventions: NO_CONVENTIONS,
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.placement"),
+        summary: "Bodies and properties contain fields, never declarations. Properties configure elements, bodies supply contents.",
     },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::WHEN,
-        keyword: "when",
-        summary: "A conditional scorer branch. When `cond` holds, nested blocks run in order, then its optional `score` is returned.",
-        syntax: "when { cond = <boolean> [when { ... } | repeat { ... }] ... [score = <number>] }",
-        name: NamePolicy::Forbidden,
-        allowed_in: IN_SCORER_CONTROL,
-        body: BodyDesc {
-            fields: WHEN_FIELDS,
-            open: false,
-        },
-        rules: WHEN_RULES,
-        conventions: NO_CONVENTIONS,
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.attachment"),
+        summary: "Indentation attaches selectors and junctions to forks. Selectors must select targets of their attached fork.",
     },
-    BlockDesc {
-        tags: &["preview"],
-        id: ids::JUDGE,
-        keyword: "judge",
-        summary: "An LLM-as-a-judge scorer body built as a Braintrust SDK prompt scorer: the model grades against the prompt and its answer maps to a score through `options`.",
-        syntax: "judge { model = <string> prompt = <string> options = { <label> = <number>, ... } }",
-        name: NamePolicy::Forbidden,
-        allowed_in: IN_SCORER,
-        body: BodyDesc {
-            fields: JUDGE_FIELDS,
-            open: false,
-        },
-        rules: JUDGE_RULES,
-        conventions: JUDGE_CONVENTIONS,
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.dependencies"),
+        summary: "Circular field dependencies are errors, independently of explicitly marked graph cycles.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.patterns"),
+        summary: "Path-pattern references select one distinct definition. Multiple matching paths to the same definition are allowed.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.context"),
+        summary: "Context reads remain explicit residual values owned by their graph element. Lowering does not prescribe scope propagation or scheduling.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::FINITE_NUMBERS,
+        summary: "Every number must be representable as a finite integer or floating-point value.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::UNIQUE_OBJECT_KEYS,
+        summary: "An object key may appear at most once in an object.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::STATIC_STRUCTURE,
+        summary: "Collection structure must be statically inspectable where a comprehension or spread requires it. Graph handles are identities rather than collection values.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::KNOWN_FUNCTIONS,
+        summary: "A function call may only use the documented functions listed in this spec.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::OPERAND_TYPES,
+        summary: "Operator operands must have a known type: `+ - * / %` and `< <= > >=` take numbers, `== !=` compare two strings, two numbers, or two booleans, and `&& || !` take booleans.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::NONZERO_DIVISORS,
+        summary: "Division and remainder require a nonzero divisor; a constant zero divisor is rejected during validation, and a divisor that evaluates to zero fails evaluation.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::BOOLEAN_CONDITIONS,
+        summary: "The condition of `?:` must be a boolean.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::CHOICE_ALTERNATIVES,
+        summary: "`choice` takes at least one alternative.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::RANGE_BOUNDS,
+        summary: "`range` takes exactly two finite numbers with min <= max.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::FUNC_ARITY,
+        summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number. `compose` accepts an optional separator.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::FUNC_ARG_TYPES,
+        summary: "A function argument must have the documented type, known before evaluation; an argument whose type is only known during evaluation (e.g. a `choice` with mixed alternatives) is rejected.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::DIST_PARAMS,
+        summary: "Distribution parameters are constant finite numbers: `normal` takes stddev >= 0, `lognormal` takes median > 0 and sigma >= 0, `exponential` and `poisson` take mean > 0, `pareto` takes min > 0 and shape > 0, `beta` takes alpha > 0 and beta > 0, and `chance` takes a probability between 0 and 1.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::WEIGHTED_OPTIONS,
+        summary: "`weighted` takes at least one `[value, weight]` pair; weights are constant non-negative finite numbers, at least one of them positive.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::SPLIT_SEPARATOR,
+        summary: "`split` requires a non-empty separator; a constant empty separator is rejected during validation, and a dynamic one fails the run during evaluation.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::FORMAT_TEMPLATE,
+        summary: "`format` takes a constant string template with exactly one `{}` placeholder per remaining argument, replaced in order.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::CLAMP_BOUNDS,
+        summary: "`clamp` bounds must satisfy min <= max; a constant violation is rejected during validation, and a dynamic one fails the run during evaluation.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::RANDOM_LENGTH,
+        summary: "`hex` and `alphanum` take a constant non-negative integer length.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::NOISE_SIZE,
+        summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during evaluation.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::INDEXABLE_TARGETS,
+        summary: "Indexing requires an array or object target: arrays take an integer index, objects take a string key.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::INDEX_BOUNDS,
+        summary: "An array index must be within bounds and an object key must be present; constant violations are rejected during validation, dynamic ones fail the run during evaluation.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::SLICEABLE_TARGETS,
+        summary: "Slicing requires an array target; slice bounds are numbers.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::SLICE_BOUNDS,
+        summary: "Slice bounds are non-negative integers, clamped to the array length; a start at or past the end produces an empty array. Constant violations are rejected during validation, dynamic ones fail the run during evaluation.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::SPREAD_OPERANDS,
+        summary: "A spread operand must be an array (inside arrays) or an object (inside objects) whose shape is known before evaluation. Later object entries override keys introduced by a spread, but two explicit keys may still not collide.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::FOR_COLLECTIONS,
+        summary: "A for expression iterates an array or object whose shape is known before evaluation; element values may still be dynamic.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::STATIC_FOR,
+        summary: "For expressions unroll during validation: a filter condition must resolve to a constant boolean and an object key to a constant string.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::SCALAR_INTERPOLATION,
+        summary: "An interpolated variable must be a string, number, or boolean; a dynamic variable must have one of those types known before evaluation.",
     },
 ];
-
-/// Metric names reserved for timestamps supplied by consumers.
-pub const RESERVED_METRIC_KEYS: &[&str] = &["start", "end"];
-
-const RULES: &[RuleDesc] = &[
-    RuleDesc {
-        tags: &[],
-        id: ids::NONEMPTY_SHAPE,
-        summary: "A shape must declare at least one trace, scorer, facet, automation, dataset, or experiment block.",
+const PRIMITIVES: &[PrimitiveDesc] = &[
+    PrimitiveDesc {
+        name: "parallel",
+        construct: "fork",
+        summary: "All branches participate. Edge guards are prohibited.",
     },
-    RuleDesc {
-        tags: &[],
-        id: ids::RESERVED_METRICS,
-        summary: "Metric keys `start` and `end` are reserved for generated timestamps.",
+    PrimitiveDesc {
+        name: "conditional",
+        construct: "fork",
+        summary: "Matching branches participate. Conditions are boolean, overlap is permitted, and no default is required.",
     },
-    RuleDesc {
-        tags: &[],
-        id: ids::DYNAMIC_CHILDREN,
-        summary: "A `repeat`, `choice`, or `maybe` block must contain at least one child block.",
+    PrimitiveDesc {
+        name: "exclusive",
+        construct: "fork",
+        summary: "At most one branch participates. Branch predicates must be provably disjoint, without requiring exhaustive coverage.",
+    },
+    PrimitiveDesc {
+        name: "vars",
+        construct: "node",
+        summary: "A node of named expression bindings. The evaluate property accepts lazy or eager. Evaluation lifetime is a consumer concern.",
     },
 ];
-
+const EXPRESSIONS: &[ExprDesc] = &[
+    ExprDesc {
+        tags: &[],
+        id: Id::new("expression.values"),
+        syntax: "null | true | false | number | string | [|values|] | {key: value}",
+        summary: "Scalars and comma-separated containers, with optional trailing commas.",
+        examples: &["[||]", "{ready: true}"],
+        rules: &[],
+    },
+    ExprDesc {
+        tags: &[],
+        id: Id::new("expression.references"),
+        syntax: "(node) | [edge_or_fork] | [fork].[edge] | ?<path>",
+        summary: "Static graph references, with one @ marker in a path pattern.",
+        examples: &["(entry)", "[checks].[lookup]", "?<(entry)-[:next]->(@:task)>"],
+        rules: &[],
+    },
+    ExprDesc {
+        tags: &[],
+        id: Id::new("expression.operations"),
+        syntax: "${expression} | !value | -value | a + b | a && b | condition ? yes : no",
+        summary: "Existing operator precedence, checked numeric arithmetic and short-circuit conditions.",
+        examples: &["${1 + 2} * 3", "true ? 1 : 2"],
+        rules: &[],
+    },
+    ExprDesc {
+        tags: &[],
+        id: Id::new("expression.collections"),
+        syntax: "value[index] | value[start:end] | ...value | [|for x in values: expression|]",
+        summary: "Indexing, slicing, spreads and comprehensions retain their type and bounds checks.",
+        examples: &["[|for x in [|1, 2|]: x + 1|]"],
+        rules: &[],
+    },
+];
 const EXAMPLES: &[Example] = &[
     Example {
         tags: &[],
-        id: ids::MULTI_TURN_CONVERSATION,
-        summary: "A multi-turn conversation drawn from a pool of authored alternatives.",
-        note: "A starting point, not a template: widen the pool with more choice alternatives and let their lengths differ — real sessions cluster short with a long tail of long ones.",
-        source: include_str!("../../../examples/multi_turn_conversation.bt"),
+        id: Id::new("example.graph"),
+        summary: "A graph with a forward reference",
+        note: "Kinds are open names, with no domain field schemas.",
+        source: "(a:custom)-[:next]->(b); (b:custom);",
         valid: true,
     },
     Example {
         tags: &[],
-        id: ids::AGENT_TOOL_LOOP,
-        summary: "An agent loop running a sampled number of think-then-tool rounds.",
-        note: "Expand along loop iterations and the set of tools; every tool the agent could realistically call deserves an alternative in the choice.",
-        source: include_str!("../../../examples/agent_tool_loop.bt"),
+        id: Id::new("example.expressions"),
+        summary: "Generic field expressions",
+        note: "Constant arithmetic folds during compilation.",
+        source: "(values:vars) {n: ${1 + 2} * 3, items: [|for x in [|1, 2|]: x * 2|]};",
         valid: true,
     },
     Example {
         tags: &[],
-        id: ids::SUPERVISOR_AND_SUBAGENTS,
-        summary: "A supervisor delegating to subagent task spans and synthesizing their results.",
-        note: "Expand along the number of subagents and the delegation depth — a subagent can nest task, tool, and llm spans of its own.",
-        source: include_str!("../../../examples/supervisor_and_subagents.bt"),
-        valid: true,
+        id: Id::new("example.duplicate"),
+        summary: "Names are globally unique",
+        note: "Kinds do not create namespaces.",
+        source: "(a:first); (a:second);",
+        valid: false,
     },
     Example {
         tags: &[],
-        id: ids::FANOUT_PARALLEL_WORKERS,
-        summary: "A fanout stamping a sampled number of parallel workers, then reducing.",
-        note: "Expand along fan width and worker heterogeneity; add choice alternatives so stamped workers stop being clones of each other.",
-        source: include_str!("../../../examples/fanout_parallel_workers.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::WINDOWED_SESSION,
-        summary: "One window of a longer session, with earlier windows summarized into context.",
-        note: "Expand along window position and carried context: more window variants, richer summaries, sessions that reference older windows.",
-        source: include_str!("../../../examples/windowed_session.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::RAG_PIPELINE,
-        summary: "A retrieve, rerank, and generate pipeline grounding an answer in documents.",
-        note: "Expand along retrieved document count, hit-versus-miss retrieval quality, and extra stages like query rewriting or guardrails.",
-        source: include_str!("../../../examples/rag_pipeline.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::ERROR_AND_ESCALATION,
-        summary: "A happy path with a maybe-gated failure, retry, and human escalation.",
-        note: "Expand along failure rate and failure variety — declines, timeouts, empty outputs — keeping each correlated failure inside one maybe block.",
-        source: include_str!("../../../examples/error_and_escalation.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::CODE_SCORER,
-        summary: "A code scorer reacting to the scored output through ordered when cases.",
-        note: "Expand along failure modes: each way an output can be wrong deserves its own when case with a matching score range.",
-        source: include_str!("../../../examples/code_scorer.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::JUDGE_SCORER,
-        summary: "An LLM-as-a-judge scorer grading responses against labeled options.",
-        note: "Expand along rubric granularity: more options give the judge finer distinctions to award.",
-        source: include_str!("../../../examples/judge_scorer.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::SCORING_AUTOMATIONS,
-        summary: "Synthetic support responses with code and judge scorers bound to their spans.",
-        note: "Build and push the scorers, then sync the automations before writing traces.",
-        source: include_str!("../../../examples/scoring_automations.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::TOPICS_AUTOMATIONS,
-        summary: "Varied support conversations with a retention facet attached to a Topics automation.",
-        note: "Synchronizing a Topics automation creates its facet and topic map directly.",
-        source: include_str!("../../../examples/topics_automations.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::DATASET_CASES,
-        summary: "A dataset with inline, whole-trace, and nested-span cases.",
-        note: "Sync writes referenced traces and reconciles every case in the dataset.",
-        source: include_str!("../../../examples/dataset_cases.bt"),
-        valid: true,
-    },
-    Example {
-        tags: &[],
-        id: ids::EXPERIMENTS,
-        summary: "Baseline and improved account recovery flows evaluated over the same dataset.",
-        note: "Sync the dataset and build/push the scorers, then write both experiments together.",
-        source: include_str!("../../../examples/experiments.bt"),
-        valid: true,
+        id: Id::new("example.missing"),
+        summary: "References must resolve",
+        note: "No implicit declarations.",
+        source: "(missing);",
+        valid: false,
     },
 ];
-
-/// The current language reference, including rules and authored examples.
+/// The supported graph language and default expression contracts.
 pub static SPEC: Spec = Spec {
-    schema_version: 1,
-    language_version: 1,
+    schema_version: 2,
+    language_version: 2,
     name: "bts",
-    summary: "A declarative language for describing synthetic traces and spans.",
+    summary: "A language for defining graphs, references and expressions without domain-specific node schemas.",
     surface: SurfaceDesc {
-        notation: "EBNF",
-        grammar: r##"
-document       = { declaration } ;
-declaration    = block | attribute ;
-block          = identifier, [ string ], "{", { declaration }, "}" ;
-attribute      = identifier, "=", expression ;
-expression     = conditional ;
-conditional    = logical_or, [ "?", expression, ":", conditional ] ;
-logical_or     = logical_and, { "||", logical_and } ;
-logical_and    = equality, { "&&", equality } ;
-equality       = comparison, { ( "==" | "!=" ), comparison } ;
-comparison     = additive, { ( "<" | "<=" | ">" | ">=" ), additive } ;
-additive       = multiplicative, { ( "+" | "-" ), multiplicative } ;
-multiplicative = unary, { ( "*" | "/" | "%" ), unary } ;
-unary          = ( "-" | "!" ), unary | postfix ;
-postfix        = primary, { "[", expression, "]" | "[", [ expression ], ":", [ expression ], "]" | ".", identifier } ;
-primary        = string | number | boolean | null | array | object | variable | context | binding | function
-               | "(", expression, ")" ;
-boolean        = "true" | "false" ;
-null           = "null" ;
-variable       = "var", ".", identifier ;
-context        = ( "trace" | "repeat" ), ".", identifier ;
-binding        = identifier (* a loop binding introduced by an enclosing for expression *) ;
-function       = identifier, "(", [ expression, { ",", expression }, [ "," ] ], ")" ;
-array          = "[", [ array_items | for_array ], "]" ;
-array_items    = array_item, { ",", array_item }, [ "," ] ;
-array_item     = expression | "...", expression ;
-object         = "{", [ object_items | for_object ], "}" ;
-object_items   = object_item, { ( "," | NEWLINE ), object_item }, [ "," ] ;
-object_item    = attribute | "...", expression ;
-for_array      = "for", bindings, "in", expression, ":", expression, [ "if", expression ] ;
-for_object     = "for", bindings, "in", expression, ":", expression, "=>", expression, [ "if", expression ] ;
-bindings       = identifier, [ ",", identifier ] ;
-identifier     = ASCII_ALPHA, { ASCII_ALPHA | ASCII_DIGIT | "_" } ;
-number         = ASCII_DIGIT, { ASCII_DIGIT }, [ ".", ASCII_DIGIT, { ASCII_DIGIT } ] ;
-string         = quoted | multiline | heredoc ;
-quoted         = '"', { ANY_EXCEPT_DOUBLE_QUOTE_OR_INTERPOLATION | escape | interpolation }, '"' ;
-multiline      = '"""', NEWLINE, { ANY_EXCEPT_TRIPLE_QUOTE | escape | interpolation }, '"""' ;
-heredoc        = "<<", [ "-" ], identifier, NEWLINE, { ANY | escape | interpolation }, NEWLINE, [ WHITESPACE ], identifier ;
-escape         = "$${" ;
-interpolation  = "${", reference_path, "}" ;
-reference_path = identifier, { ".", identifier | "[", expression, "]" | "[", [ expression ], ":", [ expression ], "]" } ;
-comment        = ( "#" | "//" ), { ANY_EXCEPT_NEWLINE } ;
-"##,
+        notation: "Typed graph elements with comma-separated properties and content fields.",
+        grammar: r#"document = { root_path, ";" }
+root_path = (node | junction), {edge | cycle}, [fork]
+attached_path = (selector | junction), {edge | cycle}, [fork]
+node = "(", header, ")", [fields] | "(", reference_expression, ")"
+header = [name], ":", kind, [fields]
+headers = header, {",", header}, [","]
+edge = "-[", headers, "]->", node
+cycle = "~[", headers, "]~>", node
+fork = "=[", header, "]=>[", edge, {",", edge}, [","], "]", {attached_path}
+selector = "->(", reference_expression, ")"
+junction = ">>[", edge_reference, {",", edge_reference}, [","], "]->", node
+fields = "{", [field, {",", field}, [","]], "}"
+field = identifier, ":", expression
+name = identifier | plain_string
+kind = identifier
+edge_reference = "[", reference_expression, "]", {".[", name, "]"}
+pattern = "?<", pattern_node, {pattern_step}, ">"
+pattern_node = "(", reference_expression, ")" | "(", ["@"], ":", kind, [fields], ")"
+pattern_step = ("-[", pattern_headers, "]->" | "~[", pattern_headers, "]~>"), pattern_node
+pattern_headers = pattern_header, {",", pattern_header}, [","]
+pattern_header = ["@"], ":", kind, [fields]
+array = "[|", [expression, {",", expression}, [","]], "|]"
+object = "{", [field, {",", field}, [","]], "}"
+group = "${", expression, "}"
+array_for = "[|for", bindings, "in", expression, ":", expression, ["if", expression], "|]"
+object_for = "{for", bindings, "in", expression, ":", expression, "=>", expression, ["if", expression], "}"
+bindings = identifier, [",", identifier]
+expression = conditional
+conditional = logical_or, ["?", expression, ":", conditional]
+logical_or = logical_and, {"||", logical_and}
+logical_and = equality, {"&&", equality}
+equality = comparison, {("==" | "!="), comparison}
+comparison = additive, {("<" | "<=" | ">" | ">="), additive}
+additive = multiplicative, {("+" | "-"), multiplicative}
+multiplicative = unary, {("*" | "/" | "%"), unary}
+unary = ("!" | "-"), unary | postfix
+postfix = primary, {"[", expression, "]" | "[", [expression], ":", [expression], "]" | ".", identifier | ".[", name, "]"}
+primary = scalar | template | array | object | array_for | object_for | group | call | reference
+call = identifier, "(", [expression, {",", expression}, [","]], ")"
+reference = identifier | "(", reference_expression, ")" | edge_reference | pattern
+reference_expression = expression
+"#,
         notes: &[
-            "Whitespace separates tokens and is otherwise insignificant, except that a line break can separate object items in place of a comma.",
-            "The surface grammar accepts declarations generically; block placement and field types are semantic rules.",
-            "`#` and `//` start a comment running to the end of the line; comments behave as whitespace and are literal text inside strings. There are no block comments.",
-            "`<<` opens a heredoc only when its delimiter word (optionally after `-`) follows directly; anything else lexes as comparison operators.",
-            "Inside strings, `$${` escapes a literal `${`; any other `$` is literal.",
-            "Block names are plain strings; interpolation is not allowed in them.",
-            "Binary operators are left-associative; `?:` is right-associative.",
-            "Interpolations accept reference paths only — no operators or function calls at the hole's top level, though bracket indexes and slice bounds hold full expressions.",
-            "`trace` and `repeat` are not reserved; a loop binding with either name shadows the context references inside its for expression.",
-            "A missing comma between numeric items parses as subtraction: `[1 -2]` is the one-element array `[-1]`.",
-            "A missing comma before an item starting with `[` parses as an index: `[var.a [0]]` is the one-element array `[var.a[0]]`.",
-            "`for` is a keyword only directly after `[` or `{`; `{ for = 1 }` is still an attribute. `in` and `if` are keywords only inside a for expression, and none of the three can name a loop binding.",
-            "A full ternary inside brackets stays an index: `xs[a ? 0 : 1]` selects one element. Parenthesize a ternary bound to slice from it.",
+            "This grammar describes token forms. The layout rules below constrain attached_path repetition and legal positions. Scalar and template tokenization includes quoted, multiline and heredoc strings, interpolation, finite numbers, booleans and null.",
+            "Spaces establish continuation levels, with no fixed width. Sibling selectors and junctions align on separate lines. A dedent returns to an established level. Tabs are not indentation. Delimited values and strings do not create graph scope.",
+            "One selector or junction may continue a fork on the same line. Another sibling requires a new aligned line. Its attachment is to the enclosing fork, never the preceding sibling's final node.",
+            "Node bodies contain only fields. Node declarations are legal at path origins and connection targets. No declarations occur in expression values or properties. Empty node parentheses are invalid.",
+            "Fork entries contain exactly one ordinary edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
+            "Root paths require semicolons. Internal entries require commas between entries on one line or multiple lines. A trailing comma is optional, including for a single entry. Array and object spreads use ...expression in an entry position.",
+            "References use parentheses and brackets, arrays use [| |], expression grouping uses ${ }.",
+            "Node and edge kinds are open identifiers. Domain schemas and execution adapters are outside this language specification.",
         ],
     },
-    expressions: EXPR_TYPES,
+    expressions: EXPRESSIONS,
     functions: FUNCS,
-    blocks: BLOCKS,
-    rules: RULES,
+    primitives: PRIMITIVES,
+    rules: LANGUAGE_RULES,
     examples: EXAMPLES,
 };

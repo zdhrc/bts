@@ -1,4 +1,6 @@
-use crate::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
+#[cfg(test)]
+use crate::ast::{Ast, Block, Decl};
+use crate::ast::{Attr, BinOp, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
 use crate::ast::{
     GraphDocument, GraphEdgeStep, GraphFork, GraphHeader, GraphJunction, GraphNode, GraphNodeDecl, GraphOrigin, GraphPath,
     GraphReferenceKind, GraphStep,
@@ -472,6 +474,7 @@ impl<'src> Parser<'src> {
         ))
     }
 
+    #[cfg(test)]
     fn parse(mut self) -> Result<Ast, Errors> {
         let mut decls = Vec::new();
 
@@ -492,6 +495,7 @@ impl<'src> Parser<'src> {
         }
     }
 
+    #[cfg(test)]
     fn parse_decl(&mut self) -> Option<Decl> {
         let range = self.peek().range;
         let Some(ident) = self.expect(token!(Ident(value)), ErrorKind::ExpectedIdentifier) else {
@@ -518,6 +522,7 @@ impl<'src> Parser<'src> {
         decl
     }
 
+    #[cfg(test)]
     fn parse_block(&mut self, kind: String, range: SrcRange) -> Option<Block> {
         if self.check(token!(TemplateOpen)) {
             // consume the whole template so recovery resumes after it
@@ -1035,6 +1040,7 @@ impl<'src> Parser<'src> {
         Some(binding)
     }
 
+    #[cfg(test)]
     fn skip_declaration(&mut self) {
         while !self.eof() {
             match self.peek().kind {
@@ -1109,12 +1115,6 @@ fn bin_op(kind: &TokenKind) -> Option<(BinOp, u8)> {
     }
 }
 
-pub(super) fn parse_blocks(tokens: Vec<Token>, src: &str) -> Result<Ast, Diags> {
-    Parser::new(tokens, src)
-        .parse()
-        .map_err(|errors| errors.into_iter().map(Diag::from).collect())
-}
-
 pub(super) fn parse(tokens: Vec<Token>, src: &str) -> Result<GraphDocument, Diags> {
     Parser::new(tokens, src)
         .parse_graph()
@@ -1160,11 +1160,13 @@ pub(super) enum ErrorKind {
     ForkNeedsSelection,
     PatternSelection,
     UnexpectedToken,
+    #[cfg(test)]
     ExpectedDeclaration,
     ExpectedIdentifier,
     ExpectedStringLiteral,
     ExpectedNumberLiteral,
     ExpectedExpression,
+    #[cfg(test)]
     InterpolatedName,
     ExpectedInterpolationPath,
     ExpectedAccessorField,
@@ -1195,11 +1197,13 @@ impl fmt::Display for ErrorKind {
             Self::ForkNeedsSelection => "select a fork target or add a junction before continuing the path",
             Self::PatternSelection => "a pattern reference requires exactly one `@` selection marker",
             Self::UnexpectedToken => "unexpected token",
+            #[cfg(test)]
             Self::ExpectedDeclaration => "expected declaration",
             Self::ExpectedIdentifier => "expected identifier",
             Self::ExpectedStringLiteral => "expected string",
             Self::ExpectedNumberLiteral => "expected number",
             Self::ExpectedExpression => "expected expression",
+            #[cfg(test)]
             Self::InterpolatedName => "block names do not support interpolation",
             Self::ExpectedInterpolationPath => "expected a reference path in interpolation",
             Self::ExpectedAccessorField => "expected field name after `.`",

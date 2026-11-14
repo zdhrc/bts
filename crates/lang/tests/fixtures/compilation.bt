@@ -27,7 +27,7 @@
     first: settings.departments[0],
     selected: settings.departments[1:],
     combined: [|"intake", ...settings.departments|],
-    copied: {...intake.input, request_id: settings.request_id,},
+    copied: {...intake.input, request_id: settings.request_id},
     labels: [|for d in settings.departments: upper(d)|],
     indexed: {for i, d in settings.departments: d => i},
     source: (settings),
@@ -36,14 +36,14 @@
     empty: [||],
 };
 
-(intake:agent {label: "Hospital intake",}) {
-    input: {message: "I need an appointment", patient_id: "p-123",},
-    metadata: {request_id: settings.request_id,},
+(intake:agent {label: "Hospital intake"}) {
+    input: {message: "I need an appointment", patient_id: "p-123"},
+    metadata: {request_id: settings.request_id},
     tags: [|"hospital", "intake"|],
 }
-    -[:entry]->(collect:llm {model: settings.model,}) {
+    -[:entry]->(collect:llm {model: settings.model}) {
         input: intake.input,
-        output: {patient_id: intake.input.patient_id,},
+        output: {patient_id: intake.input.patient_id},
         # self refers to this node in its properties and body expressions
         metrics: {
             prompt_tokens: tokens(self.input),
@@ -51,7 +51,7 @@
             tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens,
         },
     }
-        -[:next]->(lookup:tool {name: "patient_lookup",}) {
+        -[:next]->(lookup:tool {name: "patient_lookup"}) {
             input: collect.output,
             output: {
                 found: chance(0.8),
@@ -59,8 +59,8 @@
             },
         }
             =[:exclusive]=>[
-                -[:next {when: source.output.found,}]->(route:task) {
-                    output: {department: settings.department,},
+                -[:next {when: source.output.found}]->(route:task) {
+                    output: {department: settings.department},
                 },
                 -[:next {when: !source.output.found}]->("register-patient":tool {
                     name: "register_patient",
@@ -70,24 +70,24 @@
             ]
                 ->(route)
                     =[:exclusive]=>[
-                        -[:next {when: lookup.output.needs_review,}]->(manual_review:tool {
+                        -[:next {when: lookup.output.needs_review}]->(manual_review:tool {
                             name: "request_manual_review",
                         }) {
                             input: lookup.output,
                         },
-                        -[:next {when: !lookup.output.needs_review,}]->(prepare:task),
+                        -[:next {when: !lookup.output.needs_review}]->(prepare:task),
                     ]
                         ->(prepare)
                             =[patient_checks:parallel]=>[
                                 -[coverage:next]->(check_coverage:tool {
                                     name: "check_coverage",
                                 }) {
-                                    input: {patient_id: collect.output.patient_id,},
+                                    input: {patient_id: collect.output.patient_id},
                                 },
                                 -[records:next]->(fetch_records:tool {
                                     name: "fetch_records",
                                 }) {
-                                    input: {patient_id: collect.output.patient_id,},
+                                    input: {patient_id: collect.output.patient_id},
                                 },
                             ]
                                 >>[[coverage], [records],]->(finish);
@@ -97,7 +97,7 @@
 ("register-patient")-[:next]->(finish);
 
 (finish:function) {
-    output: {message: "Request ${settings.request_id} completed",},
+    output: {message: "Request ${settings.request_id} completed"},
 };
 
 # nested exclusive fork uses complementary guards to demonstrate coverage
@@ -108,11 +108,11 @@
 # conditional fork: every matching branch runs, no default is imposed here
 # a separate optional path keeps this case distinct from intake's active chain
 (optional_checks:task) {
-    input: {needs_coverage: true, needs_records: false,},
+    input: {needs_coverage: true, needs_records: false},
 }
     =[selected_checks:conditional]=>[
-        -[:next {when: optional_checks.input.needs_coverage,}]->(coverage_note:function),
-        -[:next {when: optional_checks.input.needs_records,}]->(records_note:function),
+        -[:next {when: optional_checks.input.needs_coverage}]->(coverage_note:function),
+        -[:next {when: optional_checks.input.needs_records}]->(records_note:function),
     ];
 # optional checks deliberately has no convergence dependency
 
@@ -185,8 +185,9 @@
 # details defined by a scope propagate along its outgoing paths
 # a shared definition can have independent occurrences with different contexts
 (patient_summary:task)
-    -[:next]->(fetch_patient:tool {name: "fetch_patient",}) {
-        input: {patient_id: context.patient_id,},
+    -[:next]->(fetch_patient:tool {name: "fetch_patient"}) {
+        input: {patient_id: context.patient_id},
+        output: {patient_id: context.patient_id},
     }
         -[:next]->(summarize:llm) {
             input: {
@@ -196,24 +197,24 @@
         };
 
 (intake_summary:agent {
-    scope: {patient_id: "p-123", purpose: "prepare for an appointment",},
+    scope: {patient_id: "p-123", purpose: "prepare for an appointment"},
 })
     -[:next]->(patient_summary);
 
 (billing_summary:agent {
-    scope: {patient_id: "p-123", purpose: "explain an invoice",},
+    scope: {patient_id: "p-123", purpose: "explain an invoice"},
 })
     -[:next]->(patient_summary);
 
 # independent incoming paths can combine through an explicit junction target
 # the example scope property remains illustrative, not a finalized schema
 (visit_intake:agent {
-    scope: {patient: {id: "p-123",},},
+    scope: {patient: {id: "p-123"}},
 })
     -[patient_details:next]->(capture_details:task);
 
 (scheduling:agent {
-    scope: {appointment: {visit_id: "v-101",},},
+    scope: {appointment: {visit_id: "v-101"}},
 })
     -[appointment:next]->(confirm_appointment:task);
 
@@ -269,17 +270,17 @@
 
 # edge lists, source/target access, and explicit cycles
 (review_request:task) {
-    output: {ready: true, payload: "visit details",},
+    output: {ready: true, payload: "visit details"},
 }
     -[
-        advance:next {when: source.output.ready,},
-        supply:feeds {value: source.output.payload,},
+        advance:next {when: source.output.ready},
+        supply:feeds {value: source.output.payload},
     ]->(validate_request:tool) {
-        output: {valid: chance(0.9),},
+        output: {valid: chance(0.9)},
     }
         ~[
-            retry:next {when: !source.output.valid,},
-            feedback:feeds {value: source.output,},
+            retry:next {when: !source.output.valid},
+            feedback:feeds {value: source.output},
         ]~>(review_request);
 
 # self-loop uses the same cycle notation, policies are not yet specified
@@ -287,11 +288,11 @@
     ~[:repeat]~>(poll_visit);
 
 # endpoint access works with anonymous nodes too
-(:tool {name: "check_visit",}) {
-    output: {ready: chance(0.8),},
+(:tool {name: "check_visit"}) {
+    output: {ready: chance(0.8)},
 }
     =[:exclusive]=>[
-        -[:next {when: source.output.ready,}]->(finish),
+        -[:next {when: source.output.ready}]->(finish),
         -[:next {when: !source.output.ready}]->(pending_visit:task),
     ];
 
@@ -320,8 +321,10 @@
 # lookup could retry on timeout with a cap supplied by settings.max_attempts
 
 # O09 candidate: companion definitions, not finalized kind schemas
-(routing_correct:scorer {lang: "python",}) {
-    code: {score: output.department == expected.department ? 1 : 0,},
+(routing_correct:scorer {lang: "python"}) {
+    output: {department: context.output.department},
+    expected: {department: "appointments"},
+    code: {score: self.output.department == self.expected.department ? 1 : 0},
 };
 
 # candidate field-based association, no implicit graph containment
@@ -330,8 +333,8 @@
 };
 
 (appointment_case:case) {
-    input: {message: "I need an appointment", patient_id: "p-123",},
-    expected: {department: "appointments",},
+    input: {message: "I need an appointment", patient_id: "p-123"},
+    expected: {department: "appointments"},
 };
 
 # candidate only, intake still needs a corresponding department output contract

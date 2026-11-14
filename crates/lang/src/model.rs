@@ -1,497 +1,180 @@
 use crate::diag::SrcRange;
+use std::collections::BTreeMap;
 
-/// A compiled module with resolved references and checked language rules.
-///
-/// Consumers evaluate remaining expressions using their own runtime context.
-/// Public fields permit inspection and transformation, but edits can invalidate
-/// reference indexes and type guarantees. A default model is empty.
+/// A compiled graph with stable model-local identities and resolved references.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
-    /// Root trace definitions in declaration order.
-    pub traces: Vec<Trace>,
-    /// Scoped expressions to evaluate for each instance.
+    /// Node definitions in declaration order.
+    pub nodes: Vec<Node>,
+    /// Directed connections, including marked cycle connections.
+    pub edges: Vec<Edge>,
+    /// Fork definitions and their attached continuations.
+    pub forks: Vec<Fork>,
+    /// Explicit convergence definitions.
+    pub junctions: Vec<Junction>,
+    /// Authored root paths.
+    pub paths: Vec<GraphPath>,
+    /// Field and property expressions indexed by binding identity.
     pub bindings: Vec<Binding>,
-    /// Resolved references indexed by [`RefId`].
+    /// Resolved graph references with their use-site locations.
     pub refs: Vec<ResolvedRef>,
-    /// Callable agent declarations and their root trace entrypoints.
-    pub agents: Vec<Agent>,
-    /// Reusable scorer definitions in declaration order.
-    pub scorers: Vec<Scorer>,
-    /// Automation definitions in declaration order.
-    pub automations: Vec<Automation>,
-    /// Facet definitions in declaration order.
-    pub facets: Vec<Facet>,
-    /// Dataset definitions in declaration order.
-    pub datasets: Vec<Dataset>,
-    /// Experiment definitions in declaration order.
-    pub experiments: Vec<Experiment>,
+    /// The document-wide namespace shared by named graph elements.
+    pub names: BTreeMap<String, ElementId>,
 }
-/// Identifies a block within one compiled model.
-///
-/// The identifier is not stable across recompilation or edits to source.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct NodeId(
-    /// The model-local identity assigned during compilation.
-    pub u32,
-);
-/// An index into [`Model::refs`], valid only for the model that owns it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct RefId(
-    /// The index into the owning model’s reference table.
-    pub u32,
-);
-/// A checked route from a reference expression to a block or value.
-///
-/// Consumers first choose the module anchor or walk `up` enclosing scopes,
-/// then follow `steps`, read `accessor`, and apply `path` to the resulting value.
-/// Dynamic positions and indexes still require runtime evaluation.
+
+macro_rules! identity {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        pub struct $name(pub usize);
+    };
+}
+identity!(NodeId, "A node index within its owning model.");
+identity!(EdgeId, "An edge index within its owning model.");
+identity!(ForkId, "A fork index within its owning model.");
+identity!(JunctionId, "A junction index within its owning model.");
+identity!(BindingId, "A binding index within its owning model.");
+identity!(RefId, "A reference index within its owning model.");
+
+/// The identity and category of a graph element.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ElementId {
+    /// A node definition.
+    Node(NodeId),
+    /// An edge definition.
+    Edge(EdgeId),
+    /// A fork definition.
+    Fork(ForkId),
+    /// A junction definition.
+    Junction(JunctionId),
+}
+
+/// An authored node with no domain-specific schema.
 #[derive(Debug, Clone)]
-pub struct ResolvedRef {
-    /// An absolute trace anchor, or `None` for a reference relative to its use site.
-    pub module: Option<NodeId>,
-    /// How many enclosing scopes to walk before following the path.
-    pub up: usize,
-    /// Ordered steps to follow or evaluate.
-    pub steps: Vec<Step>,
-    /// What to read after following the block path.
-    pub accessor: Accessor,
-    /// Selections applied to the referenced field value.
-    pub path: Vec<Selection>,
-    /// The complete reference expression’s source location.
+pub struct Node {
+    /// Optional authored name.
+    pub name: Option<String>,
+    /// Open node-kind identifier.
+    pub kind: String,
+    /// Configuration properties.
+    pub props: Vec<BindingId>,
+    /// Content fields.
+    pub fields: Vec<BindingId>,
+    /// Full source location.
     pub range: SrcRange,
 }
 
-/// An index or slice applied to a referenced field value.
+/// A directed connection between two existing node identities.
 #[derive(Debug, Clone)]
-pub enum Selection {
-    /// An element selection.
-    Index(Value),
-    /// A selection between optional bounds.
-    Slice {
-        /// The inclusive lower bound, or `None` to start at the beginning.
-        start: Option<Value>,
-        /// The exclusive upper bound, or `None` to continue to the end.
-        end: Option<Value>,
-    },
+pub struct Edge {
+    /// Optional authored name.
+    pub name: Option<String>,
+    /// Open edge-kind identifier.
+    pub kind: String,
+    /// Source node.
+    pub source: NodeId,
+    /// Target node.
+    pub target: NodeId,
+    /// Configuration properties.
+    pub props: Vec<BindingId>,
+    /// Explicit cycle marker, without an inferred retry policy.
+    pub cycle: bool,
+    /// Owning fork when declared in a fork entry.
+    pub fork: Option<ForkId>,
+    /// Source location of the edge header.
+    pub range: SrcRange,
 }
 
-/// One step through block instances on a resolved reference path.
+/// A typed graph split from one node.
 #[derive(Debug, Clone)]
-pub enum Step {
-    /// Selects a matching child block, optionally by runtime position.
-    Child {
-        /// Matching block identities in sibling order.
-        candidates: Vec<NodeId>,
-        /// An optional runtime expression selecting among matching siblings.
-        position: Option<Value>,
-    },
-    /// Selects one repeat iteration using an evaluated index.
-    Iteration(Value),
-    /// Selects a repeat slice and follows the remaining path for every selected iteration.
-    Iterations {
-        /// The inclusive lower bound, or `None` to start at the beginning.
-        start: Option<Value>,
-        /// The exclusive upper bound, or `None` to continue to the end.
-        end: Option<Value>,
-    },
+pub struct Fork {
+    /// Optional authored name.
+    pub name: Option<String>,
+    /// Authored kind, including the built-in graph primitives.
+    pub kind: String,
+    /// Source node.
+    pub source: NodeId,
+    /// Configuration properties.
+    pub props: Vec<BindingId>,
+    /// Edge identities for each single-step branch.
+    pub branches: Vec<Vec<EdgeId>>,
+    /// Structurally attached sibling paths.
+    pub continuations: Vec<GraphPath>,
+    /// Source location.
+    pub range: SrcRange,
 }
 
-/// The block identity, field, or execution detail read at a reference target.
+/// Explicit convergence of the listed incoming edges.
 #[derive(Debug, Clone)]
-pub enum Accessor {
-    /// Returns the target block identity and kind without reading a payload field.
-    Block {
-        /// This block’s identity within the compiled model.
-        node: NodeId,
-        /// The kind of operation represented by this definition.
-        kind: &'static str,
+pub struct Junction {
+    /// Exact incoming edge identities.
+    pub inputs: Vec<EdgeId>,
+    /// Destination node.
+    pub target: NodeId,
+    /// Owning fork for an attached junction.
+    pub fork: Option<ForkId>,
+    /// Source location.
+    pub range: SrcRange,
+}
+
+/// A path retaining authoring structure without imposing runtime scheduling.
+#[derive(Debug, Clone)]
+pub struct GraphPath {
+    /// Its initial authoring position.
+    pub origin: PathOrigin,
+    /// Connections and splits in source order.
+    pub steps: Vec<PathStep>,
+    /// Source location.
+    pub range: SrcRange,
+}
+
+/// The start of a root or attached path.
+#[derive(Debug, Clone)]
+pub enum PathOrigin {
+    /// A root node.
+    Node(NodeId),
+    /// A selector attached to one fork.
+    Selector {
+        /// The enclosing fork.
+        fork: ForkId,
+        /// The selected target node.
+        target: NodeId,
     },
-    /// Reads a payload field from the selected block.
-    Field(Field),
-    /// Reads the current iteration index of an enclosing repeat.
-    Index,
-    /// Reads the enclosing repeat count.
-    Count,
-    /// Reads the zero-based index of the selected choice alternative.
-    Chosen,
-    /// Reads whether a maybe block was included.
-    Included,
+    /// A junction destination.
+    Junction(JunctionId),
 }
-/// A payload field that source expressions can reference.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum Field {
-    /// The input field.
-    Input,
-    /// The output field.
-    Output,
-    /// The expected result field.
-    Expected,
-    /// The authored error field.
-    Error,
-    /// Additional named data.
-    Metadata,
-    /// Numeric measurements.
-    Metrics,
-    /// Authored labels.
-    Tags,
+
+/// One step through the authored graph.
+#[derive(Debug, Clone)]
+pub enum PathStep {
+    /// One or more edges with common endpoints.
+    Edges(Vec<EdgeId>),
+    /// A fork and its attached continuations.
+    Fork(ForkId),
 }
-/// A scoped expression evaluated once per instance of its declaring block.
-///
-/// Constant variables are substituted during compilation and do not appear here.
+
+/// A property or content expression owned by a graph element.
 #[derive(Debug, Clone)]
 pub struct Binding {
-    /// The name written in source.
-    pub name: String,
-    /// The value expression to inspect or evaluate.
+    /// Owning graph identity.
+    pub owner: ElementId,
+    /// Whether this binding belongs to properties rather than content.
+    pub property: bool,
+    /// Field path, including nested keys when selected independently.
+    pub path: Vec<String>,
+    /// Lowered expression, preserving dynamic evaluation.
     pub value: Value,
+    /// Source location.
+    pub range: SrcRange,
 }
 
-/// A named root definition and the behavior nested beneath it.
+/// A graph-valued reference resolved without cloning its target.
 #[derive(Debug, Clone)]
-pub struct Trace {
-    /// This block’s identity within the compiled model.
-    pub node: NodeId,
-    /// The name written in source.
-    pub name: String,
-    /// Payload fields associated with this block.
-    pub fields: SpanFields,
-    /// Scoped expressions to evaluate for each instance.
-    pub bindings: Vec<Binding>,
-    /// Nested definitions in source order.
-    pub children: Vec<Child>,
-}
-/// A nested span or a block whose children a consumer expands at runtime.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum Child {
-    /// An ordinary nested span.
-    Span(Span),
-    /// A scorer definition or authored score.
-    Scorer(ScorerSpan),
-    /// A repeated sequence.
-    Repeat(Repeat),
-    /// One selected alternative.
-    Choice(Choice),
-    /// An optional sequence.
-    Maybe(Maybe),
-}
-
-/// An authored score attached to a generated trace or span.
-#[derive(Debug, Clone)]
-pub struct ScorerSpan {
-    /// This block’s identity within the compiled model.
-    pub node: NodeId,
-    /// The name written in source.
-    pub name: String,
-    /// The score expression to evaluate.
-    pub score: Value,
-    /// The score expression’s source location.
-    pub score_range: SrcRange,
-    /// An optional explanation expression and its source location.
-    pub reason: Option<(Value, SrcRange)>,
-    /// Scoped expressions to evaluate for each instance.
-    pub bindings: Vec<Binding>,
-}
-
-/// A named task, model call, tool call, or function within a trace.
-#[derive(Debug, Clone)]
-pub struct Span {
-    /// This block’s identity within the compiled model.
-    pub node: NodeId,
-    /// The name written in source.
-    pub name: String,
-    /// The kind of operation represented by this definition.
-    pub kind: SpanKind,
-    /// Payload fields associated with this block.
-    pub fields: SpanFields,
-    /// Scoped expressions to evaluate for each instance.
-    pub bindings: Vec<Binding>,
-    /// Nested definitions in source order.
-    pub children: Vec<Child>,
-}
-
-/// Children repeated a runtime-selected number of times.
-#[derive(Debug, Clone)]
-pub struct Repeat {
-    /// This block’s identity within the compiled model.
-    pub node: NodeId,
-    #[allow(dead_code)]
-    /// The name written in source.
-    pub name: Option<String>,
-    /// The number of iterations to evaluate.
-    pub count: Value,
-    /// The count expression’s source location.
-    pub count_range: SrcRange,
-    /// Expressions evaluated separately for each iteration. The count is evaluated in the parent scope.
-    pub bindings: Vec<Binding>,
-    /// Nested definitions in source order.
-    pub children: Vec<Child>,
-}
-
-/// Alternative children from which a consumer selects one per instance.
-#[derive(Debug, Clone)]
-pub struct Choice {
-    /// This block’s identity within the compiled model.
-    pub node: NodeId,
-    #[allow(dead_code)]
-    /// The name written in source.
-    pub name: Option<String>,
-    /// Scoped expressions to evaluate for each instance.
-    pub bindings: Vec<Binding>,
-    /// Nested definitions in source order.
-    pub children: Vec<Child>,
-}
-
-/// Children included according to a probability expression.
-#[derive(Debug, Clone)]
-pub struct Maybe {
-    /// This block’s identity within the compiled model.
-    pub node: NodeId,
-    #[allow(dead_code)]
-    /// The name written in source.
-    pub name: Option<String>,
-    /// The probability expression controlling inclusion.
-    pub chance: Value,
-    /// The probability expression’s source location.
-    pub chance_range: SrcRange,
-    /// Expressions evaluated only when the children are included.
-    pub bindings: Vec<Binding>,
-    /// Nested definitions in source order.
-    pub children: Vec<Child>,
-}
-
-/// The role assigned to an ordinary span.
-#[derive(Debug, Clone)]
-pub enum SpanKind {
-    /// A task span.
-    Task,
-    /// A language model call.
-    Llm,
-    /// A tool call.
-    Tool,
-    /// A function span.
-    Function,
-}
-
-/// Optional payload expressions and generation directives for a trace or span.
-///
-/// An absent field differs from a field explicitly set to [`Value::Null`].
-#[derive(Debug, Clone, Default)]
-pub struct SpanFields {
-    /// The authored input expression.
-    pub input: Option<Value>,
-    /// The authored output expression.
-    pub output: Option<Value>,
-    /// The expected result expression, if provided.
-    pub expected: Option<Value>,
-    /// An authored error value, if provided.
-    pub error: Option<Value>,
-    /// Additional named values attached to the definition.
-    pub metadata: Option<Object>,
-    /// Named numeric measurements.
-    pub metrics: Option<Object>,
-    /// Labels attached to the definition.
-    pub tags: Vec<Template>,
-    /// A duration expression in seconds and its source location. This is a generation directive.
-    pub duration: Option<(Value, SrcRange)>,
-}
-/// A reusable scorer definition for a code generation or deployment consumer.
-#[derive(Debug, Clone)]
-pub struct Scorer {
-    /// The name written in source.
-    pub name: String,
-    /// The requested output language, or `None` to let the consumer choose.
-    pub lang: Option<ScorerLang>,
-    /// An optional output file stem for grouping generated scorers.
-    pub file: Option<String>,
-    /// The kind of operation represented by this definition.
-    pub kind: ScorerKind,
-}
-
-/// A named topic extraction definition.
-#[derive(Debug, Clone)]
-pub struct Facet {
-    /// The name written in source.
-    pub name: String,
-    /// The instructions used by the model-based operation.
-    pub prompt: String,
-    /// Optional descriptive text supplied in source.
-    pub description: Option<String>,
-    /// An optional pattern identifying responses that contain no matching topic.
-    pub no_match_pattern: Option<String>,
-}
-
-/// A named rule describing when a scorer or topic extraction should run.
-#[derive(Debug, Clone)]
-pub struct Automation {
-    /// The name written in source.
-    pub name: String,
-    /// The kind of operation represented by this definition.
-    pub kind: AutomationKind,
-    /// The fraction of eligible events selected for the automation.
-    pub sampling_rate: f64,
-    /// Whether the automation is enabled.
-    pub enabled: bool,
-}
-
-/// The operation requested by an automation definition.
-#[derive(Debug, Clone)]
-pub enum AutomationKind {
-    /// A scorer definition or authored score.
-    Scorer {
-        /// Names of the scorers bound to this automation.
-        scorers: Vec<String>,
-        /// Whether the rule targets root spans.
-        root: bool,
-        /// Names of spans targeted by the rule.
-        span_names: Vec<String>,
-    },
-    /// Topic extraction using named facets.
-    Topics {
-        /// Names of the facets used by this automation.
-        facets: Vec<String>,
-    },
-}
-
-/// A named collection of cases and their source definitions.
-#[derive(Debug, Clone)]
-pub struct Dataset {
-    /// The name written in source.
-    pub name: String,
-    /// Optional descriptive text supplied in source.
-    pub description: Option<String>,
-    /// Dataset cases in declaration order.
-    pub cases: Vec<DatasetCase>,
-}
-
-/// A dataset evaluation definition linking a task, scorers, and optional baseline.
-#[derive(Debug, Clone)]
-pub struct Experiment {
-    /// The name written in source.
-    pub name: String,
-    /// Optional descriptive text supplied in source.
-    pub description: Option<String>,
-    /// The name of the referenced dataset.
-    pub dataset: String,
-    /// A reference to the trace or static span used as the experiment task.
-    pub task: RefId,
-    /// Names of the scorers to invoke for each result.
-    pub scorers: Vec<String>,
-    /// The name of a baseline experiment, if provided.
-    pub baseline: Option<String>,
-}
-
-/// One named input case, optionally derived from modeled traces or spans.
-#[derive(Debug, Clone)]
-pub struct DatasetCase {
-    /// The name written in source.
-    pub name: String,
-    /// The source used to create the case.
-    pub source: DatasetSource,
-    /// The expected result expression, if provided.
-    pub expected: Option<Value>,
-    /// Additional named values attached to the definition.
-    pub metadata: Option<Value>,
-    /// Labels attached to the definition.
-    pub tags: Option<Value>,
-}
-
-/// The authored source from which a consumer creates a dataset case.
-#[derive(Debug, Clone)]
-pub enum DatasetSource {
-    /// Input supplied directly by the case.
-    Inline(Value),
-    /// A reference to an entire trace.
-    Trace(RefId),
-    /// A reference to one static span subtree.
-    Span(RefId),
-    /// An ordered group of referenced traces.
-    Group(Vec<RefId>),
-}
-
-/// The requested programming language for generated scorer code.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ScorerLang {
-    /// Python source output.
-    Python,
-    /// TypeScript source output.
-    Typescript,
-}
-
-/// Either executable score expressions or a model-based judge definition.
-#[derive(Debug, Clone)]
-pub enum ScorerKind {
-    /// Score expressions and ordered conditional steps.
-    Code {
-        /// The fallback score used when no earlier step returns a score.
-        score: Value,
-        /// Ordered steps to follow or evaluate.
-        steps: Vec<ScorerStep>,
-    },
-    /// A model-based judge with labeled score options.
-    Judge {
-        /// The requested judge model name.
-        model: String,
-        /// Judge instructions with optional scorer-argument interpolation.
-        prompt: Value,
-        /// Allowed judge responses and their scores.
-        options: Vec<JudgeOption>,
-    },
-}
-/// A conditional scorer branch. Nested steps run before its own score.
-#[derive(Debug, Clone)]
-pub struct When {
-    /// The condition controlling this expression or branch.
-    pub cond: Value,
-    /// The score expression to evaluate.
-    pub score: Option<Value>,
-    /// Ordered steps to follow or evaluate.
-    pub steps: Vec<ScorerStep>,
-}
-
-/// A conditional or repeated step evaluated before a scorer fallback.
-#[derive(Debug, Clone)]
-pub enum ScorerStep {
-    /// A conditional scorer branch.
-    When(When),
-    /// A repeated sequence.
-    Repeat {
-        /// The number of iterations to evaluate.
-        count: Value,
-        /// Ordered steps to follow or evaluate.
-        steps: Vec<ScorerStep>,
-    },
-}
-
-/// A named judge response and its numeric score.
-#[derive(Debug, Clone)]
-pub struct JudgeOption {
-    /// The response label returned by the judge.
-    pub label: String,
-    /// The score expression to evaluate.
-    pub score: f64,
-}
-/// An input supplied when a consumer invokes a scorer.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ScorerArg {
-    /// The input field.
-    Input,
-    /// The output field.
-    Output,
-    /// The expected result field.
-    Expected,
-    /// Additional named data.
-    Metadata,
-}
-/// A runtime index or count made available by the enclosing trace or repeat.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum CtxRef {
-    /// The zero-based trace index.
-    TraceIndex,
-    /// The zero-based index of the innermost repeat.
-    RepeatIndex,
-    /// The count of the innermost repeat.
-    RepeatCount,
+pub struct ResolvedRef {
+    /// The selected graph definition.
+    pub target: ElementId,
+    /// The authored reference location.
+    pub range: SrcRange,
 }
 /// An operator applied to one expression.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -550,6 +233,13 @@ pub enum Value {
     Bool(bool),
     /// An explicit null value.
     Null,
+    /// Context supplied for this graph element by an evaluator.
+    Context {
+        /// The element whose context is read.
+        owner: ElementId,
+        /// The authored path within that context.
+        path: Vec<String>,
+    },
     /// An ordered collection.
     Array(Array),
     /// A collection of named entries.
@@ -565,14 +255,10 @@ pub enum Value {
         /// The attachment key used to connect payloads with uploads.
         key: String,
     },
-    /// A scoped variable resolved by name during evaluation.
-    VarRef(String),
-    /// A validated runtime context reference.
-    CtxRef(CtxRef),
-    /// An argument supplied when a scorer is invoked.
-    ArgRef(ScorerArg),
-    /// A block reference resolved through the owning model.
-    BlockRef {
+    /// A resolved field or variable binding read during evaluation.
+    BindingRef(BindingId),
+    /// A graph reference resolved through the owning model.
+    GraphRef {
         /// The index of the resolved reference in [`Model::refs`].
         ref_id: RefId,
         /// The expression’s byte range in the original source.
@@ -853,7 +539,7 @@ pub enum Func {
     },
 }
 
-/// English language operations provided by generation consumers.
+/// English language operations evaluated by consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnglishOperation {
     /// Generate a procedural English utterance.
@@ -944,10 +630,8 @@ pub struct Template {
 pub enum Part {
     /// Literal text copied into the result.
     Lit(String),
-    /// A reference expression whose meaning depends on its context.
-    Ref(CtxRef),
-    /// A scoped variable resolved by name during evaluation.
-    VarRef(String),
+    /// A resolved field or variable binding read during evaluation.
+    BindingRef(BindingId),
     /// An expression whose interpolated value is checked at runtime.
     Dynamic(Value),
 }
@@ -990,13 +674,4 @@ pub struct ObjectField {
     pub key: String,
     /// The value expression to inspect or evaluate.
     pub value: Value,
-}
-
-/// A named callable agent backed by a whole trace definition.
-#[derive(Debug, Clone)]
-pub struct Agent {
-    /// The name written in source.
-    pub name: String,
-    /// A resolved reference to the whole trace this agent executes.
-    pub entrypoint: RefId,
 }
