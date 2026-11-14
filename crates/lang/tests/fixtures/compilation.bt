@@ -2,6 +2,7 @@
 # language rules live in crates/lang/src/spec.rs
 # built-in contracts live in the spec, domain kinds remain illustrative
 # update the spec and affected examples together when a language rule changes
+# actual provider schemas are tested with crates/core/tests/fixtures/braintrust.bt
 
 # standalone definitions do not acquire ownership from their use in a path
 # variable lifetime and activation in this graph remain open

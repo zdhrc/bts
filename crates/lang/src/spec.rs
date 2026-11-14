@@ -978,6 +978,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.sources"),
+        // provider schemas are opt-in data contracts, not installed runtime operations
         summary: "Callers may supply named definition sources before compilation through semantics::compile_with_definitions or compile_module_with_definitions. Definition sources use ordinary kind declaration syntax for nodes, edges, forks and junctions, and cannot declare graph instances or paths. Supplied and user kinds share one namespace and one inheritance and validation system. Forward inheritance across sources is allowed. Duplicate names, reserved names, unknown bases, inheritance cycles and cross-construct extension remain errors. Supplied definitions are registered in caller order followed by user definitions, without override precedence. Unknown instance kinds remain open under the existing rules. Source ranges retain local byte offsets and a source index, with user source at zero and definitions in caller order starting at one. Models retain source names and resolved kind identities. Empty user source follows the explicit allow_empty policy independently of supplied declarations, and supplied kinds are still validated when empty user source is allowed. No package loading, provider execution or external I/O occurs.",
     },
     RuleDesc {

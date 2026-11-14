@@ -8,6 +8,78 @@ use bts_lang::{DiagPhase, Value, semantics::compile, syntax::parse_traversal};
 
 const COMPILATION_SOURCE: &str = include_str!("fixtures/compilation.bt");
 
+// compile the provider's actual source while core awaits its graph migration
+#[path = "../../core/src/providers/braintrust/defs.rs"]
+mod braintrust_defs;
+const BRAINTRUST_FIXTURE: &str = include_str!("../../core/tests/fixtures/braintrust.bt");
+
+fn compile_braintrust(source: &str) -> Result<bts_lang::Model, bts_lang::Diags> {
+    compile_with_definitions(
+        Source {
+            name: "user.bt",
+            text: source,
+        },
+        &[braintrust_defs::SOURCE],
+    )
+}
+
+#[test]
+fn braintrust_provider_schemas_compile_inherited_spans_and_propagation() {
+    let model = compile_braintrust(BRAINTRUST_FIXTURE).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert_eq!(model.sources, ["user.bt", "braintrust.bt"]);
+    for name in ["tool", "task", "llm", "function", "scorer"] {
+        let kind = model.kinds.iter().find(|kind| kind.name == name).unwrap();
+        assert_eq!(kind.base, "span");
+        assert_eq!(kind.primitive, "node");
+        assert_eq!(kind.range.source, 1);
+        assert!(
+            kind.fields
+                .iter()
+                .any(|field| field.name == "input" && field.role.as_deref() == Some("input"))
+        );
+        assert!(
+            kind.fields
+                .iter()
+                .any(|field| field.name == "output" && field.role.as_deref() == Some("output"))
+        );
+    }
+    let local = model.kinds.iter().find(|kind| kind.name == "patient_lookup").unwrap();
+    assert_eq!(local.base, "tool");
+    assert!(
+        local
+            .props
+            .iter()
+            .any(|field| field.name == "resource" && field.default.is_some())
+    );
+    assert!(model.edges.iter().any(|edge| edge.kind == "feeds"));
+    assert!(model.nodes.iter().any(|node| node.name.is_none() && node.kind == "task"));
+}
+
+#[test]
+fn braintrust_provider_schemas_reject_invalid_known_fields_and_properties() {
+    for source in [
+        "(a:tool {typo: true});",
+        "(a:span {name: 42});",
+        "(a:task) {metadata: false};",
+        "(a:llm) {metrics: 1};",
+        "(a:function) {tags: \"tag\"};",
+        "(a:tool) {duration: \"slow\"};",
+        "(a:span) {scores: false};",
+        "(a:scorer);",
+        "(a:scorer) {score: \"good\"};",
+        "(a:scorer) {score: 1, reason: false};",
+    ] {
+        let errors = compile_braintrust(source).expect_err(source);
+        assert!(errors.iter().all(|error| error.r#where.source == 0), "{errors:#?}");
+    }
+    compile_braintrust("(a:tool) {custom: {anything: true}};").unwrap();
+    compile_braintrust(
+        "+(custom_tool::tool {fields: {custom: {type: \"string\", required: true}}}); (a:custom_tool) {custom: \"value\"};",
+    )
+    .unwrap();
+    assert!(compile_braintrust("+(tool::node {}); (a:tool);").is_err());
+}
+
 // illustrative provider definitions, not the final Braintrust schema
 const PROVIDER_SOURCE: &str = r#"
 +(span::node {

@@ -2,6 +2,7 @@
 pub mod client;
 #[cfg(feature = "native")]
 pub mod config;
+pub mod defs;
 #[cfg(feature = "native")]
 pub mod features;
 pub mod mocking;
@@ -17,6 +18,11 @@ use mocking::data;
 /// Supplies Braintrust implementations for core mocking workflows.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Bundle;
+
+impl Bundle {
+    /// Supplies span schemas for hosts to include explicitly during compilation.
+    pub const DEFINITIONS: bts_lang::semantics::Source<'static> = defs::SOURCE;
+}
 
 impl super::Bundle for Bundle {
     const ID: &'static str = "braintrust";
