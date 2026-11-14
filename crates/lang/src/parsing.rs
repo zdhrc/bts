@@ -48,6 +48,14 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn range(&self, start: usize, end: usize) -> SrcRange {
+        SrcRange {
+            source: self.tokens[0].range.source,
+            start,
+            end,
+        }
+    }
+
     fn parse_graph(mut self) -> Result<GraphDocument, Errors> {
         self.graph_syntax = true;
         let mut paths = Vec::new();
@@ -124,7 +132,7 @@ impl<'src> Parser<'src> {
             name,
             base,
             schema,
-            range: SrcRange::new(start, end),
+            range: self.range(start, end),
         })
     }
 
@@ -156,7 +164,7 @@ impl<'src> Parser<'src> {
         Some(GraphPath {
             start,
             steps,
-            range: SrcRange::new(start_offset, end),
+            range: self.range(start_offset, end),
         })
     }
 
@@ -272,7 +280,7 @@ impl<'src> Parser<'src> {
             continuations.push(GraphPath {
                 start: origin,
                 steps,
-                range: SrcRange::new(start_offset, end),
+                range: self.range(start_offset, end),
             });
         }
         let end = self.tokens[self.index - 1].range.end;
@@ -280,7 +288,7 @@ impl<'src> Parser<'src> {
             header,
             entries,
             continuations,
-            range: SrcRange::new(start, end),
+            range: self.range(start, end),
         })
     }
 
@@ -308,7 +316,7 @@ impl<'src> Parser<'src> {
             inputs,
             props,
             target,
-            range: SrcRange::new(start, end),
+            range: self.range(start, end),
         })
     }
 
@@ -329,7 +337,7 @@ impl<'src> Parser<'src> {
                     target: Box::new(expr),
                     name,
                 },
-                SrcRange::new(start, end),
+                self.range(start, end),
             );
         }
         Some(expr)
@@ -362,12 +370,12 @@ impl<'src> Parser<'src> {
                 direction,
                 cycle,
                 target,
-                range: SrcRange::new(step_start, self.tokens[self.index - 1].range.end),
+                range: self.range(step_start, self.tokens[self.index - 1].range.end),
             });
         }
         let end = self.peek().range.end;
         self.expect(token!(PatternClose), ErrorKind::UnexpectedToken)?;
-        let range = SrcRange::new(start, end);
+        let range = self.range(start, end);
         if selections != 1 {
             self.errors.push(Error::new(ErrorKind::PatternSelection, range));
             return None;
@@ -410,7 +418,7 @@ impl<'src> Parser<'src> {
             selected,
             kind,
             props,
-            range: SrcRange::new(start, end),
+            range: self.range(start, end),
         })
     }
 
@@ -435,7 +443,7 @@ impl<'src> Parser<'src> {
             Some(GraphNode::Declaration(GraphNodeDecl {
                 header,
                 body,
-                range: SrcRange::new(start, end),
+                range: self.range(start, end),
             }))
         } else {
             let reference = self.parse_graph_reference(start, GraphReferenceKind::Node)?;
@@ -468,7 +476,7 @@ impl<'src> Parser<'src> {
             name_range,
             kind,
             props,
-            range: SrcRange::new(start, end),
+            range: self.range(start, end),
         })
     }
 
@@ -527,7 +535,7 @@ impl<'src> Parser<'src> {
             direction,
             cycle,
             target,
-            range: SrcRange::new(start, end),
+            range: self.range(start, end),
         })
     }
 
@@ -555,7 +563,7 @@ impl<'src> Parser<'src> {
                 kind,
                 target: Box::new(target),
             },
-            SrcRange::new(start, end),
+            self.range(start, end),
         ))
     }
 
@@ -652,7 +660,7 @@ impl<'src> Parser<'src> {
             self.parse_expr()?
         };
         let range = if self.graph_syntax {
-            SrcRange::new(range.start, value.range.end)
+            self.range(range.start, value.range.end)
         } else {
             range
         };
@@ -676,7 +684,7 @@ impl<'src> Parser<'src> {
         self.expect(token!(Colon), ErrorKind::ExpectedTernaryColon)?;
         let otherwise = self.parse_conditional()?;
 
-        let range = SrcRange::new(cond.range.start, otherwise.range.end);
+        let range = self.range(cond.range.start, otherwise.range.end);
         Some(Expr::new(
             ExprKind::Cond {
                 cond: Box::new(cond),
@@ -698,7 +706,7 @@ impl<'src> Parser<'src> {
             self.next();
 
             let rhs = self.parse_binary(level + 1)?;
-            let range = SrcRange::new(lhs.range.start, rhs.range.end);
+            let range = self.range(lhs.range.start, rhs.range.end);
             lhs = Expr::new(
                 ExprKind::Binary {
                     op,
@@ -722,7 +730,7 @@ impl<'src> Parser<'src> {
         self.next();
 
         let operand = self.parse_unary()?;
-        let range = SrcRange::new(range.start, operand.range.end);
+        let range = self.range(range.start, operand.range.end);
         Some(Expr::new(
             ExprKind::Unary {
                 op,
@@ -774,7 +782,7 @@ impl<'src> Parser<'src> {
                     let end = self.peek().range.end;
                     self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
 
-                    expr = Expr::new(kind, SrcRange::new(expr_start, end));
+                    expr = Expr::new(kind, self.range(expr_start, end));
                 }
                 TokenKind::Dot => {
                     self.next();
@@ -788,14 +796,14 @@ impl<'src> Parser<'src> {
                                 target: Box::new(expr),
                                 name,
                             },
-                            SrcRange::new(start, end),
+                            self.range(start, end),
                         );
                         continue;
                     }
                     let name_range = self.peek().range;
                     let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedAccessorField)?;
 
-                    let range = SrcRange::new(expr.range.start, name_range.end);
+                    let range = self.range(expr.range.start, name_range.end);
                     // a dot extends a reference path, on anything else it sugars to a string index
                     expr = match expr.kind {
                         ExprKind::Ref { mut path } => {
@@ -833,14 +841,14 @@ impl<'src> Parser<'src> {
                 match self.parse_interpolation() {
                     Some((expr, end)) => parts.push(TemplatePart::Ref {
                         expr,
-                        range: SrcRange::new(open.start, end),
+                        range: self.range(open.start, end),
                     }),
                     None => self.skip_interpolation(),
                 }
             } else if self.check(token!(TemplateClose)) {
                 let end = self.peek().range.end;
                 self.next();
-                return Some(Expr::new(ExprKind::Template(parts), SrcRange::new(start, end)));
+                return Some(Expr::new(ExprKind::Template(parts), self.range(start, end)));
             } else {
                 // lexing closes every template it emits, so this is unreachable
                 self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
@@ -897,14 +905,14 @@ impl<'src> Parser<'src> {
                 self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
 
                 // no ast node for grouping, the widened range keeps diagnostics on the parens
-                Some(Expr::new(inner.kind, SrcRange::new(start, end)))
+                Some(Expr::new(inner.kind, self.range(start, end)))
             }
             TokenKind::InterpOpen if self.graph_syntax => {
                 let start = self.next().range.start;
                 let expr = self.parse_expr()?;
                 let end = self.peek().range.end;
                 self.expect(token!(InterpClose), ErrorKind::UnexpectedToken)?;
-                Some(Expr::new(expr.kind, SrcRange::new(start, end)))
+                Some(Expr::new(expr.kind, self.range(start, end)))
             }
             TokenKind::LBrack if self.graph_syntax => {
                 let start = self.next().range.start;
@@ -948,7 +956,7 @@ impl<'src> Parser<'src> {
                     let end = self.peek().range.end;
                     self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
 
-                    Some(Expr::new(ExprKind::Func { name, args }, SrcRange::new(range.start, end)))
+                    Some(Expr::new(ExprKind::Func { name, args }, self.range(range.start, end)))
                 } else {
                     // any other ident starts a reference path, the modeler resolves it
                     let name = value.clone();
@@ -969,7 +977,7 @@ impl<'src> Parser<'src> {
                     let range = self.peek().range;
                     if self.consume(token!(Ellipsis)).is_some() {
                         let operand = self.parse_expr()?;
-                        let range = SrcRange::new(range.start, operand.range.end);
+                        let range = self.range(range.start, operand.range.end);
                         values.push(Expr::new(ExprKind::Spread(Box::new(operand)), range));
                     } else {
                         values.push(self.parse_expr()?);
@@ -982,7 +990,7 @@ impl<'src> Parser<'src> {
                 let end = self.peek().range.end;
                 self.expect_array_close()?;
 
-                Some(Expr::new(ExprKind::Array(values), SrcRange::new(start, end)))
+                Some(Expr::new(ExprKind::Array(values), self.range(start, end)))
             }
             TokenKind::LBrace => {
                 let start = self.peek().range.start;
@@ -1021,7 +1029,7 @@ impl<'src> Parser<'src> {
                 let end = self.peek().range.end;
                 self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
 
-                Some(Expr::new(ExprKind::Object(items), SrcRange::new(start, end)))
+                Some(Expr::new(ExprKind::Object(items), self.range(start, end)))
             }
             _ => {
                 self.errors.push(Error::new(ErrorKind::ExpectedExpression, self.peek().range));
@@ -1095,7 +1103,7 @@ impl<'src> Parser<'src> {
                 body: Box::new(body),
                 cond: cond.map(Box::new),
             },
-            SrcRange::new(start, end),
+            self.range(start, end),
         ))
     }
 

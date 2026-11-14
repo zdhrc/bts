@@ -12,7 +12,7 @@ impl Token {
     fn new(kind: TokenKind, start: usize, end: usize) -> Self {
         Self {
             kind,
-            range: SrcRange { start, end },
+            range: SrcRange::new(start, end),
             line_start: 0,
         }
     }

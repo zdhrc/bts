@@ -24,7 +24,16 @@ pub use model::*;
 /// Runtime-dependent expressions remain in the model for consumers to evaluate.
 /// Use [`crate::syntax`] when only source structure is needed.
 pub mod semantics {
-    use crate::{Diags, Model, lexing::lex, modeling::model, parsing::parse};
+    use crate::{Diag, DiagPhase, Diags, Model, SrcRange, lexing::lex, modeling::model, parsing::parse};
+
+    /// A named source supplied by the caller without filesystem or package loading.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Source<'a> {
+        /// A display name for diagnostics and model provenance.
+        pub name: &'a str,
+        /// Source text in the ordinary language syntax.
+        pub text: &'a str,
+    }
 
     /// Parses source, resolves references, and checks the language's semantic rules.
     ///
@@ -43,12 +52,86 @@ pub mod semantics {
     /// empty model. All nonempty source receives the same checks as [`compile`].
     /// This supports consumers that interpret an empty module as removing resources.
     pub fn compile_module(src: &str, allow_empty: bool) -> Result<Model, Diags> {
-        let tokens = tracing::info_span!("lex").in_scope(|| lex(src))?;
-        let ast = tracing::info_span!("parse").in_scope(|| parse(tokens, src))?;
-        if allow_empty && ast.paths.is_empty() && ast.kinds.is_empty() {
-            return Ok(Model::default());
+        compile_module_with_definitions(
+            Source {
+                name: "<source>",
+                text: src,
+            },
+            &[],
+            allow_empty,
+        )
+    }
+
+    /// Compiles user source together with caller-supplied kind definitions.
+    ///
+    /// Definition sources may contain only kind declarations. All kinds share one
+    /// namespace and resolve together, including forward references across sources.
+    /// Duplicate names are errors, including identical declarations.
+    /// Source ranges use local byte offsets and a source index. Index zero identifies
+    /// `source`, and index `n + 1` identifies `definitions[n]`. Successful models
+    /// retain the corresponding names in [`Model::sources`]. The caller retains
+    /// source text and can use these indexes to render diagnostics with [`Diag::render`].
+    pub fn compile_with_definitions(source: Source<'_>, definitions: &[Source<'_>]) -> Result<Model, Diags> {
+        compile_module_with_definitions(source, definitions, false)
+    }
+
+    /// Compiles with supplied definitions and an explicit empty user module policy.
+    ///
+    /// Provider declarations do not make an empty user module nonempty. When empty
+    /// user source is allowed, supplied kinds are still validated and retained.
+    pub fn compile_module_with_definitions(
+        source: Source<'_>,
+        definitions: &[Source<'_>],
+        allow_empty: bool,
+    ) -> Result<Model, Diags> {
+        fn document(source: Source<'_>, index: usize) -> Result<crate::ast::GraphDocument, Diags> {
+            let mut tokens = tracing::info_span!("lex")
+                .in_scope(|| lex(source.text))
+                .map_err(|mut errors| {
+                    for error in &mut errors {
+                        error.r#where.source = index;
+                    }
+                    errors
+                })?;
+            for token in &mut tokens {
+                token.range.source = index;
+            }
+            tracing::info_span!("parse").in_scope(|| parse(tokens, source.text))
         }
-        tracing::info_span!("model").in_scope(|| model(ast))
+
+        let mut ast = document(source, 0)?;
+        let empty = ast.paths.is_empty() && ast.kinds.is_empty();
+        let mut kinds = Vec::new();
+        for (index, definition) in definitions.iter().enumerate() {
+            let supplied = document(*definition, index + 1)?;
+            if let Some(path) = supplied.paths.first() {
+                return Err(vec![Diag {
+                    when: DiagPhase::Validation,
+                    what: "definition sources may contain only kind declarations".to_owned(),
+                    r#where: path.range,
+                }]);
+            }
+            kinds.extend(supplied.kinds);
+        }
+        if empty && !allow_empty {
+            return Err(vec![Diag {
+                when: DiagPhase::Validation,
+                what: "expected at least one graph statement".to_owned(),
+                r#where: SrcRange::new(0, 0),
+            }]);
+        }
+        kinds.append(&mut ast.kinds);
+        ast.kinds = kinds;
+        let mut compiled = if ast.paths.is_empty() && ast.kinds.is_empty() {
+            Model::default()
+        } else {
+            tracing::info_span!("model").in_scope(|| model(ast))?
+        };
+        compiled.sources = std::iter::once(source)
+            .chain(definitions.iter().copied())
+            .map(|source| source.name.to_owned())
+            .collect();
+        Ok(compiled)
     }
 }
 

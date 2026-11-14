@@ -1,4 +1,5 @@
 use bts_lang::SrcRange;
+use bts_lang::semantics::{Source, compile_module_with_definitions, compile_with_definitions};
 use bts_lang::syntax::{
     BinOp, Expr, ExprKind, GraphNode, GraphNodeDecl, GraphOrigin, GraphReferenceKind, GraphStep, ObjectItem, TemplatePart,
     parse,
@@ -6,6 +7,36 @@ use bts_lang::syntax::{
 use bts_lang::{DiagPhase, Value, semantics::compile, syntax::parse_traversal};
 
 const COMPILATION_SOURCE: &str = include_str!("fixtures/compilation.bt");
+
+// illustrative provider definitions, not the final Braintrust schema
+const PROVIDER_SOURCE: &str = r#"
++(span::node {
+    props: {
+        name: {type: "string", required: true},
+    },
+    fields: {
+        patient_id: {type: "string"},
+        output: {type: "object", role: "output"},
+        metadata: {type: "object", default: {}},
+    },
+});
+
++(tool_span::span {});
+"#;
+
+fn compile_fixture() -> bts_lang::Model {
+    compile_with_definitions(
+        Source {
+            name: "compilation.bt",
+            text: COMPILATION_SOURCE,
+        },
+        &[Source {
+            name: "braintrust.bt",
+            text: PROVIDER_SOURCE,
+        }],
+    )
+    .unwrap_or_else(|errors| panic!("{errors:#?}"))
+}
 
 fn named_fixture_node<'a>(ast: &'a bts_lang::syntax::Ast, name: &str) -> &'a GraphNodeDecl {
     ast.paths
@@ -677,16 +708,7 @@ fn handles_truncated_pattern_references_without_panicking() {
 
 #[test]
 fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
-    let model = compile(COMPILATION_SOURCE).unwrap_or_else(|errors| {
-        panic!(
-            "{}",
-            errors
-                .iter()
-                .map(|e| e.render("compilation.bt", COMPILATION_SOURCE))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    });
+    let model = compile_fixture();
     assert_eq!(model.paths.len(), 53);
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
@@ -1320,21 +1342,21 @@ fn validates_builtin_junction_configuration() {
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     use bts_lang::{Construct, ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.kinds.len(), 6);
+    assert_eq!(ast.kinds.len(), 5);
     assert_eq!(ast.kinds[0].construct, Construct::Node);
-    assert_eq!(ast.kinds[2].construct, Construct::Edge);
-    assert_eq!(ast.kinds[3].construct, Construct::Fork);
-    assert_eq!(ast.kinds[4].construct, Construct::Junction);
+    assert_eq!(ast.kinds[1].construct, Construct::Edge);
+    assert_eq!(ast.kinds[2].construct, Construct::Fork);
+    assert_eq!(ast.kinds[3].construct, Construct::Junction);
     let marker = field(node_declaration(&edge(&ast.paths[37].steps[0]).target), "patient_id");
     assert!(matches!(marker.kind, ExprKind::Upstream));
     assert_eq!(&COMPILATION_SOURCE[marker.range.start..marker.range.end], "<-");
-    let model = compiled(COMPILATION_SOURCE);
+    let model = compile_fixture();
     assert_eq!(binding(&model, "patient_request", "patient_id").ty, FieldType::String);
     assert!(matches!(
         binding(&model, "patient_request", "description").value,
         Value::Template(_)
     ));
-    let span = model.kind_names["span"];
+    let span = model.kind_names["tool_span"];
     let lookup = &model.kinds[model.kind_names["patient_lookup"].0];
     assert_eq!(lookup.base_kind, Some(span));
     assert!(
@@ -1835,7 +1857,7 @@ fn weighted_each_and_reduce_validate_configuration_without_executing() {
 
 #[test]
 fn fixture_covers_networks_hyperrelations_and_runtime_kind_contracts() {
-    let model = compiled(COMPILATION_SOURCE);
+    let model = compile_fixture();
     assert_eq!(model.networks.len(), 2);
     assert_eq!(model.networks[0].acyclic, bts_lang::Acyclic::Underlying);
     assert_eq!(model.networks[1].validate, bts_lang::ValidationStage::Materialized);
@@ -1850,4 +1872,177 @@ fn fixture_covers_networks_hyperrelations_and_runtime_kind_contracts() {
     }
     assert!(model.junctions.iter().any(|junction| junction.kind == "reduce"));
     assert_eq!(model.edges.iter().filter(|edge| edge.kind == "incidence").count(), 3);
+}
+
+#[test]
+fn provider_definitions_extend_and_preserve_source_identity() {
+    let model = compile_fixture();
+    assert_eq!(model.sources, ["compilation.bt", "braintrust.bt"]);
+    let span = &model.kinds[model.kind_names["span"].0];
+    let tool = &model.kinds[model.kind_names["tool_span"].0];
+    let local = &model.kinds[model.kind_names["patient_lookup"].0];
+    assert_eq!(tool.base_kind, Some(model.kind_names["span"]));
+    assert_eq!(local.base_kind, Some(model.kind_names["tool_span"]));
+    assert_eq!(span.range.source, 1);
+    assert_eq!(tool.range.source, 1);
+    assert_eq!(local.range.source, 0);
+    assert!(PROVIDER_SOURCE[span.range.start..span.range.end].starts_with("+(span::node"));
+    assert!(COMPILATION_SOURCE[local.range.start..local.range.end].starts_with("+(patient_lookup::tool_span"));
+    let metadata = local.fields.iter().find(|field| field.name == "metadata").unwrap();
+    assert_eq!(metadata.range.source, 1);
+}
+
+#[test]
+fn supplied_kinds_cover_every_construct_and_cross_source_forward_inheritance() {
+    let definitions = [
+        Source {
+            name: "derived.bt",
+            text: "+(tool_span::span {}); +-[delivery::feeds {}]-; +=[split::parallel {}]=; +>[join::accumulate {}]>>;",
+        },
+        Source {
+            name: "base.bt",
+            text: "+(span::node {fields: {id: {type: \"string\"}}});",
+        },
+    ];
+    let source = Source {
+        name: "user.bt",
+        text: r#"
+        +(special::tool_span {});
+        (a:special) {id: "p-1"}
+            =[branches:split]=>[
+                -[one:delivery {value: source.id, into: target.id}]->(b:tool_span) {id: <-},
+                -[two:next]->(c:span)
+            ]
+                >[:join [one], [two]]>>(d:span);
+    "#,
+    };
+    let model = compile_with_definitions(source, &definitions).unwrap();
+    assert_eq!(model.kinds[model.kind_names["special"].0].primitive, "node");
+    assert_eq!(model.kinds[model.kind_names["delivery"].0].primitive, "feeds");
+    assert_eq!(model.kinds[model.kind_names["split"].0].primitive, "parallel");
+    assert_eq!(model.kinds[model.kind_names["join"].0].primitive, "accumulate");
+    assert_eq!(model.kinds[model.kind_names["span"].0].range.source, 2);
+}
+
+#[test]
+fn provider_conflicts_and_inheritance_errors_use_the_existing_rules() {
+    for (user, first, second, message, source_index) in [
+        ("+(span::node {});", "+(span::node {});", "", "duplicate kind", 0),
+        ("(a:node);", "+(span::node {});", "+(span::node {});", "duplicate kind", 2),
+        ("(a:node);", "+(node::node {});", "", "reserved", 1),
+        ("(a:node);", "+(span::missing {});", "", "unknown base", 1),
+        ("(a:node);", "+(span::tool_span {});", "+(tool_span::span {});", "circular", 1),
+        ("(a:node);", "+(span::delivery {});", "+-[delivery::link {}]-;", "crosses", 1),
+        (
+            "+(local::span {props: {name: {required: false}}});",
+            "+(span::node {props: {name: {type: \"string\", required: true}}});",
+            "",
+            "required",
+            0,
+        ),
+    ] {
+        let errors = compile_with_definitions(
+            Source {
+                name: "user.bt",
+                text: user,
+            },
+            &[
+                Source {
+                    name: "first.bt",
+                    text: first,
+                },
+                Source {
+                    name: "second.bt",
+                    text: second,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(errors[0].what.contains(message), "{errors:?}");
+        assert_eq!(errors[0].r#where.source, source_index, "{errors:?}");
+    }
+}
+
+#[test]
+fn supplied_sources_report_local_ranges_in_every_phase() {
+    for (text, phase) in [
+        ("# é\n`", DiagPhase::Lexing),
+        ("# é\n+(span::node {", DiagPhase::Parsing),
+        (
+            "# é\n+(span::node {fields: {id: {type: \"unknown\"}}});",
+            DiagPhase::Validation,
+        ),
+        ("# é\n(a:node);", DiagPhase::Validation),
+    ] {
+        let error = compile_with_definitions(
+            Source {
+                name: "user.bt",
+                text: "(a:node);",
+            },
+            &[Source {
+                name: "provider.bt",
+                text,
+            }],
+        )
+        .unwrap_err()
+        .remove(0);
+        assert_eq!(error.when, phase);
+        assert_eq!(error.r#where.source, 1);
+        assert!(error.r#where.end <= text.len());
+        assert!(error.render("provider.bt", text).starts_with("provider.bt:2:"));
+    }
+    for text in ["(a:span);", "(a:span {name: 1});", "(a:span {name: \"ok\", extra: true});"] {
+        let error = compile_with_definitions(
+            Source { name: "user.bt", text },
+            &[Source {
+                name: "provider.bt",
+                text: PROVIDER_SOURCE,
+            }],
+        )
+        .unwrap_err()
+        .remove(0);
+        assert_eq!(error.r#where.source, 0);
+        assert!(error.r#where.end <= text.len());
+        assert_eq!(error.when, DiagPhase::Validation);
+    }
+}
+
+#[test]
+fn empty_user_modules_do_not_bypass_provider_validation() {
+    let source = Source {
+        name: "empty.bt",
+        text: "# empty",
+    };
+    let definitions = [Source {
+        name: "provider.bt",
+        text: PROVIDER_SOURCE,
+    }];
+    assert!(compile_with_definitions(source, &definitions).is_err());
+    let model = compile_module_with_definitions(source, &definitions, true).unwrap();
+    assert!(model.nodes.is_empty());
+    assert_eq!(model.kinds.len(), 2);
+    assert!(
+        compile_module_with_definitions(
+            source,
+            &[Source {
+                name: "invalid.bt",
+                text: "+(span::missing {});",
+            }],
+            true
+        )
+        .is_err()
+    );
+    let model = compile_module_with_definitions(source, &[], true).unwrap();
+    assert_eq!(model.sources, ["empty.bt"]);
+    assert!(model.kinds.is_empty());
+    let model = compile_with_definitions(
+        Source {
+            name: "user.bt",
+            text: "(a:custom);",
+        },
+        &[],
+    )
+    .unwrap();
+    assert_eq!(model.sources, ["user.bt"]);
+    assert_eq!(model.nodes[0].range.source, 0);
 }

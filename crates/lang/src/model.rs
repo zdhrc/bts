@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 /// A compiled graph with stable model-local identities and resolved references.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
+    /// Source names indexed by source ranges, with user source at zero.
+    pub sources: Vec<String>,
     /// Resolved kind schemas with inherited fields.
     pub kinds: Vec<Kind>,
     /// Kind names live separately from graph instance names.

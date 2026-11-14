@@ -87,6 +87,8 @@ impl fmt::Display for DiagPhase {
 /// `start` is inclusive and `end` is exclusive. These are not character indexes.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SrcRange {
+    /// Source index within a compilation, with user source at zero.
+    pub source: usize,
     /// The inclusive starting byte offset.
     pub start: usize,
     /// The exclusive ending byte offset.
@@ -96,7 +98,7 @@ pub struct SrcRange {
 impl SrcRange {
     /// Creates a byte range. The caller must supply ordered offsets at UTF-8 boundaries.
     pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+        Self { source: 0, start, end }
     }
 }
 

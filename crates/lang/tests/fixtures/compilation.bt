@@ -360,19 +360,9 @@
 >[:quorum {count: 2, correlate: settings.request_id} [to_identity], [to_insurance], [to_schedule]]>>(enough_checks:task);
 
 
-# kind schemas have strict properties and open content fields
-+(span::node {
-    props: {
-        name: {type: "string", required: true},
-    },
-    fields: {
-        patient_id: {type: "string"},
-        output: {type: "object", role: "output"},
-        metadata: {type: "object", default: {}},
-    },
-});
-
-+(patient_lookup::span {
+# span and tool_span are supplied by the provider source in compilation.rs
+# local kinds inherit strict properties and open content fields
++(patient_lookup::tool_span {
     props: {
         resource: {type: "string", default: "patients"},
     },
