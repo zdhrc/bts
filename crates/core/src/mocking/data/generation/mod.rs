@@ -280,8 +280,8 @@ pub fn case_snapshot(model: &Model, case: &crate::dsl::DatasetCase, seed: u64) -
 #[cfg(test)]
 mod snapshot_tests {
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::mocking::data::{UnsupportedAttachment, Value};
+    use crate::providers::braintrust::mocking::compile;
     use serde_json::{Value as JsonValue, json};
 
     fn snapshot(model: &Model, case: usize, seed: u64) -> JsonValue {
@@ -294,18 +294,12 @@ mod snapshot_tests {
     #[test]
     fn inline_references_share_samples_and_respect_the_seed() {
         let model = compile(
-            r#"trace "sample" {
-                input = { first = range(1, 1000000000), second = range(1, 1000000000) }
-                output = self.input.first + self.input.second
-            }
-            dataset "cases" {
-                case "inline" {
-                    input = trace.sample.input
-                    expected = trace.sample.output
-                    metadata = { first = trace.sample.input.first }
-                    tags = ["sample-${trace.sample.input.second}"]
-                }
-            }"#,
+            r#"(sample_root:task {name: "sample"}) {input: sample.input, output: self.input.first + self.input.second};
+(sample:agent) {input: {first: range (1 , 1000000000), second: range (1 , 1000000000)}, output: sample_root.output};
+(sample)-[:contains]->(sample_root);
+(sample)-[:next]->(sample_root);
+(dataset_cases_inline:case {name: "inline"}) {input: (sample_root).input, expected: (sample_root).output, metadata: {first: (sample_root).input.first}, tags: [|"sample-${(sample_root).input.second}"|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_inline)|]};"#,
         )
         .unwrap();
         let row = snapshot(&model, 0, 42);
@@ -321,26 +315,27 @@ mod snapshot_tests {
     #[test]
     fn trace_and_nested_span_sources_default_to_output_and_allow_expected_overrides() {
         let model = compile(
-            r#"trace "support" {
-                input = { request = "question" }
-                output = task.answer.tool.reply.output
-                task "answer" {
-                    input = trace.input.request
-                    tool "reply" {
-                        input = { query = task.answer.input }
-                        output = { answer = "answer", request = self.input.query }
-                    }
-                }
-            }
-            trace "deferred" { input = "question" output = 1 / range(0, 0) }
-            dataset "cases" {
-                case "trace" { trace = trace.support }
-                case "span" { span = trace.support.task.answer.tool.reply }
-                case "trace-override" { trace = trace.support expected = "reviewed trace" }
-                case "span-override" { span = trace.support.task.answer.tool.reply expected = null }
-                case "unused-output" { trace = trace.deferred expected = "reviewed" }
-                case "invalid-default" { trace = trace.deferred }
-            }"#,
+            r#"(support_root:task {name: "support"}) {input: support.input, output: reply.output};
+(answer:task {name: "answer"}) {input: support_root.input.request};
+(reply:tool {name: "reply"}) {input: {query: answer.input}, output: {answer: "answer", request: self.input.query}};
+(support:agent) {input: {request: "question"}, output: support_root.output};
+(support)-[:contains]->(support_root);
+(support)-[:contains]->(answer);
+(answer)-[:child_of]->(support_root);
+(support)-[:contains]->(reply);
+(reply)-[:child_of]->(answer);
+(support)-[:next]->(support_root)-[:next]->(answer)-[:next]->(reply);
+(deferred_root:task {name: "deferred"}) {input: deferred.input, output: 1 / range (0 , 0)};
+(deferred:agent) {input: "question", output: deferred_root.output};
+(deferred)-[:contains]->(deferred_root);
+(deferred)-[:next]->(deferred_root);
+(dataset_cases_trace:case {name: "trace"}) {source: (support_root)};
+(dataset_cases_span:case {name: "span"}) {source: (reply)};
+(dataset_cases_trace_override:case {name: "trace-override"}) {source: (support_root), expected: "reviewed trace"};
+(dataset_cases_span_override:case {name: "span-override"}) {source: (reply), expected: null};
+(dataset_cases_unused_output:case {name: "unused-output"}) {source: (deferred_root), expected: "reviewed"};
+(dataset_cases_invalid_default:case {name: "invalid-default"}) {source: (deferred_root)};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_trace), (dataset_cases_span), (dataset_cases_trace_override), (dataset_cases_span_override), (dataset_cases_unused_output), (dataset_cases_invalid_default)|]};"#,
         )
         .unwrap();
         let expected = json!({"answer": "answer", "request": "question"});
@@ -365,12 +360,17 @@ mod snapshot_tests {
     #[test]
     fn grouped_sources_preserve_order_and_reuse_repeated_trace_values() {
         let model = compile(
-            r#"trace "first" { input = { label = "first", number = range(1, 1000000) } output = self.input.number * 2 }
-               trace "second" { input = { label = "second", number = range(1, 1000000) } output = self.input.number * 2 }
-               dataset "cases" {
-                   case "group" { traces = [trace.second, trace.first, trace.second] }
-                   case "override" { traces = [trace.second, trace.first] expected = "reviewed group" }
-               }"#,
+            r#"(first_root:task {name: "first"}) {input: first.input, output: self.input.number * 2};
+(first:agent) {input: {label: "first", number: range (1 , 1000000)}, output: first_root.output};
+(first)-[:contains]->(first_root);
+(first)-[:next]->(first_root);
+(second_root:task {name: "second"}) {input: second.input, output: self.input.number * 2};
+(second:agent) {input: {label: "second", number: range (1 , 1000000)}, output: second_root.output};
+(second)-[:contains]->(second_root);
+(second)-[:next]->(second_root);
+(dataset_cases_group:case {name: "group"}) {traces: [|(second_root) , (first_root) , (second_root)|]};
+(dataset_cases_override:case {name: "override"}) {traces: [|(second_root) , (first_root)|], expected: "reviewed group"};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_group), (dataset_cases_override)|]};"#,
         )
         .unwrap();
         let row = snapshot(&model, 0, 17);
@@ -394,14 +394,22 @@ mod snapshot_tests {
     #[test]
     fn missing_source_fields_preserve_null_input_and_absent_expected() {
         let model = compile(
-            r#"trace "empty" { task "empty" {} }
-               trace "answer" { output = "answer" }
-               dataset "cases" {
-                   case "trace" { trace = trace.empty }
-                   case "span" { span = trace.empty.task.empty }
-                   case "answer" { trace = trace.answer }
-                   case "group" { traces = [trace.empty, trace.answer] }
-               }"#,
+            r#"(empty_root:task {name: "empty"}) {input: empty.input};
+(empty_1:task {name: "empty"}) {};
+(empty:agent) {input: null, output: null};
+(empty)-[:contains]->(empty_root);
+(empty)-[:contains]->(empty_1);
+(empty_1)-[:child_of]->(empty_root);
+(empty)-[:next]->(empty_root)-[:next]->(empty_1);
+(answer_root:task {name: "answer"}) {output: "answer", input: answer.input};
+(answer:agent) {input: null, output: answer_root.output};
+(answer)-[:contains]->(answer_root);
+(answer)-[:next]->(answer_root);
+(dataset_cases_trace:case {name: "trace"}) {source: (empty_root)};
+(dataset_cases_span:case {name: "span"}) {source: (empty_1)};
+(dataset_cases_answer:case {name: "answer"}) {source: (answer_root)};
+(dataset_cases_group:case {name: "group"}) {traces: [|(empty_root) , (answer_root)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_trace), (dataset_cases_span), (dataset_cases_answer), (dataset_cases_group)|]};"#,
         )
         .unwrap();
         assert_eq!(snapshot(&model, 0, 42), json!({"input": null}));
@@ -416,12 +424,14 @@ mod snapshot_tests {
     #[test]
     fn attachments_stay_typed_and_fail_without_a_projection() {
         let model = compile(
-            r#"trace "document" { input = attachment("report.txt", "text/plain") }
-               dataset "cases" {
-                   case "inline" { input = { files = [attachment("report.txt", "text/plain")] } }
-                   case "trace" { trace = trace.document }
-                   case "projected" { input = trace.document.input.filename }
-               }"#,
+            r#"(document_root:task {name: "document"}) {input: document.input};
+(document:agent) {input: attachment ("report.txt" , "text/plain"), output: null};
+(document)-[:contains]->(document_root);
+(document)-[:next]->(document_root);
+(dataset_cases_inline:case {name: "inline"}) {input: {files: [|attachment ("report.txt" , "text/plain")|]}};
+(dataset_cases_trace:case {name: "trace"}) {source: (document_root)};
+(dataset_cases_projected:case {name: "projected"}) {input: (document_root).input.filename};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_inline), (dataset_cases_trace), (dataset_cases_projected)|]};"#,
         )
         .unwrap();
         let inline = case_snapshot(&model, &model.datasets[0].cases[0], 42).unwrap();
@@ -447,17 +457,19 @@ mod experiment_tests {
 
     #[test]
     fn materializes_fields_from_a_resolved_case_source() {
-        let model = crate::dsl::semantics::compile(
-            r#"
-            vars { source = trace["support"] }
-            dataset "cases" {
-                case "whole" { trace = var.source }
-                case "span" { span = var.source.task["lookup"] }
-                case "fields" { input = var.source.input expected = var.source.task["lookup"].output }
-                case "group" { traces = [var.source, trace["support"]] }
-            }
-            trace "support" { input = "question" task "lookup" { output = "answer" } }
-        "#,
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(support_root:task {name: "support"}) {input: support.input, source: (support_root)};
+(lookup:task {name: "lookup"}) {output: "answer"};
+(support:agent) {input: "question", output: null};
+(support)-[:contains]->(support_root);
+(support)-[:contains]->(lookup);
+(lookup)-[:child_of]->(support_root);
+(support)-[:next]->(support_root)-[:next]->(lookup);
+(dataset_cases_whole:case {name: "whole"}) {source: support_root.source};
+(dataset_cases_span:case {name: "span"}) {source: (lookup)};
+(dataset_cases_fields:case {name: "fields"}) {input: support_root.source.input, expected: lookup.output};
+(dataset_cases_group:case {name: "group"}) {traces: [|support_root.source , (support_root)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_whole), (dataset_cases_span), (dataset_cases_fields), (dataset_cases_group)|]};"#,
         )
         .unwrap();
         let batch = case_data(&model, &model.datasets[0].cases[2], 3, &()).unwrap();
@@ -469,27 +481,35 @@ mod experiment_tests {
 
     #[test]
     fn selected_task_evaluates_only_used_dependencies() {
-        let model = crate::dsl::semantics::compile(
+        let model = crate::providers::braintrust::mocking::compile(
             r#"
-            trace "workflow" {
-                input = "outer"
-                repeat "unused" { count = range(-2, -1) tool "unused" { output = "unused" } }
-                task "answer" {
-                    input = "fallback"
-                    output = self.input == "use" ? trace.context.task.details.output : "no dependency"
-                    llm "first" { output = llm.second.output }
-                    llm "second" { output = "reply" }
-                }
-            }
-            trace "context" {
-                task "details" { output = "support context" }
-                repeat "unused" { count = range(-2, -1) tool "unused" { output = "unused" } }
-            }
-            trace "unrelated" { repeat "unused" { count = range(-2, -1) tool "unused" { output = "unused" } } }
-            dataset "cases" { case "one" { input = "use" } }
-            scorer "s" { code { score = 1 } }
-            experiment "e" { dataset = dataset.cases task = trace.workflow.task.answer scorers = [scorer.s] }
-        "#,
+(workflow:agent) {input: "outer", output: null};
+(workflow)-[:contains]->(root);
+(workflow)-[:contains]->(unused);
+(workflow)-[:contains]->(selected);
+(workflow)-[:contains]->(first);
+(workflow)-[:contains]->(second);
+(workflow)-[:next]->(root:task) {input: workflow.input};
+(root)=[:repeat {count: range(-2, -1)}]=>[-[:next]->(unused:tool) {output: "unused"}];
+(unused)-[:child_of]->(root);
+(root)-[:next]->(selected:task {name: "answer"}) {
+ input: "fallback", output: self.input == "use" ? details.output : "no dependency"
+}-[:next]->(first:llm) {output: second.output}-[:next]->(second:llm) {output: "reply"};
+(selected)-[:child_of]->(root);
+(first)-[:child_of]->(selected);
+(second)-[:child_of]->(selected);
+(context_agent:agent) {input: null, output: null};
+(context_agent)-[:contains]->(details);
+(context_agent)-[:contains]->(context_unused);
+(context_agent)-[:next]->(details:task) {input: context_agent.input, output: "support context"};
+(details)=[:repeat {count: range(-2, -1)}]=>[-[:next]->(context_unused:tool) {output: "unused"}];
+(context_unused)-[:child_of]->(details);
+
+(one:case) {input: "question"};
+(cases:dataset) {cases: [|(one)|]};
+(s:scorer) {score: 1};
+(e:experiment) {dataset: (cases), task: (selected), scorers: [|(s)|]};
+"#,
         )
         .unwrap();
         for (input, expected) in [("use", "support context"), ("skip", "no dependency")] {
@@ -515,13 +535,19 @@ mod experiment_tests {
     #[test]
     fn selected_trace_skips_unrelated_errors_but_reports_used_dependency_errors() {
         let source = r#"
-            trace "good" { input = "fallback" output = "ok" }
-            trace "bad" { repeat "steps" { count = range(-2, -1) tool "lookup" { output = "unused" } } }
-            dataset "cases" { case "one" { input = "question" } }
-            scorer "s" { code { score = 1 } }
-            experiment "e" { dataset = dataset.cases task = trace.good scorers = [scorer.s] }
-        "#;
-        let model = crate::dsl::semantics::compile(source).unwrap();
+(good:agent) {input: "fallback", output: selected.output};
+(good)-[:contains]->(selected);
+(good)-[:next]->(selected:task) {input: good.input, output: "ok"};
+(bad:agent) {input: null, output: bad_root.output};
+(bad)-[:contains]->(bad_root);
+(bad)-[:next]->(bad_root:task) {input: bad.input, output: 1 / range(0, 0)};
+
+(one:case) {input: "question"};
+(cases:dataset) {cases: [|(one)|]};
+(s:scorer) {score: 1};
+(e:experiment) {dataset: (cases), task: (selected), scorers: [|(s)|]};
+"#;
+        let model = crate::providers::braintrust::mocking::compile(source).unwrap();
         assert!(
             experiment_result(
                 &model,
@@ -534,10 +560,9 @@ mod experiment_tests {
             )
             .is_ok()
         );
-        let model = crate::dsl::semantics::compile(
-            &source.replace("output = \"ok\"", "output = trace.bad.repeat.steps[0].tool.lookup.output"),
-        )
-        .unwrap();
+        let model =
+            crate::providers::braintrust::mocking::compile(&source.replace("output: \"ok\"", "output: bad_root.output"))
+                .unwrap();
         let error = experiment_result(
             &model,
             model.experiments[0].task,
@@ -548,30 +573,34 @@ mod experiment_tests {
             &(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("repeat count is negative"));
+        assert!(matches!(error, Error::Plan(error) if error.kind() == EvaluationErrorKind::DivisionByZero));
     }
 
     #[test]
     fn dataset_fields_drive_selected_subtree_and_preserve_original_scopes() {
-        let model = crate::dsl::semantics::compile(
-            r#"
-            vars { context = "root variable" }
-            trace "workflow" {
-                input = "outer fallback"
-                tool "context" { output = var.context }
-                task "answer" {
-                    input = "task fallback"
-                    expected = "task expectation"
-                    metadata = { tier = "free", channel = "chat" }
-                    output = "${self.input}/${self.expected}/${self.metadata.tier}/${tool.context.output}"
-                    llm "reply" { input = task.answer.input output = task.answer.output }
-                    scorer "quality" { score = 0 }
-                }
-            }
-            dataset "cases" { case "one" { input = "dataset input" } }
-            scorer "quality" { code { score = 1 } }
-            experiment "e" { dataset = dataset.cases task = trace.workflow.task.answer scorers = [scorer.quality] }
-        "#,
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"+(text_task::task {fields: {input: {type: "string"}}});
++(text_tool::tool {fields: {output: {type: "string"}}});
+(workflow_root:task {name: "workflow"}) {input: workflow.input, context: "root variable"};
+(context_node:text_tool {name: "context"}) {output: workflow_root.context};
+(answer:text_task {name: "answer"}) {input: "task fallback", expected: "task expectation", metadata: {tier: "free", channel: "chat"}, output: "${self.input}/${trim(self.expected)}/${trim(self.metadata.tier)}/${context_node.output}"};
+(reply:llm {name: "reply"}) {input: answer.input, output: answer.output};
+(quality:scorer {name: "quality"}) {score: 0};
+(workflow:agent) {input: "outer fallback", output: null};
+(workflow)-[:contains]->(workflow_root);
+(workflow)-[:contains]->(context_node);
+(context_node)-[:child_of]->(workflow_root);
+(workflow)-[:contains]->(answer);
+(answer)-[:child_of]->(workflow_root);
+(workflow)-[:contains]->(reply);
+(reply)-[:child_of]->(answer);
+(workflow)-[:contains]->(quality);
+(quality)-[:child_of]->(answer);
+(workflow)-[:next]->(workflow_root)-[:next]->(context_node)-[:next]->(answer)-[:next]->(reply)-[:next]->(quality);
+(dataset_cases_one:case {name: "one"}) {input: "dataset input"};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
+(quality_function:scorer {name: "quality"}) {score: 1};
+(experiment_e:experiment {name: "e"}) {dataset: (dataset_cases), task: (answer), scorers: [|(quality_function)|]};"#,
         )
         .unwrap();
         let row = json!({"input":"dataset input", "expected":"dataset expectation", "metadata":{"tier":"enterprise"}, "tags":["regression"]});
@@ -594,12 +623,22 @@ mod experiment_tests {
 
     #[test]
     fn whole_trace_generation_uses_dataset_input_and_dynamic_children() {
-        let model = crate::dsl::semantics::compile(r#"
-            trace "t" { input = "fallback" output = trace.input repeat "steps" { count = 2 tool "lookup" { input = trace.input output = repeat.index } } }
-            dataset "cases" { case "one" { input = "question" } }
-            scorer "s" { code { score = 1 } }
-            experiment "e" { dataset = dataset.cases task = trace.t scorers = [scorer.s] }
-        "#).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"
+(t:agent) {input: "fallback", output: selected.output};
+(t)-[:contains]->(selected);
+(t)-[:contains]->(lookup);
+(t)-[:next]->(selected:task) {input: t.input, output: self.input};
+(selected)=[:repeat {count: 2}]=>[-[:next]->(lookup:tool) {input: selected.input, output: context.index}];
+(lookup)-[:child_of]->(selected);
+
+(one:case) {input: "question"};
+(cases:dataset) {cases: [|(one)|]};
+(s:scorer) {score: 1};
+(e:experiment) {dataset: (cases), task: (selected), scorers: [|(s)|]};
+"#,
+        )
+        .unwrap();
         let batch = experiment_result(
             &model,
             model.experiments[0].task,

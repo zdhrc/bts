@@ -232,8 +232,8 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::mocking::data::{Distribution, generate};
+    use crate::providers::braintrust::mocking::compile;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -246,13 +246,10 @@ mod tests {
         }
 
         let model = compile(
-            r#"
-            trace "example" {
-                input = { files = [attachment("report.txt", "text/plain")] }
-                output = self.input["files"][0]
-                metadata = { copied = self.output }
-            }
-            "#,
+            r#"(example_root:task {name: "example"}) {input: example.input, output: self.input ["files"][0], metadata: {copied: self.output}};
+(example:agent) {input: {files: [|attachment("report.txt", "text/plain")|]}, output: example_root.output};
+(example)-[:contains]->(example_root);
+(example)-[:next]->(example_root);"#,
         )
         .unwrap();
         let mut batch = generate(

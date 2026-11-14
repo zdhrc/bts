@@ -57,6 +57,7 @@ fn braintrust_provider_schemas_compile_inherited_spans_and_propagation() {
 
 #[test]
 fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
+    compile_braintrust(include_str!("../../core/tests/fixtures/agent.bt")).unwrap();
     let model = compile_braintrust(BRAINTRUST_FIXTURE).unwrap();
     let agent = model.kinds.iter().find(|kind| kind.name == "agent").unwrap();
     assert_eq!(agent.base, "node");
@@ -97,6 +98,31 @@ fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
 }
 
 #[test]
+fn braintrust_span_parenting_preserves_direction_and_extension() {
+    let model = compile_braintrust(BRAINTRUST_FIXTURE).unwrap();
+    let parents: Vec<_> = model.edges.iter().filter(|edge| edge.kind == "child_of").collect();
+    assert_eq!(parents.len(), 5);
+    for (child, parent) in [
+        ("lookup", "request"),
+        ("route", "request"),
+        ("reply", "route"),
+        ("format_reply", "request"),
+        ("grade", "request"),
+    ] {
+        assert!(parents.iter().any(|edge| {
+            model.nodes[edge.source.0].name.as_deref() == Some(child)
+                && model.nodes[edge.target.0].name.as_deref() == Some(parent)
+        }));
+    }
+    let declarations = "+-[nested::child_of {}]-; (parent:task); (child:tool);";
+    compile_braintrust(&format!("{declarations} (child)-[:nested]->(parent);")).unwrap();
+    for edge in ["(child)-[:child_of]-(parent);", "(child)-[:nested]-(parent);"] {
+        assert!(compile_braintrust(&format!("{declarations} {edge}")).is_err());
+    }
+    assert!(compile_braintrust("+-[nested::child_of {direction: \"either\"}]-; (a:task);").is_err());
+}
+
+#[test]
 fn braintrust_provider_schemas_reject_invalid_known_fields_and_properties() {
     for source in [
         "(a:agent {name: 42});",
@@ -110,7 +136,6 @@ fn braintrust_provider_schemas_reject_invalid_known_fields_and_properties() {
         "(a:function) {tags: \"tag\"};",
         "(a:tool) {duration: \"slow\"};",
         "(a:span) {scores: false};",
-        "(a:scorer);",
         "(a:scorer) {score: \"good\"};",
         "(a:scorer) {score: 1, reason: false};",
     ] {
@@ -253,7 +278,7 @@ fn parses_companion_definitions_from_the_fixture() {
     let scorer = named_fixture_node(&ast, "routing_correct");
     assert_eq!(scorer.header.kind, "scorer");
     assert!(matches!(&scorer.header.props.as_ref().unwrap()[0].value.kind, ExprKind::Str(lang) if lang == "python"));
-    assert!(matches!(field(scorer, "code").kind, ExprKind::Object(_)));
+    assert!(matches!(field(scorer, "score").kind, ExprKind::Cond { .. }));
     let dataset = named_fixture_node(&ast, "intake_cases");
     assert_eq!(dataset.header.kind, "dataset");
     let ExprKind::Array(cases) = &field(dataset, "cases").kind else {
@@ -656,7 +681,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 53);
+    assert_eq!(graph.paths.len(), 55);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -826,7 +851,7 @@ fn handles_truncated_pattern_references_without_panicking() {
 #[test]
 fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
     let model = compile_fixture();
-    assert_eq!(model.paths.len(), 53);
+    assert_eq!(model.paths.len(), 55);
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
     assert!(model.forks.len() > 5);
@@ -926,7 +951,7 @@ fn preserves_dynamic_binding_identity_through_aliases() {
     let model =
         compiled("(v:vars) {draw: range(1, 9), alias: self.draw, result: self.alias + 1, text: \"draw ${self.alias}\"};");
     let draw = model.bindings.iter().position(|item| item.path == ["draw"]).unwrap();
-    assert!(matches!(binding(&model,"v","alias").value, Value::BindingRef(id) if id.0 == draw));
+    assert!(matches!(binding(&model,"v","alias").value, Value::BindingRef(id, _) if id.0 == draw));
     assert!(matches!(binding(&model, "v", "result").value, Value::Binary { .. }));
     assert!(matches!(binding(&model, "v", "text").value, Value::Template(_)));
     compiled(
@@ -1120,7 +1145,7 @@ fn shares_nested_dynamic_fields_without_resampling() {
     let Value::Object(object) = &binding(&model, "v", "metrics").value else {
         panic!()
     };
-    assert!(matches!(object.elem[0].value, Value::BindingRef(_)));
+    assert!(matches!(object.elem[0].value, Value::BindingRef(_, _)));
 }
 
 #[test]
@@ -1459,7 +1484,7 @@ fn validates_builtin_junction_configuration() {
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     use bts_lang::{Construct, ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.kinds.len(), 5);
+    assert_eq!(ast.kinds.len(), 6);
     assert_eq!(ast.kinds[0].construct, Construct::Node);
     assert_eq!(ast.kinds[1].construct, Construct::Edge);
     assert_eq!(ast.kinds[2].construct, Construct::Fork);
@@ -2162,4 +2187,77 @@ fn empty_user_modules_do_not_bypass_provider_validation() {
     .unwrap();
     assert_eq!(model.sources, ["user.bt"]);
     assert_eq!(model.nodes[0].range.source, 0);
+}
+
+#[test]
+fn input_roles_preserve_fallbacks_without_folding_caller_reads() {
+    let model = compile_fixture();
+    let binding = |field: &str| {
+        model
+            .bindings
+            .iter()
+            .find(|binding| {
+                let bts_lang::ElementId::Node(node) = binding.owner else {
+                    return false;
+                };
+                model.nodes[node.0].name.as_deref() == Some("caller_values") && binding.path == [field]
+            })
+            .unwrap()
+    };
+    assert!(matches!(binding("payload").value, Value::Object(_)));
+    assert!(matches!(binding("observed").value, Value::BindingRef(_, _)));
+    assert!(matches!(binding("selected").value, Value::Cond { .. }));
+
+    let source = r#"
++(payload::node {fields: {input: {type: "number", role: "input"}}});
+(a:payload) {input: 1, first: a.input, second: a.input};
+"#;
+    let model = bts_lang::semantics::compile(source).unwrap();
+    let reads: Vec<_> = model
+        .bindings
+        .iter()
+        .filter_map(|binding| {
+            if matches!(binding.path.first().map(String::as_str), Some("first" | "second"))
+                && let Value::BindingRef(id, range) = binding.value
+            {
+                return Some((id, range));
+            }
+            None
+        })
+        .collect();
+    assert_eq!(reads.len(), 2);
+    assert_eq!(reads[0].0, reads[1].0);
+    assert_ne!(reads[0].1, reads[1].1);
+    for (_, range) in reads {
+        assert_eq!(&source[range.start..range.end], "a.input");
+    }
+
+    let source = r#"
++(flags::node {fields: {first: {type: "boolean", role: "input"}, second: {type: "boolean", role: "input"}}});
+(a:flags) {first: true, second: false}
+    =[:exclusive]=>[
+        -[:next {when: a.first}]->(b:node),
+        -[:next {when: a.second}]->(c:node),
+    ];
+"#;
+    assert!(compile(source).is_err(), "fallbacks cannot prove caller inputs disjoint");
+}
+
+#[test]
+fn repeat_forks_require_nonnegative_integer_counts() {
+    for source in [
+        "(a:task)=[:repeat {count: 0}]=>[-[:next]->(b:task)];",
+        "(a:task)=[:repeat {count: context.count}]=>[-[:next]->(b:task)];",
+    ] {
+        compiled(source);
+    }
+    for source in [
+        "(a:task)=[:repeat]=>[-[:next]->(b:task)];",
+        "(a:task)=[:repeat {count: -1}]=>[-[:next]->(b:task)];",
+        "(a:task)=[:repeat {count: 1.5}]=>[-[:next]->(b:task)];",
+        "(a:task)=[:repeat {count: true}]=>[-[:next]->(b:task)];",
+        "(a:task)=[:repeat {count: 2}]=>[-[:next {when: true}]->(b:task)];",
+    ] {
+        assert!(bts_lang::semantics::compile(source).is_err(), "{source}");
+    }
 }

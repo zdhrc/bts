@@ -628,17 +628,21 @@ impl From<String> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl;
     use crate::providers::braintrust::client::tests::{Reply, serve};
 
-    const SOURCE: &str = r#"
-        trace "old" { input = "fallback" output = "wrong" }
-        trace "new" { input = "fallback" output = trace.input }
-        dataset "cases" { case "local" { input = "local value" } }
-        scorer "quality" { code { score = input == output ? 1 : 0 } }
-        experiment "fixed" { dataset = dataset.cases task = trace.new scorers = [scorer.quality] baseline = experiment.baseline }
-        experiment "baseline" { dataset = dataset.cases task = trace.old scorers = [scorer.quality] }
-    "#;
+    const SOURCE: &str = r#"(old_root:task {name: "old"}) {input: old.input, output: "wrong"};
+(old:agent) {input: "fallback", output: old_root.output};
+(old)-[:contains]->(old_root);
+(old)-[:next]->(old_root);
+(new_root:task {name: "new"}) {input: new.input, output: new_root.input};
+(new:agent) {input: "fallback", output: new_root.output};
+(new)-[:contains]->(new_root);
+(new)-[:next]->(new_root);
+(dataset_cases_local:case {name: "local"}) {input: "local value"};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_local)|]};
+("quality":scorer) {score: context.input == context.output ? 1 : 0};
+(experiment_fixed:experiment {name: "fixed"}) {dataset: (dataset_cases), task: (new_root), scorers: [|("quality")|], baseline: (experiment_baseline)};
+(experiment_baseline:experiment {name: "baseline"}) {dataset: (dataset_cases), task: (old_root), scorers: [|("quality")|]};"#;
 
     fn body(request: &str) -> Value {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
@@ -646,7 +650,7 @@ mod tests {
 
     #[test]
     fn selection_is_strict_and_orders_selected_baselines_first() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(
             &model,
             &["experiment.fixed".parse().unwrap(), "experiment.baseline".parse().unwrap()],
@@ -699,9 +703,9 @@ mod tests {
     #[test]
     fn reuses_attachment_uploads_across_cases_and_experiments() {
         let source = SOURCE
-            .replace("output = \"wrong\"", "output = attachment(\"photo.png\", \"image/png\")")
-            .replace("output = trace.input", "output = attachment(\"photo.png\", \"image/png\")");
-        let model = dsl::semantics::compile(&source).unwrap();
+            .replace("output: \"wrong\"", "output: attachment(\"photo.png\", \"image/png\")")
+            .replace("output: new_root.input", "output: attachment(\"photo.png\", \"image/png\")");
+        let model = crate::providers::braintrust::mocking::compile(&source).unwrap();
         let selected = select(&model, &[]).unwrap();
         let snapshots = HashMap::from([(
             "cases".to_owned(),
@@ -725,7 +729,7 @@ mod tests {
 
     #[test]
     fn scorer_failure_prevents_experiment_creation() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(&model, &["experiment.baseline".parse().unwrap()]).unwrap();
         let snapshots = HashMap::from([(
             "cases".to_owned(),
@@ -755,7 +759,7 @@ mod tests {
 
     #[test]
     fn invokes_scorers_and_uploads_linked_baseline_results_from_remote_rows() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(
             &model,
             &["experiment.fixed".parse().unwrap(), "experiment.baseline".parse().unwrap()],
@@ -807,7 +811,7 @@ mod tests {
 
     #[test]
     fn missing_deployed_scorer_fails_before_creating_any_experiment() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(&model, &[]).unwrap();
         let (client, requests) = serve(vec![Reply::json(json!({"objects":[]}))]);
         assert!(dependencies(&client, &model, &selected).is_err());
@@ -816,7 +820,7 @@ mod tests {
 
     #[test]
     fn failed_insert_reports_completed_and_incomplete_experiments() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(&model, &[]).unwrap();
         let snapshots = HashMap::from([(
             "cases".to_owned(),

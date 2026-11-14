@@ -8,9 +8,9 @@
 //! and provider clients. Disable it to use generation, encoding, and codebase
 //! planning in browser applications.
 //!
-//! Pass models produced by [`bts_lang::semantics::compile`] or
-//! [`bts_lang::semantics::compile_module`]. Model transformations must preserve
-//! resolved references and the compiler's type and scope invariants.
+//! Compile graph sources with provider definitions, then lower them through
+//! [`providers::braintrust::Bundle::lower`] before invoking mocking consumers.
+//! Model transformations must preserve resolved references and scope invariants.
 
 #[cfg(feature = "native")]
 pub mod config;
@@ -20,4 +20,4 @@ pub mod providers;
 pub mod selection;
 pub mod skill;
 
-use bts_lang as dsl;
+use mocking as dsl;

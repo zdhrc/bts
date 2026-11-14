@@ -8,7 +8,7 @@
 
 mod assembly;
 mod codebase;
-mod contracts;
+pub(crate) mod contracts;
 pub mod languages;
 pub(crate) mod lowering;
 pub(crate) mod planning;

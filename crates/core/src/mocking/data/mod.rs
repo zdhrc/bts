@@ -6,7 +6,7 @@
 //! [`run`] combines preparation and delivery. Errors preserve the failing stage
 //! and its concrete cause.
 
-mod contracts;
+pub(crate) mod contracts;
 pub mod delivery;
 pub mod events;
 pub mod generation;

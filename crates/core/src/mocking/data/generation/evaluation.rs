@@ -522,8 +522,18 @@ impl<'m> Ctx<'m> {
         let mut at = Some(self.site);
         while let Some(instance) = at {
             if let Shape::Iteration { index, count } = self.instances[instance].shape {
+                if let ModelCtxRef::RepeatIndexAt(node) = ctx_ref {
+                    if self.instances[instance]
+                        .parent
+                        .is_some_and(|parent| self.instances[parent].node == node)
+                    {
+                        return index as i64;
+                    }
+                    at = self.instances[instance].parent;
+                    continue;
+                }
                 return match ctx_ref {
-                    ModelCtxRef::RepeatIndex => index as i64,
+                    ModelCtxRef::RepeatIndex | ModelCtxRef::RepeatIndexAt(_) => index as i64,
                     ModelCtxRef::RepeatCount => count as i64,
                     ModelCtxRef::TraceIndex => unreachable!("trace index returned above"),
                 };
@@ -693,6 +703,33 @@ impl<'m> Ctx<'m> {
         range: SrcRange,
     ) -> Result<JsonValue, Error> {
         match accessor {
+            Accessor::Record => {
+                let mut record = JsonMap::new();
+                for (key, field) in [
+                    ("input", Field::Input),
+                    ("output", Field::Output),
+                    ("expected", Field::Expected),
+                    ("metadata", Field::Metadata),
+                ] {
+                    let fields = &self.instances[at].fields;
+                    let present = match field {
+                        Field::Input => fields.input.is_some(),
+                        Field::Output => fields.output.is_some(),
+                        Field::Expected => fields.expected.is_some(),
+                        Field::Metadata => fields.metadata.is_some(),
+                        _ => false,
+                    };
+                    record.insert(
+                        key.into(),
+                        if present {
+                            self.read_field(at, field, vec![], range)?
+                        } else {
+                            JsonValue::Null
+                        },
+                    );
+                }
+                Ok(JsonValue::Object(record))
+            }
             Accessor::Block { .. } => Err(Error::new(ErrorKind::RefShapeMismatch, range)),
             Accessor::Field(field) => self.read_field(at, *field, path.to_vec(), range),
             // the current iteration of the repeat collection `at`, found on
@@ -1752,6 +1789,33 @@ fn english_expression_shapes(source: &InputValue, english_options: Option<&Input
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
+        ModelFunc::Arrivals { ready } => {
+            if !matches!(eval_binding(*ready, ctx)?, ModelValue::Bool(true)) {
+                return Err(Error::new(ErrorKind::MissingArrival, range));
+            }
+            ModelValue::Num(ModelNumber::Int(1))
+        }
+        ModelFunc::Check { value, ty } => {
+            use bts_lang::FieldType;
+            let value = eval_binding(*value, ctx)?;
+            let valid = matches!(
+                (&value, ty),
+                (_, FieldType::Any)
+                    | (ModelValue::Str(_), FieldType::String)
+                    | (ModelValue::Num(_), FieldType::Number)
+                    | (ModelValue::Bool(_), FieldType::Boolean)
+                    | (ModelValue::Object(_), FieldType::Object)
+                    | (ModelValue::Array(_), FieldType::Array)
+            );
+            if !valid {
+                return Err(Error {
+                    kind: ErrorKind::SchemaTypeMismatch,
+                    range,
+                    detail: Some(format!("upstream field requires {}", format!("{ty:?}").to_lowercase())),
+                });
+            }
+            value
+        }
         ModelFunc::English { operation, args } => {
             let args = args
                 .into_iter()
@@ -2621,6 +2685,8 @@ impl Error {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ErrorKind {
+    MissingArrival,
+    SchemaTypeMismatch,
     UnsupportedAttachment,
     DivisionByZero,
     NonFiniteResult,
@@ -2651,6 +2717,8 @@ pub enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::MissingArrival => "accumulate group closed with a missing listed input",
+            Self::SchemaTypeMismatch => "upstream value does not satisfy its field schema",
             Self::UnsupportedAttachment => "the selected format does not support attachments",
             Self::DivisionByZero => "expression divides by zero",
             Self::NonFiniteResult => "expression result overflowed or is not finite",
@@ -2704,7 +2772,7 @@ impl From<Error> for crate::dsl::Diag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::semantics::compile;
+    use crate::providers::braintrust::mocking::compile;
 
     macro_rules! value {
         ($($tokens:tt)*) => { JsonValue::from(serde_json::json!($($tokens)*)) };
@@ -2739,17 +2807,13 @@ mod tests {
     #[test]
     fn preserves_typed_attachments_through_references_and_bindings() {
         let model = compile(
-            r#"
-            trace "source" {
-                input = { files = [attachment("report.txt", "text/plain")] }
-                output = self.input["files"][0]
-                tool "copy" {
-                    vars { picked = trace.output }
-                    input = { nested = [var.picked] }
-                    output = trace.output
-                }
-            }
-            "#,
+            r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["files"][0]};
+(copy:tool {name: "copy"}) {input: {nested: [|copy.picked|]}, output: source_root.output, picked: source_root.output};
+(source_node:agent) {input: {files: [|attachment("report.txt", "text/plain")|]}, output: source_root.output};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:contains]->(copy);
+(copy)-[:child_of]->(source_root);
+(source_node)-[:next]->(source_root)-[:next]->(copy);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -2764,13 +2828,10 @@ mod tests {
     #[test]
     fn uses_the_selected_attachment_projection_for_fields_and_tokens() {
         let model = compile(
-            r#"
-            trace "source" {
-                input = attachment("report.txt", "text/plain")
-                output = self.input["name"]
-                metrics = { count = tokens([self.input]) }
-            }
-            "#,
+            r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["name"], metrics: {count: tokens([|self.input|])}};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: source_root.output};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#,
         )
         .unwrap();
         let plan = plan_with_filter(model, 1, 0, &WriteFilter::default(), &AttachmentView).unwrap();
@@ -2785,8 +2846,10 @@ mod tests {
 
     #[test]
     fn unsupported_attachment_projection_keeps_the_expression_range() {
-        let source =
-            r#"trace "source" { input = attachment("report.txt", "text/plain") metrics = { count = tokens(self.input) } }"#;
+        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, metrics: {count: tokens(self.input)}};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: null};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnsupportedAttachment);
         assert_eq!(&source[error.range.start..error.range.end], "tokens(self.input)");
@@ -2795,20 +2858,25 @@ mod tests {
     #[test]
     fn attachment_projection_shape_errors_point_to_the_consuming_selection() {
         for (projection, expression) in [
-            (serde_json::json!(["value"]), r#"var.file["key"]"#),
-            (serde_json::json!("value"), r#"var.file["key"]"#),
-            (serde_json::json!(false), r#"var.file["key"]"#),
-            (InputValue::Null, r#"var.file["key"]"#),
+            (serde_json::json!(["value"]), r#"source_root.file["key"]"#),
+            (serde_json::json!("value"), r#"source_root.file["key"]"#),
+            (serde_json::json!(false), r#"source_root.file["key"]"#),
+            (InputValue::Null, r#"source_root.file["key"]"#),
             (serde_json::json!(42), r#"attachment("report.txt", "text/plain")["key"]"#),
             (serde_json::json!({"nested": "value"}), r#"self.input["nested"]["key"]"#),
-            (serde_json::json!({"nested": "value"}), r#"var.selected["nested"]["key"]"#),
-            (serde_json::json!({}), r#"var.selected[:]"#),
-            (serde_json::json!("value"), r#"var.selected[:]"#),
-            (serde_json::json!(["value"]), r#"var.selected[true]"#),
+            (
+                serde_json::json!({"nested": "value"}),
+                r#"source_root.selected["nested"]["key"]"#,
+            ),
+            (serde_json::json!({}), r#"source_root.selected[:]"#),
+            (serde_json::json!("value"), r#"source_root.selected[:]"#),
+            (serde_json::json!(["value"]), r#"source_root.selected[true]"#),
         ] {
             let source = format!(
-                r#"vars {{ file = attachment("report.txt", "text/plain") selected = trace.source.input }}
-                trace "source" {{ input = var.file output = {expression} }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, file: attachment("report.txt", "text/plain"), selected: source_root.input}};
+(source_node:agent) {{input: source_root.file, output: source_root.output}};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch, "{expression}");
@@ -2821,20 +2889,26 @@ mod tests {
         for (projection, expression, expected) in [
             (
                 serde_json::json!({"name": "report.txt"}),
-                r#"var.file["name"]"#,
+                r#"source_root.file["name"]"#,
                 value!("report.txt"),
             ),
             (serde_json::json!(["first", "second"]), "self.input[1]", value!("second")),
-            (serde_json::json!(["first", "second"]), "var.selected[1:]", value!(["second"])),
             (
                 serde_json::json!(["first", "second"]),
-                "[...var.selected]",
+                "source_root.selected[1:]",
+                value!(["second"]),
+            ),
+            (
+                serde_json::json!(["first", "second"]),
+                "[|...source_root.selected|]",
                 value!(["first", "second"]),
             ),
         ] {
             let source = format!(
-                r#"vars {{ file = attachment("report.txt", "text/plain") selected = trace.source.input }}
-                trace "source" {{ input = var.file output = {expression} }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, file: attachment("report.txt", "text/plain"), selected: source_root.input}};
+(source_node:agent) {{input: source_root.file, output: source_root.output}};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#
             );
             let plan = plan_with_projection(&source, projection).unwrap();
             assert_eq!(plan.events[0].fields.output.as_ref(), Some(&expected), "{expression}");
@@ -2844,9 +2918,21 @@ mod tests {
     #[test]
     fn attachment_projection_navigation_preserves_specific_errors() {
         for (projection, expression, kind) in [
-            (serde_json::json!({}), r#"var.file["missing"]"#, ErrorKind::MissingObjectKey),
-            (serde_json::json!(["value"]), "var.selected[3]", ErrorKind::IndexOutOfBounds),
-            (serde_json::json!(["value"]), "var.selected[0.5]", ErrorKind::NonIntegerIndex),
+            (
+                serde_json::json!({}),
+                r#"source_root.file["missing"]"#,
+                ErrorKind::MissingObjectKey,
+            ),
+            (
+                serde_json::json!(["value"]),
+                "source_root.selected[3]",
+                ErrorKind::IndexOutOfBounds,
+            ),
+            (
+                serde_json::json!(["value"]),
+                "source_root.selected[0.5]",
+                ErrorKind::NonIntegerIndex,
+            ),
             (
                 serde_json::json!({"items": ["value"], "bound": -1}),
                 r#"self.input["items"][self.input["bound"]:]"#,
@@ -2869,8 +2955,10 @@ mod tests {
             ),
         ] {
             let source = format!(
-                r#"vars {{ file = attachment("report.txt", "text/plain") selected = trace.source.input }}
-                trace "source" {{ input = var.file output = {expression} }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, file: attachment("report.txt", "text/plain"), selected: source_root.input}};
+(source_node:agent) {{input: source_root.file, output: source_root.output}};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), kind, "{expression}");
@@ -2880,10 +2968,10 @@ mod tests {
 
     #[test]
     fn attachment_projection_rejects_non_array_spreads_without_panicking() {
-        let source = r#"trace "source" {
-            input = attachment("report.txt", "text/plain")
-            output = [...self.input]
-        }"#;
+        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, output: [|... self.input|]};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: source_root.output};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#;
         for projection in [serde_json::json!({}), serde_json::json!("value"), InputValue::Null] {
             let error = plan_with_projection(source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch);
@@ -2894,30 +2982,32 @@ mod tests {
     #[test]
     fn attachment_projection_spreads_report_the_current_expression() {
         for (projection, expression, expected) in [
-            (serde_json::json!("value"), "[...self.expected, ...self.input]", "self.input"),
             (
-                serde_json::json!({"nested": "value"}),
-                r#"[...self.expected, ...var.selected["nested"]]"#,
-                r#"var.selected["nested"]"#,
+                serde_json::json!("value"),
+                "[|...self.expected, ...self.input|]",
+                "self.input",
             ),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"[...var.selected["nested"]]"#,
-                r#"var.selected["nested"]"#,
+                r#"[|...self.expected, ...source_root.selected["nested"]|]"#,
+                r#"source_root.selected["nested"]"#,
+            ),
+            (
+                serde_json::json!({"nested": "value"}),
+                r#"[|...source_root.selected["nested"]|]"#,
+                r#"source_root.selected["nested"]"#,
             ),
             (
                 serde_json::json!("value"),
-                "[...self.expected, ...choice(self.input, self.input)]",
+                "[|...self.expected, ...choice(self.input, self.input)|]",
                 "choice(self.input, self.input)",
             ),
         ] {
             let source = format!(
-                r#"vars {{ selected = trace.source.input }}
-                trace "source" {{
-                    input = attachment("report.txt", "text/plain")
-                    expected = ["seed"]
-                    output = {expression}
-                }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, expected: [|"seed"|], output: {expression}, selected: source_root.input}};
+(source_node:agent) {{input: attachment("report.txt", "text/plain"), output: source_root.output}};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch, "{expression}");
@@ -2927,10 +3017,10 @@ mod tests {
 
     #[test]
     fn attachment_projection_accepts_any_json_for_projection_and_token_counting() {
-        let source = r#"trace "source" {
-            input = attachment("report.txt", "text/plain")
-            metrics = { count = tokens(self.input) }
-        }"#;
+        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, metrics: {count: tokens(self.input)}};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: null};
+(source_node)-[:contains]->(source_root);
+(source_node)-[:next]->(source_root);"#;
         for projection in [
             serde_json::json!({"name": "report.txt"}),
             serde_json::json!(["value"]),
@@ -2959,7 +3049,13 @@ mod tests {
 
     #[test]
     fn lowers_null_and_negative_numbers_to_json() {
-        let model = compile(r#"trace "t" { input = null metrics = { delta = -0.5 } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, metrics: {delta: - 0.5}};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 1, 0).unwrap();
 
         let fields = &plan.events[0].fields;
@@ -2969,7 +3065,13 @@ mod tests {
 
     #[test]
     fn resolves_trace_index_per_generated_trace() {
-        let model = compile(r#"trace "t" { input = "q ${trace.index}" tags = ["t-${trace.index}"] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, tags: [|"t-${context.trace_index}"|]};
+(t:agent) {input: "q ${context.trace_index}", output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 3, 0).unwrap();
 
         let inputs = plan
@@ -2987,15 +3089,15 @@ mod tests {
     #[test]
     fn evaluates_context_references_in_expressions() {
         let model = compile(
-            r#"
-            trace "t" {
-                input = trace.index
-                repeat {
-                    count = 3
-                    task "turn" { metrics = { turn = repeat.index + 1, of = repeat.count } }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {metrics: {turn: context.index + 1, of: context.count}};
+(t:agent) {input: context.trace_index, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: 3}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 2, 0).unwrap();
@@ -3012,15 +3114,15 @@ mod tests {
     #[test]
     fn slices_trace_scope_vars_by_repeat_index() {
         let model = compile(
-            r#"
-            trace "t" {
-                vars { messages = ["q0", "a0", "q1", "a1"] }
-                repeat {
-                    count = 2
-                    task "turn" { input = var.messages[:(repeat.index * 2) + 1] }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {messages: [|"q0" , "a0" , "q1" , "a1"|], input: t.input};
+(turn:task {name: "turn"}) {input: t_root.messages [: ${context.index * 2} + 1]};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: 2}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3033,16 +3135,16 @@ mod tests {
     fn resolves_repeat_refs_against_the_innermost_repeat() {
         let model = compile(
             r#"
-            trace "t" {
-                repeat {
-                    count = 2
-                    repeat {
-                        count = repeat.index + 1
-                        task "step" { metrics = { inner = repeat.index, of = repeat.count } }
-                    }
-                }
-            }
-            "#,
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(root);
+(t)-[:contains]->(iteration);
+(t)-[:contains]->(step);
+(t)-[:next]->(root:task) {input: t.input};
+(root)=[:repeat {count: 2}]=>[-[:next]->(iteration:node) {index: context.index}];
+(iteration)=[:repeat {count: iteration.index + 1}]=>[-[:next]->(step:task) {metrics: {inner: context.index, of: context.count}}];
+(iteration)-[:child_of]->(root);
+(step)-[:child_of]->(iteration);
+"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3063,10 +3165,14 @@ mod tests {
     #[test]
     fn cycles_templates_to_the_requested_trace_count() {
         let model = compile(
-            r#"
-                trace "first" {}
-                trace "second" {}
-            "#,
+            r#"(first_root:task {name: "first"}) {input: first.input};
+(first:agent) {input: null, output: null};
+(first)-[:contains]->(first_root);
+(first)-[:next]->(first_root);
+(second_root:task {name: "second"}) {input: second.input};
+(second:agent) {input: null, output: null};
+(second)-[:contains]->(second_root);
+(second)-[:next]->(second_root);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 0).unwrap();
@@ -3080,7 +3186,13 @@ mod tests {
 
     #[test]
     fn evaluates_choice_within_its_alternatives() {
-        let model = compile(r#"trace "t" { input = choice("a", "b") }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: choice("a", "b"), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3091,7 +3203,13 @@ mod tests {
 
     #[test]
     fn evaluates_ranges_within_bounds_and_keeps_integer_bounds_integral() {
-        let model = compile(r#"trace "t" { metrics = { tokens = range(80, 400), temp = range(0.0, 1.0) } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {metrics: {tokens: range(80, 400), temp: range(0.0, 1.0)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3105,7 +3223,13 @@ mod tests {
 
     #[test]
     fn evaluates_weighted_picks_proportionally_to_their_weights() {
-        let model = compile(r#"trace "t" { input = weighted(["common", 9], ["rare", 1], ["never", 0]) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: weighted([|"common", 9|], [|"rare", 1|], [|"never", 0|]), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 200, 7).unwrap();
 
         let mut counts = std::collections::HashMap::new();
@@ -3120,7 +3244,13 @@ mod tests {
 
     #[test]
     fn evaluates_weighted_picks_with_dynamic_values() {
-        let model = compile(r#"trace "t" { input = weighted([range(1, 3), 1], [10, 1]) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: weighted([|range(1, 3), 1|], [|10, 1|]), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 40, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3132,19 +3262,10 @@ mod tests {
     #[test]
     fn evaluates_distributions_within_their_supports() {
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        normal = normal(100, 10)
-                        lognormal = lognormal(300, 0.5)
-                        exponential = exponential(250)
-                        pareto = pareto(100, 1.5)
-                        beta = beta(2, 5)
-                        poisson = poisson(3)
-                    }
-                    input = chance(0.5)
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {normal: normal(100, 10), lognormal: lognormal(300, 0.5), exponential: exponential(250), pareto: pareto(100, 1.5), beta: beta(2, 5), poisson: poisson(3)}, input: t.input};
+(t:agent) {input: chance(0.5), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan_a = plan(model, 50, 7).unwrap();
@@ -3175,19 +3296,10 @@ mod tests {
         assert!(normals.len() > 1, "expected varying samples over 50 traces");
 
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        normal = normal(100, 10)
-                        lognormal = lognormal(300, 0.5)
-                        exponential = exponential(250)
-                        pareto = pareto(100, 1.5)
-                        beta = beta(2, 5)
-                        poisson = poisson(3)
-                    }
-                    input = chance(0.5)
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {normal: normal(100, 10), lognormal: lognormal(300, 0.5), exponential: exponential(250), pareto: pareto(100, 1.5), beta: beta(2, 5), poisson: poisson(3)}, input: t.input};
+(t:agent) {input: chance(0.5), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan_b = plan(model, 50, 7).unwrap();
@@ -3196,7 +3308,13 @@ mod tests {
 
     #[test]
     fn evaluates_chance_bounds_deterministically() {
-        let always = compile(r#"trace "t" { input = chance(1) }"#).unwrap();
+        let always = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: chance(1), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan_a = plan(always, 10, 7).unwrap();
         assert!(
             plan_a
@@ -3205,7 +3323,13 @@ mod tests {
                 .all(|event| event.fields.input == Some(JsonValue::Bool(true)))
         );
 
-        let never = compile(r#"trace "t" { input = chance(0) }"#).unwrap();
+        let never = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: chance(0), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan_b = plan(never, 10, 7).unwrap();
         assert!(
             plan_b
@@ -3218,32 +3342,10 @@ mod tests {
     #[test]
     fn evaluates_string_funcs() {
         let model = compile(
-            r#"
-                vars { tags = ["alpha", "beta"] }
-                trace "t" {
-                    input = [
-                        upper("get"),
-                        lower("WARN"),
-                        trim("  padded  "),
-                        replace("a b c", " ", "-"),
-                        replace("keep", "", "x"),
-                        join(var.tags, ", "),
-                        join([1, 2.5, true], "-"),
-                        format("model={} n={}", "gpt", 4),
-                    ]
-                    output = split("a,b,c", ",")
-                    metadata = {
-                        sub = contains("gpt-4o-mini", "mini")
-                        missing = contains("gpt-4o", "mini")
-                        elem = contains(var.tags, "beta")
-                        absent = contains(var.tags, "gamma")
-                        prefix = starts_with("gpt-4o", "gpt")
-                        suffix = ends_with("gpt-4o", "4o")
-                        chars = len("hello")
-                        elems = len(var.tags)
-                    }
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, output: split("a,b,c", ","), metadata: {sub: contains("gpt-4o-mini", "mini"), missing: contains("gpt-4o", "mini"), elem: contains(t_root.tags, "beta"), absent: contains(t_root.tags, "gamma"), prefix: starts_with("gpt-4o", "gpt"), suffix: ends_with("gpt-4o", "4o"), chars: len("hello"), elems: len(t_root.tags)}, tags: [|"alpha", "beta"|]};
+(t:agent) {input: [|upper("get"), lower("WARN"), trim("  padded  "), replace("a b c", " ", "-"), replace("keep", "", "x"), join(t_root.tags, ", "), join([|1, 2.5, true|], "-"), format("model={} n={}", "gpt", 4),|], output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3286,15 +3388,10 @@ mod tests {
     #[test]
     fn evaluates_token_counts() {
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        text = tokens("What is the weather in Tokyo?")
-                        empty = tokens("")
-                        messages = tokens([{ role = "user", content = "hi" }])
-                    }
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {text: tokens("What is the weather in Tokyo?"), empty: tokens(""), messages: tokens([|{role: "user", content: "hi"}|])}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3309,7 +3406,13 @@ mod tests {
 
     #[test]
     fn evaluates_string_funcs_over_dynamic_args() {
-        let model = compile(r#"trace "t" { input = upper(choice("get", "post")) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: upper(choice("get", "post")), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 20, 7).unwrap();
 
         let mut seen = std::collections::HashSet::new();
@@ -3321,8 +3424,13 @@ mod tests {
         assert_eq!(seen.len(), 2, "expected both alternatives over 20 traces");
 
         // split results behave as arrays for indexing and lens
-        let model =
-            compile(r#"trace "t" { input = split("a,b,c", ",")[range(0, 2)] output = len(split("a,b", ",")) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, output: len(split("a,b", ","))};
+(t:agent) {input: split("a,b,c", ",") [range(0, 2)], output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 10, 7).unwrap();
         for event in planned.events.iter() {
             let input = event.fields.input.as_ref().unwrap().as_str().unwrap();
@@ -3333,7 +3441,13 @@ mod tests {
 
     #[test]
     fn evaluates_format_with_dynamic_args() {
-        let model = compile(r#"trace "t" { input = format("n={} f={} b={}", range(1, 1), 0.5, chance(1)) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: format("n={} f={} b={}", range(1, 1), 0.5, chance(1)), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 1, 0).unwrap();
 
         assert_eq!(plan.events[0].fields.input, Some(JsonValue::from("n=1 f=0.5 b=true")));
@@ -3341,34 +3455,10 @@ mod tests {
 
     #[test]
     fn english_functions_materialize_composable_grammar_and_explicit_context() {
-        let source = r#"
-            vars {
-                guest = { id = "guest_1", label = "Maya", pronouns = {
-                    subject = "she", object = "her", possessive_determiner = "her", possessive = "hers"
-                } }
-                arrival = { clause = { subject = { text = "the guest" }, predicate = { verb = "arrive" }, tense = "future" } }
-                checkin = { clause = { subject = { text = "the guest" }, predicate = { verb = "check", complement = "in" }, modal = "can" } }
-            }
-            trace "t" {
-                vars { context = remember({}, [var.guest], ["arrival"]) }
-                output = {
-                    sentence = realize(var.arrival)
-                    combined = combine([var.arrival, var.checkin], "and")
-                    first = refer(var.guest, {})
-                    later = refer(var.guest, var.context)
-                    reset = refer(var.guest, {})
-                    context = var.context
-                    details = unmentioned([
-                        { id = "arrival", text = "The arrival is recorded." },
-                        { id = "key", text = "Your key is at reception." }
-                    ], var.context)
-                    amount = format_number("1234567.125", { locale = "en-IN", fraction_digits = 2 })
-                    date = format_date("2026-11-10", { locale = "en-GB" })
-                    time = format_time("17:30", { locale = "en-US" })
-                    composed = compose([render("Hello {name}.", { name = var.guest.label }), realize(var.checkin)])
-                }
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {output: {sentence: realize(t_root.arrival), combined: combine([|t_root.arrival, t_root.checkin|], "and"), first: refer(t_root.guest, {}), later: refer(t_root.guest, t_root.context), reset: refer(t_root.guest, {}), context: t_root.context, details: unmentioned([|{id: "arrival", text: "The arrival is recorded."}, {id: "key", text: "Your key is at reception."}|], t_root.context), amount: format_number("1234567.125", {locale: "en-IN", fraction_digits: 2}), date: format_date("2026-11-10", {locale: "en-GB"}), time: format_time("17:30", {locale: "en-US"}), composed: compose([|render("Hello {name}.", {name: t_root.guest.label}), realize(t_root.checkin)|])}, guest: {id: "guest_1", label: "Maya", pronouns: {subject: "she", object: "her", possessive_determiner: "her", possessive: "hers"}}, arrival: {clause: {subject: {text: "the guest"}, predicate: {verb: "arrive"}, tense: "future"}}, checkin: {clause: {subject: {text: "the guest"}, predicate: {verb: "check", complement: "in"}, modal: "can"}}, context: remember({}, [|t_root.guest|], [|"arrival"|]), input: t.input};
+(t:agent) {input: null, output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let generated = plan(compile(source).unwrap(), 2, 42).unwrap();
         for event in generated.events.iter() {
             let output = event.fields.output.as_ref().unwrap();
@@ -3393,13 +3483,10 @@ mod tests {
 
     #[test]
     fn english_variation_uses_scoped_randomness_and_binding_caching() {
-        let source = r#"
-            trace "t" {
-                vars { reply = vary("The guest cannot check in.") }
-                input = var.reply
-                output = var.reply
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.reply, reply: vary("The guest cannot check in.")};
+(t:agent) {input: t_root.reply, output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let first = plan(compile(source).unwrap(), 32, 7).unwrap();
         assert_eq!(first, plan(compile(source).unwrap(), 32, 7).unwrap());
         let outputs = first
@@ -3412,7 +3499,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(outputs.contains(&"The guest cannot check in."));
         assert!(outputs.contains(&"The guest can't check in."));
-        let with_unrelated = source.replace("output = var.reply", "output = var.reply metadata = { other = choice(1, 2) }");
+        let with_unrelated = source.replace(
+            "output = turn.reply",
+            "output = turn.reply metadata = { other = choice(1, 2) }",
+        );
         let changed = plan(compile(&with_unrelated).unwrap(), 32, 7).unwrap();
         for (before, after) in first.events.iter().zip(changed.events.iter()) {
             assert_eq!(before.fields.output, after.fields.output);
@@ -3423,14 +3513,16 @@ mod tests {
     fn english_argument_errors_keep_the_function_range_and_detail() {
         for (expression, detail) in [
             (r#"realize({})"#, "clause"),
-            (r#"vary("The guest cannot leave.", { negation = "yes" })"#, "boolean"),
-            (r#"vary("The guest cannot leave.", { unknown = true })"#, "unknown field"),
+            (r#"vary("The guest cannot leave.", { negation: "yes" })"#, "boolean"),
+            (r#"vary("The guest cannot leave.", { unknown: true })"#, "unknown field"),
             (r#"format_date("2026-02-30")"#, "date"),
             (r#"format_time("25:30")"#, "time"),
-            (r#"format_number("12", { locale = "fr-FR" })"#, "en-US"),
-            (r#"combine([], "and")"#, "propositions"),
+            (r#"format_number("12", { locale: "fr-FR" })"#, "en-US"),
+            (r#"combine([||], "and")"#, "propositions"),
         ] {
-            let source = format!("trace \"t\" {{ output = {expression} }}");
+            let source = format!(
+                "(t_root:task {{name: \"t\"}}) {{output: {expression}, input: t.input}};\n(t:agent) {{input: null, output: t_root.output}};\n(t)-[:contains]->(t_root);\n(t)-[:next]->(t_root);"
+            );
             let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::InvalidEnglish);
             assert_eq!(&source[error.range.start..error.range.end], expression);
@@ -3444,25 +3536,10 @@ mod tests {
     #[test]
     fn evaluates_numeric_funcs() {
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        low = clamp(1, 5, 10)
-                        high = clamp(50, 5, 10)
-                        inside = clamp(7, 5, 10)
-                        promoted = clamp(7, 5.0, 10)
-                        round = round(2.5)
-                        down = floor(2.9)
-                        up = ceil(2.1)
-                        int = round(3)
-                        abs = abs(0 - 4)
-                        fabs = abs(0.0 - 4.5)
-                        min = min(3, 1, 2)
-                        max = max(3, 1, 2)
-                        fmin = min(3, 1.5)
-                    }
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {low: clamp(1, 5, 10), high: clamp(50, 5, 10), inside: clamp(7, 5, 10), promoted: clamp(7, 5.0, 10), round: round(2.5), down: floor(2.9), up: ceil(2.1), int: round(3), abs: abs(0 - 4), fabs: abs(0.0 - 4.5), min: min(3, 1, 2), max: max(3, 1, 2), fmin: min(3, 1.5)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3485,7 +3562,13 @@ mod tests {
 
     #[test]
     fn clamps_distribution_samples_within_bounds() {
-        let model = compile(r#"trace "t" { metrics = { latency = clamp(lognormal(300, 1.5), 20, 1000) } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {metrics: {latency: clamp(lognormal(300, 1.5), 20, 1000)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 50, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3496,27 +3579,42 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_func_values() {
-        let source = r#"trace "t" { input = clamp(1, range(5, 5), 2) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: clamp(1, range(5, 5), 2), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "clamp bounds are out of order");
         assert_eq!(&source[error.range.start..error.range.end], "clamp(1, range(5, 5), 2)");
 
-        let source = r#"trace "t" { input = split("a,b", choice(",", "")) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: split("a,b", choice(",", "")), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 20, 7).unwrap_err();
         assert_eq!(error.to_string(), "split separator is empty");
 
-        let source = r#"trace "t" { input = join([{}], ",") }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: join([|{}|], ","), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "join element is not a string, number, or boolean");
 
-        let source = r#"trace "t" { input = round(99999999999999999999.0 * range(1.0, 1.0)) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: round(99999999999999999999.0 * range(1.0, 1.0)), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
     }
 
     #[test]
     fn evaluates_id_funcs_reproducibly() {
-        let source = r#"trace "t" { input = [uuid(), hex(16), alphanum(12), hex(0)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|uuid(), hex(16), alphanum(12), hex(0)|], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 5, 7).unwrap();
 
         let mut uuids = std::collections::HashSet::new();
@@ -3548,7 +3646,10 @@ mod tests {
 
     #[test]
     fn evaluates_noise_reproducibly_and_rejects_bad_sizes() {
-        let source = r#"trace "t" { input = [noise(64), noise(round(range(10, 20))), noise(0)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|noise(64), noise(round(range(10, 20))), noise(0)|], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
         for event in plan_a.events.iter() {
             let JsonValue::Array(values) = event.fields.input.as_ref().unwrap() else {
@@ -3568,8 +3669,14 @@ mod tests {
         assert_eq!(plan_a, plan_b);
 
         for source in [
-            r#"trace "t" { input = noise(range(1, 1) - 2) }"#,
-            r#"trace "t" { input = noise(range(1.5, 1.5)) }"#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: noise(range(1, 1) - 2), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: noise(range(1.5, 1.5)), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         ] {
             let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
             assert_eq!(error.to_string(), "noise size is not an integer between 0 and 8388608");
@@ -3579,10 +3686,10 @@ mod tests {
     #[test]
     fn evaluates_nested_funcs_and_funcs_from_vars() {
         let model = compile(
-            r#"
-                vars { style = choice("clear", "vague") }
-                trace "t" { input = [choice(range(1, 3), "x"), var.style] }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, style: choice("clear", "vague")};
+(t:agent) {input: [|choice(range(1, 3), "x"), t_root.style|], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 20, 7).unwrap();
@@ -3602,7 +3709,10 @@ mod tests {
 
     #[test]
     fn reproduces_the_same_plan_for_the_same_seed() {
-        let source = r#"trace "t" { input = choice("a", "b", "c") metrics = { n = range(0, 1000000) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, metrics: {n: range(0, 1000000)}};
+(t:agent) {input: choice("a", "b", "c"), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let first = plan(compile(source).unwrap(), 10, 42).unwrap();
         let second = plan(compile(source).unwrap(), 10, 42).unwrap();
 
@@ -3612,7 +3722,10 @@ mod tests {
     #[test]
     fn samples_traces_independently_of_earlier_traces() {
         // trace 3 of a 5-trace run must match trace 3 of a 4-trace run
-        let source = r#"trace "t" { metrics = { n = range(0, 1000000) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {metrics: {n: range(0, 1000000)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let longer = plan(compile(source).unwrap(), 5, 42).unwrap();
         let shorter = plan(compile(source).unwrap(), 4, 42).unwrap();
 
@@ -3621,7 +3734,10 @@ mod tests {
 
     #[test]
     fn evaluates_dynamic_arithmetic_within_bounds() {
-        let source = r#"trace "t" { metrics = { n = range(1, 5) * 100, m = -range(1, 5) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {metrics: {n: range(1, 5) * 100, m: - range(1, 5)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         for event in plan_a.events.iter() {
@@ -3639,7 +3755,13 @@ mod tests {
 
     #[test]
     fn evaluates_dynamic_ternaries_per_trace() {
-        let model = compile(r#"trace "t" { input = choice(true, false) ? "a" : "b" }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: choice(true, false) ? "a": "b", output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         let mut seen = std::collections::HashSet::new();
@@ -3651,7 +3773,13 @@ mod tests {
 
     #[test]
     fn compares_resolved_templates_per_trace() {
-        let model = compile(r#"trace "t" { input = "i ${trace.index}" == "i 1" ? 1 : 0 }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: "i ${context.trace_index}" == "i 1" ? 1: 0, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 3, 0).unwrap();
 
         let inputs: Vec<_> = plan
@@ -3665,24 +3793,33 @@ mod tests {
     #[test]
     fn short_circuits_guarded_divisions() {
         // the zero divisor is never evaluated, so neither shape fails
-        let model = compile(r#"trace "t" { input = range(0, 0) == 0 ? 0 : 100 / range(0, 0) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: range(0, 0) == 0 ? 0: 100 / range(0, 0), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 5, 7).unwrap();
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(0)));
 
-        let model = compile(r#"trace "t" { input = range(0, 0) != 0 && 100 / range(0, 0) > 1 }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: range(0, 0) != 0 && 100 / range(0, 0) > 1, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 5, 7).unwrap();
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(false)));
     }
 
     #[test]
     fn evaluates_dynamic_indexes_within_their_containers() {
-        let source = r#"
-            vars { user = { a = 1, b = 2 } }
-            trace "t" {
-                input = ["a", "b", "c"][range(0, 2)]
-                output = var.user[choice("a", "b")]
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.user [choice("a", "b")], user: {a: 1, b: 2}};
+(t:agent) {input: [|"a", "b", "c"|][range(0, 2)], output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut inputs = std::collections::HashSet::new();
@@ -3702,10 +3839,10 @@ mod tests {
 
     #[test]
     fn evaluates_nested_dynamic_indexes() {
-        let source = r#"
-            vars { matrix = [[1, 2], [3, 4]] }
-            trace "t" { input = var.matrix[range(0, 1)][range(0, 1)] }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, matrix: [|[|1, 2|], [|3, 4|]|]};
+(t:agent) {input: t_root.matrix [range(0, 1)][range(0, 1)], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3717,7 +3854,13 @@ mod tests {
     #[test]
     fn evaluates_only_the_selected_element() {
         // the division by zero sits in an unselected element, so nothing fails
-        let model = compile(r#"trace "t" { input = [0, 100 / range(0, 0)][range(0, 0)] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|0, 100 / range(0, 0)|][range(0, 0)], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 5, 7).unwrap();
 
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(0)));
@@ -3725,33 +3868,35 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_indexes() {
-        let source = r#"trace "t" { input = [1][range(1, 1)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|1|][range(1, 1)], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "array index is out of bounds");
-        assert_eq!(&source[error.range.start..error.range.end], "[1][range(1, 1)]");
+        assert_eq!(&source[error.range.start..error.range.end], "[|1|][range(1, 1)]");
 
-        let source = r#"trace "t" { input = [1, 2][range(0.0, 0.0)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|1, 2|][range(0.0, 0.0)], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "array index is not an integer");
 
-        let source = r#"trace "t" { input = { a = 1 }[choice("b")] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: {a: 1}[choice("b")], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "object key is not present");
     }
 
     #[test]
     fn evaluates_dynamic_slices_with_clamped_bounds() {
-        let source = r#"
-            trace "t" {
-                input = [1, 2, 3, 4][range(1, 1):range(3, 3)]
-                output = [1, 2][0:range(5, 5)]
-                metadata = {
-                    empty = [1, 2][range(1, 1):0]
-                    large_end = [1, 2][:range(4294967296, 4294967296)]
-                    large_start = [1, 2][range(9223372036854775807, 9223372036854775807):]
-                }
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: [|1, 2|][0: range(5, 5)], metadata: {empty: [|1, 2|][range(1, 1): 0], large_end: [|1, 2|][: range(4294967296, 4294967296)], large_start: [|1, 2|][range(9223372036854775807, 9223372036854775807):]}};
+(t:agent) {input: [|1, 2, 3, 4|][range(1, 1): range(3, 3)], output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
 
         for event in plan_a.events.iter() {
@@ -3769,7 +3914,13 @@ mod tests {
 
     #[test]
     fn evaluates_indexes_into_sliced_targets() {
-        let model = compile(r#"trace "t" { input = [1, 2, 3][range(1, 1):][0] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|1, 2, 3|][range(1, 1):][0], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 1, 0).unwrap();
 
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(2)));
@@ -3777,19 +3928,31 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_slice_bounds() {
-        let source = r#"trace "t" { input = [1, 2][0 - range(1, 1):] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|1, 2|][0 - range(1, 1):], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "slice bound is negative");
-        assert_eq!(&source[error.range.start..error.range.end], "[1, 2][0 - range(1, 1):]");
+        assert_eq!(&source[error.range.start..error.range.end], "[|1, 2|][0 - range(1, 1):]");
 
-        let source = r#"trace "t" { input = [1, 2][range(0.5, 0.5):] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|1, 2|][range(0.5, 0.5):], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "slice bound is not an integer");
     }
 
     #[test]
     fn evaluates_unrolled_for_bodies_per_trace() {
-        let model = compile(r#"trace "t" { input = [for x in [1, 2] : x * range(1, 3)] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [|for x in [|1, 2|]: x * range(1, 3)|], output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3803,7 +3966,10 @@ mod tests {
 
     #[test]
     fn fails_on_dynamic_division_by_zero() {
-        let source = r#"trace "t" { input = 100 / range(0, 0) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: 100 / range(0, 0), output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
 
         assert_eq!(error.to_string(), "expression divides by zero");
@@ -3812,20 +3978,43 @@ mod tests {
 
     #[test]
     fn fails_on_dynamic_overflow_and_non_finite_results() {
-        let source = r#"trace "t" { metrics = { n = 9223372036854775807 + range(1, 1) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {metrics: {n: 9223372036854775807 + range(1, 1)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
 
         // ~9.99e307 is finite on its own, doubling it overflows f64
         let big = format!("{}.0", "9".repeat(308));
-        let source = format!(r#"trace "t" {{ input = {big} * range(2.0, 2.0) }}"#);
+        let source = format!(
+            r#"(t_root:task {{name: "t"}}) {{input: t.input}};
+(t:agent) {{input: {big} * range(2.0, 2.0), output: null}};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#
+        );
         let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
     }
 
     #[test]
     fn repeats_children_a_constant_number_of_times() {
-        let model = compile(r#"trace "t" { repeat { count = 3 task "turn" { llm "reply" {} } } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(reply:llm {name: "reply"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+(t)-[:contains]->(reply);
+(reply)-[:child_of]->(turn);
+
+(t_root)=[:repeat {count: 3}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);
+(turn)-[:next]->(reply);"#,
+        )
+        .unwrap();
         let plan = plan(model, 2, 0).unwrap();
 
         // per trace: root + 3 * (task + llm)
@@ -3841,7 +4030,18 @@ mod tests {
 
     #[test]
     fn skips_repeats_with_a_zero_count() {
-        let model = compile(r#"trace "t" { repeat { count = 0 task "turn" {} } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: 0}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 3, 0).unwrap();
 
         assert_eq!(plan.events.len(), 3);
@@ -3849,7 +4049,15 @@ mod tests {
 
     #[test]
     fn varies_repeat_counts_per_trace_and_reproduces_them_by_seed() {
-        let source = r#"trace "t" { repeat { count = range(1, 4) task "turn" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: range (1 , 4)}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut lengths = std::collections::HashSet::new();
@@ -3866,20 +4074,19 @@ mod tests {
 
     #[test]
     fn resolves_repeat_index_per_iteration_with_the_innermost_repeat_winning() {
-        let source = r#"
-            trace "t" {
-                repeat {
-                    count = 2
-                    task "outer" {
-                        input = "o ${repeat.index}"
-                        repeat {
-                            count = 2
-                            task "inner" { input = "i ${repeat.index}" }
-                        }
-                    }
-                }
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(outer:task {name: "outer"}) {input: "o ${context.index}"};
+(inner:task {name: "inner"}) {input: "i ${context.index}"};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(outer);
+(outer)-[:child_of]->(t_root);
+(t)-[:contains]->(inner);
+(inner)-[:child_of]->(outer);
+
+(t_root)=[:repeat {count: 2}]=>[-[:next]->(outer)];
+(outer)=[:repeat {count: 2}]=>[-[:next]->(inner)];
+(t)-[:next]->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 1, 0).unwrap();
 
         let inputs: Vec<_> = plan
@@ -3892,7 +4099,18 @@ mod tests {
 
     #[test]
     fn plans_exactly_one_choice_child() {
-        let source = r#"trace "t" { choice { tool "a" {} function "b" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {branch_0_selection: range(0, 1), input: t.input};
+(a:tool {name: "a"}) {};
+(b:function {name: "b"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(a);
+(a)-[:child_of]->(t_root);
+(t)-[:contains]->(b);
+(b)-[:child_of]->(t_root);
+
+(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection == 0}]->(a), -[:next {when: t_root.branch_0_selection == 1}]->(b)];
+(t)-[:next]->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut picked = std::collections::HashSet::new();
@@ -3906,7 +4124,15 @@ mod tests {
 
     #[test]
     fn includes_maybe_children_probabilistically() {
-        let source = r#"trace "t" { maybe { task "extra" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0.5), input: t.input};
+(extra:task {name: "extra"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(extra);
+(extra)-[:child_of]->(t_root);
+
+(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(extra)];
+(t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 40, 7).unwrap();
 
         let lengths: Vec<_> = plan_a.traces.iter().map(std::ops::Range::len).collect();
@@ -3917,14 +4143,36 @@ mod tests {
 
         // the bounds always include or always skip
         let always = plan(
-            compile(r#"trace "t" { maybe { chance = 1 task "extra" {} } }"#).unwrap(),
+            compile(
+                r#"(t_root:task {name: "t"}) {branch_0_selection: chance(1), input: t.input};
+(extra:task {name: "extra"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(extra);
+(extra)-[:child_of]->(t_root);
+
+(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(extra)];
+(t)-[:next]->(t_root);"#,
+            )
+            .unwrap(),
             10,
             7,
         )
         .unwrap();
         assert!(always.traces.iter().all(|range| range.len() == 2));
         let never = plan(
-            compile(r#"trace "t" { maybe { chance = 0 task "extra" {} } }"#).unwrap(),
+            compile(
+                r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0), input: t.input};
+(extra:task {name: "extra"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(extra);
+(extra)-[:child_of]->(t_root);
+
+(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(extra)];
+(t)-[:next]->(t_root);"#,
+            )
+            .unwrap(),
             10,
             7,
         )
@@ -3935,13 +4183,21 @@ mod tests {
     #[test]
     fn redraws_nested_dynamic_blocks_per_iteration() {
         let source = r#"
-            trace "t" {
-                repeat {
-                    count = 8
-                    choice { tool "a" {} function "b" {} }
-                }
-            }
-        "#;
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(root);
+(t)-[:contains]->(iteration);
+(t)-[:contains]->(a);
+(t)-[:contains]->(b);
+(t)-[:next]->(root:task) {input: t.input};
+(root)=[:repeat {count: 8}]=>[-[:next]->(iteration:node) {pick: range(0, 1)}];
+(iteration)=[:exclusive]=>[
+    -[:next {when: iteration.pick == 0}]->(a:tool),
+    -[:next {when: iteration.pick == 1}]->(b:function),
+];
+(iteration)-[:child_of]->(root);
+(a)-[:child_of]->(iteration);
+(b)-[:child_of]->(iteration);
+"#;
         let plan = plan(compile(source).unwrap(), 5, 7).unwrap();
 
         let names: std::collections::HashSet<_> = plan
@@ -3955,23 +4211,58 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_counts_and_chances() {
-        let source = r#"trace "t" { repeat { count = 0 - range(2, 2) task "turn" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: 0 - range(2, 2)}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "repeat count is negative");
         assert_eq!(&source[error.range.start..error.range.end], "0 - range(2, 2)");
 
-        let source = r#"trace "t" { repeat { count = range(0.5, 0.5) task "turn" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: range(0.5, 0.5)}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "repeat count is not an integer");
 
-        let source = r#"trace "t" { maybe { chance = range(2.0, 2.0) task "turn" {} } }"#;
-        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        let source = r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0.5), input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(turn)];
+(t)-[:next]->(t_root);"#;
+        let mut model = compile(source).unwrap();
+        let ModelChild::Maybe(branch) = &mut model.traces[0].children[0] else {
+            panic!("conditional branch")
+        };
+        branch.chance = ModelValue::Num(ModelNumber::Float(2.0));
+        let error = plan(model, 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "maybe chance is not between 0 and 1");
     }
 
     #[test]
     fn varies_durations_per_trace_and_reproduces_them_by_seed() {
-        let source = r#"trace "t" { task "turn" { duration = range(0.2, 5.0) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {duration: range(0.2, 5.0)};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+(t)-[:next]->(t_root)-[:next]->(turn);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let durations: std::collections::HashSet<_> = plan_a
@@ -3988,7 +4279,13 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_durations() {
-        let source = r#"trace "t" { task "turn" { duration = 0.0 - range(1.0, 1.0) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {duration: 0.0 - range(1.0, 1.0)};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+(t)-[:next]->(t_root)-[:next]->(turn);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "duration is not a positive number of seconds");
         assert_eq!(&source[error.range.start..error.range.end], "0.0 - range(1.0, 1.0)");
@@ -3996,14 +4293,30 @@ mod tests {
 
     #[test]
     fn plans_dynamic_blocks_reproducibly() {
-        let source = r#"trace "session" {
-            repeat "turns" {
-                count = range(1, 4)
-                task "turn" { input = "question ${repeat.index}" llm "draft" {} }
-            }
-            choice { tool "get_order_status" {} function "summarize_session" {} }
-            maybe { chance = 0.25 task "escalation" {} }
-        }"#;
+        let source = r#"(session_root:task {name: "session"}) {branch_2_selection: chance(0.25), branch_1_selection: range(0, 1), input: session.input};
+(turn:task {name: "turn"}) {input: "question ${context.index}"};
+(draft:llm {name: "draft"}) {};
+(get_order_status:tool {name: "get_order_status"}) {};
+(summarize_session:function {name: "summarize_session"}) {};
+(escalation:task {name: "escalation"}) {};
+(session:agent) {input: null, output: null};
+(session)-[:contains]->(session_root);
+(session)-[:contains]->(turn);
+(turn)-[:child_of]->(session_root);
+(session)-[:contains]->(draft);
+(draft)-[:child_of]->(turn);
+(session)-[:contains]->(get_order_status);
+(get_order_status)-[:child_of]->(session_root);
+(session)-[:contains]->(summarize_session);
+(summarize_session)-[:child_of]->(session_root);
+(session)-[:contains]->(escalation);
+(escalation)-[:child_of]->(session_root);
+
+(session_root)=["turns":repeat {count: range (1 , 4)}]=>[-[:next]->(turn)];
+(session_root)=[:conditional]=>[-[:next {when: session_root.branch_1_selection == 0}]->(get_order_status), -[:next {when: session_root.branch_1_selection == 1}]->(summarize_session)];
+(session_root)=[:conditional]=>[-[:next {when: session_root.branch_2_selection}]->(escalation)];
+(session)-[:next]->(session_root);
+(turn)-[:next]->(draft);"#;
         let model = compile(source).unwrap();
         let plan_a = plan(model, 10, 42).unwrap();
 
@@ -4026,10 +4339,10 @@ mod tests {
     #[test]
     fn evaluates_root_bindings_once_per_trace() {
         let model = compile(
-            r#"
-            vars { x = range(0, 1000000) }
-            trace "t" { input = var.x output = var.x }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.x, x: range(0, 1000000)};
+(t:agent) {input: t_root.x, output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 4, 7).unwrap();
@@ -4050,15 +4363,15 @@ mod tests {
     #[test]
     fn evaluates_repeat_bindings_once_per_iteration() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat {
-                    count = 3
-                    vars { r = range(0, 1000000) }
-                    task "turn" { input = var.r output = var.r }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {input: turn.r, output: turn.r, r: range (0 , 1000000)};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(turn);
+(turn)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: 3}]=>[-[:next]->(turn)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 3).unwrap();
@@ -4078,17 +4391,13 @@ mod tests {
     #[test]
     fn sums_span_bindings_exactly() {
         let model = compile(
-            r#"
-            trace "t" {
-                llm "Chat Completion" {
-                    vars {
-                        pt = round(lognormal(600, 0.4))
-                        ct = round(lognormal(90, 0.7))
-                    }
-                    metrics = { prompt_tokens = var.pt, completion_tokens = var.ct, tokens = var.pt + var.ct }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(Chat_Completion:llm {name: "Chat Completion"}) {metrics: {prompt_tokens: Chat_Completion.pt, completion_tokens: Chat_Completion.ct, tokens: Chat_Completion.pt + Chat_Completion.ct}, pt: round(lognormal(600, 0.4)), ct: round(lognormal(90, 0.7))};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(Chat_Completion);
+(Chat_Completion)-[:child_of]->(t_root);
+(t)-[:next]->(t_root)-[:next]->(Chat_Completion);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 11).unwrap();
@@ -4105,10 +4414,10 @@ mod tests {
     #[test]
     fn interpolates_bindings_consistently_with_value_references() {
         let model = compile(
-            r#"
-            vars { m = choice("gpt-4o", "gpt-4o-mini") }
-            trace "t" { input = "model: ${var.m}" metadata = { model = var.m } }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, metadata: {model: t_root.m}, m: choice("gpt-4o", "gpt-4o-mini")};
+(t:agent) {input: "model: ${t_root.m}", output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 6, 5).unwrap();
@@ -4122,15 +4431,18 @@ mod tests {
     #[test]
     fn shares_choice_bindings_across_alternatives() {
         let model = compile(
-            r#"
-            trace "t" {
-                choice {
-                    vars { c = range(0, 1000000) }
-                    task "a" { input = var.c output = var.c }
-                    task "b" { input = var.c output = var.c }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {branch_0_selection: range(0, 1), input: t.input};
+(a:task {name: "a"}) {input: a.c, output: a.c, c: range (0 , 1000000)};
+(b:task {name: "b"}) {input: a.c, output: a.c};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(a);
+(a)-[:child_of]->(t_root);
+(t)-[:contains]->(b);
+(b)-[:child_of]->(t_root);
+
+(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection == 0}]->(a), -[:next {when: t_root.branch_0_selection == 1}]->(b)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 13).unwrap();
@@ -4144,15 +4456,15 @@ mod tests {
     #[test]
     fn evaluates_maybe_bindings_only_on_inclusion() {
         let model = compile(
-            r#"
-            trace "t" {
-                maybe {
-                    chance = 0.5
-                    vars { e = range(0, 1000000) }
-                    task "escalation" { input = var.e }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0.5), input: t.input};
+(escalation:task {name: "escalation"}) {input: escalation.e, e: range (0 , 1000000)};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(escalation);
+(escalation)-[:child_of]->(t_root);
+
+(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(escalation)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 8, 17).unwrap();
@@ -4164,18 +4476,16 @@ mod tests {
     #[test]
     fn threads_referenced_values_across_spans() {
         let model = compile(
-            r#"
-            trace "t" {
-                # written above the block it reads, order is dataflow not layout
-                output = llm.chat.output.content
-                metadata = { echoed = "${llm.chat.output.content}" }
-                task "plan" { output = "planned" }
-                llm "chat" {
-                    input = [{ role = "user", content = task.plan.output }]
-                    output = { role = "assistant", content = choice("alpha", "beta") }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {output: chat.output.content, metadata: {echoed: "${chat.output.content}"}, input: t.input};
+(plan:task {name: "plan"}) {output: "planned"};
+(chat:llm {name: "chat"}) {input: [|{role: "user", content: plan.output}|], output: {role: "assistant", content: choice("alpha", "beta")}};
+(t:agent) {input: null, output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(plan);
+(plan)-[:child_of]->(t_root);
+(t)-[:contains]->(chat);
+(chat)-[:child_of]->(t_root);
+(t)-[:next]->(t_root)-[:next]->(plan)-[:next]->(chat);"#,
         )
         .unwrap();
         let plan = plan(model, 4, 11).unwrap();
@@ -4199,19 +4509,13 @@ mod tests {
     #[test]
     fn sums_sibling_metric_keys_exactly() {
         let model = compile(
-            r#"
-            trace "t" {
-                llm "chat" {
-                    output = "brief answer"
-                    metrics = {
-                        prompt_tokens = round(lognormal(600, 0.4)),
-                        completion_tokens = round(lognormal(90, 0.7)),
-                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
-                        exact = tokens(self.output),
-                    }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(chat:llm {name: "chat"}) {output: "brief answer", metrics: {prompt_tokens: round(lognormal(600, 0.4)), completion_tokens: round(lognormal(90, 0.7)), tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens, exact: tokens(self.output)}};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(chat);
+(chat)-[:child_of]->(t_root);
+(t)-[:next]->(t_root)-[:next]->(chat);"#,
         )
         .unwrap();
         let plan = plan(model, 3, 5).unwrap();
@@ -4227,15 +4531,18 @@ mod tests {
     #[test]
     fn correlates_same_iteration_references_inside_repeats() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat {
-                    count = 4
-                    llm "gen" { output = choice("a", "b", "c") }
-                    tool "use" { input = llm.gen.output }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(gen:llm {name: "gen"}) {output: choice ("a" , "b" , "c")};
+(use:tool {name: "use"}) {input: gen.output};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(gen);
+(gen)-[:child_of]->(t_root);
+(t)-[:contains]->(use);
+(use)-[:child_of]->(t_root);
+
+(t_root)=[:repeat {count: 4}]=>[-[:next]->(gen), -[:next]->(use)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 2, 23).unwrap();
@@ -4256,13 +4563,19 @@ mod tests {
     #[test]
     fn draws_a_referenced_field_once() {
         let model = compile(
-            r#"
-            trace "t" {
-                task "roll" { output = range(0, 1000000) }
-                task "a" { input = task.roll.output }
-                task "b" { input = task.roll.output }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(roll:task {name: "roll"}) {output: range(0, 1000000)};
+(a:task {name: "a"}) {input: roll.output};
+(b:task {name: "b"}) {input: roll.output};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(roll);
+(roll)-[:child_of]->(t_root);
+(t)-[:contains]->(a);
+(a)-[:child_of]->(t_root);
+(t)-[:contains]->(b);
+(b)-[:child_of]->(t_root);
+(t)-[:next]->(t_root)-[:next]->(roll)-[:next]->(a)-[:next]->(b);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 3).unwrap();
@@ -4274,15 +4587,35 @@ mod tests {
 
     #[test]
     fn fails_generation_on_dynamic_position_cycles() {
-        // the static graph skips dynamic positions, in-progress marking catches them
-        let model = compile(
+        let mut model = compile(
             r#"
-            trace "t" {
-                llm "x" { input = llm["x"][trace.index % 1].input output = 1 }
-            }
-            "#,
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(root);
+(t)-[:contains]->(x);
+(t)-[:next]->(root:task) {input: t.input};
+(root)-[:next]->(x:llm) {input: 1};
+(x)-[:child_of]->(root);
+"#,
         )
         .unwrap();
+        let ModelChild::Span(span) = &mut model.traces[0].children[0] else {
+            panic!("span")
+        };
+        let node = span.node;
+        let range = SrcRange::new(0, 0);
+        let ref_id = RefId(model.refs.len() as u32);
+        span.fields.input = Some(ModelValue::BlockRef { ref_id, range });
+        model.refs.push(ResolvedRef {
+            module: Some(model.traces[0].node),
+            up: 0,
+            steps: vec![Step::Child {
+                candidates: vec![node],
+                position: Some(ModelValue::Num(ModelNumber::Int(0))),
+            }],
+            accessor: Accessor::Field(Field::Input),
+            path: vec![],
+            range,
+        });
         let error = plan(model, 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "references form a cycle");
     }
@@ -4290,18 +4623,15 @@ mod tests {
     #[test]
     fn accumulates_history_across_iterations() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat "rounds" {
-                    count = 3
-                    llm "chat" {
-                        input = [{ role = "user", content = trace.input }, ...repeat.rounds[:repeat.index].llm.chat.output]
-                        output = { role = "assistant", content = "reply ${repeat.rounds.index}" }
-                    }
-                }
-                input = "q"
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(chat:llm {name: "chat"}) {input: [|{role: "user", content: t_root.input} , ... context.history.chat|], output: {role: "assistant", content: "reply ${context.index}"}};
+(t:agent) {input: "q", output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(chat);
+(chat)-[:child_of]->(t_root);
+
+(t_root)=["rounds":repeat {count: 3}]=>[-[:next]->(chat)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 7).unwrap();
@@ -4311,7 +4641,7 @@ mod tests {
             let input = event.fields.input.as_ref().unwrap().as_array().unwrap();
             assert_eq!(input.len(), 1 + round);
             for (earlier, message) in input[1..].iter().enumerate() {
-                assert_eq!(message["content"], JsonValue::String(format!("reply {earlier}")));
+                assert_eq!(message["output"]["content"], JsonValue::String(format!("reply {earlier}")));
             }
         }
     }
@@ -4319,17 +4649,15 @@ mod tests {
     #[test]
     fn reads_previous_iterations_with_guards() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat "r" {
-                    count = 3
-                    task "step" {
-                        output = range(0, 1000)
-                        input = repeat.index > 0 ? repeat.r[repeat.index - 1].task.step.output : -1
-                    }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(step:task {name: "step"}) {output: range (0 , 1000), input: context.index > 0 ? context.history.step[context.index - 1].output : - 1};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(step);
+(step)-[:child_of]->(t_root);
+
+(t_root)=["r":repeat {count: 3}]=>[-[:next]->(step)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 13).unwrap();
@@ -4343,12 +4671,15 @@ mod tests {
     #[test]
     fn fails_generation_on_out_of_range_iterations() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat "r" { count = 2 task "step" { output = 1 } }
-                input = repeat.r[trace.index + 2].task.step.output
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(step:task {name: "step"}) {input: context.history.step[context.index + 2].output, output: 1};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(step);
+(step)-[:child_of]->(t_root);
+
+(t_root)=["r":repeat {count: 2}]=>[-[:next]->(step)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let error = plan(model, 1, 0).unwrap_err();
@@ -4358,20 +4689,22 @@ mod tests {
     #[test]
     fn reports_branch_outcomes_and_nulls() {
         let model = compile(
-            r#"
-            trace "t" {
-                choice "outcome" {
-                    task "resolved" { output = "ok" }
-                    task "escalated" { output = "paged" }
-                }
-                maybe "retry" { chance = 0.5 task "again" { output = 1 } }
-                metadata = {
-                    picked = choice.outcome.chosen,
-                    resolved = choice.outcome.task.resolved.output != null,
-                    retried = maybe.retry.included,
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {branch_1_selection: chance(0.5), branch_0_selection: range(0, 1), metadata: {picked: t_root.branch_0_selection, resolved: resolved.output != null, retried: t_root.branch_1_selection}, input: t.input};
+(resolved:task {name: "resolved"}) {output: "ok"};
+(escalated:task {name: "escalated"}) {output: "paged"};
+(again:task {name: "again"}) {output: 1};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(resolved);
+(resolved)-[:child_of]->(t_root);
+(t)-[:contains]->(escalated);
+(escalated)-[:child_of]->(t_root);
+(t)-[:contains]->(again);
+(again)-[:child_of]->(t_root);
+
+(t_root)=["outcome":conditional]=>[-[:next {when: t_root.branch_0_selection == 0}]->(resolved), -[:next {when: t_root.branch_0_selection == 1}]->(escalated)];
+(t_root)=["retry":conditional]=>[-[:next {when: t_root.branch_1_selection}]->(again)];
+(t)-[:next]->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 16, 29).unwrap();
@@ -4400,8 +4733,20 @@ mod tests {
     #[test]
     fn keeps_unrelated_draws_stable_across_edits() {
         // path-addressed rngs: editing one field must not reshuffle another's draws
-        let before = compile(r#"trace "t" { input = range(0, 1000000) output = "x" }"#).unwrap();
-        let after = compile(r#"trace "t" { input = range(0, 1000000) output = "y ${trace.index}" }"#).unwrap();
+        let before = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, output: "x"};
+(t:agent) {input: range(0, 1000000), output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
+        let after = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, output: "y ${context.trace_index}"};
+(t:agent) {input: range(0, 1000000), output: t_root.output};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#,
+        )
+        .unwrap();
 
         let before = plan(before, 5, 99).unwrap();
         let after = plan(after, 5, 99).unwrap();

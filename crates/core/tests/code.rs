@@ -2,7 +2,8 @@ use bts_core::mocking::code::{
     self, Assembly, CodeGroup, CodebaseContext, CodebaseFile, CodebasePlan, Emitter, ExistingFiles, Item, Judge, Module,
     SourceFile, Target,
 };
-use bts_lang::{Number, ScorerLang, Value, semantics::compile};
+use bts_core::mocking::{Number, ScorerLang, Value};
+use bts_core::providers::braintrust::mocking::compile;
 use std::{collections::BTreeMap, error::Error as _, fmt, fs, path::Path};
 
 #[derive(Debug, PartialEq)]
@@ -131,7 +132,7 @@ impl ExistingFiles for MemoryFiles {
 
 #[test]
 fn external_emitter_and_target_build_without_a_provider_dependency() {
-    let model = compile(r#"scorer "Answer Quality" { code { score = 0.5 } }"#).unwrap();
+    let model = compile(r#"("Answer Quality":scorer) {score: 0.5};"#).unwrap();
     let assembly = code::assemble(&model.scorers, None, &ConstantEmitter, &PlainTarget).unwrap();
     assert_eq!(assembly.files[0].slugs, ["answer_quality"]);
     let out = std::env::temp_dir().join(format!("bts-code-target-{}", uuid::Uuid::new_v4()));
@@ -176,8 +177,8 @@ fn external_target_errors_keep_their_concrete_cause() {
 #[test]
 fn braintrust_target_accepts_an_external_emitters_source_and_exports() {
     let model = compile(
-        r#"scorer "Quality" { file = "packed" code { score = 0.5 } }
-           scorer "Coverage" { file = "packed" code { score = 0.9 } }"#,
+        r#"("Quality":scorer {file: "packed"}) {score: 0.5};
+("Coverage":scorer {file: "packed"}) {score: 0.9};"#,
     )
     .unwrap();
     let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new("test-project");
@@ -257,8 +258,8 @@ fn built_in_emitters_preserve_existing_function_names() {
 #[test]
 fn built_in_emitters_reject_custom_slugs_that_would_collide() {
     let model = compile(
-        r#"scorer "foo-bar" { file = "packed" code { score = 0.1 } }
-           scorer "foo_bar" { file = "packed" code { score = 0.9 } }"#,
+        r#"("foo-bar":scorer {file: "packed"}) {score: 0.1};
+("foo_bar":scorer {file: "packed"}) {score: 0.9};"#,
     )
     .unwrap();
     for lang in [ScorerLang::Python, ScorerLang::Typescript] {
@@ -275,8 +276,8 @@ fn built_in_emitters_reject_custom_slugs_that_would_collide() {
 #[test]
 fn assembly_rejects_invalid_exports_before_invoking_the_target() {
     let model = compile(
-        r#"scorer "first" { file = "packed" code { score = 0.1 } }
-           scorer "second" { file = "packed" code { score = 0.9 } }"#,
+        r#"("first":scorer {file: "packed"}) {score: 0.1};
+("second":scorer {file: "packed"}) {score: 0.9};"#,
     )
     .unwrap();
     let assemble = |functions: &[&str]| {
@@ -359,7 +360,13 @@ impl code::AgentTarget for PlainTarget {
 fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access() {
     use code::AgentTarget;
 
-    let model = compile(r#"agent "support" { entrypoint = trace.request } trace "request" { output = "hello" }"#).unwrap();
+    let model = compile(
+        r#"(request_root:task {name: "request"}) {output: "hello", input: support.input};
+(support:agent) {input: null, output: request_root.output};
+(support)-[:contains]->(request_root);
+(support)-[:next]->(request_root);"#,
+    )
+    .unwrap();
     let out = std::env::temp_dir().join(format!("bts-agent-target-{}", uuid::Uuid::new_v4()));
     let existing = MemoryFiles(BTreeMap::from([("settings.json".to_owned(), "{\"keep\":true}".to_owned())]));
     let context = CodebaseContext {
@@ -401,22 +408,10 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
 #[test]
 fn language_functions_execute_in_generated_agents() {
     let model = compile(
-        r#"
-agent "language" { entrypoint = trace.language }
-trace "language" {
-    input = { template = "{{{name}}}: {n} {ok}", count = 2, parts = [null, "", "Hi!", "there"] }
-    vars { selected = sample([0, 1, 2, 3, 4], self.input.count) }
-    output = {
-        text = render(self.input.template, { name = "Zoë", n = 6.0, ok = true })
-        composed = compose(self.input.parts)
-        selected = var.selected
-        reused = var.selected
-        all = sample(["same", "same"], 2)
-        empty = sample([], 0)
-        nested = compose(["Details:", compose(sample(["one", "two"], 2), ", ")])
-    }
-}
-"#,
+        r#"(language_root:task {name: "language"}) {input: language.input, output: {text: render(self.input.template, {name: "Zoë", n: 6.0, ok: true}), composed: compose(self.input.parts), selected: language_root.selected, reused: language_root.selected, all: sample([|"same", "same"|], 2), empty: sample([||], 0), nested: compose([|"Details:", compose(sample([|"one", "two"|], 2), ", ")|])}, selected: sample([|0, 1, 2, 3, 4|], self.input.count)};
+(language:agent) {input: {template: "{{{name}}}: {n} {ok}", count: 2, parts: [|null, "", "Hi!", "there"|]}, output: language_root.output};
+(language)-[:contains]->(language_root);
+(language)-[:next]->(language_root);"#,
     )
     .unwrap();
     let root = std::env::temp_dir().join(format!("bts-language-{}", uuid::Uuid::new_v4()));
@@ -606,8 +601,8 @@ assert.deepEqual(run(undefined, () => 0.0), run(undefined, () => 0.0));
 
 #[test]
 fn language_numeric_contract_matches_native_agents_and_scorers() {
+    use bts_core::mocking::ScorerKind;
     use bts_core::mocking::data::{self, Distribution};
-    use bts_lang::ScorerKind;
     use std::time::{Duration, UNIX_EPOCH};
 
     let cases = [
@@ -624,7 +619,7 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         ("self.input.n / 2", "1"),
         ("self.input.n / 2.0", "1.0"),
         ("choice(6.0, 6.0)", "6.0"),
-        ("weighted([6.0, 1], [6.0, 2])", "6.0"),
+        ("weighted([|6.0, 1|], [|6.0, 2|])", "6.0"),
         ("range(6.0, 6.0)", "6.0"),
         ("-self.input.n / 3", "0"),
         ("-self.input.n % 2", "0"),
@@ -632,11 +627,11 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         ("max(self.input.n, 1.0)", "2.0"),
         ("clamp(self.input.n, 0, 6.0)", "2.0"),
         ("abs(-self.input.n * 1.0)", "2.0"),
-        ("[6.0][0]", "6.0"),
+        ("[|6.0|][0]", "6.0"),
         ("self.input.n == 2 ? 6.0 : 7", "6.0"),
         ("true", "true"),
     ];
-    let render = |expression: &str| format!("render(\"{{n}}\", {{ n = {expression} }})");
+    let render = |expression: &str| format!("render(\"{{n}}\", {{ n: {expression} }})");
     let expected: Vec<_> = cases.iter().map(|(_, expected)| *expected).collect();
     let generate = |source: &str| {
         data::generate(
@@ -650,7 +645,7 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         )
     };
     let source = format!(
-        "agent \"numeric\" {{ entrypoint = trace.numeric }} trace \"numeric\" {{ input = {{ n = 2 }} output = [{}] }}",
+        "(numeric_root:task {{name: \"numeric\"}}) {{input: numeric.input, output: [|{}|]}};\n(numeric:agent) {{input: {{n: 2}}, output: numeric_root.output}};\n(numeric)-[:contains]->(numeric_root);\n(numeric)-[:next]->(numeric_root);",
         cases
             .iter()
             .map(|(expression, _)| render(expression))
@@ -666,16 +661,16 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
     let invalid = [
         "1.0",
         "choice(1.0, 1.0)",
-        "weighted([1.0, 1], [1.0, 2])",
+        "weighted([|1.0, 1|], [|1.0, 2|])",
         "range(1.0, 1.0)",
         "self.input.n / 2.0",
         "min(self.input.n, 1.0)",
-        "[1.0][0]",
+        "[|1.0|][0]",
     ];
     for expression in invalid {
         assert!(
             generate(&format!(
-                "trace \"t\" {{ input = {{ n = 2 }} output = sample([1, 2], {expression}) }}"
+                "(t_root:task {{name: \"t\"}}) {{input: t.input, output: sample ([|1 , 2|] , {expression})}};\n(t:agent) {{input: {{n: 2}}, output: t_root.output}};\n(t)-[:contains]->(t_root);\n(t)-[:next]->(t_root);"
             ))
             .is_err(),
             "{expression}"
@@ -686,19 +681,19 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         .enumerate()
         .map(|(index, (expression, expected))| {
             format!(
-                "scorer \"render{index}\" {{ code {{ score = {} == {} ? 1 : 0 }} }}",
-                render(&expression.replace("self.input", "input")),
+                "(\"render{index}\":scorer) {{score: {} == {} ? 1 : 0}};",
+                render(&expression.replace("self.input", "context.input")),
                 serde_json::to_string(expected).unwrap()
             )
         })
         .collect::<Vec<_>>();
     for (index, expression) in invalid.iter().enumerate() {
         scorers.push(format!(
-            "scorer \"sample{index}\" {{ code {{ score = len(sample([1, 2], {})) }} }}",
-            expression.replace("self.input", "input")
+            "(\"sample{index}\":scorer) {{score: len (sample ([|1 , 2|] , {}))}};",
+            expression.replace("self.input", "context.input")
         ));
     }
-    scorers.push("scorer \"integer\" { code { score = len(sample([1, 2], input.n / 2)) } }".into());
+    scorers.push("(\"integer\":scorer) {score: len (sample ([|1 , 2|] , context.input.n / 2))};".into());
     let scorer_model = compile(&scorers.join("\n")).unwrap();
     let items = scorer_model
         .scorers

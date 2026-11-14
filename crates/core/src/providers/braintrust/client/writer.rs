@@ -770,8 +770,8 @@ pub fn client_error(error: super::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::mocking::data::{self, Distribution, Format as _};
+    use crate::providers::braintrust::mocking::compile;
     use crate::providers::braintrust::mocking::data::{Event, Format, SpanAttributes};
     use serde_json::{Map as JsonMap, Value as JsonValue};
     use std::io::{Read, Write};
@@ -790,12 +790,22 @@ mod tests {
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(1);
         let model = compile(
-            r#"trace "send" {
-            task "first" {}
-            task "second" {}
-            task "third" {}
-            task "fourth" {}
-        }"#,
+            r#"(send_root:task {name: "send"}) {input: send.input};
+(first:task {name: "first"}) {};
+(second:task {name: "second"}) {};
+(third:task {name: "third"}) {};
+(fourth:task {name: "fourth"}) {};
+(send:agent) {input: null, output: null};
+(send)-[:contains]->(send_root);
+(send)-[:contains]->(first);
+(first)-[:child_of]->(send_root);
+(send)-[:contains]->(second);
+(second)-[:child_of]->(send_root);
+(send)-[:contains]->(third);
+(third)-[:child_of]->(send_root);
+(send)-[:contains]->(fourth);
+(fourth)-[:child_of]->(send_root);
+(send)-[:next]->(send_root)-[:next]->(first)-[:next]->(second)-[:next]->(third)-[:next]->(fourth);"#,
         )
         .unwrap();
         let events = data::generate(
@@ -828,7 +838,13 @@ mod tests {
         let mut config = Braintrust::new("secret".to_owned(), project_id);
         config.api_url = api_url;
         config.request_timeout = Duration::from_secs(1);
-        let model = compile(r#"trace "example" {}"#).unwrap();
+        let model = compile(
+            r#"(example_root:task {name: "example"}) {input: example.input};
+(example:agent) {input: null, output: null};
+(example)-[:contains]->(example_root);
+(example)-[:next]->(example_root);"#,
+        )
+        .unwrap();
         let events = data::generate(
             model,
             1,

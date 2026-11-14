@@ -666,10 +666,23 @@ mod tests {
 
     #[test]
     fn selected_sync_keeps_unselected_removed_rules_and_facets() {
-        let model = crate::dsl::semantics::compile(
-            r#"facet "new" { prompt = "Extract." } automation "new-rule" { type = "topics" facets = ["new"] scope = "trace" }"#,
-        )
-        .unwrap();
+        let model = crate::dsl::Model {
+            facets: vec![crate::dsl::Facet {
+                name: "new".into(),
+                prompt: "Extract.".into(),
+                description: None,
+                no_match_pattern: None,
+            }],
+            automations: vec![crate::dsl::Automation {
+                name: "new-rule".into(),
+                kind: crate::dsl::AutomationKind::Topics {
+                    facets: vec!["new".into()],
+                },
+                sampling_rate: 1.0,
+                enabled: true,
+            }],
+            ..Default::default()
+        };
         let path = path();
         let mut state = SyncState::open(path.clone(), "p", "a.bt".to_owned(), true).unwrap();
         state.shape_mut().resources = vec![
@@ -698,10 +711,23 @@ mod tests {
 
     #[test]
     fn changing_bindings_keeps_old_dependencies_until_cleanup_succeeds() {
-        let model = crate::dsl::semantics::compile(
-            r#"facet "new" { prompt = "Extract." } automation "rule" { type = "topics" facets = ["new"] scope = "trace" }"#,
-        )
-        .unwrap();
+        let model = crate::dsl::Model {
+            facets: vec![crate::dsl::Facet {
+                name: "new".into(),
+                prompt: "Extract.".into(),
+                description: None,
+                no_match_pattern: None,
+            }],
+            automations: vec![crate::dsl::Automation {
+                name: "rule".into(),
+                kind: crate::dsl::AutomationKind::Topics {
+                    facets: vec!["new".into()],
+                },
+                sampling_rate: 1.0,
+                enabled: true,
+            }],
+            ..Default::default()
+        };
         let mut state = SyncState::open(path(), "p", "a.bt".to_owned(), true).unwrap();
         state.shape_mut().resources = vec![
             owned(ResourceKind::TopicsAutomation, "rule", &["old"]),

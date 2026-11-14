@@ -159,6 +159,25 @@ impl Modeler {
             .unwrap_or(FieldType::Any)
     }
 
+    fn input_role(&self, owner: ElementId, property: bool, path: &[String]) -> bool {
+        !property
+            && self.kind_schema(owner).is_some_and(|kind| {
+                kind.fields
+                    .iter()
+                    .any(|field| path.first() == Some(&field.name) && field.role.as_deref() == Some("input"))
+            })
+    }
+
+    fn output_role(&self, owner: ElementId, property: bool, path: &[String]) -> bool {
+        !property
+            && path.len() == 1
+            && self.kind_schema(owner).is_some_and(|kind| {
+                kind.fields
+                    .iter()
+                    .any(|field| path.first() == Some(&field.name) && field.role.as_deref() == Some("output"))
+            })
+    }
+
     fn name(&mut self, name: &Option<String>, id: ElementId, range: SrcRange) {
         if let Some(name) = name {
             if matches!(
@@ -657,6 +676,14 @@ impl Modeler {
                 };
                 let mut child = slot.clone();
                 child.path.extend(path);
+                let id = self.binding(child.clone(), expr.range)?;
+                let value = self.model.bindings[id.0].value.clone();
+                if expr::static_value(&value) {
+                    return Ok(ReferenceValue {
+                        value,
+                        bindings: Vec::new(),
+                    });
+                }
                 self.finish(Cursor::Slot(child), expr.range)
             });
         }
@@ -667,15 +694,22 @@ impl Modeler {
         match cursor {
             Cursor::Element(element) => Ok(self.graph_value(element, range)),
             Cursor::Slot(slot) => {
+                let input = self.input_role(slot.owner, slot.property, &slot.path);
+                let output = !slot.property
+                    && self.kind_schema(slot.owner).is_some_and(|kind| {
+                        kind.fields
+                            .iter()
+                            .any(|field| slot.path.first() == Some(&field.name) && field.role.as_deref() == Some("output"))
+                    });
                 let id = self.binding(slot, range)?;
                 let value = self.model.bindings[id.0].value.clone();
-                if expr::static_value(&value) {
+                if !input && !output && expr::static_value(&value) {
                     Ok(ReferenceValue {
                         value,
                         bindings: Vec::new(),
                     })
                 } else {
-                    Ok(self.reference_value(Value::BindingRef(id)))
+                    Ok(self.reference_value(Value::BindingRef(id, range)))
                 }
             }
             Cursor::Value(value) => Ok(value),
@@ -713,7 +747,7 @@ impl Modeler {
         loop {
             match value {
                 Value::GraphRef { ref_id, .. } => return Ok(self.model.refs[ref_id.0].target),
-                Value::BindingRef(id) if visited.insert(id) => value = self.model.bindings[id.0].value.clone(),
+                Value::BindingRef(id, _) if visited.insert(id) => value = self.model.bindings[id.0].value.clone(),
                 _ => return Err(error(range, "expected a statically resolved graph reference")),
             }
         }
@@ -1086,7 +1120,17 @@ impl Modeler {
             if !seen.insert(id) {
                 continue;
             }
-            let definition = self.model.bindings[id.0].value.clone();
+            let binding = &self.model.bindings[id.0];
+            let definition = if self.input_role(binding.owner, binding.property, &binding.path)
+                || self.output_role(binding.owner, binding.property, &binding.path)
+            {
+                Value::Input {
+                    binding: id,
+                    ty: binding.ty,
+                }
+            } else {
+                binding.value.clone()
+            };
             pending.extend(expr::dependencies(&definition));
             bindings.push((id, definition, self.model.bindings[id.0].ty));
         }
@@ -1174,6 +1218,17 @@ impl Modeler {
                 }
             }
         }
+        let mut predicate_bindings = self.model.bindings.clone();
+        for (index, binding) in predicate_bindings.iter_mut().enumerate() {
+            if self.input_role(binding.owner, binding.property, &binding.path)
+                || self.output_role(binding.owner, binding.property, &binding.path)
+            {
+                binding.value = Value::Input {
+                    binding: BindingId(index),
+                    ty: binding.ty,
+                };
+            }
+        }
         for (fork_index, fork) in self.model.forks.iter().enumerate() {
             if self.primitive(ElementId::Fork(ForkId(fork_index))) == "parallel" {
                 for edge in fork.branches.iter().flatten() {
@@ -1195,7 +1250,7 @@ impl Modeler {
                                         .map(|id| self.model.bindings[id.0].value.clone())
                                         .unwrap_or(Value::Bool(true))
                                 };
-                                if !disjoint(&guard(*left), &guard(*right), &self.model.bindings) {
+                                if !disjoint(&guard(*left), &guard(*right), &predicate_bindings) {
                                     errors.extend(error(
                                         self.model.edges[right.0].range,
                                         "exclusive fork guards overlap or cannot be proven disjoint",
@@ -1362,6 +1417,7 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
         ]),
         "incidence" => names.push(("role", FieldType::String, false)),
         "weighted" => names.push(("count", FieldType::Number, false)),
+        "repeat" => names.push(("count", FieldType::Number, true)),
         "each" => names.extend([("items", FieldType::Array, true), ("concurrency", FieldType::Number, false)]),
         "reduce" => names.extend([
             ("correlate", FieldType::Any, false),
@@ -1544,6 +1600,7 @@ enum Predicate {
 }
 fn predicate_key(value: &Value) -> String {
     match value {
+        Value::BindingRef(id, _) => format!("binding:{}", id.0),
         Value::Unary { op, operand, .. } => format!("{op:?}({})", predicate_key(operand)),
         Value::Binary { op, lhs, rhs, .. } => format!("{op:?}({},{})", predicate_key(lhs), predicate_key(rhs)),
         Value::Index { target, index, .. } => format!("index({},{})", predicate_key(target), predicate_key(index)),
@@ -1559,7 +1616,7 @@ struct PredicateAtom {
 
 fn normalize_predicate(value: &Value, bindings: &[Binding]) -> Value {
     match value {
-        Value::BindingRef(id) => match &bindings[id.0].value {
+        Value::BindingRef(id, _) => match &bindings[id.0].value {
             // a shared draw keeps its identity rather than becoming another call
             Value::Func { .. } => value.clone(),
             definition => normalize_predicate(definition, bindings),
@@ -1729,7 +1786,7 @@ impl<'a> GraphCheck<'a> {
     }
 
     fn value(&self, mut value: &'a Value) -> &'a Value {
-        while let Value::BindingRef(id) = value {
+        while let Value::BindingRef(id, _) = value {
             value = &self.model.bindings[id.0].value;
         }
         value
@@ -1872,7 +1929,10 @@ impl<'a> GraphCheck<'a> {
             }
         }
         if !self.model.kind_names.contains_key(kind)
-            && matches!(base, "network" | "relation" | "incidence" | "weighted" | "each" | "reduce")
+            && matches!(
+                base,
+                "network" | "relation" | "incidence" | "weighted" | "each" | "repeat" | "reduce"
+            )
         {
             for id in properties(self.model, self.owner) {
                 let binding = &self.model.bindings[id.0];
@@ -2182,9 +2242,17 @@ fn validate_graph(model: &mut Model) -> Result<()> {
             range: fork.range,
         };
         match primitive(model, owner) {
-            "each" => {
-                check.typed(check.required("items")?, FieldType::Array)?;
-                check.positive_count("concurrency", None)?;
+            "each" | "repeat" => {
+                if primitive(model, owner) == "repeat" {
+                    let count = check.required("count")?;
+                    check.typed(count, FieldType::Number)?;
+                    if expr::constant(count) {
+                        check.count(count, "count")?;
+                    }
+                } else {
+                    check.typed(check.required("items")?, FieldType::Array)?;
+                    check.positive_count("concurrency", None)?;
+                }
                 for edge in fork.branches.iter().flatten() {
                     let edge_check = GraphCheck {
                         model,
@@ -2192,7 +2260,7 @@ fn validate_graph(model: &mut Model) -> Result<()> {
                         range: model.edges[edge.0].range,
                     };
                     if edge_check.prop("when").is_some() {
-                        return edge_check.error("each runs every listed branch and does not allow branch guards");
+                        return edge_check.error("each and repeat run every listed branch and do not allow branch guards");
                     }
                 }
             }

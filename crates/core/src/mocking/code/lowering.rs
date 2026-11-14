@@ -672,7 +672,16 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
                     );
                     visit(&maybe.children, lang, used, names);
                 }
-                _ => {}
+                Child::Scorer(v) => {
+                    names.push((
+                        v.node,
+                        Names {
+                            function: allocate(&v.name, "", lang, used),
+                            state: allocate(&v.name, "span", lang, used),
+                            ..Names::default()
+                        },
+                    ));
+                }
             }
         }
     }
@@ -700,8 +709,8 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
     names
 }
 
-pub(crate) fn agent(model: &Model, trace: &Trace, lang: ScorerLang) -> Result<Agent, String> {
-    execution::emit(model, trace, lang)
+pub(crate) fn agent(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang) -> Result<Agent, String> {
+    execution::emit(model, trace, output, lang)
 }
 
 fn is_literal(value: &Value) -> bool {
@@ -829,6 +838,40 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
         }
         Value::BlockRef { ref_id, .. } => {
             let reference = &ctx.model.refs[ref_id.0 as usize];
+            if matches!(reference.accessor, Accessor::Record) {
+                let group = reference
+                    .steps
+                    .windows(2)
+                    .rev()
+                    .find_map(|steps| match (&steps[0], &steps[1]) {
+                        (Step::Child { candidates, .. }, Step::Iterations { .. }) => candidates.first().copied(),
+                        _ => None,
+                    })
+                    .ok_or("history requires a repetition group")?;
+                let target = reference
+                    .steps
+                    .iter()
+                    .rev()
+                    .find_map(|step| match step {
+                        Step::Child { candidates, .. } => candidates.first().copied(),
+                        _ => None,
+                    })
+                    .ok_or("history requires a target")?;
+                let frame = ctx
+                    .frames
+                    .iter()
+                    .rev()
+                    .find(|(node, _)| *node == ctx.site)
+                    .ok_or("history requires an active node")?;
+                return Ok(Expr::call(
+                    "_history",
+                    vec![
+                        Expr::Name(frame.1.clone()),
+                        Expr::string(&ctx.names(target).state),
+                        Expr::string(&ctx.names(group).state),
+                    ],
+                ));
+            }
             let mut node = reference.module.unwrap_or(ctx.site);
             for _ in 0..reference.up {
                 node = ctx
@@ -846,6 +889,14 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
 fn context_ref(reference: CtxRef, ctx: &Context<'_>) -> Result<Expr, String> {
     if reference == CtxRef::TraceIndex {
         return Ok(Expr::number(0));
+    }
+    if let CtxRef::RepeatIndexAt(node) = reference {
+        return ctx
+            .iterations
+            .iter()
+            .find(|(id, _, _)| *id == node)
+            .map(|(_, index, _)| Expr::Name(index.clone()))
+            .ok_or("repeat context is unavailable".into());
     }
     let mut node = ctx.site;
     loop {
@@ -921,9 +972,15 @@ fn reference_expression(
             rest,
         )) = steps.split_first()
         && candidates.len() == 1
-        && let Some((_, frame)) = ctx.frames.iter().rev().find(|(id, _)| *id == candidates[0])
+        && ctx.frames.iter().any(|(id, _)| *id == candidates[0])
     {
-        return reference_expression(candidates[0], rest, accessor, path, Some(frame.clone().into()), ctx, lang);
+        let rest = if matches!(rest.first(), Some(Step::Iteration(Value::CtxRef(CtxRef::RepeatIndexAt(id)))) if *id == candidates[0])
+        {
+            &rest[1..]
+        } else {
+            rest
+        };
+        return reference_expression(candidates[0], rest, accessor, path, None, ctx, lang);
     }
     let frame = record
         .or_else(|| {
@@ -995,6 +1052,7 @@ fn reference_expression(
         };
     }
     let mut result = match accessor {
+        Accessor::Record => Expr::call("_occurrence", vec![frame]),
         Accessor::Field(field) => read_field(frame, field_key(field), ctx.direct),
         Accessor::Chosen => read_field(frame, "chosen", ctx.direct),
         Accessor::Included => read_field(frame, "included", ctx.direct),
@@ -1023,7 +1081,7 @@ mod execution {
     use crate::dsl::{Binding, SpanKind};
     use crate::mocking::code::planning::Operation;
 
-    pub(crate) fn emit(model: &Model, trace: &Trace, lang: ScorerLang) -> Result<Agent, String> {
+    pub(crate) fn emit(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang) -> Result<Agent, String> {
         let mut parents = Vec::new();
         let mut bindings = model.bindings.iter().chain(&trace.bindings).collect::<Vec<_>>();
         fn collect<'a>(
@@ -1038,7 +1096,11 @@ mod execution {
                     Child::Repeat(v) => (v.node, &v.bindings, &v.children),
                     Child::Choice(v) => (v.node, &v.bindings, &v.children),
                     Child::Maybe(v) => (v.node, &v.bindings, &v.children),
-                    Child::Scorer(_) => return Err("scorer spans are not supported by agent generation yet".into()),
+                    Child::Scorer(v) => {
+                        parents.push((v.node, parent));
+                        bindings.extend(&v.bindings);
+                        continue;
+                    }
                 };
                 parents.push((node, parent));
                 bindings.extend(locals);
@@ -1076,15 +1138,25 @@ mod execution {
             true,
         ) {
             Ok(mut work) => {
-                work.push(Statement::Return(Expr::call("_details", vec!["root".into()])));
+                work.push(Statement::Return(Expr::call(
+                    "_agent_result",
+                    vec![
+                        Expr::call("_details", vec!["root".into()]),
+                        expression(output, &direct_ctx, lang)?,
+                    ],
+                )));
                 vec![Statement::TraceScope {
                     scope: "root".into(),
                     body: work,
                 }]
             }
+            Err(error) if model.ordered => return Err(error),
             Err(_) => {
                 let mut work = scope(Some(&trace.fields), &all_bindings, &trace.children, "root", &ctx, lang, true)?;
-                work.push(Statement::Return(Expr::call("_details", vec!["root".into()])));
+                work.push(Statement::Return(Expr::call(
+                    "_agent_result",
+                    vec![Expr::call("_details", vec!["root".into()]), expression(output, &ctx, lang)?],
+                )));
                 work
             }
         };
@@ -1273,8 +1345,16 @@ mod execution {
                 });
             }
         }
+        let mut previous = None;
         for child in children {
-            operations.push(child_operation(child, frame, ctx, lang)?);
+            let mut operation = child_operation(child, frame, ctx, lang)?;
+            if ctx.model.ordered
+                && let Some(previous) = previous
+            {
+                operation.reads.insert(previous);
+            }
+            previous = Some(operation.key.clone());
+            operations.push(operation);
         }
         if ctx.direct {
             crate::mocking::code::planning::order(operations, frame)
@@ -1289,6 +1369,7 @@ mod execution {
         let mut child_ctx = ctx.clone();
         child_ctx.site = node;
         child_ctx.frames.push((node, frame.clone()));
+        let empty = Vec::new();
         let (name, kind, bindings, children, fields) = match child {
             Child::Span(v) => (
                 v.name.as_str(),
@@ -1317,7 +1398,7 @@ mod execution {
                 None,
             ),
             Child::Maybe(v) => (v.name.as_deref().unwrap_or("maybe"), "maybe", &v.bindings, &v.children, None),
-            Child::Scorer(_) => return Err("scorer spans are unsupported".into()),
+            Child::Scorer(v) => (v.name.as_str(), "scorer", &v.bindings, &empty, None),
         };
         let mut parameters = vec![];
         if matches!(child, Child::Repeat(_)) {
@@ -1345,6 +1426,22 @@ mod execution {
             false,
         )?;
         match child {
+            Child::Scorer(v) => {
+                work.push(Statement::Evaluate(Expr::call(
+                    "_score_span",
+                    vec![
+                        frame.clone().into(),
+                        parent.into(),
+                        Expr::string(&v.name),
+                        expression(&v.score, &child_ctx, lang)?,
+                        v.reason
+                            .as_ref()
+                            .map(|(value, _)| expression(value, &child_ctx, lang))
+                            .transpose()?
+                            .unwrap_or(Expr::Null),
+                    ],
+                )));
+            }
             Child::Choice(_) => {
                 work.push(assign(
                     Expr::from(frame.clone()).member("fields").index(Expr::string("chosen")),
@@ -2375,7 +2472,9 @@ mod native {
                 }
             })
             .collect();
-        let mut traverses = false;
+        let mut traverses = functions
+            .iter()
+            .any(|function| code::references(&function.body).contains(&Dependency::Variable("_history".into())));
         for function in functions.iter_mut() {
             code::rewrite(&mut function.body, &mut |e| {
                 if matches!(e, Expr::Member(_, member) if member == "children" || member == "iterations") {
@@ -2687,7 +2786,10 @@ mod native {
     // Trace records observe the execution; application results never come from
     // the collector. Structural control-flow scopes are not SDK spans.
     fn observe(functions: &mut [code::Function], lang: ScorerLang) {
-        fn scopes(body: &mut Vec<Statement>) {
+        let history = functions
+            .iter()
+            .any(|function| code::references(&function.body).contains(&Dependency::Variable("_history".into())));
+        fn scopes(body: &mut Vec<Statement>, history: bool) {
             let mut structural = HashSet::new();
             for statement in body.iter() {
                 if let Statement::Variable(Variable::Declare {
@@ -2711,7 +2813,7 @@ mod native {
                     needed.insert(name.clone());
                 }
             });
-            structural.retain(|name| !needed.contains(name));
+            structural.retain(|name| !history && !needed.contains(name));
             let mut output = Vec::new();
             for mut statement in std::mem::take(body) {
                 match &mut statement {
@@ -2768,17 +2870,17 @@ mod native {
                                 ));
                             }
                         });
-                        scopes(body);
+                        scopes(body, history);
                         output.append(body);
                         continue;
                     }
-                    Statement::Function(f) => scopes(&mut f.body),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => scopes(body),
+                    Statement::Function(f) => scopes(&mut f.body, history),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => scopes(body, history),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        scopes(then_body);
-                        scopes(else_body);
+                        scopes(then_body, history);
+                        scopes(else_body, history);
                     }
                     _ => {}
                 }
@@ -2815,7 +2917,7 @@ mod native {
                 }
                 _ => {}
             });
-            scopes(&mut function.body);
+            scopes(&mut function.body, history);
             function.body.insert(
                 0,
                 Statement::Variable(Variable::constant(
@@ -4770,6 +4872,11 @@ mod expressions {
             )
         };
         Ok(match func {
+            Func::Arrivals { ready } => call("_require_arrivals", &[ready])?,
+            Func::Check { value, ty } => Expr::call(
+                "_check_type",
+                vec![expr(value)?, Expr::string(format!("{ty:?}").to_lowercase())],
+            ),
             Func::Len { target } => call("_len", &[target])?,
             Func::Upper { text } => call("_upper", &[text])?,
             Func::Lower { text } => call("_lower", &[text])?,
@@ -5280,6 +5387,11 @@ pub(crate) mod scoring {
                 }
             };
             Ok(match func {
+                Func::Check { .. } | Func::Arrivals { .. } => {
+                    return Err(Error::Unsupported {
+                        what: "runtime schema checks",
+                    });
+                }
                 Func::Choice(options) => {
                     let args = vec![Expr::Array(options.iter().map(|v| self.lower(v)).collect::<Result<_, _>>()?)];
                     if python {

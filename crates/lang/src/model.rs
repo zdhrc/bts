@@ -98,7 +98,7 @@ pub struct FieldSchema {
     pub required: bool,
     /// A constant fallback for omitted fields.
     pub default: Option<Value>,
-    /// Optional descriptive role without an operation binding.
+    /// Optional role without an operation binding. Input roles retain runtime reads.
     pub role: Option<String>,
     /// Schema field location.
     pub range: SrcRange,
@@ -462,8 +462,8 @@ pub enum Value {
         /// The attachment key used to connect payloads with uploads.
         key: String,
     },
-    /// A resolved field or variable binding read during evaluation.
-    BindingRef(BindingId),
+    /// A resolved field or variable binding and the location of this read.
+    BindingRef(BindingId, SrcRange),
     /// A graph reference resolved through the owning model.
     GraphRef {
         /// The index of the resolved reference in [`Model::refs`].
@@ -837,7 +837,7 @@ pub struct Template {
 pub enum Part {
     /// Literal text copied into the result.
     Lit(String),
-    /// A resolved field or variable binding read during evaluation.
+    /// A resolved field or variable binding and the location of this read.
     BindingRef(BindingId),
     /// An expression whose interpolated value is checked at runtime.
     Dynamic(Value),

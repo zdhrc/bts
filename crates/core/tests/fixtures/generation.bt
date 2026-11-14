@@ -1,47 +1,83 @@
-# a session with variable turns, a selected route, and an optional handoff
-vars { product = "billing" }
-
-trace "support-session" {
-    vars { turns = range(2, 4) }
-    input = { request = "Where is my order?", customer = "acct-42" }
-    output = repeat.turns[var.turns - 1].task.turn.output
-    metadata = { product = var.product, escalated = maybe.escalation.included }
-    tags = ["support", "orders"]
-
-    repeat "turns" {
-        count = var.turns
-
-        task "turn" {
-            input = { index = repeat.index, request = trace.input.request }
-            output = format("answer {}", repeat.index)
-
-            llm "draft" {
-                input = task.turn.input
-                output = { role = "assistant", content = task.turn.output }
-                metadata = { model = "gpt-4o-mini", provider = "openai" }
-                metrics = { prompt_tokens = 12, completion_tokens = 4,
-                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens }
-            }
-        }
-    }
-
-    choice "route" {
-        tool "lookup" {
-            input = trace.input
-            output = { status = "found" }
-        }
-
-        function "fallback" {
-            input = trace.input
-            output = { status = "deferred" }
-        }
-    }
-
-    maybe "escalation" {
-        chance = 0.5
-        task "handoff" {
-            input = trace.input
-            output = "queued"
-        }
-    }
+# a session with bounded turns, one route, and an optional handoff
+(session:task {name: "support-session"}) {
+    input: support.input,
+    turns: range(2, 4),
+    route: choice("lookup", "fallback"),
+    escalated: chance(0.5),
+    output: self.turns == 4 ? turn3.output : self.turns == 3 ? turn2.output : turn1.output,
+    metadata: {product: "billing", escalated: self.escalated},
+    tags: [|"support", "orders"|],
 }
+    =[:conditional]=>[
+        -[:next {when: source.turns > 0}]->(turn0),
+        -[:next {when: source.turns > 1}]->(turn1),
+        -[:next {when: source.turns > 2}]->(turn2),
+        -[:next {when: source.turns > 3}]->(turn3),
+    ];
+(session)
+    =[:exclusive]=>[
+        -[:next {when: source.route == "lookup"}]->(lookup:tool) {input: session.input, output: {status: "found"}},
+        -[:next {when: source.route == "fallback"}]->(fallback:function) {input: session.input, output: {status: "deferred"}},
+    ];
+(session)-[:next {when: source.escalated}]->(handoff:task) {input: session.input, output: "queued"};
+(support:agent) {input: {request: "Where is my order?", customer: "acct-42"}, output: session.output};
+(support)-[:contains]->(session);
+(support)-[:next]->(session);
+(turn0:task {name: "turn"}) {
+    input: {index: 0, request: session.input.request},
+    output: "answer 0",
+}-[:next]->(draft0:llm {name: "draft"}) {
+    input: turn0.input,
+    output: {role: "assistant", content: turn0.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};
+(support)-[:contains]->(turn0);
+(support)-[:contains]->(draft0);
+(turn0)-[:child_of]->(session);
+(draft0)-[:child_of]->(turn0);
+(turn1:task {name: "turn"}) {
+    input: {index: 1, request: session.input.request},
+    output: "answer 1",
+}-[:next]->(draft1:llm {name: "draft"}) {
+    input: turn1.input,
+    output: {role: "assistant", content: turn1.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};
+(support)-[:contains]->(turn1);
+(support)-[:contains]->(draft1);
+(turn1)-[:child_of]->(session);
+(draft1)-[:child_of]->(turn1);
+(turn2:task {name: "turn"}) {
+    input: {index: 2, request: session.input.request},
+    output: "answer 2",
+}-[:next]->(draft2:llm {name: "draft"}) {
+    input: turn2.input,
+    output: {role: "assistant", content: turn2.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};
+(support)-[:contains]->(turn2);
+(support)-[:contains]->(draft2);
+(turn2)-[:child_of]->(session);
+(draft2)-[:child_of]->(turn2);
+(turn3:task {name: "turn"}) {
+    input: {index: 3, request: session.input.request},
+    output: "answer 3",
+}-[:next]->(draft3:llm {name: "draft"}) {
+    input: turn3.input,
+    output: {role: "assistant", content: turn3.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};
+(support)-[:contains]->(turn3);
+(support)-[:contains]->(draft3);
+(turn3)-[:child_of]->(session);
+(draft3)-[:child_of]->(turn3);
+(support)-[:contains]->(lookup);
+(lookup)-[:child_of]->(session);
+(support)-[:contains]->(fallback);
+(fallback)-[:child_of]->(session);
+(support)-[:contains]->(handoff);
+(handoff)-[:child_of]->(session);

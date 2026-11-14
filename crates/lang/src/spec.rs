@@ -898,7 +898,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.schemas"),
-        summary: "Kind descriptors accept props and, for nodes, fields. Edge kind descriptors also accept direction with values directed, undirected or either. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. Each maps names to descriptors with type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role is descriptive metadata, not an operation binding. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
+        summary: "Kind descriptors accept props and, for nodes, fields. Edge kind descriptors also accept direction with values directed, undirected or either. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. Each maps names to descriptors with type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role does not install an operation. The input role preserves references to the field and its nested values as runtime reads, even when its authored fallback is constant. Consumers may supply a value at that boundary. Constant folding and branch proofs cannot assume the fallback is the supplied value. Output roles preserve field reference identity without installing evaluation behavior. Other roles remain descriptive metadata. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
     },
     RuleDesc {
         tags: &[],
@@ -994,7 +994,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.fields"),
-        summary: "Undeclared kinds remain open identifiers without domain schemas. The network, relation, incidence, weighted, each and reduce built-ins have fixed configuration properties, with additional properties introduced through kind extension. Declared kinds enforce strict property schemas while allowing additional content fields. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
+        summary: "Undeclared kinds remain open identifiers without domain schemas. The network, relation, incidence, weighted, each, repeat and reduce built-ins have fixed configuration properties, with additional properties introduced through kind extension. Declared kinds enforce strict property schemas while allowing additional content fields. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
     },
     RuleDesc {
         tags: &[],
@@ -1069,7 +1069,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.context"),
-        summary: "Context reads remain explicit residual values owned by their graph element. Lowering does not prescribe scope propagation or scheduling.",
+        summary: "Context reads remain explicit residual values owned by their graph element. A consumer supplies their meaning for the selected behavior, so the same node definition can be interpreted by different consumers without introducing a separate kind. Lowering does not prescribe scope propagation or scheduling.",
     },
     RuleDesc {
         tags: &[],
@@ -1222,6 +1222,11 @@ const PRIMITIVES: &[PrimitiveDesc] = &[
         name: "weighted",
         construct: "fork",
         summary: "Select count eligible branches without replacement using nonnegative branch weights and the consumer seeded evaluation context. Count defaults to one and omitted weights to one. All edges in a branch must agree on weight and all their guards must pass. Runtime eligibility must leave enough positive-weight branches.",
+    },
+    PrimitiveDesc {
+        name: "repeat",
+        construct: "fork",
+        summary: "Instantiate every listed branch count times with distinct destination occurrences. Count is a nonnegative integer evaluated once when the fork activates. Zero creates no occurrences. Each occurrence exposes context.index and context.count, with nested forks supplying their own innermost context. context.history.<node_name> exposes payload records from completed earlier occurrences in the same repetition group. Consumers supply the payload fields and preserve group identity when evaluating history. The group closes after every contributing occurrence settles.",
     },
     PrimitiveDesc {
         name: "each",

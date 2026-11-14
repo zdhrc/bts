@@ -535,7 +535,7 @@ fn toolkit_materializes_through_the_dsl_with_explicit_conversation_scope() {
     let source = include_str!("fixtures/english.bt");
     let outputs = |seed| {
         let batch = data::generate(
-            bts_lang::semantics::compile(source).unwrap(),
+            bts_core::providers::braintrust::mocking::compile(source).unwrap(),
             16,
             Duration::from_secs(600),
             Distribution::Linear,
@@ -613,11 +613,12 @@ fn toolkit_materializes_through_the_dsl_with_explicit_conversation_scope() {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod parity {
+    use bts_core::mocking::{ScorerKind, ScorerLang};
     use bts_core::mocking::{
         code::{Emitter, Item, languages::Languages},
         data::{self, Distribution},
     };
-    use bts_lang::{ScorerKind, ScorerLang, semantics::compile};
+    use bts_core::providers::braintrust::mocking::compile;
     use serde_json::{Value, json};
     use std::{collections::BTreeSet, fs, io::Write, process::Stdio, time::Duration};
 
@@ -1355,8 +1356,8 @@ mod parity {
         cases
     }
 
-    fn input_value(value: &Value) -> bts_lang::Value {
-        use bts_lang::{Array, ArrayElem, Number, Object, ObjectField, Value as ModelValue};
+    fn input_value(value: &Value) -> bts_core::mocking::Value {
+        use bts_core::mocking::{Array, ArrayElem, Number, Object, ObjectField, Value as ModelValue};
         match value {
             Value::Array(values) => ModelValue::Array(Array {
                 elem: values.iter().map(|value| ArrayElem::Item(input_value(value))).collect(),
@@ -1392,7 +1393,9 @@ mod parity {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let source = format!("trace \"corpus\" {{ input = {{ args = [] }} output = {call} }}");
+        let source = format!(
+            "(corpus_root:task {{name: \"corpus\"}}) {{input: corpus.input, output: {call}}};\n(corpus:agent) {{input: {{args: [||]}}, output: corpus_root.output}};\n(corpus)-[:contains]->(corpus_root);\n(corpus)-[:next]->(corpus_root);"
+        );
         let mut model = compile(&source).unwrap_or_else(|errors| panic!("{} did not compile: {errors:?}\n{source}", case.name));
         model.traces[0].fields.input = Some(input_value(&json!({"args":case.args})));
         let mut results = BTreeSet::new();
@@ -1564,7 +1567,9 @@ mod parity {
         let (replays, expected_replays) = style_replays();
         let (expressions, expected_expressions) = expression_replays();
         let payload = json!({"cases":payload,"replays":replays,"expressions":expressions});
-        let model = compile(r#"scorer "corpus" { code { score = len(realize(output)) } } scorer "styled" { code { score = len(vary(output, {style = "text_message", max_changes = 6})) } } scorer "procedural" { code { score = len(express(output)) + len(expression_candidates(output)) + len(expression(output)["text"]) } }"#).unwrap();
+        let model = compile(r#"("corpus":scorer) {score: len(realize(context.output))};
+("styled":scorer) {score: len(vary(context.output, {style: "text_message", max_changes: 6}))};
+("procedural":scorer) {score: len(express(context.output)) + len(expression_candidates(context.output)) + len(expression(context.output) ["text"])};"#).unwrap();
         let ScorerKind::Code { score, steps } = &model.scorers[0].kind else {
             panic!("code scorer")
         };

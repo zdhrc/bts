@@ -1,4 +1,4 @@
-use bts_lang::spec::{Cardinality, NamePolicy, Place, RuleDesc, Spec as DslSpec};
+use bts_lang::spec::{RuleDesc, Spec as DslSpec};
 use std::fmt::Write as _;
 const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
 Steal the structure, replace the content, and expand along the axis each one names.";
@@ -101,46 +101,10 @@ pub fn reference(spec: &DslSpec) -> String {
         }
     }
 
-    writeln!(output, "## Blocks\n").unwrap();
-    for block in spec.blocks {
-        writeln!(output, "### {}\n", inline_code(block.keyword)).unwrap();
-        writeln!(output, "{}\n", block.summary).unwrap();
-        writeln!(output, "- Syntax: {}", inline_code(block.syntax)).unwrap();
-        writeln!(output, "- Name: {}", name_requirement(block.name)).unwrap();
-        writeln!(output, "- Allowed in: {}", placements(spec, block.allowed_in)).unwrap();
-        writeln!(
-            output,
-            "- Unlisted fields: {}\n",
-            if block.body.open { "allowed" } else { "rejected" }
-        )
-        .unwrap();
-
-        if !block.body.fields.is_empty() {
-            writeln!(output, "| Field | Value | Cardinality | Description |").unwrap();
-            writeln!(output, "| --- | --- | --- | --- |").unwrap();
-            for field in block.body.fields {
-                writeln!(
-                    output,
-                    "| {} | {} | {} | {} |",
-                    inline_code(field.keyword),
-                    markdown_cell(&inline_code(&field.value.to_string())),
-                    cardinality(field.cardinality),
-                    markdown_cell(field.summary),
-                )
-                .unwrap();
-            }
-            writeln!(output).unwrap();
-        }
-
-        if !block.conventions.is_empty() {
-            writeln!(output, "Conventions:").unwrap();
-            for convention in block.conventions {
-                writeln!(output, "- {convention}").unwrap();
-            }
-            writeln!(output).unwrap();
-        }
-
-        render_rules(&mut output, block.rules);
+    writeln!(output, "## Graph primitives\n").unwrap();
+    for primitive in spec.primitives {
+        writeln!(output, "### {} ({})\n", inline_code(primitive.name), primitive.construct).unwrap();
+        writeln!(output, "{}\n", primitive.summary).unwrap();
     }
 
     writeln!(output, "## Global rules\n").unwrap();
@@ -176,40 +140,6 @@ fn render_rules(output: &mut String, rules: &[RuleDesc]) {
         writeln!(output, "- {}: {}", inline_code(rule.id.as_str()), rule.summary).unwrap();
     }
     writeln!(output).unwrap();
-}
-
-fn name_requirement(name: NamePolicy) -> &'static str {
-    match name {
-        NamePolicy::Forbidden => "forbidden",
-        NamePolicy::Optional => "optional",
-        NamePolicy::Required => "required",
-    }
-}
-
-fn cardinality(cardinality: Cardinality) -> &'static str {
-    match cardinality {
-        Cardinality::Optional => "optional",
-        Cardinality::Required => "required",
-        Cardinality::Repeated => "repeated",
-    }
-}
-
-fn placements(spec: &DslSpec, allowed_in: &[Place]) -> String {
-    allowed_in
-        .iter()
-        .map(|place| match *place {
-            Place::Root => "document root".to_owned(),
-            Place::Block { id } => spec
-                .block_by_id(id)
-                .map(|block| inline_code(block.keyword))
-                .unwrap_or_else(|| inline_code(id.as_str())),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', " ")
 }
 
 fn inline_code(value: &str) -> String {
@@ -256,17 +186,9 @@ mod tests {
             assert!(skill.contains(function.syntax));
             assert!(skill.contains(function.summary));
         }
-        for block in DSL_SPEC.blocks {
-            assert!(skill.contains(block.keyword));
-            assert!(skill.contains(block.syntax));
-            assert!(skill.contains(block.summary));
-            for field in block.body.fields {
-                assert!(skill.contains(field.keyword));
-                assert!(skill.contains(field.summary));
-            }
-            for convention in block.conventions {
-                assert!(skill.contains(convention));
-            }
+        for primitive in DSL_SPEC.primitives {
+            assert!(skill.contains(primitive.name));
+            assert!(skill.contains(primitive.summary));
         }
         assert!(skill.contains(crate::providers::braintrust::skill::WORKFLOW));
         assert!(skill.contains(crate::providers::braintrust::skill::PRESENTATION));

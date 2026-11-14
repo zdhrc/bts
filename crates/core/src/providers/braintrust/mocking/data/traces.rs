@@ -460,7 +460,13 @@ mod tests {
     fn batch(count: usize) -> Batch {
         use crate::mocking::data::Format as _;
         let events = data::generate(
-            crate::dsl::semantics::compile(r#"trace "run" { output = "hello" }"#).unwrap(),
+            crate::providers::braintrust::mocking::compile(
+                r#"(run_root:task {name: "run"}) {output: "hello", input: run.input};
+(run:agent) {input: null, output: run_root.output};
+(run)-[:contains]->(run_root);
+(run)-[:next]->(run_root);"#,
+            )
+            .unwrap(),
             count,
             Duration::from_secs(60),
             Distribution::Linear,
@@ -561,7 +567,13 @@ mod tests {
         let (client, requests) = serve(vec![Reply::json(json!({"row_ids":["one","two"]}))]);
         let written = run(
             Request {
-                model: crate::dsl::semantics::compile(r#"trace "run" { output = "hello" }"#).unwrap(),
+                model: crate::providers::braintrust::mocking::compile(
+                    r#"(run_root:task {name: "run"}) {output: "hello", input: run.input};
+(run:agent) {input: null, output: run_root.output};
+(run)-[:contains]->(run_root);
+(run)-[:next]->(run_root);"#,
+                )
+                .unwrap(),
                 count: 2,
                 over: Duration::from_secs(60),
                 distribution: Distribution::Linear,

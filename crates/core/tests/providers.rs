@@ -1,9 +1,9 @@
+use bts_core::providers::braintrust::mocking::compile;
 use bts_core::{
     mocking::{code, data},
     providers::{Bundle, CodeProvider, DataProvider, braintrust},
     selection::filter::WriteFilter,
 };
-use bts_lang::semantics::compile;
 use std::{
     cell::RefCell,
     convert::Infallible,
@@ -115,7 +115,13 @@ type RunResult<B> = data::RunResult<
 fn generate_and_send<B: DataProvider>(bundle: &B, client: &B::Client) -> RunResult<B> {
     let filter = WriteFilter::default();
     let request = data::Request {
-        model: compile(r#"trace "flow" { output = "ok" }"#).unwrap(),
+        model: compile(
+            r#"(flow_root:task {name: "flow"}) {output: "ok", input: flow.input};
+(flow:agent) {input: null, output: flow_root.output};
+(flow)-[:contains]->(flow_root);
+(flow)-[:next]->(flow_root);"#,
+        )
+        .unwrap(),
         count: 1,
         over: Duration::from_secs(60),
         distribution: data::Distribution::Linear,
@@ -266,7 +272,7 @@ impl code::Target for PlainTarget {
 }
 
 fn assemble<B: CodeProvider>(bundle: &B, config: &B::CodeConfig) -> code::Assembly {
-    let model = compile(r#"scorer "quality" { code { score = 0.5 } }"#).unwrap();
+    let model = compile(r#"("quality":scorer) {score: 0.5};"#).unwrap();
     code::assemble(&model.scorers, None, &bundle.emitter(), &bundle.code(config)).unwrap()
 }
 

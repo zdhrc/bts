@@ -1121,8 +1121,13 @@ mod tests {
     #[test]
     fn grouped_sources_keep_order_and_have_distinct_native_trace_references() {
         let config = Braintrust::new("test".to_owned(), uuid::Uuid::nil());
-        let model = dsl::semantics::compile(
-            r#"trace "one" { input = "question" } dataset "cases" { case "group" { traces = [trace["one"], trace["one"]] } }"#,
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(one_root:task {name: "one"}) {input: one.input};
+(one:agent) {input: "question", output: null};
+(one)-[:contains]->(one_root);
+(one)-[:next]->(one_root);
+(dataset_cases_group:case {name: "group"}) {traces: [|(one_root) , (one_root)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_group)|]};"#,
         )
         .unwrap();
         let mut plans = prepare(
@@ -1145,7 +1150,11 @@ mod tests {
         assert_ne!(refs[0]["trace_ref"]["root_span_id"], refs[1]["trace_ref"]["root_span_id"]);
     }
     fn inline_plan(client: &Client) -> (Dataset, Vec<Case>) {
-        let model = dsl::semantics::compile(r#"dataset "cases" { case "one" { input = "new" } }"#).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(dataset_cases_one:case {name: "one"}) {input: "new"};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};"#,
+        )
+        .unwrap();
         let plans = prepare(
             &model.datasets[0],
             &model,
@@ -1227,8 +1236,15 @@ mod tests {
 
     #[test]
     fn failed_enrichment_repairs_do_not_delete_their_authored_parents() {
-        let model =
-            dsl::semantics::compile(r#"trace "one" {} dataset "cases" { case "one" { trace = trace["one"] } }"#).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(one_root:task {name: "one"}) {input: one.input};
+(one:agent) {input: null, output: null};
+(one)-[:contains]->(one_root);
+(one)-[:next]->(one_root);
+(dataset_cases_one:case {name: "one"}) {source: (one_root)};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};"#,
+        )
+        .unwrap();
         let config = Braintrust::new("test".to_owned(), uuid::Uuid::nil());
         let mut plans = prepare(
             &model.datasets[0],

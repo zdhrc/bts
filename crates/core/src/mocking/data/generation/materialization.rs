@@ -282,41 +282,32 @@ impl Error {
 mod tests {
     use super::super::evaluation::plan;
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::mocking::data::Value;
+    use crate::providers::braintrust::mocking::compile;
     use std::collections::BTreeMap;
 
     #[test]
     fn materializes_nested_spans_and_fields() {
         let model = compile(
-            r#"
-            vars {
-                system = """
+            r#"(support_sessions_root:task {name: "support-sessions"}) {tags: [|"chat", "prod"|], system: """
                     You are a concise personal finance assistant.
                     Answer briefly.
-                    """
-                meta = { model = "gpt-4o-mini", temperature = 0.2 }
-            }
-            trace "support-sessions" {
-                task "turn_0" {
-                    input = "How did NVDA do today?"
-                    llm "Chat Completion" {
-                        input = [
-                            { role = "system", content = var.system },
-                            { role = "user", content = task.turn_0.input },
-                        ]
-                        output = { role = "assistant", content = "NVDA closed down 1.4% at $207.40." }
-                        metadata = var.meta
-                        metrics = { prompt_tokens = 612, completion_tokens = 24,
-                            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens }
-                    }
-                }
-                task "turn_1" {
-                    llm "Chat Completion" { metadata = var.meta }
-                }
-                tags = ["chat", "prod"]
-            }
-        "#,
+                    """, meta: {model: "gpt-4o-mini", temperature: 0.2}, input: support_sessions.input};
+(turn_0:task {name: "turn_0"}) {input: "How did NVDA do today?"};
+(Chat_Completion:llm {name: "Chat Completion"}) {input: [|{role: "system", content: support_sessions_root.system}, {role: "user", content: turn_0.input},|], output: {role: "assistant", content: "NVDA closed down 1.4% at $207.40."}, metadata: support_sessions_root.meta, metrics: {prompt_tokens: 612, completion_tokens: 24, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}};
+(turn_1:task {name: "turn_1"}) {};
+(Chat_Completion_1:llm {name: "Chat Completion"}) {metadata: support_sessions_root.meta};
+(support_sessions:agent) {input: null, output: null};
+(support_sessions)-[:contains]->(support_sessions_root);
+(support_sessions)-[:contains]->(turn_0);
+(turn_0)-[:child_of]->(support_sessions_root);
+(support_sessions)-[:contains]->(Chat_Completion);
+(Chat_Completion)-[:child_of]->(turn_0);
+(support_sessions)-[:contains]->(turn_1);
+(turn_1)-[:child_of]->(support_sessions_root);
+(support_sessions)-[:contains]->(Chat_Completion_1);
+(Chat_Completion_1)-[:child_of]->(turn_1);
+(support_sessions)-[:next]->(support_sessions_root)-[:next]->(turn_0)-[:next]->(Chat_Completion)-[:next]->(turn_1)-[:next]->(Chat_Completion_1);"#,
         )
         .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
@@ -382,13 +373,13 @@ mod tests {
 
     #[test]
     fn retains_expected_and_error_fields_only_when_set() {
-        let source = r#"
-            trace "example" {
-                expected = "4"
-                error = { message = "timeout" }
-                task "step" {}
-            }
-        "#;
+        let source = r#"(example_root:task {name: "example"}) {expected: "4", error: {message: "timeout"}, input: example.input};
+(step:task {name: "step"}) {};
+(example:agent) {input: null, output: null};
+(example)-[:contains]->(example_root);
+(example)-[:contains]->(step);
+(step)-[:child_of]->(example_root);
+(example)-[:next]->(example_root)-[:next]->(step);"#;
         let model = compile(source).unwrap();
         let events = materialize(
             plan(model, 1, 0).unwrap(),
@@ -440,15 +431,19 @@ mod tests {
 
     #[test]
     fn lays_spans_out_by_their_durations() {
-        let source = r#"
-            trace "t" {
-                duration = 60
-                task "a" { duration = 2 }
-                task "b" {
-                    llm "c" { duration = 1.5 }
-                }
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {duration: 60, input: t.input};
+(a:task {name: "a"}) {duration: 2};
+(b:task {name: "b"}) {};
+(c:llm {name: "c"}) {duration: 1.5};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:contains]->(a);
+(a)-[:child_of]->(t_root);
+(t)-[:contains]->(b);
+(b)-[:child_of]->(t_root);
+(t)-[:contains]->(c);
+(c)-[:child_of]->(b);
+(t)-[:next]->(t_root)-[:next]->(a)-[:next]->(b)-[:next]->(c);"#;
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
@@ -478,7 +473,10 @@ mod tests {
 
     #[test]
     fn rejects_windows_shorter_than_the_longest_trace() {
-        let source = r#"trace "t" { duration = 7200 }"#;
+        let source = r#"(t_root:task {name: "t"}) {duration: 7200, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-[:contains]->(t_root);
+(t)-[:next]->(t_root);"#;
         let error = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
             Duration::from_secs(3_600),
@@ -492,7 +490,13 @@ mod tests {
 
     #[test]
     fn spreads_generated_traces_across_the_window() {
-        let model = compile(r#"trace "example" {}"#).unwrap();
+        let model = compile(
+            r#"(example_root:task {name: "example"}) {input: example.input};
+(example:agent) {input: null, output: null};
+(example)-[:contains]->(example_root);
+(example)-[:next]->(example_root);"#,
+        )
+        .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(model, 3, 0).unwrap(),
@@ -512,7 +516,13 @@ mod tests {
 
     #[test]
     fn sine_distribution_clusters_traces_mid_window() {
-        let model = compile(r#"trace "example" {}"#).unwrap();
+        let model = compile(
+            r#"(example_root:task {name: "example"}) {input: example.input};
+(example:agent) {input: null, output: null};
+(example)-[:contains]->(example_root);
+(example)-[:next]->(example_root);"#,
+        )
+        .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(model, 5, 0).unwrap(),

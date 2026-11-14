@@ -9,13 +9,15 @@ use std::{
 
 #[test]
 fn previews_experiments_through_the_public_api() {
-    let model = bts_lang::semantics::compile(
-        r#"
-        trace "answer" { input = "fallback" output = trace.input }
-        dataset "cases" { case "question" { input = "hello" } }
-        scorer "quality" { code { score = input == output ? 1 : 0 } }
-        experiment "trial" { dataset = dataset.cases task = trace.answer scorers = [scorer.quality] }
-    "#,
+    let model = bts_core::providers::braintrust::mocking::compile(
+        r#"(answer_root:task {name: "answer"}) {input: answer.input, output: answer_root.input};
+(answer:agent) {input: "fallback", output: answer_root.output};
+(answer)-[:contains]->(answer_root);
+(answer)-[:next]->(answer_root);
+(dataset_cases_question:case {name: "question"}) {input: "hello"};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_question)|]};
+("quality":scorer) {score: context.input == context.output ? 1 : 0};
+(experiment_trial:experiment {name: "trial"}) {dataset: (dataset_cases), task: (answer_root), scorers: [|("quality")|]};"#,
     )
     .unwrap();
     let preview = experiments::preview(&model, &[], Path::new("shape.bt"), 42, UNIX_EPOCH + Duration::from_secs(3600)).unwrap();
@@ -57,15 +59,11 @@ fn prepares_preview_attachments_without_reading_or_uploading_files() {
     use bts_core::{mocking::data, selection::filter::WriteFilter};
     let root = std::env::temp_dir().join(format!("bts-preview-{}", uuid::Uuid::new_v4()));
     let source = root.join("shape.bt");
-    let model = bts_lang::semantics::compile(
-        r#"
-        trace "review" {
-            input = {
-                first = attachment("report.pdf", "application/pdf")
-                second = attachment("report.pdf", "application/pdf")
-            }
-        }
-    "#,
+    let model = bts_core::providers::braintrust::mocking::compile(
+        r#"(review_root:task {name: "review"}) {input: review.input};
+(review:agent) {input: {first: attachment("report.pdf", "application/pdf"), second: attachment("report.pdf", "application/pdf")}, output: null};
+(review)-[:contains]->(review_root);
+(review)-[:next]->(review_root);"#,
     )
     .unwrap();
     let batch = data::prepare(
@@ -138,9 +136,12 @@ fn client_keeps_its_own_configuration() {
 fn generation_errors_keep_their_kind_range_and_diagnostic_conversion() {
     use bts_core::mocking::data::{self, Distribution, generation};
     use std::error::Error as _;
-    let source = r#"trace "run" { output = 1 / trace.index }"#;
+    let source = r#"(run_root:task {name: "run"}) {output: 1 / context.trace_index, input: run.input};
+(run:agent) {input: null, output: run_root.output};
+(run)-[:contains]->(run_root);
+(run)-[:next]->(run_root);"#;
     let error = data::generate(
-        bts_lang::semantics::compile(source).unwrap(),
+        bts_core::providers::braintrust::mocking::compile(source).unwrap(),
         1,
         Duration::from_secs(60),
         Distribution::Linear,
@@ -165,7 +166,13 @@ fn generation_errors_keep_their_kind_range_and_diagnostic_conversion() {
 fn materialization_errors_expose_the_failure_and_event() {
     use bts_core::mocking::data::{self, Distribution, generation};
     let error = data::generate(
-        bts_lang::semantics::compile(r#"trace "run" {}"#).unwrap(),
+        bts_core::providers::braintrust::mocking::compile(
+            r#"(run_root:task {name: "run"}) {input: run.input};
+(run:agent) {input: null, output: null};
+(run)-[:contains]->(run_root);
+(run)-[:next]->(run_root);"#,
+        )
+        .unwrap(),
         1,
         Duration::from_nanos(1),
         Distribution::Linear,
@@ -216,12 +223,18 @@ fn attachment_failures_keep_the_io_cause_through_the_writer() {
 #[test]
 fn experiment_preview_keeps_the_underlying_generation_failure() {
     use bts_core::mocking::data::generation;
-    let model = bts_lang::semantics::compile(
+    let model = bts_core::providers::braintrust::mocking::compile(
         r#"
-        trace "run" { repeat "steps" { count = range(-2, -1) tool "step" {} } }
-        dataset "cases" { case "one" { input = "hello" } }
-        scorer "quality" { code { score = 1 } }
-        experiment "trial" { dataset = dataset.cases task = trace.run scorers = [scorer.quality] }
+        (run:agent) {input: null, output: null};
+        (run)-[:contains]->(root);
+        (run)-[:contains]->(step);
+        (run)-[:next]->(root:task) {input: run.input};
+        (root)=[:repeat {count: range(-2, -1)}]=>[-[:next]->(step:tool)];
+        (step)-[:child_of]->(root);
+        (one:case) {input: "hello"};
+        (cases:dataset) {cases: [|(one)|]};
+        (quality:scorer) {score: 1};
+        (trial:experiment) {dataset: (cases), task: (root), scorers: [|(quality)|]};
     "#,
     )
     .unwrap();

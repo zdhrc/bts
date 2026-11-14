@@ -782,6 +782,7 @@ class ExecutionContext:
 class Span:
     def __init__(self, name, kind, parent=None, logger=None, key=None):
         self.name, self.kind = name, kind
+        self.parent, self.key = parent, key
         if parent is not None and key is not None: parent.children[key] = self
         self.fields, self.children, self.iterations = {}, {}, []
         self.opened = parent.opened if parent is not None else []
@@ -874,6 +875,48 @@ def _duration(value):
     if value <= 0: raise ValueError("duration must be positive")
     return value
 
+
+def _history(span, target_key, group_key):
+    def group(node):
+        while node is not None:
+            if node.kind == "repeat" and node.key == group_key: return node
+            node = node.parent
+        return None
+    current = group(span)
+    if current is None or span.context is None: raise ValueError("history requires an active repetition group")
+    result = []
+    for candidate in span.context.records:
+        if candidate is span: break
+        previous = group(candidate)
+        if candidate.key == target_key and previous is not None and previous is not current and previous.parent is current.parent:
+            result.append(_occurrence(candidate))
+    return result
+
+
+def _occurrence(span):
+    return {key: _value(_read(span, key)) for key in ("input", "output", "expected", "metadata")}
+
+
+def _require_arrivals(ready):
+    if ready is not True: raise ValueError("accumulate group closed with a missing listed input")
+    return 1
+
+
+def _score_span(span, parent, name, score, reason):
+    while parent.kind in ("repeat", "choice", "maybe"): parent = parent.parent
+    score = _num(score)
+    if not 0 <= score <= 1: raise ValueError("score must be between zero and one")
+    if reason is not None and not isinstance(reason, str): raise TypeError("scorer reason must be a string")
+    values = {key: _value(parent.fields[key]) for key in ("input", "output", "expected", "metadata") if key in parent.fields}
+    fields = {"input": values, "output": {"score": score}, "scores": {name: score}}
+    if reason is not None: fields["metadata"] = {"reason": reason}
+    span.log(**fields)
+    parent.log(scores={**parent.fields.get("scores", {}), name: score})
+
+
+def _agent_result(details, output):
+    details["output"] = _value(output)
+    return details
 
 def _details(root):
     spans = []
@@ -968,6 +1011,7 @@ class ExecutionContext {
 
 class Span {
     context: ExecutionContext | null = null;
+    key: string | null = null;
     parent: Span | null = null;
     fields: Record<string, unknown> = Object.create(null);
     children: Record<string, Span | (() => Span)> = Object.create(null);
@@ -979,7 +1023,7 @@ class Span {
     ended = false;
     opened: Span[];
     constructor(name: string, kind: string, parent: Span | null = null, logger: any = null, key: string | null = null) {
-        this.name = name; this.kind = kind;
+        this.name = name; this.kind = kind; this.parent = parent; this.key = key;
         if (parent !== null && key !== null) parent.children[key] = this;
         this.span = parent?.span ?? logger;
         this.opened = parent?.opened ?? [];
@@ -1047,6 +1091,53 @@ function _duration(value: unknown): number {
     if (number <= 0) throw new RangeError("duration must be positive");
     return number;
 }
+function _history(span: Span, targetKey: string, groupKey: string): Record<string, unknown>[] {
+    const group = (node: Span | null): Span | null => {
+        while (node !== null) {
+            if (node.kind === "repeat" && node.key === groupKey) return node
+            node = node.parent
+        }
+        return null
+    }
+    const current = group(span)
+    if (current === null || span.context === null) throw new Error("history requires an active repetition group")
+    const result: Record<string, unknown>[] = []
+    for (const candidate of span.context.records) {
+        if (candidate === span) break
+        const previous = group(candidate)
+        if (candidate.key === targetKey && previous !== null && previous !== current && previous.parent === current.parent) result.push(_occurrence(candidate))
+    }
+    return result
+}
+
+function _occurrence(span: Span): Record<string, unknown> {
+    return Object.fromEntries(["input", "output", "expected", "metadata"].map(key => [key, _value(_read(span, key))]))
+}
+
+function _require_arrivals(ready: unknown): number {
+    if (ready !== true) throw new Error("accumulate group closed with a missing listed input")
+    return 1
+}
+
+function _score_span(span: Span, parent: Span, name: string, score: unknown, reason: unknown): void {
+    while (["repeat", "choice", "maybe"].includes(parent.kind)) parent = parent.parent!
+    const value = _num(score)
+    if (value < 0 || value > 1) throw new RangeError("score must be between zero and one")
+    if (reason !== null && typeof reason !== "string") throw new TypeError("scorer reason must be a string")
+    const input: Record<string, unknown> = {}
+    for (const key of ["input", "output", "expected", "metadata"]) {
+        if (key in parent.fields) input[key] = _value(parent.fields[key])
+    }
+    const fields: Record<string, unknown> = {input, output: {score: value}, scores: {[name]: value}}
+    if (reason !== null) fields.metadata = {reason}
+    span.log(fields)
+    parent.log({scores: {...(parent.fields.scores as Record<string, unknown> ?? {}), [name]: value}})
+}
+
+function _agent_result(details: any, output: unknown): any {
+    details.output = _serialize(output);
+    return details;
+}
 function _details(root: Span): {output: unknown, spans: Record<string, unknown>[]} {
     const spans: Record<string, unknown>[] = [];
     function visit(scope: Span, parent: number | null): number {
@@ -1098,6 +1189,19 @@ def _num(value):
         raise TypeError("expected a finite number")
     if type(value) is int and abs(value) > 9007199254740991:
         raise ValueError("integer exceeds the portable safe range")
+    return value
+
+def _check_type(value, kind):
+    value = _force(value)
+    valid = kind == "any" or (
+        (kind == "string" and type(value) is str)
+        or (kind == "boolean" and type(value) is bool)
+        or (kind == "number" and type(value) in (int, float))
+        or (kind == "array" and type(value) is list)
+        or (kind == "object" and type(value) is dict)
+    )
+    if not valid: raise TypeError("upstream field requires " + kind)
+    if kind == "number": _num(value)
     return value
 
 def _upper(value): return _string(value).upper()
@@ -1259,6 +1363,18 @@ function _num(value: unknown): number {
     if (value instanceof _Float) return value.value;
     if (typeof value !== "number" || !Number.isFinite(value)) throw new TypeError("expected a finite number");
     if (Number.isInteger(value) && !Number.isSafeInteger(value)) throw new RangeError("integer exceeds the portable safe range");
+    return value;
+}
+function _check_type(value: unknown, kind: string): unknown {
+    value = _force(value);
+    const valid = kind === "any"
+        || (kind === "string" && typeof value === "string")
+        || (kind === "boolean" && typeof value === "boolean")
+        || (kind === "number" && (typeof value === "number" || value instanceof _Float))
+        || (kind === "array" && Array.isArray(value))
+        || (kind === "object" && value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof _Float));
+    if (!valid) throw new TypeError("upstream field requires " + kind);
+    if (kind === "number") _num(value);
     return value;
 }
 function _upper(value: unknown): string { return _string(value).toUpperCase(); }
@@ -3758,21 +3874,22 @@ mod english_tests {
                 "{{{}}}",
                 fields
                     .iter()
-                    .map(|(key, value)| format!("{key} = {}", literal(value)))
+                    .map(|(key, value)| format!("{key}: {}", literal(value)))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Value::Array(items) => format!("[{}]", items.iter().map(literal).collect::<Vec<_>>().join(", ")),
+            Value::Array(items) => format!("[|{}|]", items.iter().map(literal).collect::<Vec<_>>().join(", ")),
             value => value.to_string(),
         }
     }
 
     fn native(operation: &str, args: &[Value]) -> Value {
         let source = format!(
-            "trace \"language\" {{ output = {operation}({}) }}",
+            "(language_root:task {{name: \"language\"}}) {{output: {operation} ({}), input: language.input}};\n(language:agent) {{input: null, output: language_root.output}};\n(language)-[:contains]->(language_root);\n(language)-[:next]->(language_root);",
             args.iter().map(literal).collect::<Vec<_>>().join(", ")
         );
-        let model = crate::dsl::semantics::compile(&source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let model =
+            crate::providers::braintrust::mocking::compile(&source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
         match data::generate(
             model,
             1,

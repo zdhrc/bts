@@ -42,7 +42,17 @@
         metrics: {prompt_tokens: 12, completion_tokens: 8, tokens: 20},
     }
     -[:next]->(format_reply:function) {output: reply.output}
-    -[:next]->(grade:scorer) {score: 1, reason: "Routed to appointments", scores: {routing: 1}};
+    -[:next]->(grade:scorer {file: "intake_checks"}) {
+        score: context.output.patient_id == context.input.patient_id ? 1 : 0,
+        reason: "Preserved the patient identifier",
+    };
+
+# parenting is independent of membership, progression, and value transfer
+(lookup)-[:child_of]->(request);
+(route)-[:child_of]->(request);
+(reply)-[:child_of]->(route);
+(format_reply)-[:child_of]->(request);
+(grade)-[:child_of]->(request);
 
 (failed:tool) {error: {message: "Patient lookup timed out"}, expected: {found: true}};
 (:task) {input: "anonymous spans are allowed"};

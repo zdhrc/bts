@@ -249,7 +249,7 @@
         -[:next]->(record_check:function),
     ]
         ->(inspect)
-            ~[:repeat]~>(recheck);
+            ~[:retry]~>(recheck);
 
 # combined scopes remain separate, with no silent field merge
 # junction kinds define combination behavior, properties configure it
@@ -287,7 +287,7 @@
 # cycle edges have their own kind, identity and configuration
 # max_attempts is illustrative, the language does not execute retries
 (poll_visit:tool)
-    ~[poll_again:repeat {max_attempts: settings.max_attempts}]~>(poll_visit);
+    ~[poll_again:retry {max_attempts: settings.max_attempts}]~>(poll_visit);
 
 # endpoint access works with anonymous nodes too
 (:tool {name: "check_visit"}) {
@@ -318,7 +318,7 @@
 (routing_correct:scorer {lang: "python"}) {
     output: {department: context.output.department},
     expected: {department: "appointments"},
-    code: {score: self.output.department == self.expected.department ? 1 : 0},
+    score: context.output.department == context.expected.department ? 1 : 0,
 };
 
 # candidate field-based association, no implicit graph containment
@@ -476,3 +476,17 @@
             on_failure: "fail",
             on_cancel: "fail",
         } [processed]]>>(total:node) {value: <-};
+
+# caller inputs retain references even when their authored fallback is constant
++(supplied_values::node {fields: {payload: {type: "object", role: "input"}}});
+(caller_values:supplied_values) {
+    payload: {count: 2, enabled: true},
+    observed: self.payload.count,
+    selected: self.payload.enabled ? "enabled" : "disabled",
+};
+
+# count-based iteration creates separate occurrences without an item collection
+(retry_batch:task)
+    =[:repeat {count: 3}]=>[
+        -[:next]->(attempt:tool) {input: context.history.attempt, output: {index: context.index, count: context.count}},
+    ];

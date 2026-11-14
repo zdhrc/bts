@@ -1,5 +1,5 @@
 use super::codebase::{CodebaseContext, CodebasePlan};
-use crate::dsl::{JudgeOption, ScorerArg, ScorerLang, ScorerStep, Value};
+use crate::dsl::Value;
 
 /// The inputs for one scorer function.
 pub struct Item<'m> {
@@ -95,4 +95,94 @@ pub trait AgentTarget: Target {
         lang: ScorerLang,
         context: &CodebaseContext<'_>,
     ) -> Result<CodebasePlan, Self::Error>;
+}
+
+/// A reusable scorer definition for a code generation or deployment consumer.
+#[derive(Debug, Clone)]
+pub struct Scorer {
+    /// The name written in source.
+    pub name: String,
+    /// The requested output language, or `None` to let the consumer choose.
+    pub lang: Option<ScorerLang>,
+    /// An optional output file stem for grouping generated scorers.
+    pub file: Option<String>,
+    /// The kind of operation represented by this definition.
+    pub kind: ScorerKind,
+}
+
+/// The requested programming language for generated scorer code.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ScorerLang {
+    /// Python source output.
+    Python,
+    /// TypeScript source output.
+    Typescript,
+}
+
+/// Either executable score expressions or a model-based judge definition.
+#[derive(Debug, Clone)]
+pub enum ScorerKind {
+    /// Score expressions and ordered conditional steps.
+    Code {
+        /// The fallback score used when no earlier step returns a score.
+        score: Value,
+        /// Ordered steps to follow or evaluate.
+        steps: Vec<ScorerStep>,
+    },
+    /// A model-based judge with labeled score options.
+    Judge {
+        /// The requested judge model name.
+        model: String,
+        /// Judge instructions with optional scorer-argument interpolation.
+        prompt: Value,
+        /// Allowed judge responses and their scores.
+        options: Vec<JudgeOption>,
+    },
+}
+
+/// A conditional scorer branch. Nested steps run before its own score.
+#[derive(Debug, Clone)]
+pub struct When {
+    /// The condition controlling this expression or branch.
+    pub cond: Value,
+    /// The score expression to evaluate.
+    pub score: Option<Value>,
+    /// Ordered steps to follow or evaluate.
+    pub steps: Vec<ScorerStep>,
+}
+
+/// A conditional or repeated step evaluated before a scorer fallback.
+#[derive(Debug, Clone)]
+pub enum ScorerStep {
+    /// A conditional scorer branch.
+    When(When),
+    /// A repeated sequence.
+    Repeat {
+        /// The number of iterations to evaluate.
+        count: Value,
+        /// Ordered steps to follow or evaluate.
+        steps: Vec<ScorerStep>,
+    },
+}
+
+/// A named judge response and its numeric score.
+#[derive(Debug, Clone)]
+pub struct JudgeOption {
+    /// The response label returned by the judge.
+    pub label: String,
+    /// The score expression to evaluate.
+    pub score: f64,
+}
+
+/// An input supplied when a consumer invokes a scorer.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ScorerArg {
+    /// The input field.
+    Input,
+    /// The output field.
+    Output,
+    /// The expected result field.
+    Expected,
+    /// Additional named data.
+    Metadata,
 }

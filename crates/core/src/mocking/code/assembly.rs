@@ -209,7 +209,8 @@ pub fn assemble_agents(
     let mut sources = Vec::new();
     let mut types = Vec::new();
     for agent in planning::agents(model, lang)? {
-        let function = lowering::agent(model, agent.trace, lang).map_err(|e| format!("agent {:?}: {e}", agent.name))?;
+        let function =
+            lowering::agent(model, agent.trace, agent.output, lang).map_err(|e| format!("agent {:?}: {e}", agent.name))?;
         let path = std::path::Path::new(&agent.file);
         let module = format!("{}_types", path.file_stem().unwrap().to_string_lossy());
         let (contents, definitions) = super::languages::rendering::agent(&function, lang, &module, target.tracing(lang));
@@ -354,18 +355,20 @@ fn needed_helpers(runtime: &str, source: &str) -> String {
 #[cfg(test)]
 mod agent_tests {
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::providers::braintrust::mocking::code::CodeTarget;
+    use crate::providers::braintrust::mocking::compile;
 
     #[test]
     fn selected_agents_keep_independent_runtimes() {
         let model = compile(
-            r#"
-trace "count" { output = tokens("hello") }
-trace "plain" { output = "hello" }
-agent "count" { entrypoint = trace.count }
-agent "plain" { entrypoint = trace.plain }
-"#,
+            r#"(count_root:task {name: "count"}) {output: tokens("hello"), input: count.input};
+(count:agent) {input: null, output: count_root.output};
+(count)-[:contains]->(count_root);
+(count)-[:next]->(count_root);
+(plain_root:task {name: "plain"}) {output: "hello", input: plain.input};
+(plain:agent) {input: null, output: plain_root.output};
+(plain)-[:contains]->(plain_root);
+(plain)-[:next]->(plain_root);"#,
         )
         .unwrap();
         let target = CodeTarget::new("");
@@ -400,14 +403,25 @@ agent "plain" { entrypoint = trace.plain }
     fn validates_agent_names_and_language_integer_limits() {
         let target = CodeTarget::new("");
         for source in [
-            r#"agent "a-b" { entrypoint = trace.t } agent "a_b" { entrypoint = trace.t } trace "t" { output = "ok" }"#,
-            r#"trace "t" { output = "ok" }"#,
+            r#"(first:agent {name: "a-b"}) {input: null, output: "ok"};
+(first)-[:contains]->(first_root);
+(first)-[:next]->(first_root:task) {input: first.input};
+(second:agent {name: "a_b"}) {input: null, output: "ok"};
+(second)-[:contains]->(second_root);
+(second)-[:next]->(second_root:task) {input: second.input};"#,
+            "(quality:scorer) {score: 1};",
         ] {
             for lang in [ScorerLang::Python, ScorerLang::Typescript] {
                 assert!(assemble_agents(&compile(source).unwrap(), lang, &target).is_err());
             }
         }
-        let model = compile(r#"agent "a" { entrypoint = trace.t } trace "t" { output = 9007199254740993 }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {output: 9007199254740993, input: a.input};
+(a:agent) {input: null, output: t_root.output};
+(a)-[:contains]->(t_root);
+(a)-[:next]->(t_root);"#,
+        )
+        .unwrap();
         assert!(assemble_agents(&model, ScorerLang::Python, &target).is_ok());
         assert!(
             assemble_agents(&model, ScorerLang::Typescript, &target)

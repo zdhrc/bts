@@ -35,7 +35,7 @@ impl ExprType {
                 // constant exprs fold to values, only dynamic ones get here
                 Value::Input { .. }
                 | Value::FieldRef(_)
-                | Value::BindingRef(_)
+                | Value::BindingRef(_, _)
                 | Value::GraphRef { .. }
                 | Value::Context { .. }
                 | Value::Unary { .. }
@@ -152,7 +152,7 @@ impl<'a> ExpressionModeler<'a> {
     fn var_value(&self, name: &BindingId) -> Option<&Folded> {
         let mut value = self.vars.get(name)?;
         for _ in 0..self.vars.len() {
-            let FoldedKind::Value(Value::BindingRef(id)) = &value.kind else {
+            let FoldedKind::Value(Value::BindingRef(id, _)) = &value.kind else {
                 return Some(value);
             };
             value = self.vars.get(id)?;
@@ -277,8 +277,8 @@ impl<'a> ExpressionModeler<'a> {
                         // a template value splices its parts inline
                         FoldedKind::Value(Value::Template(template)) => modeled.extend(template.parts),
                         // dynamic defs resolve per scope instantiation, scalar by type
-                        FoldedKind::Value(Value::BindingRef(name)) => {
-                            let var_type = self.value_type(&Value::BindingRef(name));
+                        FoldedKind::Value(Value::BindingRef(name, reference_range)) => {
+                            let var_type = self.value_type(&Value::BindingRef(name, reference_range));
                             match var_type {
                                 Some(StaticType::String | StaticType::Number | StaticType::Boolean) => {
                                     modeled.push(Part::BindingRef(name));
@@ -287,7 +287,8 @@ impl<'a> ExpressionModeler<'a> {
                                     self.errors.push(Error::new(
                                         ErrorKind::NonScalarInterpolation {
                                             rule: spec::ids::SCALAR_INTERPOLATION,
-                                            found: self.found_type(&Folded::value(Value::BindingRef(name), range)),
+                                            found: self
+                                                .found_type(&Folded::value(Value::BindingRef(name, reference_range), range)),
                                         },
                                         range,
                                     ));
@@ -531,7 +532,7 @@ impl<'a> ExpressionModeler<'a> {
     // inspect known collection structure without evaluating its dynamic leaves
     fn selection_shape(&self, value: &Folded) -> Option<Folded> {
         match &value.kind {
-            FoldedKind::Value(Value::BindingRef(id)) => self.selection_shape(self.var_value(id)?),
+            FoldedKind::Value(Value::BindingRef(id, _)) => self.selection_shape(self.var_value(id)?),
             FoldedKind::Value(Value::Index { target, index, .. }) => {
                 let target = self.selection_shape(&folded_value((**target).clone(), value.range))?;
                 let selected = match (&target.kind, index.as_ref()) {
@@ -546,7 +547,7 @@ impl<'a> ExpressionModeler<'a> {
     }
 
     fn fold_index(&mut self, target: Folded, index: Folded, range: SrcRange) -> Option<Folded> {
-        if matches!(&target.kind, FoldedKind::Value(Value::BindingRef(_) | Value::Index { .. }))
+        if matches!(&target.kind, FoldedKind::Value(Value::BindingRef(_, _) | Value::Index { .. }))
             && let Some(definition) = self.selection_shape(&target)
             && matches!(definition.kind, FoldedKind::Array(_) | FoldedKind::Object(_))
             && is_constant(&index)
@@ -672,7 +673,7 @@ impl<'a> ExpressionModeler<'a> {
         let operand = self.fold_expr(operand)?;
 
         // a dynamic var splices as accessors into the one evaluated binding
-        if let FoldedKind::Value(Value::BindingRef(name)) = &operand.kind {
+        if let FoldedKind::Value(Value::BindingRef(name, _)) = &operand.kind {
             let ranges = match self.var_value(name).map(|value| &value.kind) {
                 Some(FoldedKind::Array(values)) => Some(values.iter().map(|value| value.range).collect::<Vec<_>>()),
                 _ => None,
@@ -685,7 +686,7 @@ impl<'a> ExpressionModeler<'a> {
                         .map(|(index, range)| {
                             FoldedElem::Item(Folded::value(
                                 Value::Index {
-                                    target: Box::new(Value::BindingRef(*name)),
+                                    target: Box::new(Value::BindingRef(*name, operand.range)),
                                     index: Box::new(Value::Num(Number::Int(index as i64))),
                                     range,
                                 },
@@ -777,7 +778,7 @@ impl<'a> ExpressionModeler<'a> {
         let operand = self.fold_expr(operand)?;
 
         // a dynamic var splices as accessors into the one evaluated binding
-        if let FoldedKind::Value(Value::BindingRef(name)) = &operand.kind {
+        if let FoldedKind::Value(Value::BindingRef(name, _)) = &operand.kind {
             let keys = match self.var_value(name).map(|value| &value.kind) {
                 Some(FoldedKind::Object(fields)) => Some(
                     fields
@@ -803,7 +804,7 @@ impl<'a> ExpressionModeler<'a> {
                     .map(|(key, range)| FoldedField {
                         value: Folded::value(
                             Value::Index {
-                                target: Box::new(Value::BindingRef(*name)),
+                                target: Box::new(Value::BindingRef(*name, operand.range)),
                                 index: Box::new(Value::Str(key.clone())),
                                 range,
                             },
@@ -1058,7 +1059,7 @@ impl<'a> ExpressionModeler<'a> {
                     })
                     .collect(),
             ),
-            FoldedKind::Value(Value::BindingRef(name)) => {
+            FoldedKind::Value(Value::BindingRef(name, reference_range)) => {
                 enum VarShape {
                     Array(Vec<SrcRange>),
                     Object(Vec<(String, SrcRange)>),
@@ -1072,7 +1073,7 @@ impl<'a> ExpressionModeler<'a> {
                     _ => None,
                 };
                 let Some(shape) = shape else {
-                    let collection = Folded::value(Value::BindingRef(name), collection.range);
+                    let collection = Folded::value(Value::BindingRef(name, reference_range), collection.range);
                     self.errors.push(Error::new(
                         ErrorKind::ForCollectionMismatch {
                             rule: spec::ids::FOR_COLLECTIONS,
@@ -1086,7 +1087,7 @@ impl<'a> ExpressionModeler<'a> {
                 let accessor = |index: Value, range| {
                     Folded::value(
                         Value::Index {
-                            target: Box::new(Value::BindingRef(name)),
+                            target: Box::new(Value::BindingRef(name, reference_range)),
                             index: Box::new(index),
                             range,
                         },
@@ -1214,7 +1215,7 @@ impl<'a> ExpressionModeler<'a> {
                     let right = self.check_operand(&otherwise, required, op);
                     return left && right;
                 }
-                Value::BindingRef(id) if self.types.get(id).and_then(|ty| schema_static_type(*ty)).is_none() => {
+                Value::BindingRef(id, _) if self.types.get(id).and_then(|ty| schema_static_type(*ty)).is_none() => {
                     if let Some(value) = self.vars.get(id).cloned() {
                         return self.check_operand(&value, required, op);
                     }
@@ -1268,7 +1269,7 @@ impl<'a> ExpressionModeler<'a> {
             }),
             Value::Object(object) => object.elem.iter().any(|field| self.value_reaches_context(&field.value)),
             // a binding reaches through its definition
-            Value::BindingRef(name) => self.var_value(name).is_some_and(|def| self.folded_reaches_context(def)),
+            Value::BindingRef(name, _) => self.var_value(name).is_some_and(|def| self.folded_reaches_context(def)),
             Value::Unary { operand, .. } => self.value_reaches_context(operand),
             Value::Binary { lhs, rhs, .. } => self.value_reaches_context(lhs) || self.value_reaches_context(rhs),
             Value::Cond { cond, then, otherwise } => {
@@ -2025,7 +2026,7 @@ impl<'a> ExpressionModeler<'a> {
 
     fn value_matches_static_types(&self, value: &Value, allowed: &[StaticType]) -> bool {
         match value {
-            Value::BindingRef(name) => self
+            Value::BindingRef(name, _) => self
                 .var_value(name)
                 .is_some_and(|value| self.matches_static_types(value, allowed)),
             Value::Func {
@@ -2247,7 +2248,7 @@ impl<'a> ExpressionModeler<'a> {
             Value::Array(_) => Some(StaticType::Array),
             Value::Object(_) | Value::Attachment { .. } => Some(StaticType::Object),
             // a binding is typed by its definition
-            Value::BindingRef(name) => self
+            Value::BindingRef(name, _) => self
                 .types
                 .get(name)
                 .and_then(|ty| schema_static_type(*ty))
@@ -2284,7 +2285,7 @@ impl<'a> ExpressionModeler<'a> {
                     ArrayElem::Spread(_) => None,
                 })),
                 Value::Object(object) => unify_types(object.elem.iter().map(|field| self.value_type(&field.value))),
-                Value::BindingRef(name) => match self.var_value(name).map(|value| &value.kind) {
+                Value::BindingRef(name, _) => match self.var_value(name).map(|value| &value.kind) {
                     Some(FoldedKind::Array(values)) => match &**index {
                         Value::Num(Number::Int(position)) => usize::try_from(*position)
                             .ok()
@@ -2311,7 +2312,7 @@ impl<'a> ExpressionModeler<'a> {
     // keep known result fields typed through bindings and nested indexes
     fn result_shape(&self, value: &Value) -> Option<ResultShape> {
         match value {
-            Value::BindingRef(name) => match &self.var_value(name)?.kind {
+            Value::BindingRef(name, _) => match &self.var_value(name)?.kind {
                 FoldedKind::Value(value) => self.result_shape(value),
                 _ => None,
             },
@@ -2591,7 +2592,7 @@ fn value_is_constant(value: &Value) -> bool {
         Value::Object(object) => object.elem.iter().all(|field| value_is_constant(&field.value)),
         Value::Template(_)
         | Value::Func { .. }
-        | Value::BindingRef(_)
+        | Value::BindingRef(_, _)
         | Value::GraphRef { .. }
         | Value::Input { .. }
         | Value::FieldRef(_)
@@ -3219,7 +3220,7 @@ fn collect_template_refs(template: &Template, found: &mut Vec<BindingId>) {
 
 fn collect_refs(value: &Value, found: &mut Vec<BindingId>) {
     match value {
-        Value::BindingRef(id) => found.push(*id),
+        Value::BindingRef(id, _) => found.push(*id),
         Value::Str(_)
         | Value::Num(_)
         | Value::Bool(_)

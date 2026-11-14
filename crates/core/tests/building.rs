@@ -1,10 +1,11 @@
+use bts_core::mocking::ScorerLang;
 use bts_core::mocking::code::{
     self, AgentTarget, CodebaseContext,
     languages::Languages,
     writing::{Action, Directory},
 };
 use bts_core::providers::braintrust::mocking::code::CodeTarget;
-use bts_lang::{ScorerLang, semantics::compile};
+use bts_core::providers::braintrust::mocking::compile;
 use std::fs;
 
 const SOURCE: &str = include_str!("fixtures/building.bt");
@@ -77,14 +78,17 @@ fn builds_typescript_scorers_and_their_codebase_files() {
 #[test]
 fn agent_build_preserves_scorers_from_other_shapes_with_matching_experiment_names() {
     let target = CodeTarget::new("test-project");
-    let scorers = compile(r#"scorer "checks" { code { score = 1 } }"#).unwrap();
+    let scorers = compile(r#"("checks":scorer) {score: 1};"#).unwrap();
     let agents = compile(
-        r#"agent "support" { entrypoint = trace.support }
-           trace "support" { input = "hi" output = "hello" }
-           dataset "cases" { case "one" { input = "hi" expected = "hello" } }
-           scorer "quality" { code { score = 1 } }
-           experiment "checks" { task = trace.support dataset = dataset.cases scorers = [scorer.quality] }
-           experiment "checks_impl" { task = trace.support dataset = dataset.cases scorers = [scorer.quality] }"#,
+        r#"(support_root:task {name: "support"}) {input: support.input, output: "hello"};
+(support:agent) {input: "hi", output: support_root.output};
+(support)-[:contains]->(support_root);
+(support)-[:next]->(support_root);
+(dataset_cases_one:case {name: "one"}) {input: "hi", expected: "hello"};
+(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
+("quality":scorer) {score: 1};
+(experiment_checks:experiment {name: "checks"}) {task: (support_root), dataset: (dataset_cases), scorers: [|("quality")|]};
+(experiment_checks_impl:experiment {name: "checks_impl"}) {task: (support_root), dataset: (dataset_cases), scorers: [|("quality")|]};"#,
     )
     .unwrap();
     for lang in [ScorerLang::Python, ScorerLang::Typescript] {
@@ -145,7 +149,7 @@ fn build(assembly: &code::Assembly, out: &std::path::Path) -> Result<Vec<code::w
 
 #[test]
 fn preserves_existing_manifest_settings_and_unread_tsconfig() {
-    let model = compile(r#"scorer "quality" { code { score = 0.5 } }"#).unwrap();
+    let model = compile(r#"("quality":scorer) {score: 0.5};"#).unwrap();
     let out = std::env::temp_dir().join(format!("bts-building-test-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&out).unwrap();
     let pyproject = "# project notes\n[project] # settings\nname = \"kept\"\ndependencies = [\"braintrust==0.40.0\", \"requests>=2\"] # dependencies\n\n[tool.example]\nactive = true\n";
@@ -226,11 +230,11 @@ fn removes_unchanged_snapshots_and_preserves_files_edited_after_planning() {
 #[test]
 fn python_packages_include_agents_and_scorers_in_either_build_order() {
     let model = compile(
-        r#"
-        agent "support" { entrypoint = trace.support }
-        trace "support" { output = "hello" }
-        scorer "quality" { code { score = 0.5 } }
-    "#,
+        r#"(support_root:task {name: "support"}) {output: "hello", input: support.input};
+(support:agent) {input: null, output: support_root.output};
+(support)-[:contains]->(support_root);
+(support)-[:next]->(support_root);
+("quality":scorer) {score: 0.5};"#,
     )
     .unwrap();
     let target = CodeTarget::new("test-project");
@@ -363,7 +367,7 @@ dependencies = ["braintrust==0.40.0"] # pinned
 {packaging}"#
     );
     fs::write(out.join("pyproject.toml"), &original).unwrap();
-    let model = compile(r#"scorer "quality" { code { score = 0.5 } }"#).unwrap();
+    let model = compile(r#"("quality":scorer) {score: 0.5};"#).unwrap();
     let assembly = code::assemble(
         &model.scorers,
         Some(ScorerLang::Python),

@@ -1,37 +1,12 @@
-# code scorers -- score logic over the scorer arguments; `when` cases check
-# in order, first match wins, and the base score is the fallback; scorers
-# sharing a `file` stem build into one source file
+("response-quality":scorer {lang: "python", file: "quality"}) {
+    score: clamp(normal(0.78, 0.12), 0, 1),
+    steps: [|
+        {when: context.output == null, score: 0},
+        {when: contains(context.output, "I'm sorry"), score: range(0.1, 0.4)},
+    |],
+};
 
-scorer "response-quality" {
-    lang = "python"
-    file = "quality"
-
-    code {
-        # fallback: a plausible quality curve clamped into the score range
-        score = clamp(normal(0.78, 0.12), 0, 1)
-
-        when {
-            cond = output == null
-            score = 0
-        }
-        when {
-            cond = contains(output, "I'm sorry")
-            score = range(0.1, 0.4)
-        }
-    }
-}
-
-scorer "response-length" {
-    lang = "python"
-    file = "quality"
-
-    code {
-        # brief answers read as worse; length is a cheap proxy
-        score = clamp(len(output) / 400, 0.1, 0.9)
-
-        when {
-            cond = output == null
-            score = 0
-        }
-    }
-}
+("response-length":scorer {lang: "python", file: "quality"}) {
+    score: clamp(len(context.output) / 400, 0.1, 0.9),
+    steps: [|{when: context.output == null, score: 0}|],
+};

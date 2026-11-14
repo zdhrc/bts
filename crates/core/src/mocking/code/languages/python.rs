@@ -74,8 +74,8 @@ fn helper_snippet(helper: Helper) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::dsl::{Scorer, ScorerKind, Value};
+    use crate::providers::braintrust::mocking::compile;
 
     fn render(source: &str) -> Result<String, Error> {
         let model = compile(source).unwrap();
@@ -104,14 +104,7 @@ mod tests {
     #[test]
     fn emits_nested_scorer_repeats() {
         let generated = emit(
-            r#"scorer "s" { code {
-            score = 0
-            repeat {
-                count = len(output)
-                when { cond = output[repeat.index] == expected score = 1 }
-                repeat { count = repeat.index + 1 when { cond = repeat.index < repeat.count score = 0.5 } }
-            }
-        } }"#,
+            r#"("s":scorer) {score: 0, steps: [|{repeat: len(context.output), steps: [|{when: context.output [context.index] == context.expected, score: 1}, {repeat: context.index + 1, steps: [|{when: context.index < context.count, score: 0.5}|]}|]}|]};"#,
         );
         assert!(generated.contains("repeat_count = len(output)"));
         assert!(generated.contains("for repeat_index in range(repeat_count):"));
@@ -123,13 +116,7 @@ mod tests {
     #[test]
     fn emits_nested_when_fallthrough() {
         let generated = emit(
-            r#"scorer "s" { code {
-            score = 0
-            when { cond = len(output) > 0
-                when { cond = output[0] == expected score = 1 }
-                score = 0.5
-            }
-        } }"#,
+            r#"("s":scorer) {score: 0, steps: [|{when: len(context.output) > 0, score: 0.5, steps: [|{when: context.output [0] == context.expected, score: 1}|]}|]};"#,
         );
         assert!(generated.contains("    if len(output) > 0:\n        if output[0] == expected:\n            return"));
         assert!(generated.contains("\n        return {\"name\": \"s\", \"score\": 0.5"));
@@ -138,7 +125,7 @@ mod tests {
 
     // the expression under test, wrapped in a minimal scorer
     fn emit_score(expr: &str) -> String {
-        let generated = emit(&format!(r#"scorer "s" {{ code {{ score = {expr} }} }}"#));
+        let generated = emit(&format!(r#"("s":scorer) {{score: {expr}}};"#));
         let line = generated.lines().rev().find(|line| !line.is_empty()).unwrap();
         line.trim_start()
             .strip_prefix("return {\"name\": \"s\", \"score\": ")
@@ -185,14 +172,14 @@ def scorer_response_length(output, input=None, expected=None, metadata=None):
     #[test]
     fn prefixes_language_keywords_and_runtime_names() {
         for name in ["class", "poisson", "random", "handler", "len"] {
-            let generated = emit(&format!(r#"scorer "{name}" {{ code {{ score = 0.5 }} }}"#));
+            let generated = emit(&format!(r#"("{name}":scorer) {{score: 0.5}};"#));
             assert!(generated.contains(&format!("def scorer_{name}(")), "name {name}");
         }
     }
 
     #[test]
     fn rounds_dynamic_scores_away_from_zero() {
-        let generated = emit(r#"scorer "s" { code { score = round(output) } }"#);
+        let generated = emit(r#"("s":scorer) {score: round(context.output)};"#);
         assert!(generated.contains("import math\n"));
         assert!(
             generated.contains(
@@ -205,15 +192,25 @@ def scorer_response_length(output, input=None, expected=None, metadata=None):
     #[test]
     fn parenthesizes_only_when_precedence_demands() {
         // constant arithmetic folds away, so operands must stay dynamic
-        assert_eq!(emit_score("len(output) + len(input) * 2"), "len(output) + len(input) * 2");
-        assert_eq!(emit_score("(len(output) + len(input)) % 2"), "(len(output) + len(input)) % 2");
-        assert_eq!(emit_score("len(output) > 5 ? 0.1 : 0.9"), "0.1 if len(output) > 5 else 0.9");
+        assert_eq!(
+            emit_score("len(context.output) + len(context.input) * 2"),
+            "len(output) + len(input) * 2"
+        );
+        assert_eq!(
+            emit_score("${len(context.output) + len(context.input)} % 2"),
+            "(len(output) + len(input)) % 2"
+        );
+        assert_eq!(
+            emit_score("len(context.output) > 5 ? 0.1 : 0.9"),
+            "0.1 if len(output) > 5 else 0.9"
+        );
     }
 
     #[test]
     fn never_chains_python_comparisons() {
-        let generated =
-            emit(r#"scorer "s" { code { score = 0.5 when { cond = (len(output) > 1) == (len(input) > 1) score = 0 } } }"#);
+        let generated = emit(
+            r#"("s":scorer) {score: 0.5, steps: [|{when: ${len(context.output) > 1} == ${len(context.input) > 1}, score: 0}|]};"#,
+        );
         assert!(
             generated.contains("if (len(output) > 1) == (len(input) > 1):"),
             "generated:\n{generated}"
@@ -231,10 +228,8 @@ def scorer_response_length(output, input=None, expected=None, metadata=None):
     #[test]
     fn shares_stdlib_random_import_across_scorers() {
         let generated = emit(
-            r#"
-            scorer "first" { code { score = clamp(normal(0.5, 0.1) + range(0.1, 0.2), 0, 1) } }
-            scorer "second" { code { score = clamp(normal(0.2, 0.1) + range(0.2, 0.3), 0, 1) } }
-            "#,
+            r#"("first":scorer) {score: clamp(normal(0.5, 0.1) + range(0.1, 0.2), 0, 1)};
+("second":scorer) {score: clamp(normal(0.2, 0.1) + range(0.2, 0.3), 0, 1)};"#,
         );
         assert_eq!(generated.matches("import random").count(), 1);
         assert_eq!(generated.matches("random.gauss(").count(), 2);
@@ -256,11 +251,12 @@ def scorer_response_length(output, input=None, expected=None, metadata=None):
     #[test]
     fn interpolates_templates_as_f_strings() {
         // a quote-free hole makes an f-string
-        let generated = emit(r#"scorer "s" { code { score = 0.5 when { cond = "${output}!" == "pro!" score = 1 } } }"#);
+        let generated = emit(r#"("s":scorer) {score: 0.5, steps: [|{when: "${context.output}!" == "pro!", score: 1}|]};"#);
         assert!(generated.contains(r#"if f"{output}!" == "pro!":"#), "generated:\n{generated}");
 
         // Ordinary keyed access uses the other quote style inside the f-string.
-        let generated = emit(r#"scorer "s" { code { score = 0.5 when { cond = "${metadata.tier}!" == "pro!" score = 1 } } }"#);
+        let generated =
+            emit(r#"("s":scorer) {score: 0.5, steps: [|{when: "${context.metadata.tier}!" == "pro!", score: 1}|]};"#);
         assert!(
             generated.contains(r#"if f"{metadata['tier']}!" == "pro!":"#),
             "generated:\n{generated}"
