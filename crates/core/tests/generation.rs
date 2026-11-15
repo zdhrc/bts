@@ -11,7 +11,7 @@ fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
         &[Bundle::DEFINITIONS],
     )
     .map_err(|errors| format!("{errors:#?}"))?;
-    Bundle::lower(&graph)
+    Bundle::lower(&graph).map_err(|diag| diag.what)
 }
 use std::collections::HashSet;
 use std::time::{Duration, UNIX_EPOCH};

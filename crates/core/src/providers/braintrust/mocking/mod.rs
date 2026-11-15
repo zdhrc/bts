@@ -25,7 +25,58 @@ pub fn compile(source: &str) -> Result<execution::Model, String> {
 /// One trace has one entry span, so loop-back targets must be its descendants.
 /// Authored error payloads are trace data, not failed runtime operations.
 /// Expression errors abort generation. Mocking does not dispatch cancellable operations.
-pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
+///
+/// A failure is one validation diagnostic at the graph element it concerns, or at
+/// the start of the source when no single element is responsible.
+pub fn lower(model: &graph::Model) -> Result<execution::Model, graph::Diag> {
+    lower_model(model).map_err(|error| graph::Diag {
+        when: graph::DiagPhase::Validation,
+        what: error.what,
+        r#where: error.range.unwrap_or(graph::SrcRange::new(0, 0)),
+    })
+}
+
+// a lowering failure, with the range of the graph element it concerns once one is known
+struct Error {
+    what: String,
+    range: Option<graph::SrcRange>,
+}
+
+impl From<String> for Error {
+    fn from(what: String) -> Self {
+        Self { what, range: None }
+    }
+}
+
+impl From<&str> for Error {
+    fn from(what: &str) -> Self {
+        what.to_owned().into()
+    }
+}
+
+fn located(range: graph::SrcRange, what: impl Into<String>) -> Error {
+    Error {
+        what: what.into(),
+        range: Some(range),
+    }
+}
+
+trait At<T> {
+    // names the element responsible for a failure unless a more specific one already has
+    fn at(self, range: graph::SrcRange) -> Result<T, Error>;
+}
+
+impl<T, E: Into<Error>> At<T> for Result<T, E> {
+    fn at(self, range: graph::SrcRange) -> Result<T, Error> {
+        self.map_err(|error| {
+            let mut error = error.into();
+            error.range.get_or_insert(range);
+            error
+        })
+    }
+}
+
+fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
     let mut result = execution::Model {
         ordered: true,
         ..Default::default()
@@ -106,11 +157,11 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
             || model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
             || model.junctions.iter().any(|junction| members.contains(&junction.target))
         {
-            lower_flow(model, agent, &members, &mut result)?;
+            lower_flow(model, agent, &members, &mut result).at(node.range)?;
             continue;
         }
-        let mut lowerer = AgentLowering::new(model, agent, &mut result)?;
-        lowerer.lower()?;
+        let mut lowerer = AgentLowering::new(model, agent, &mut result).at(node.range)?;
+        lowerer.lower().at(node.range)?;
     }
     for (index, node) in model.nodes.iter().enumerate() {
         if !inherits(model, &node.kind, "scorer") {
@@ -132,10 +183,11 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
         };
         let kind = if let Some(judge) = lowerer.binding(id, "judge") {
             if lowerer.binding(id, "score").is_some() || lowerer.binding(id, "steps").is_some() {
-                return Err("a scorer must select expressions or a judge".into());
+                return Err(located(node.range, "a scorer must select expressions or a judge"));
             }
+            let judge_range = model.bindings[judge.0].range;
             let execution::Value::Object(judge) = lowerer.binding_value(judge)? else {
-                return Err("judge must be an object".into());
+                return Err(located(judge_range, "judge must be an object"));
             };
             let field = |key: &str| {
                 judge
@@ -143,14 +195,14 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
                     .iter()
                     .find(|field| field.key == key)
                     .map(|field| field.value.clone())
-                    .ok_or_else(|| format!("judge needs {key}"))
+                    .ok_or_else(|| located(judge_range, format!("judge needs {key}")))
             };
             let execution::Value::Str(model) = field("model")? else {
-                return Err("judge model must be a string".into());
+                return Err(located(judge_range, "judge model must be a string"));
             };
             let prompt = field("prompt")?;
             let execution::Value::Object(options) = field("options")? else {
-                return Err("judge options must be an object".into());
+                return Err(located(judge_range, "judge options must be an object"));
             };
             let options = options
                 .elem
@@ -159,25 +211,28 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
                     let score = match field.value {
                         execution::Value::Num(execution::Number::Int(n)) => n as f64,
                         execution::Value::Num(execution::Number::Float(n)) => n,
-                        _ => return Err("judge scores must be constants".to_owned()),
+                        _ => return Err(located(judge_range, "judge scores must be constants")),
                     };
                     if !(0.0..=1.0).contains(&score) {
-                        return Err("judge scores must be between zero and one".into());
+                        return Err(located(judge_range, "judge scores must be between zero and one"));
                     }
                     Ok(execution::JudgeOption { label: field.key, score })
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, Error>>()?;
             if options.is_empty() {
-                return Err("judge needs at least one option".into());
+                return Err(located(judge_range, "judge needs at least one option"));
             }
             execution::ScorerKind::Judge { model, prompt, options }
         } else {
-            let score = lowerer.binding(id, "score").ok_or("scorer needs a score or judge field")?;
+            let score = lowerer
+                .binding(id, "score")
+                .ok_or("scorer needs a score or judge field")
+                .at(node.range)?;
             let score = lowerer.binding_value(score)?;
             let steps = lowerer.binding(id, "steps").map(|id| lowerer.binding_value(id)).transpose()?;
             execution::ScorerKind::Code {
                 score,
-                steps: scorer_steps(steps)?,
+                steps: scorer_steps(steps).at(node.range)?,
             }
         };
         let mut lang = None;
@@ -189,12 +244,12 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
                     lang = Some(match &binding.value {
                         graph::Value::Str(value) if value == "python" => execution::ScorerLang::Python,
                         graph::Value::Str(value) if value == "typescript" => execution::ScorerLang::Typescript,
-                        _ => return Err("scorer lang must be python or typescript".into()),
+                        _ => return Err(located(binding.range, "scorer lang must be python or typescript")),
                     })
                 }
                 "file" => match &binding.value {
                     graph::Value::Str(value) => file = Some(value.clone()),
-                    _ => return Err("scorer file must be a constant string".into()),
+                    _ => return Err(located(binding.range, "scorer file must be a constant string")),
                 },
                 _ => {}
             }
@@ -235,7 +290,7 @@ fn resolved<'a>(graph: &'a graph::Model, mut value: &'a graph::Value) -> &'a gra
     value
 }
 
-fn node_ref(graph: &graph::Model, value: &graph::Value, kind: Option<&str>) -> Result<graph::NodeId, String> {
+fn node_ref(graph: &graph::Model, value: &graph::Value, kind: Option<&str>) -> Result<graph::NodeId, Error> {
     let graph::Value::GraphRef { ref_id, .. } = resolved(graph, value) else {
         return Err("expected a node reference".into());
     };
@@ -243,12 +298,12 @@ fn node_ref(graph: &graph::Model, value: &graph::Value, kind: Option<&str>) -> R
         return Err("expected a node reference".into());
     };
     if kind.is_some_and(|kind| !inherits(graph, &graph.nodes[node.0].kind, kind)) {
-        return Err(format!("expected a {} node", kind.unwrap()));
+        return Err(format!("expected a {} node", kind.unwrap()).into());
     }
     Ok(node)
 }
 
-fn node_refs(graph: &graph::Model, value: &graph::Value, kind: Option<&str>) -> Result<Vec<graph::NodeId>, String> {
+fn node_refs(graph: &graph::Model, value: &graph::Value, kind: Option<&str>) -> Result<Vec<graph::NodeId>, Error> {
     let graph::Value::Array(array) = resolved(graph, value) else {
         return Err("expected an array of node references".into());
     };
@@ -262,22 +317,22 @@ fn node_refs(graph: &graph::Model, value: &graph::Value, kind: Option<&str>) -> 
         .collect()
 }
 
-fn node_name(graph: &graph::Model, node: graph::NodeId) -> Result<String, String> {
+fn node_name(graph: &graph::Model, node: graph::NodeId) -> Result<String, Error> {
     for id in &graph.nodes[node.0].props {
         if graph.bindings[id.0].path == ["name"] {
             if let graph::Value::Str(name) = &graph.bindings[id.0].value {
                 return Ok(name.clone());
             }
-            return Err("resource names must be constant strings".into());
+            return Err(located(graph.bindings[id.0].range, "resource names must be constant strings"));
         }
     }
     graph.nodes[node.0]
         .name
         .clone()
-        .ok_or("provider resources must have names".into())
+        .ok_or_else(|| located(graph.nodes[node.0].range, "provider resources must have names"))
 }
 
-fn span_ref(graph: &graph::Model, node: graph::NodeId, result: &mut execution::Model) -> Result<execution::RefId, String> {
+fn span_ref(graph: &graph::Model, node: graph::NodeId, result: &mut execution::Model) -> Result<execution::RefId, Error> {
     if inherits(graph, &graph.nodes[node.0].kind, "agent") {
         let name = node_name(graph, node)?;
         return result
@@ -285,7 +340,7 @@ fn span_ref(graph: &graph::Model, node: graph::NodeId, result: &mut execution::M
             .iter()
             .find(|agent| agent.name == name)
             .map(|agent| agent.entrypoint)
-            .ok_or("agent has no entrypoint".into());
+            .ok_or_else(|| located(graph.nodes[node.0].range, "agent has no entrypoint"));
     }
     fn locate(children: &[execution::Child], node: execution::NodeId) -> Option<Vec<execution::Step>> {
         for child in children {
@@ -328,7 +383,10 @@ fn span_ref(graph: &graph::Model, node: graph::NodeId, result: &mut execution::M
             return Ok(id);
         }
     }
-    Err("resource task must reference a statically reachable emitted span".into())
+    Err(located(
+        graph.nodes[node.0].range,
+        "resource task must reference a statically reachable emitted span",
+    ))
 }
 
 fn resource_value(
@@ -336,7 +394,7 @@ fn resource_value(
     node: graph::NodeId,
     value: &graph::Value,
     result: &mut execution::Model,
-) -> Result<execution::Value, String> {
+) -> Result<execution::Value, Error> {
     AgentLowering {
         graph,
         agent: node,
@@ -351,6 +409,7 @@ fn resource_value(
         result,
     }
     .value(value)
+    .at(graph.nodes[node.0].range)
 }
 
 fn lower_flow(
@@ -358,7 +417,7 @@ fn lower_flow(
     agent: graph::NodeId,
     members: &HashSet<graph::NodeId>,
     result: &mut execution::Model,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let entries: Vec<_> = graph
         .edges
         .iter()
@@ -369,10 +428,10 @@ fn lower_flow(
     }
     let root = entries[0].target;
     if !members.contains(&root) {
-        return Err("agent entry must be a member".into());
+        return Err(located(entries[0].range, "agent entry must be a member"));
     }
     if !inherits(graph, &graph.nodes[root.0].kind, "task") && graph.nodes[root.0].kind != "span" {
-        return Err("the entry must be a task or span".into());
+        return Err(located(graph.nodes[root.0].range, "the entry must be a task or span"));
     }
     let mut parents = HashMap::new();
     for edge in &graph.edges {
@@ -380,22 +439,23 @@ fn lower_flow(
             && inherits(graph, &edge.kind, "child_of")
             && (!members.contains(&edge.target) || !edge.props.is_empty() || parents.insert(edge.source, edge.target).is_some())
         {
-            return Err("child_of needs one unconfigured member parent".into());
+            return Err(located(edge.range, "child_of needs one unconfigured member parent"));
         }
     }
     if parents.contains_key(&root) {
-        return Err("entry span cannot have a parent".into());
+        return Err(located(graph.nodes[root.0].range, "entry span cannot have a parent"));
     }
     for node in members {
         let mut cursor = *node;
         let mut seen = HashSet::new();
         while cursor != root {
             if !seen.insert(cursor) {
-                return Err("span parenting cannot contain cycles".into());
+                return Err(located(graph.nodes[cursor.0].range, "span parenting cannot contain cycles"));
             }
             cursor = *parents
                 .get(&cursor)
-                .ok_or("each member needs a child_of path to the entry span")?;
+                .ok_or("each member needs a child_of path to the entry span")
+                .at(graph.nodes[cursor.0].range)?;
         }
     }
     let mut lowerer = AgentLowering {
@@ -417,7 +477,10 @@ fn lower_flow(
     let input = lowerer.binding(agent, "input").ok_or("agent needs input")?;
     let root_input = lowerer.binding(root, "input").ok_or("entry span needs input")?;
     if !matches!(graph.bindings[root_input.0].value, graph::Value::BindingRef(id, _) if id == input) {
-        return Err("entry span input must reference the agent input".into());
+        return Err(located(
+            graph.bindings[root_input.0].range,
+            "entry span input must reference the agent input",
+        ));
     }
     let output = lowerer.binding(agent, "output").ok_or("agent needs output")?;
     let output = lowerer.binding_value(output)?;
@@ -426,7 +489,8 @@ fn lower_flow(
         let kind = ["scorer", "tool", "llm", "function", "task", "span", "vars", "node"]
             .into_iter()
             .find(|kind| inherits(graph, &graph.nodes[node.0].kind, kind))
-            .ok_or("unsupported graph execution node kind")?;
+            .ok_or("unsupported graph execution node kind")
+            .at(graph.nodes[node.0].range)?;
         let mut bindings = Vec::new();
         for (id, binding) in graph.bindings.iter().enumerate() {
             if binding.owner == graph::ElementId::Node(node)
@@ -461,15 +525,16 @@ fn lower_flow(
             continue;
         }
         if !members.contains(&edge.target) || edge.direction != graph::Direction::Directed {
-            return Err("execution edges require directed member endpoints".into());
+            return Err(located(edge.range, "execution edges require directed member endpoints"));
         }
         if edge.cycle && edge.target == root {
-            return Err("cycle edges cannot target the trace entry span".into());
+            return Err(located(edge.range, "cycle edges cannot target the trace entry span"));
         }
         let kind = ["next", "feeds", "link", "requires", "contains"]
             .into_iter()
             .find(|kind| inherits(graph, &edge.kind, kind))
-            .ok_or("unsupported execution edge kind")?;
+            .ok_or("unsupported execution edge kind")
+            .at(edge.range)?;
         let mut props = vec![];
         let mut into = None;
         for prop in &edge.props {
@@ -479,19 +544,25 @@ fn lower_flow(
                     if graph.bindings[target.0].owner != graph::ElementId::Node(edge.target)
                         || !matches!(graph.bindings[target.0].value, graph::Value::Input { .. })
                     {
-                        return Err("feeds destination must declare an upstream field on its target".into());
+                        return Err(located(
+                            binding.range,
+                            "feeds destination must declare an upstream field on its target",
+                        ));
                     }
                     into = Some(target.0)
                 }
             } else {
                 if !["when", "weight", "value", "max_traversals"].contains(&binding.path[0].as_str()) {
-                    return Err(format!("unsupported execution edge property {}", binding.path[0]));
+                    return Err(located(
+                        binding.range,
+                        format!("unsupported execution edge property {}", binding.path[0]),
+                    ));
                 }
                 props.push((binding.path[0].clone(), lowerer.flow_property(*prop)?));
             }
         }
         if kind == "feeds" && (into.is_none() || !props.iter().any(|(key, _)| key == "value")) {
-            return Err("feeds requires value and into".into());
+            return Err(located(edge.range, "feeds requires value and into"));
         }
         let bundle = graph
             .paths
@@ -530,12 +601,13 @@ fn lower_flow(
         let kind = ["parallel", "conditional", "exclusive", "weighted", "each", "repeat"]
             .into_iter()
             .find(|kind| inherits(graph, &fork.kind, kind))
-            .ok_or("unsupported fork execution kind")?;
+            .ok_or("unsupported fork execution kind")
+            .at(fork.range)?;
         let props = fork
             .props
             .iter()
             .map(|id| Ok((graph.bindings[id.0].path[0].clone(), lowerer.flow_property(*id)?)))
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, Error>>()?;
         forks.push(execution::FlowFork {
             id,
             source: AgentLowering::id(fork.source),
@@ -549,15 +621,16 @@ fn lower_flow(
         let kind = ["accumulate", "merge", "first", "quorum", "reduce"]
             .into_iter()
             .find(|kind| inherits(graph, &junction.kind, kind))
-            .ok_or("unsupported junction execution kind")?;
+            .ok_or("unsupported junction execution kind")
+            .at(junction.range)?;
         if junction.inputs.iter().any(|id| !edges.iter().any(|edge| edge.id == id.0)) {
-            return Err("junction inputs must belong to the current agent".into());
+            return Err(located(junction.range, "junction inputs must belong to the current agent"));
         }
         let props = junction
             .props
             .iter()
             .map(|id| Ok((graph.bindings[id.0].path[0].clone(), lowerer.flow_property(*id)?)))
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, Error>>()?;
         junctions.push(execution::FlowJunction {
             target: AgentLowering::id(junction.target),
             kind: kind.into(),
@@ -604,188 +677,195 @@ fn lower_flow(
     Ok(())
 }
 
-fn lower_resources(graph: &graph::Model, result: &mut execution::Model) -> Result<(), String> {
+fn lower_resources(graph: &graph::Model, result: &mut execution::Model) -> Result<(), Error> {
     for (index, node) in graph.nodes.iter().enumerate() {
-        let id = graph::NodeId(index);
-        if !["dataset", "experiment", "facet", "automation"]
-            .iter()
-            .any(|kind| inherits(graph, &node.kind, kind))
-        {
-            continue;
-        }
-        let name = node_name(graph, id)?;
-        let required = |key| field(graph, id, key).ok_or_else(|| format!("{name} needs {key}"));
-        let description = field(graph, id, "description")
-            .map(|value| match resolved(graph, value) {
-                graph::Value::Str(value) => Ok(value.clone()),
-                _ => Err("description must be a constant string".to_owned()),
-            })
-            .transpose()?;
-        let string = |key: &str| -> Result<Option<String>, String> {
-            field(graph, id, key)
-                .map(|value| match resolved(graph, value) {
-                    graph::Value::Str(value) => Ok(value.clone()),
-                    _ => Err(format!("{name}.{key} must be a constant string")),
-                })
-                .transpose()
-        };
-        let boolean = |key: &str, default: bool| -> Result<bool, String> {
-            match field(graph, id, key).map(|value| resolved(graph, value)) {
-                None => Ok(default),
-                Some(graph::Value::Bool(value)) => Ok(*value),
-                _ => Err(format!("{name}.{key} must be a constant boolean")),
-            }
-        };
-        let strings = |key: &str| -> Result<Vec<String>, String> {
-            let Some(value) = field(graph, id, key) else {
-                return Ok(vec![]);
-            };
-            let graph::Value::Array(array) = resolved(graph, value) else {
-                return Err(format!("{name}.{key} must be an array"));
-            };
-            array
-                .elem
-                .iter()
-                .map(|item| match item {
-                    graph::ArrayElem::Item(value) => match resolved(graph, value) {
-                        graph::Value::Str(value) => Ok(value.clone()),
-                        _ => Err(format!("{name}.{key} must contain constant strings")),
-                    },
-                    _ => Err(format!("{name}.{key} must contain explicit entries")),
-                })
-                .collect()
-        };
-        if inherits(graph, &node.kind, "facet") {
-            result.facets.push(execution::Facet {
-                prompt: string("prompt")?.ok_or_else(|| format!("{name} needs prompt"))?,
-                no_match_pattern: string("no_match_pattern")?,
-                name,
-                description,
-            });
-        } else if inherits(graph, &node.kind, "automation") {
-            let kind = match string("type")?.as_deref() {
-                Some("scorer") => {
-                    let scorers = strings("scorers")?;
-                    if scorers.is_empty() {
-                        return Err(format!("{name} needs scorers"));
-                    }
-                    if field(graph, id, "facets").is_some() {
-                        return Err(format!("{name} cannot mix scorers and facets"));
-                    }
-                    if string("scope")?.as_deref().is_some_and(|scope| scope != "span") {
-                        return Err(format!("{name} scorer scope must be span"));
-                    }
-                    execution::AutomationKind::Scorer {
-                        scorers,
-                        root: boolean("root", false)?,
-                        span_names: strings("span_names")?,
-                    }
-                }
-                Some("topics") => {
-                    let facets = strings("facets")?;
-                    if facets.is_empty() {
-                        return Err(format!("{name} needs facets"));
-                    }
-                    if field(graph, id, "scorers").is_some()
-                        || field(graph, id, "root").is_some()
-                        || field(graph, id, "span_names").is_some()
-                    {
-                        return Err(format!("{name} topics cannot configure scorer targeting"));
-                    }
-                    if string("scope")?.as_deref().is_some_and(|scope| scope != "trace") {
-                        return Err(format!("{name} topics scope must be trace"));
-                    }
-                    execution::AutomationKind::Topics { facets }
-                }
-                _ => return Err(format!("{name} type must be scorer or topics")),
-            };
-            let sampling_rate = match field(graph, id, "sampling_rate").map(|v| resolved(graph, v)) {
-                None => 1.0,
-                Some(graph::Value::Num(graph::Number::Int(value))) => *value as f64,
-                Some(graph::Value::Num(graph::Number::Float(value))) => *value,
-                _ => return Err(format!("{name} sampling_rate must be a constant number")),
-            };
-            if !sampling_rate.is_finite() || !(0.0..=1.0).contains(&sampling_rate) {
-                return Err(format!("{name} sampling_rate must be between zero and one"));
-            }
-            let enabled = boolean("enabled", true)?;
-            result.automations.push(execution::Automation {
-                name,
-                kind,
-                sampling_rate,
-                enabled,
-            });
-        } else if inherits(graph, &node.kind, "dataset") {
-            let mut cases = Vec::new();
-            for case in node_refs(graph, required("cases")?, Some("case"))? {
-                let source = if let Some(value) = field(graph, case, "input") {
-                    if field(graph, case, "source").is_some() || field(graph, case, "traces").is_some() {
-                        return Err("case needs exactly one input source".into());
-                    }
-                    execution::DatasetSource::Inline(resource_value(graph, case, value, result)?)
-                } else if let Some(value) = field(graph, case, "source") {
-                    if field(graph, case, "traces").is_some() {
-                        return Err("case needs exactly one input source".into());
-                    }
-                    let target = node_ref(graph, value, None)?;
-                    let reference = span_ref(graph, target, result)?;
-                    if result.refs[reference.0 as usize].steps.is_empty() {
-                        execution::DatasetSource::Trace(reference)
-                    } else {
-                        execution::DatasetSource::Span(reference)
-                    }
-                } else if let Some(value) = field(graph, case, "traces") {
-                    let refs = node_refs(graph, value, None)?
-                        .into_iter()
-                        .map(|node| span_ref(graph, node, result))
-                        .collect::<Result<_, _>>()?;
-                    execution::DatasetSource::Group(refs)
-                } else {
-                    return Err("case needs input, source or traces".into());
-                };
-                cases.push(execution::DatasetCase {
-                    name: node_name(graph, case)?,
-                    source,
-                    expected: field(graph, case, "expected")
-                        .map(|v| resource_value(graph, case, v, result))
-                        .transpose()?,
-                    metadata: field(graph, case, "metadata")
-                        .map(|v| resource_value(graph, case, v, result))
-                        .transpose()?,
-                    tags: field(graph, case, "tags")
-                        .map(|v| resource_value(graph, case, v, result))
-                        .transpose()?,
-                });
-            }
-            result.datasets.push(execution::Dataset {
-                name,
-                description,
-                cases,
-            });
-        } else {
-            let dataset = node_name(graph, node_ref(graph, required("dataset")?, Some("dataset"))?)?;
-            let task = span_ref(graph, node_ref(graph, required("task")?, None)?, result)?;
-            let scorers = node_refs(graph, required("scorers")?, Some("scorer"))?
-                .into_iter()
-                .map(|id| node_name(graph, id))
-                .collect::<Result<_, _>>()?;
-            let baseline = field(graph, id, "baseline")
-                .map(|value| node_ref(graph, value, Some("experiment")).and_then(|id| node_name(graph, id)))
-                .transpose()?;
-            result.experiments.push(execution::Experiment {
-                name,
-                description,
-                dataset,
-                task,
-                scorers,
-                baseline,
-            });
-        }
+        lower_resource(graph, graph::NodeId(index), result).at(node.range)?;
     }
     Ok(())
 }
 
-fn scorer_steps(value: Option<execution::Value>) -> Result<Vec<execution::ScorerStep>, String> {
+// failures that name no narrower element are located at the resource node by the caller
+fn lower_resource(graph: &graph::Model, id: graph::NodeId, result: &mut execution::Model) -> Result<(), Error> {
+    let node = &graph.nodes[id.0];
+    if !["dataset", "experiment", "facet", "automation"]
+        .iter()
+        .any(|kind| inherits(graph, &node.kind, kind))
+    {
+        return Ok(());
+    }
+    let name = node_name(graph, id)?;
+    let required = |key| field(graph, id, key).ok_or_else(|| format!("{name} needs {key}"));
+    let description = field(graph, id, "description")
+        .map(|value| match resolved(graph, value) {
+            graph::Value::Str(value) => Ok(value.clone()),
+            _ => Err("description must be a constant string".to_owned()),
+        })
+        .transpose()?;
+    let string = |key: &str| -> Result<Option<String>, Error> {
+        field(graph, id, key)
+            .map(|value| match resolved(graph, value) {
+                graph::Value::Str(value) => Ok(value.clone()),
+                _ => Err(format!("{name}.{key} must be a constant string").into()),
+            })
+            .transpose()
+    };
+    let boolean = |key: &str, default: bool| -> Result<bool, Error> {
+        match field(graph, id, key).map(|value| resolved(graph, value)) {
+            None => Ok(default),
+            Some(graph::Value::Bool(value)) => Ok(*value),
+            _ => Err(format!("{name}.{key} must be a constant boolean").into()),
+        }
+    };
+    let strings = |key: &str| -> Result<Vec<String>, Error> {
+        let Some(value) = field(graph, id, key) else {
+            return Ok(vec![]);
+        };
+        let graph::Value::Array(array) = resolved(graph, value) else {
+            return Err(format!("{name}.{key} must be an array").into());
+        };
+        array
+            .elem
+            .iter()
+            .map(|item| match item {
+                graph::ArrayElem::Item(value) => match resolved(graph, value) {
+                    graph::Value::Str(value) => Ok(value.clone()),
+                    _ => Err(format!("{name}.{key} must contain constant strings").into()),
+                },
+                _ => Err(format!("{name}.{key} must contain explicit entries").into()),
+            })
+            .collect()
+    };
+    if inherits(graph, &node.kind, "facet") {
+        result.facets.push(execution::Facet {
+            prompt: string("prompt")?.ok_or_else(|| format!("{name} needs prompt"))?,
+            no_match_pattern: string("no_match_pattern")?,
+            name,
+            description,
+        });
+    } else if inherits(graph, &node.kind, "automation") {
+        let kind = match string("type")?.as_deref() {
+            Some("scorer") => {
+                let scorers = strings("scorers")?;
+                if scorers.is_empty() {
+                    return Err(format!("{name} needs scorers").into());
+                }
+                if field(graph, id, "facets").is_some() {
+                    return Err(format!("{name} cannot mix scorers and facets").into());
+                }
+                if string("scope")?.as_deref().is_some_and(|scope| scope != "span") {
+                    return Err(format!("{name} scorer scope must be span").into());
+                }
+                execution::AutomationKind::Scorer {
+                    scorers,
+                    root: boolean("root", false)?,
+                    span_names: strings("span_names")?,
+                }
+            }
+            Some("topics") => {
+                let facets = strings("facets")?;
+                if facets.is_empty() {
+                    return Err(format!("{name} needs facets").into());
+                }
+                if field(graph, id, "scorers").is_some()
+                    || field(graph, id, "root").is_some()
+                    || field(graph, id, "span_names").is_some()
+                {
+                    return Err(format!("{name} topics cannot configure scorer targeting").into());
+                }
+                if string("scope")?.as_deref().is_some_and(|scope| scope != "trace") {
+                    return Err(format!("{name} topics scope must be trace").into());
+                }
+                execution::AutomationKind::Topics { facets }
+            }
+            _ => return Err(format!("{name} type must be scorer or topics").into()),
+        };
+        let sampling_rate = match field(graph, id, "sampling_rate").map(|v| resolved(graph, v)) {
+            None => 1.0,
+            Some(graph::Value::Num(graph::Number::Int(value))) => *value as f64,
+            Some(graph::Value::Num(graph::Number::Float(value))) => *value,
+            _ => return Err(format!("{name} sampling_rate must be a constant number").into()),
+        };
+        if !sampling_rate.is_finite() || !(0.0..=1.0).contains(&sampling_rate) {
+            return Err(format!("{name} sampling_rate must be between zero and one").into());
+        }
+        let enabled = boolean("enabled", true)?;
+        result.automations.push(execution::Automation {
+            name,
+            kind,
+            sampling_rate,
+            enabled,
+        });
+    } else if inherits(graph, &node.kind, "dataset") {
+        let mut cases = Vec::new();
+        for case in node_refs(graph, required("cases")?, Some("case"))? {
+            let source = if let Some(value) = field(graph, case, "input") {
+                if field(graph, case, "source").is_some() || field(graph, case, "traces").is_some() {
+                    return Err(located(graph.nodes[case.0].range, "case needs exactly one input source"));
+                }
+                execution::DatasetSource::Inline(resource_value(graph, case, value, result)?)
+            } else if let Some(value) = field(graph, case, "source") {
+                if field(graph, case, "traces").is_some() {
+                    return Err(located(graph.nodes[case.0].range, "case needs exactly one input source"));
+                }
+                let target = node_ref(graph, value, None).at(graph.nodes[case.0].range)?;
+                let reference = span_ref(graph, target, result)?;
+                if result.refs[reference.0 as usize].steps.is_empty() {
+                    execution::DatasetSource::Trace(reference)
+                } else {
+                    execution::DatasetSource::Span(reference)
+                }
+            } else if let Some(value) = field(graph, case, "traces") {
+                let refs = node_refs(graph, value, None)
+                    .at(graph.nodes[case.0].range)?
+                    .into_iter()
+                    .map(|node| span_ref(graph, node, result))
+                    .collect::<Result<_, _>>()?;
+                execution::DatasetSource::Group(refs)
+            } else {
+                return Err(located(graph.nodes[case.0].range, "case needs input, source or traces"));
+            };
+            cases.push(execution::DatasetCase {
+                name: node_name(graph, case)?,
+                source,
+                expected: field(graph, case, "expected")
+                    .map(|v| resource_value(graph, case, v, result))
+                    .transpose()?,
+                metadata: field(graph, case, "metadata")
+                    .map(|v| resource_value(graph, case, v, result))
+                    .transpose()?,
+                tags: field(graph, case, "tags")
+                    .map(|v| resource_value(graph, case, v, result))
+                    .transpose()?,
+            });
+        }
+        result.datasets.push(execution::Dataset {
+            name,
+            description,
+            cases,
+        });
+    } else {
+        let dataset = node_name(graph, node_ref(graph, required("dataset")?, Some("dataset"))?)?;
+        let task = span_ref(graph, node_ref(graph, required("task")?, None)?, result)?;
+        let scorers = node_refs(graph, required("scorers")?, Some("scorer"))?
+            .into_iter()
+            .map(|id| node_name(graph, id))
+            .collect::<Result<_, _>>()?;
+        let baseline = field(graph, id, "baseline")
+            .map(|value| node_ref(graph, value, Some("experiment")).and_then(|id| node_name(graph, id)))
+            .transpose()?;
+        result.experiments.push(execution::Experiment {
+            name,
+            description,
+            dataset,
+            task,
+            scorers,
+            baseline,
+        });
+    }
+    Ok(())
+}
+
+fn scorer_steps(value: Option<execution::Value>) -> Result<Vec<execution::ScorerStep>, Error> {
     let Some(value) = value else {
         return Ok(vec![]);
     };
@@ -845,11 +925,11 @@ struct AgentLowering<'a> {
 }
 
 impl<'a> AgentLowering<'a> {
-    fn new(graph: &'a graph::Model, agent: graph::NodeId, result: &'a mut execution::Model) -> Result<Self, String> {
+    fn new(graph: &'a graph::Model, agent: graph::NodeId, result: &'a mut execution::Model) -> Result<Self, Error> {
         let mut members = HashSet::new();
         for edge in &graph.edges {
             if edge.source == agent && inherits(graph, &edge.kind, "contains") && !members.insert(edge.target) {
-                return Err("duplicate agent membership".into());
+                return Err(located(edge.range, "duplicate agent membership"));
             }
         }
         if members.is_empty() {
@@ -860,16 +940,22 @@ impl<'a> AgentLowering<'a> {
                 continue;
             }
             if fork.source == agent && inherits(graph, &fork.kind, "weighted") {
-                return Err("agent entry must be unconditional, not a weighted selection".into());
+                return Err(located(
+                    fork.range,
+                    "agent entry must be unconditional, not a weighted selection",
+                ));
             }
             if !["parallel", "conditional", "exclusive", "each", "repeat", "weighted"]
                 .iter()
                 .any(|kind| inherits(graph, &fork.kind, kind))
                 || (!inherits(graph, &fork.kind, "each") && !inherits(graph, &fork.kind, "repeat") && !fork.props.is_empty())
             {
-                return Err(format!(
-                    "fork kind {:?} or its configuration is not supported by mocking yet",
-                    fork.kind
+                return Err(located(
+                    fork.range,
+                    format!(
+                        "fork kind {:?} or its configuration is not supported by mocking yet",
+                        fork.kind
+                    ),
                 ));
             }
         }
@@ -881,10 +967,10 @@ impl<'a> AgentLowering<'a> {
                 continue;
             }
             if edge.cycle || edge.direction != graph::Direction::Directed {
-                return Err("mocking requires directed paths without cycle edges".into());
+                return Err(located(edge.range, "mocking requires directed paths without cycle edges"));
             }
             if !members.contains(&edge.target) {
-                return Err("agent edges must target a member of the same agent".into());
+                return Err(located(edge.range, "agent edges must target a member of the same agent"));
             }
             let kind = &edge.kind;
             if inherits(graph, kind, "contains") && edge.source == agent {
@@ -904,20 +990,28 @@ impl<'a> AgentLowering<'a> {
                                         .flatten()
                                         .any(|id| std::ptr::eq(&graph.edges[id.0], edge))
                             }) => {}
-                        _ => return Err("configured next edges are not supported by mocking yet".into()),
+                        _ => {
+                            return Err(located(
+                                graph.bindings[id.0].range,
+                                "configured next edges are not supported by mocking yet",
+                            ));
+                        }
                     }
                 }
                 let targets = next.entry(edge.source).or_default();
                 if targets.iter().any(|(target, _)| *target == edge.target) {
-                    return Err("multiple next edges to one target require occurrence policies".into());
+                    return Err(located(
+                        edge.range,
+                        "multiple next edges to one target require occurrence policies",
+                    ));
                 }
                 targets.push((edge.target, guards));
             } else if inherits(graph, kind, "child_of") {
                 if edge.source == agent || !edge.props.is_empty() {
-                    return Err("child_of requires span endpoints without configuration".into());
+                    return Err(located(edge.range, "child_of requires span endpoints without configuration"));
                 }
                 if parents.insert(edge.source, edge.target).is_some() {
-                    return Err("a span cannot have multiple child_of parents".into());
+                    return Err(located(edge.range, "a span cannot have multiple child_of parents"));
                 }
             } else if inherits(graph, kind, "feeds") {
                 let mut value = None;
@@ -940,22 +1034,36 @@ impl<'a> AgentLowering<'a> {
                                         .flatten()
                                         .any(|id| std::ptr::eq(&graph.edges[id.0], edge))
                             }) => {}
-                        _ => return Err("configured feeds edges are not supported by mocking yet".into()),
+                        _ => {
+                            return Err(located(
+                                binding.range,
+                                "configured feeds edges are not supported by mocking yet",
+                            ));
+                        }
                     }
                 }
-                let value = value.ok_or("feeds needs a value")?;
+                let value = value.ok_or("feeds needs a value").at(edge.range)?;
                 let Some(into) = into else { continue };
                 if graph.bindings[into.0].owner != graph::ElementId::Node(edge.target) {
-                    return Err("feeds destination must belong to its target".into());
+                    return Err(located(edge.range, "feeds destination must belong to its target"));
                 }
                 if !matches!(graph.bindings[into.0].value, graph::Value::Input { .. }) {
-                    return Err("feeds destination must declare an upstream value with <-".into());
+                    return Err(located(
+                        edge.range,
+                        "feeds destination must declare an upstream value with <-",
+                    ));
                 }
                 if inputs.insert(into, value).is_some() {
-                    return Err("multiple feeds to one field require an accumulation policy".into());
+                    return Err(located(
+                        edge.range,
+                        "multiple feeds to one field require an accumulation policy",
+                    ));
                 }
             } else {
-                return Err(format!("edge kind {kind:?} is not supported by mocking yet"));
+                return Err(located(
+                    edge.range,
+                    format!("edge kind {kind:?} is not supported by mocking yet"),
+                ));
             }
         }
         let mut joined = HashSet::new();
@@ -964,24 +1072,31 @@ impl<'a> AgentLowering<'a> {
                 continue;
             }
             if !inherits(graph, &junction.kind, "accumulate") {
-                return Err("mocking currently requires accumulate junctions".into());
+                return Err(located(junction.range, "mocking currently requires accumulate junctions"));
             }
             if !joined.insert(junction.target) {
-                return Err("multiple junction groups to one target require occurrence policies".into());
+                return Err(located(
+                    junction.range,
+                    "multiple junction groups to one target require occurrence policies",
+                ));
             }
             let fork = junction
                 .fork
-                .ok_or("mocking junctions need an attached fork to define their group")?;
+                .ok_or("mocking junctions need an attached fork to define their group")
+                .at(junction.range)?;
             let source = graph.forks[fork.0].source;
             if !members.contains(&source) {
-                return Err("junction group must belong to the same agent".into());
+                return Err(located(junction.range, "junction group must belong to the same agent"));
             }
             for id in &junction.props {
                 let binding = &graph.bindings[id.0];
                 if binding.path != ["observe"]
                     || !matches!(&binding.value, graph::Value::Str(mode) if mode == "arrival" || mode == "result")
                 {
-                    return Err("mocking junctions support observe with one group per fork activation".into());
+                    return Err(located(
+                        binding.range,
+                        "mocking junctions support observe with one group per fork activation",
+                    ));
                 }
             }
             next.entry(source).or_default().push((junction.target, vec![]));
@@ -994,40 +1109,51 @@ impl<'a> AgentLowering<'a> {
         let mut order = vec![];
         let mut guards = HashMap::new();
         fn walk(
+            graph: &graph::Model,
             node: graph::NodeId,
             inherited: Vec<graph::BindingId>,
             next: &HashMap<graph::NodeId, Vec<(graph::NodeId, Vec<graph::BindingId>)>>,
             order: &mut Vec<graph::NodeId>,
             guards: &mut HashMap<graph::NodeId, Vec<graph::BindingId>>,
-        ) -> Result<(), String> {
+        ) -> Result<(), Error> {
             if guards.insert(node, inherited.clone()).is_some() {
-                return Err("repeated arrivals require a junction or an occurrence policy".into());
+                return Err(located(
+                    graph.nodes[node.0].range,
+                    "repeated arrivals require a junction or an occurrence policy",
+                ));
             }
             order.push(node);
             for (target, local) in next.get(&node).into_iter().flatten() {
                 let mut combined = inherited.clone();
                 combined.extend(local);
-                walk(*target, combined, next, order, guards)?;
+                walk(graph, *target, combined, next, order, guards)?;
             }
             Ok(())
         }
-        walk(root, vec![], &next, &mut order, &mut guards)?;
+        walk(graph, root, vec![], &next, &mut order, &mut guards)?;
         for edge in &graph.edges {
             if members.contains(&edge.source) && inherits(graph, &edge.kind, "feeds") {
                 let source = order.iter().position(|node| *node == edge.source);
                 let target = order.iter().position(|node| *node == edge.target);
                 if source >= target {
-                    return Err("feeds must follow progression order for straight-line mocking".into());
+                    return Err(located(
+                        edge.range,
+                        "feeds must follow progression order for straight-line mocking",
+                    ));
                 }
             }
         }
         if parents.contains_key(&root) {
-            return Err("the entry span cannot have a parent".into());
+            return Err(located(graph.nodes[root.0].range, "the entry span cannot have a parent"));
         }
         for (position, node) in order.iter().enumerate().skip(1) {
-            let parent = parents.get(node).ok_or("each non-root span needs a child_of parent")?;
+            let range = graph.nodes[node.0].range;
+            let parent = parents
+                .get(node)
+                .ok_or("each non-root span needs a child_of parent")
+                .at(range)?;
             if !order[..position].contains(parent) {
-                return Err("a span parent must be entered before its child".into());
+                return Err(located(range, "a span parent must be entered before its child"));
             }
         }
         // nested span execution must preserve the explicit progression order
@@ -1074,20 +1200,32 @@ impl<'a> AgentLowering<'a> {
             .find(|id| self.graph.bindings[id.0].path == [name])
     }
 
-    fn lower(&mut self) -> Result<(), String> {
+    fn lower(&mut self) -> Result<(), Error> {
         let agent = &self.graph.nodes[self.agent.0];
         let name = node_name(self.graph, self.agent)?;
         let root_kind = &self.graph.nodes[self.root.0].kind;
         if self.result.traces.iter().any(|trace| trace.node == Self::id(self.root)) {
-            return Err("shared agent entry spans are not supported by mocking yet".into());
+            return Err(located(
+                self.graph.nodes[self.root.0].range,
+                "shared agent entry spans are not supported by mocking yet",
+            ));
         }
         if !inherits(self.graph, root_kind, "task") && root_kind != "span" {
-            return Err("the first mocking span must be a task or span".into());
+            return Err(located(
+                self.graph.nodes[self.root.0].range,
+                "the first mocking span must be a task or span",
+            ));
         }
         let agent_input = self.binding(self.agent, "input").ok_or("agent needs an input field")?;
-        let root_input = self.binding(self.root, "input").ok_or("entry span needs an input field")?;
+        let root_input = self
+            .binding(self.root, "input")
+            .ok_or("entry span needs an input field")
+            .at(self.graph.nodes[self.root.0].range)?;
         if !matches!(self.graph.bindings[root_input.0].value, graph::Value::BindingRef(id, _) if id == agent_input) {
-            return Err("entry span input must reference the agent input for mocking".into());
+            return Err(located(
+                self.graph.bindings[root_input.0].range,
+                "entry span input must reference the agent input for mocking",
+            ));
         }
         let agent_output = self.binding(self.agent, "output").ok_or("agent needs an output field")?;
         let output = self.binding_value(agent_output)?;
@@ -1181,7 +1319,7 @@ impl<'a> AgentLowering<'a> {
         Ok(())
     }
 
-    fn name(&self, node: graph::NodeId) -> Result<String, String> {
+    fn name(&self, node: graph::NodeId) -> Result<String, Error> {
         let n = &self.graph.nodes[node.0];
         for id in &n.props {
             let binding = &self.graph.bindings[id.0];
@@ -1189,7 +1327,7 @@ impl<'a> AgentLowering<'a> {
                 if let graph::Value::Str(name) = &binding.value {
                     return Ok(name.clone());
                 }
-                return Err("mocking span names must be constant strings".into());
+                return Err(located(binding.range, "mocking span names must be constant strings"));
             }
         }
         Ok(n.name.clone().unwrap_or_else(|| format!("{}_{}", n.kind, node.0)))
@@ -1215,7 +1353,7 @@ impl<'a> AgentLowering<'a> {
         }
     }
 
-    fn fork_bindings(&mut self, node: graph::NodeId) -> Result<Vec<execution::Binding>, String> {
+    fn fork_bindings(&mut self, node: graph::NodeId) -> Result<Vec<execution::Binding>, Error> {
         let ids: Vec<_> = self
             .graph
             .forks
@@ -1233,7 +1371,7 @@ impl<'a> AgentLowering<'a> {
                         value: self.binding_value(id)?,
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, Error>>()?,
         );
         Ok(bindings)
     }
@@ -1316,7 +1454,7 @@ impl<'a> AgentLowering<'a> {
         }
     }
 
-    fn weighted_bindings(&mut self, owner: graph::NodeId) -> Result<Vec<execution::Binding>, String> {
+    fn weighted_bindings(&mut self, owner: graph::NodeId) -> Result<Vec<execution::Binding>, Error> {
         let forks: Vec<_> = self
             .graph
             .forks
@@ -1385,7 +1523,7 @@ impl<'a> AgentLowering<'a> {
         Ok(bindings)
     }
 
-    fn iteration_bindings(&mut self, index: usize) -> Result<Vec<execution::Binding>, String> {
+    fn iteration_bindings(&mut self, index: usize) -> Result<Vec<execution::Binding>, Error> {
         let mut bindings = Vec::new();
         for (id, binding) in self.graph.bindings.iter().enumerate() {
             let name = match binding.owner {
@@ -1436,7 +1574,7 @@ impl<'a> AgentLowering<'a> {
             })
     }
 
-    fn arrivals(&mut self, node: graph::NodeId) -> Result<execution::Value, String> {
+    fn arrivals(&mut self, node: graph::NodeId) -> Result<execution::Value, Error> {
         let junction = self
             .junction(node)
             .ok_or("context.arrivals requires a junction target")?
@@ -1484,7 +1622,7 @@ impl<'a> AgentLowering<'a> {
         execution::NodeId((self.graph.nodes.len() + node.0) as u32)
     }
 
-    fn children(&mut self, parent: graph::NodeId) -> Result<Vec<execution::Child>, String> {
+    fn children(&mut self, parent: graph::NodeId) -> Result<Vec<execution::Child>, Error> {
         let children: Vec<_> = self
             .order
             .iter()
@@ -1495,6 +1633,7 @@ impl<'a> AgentLowering<'a> {
             .into_iter()
             .map(|node| {
                 let kind = &self.graph.nodes[node.0].kind;
+                let range = self.graph.nodes[node.0].range;
                 let span = if kind == "node" || kind == "vars" {
                     execution::Child::Maybe(execution::Maybe {
                         node: Self::id(node),
@@ -1506,9 +1645,9 @@ impl<'a> AgentLowering<'a> {
                     })
                 } else if inherits(self.graph, kind, "scorer") {
                     if self.parents.values().any(|parent| *parent == node) {
-                        return Err("scorer spans cannot contain child spans yet".into());
+                        return Err(located(range, "scorer spans cannot contain child spans yet"));
                     }
-                    let score = self.binding(node, "score").ok_or("scorer needs a score field")?;
+                    let score = self.binding(node, "score").ok_or("scorer needs a score field").at(range)?;
                     let reason = self
                         .binding(node, "reason")
                         .map(|id| self.binding_value(id).map(|value| (value, self.graph.bindings[id.0].range)))
@@ -1531,7 +1670,10 @@ impl<'a> AgentLowering<'a> {
                     } else if inherits(self.graph, kind, "task") || kind == "span" {
                         execution::SpanKind::Task
                     } else {
-                        return Err(format!("node kind {kind:?} is not supported by agent mocking yet"));
+                        return Err(located(
+                            range,
+                            format!("node kind {kind:?} is not supported by agent mocking yet"),
+                        ));
                     };
                     execution::Child::Span(execution::Span {
                         node: Self::id(node),
@@ -1578,7 +1720,7 @@ impl<'a> AgentLowering<'a> {
                     children: vec![span],
                 }))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, Error>>()?;
         let mut result = Vec::new();
         let mut groups = HashMap::new();
         for child in children {
@@ -1590,7 +1732,10 @@ impl<'a> AgentLowering<'a> {
             };
             if let Some((index, fork)) = self.each(node) {
                 if fork.source != parent {
-                    return Err("each branch spans must be children of the fork source".into());
+                    return Err(located(
+                        self.graph.nodes[node.0].range,
+                        "each branch spans must be children of the fork source",
+                    ));
                 }
                 if let Some(position) = groups.get(&index) {
                     let execution::Child::Repeat(repeat) = &mut result[*position] else {
@@ -1647,7 +1792,7 @@ impl<'a> AgentLowering<'a> {
         })
     }
 
-    fn fields(&mut self, node: graph::NodeId) -> Result<execution::SpanFields, String> {
+    fn fields(&mut self, node: graph::NodeId) -> Result<execution::SpanFields, Error> {
         let mut fields = execution::SpanFields::default();
         for id in self.graph.nodes[node.0].fields.clone() {
             let binding = &self.graph.bindings[id.0];
@@ -1663,7 +1808,10 @@ impl<'a> AgentLowering<'a> {
                 "error" => fields.error = Some(value),
                 "metadata" | "metrics" => {
                     let execution::Value::Object(object) = value else {
-                        return Err(format!("{name} must be an object expression for mocking"));
+                        return Err(located(
+                            binding.range,
+                            format!("{name} must be an object expression for mocking"),
+                        ));
                     };
                     if name == "metadata" {
                         fields.metadata = Some(object);
@@ -1673,7 +1821,7 @@ impl<'a> AgentLowering<'a> {
                 }
                 "tags" => {
                     let execution::Value::Array(array) = value else {
-                        return Err("tags must be an array expression for mocking".into());
+                        return Err(located(binding.range, "tags must be an array expression for mocking"));
                     };
                     for item in array.elem {
                         fields.tags.push(match item {
@@ -1681,19 +1829,21 @@ impl<'a> AgentLowering<'a> {
                                 parts: vec![execution::Part::Lit(text)],
                             },
                             execution::ArrayElem::Item(execution::Value::Template(template)) => template,
-                            _ => return Err("mocking tags must be strings".into()),
+                            _ => return Err(located(binding.range, "mocking tags must be strings")),
                         });
                     }
                 }
                 "duration" => fields.duration = Some((execution::Value::VarRef(format!("binding_{}", id.0)), binding.range)),
-                "scores" => return Err("span scores are not supported by agent mocking yet".into()),
+                "scores" => {
+                    return Err(located(binding.range, "span scores are not supported by agent mocking yet"));
+                }
                 _ => {}
             }
         }
         Ok(fields)
     }
 
-    fn reference(&mut self, id: graph::BindingId) -> Result<execution::Value, String> {
+    fn reference(&mut self, id: graph::BindingId) -> Result<execution::Value, Error> {
         let binding = &self.graph.bindings[id.0];
         if self.flow {
             if let graph::ElementId::Node(node) = binding.owner {
@@ -1824,7 +1974,7 @@ impl<'a> AgentLowering<'a> {
         })
     }
 
-    fn flow_property(&mut self, id: graph::BindingId) -> Result<execution::Value, String> {
+    fn flow_property(&mut self, id: graph::BindingId) -> Result<execution::Value, Error> {
         let value = self.binding_value(id)?;
         if matches!(self.graph.bindings[id.0].owner, graph::ElementId::Junction(_)) {
             return Ok(value);
@@ -1838,17 +1988,17 @@ impl<'a> AgentLowering<'a> {
         })
     }
 
-    fn binding_value(&mut self, id: graph::BindingId) -> Result<execution::Value, String> {
+    fn binding_value(&mut self, id: graph::BindingId) -> Result<execution::Value, Error> {
         if self.building.contains(&id) {
-            return Err("circular value propagation".into());
+            return Err(located(self.graph.bindings[id.0].range, "circular value propagation"));
         }
         self.building.push(id);
         let value = self.value(&self.graph.bindings[id.0].value.clone());
         self.building.pop();
-        value
+        value.at(self.graph.bindings[id.0].range)
     }
 
-    fn value(&mut self, value: &graph::Value) -> Result<execution::Value, String> {
+    fn value(&mut self, value: &graph::Value) -> Result<execution::Value, Error> {
         use execution::Value as V;
         use graph::Value as G;
         Ok(match value {
@@ -1912,7 +2062,7 @@ impl<'a> AgentLowering<'a> {
                             graph::ArrayElem::Spread(value) => execution::ArrayElem::Spread(self.value(value)?),
                         })
                     })
-                    .collect::<Result<_, String>>()?,
+                    .collect::<Result<_, Error>>()?,
             }),
             G::Object(object) => V::Object(execution::Object {
                 elem: object
@@ -1924,7 +2074,7 @@ impl<'a> AgentLowering<'a> {
                             value: self.value(&field.value)?,
                         })
                     })
-                    .collect::<Result<_, String>>()?,
+                    .collect::<Result<_, Error>>()?,
             }),
             G::Template(template) => V::Template(execution::Template {
                 parts: template
@@ -1937,7 +2087,7 @@ impl<'a> AgentLowering<'a> {
                             graph::Part::Dynamic(value) => execution::Part::Dynamic(self.value(value)?),
                         })
                     })
-                    .collect::<Result<_, String>>()?,
+                    .collect::<Result<_, Error>>()?,
             }),
             G::Attachment {
                 path,
@@ -2105,7 +2255,7 @@ impl<'a> AgentLowering<'a> {
                     "output" => execution::ScorerArg::Output,
                     "expected" => execution::ScorerArg::Expected,
                     "metadata" => execution::ScorerArg::Metadata,
-                    _ => return Err(format!("unsupported mocking context field {first:?}")),
+                    _ => return Err(format!("unsupported mocking context field {first:?}").into()),
                 };
                 let mut value = if self.callable {
                     V::ArgRef(arg)
@@ -2137,18 +2287,18 @@ impl<'a> AgentLowering<'a> {
         })
     }
 
-    fn function(&mut self, func: &graph::Func) -> Result<execution::Func, String> {
+    fn function(&mut self, func: &graph::Func) -> Result<execution::Func, Error> {
         Ok(match func {
             graph::Func::English { operation, args } => execution::Func::English {
                 operation: *operation,
-                args: args.iter().map(|v| self.value(v)).collect::<Result<_, String>>()?,
+                args: args.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?,
             },
             graph::Func::Attachment { path, content_type } => execution::Func::Attachment {
                 path: path.clone(),
                 content_type: content_type.clone(),
             },
             graph::Func::Choice(values) => {
-                execution::Func::Choice(values.iter().map(|v| self.value(v)).collect::<Result<_, String>>()?)
+                execution::Func::Choice(values.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?)
             }
             graph::Func::Range(values) => execution::Func::Range(match values {
                 graph::Range::Int { min, max } => execution::Range::Int { min: *min, max: *max },
@@ -2163,7 +2313,7 @@ impl<'a> AgentLowering<'a> {
                             weight: v.weight,
                         })
                     })
-                    .collect::<Result<_, String>>()?,
+                    .collect::<Result<_, Error>>()?,
             ),
             graph::Func::Normal { mean, stddev } => execution::Func::Normal {
                 mean: *mean,
@@ -2240,7 +2390,7 @@ impl<'a> AgentLowering<'a> {
             },
             graph::Func::Format { pieces, args } => execution::Func::Format {
                 pieces: pieces.clone(),
-                args: args.iter().map(|v| self.value(v)).collect::<Result<_, String>>()?,
+                args: args.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?,
             },
             graph::Func::Clamp { value, min, max } => execution::Func::Clamp {
                 value: Box::new(self.value(value)?),
@@ -2260,10 +2410,10 @@ impl<'a> AgentLowering<'a> {
                 value: Box::new(self.value(value)?),
             },
             graph::Func::Min(values) => {
-                execution::Func::Min(values.iter().map(|v| self.value(v)).collect::<Result<_, String>>()?)
+                execution::Func::Min(values.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?)
             }
             graph::Func::Max(values) => {
-                execution::Func::Max(values.iter().map(|v| self.value(v)).collect::<Result<_, String>>()?)
+                execution::Func::Max(values.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?)
             }
             graph::Func::Uuid => execution::Func::Uuid,
             graph::Func::Hex { length } => execution::Func::Hex { length: *length },

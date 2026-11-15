@@ -40,7 +40,7 @@ fn lower(source: &str) -> Result<bts_core::mocking::Model, String> {
         &[Bundle::DEFINITIONS],
     )
     .unwrap_or_else(|errors| panic!("{errors:#?}"));
-    Bundle::lower(&graph)
+    Bundle::lower(&graph).map_err(|diag| diag.what)
 }
 
 #[test]
@@ -1423,5 +1423,42 @@ fn junction_results_wait_for_destination_payload_dependencies() {
                 .unwrap()["output"],
             expected
         );
+    }
+}
+
+// the probe cases from the graph contracts plan: a consumer rejection names the offending element
+#[test]
+fn consumer_rejections_point_at_the_offending_element() {
+    let fork = r#"
+(route:agent) {input: "question", output: request.output};
+(route)-[:contains]->(request);
+(route)-[:contains]->(answer);
+(route)-[:next]->(request:task) {input: route.input, output: "done"};
+(request)=[:exclusiv]=>[-[:next]->(answer:tool)];
+(answer)-[:child_of]->(request);
+"#;
+    for (source, located, message) in [
+        (
+            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:next {whne: true}, :feeds"),
+            "true",
+            "configured next edges are not supported by mocking yet",
+        ),
+        (
+            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:nxet, :feeds"),
+            ":nxet",
+            "edge kind \"nxet\" is not supported by mocking yet",
+        ),
+        (
+            fork.to_owned(),
+            "=[:exclusiv]=>[-[:next]->(answer:tool)]",
+            "fork kind \"exclusiv\" or its configuration is not supported by mocking yet",
+        ),
+    ] {
+        let errors = Bundle::compile_module(&source, false).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let range = errors[0].r#where;
+        assert_eq!(errors[0].what, message);
+        assert_eq!(&source[range.start..range.end], located, "{errors:#?}");
+        assert_eq!(range.source, 0);
     }
 }

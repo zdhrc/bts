@@ -38,17 +38,13 @@ impl Bundle {
             &[Self::DEFINITIONS],
             allow_empty,
         )?;
-        Self::lower(&graph).map_err(|what| {
-            vec![bts_lang::Diag {
-                when: bts_lang::DiagPhase::Validation,
-                what,
-                r#where: bts_lang::SrcRange::new(0, 0),
-            }]
-        })
+        Self::lower(&graph).map_err(|diag| vec![diag])
     }
 
     /// Lowers an agent graph for the shared mock data and mock code consumers.
-    pub fn lower(model: &bts_lang::Model) -> Result<crate::mocking::Model, String> {
+    ///
+    /// A failure is located at the graph element it concerns when one is responsible.
+    pub fn lower(model: &bts_lang::Model) -> Result<crate::mocking::Model, bts_lang::Diag> {
         mocking::lower(model)
     }
 }
