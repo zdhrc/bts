@@ -16,27 +16,27 @@
         input: {candidates: len(search.output.doc_ids)},
         output: {kept: search.output.doc_ids[:2]},
     }
-    -[:next]->(answer:llm {name: "Chat Completion"}) {
-        gen_time: lognormal(2.4, 0.4),
-        duration: self.gen_time,
-        input: {
-            system: "Answer using only the provided documents. Cite doc ids.",
-            question: request.input,
-            document_ids: rerank.output.kept,
-            documents: [|
-                {id: "doc_112", content: "Rotate API keys under Settings > API. Old keys remain valid for 24 hours."},
-                {id: "doc_089", content: "Service accounts have individually scoped API keys."},
-            |],
-        },
-        output: {role: "assistant", content: "Rotate keys under Settings > API. The old key stays valid for 24 hours. [doc_112]"},
-        metadata: {model: "gpt-4o-mini", provider: "openai"},
-        metrics: {
-            prompt_tokens: tokens(self.input),
-            completion_tokens: tokens(self.output),
-            tokens: tokens(self.input) + tokens(self.output),
-            time_to_first_token: self.gen_time * range(0.1, 0.25),
-        },
-    };
+        -[:next]->(answer:llm {name: "Chat Completion"}) {
+            gen_time: lognormal(2.4, 0.4),
+            duration: self.gen_time,
+            input: {
+                system: "Answer using only the provided documents. Cite doc ids.",
+                question: request.input,
+                document_ids: rerank.output.kept,
+                documents: [|
+                    {id: "doc_112", content: "Rotate API keys under Settings > API. Old keys remain valid for 24 hours."},
+                    {id: "doc_089", content: "Service accounts have individually scoped API keys."},
+                |],
+            },
+            output: {role: "assistant", content: "Rotate keys under Settings > API. The old key stays valid for 24 hours. [doc_112]"},
+            metadata: {model: "gpt-4o-mini", provider: "openai"},
+            metrics: {
+                prompt_tokens: tokens(self.input),
+                completion_tokens: tokens(self.output),
+                tokens: tokens(self.input) + tokens(self.output),
+                time_to_first_token: self.gen_time * range(0.1, 0.25),
+            },
+        };
 (docs_qa)-[:contains]->(search)-[:child_of]->(request);
 (docs_qa)-[:contains]->(rerank)-[:child_of]->(request);
 (docs_qa)-[:contains]->(answer)-[:child_of]->(request);

@@ -41,11 +41,11 @@
         metadata: {model: "intake-model"},
         metrics: {prompt_tokens: 12, completion_tokens: 8, tokens: 20},
     }
-    -[:next]->(format_reply:function) {output: reply.output}
-    -[:next]->(grade:scorer {file: "intake_checks"}) {
-        score: context.output.patient_id == context.input.patient_id ? 1 : 0,
-        reason: "Preserved the patient identifier",
-    };
+        -[:next]->(format_reply:function) {output: reply.output}
+            -[:next]->(grade:scorer {file: "intake_checks"}) {
+                score: context.output.patient_id == context.input.patient_id ? 1 : 0,
+                reason: "Preserved the patient identifier",
+            };
 
 # parenting is independent of membership, progression, and value transfer
 (lookup)-[:child_of]->(request);

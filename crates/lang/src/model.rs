@@ -347,6 +347,8 @@ pub enum PathStep {
     Edges(Vec<EdgeId>),
     /// A fork and its attached continuations.
     Fork(ForkId),
+    /// Sibling chains sharing the node reached so far as their origin.
+    Arms(Vec<Vec<PathStep>>),
 }
 
 /// A property or content expression owned by a graph element.

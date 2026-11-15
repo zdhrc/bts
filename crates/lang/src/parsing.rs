@@ -147,7 +147,7 @@ impl<'src> Parser<'src> {
             return None;
         }
         if matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde | TokenKind::Equals) {
-            let kind = if matches!(steps.last(), Some(GraphStep::Fork(_))) {
+            let kind = if ends_in_fork(&steps) {
                 ErrorKind::ForkNeedsSelection
             } else {
                 ErrorKind::GraphIndentation
@@ -163,30 +163,73 @@ impl<'src> Parser<'src> {
         })
     }
 
-    fn parse_graph_steps(&mut self, floor: usize) -> Option<Vec<GraphStep>> {
+    // `level` is the indentation of the line these steps attach to
+    fn parse_graph_steps(&mut self, level: usize) -> Option<Vec<GraphStep>> {
         let mut steps = Vec::new();
-        let mut node_indent = floor;
-        loop {
-            if !matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde | TokenKind::Equals) {
-                break;
-            }
-            if self.graph_indent()? < node_indent {
-                break;
-            }
+        // steps on the current line chain from the preceding node
+        while self.at_graph_step() && !self.starts_line() {
             if self.check(token!(Equals)) {
                 steps.push(GraphStep::Fork(self.parse_fork()?));
+                return Some(steps);
+            }
+            steps.push(GraphStep::Edge(self.parse_graph_edge()?));
+        }
+        if !self.at_graph_step() {
+            return Some(steps);
+        }
+        let indent = self.graph_indent()?;
+        if indent <= level {
+            return Some(steps);
+        }
+        // aligned continuation lines are arms sharing the preceding node as their origin
+        let mut arms = Vec::new();
+        loop {
+            let arm = if self.check(token!(Equals)) {
+                vec![GraphStep::Fork(self.parse_fork()?)]
+            } else {
+                let mut arm = vec![GraphStep::Edge(self.parse_graph_edge()?)];
+                arm.extend(self.parse_graph_steps(indent)?);
+                arm
+            };
+            let forked = matches!(arm.last(), Some(GraphStep::Fork(_)));
+            arms.push(arm);
+            if !self.at_graph_step() {
                 break;
             }
-            let edge = self.parse_graph_edge()?;
-            let start = match &edge.target {
-                GraphNode::Declaration(node) => node.range.start,
-                GraphNode::Reference(expr) => expr.range.start,
-            };
-            let index = self.tokens.partition_point(|token| token.range.start < start);
-            node_indent = self.graph_indent_at(index)?;
-            steps.push(GraphStep::Edge(edge));
+            if !self.starts_line() {
+                self.errors.push(Error::new(ErrorKind::ForkNeedsSelection, self.peek().range));
+                return None;
+            }
+            let next = self.graph_indent()?;
+            if next <= level {
+                break;
+            }
+            if next != indent {
+                // deeper lines can only follow a fork here, shallower ones match no established level
+                let kind = if next > indent && forked {
+                    ErrorKind::ForkNeedsSelection
+                } else {
+                    ErrorKind::GraphIndentation
+                };
+                self.errors.push(Error::new(kind, self.peek().range));
+                return None;
+            }
+        }
+        if arms.len() == 1 {
+            steps.extend(arms.remove(0));
+        } else {
+            steps.push(GraphStep::Arms(arms));
         }
         Some(steps)
+    }
+
+    fn at_graph_step(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde | TokenKind::Equals)
+    }
+
+    fn starts_line(&self) -> bool {
+        let token = &self.tokens[self.index];
+        self.src[token.line_start..token.range.start].trim().is_empty()
     }
 
     fn graph_indent(&mut self) -> Option<usize> {
@@ -575,6 +618,18 @@ impl<'src> Parser<'src> {
         Some(Attr { key, value, range })
     }
 
+    // one expression that must consume all input
+    fn parse_expression(mut self) -> Result<Expr, Errors> {
+        let expr = self.parse_expr();
+        if !self.eof() {
+            self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
+        }
+        match (expr, self.errors.is_empty()) {
+            (Some(expr), true) => Ok(expr),
+            _ => Err(self.errors),
+        }
+    }
+
     fn parse_expr(&mut self) -> Option<Expr> {
         self.parse_conditional()
     }
@@ -618,18 +673,6 @@ impl<'src> Parser<'src> {
                 ExprKind::Binary {
                     op,
                     lhs: Box::new(lhs),
-    // one expression that must consume all input
-    fn parse_expression(mut self) -> Result<Expr, Errors> {
-        let expr = self.parse_expr();
-        if !self.eof() {
-            self.errors.push(Error::new(ErrorKind::UnexpectedToken, self.peek().range));
-        }
-        match (expr, self.errors.is_empty()) {
-            (Some(expr), true) => Ok(expr),
-            _ => Err(self.errors),
-        }
-    }
-
                     rhs: Box::new(rhs),
                 },
                 range,
@@ -802,6 +845,7 @@ impl<'src> Parser<'src> {
                 let expr = self.parse_expr()?;
                 let end = self.peek().range.end;
                 self.expect(token!(InterpClose), ErrorKind::UnexpectedToken)?;
+                // no ast node for grouping, the widened range keeps diagnostics on the delimiters
                 Some(Expr::new(expr.kind, self.range(start, end)))
             }
             TokenKind::LBrack => {
@@ -845,7 +889,6 @@ impl<'src> Parser<'src> {
                     }
                     let end = self.peek().range.end;
                     self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
-                // no ast node for grouping, the widened range keeps diagnostics on the delimiters
 
                     Some(Expr::new(ExprKind::Func { name, args }, self.range(range.start, end)))
                 } else {
@@ -1169,6 +1212,15 @@ impl From<Error> for Diag {
             what: kind.to_string(),
             r#where: range,
         }
+    }
+}
+
+// whether the last authored step, through any arms, is a fork
+fn ends_in_fork(steps: &[GraphStep]) -> bool {
+    match steps.last() {
+        Some(GraphStep::Fork(_)) => true,
+        Some(GraphStep::Arms(arms)) => arms.last().is_some_and(|arm| ends_in_fork(arm)),
+        _ => false,
     }
 }
 

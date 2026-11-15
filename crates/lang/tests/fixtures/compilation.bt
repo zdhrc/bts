@@ -511,3 +511,14 @@
         >[:merge [arrival_a], [arrival_b]]>>(merged:node) {arrivals: context.arrivals}
         >[:first [arrival_a], [arrival_b]]>>(winner:node) {arrivals: context.arrivals}
         >[:quorum {count: 2} [arrival_a], [arrival_b]]>>(quorum_result:node) {arrivals: context.arrivals};
+
+# aligned continuation lines share an origin, deeper lines continue the chain
+(dispatch:task) {output: "ready"}
+    -[:next]->(dispatch_audit:task) {input: dispatch.output}
+        -[:next]->(dispatch_archive:task)
+    =[dispatch_route:parallel]=>[
+        -[to_page:next]->(dispatch_page:tool),
+        -[to_email:next]->(dispatch_email:tool),
+    ]
+        >[:accumulate [to_page], [to_email]]>>(dispatch_done:task)
+    ~[:next {max_traversals: 1}]~>(dispatch);

@@ -400,7 +400,7 @@ impl Modeler {
     }
 
     fn path(&mut self, path: &ast::GraphPath, parent: Option<ForkId>) -> RawPath {
-        let (origin, mut current) = match &path.start {
+        let (origin, current) = match &path.start {
             ast::GraphOrigin::Node(node) => {
                 let anchor = self.node(node, parent.map(ElementId::Fork));
                 (RawOrigin::Node(anchor.clone()), anchor)
@@ -415,8 +415,16 @@ impl Modeler {
                 (RawOrigin::Junction(id), self.raw_junctions[id.0].target.clone())
             }
         };
+        RawPath {
+            origin,
+            steps: self.steps(&path.steps, current),
+            range: path.range,
+        }
+    }
+
+    fn steps(&mut self, authored: &[ast::GraphStep], mut current: Anchor) -> Vec<PathStep> {
         let mut steps = Vec::new();
-        for step in &path.steps {
+        for step in authored {
             match step {
                 ast::GraphStep::Edge(step) => {
                     let edges = self.edge(step, current.clone(), None);
@@ -454,13 +462,14 @@ impl Modeler {
                     self.continuations[id.0] = paths;
                     steps.push(PathStep::Fork(id));
                 }
+                // every arm starts from the node reached before the fan-out
+                ast::GraphStep::Arms(arms) => {
+                    let arms = arms.iter().map(|arm| self.steps(arm, current.clone())).collect();
+                    steps.push(PathStep::Arms(arms));
+                }
             }
         }
-        RawPath {
-            origin,
-            steps,
-            range: path.range,
-        }
+        steps
     }
 
     fn endpoint(&mut self, anchor: &Anchor) -> Result<NodeId> {
@@ -643,6 +652,11 @@ impl Modeler {
                         self.model.forks[fork.0].continuations = continuations.into_iter().flatten().collect();
                     } else {
                         resolved = false;
+                    }
+                }
+                PathStep::Arms(arms) => {
+                    for arm in arms {
+                        resolved &= self.resolve_steps(arm);
                     }
                 }
             }

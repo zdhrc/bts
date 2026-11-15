@@ -54,6 +54,8 @@ pub enum GraphStep {
     Edge(GraphEdgeStep),
     /// A typed fork with structurally attached continuations.
     Fork(GraphFork),
+    /// Aligned continuation lines, each a chain starting from the current node.
+    Arms(Vec<Vec<GraphStep>>),
 }
 
 /// A typed fork and the paths attached to it by layout.

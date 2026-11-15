@@ -648,6 +648,128 @@ fn rejects_ambiguous_or_unattached_graph_continuations() {
     }
 }
 
+// every edge as its source and target node names, in declaration order
+fn endpoints(source: &str) -> Vec<(String, String)> {
+    let model = compiled(source);
+    let name = |id: bts_lang::NodeId| model.nodes[id.0].name.clone().unwrap();
+    model
+        .edges
+        .iter()
+        .map(|edge| (name(edge.source), name(edge.target)))
+        .collect()
+}
+
+fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(source, target)| (source.to_string(), target.to_string()))
+        .collect()
+}
+
+#[test]
+fn aligned_continuation_lines_share_an_origin() {
+    let source = "(a:x)\n    -[:next]->(b:x)\n    -[:next]->(c:x)\n    -[:next]->(d:x);";
+    let graph = parse(source).unwrap();
+    assert_eq!(graph.paths[0].steps.len(), 1);
+    let GraphStep::Arms(arms) = &graph.paths[0].steps[0] else {
+        panic!("expected arms")
+    };
+    assert_eq!(arms.len(), 3);
+    assert!(arms.iter().all(|arm| arm.len() == 1));
+    assert_eq!(endpoints(source), pairs(&[("a", "b"), ("a", "c"), ("a", "d")]));
+}
+
+#[test]
+fn deeper_continuation_lines_chain() {
+    let source = "(a:x)\n    -[:next]->(b:x)\n        -[:next]->(c:x)\n            -[:next]->(d:x);";
+    let graph = parse(source).unwrap();
+    assert_eq!(graph.paths[0].steps.len(), 3);
+    assert!(graph.paths[0].steps.iter().all(|step| matches!(step, GraphStep::Edge(_))));
+    assert_eq!(endpoints(source), pairs(&[("a", "b"), ("b", "c"), ("c", "d")]));
+}
+
+#[test]
+fn a_single_continuation_line_attaches_to_the_last_node_above() {
+    assert_eq!(endpoints("(a:x)\n    -[:next]->(b:x);"), pairs(&[("a", "b")]));
+    assert_eq!(
+        endpoints("(a:x)-[:next]->(b:x)\n    -[:next]->(c:x);"),
+        pairs(&[("a", "b"), ("b", "c")])
+    );
+    let graph = parse("(a:x)-[:next]->(b:x)\n    -[:next]->(c:x);").unwrap();
+    assert_eq!(graph.paths[0].steps.len(), 2);
+}
+
+#[test]
+fn mixes_fan_out_chains_bodies_and_loop_backs() {
+    let source = "(a:x)\n    -[:next]->(b:x)-[:next]->(c:x)\n        -[:next]->(d:x)\n        ~[:next]~>(a)\n    -[:next]->(e:x) {\n        note: 1,\n    }\n    -[:next]->(f:x);";
+    assert_eq!(
+        endpoints(source),
+        pairs(&[("a", "b"), ("b", "c"), ("c", "d"), ("c", "a"), ("a", "e"), ("a", "f")])
+    );
+    assert!(compiled(source).edges[3].cycle);
+    // a step after a body on its closing line chains, and the body sets no level
+    let source = "(a:x) {\n        n: 1,\n}-[:next]->(b:x)\n    -[:next]->(c:x)\n    -[:next]->(d:x);";
+    assert_eq!(endpoints(source), pairs(&[("a", "b"), ("b", "c"), ("b", "d")]));
+}
+
+#[test]
+fn fans_out_under_selectors_and_junctions() {
+    let source = "(a:x)=[f:parallel]=>[-[p:next]->(b:x), -[q:next]->(c:x)]\n    ->(b)\n        -[:next]->(d:x)\n        -[:next]->(e:x)\n    >[:accumulate [p], [q]]>>(g:x)\n        -[:next]->(h:x)\n        -[:next]->(i:x);";
+    assert_eq!(
+        endpoints(source),
+        pairs(&[("a", "b"), ("a", "c"), ("b", "d"), ("b", "e"), ("g", "h"), ("g", "i")])
+    );
+}
+
+#[test]
+fn a_fork_is_an_arm_beside_aligned_edges() {
+    let source = "(a:x)\n    -[:link]->(b:x)\n    =[f:parallel]=>[-[p:next]->(c:x), -[q:next]->(d:x)]\n        ->(c)-[:next]->(e:x)\n    -[:link]->(g:x);";
+    let graph = parse(source).unwrap();
+    let GraphStep::Arms(arms) = &graph.paths[0].steps[0] else {
+        panic!("expected arms")
+    };
+    assert_eq!(arms.len(), 3);
+    assert_eq!(fork(&arms[1][0]).continuations.len(), 1);
+    let model = compiled(source);
+    assert_eq!(model.nodes[model.forks[0].source.0].name.as_deref(), Some("a"));
+    assert_eq!(
+        endpoints(source),
+        pairs(&[("a", "b"), ("a", "c"), ("a", "d"), ("c", "e"), ("a", "g")])
+    );
+}
+
+#[test]
+fn rejects_inconsistent_continuation_indentation() {
+    let indentation = "graph continuations require spaces and aligned sibling indentation";
+    let selection = "select a fork target or add a junction before continuing the path";
+    for (source, message) in [
+        // a dedent to a level no earlier line established
+        ("(a:x)\n        -[:next]->(b:x)\n    -[:next]->(c:x);", indentation),
+        (
+            "(a:x)\n    -[:next]->(b:x)\n        -[:next]->(d:x)\n      -[:next]->(c:x);",
+            indentation,
+        ),
+        // a continuation line is deeper than the line it attaches to
+        ("(a:x)\n-[:next]->(b:x);", indentation),
+        ("  (a:x)\n    -[:next]->(b:x)\n-[:next]->(c:x);", indentation),
+        // edge lines do not align with a fork's selectors and junctions
+        (
+            "(a:x)=[:parallel]=>[-[:next]->(b:x)]\n    ->(b)\n    -[:next]->(c:x);",
+            selection,
+        ),
+        (
+            "(a:x)\n    =[:parallel]=>[-[:next]->(b:x)]\n        ->(b)\n        -[:next]->(c:x);",
+            selection,
+        ),
+        ("(a:x)\n    =[:parallel]=>[-[:next]->(b:x)]-[:next]->(c:x);", selection),
+    ] {
+        let errors = parse(source).expect_err(source);
+        assert_eq!(errors[0].what, message, "{source}");
+        // the diagnostic points at the offending line's first token
+        assert_eq!(errors[0].r#where.start, source.rfind("-[").unwrap(), "{source}");
+    }
+}
+
 #[test]
 fn requires_single_steps_and_typed_forks_and_exact_junction_inputs() {
     for source in [
@@ -681,7 +803,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 60);
+    assert_eq!(graph.paths.len(), 61);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -851,7 +973,7 @@ fn handles_truncated_pattern_references_without_panicking() {
 #[test]
 fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
     let model = compile_fixture();
-    assert_eq!(model.paths.len(), 60);
+    assert_eq!(model.paths.len(), 61);
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
     assert!(model.forks.len() > 5);

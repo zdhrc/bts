@@ -1059,7 +1059,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.attachment"),
-        summary: "Indentation attaches selectors and junctions to forks. Selectors must select the opposite endpoints of branches in their attached fork. Fork origin determines the branch destination even for undirected edges.",
+        summary: "Indentation attaches continuation lines. Aligned edge, cycle and fork lines share an origin, the last node of the nearest shallower line. A line indented deeper continues from the last node of the line it sits under. Indentation also attaches selectors and junctions to forks. Selectors must select the opposite endpoints of branches in their attached fork. Fork origin determines the branch destination even for undirected edges.",
     },
     RuleDesc {
         tags: &[],
@@ -1378,6 +1378,22 @@ const EXAMPLES: &[Example] = &[
     },
     Example {
         tags: &[],
+        id: Id::new("example.fan-out"),
+        summary: "Aligned continuation lines share an origin",
+        note: "All three edges leave a. Writing them as separate statements means the same.",
+        source: "(a:custom)\n    -[:next]->(b:custom)\n    -[:next]->(c:custom)\n    -[:next]->(d:custom);",
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.chain"),
+        summary: "Deeper continuation lines chain",
+        note: "Each line continues from the last node of the line it sits under, so the edges run a to b, b to c and c to d.",
+        source: "(a:custom)\n    -[:next]->(b:custom)\n        -[:next]->(c:custom)\n            -[:next]->(d:custom);",
+        valid: true,
+    },
+    Example {
+        tags: &[],
         id: Id::new("example.expressions"),
         summary: "Generic field expressions",
         note: "Constant arithmetic folds during compilation.",
@@ -1412,8 +1428,11 @@ pub static SPEC: Spec = Spec {
         grammar: r#"document = { (root_path | kind_declaration), ";" }
 kind_declaration = "+(", kind_schema, ")" | "+-[", kind_schema, "]-" | "+=[", kind_schema, "]=" | "+>[", kind_schema, "]>>"
 kind_schema = identifier, "::", kind, fields
-root_path = (node | junction), {edge | cycle}, [fork]
-attached_path = (selector | junction), {edge | cycle}, [fork]
+root_path = (node | junction), steps
+attached_path = (selector | junction), steps
+steps = {edge | cycle}, [fork | arms]
+arms = arm, {arm}
+arm = (edge | cycle), steps | fork
 node = "(", header, ")", [fields] | "(", reference_expression, ")"
 header = [name], ":", kind, [fields]
 headers = header, {",", header}, [","]
@@ -1455,9 +1474,10 @@ reference = identifier | "(", reference_expression, ")" | edge_reference | patte
 reference_expression = expression
 "#,
         notes: &[
-            "This grammar describes token forms. The layout rules below constrain attached_path repetition and legal positions. Scalar and template tokenization includes quoted, multiline and heredoc strings, interpolation, finite numbers, booleans and null.",
-            "Spaces establish continuation levels, with no fixed width. Sibling selectors and junctions align on separate lines. A dedent returns to an established level. Tabs are not indentation. Delimited values and strings do not create graph scope.",
-            "One selector or junction may continue a fork on the same line. Another sibling requires a new aligned line. Its attachment is to the enclosing fork, never the preceding sibling's final node.",
+            "This grammar describes token forms. The layout rules below constrain arm and attached_path repetition and legal positions. Scalar and template tokenization includes quoted, multiline and heredoc strings, interpolation, finite numbers, booleans and null.",
+            "Spaces establish continuation levels, with no fixed width. A step that begins a line is a continuation line, and it is indented deeper than the line it attaches to. Aligned continuation lines are siblings. A dedent returns to an established level. Tabs are not indentation. Delimited values and strings do not create graph scope.",
+            "Each arm begins a continuation line. Its origin is the last node of the nearest shallower line, so aligned arms share one origin and a deeper line continues the chain. Steps on one line chain, including a step that follows a node body on its closing line. A fork may be an arm, and arms aligned with it after its attached paths share its origin.",
+            "One selector or junction may continue a fork on the same line. Another sibling requires a new aligned line. Its attachment is to the enclosing fork, never the preceding sibling's final node. Edge and cycle lines do not align with a fork's selectors and junctions.",
             "The <- marker is legal only as the entire value of a direct instance node content field. It is not an expression and is forbidden in properties, nested objects, arrays and schema descriptors.",
             "Node bodies contain only fields. Node declarations are legal at path origins and connection targets. No declarations occur in expression values or properties. Empty node parentheses are invalid.",
             "Fork entries contain exactly one ordinary directed or undirected edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
