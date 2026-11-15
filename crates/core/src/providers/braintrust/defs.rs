@@ -26,6 +26,7 @@ pub const SOURCE: Source<'static> = Source {
 # provider schemas describe span data, they do not execute or emit spans
 # names are optional so anonymous graph nodes remain usable
 # value ranges, tag element types, and emission rules need provider validation
+# a span takes these fields only, local holds values a shape computes for its own expressions and is never emitted
 +(span:node {name: {type: "string"}}) {
     input: {type: "any", role: "input"},
     output: {type: "any", role: "output"},
@@ -36,6 +37,7 @@ pub const SOURCE: Source<'static> = Source {
     scores: {type: "object"},
     tags: {type: "array"},
     duration: {type: "number"},
+    local: {type: "object"},
 };
 
 +(tool:node)-[:extends]->(span);

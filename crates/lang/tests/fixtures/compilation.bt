@@ -274,18 +274,17 @@
     output: {ready: true, payload: "visit details"},
 }
     -[
-        advance:next {when: source.output.ready, max_attempts: settings.max_attempts},
+        advance:attempted {when: source.output.ready, max_attempts: settings.max_attempts},
         supply:feeds {value: source.output.payload},
     ]->(validate_request:tool) {
         output: {valid: chance(0.9)},
     }
         ~[
-            retry:next {when: !source.output.valid, max_attempts: [review_interface.advance_edge].props.max_attempts},
+            retry:attempted {when: !source.output.valid, max_attempts: [review_interface.advance_edge].props.max_attempts},
             feedback:feeds {value: source.output},
         ]~>(review_request);
 
 # cycle edges have their own kind, identity and configuration
-# max_attempts is illustrative, the language does not execute retries
 (poll_visit:tool)
     ~[poll_again:retry {max_attempts: settings.max_attempts}]~>(poll_visit);
 
@@ -362,9 +361,10 @@
 
 
 # span and tool_span are supplied by the provider source in compilation.rs
-# local kinds inherit strict properties and open content fields
+# local kinds inherit strict properties and a closed set of content fields
 +(patient_lookup:node {resource: {type: "string", default: "patients"}}) {
     patient_id: {required: true},
+    note: {type: "string"},
 }
     -[:extends]->(tool_span);
 
@@ -373,6 +373,12 @@
 +(patient_checks_kind:fork {label: {type: "string"}})-[:extends]->(parallel);
 
 +(patient_join:junction {label: {type: "string"}})-[:extends]->(accumulate);
+
+# every instance kind is a built-in or a definition, so the fixture defines its own edge kinds
+# max_attempts is illustrative, the language does not execute retries
++(entry:edge)-[:extends]->(link);
++(retry:edge {max_attempts: {type: "number"}})-[:extends]->(link);
++(attempted:edge {max_attempts: {type: "number"}})-[:extends]->(next);
 
 # an incoming field is a requirement, its destination reference does not read it
 (patient_request:span {name: "Patient request"}) {
@@ -386,7 +392,7 @@
     }]->(patient_step:patient_lookup {name: "Look up patient"}) {
         patient_id: <-,
         output: {id: self.patient_id},
-        extra_content: "open fields remain available",
+        note: "a closed kind takes declared fields only",
     };
 
 # specializations retain the behavior of their base primitive
@@ -462,7 +468,8 @@
         } [processed]]>>(total:node) {value: <-};
 
 # caller inputs retain references even when their authored fallback is constant
-+(supplied_values:node) {payload: {type: "object", role: "input"}};
+# an open kind takes content fields beyond the ones it declares
++(supplied_values:node {open: true}) {payload: {type: "object", role: "input"}};
 (caller_values:supplied_values) {
     payload: {count: 2, enabled: true},
     observed: self.payload.count,
@@ -522,6 +529,8 @@
 
 +(patient_export:node {format: {type: "string", default: "fhir"}}) {
     patient_id: {type: "string"},
+    kept_for: {type: "number"},
+    checked_by: {type: "string"},
 }
     -[:extends]->(patient_lookup)
     -[:has]->(consented)

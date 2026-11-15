@@ -3854,7 +3854,7 @@ mod tests {
     fn preserves_typed_attachments_through_references_and_bindings() {
         let model = compile(
             r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["files"][0]};
-(copy:tool {name: "copy"}) {input: {nested: [|copy.picked|]}, output: source_root.output, picked: source_root.output};
+(copy:tool {name: "copy"}) {input: {nested: [|copy.local.picked|]}, output: source_root.output, local: {picked: source_root.output}};
 (source_node:agent) {input: {files: [|attachment("report.txt", "text/plain")|]}, output: source_root.output};
 (source_node)-[:contains]->(source_root);
 (source_node)-[:contains]->(copy);
@@ -3904,23 +3904,23 @@ mod tests {
     #[test]
     fn attachment_projection_shape_errors_point_to_the_consuming_selection() {
         for (projection, expression) in [
-            (serde_json::json!(["value"]), r#"source_root.file["key"]"#),
-            (serde_json::json!("value"), r#"source_root.file["key"]"#),
-            (serde_json::json!(false), r#"source_root.file["key"]"#),
-            (InputValue::Null, r#"source_root.file["key"]"#),
+            (serde_json::json!(["value"]), r#"source_root.local.file["key"]"#),
+            (serde_json::json!("value"), r#"source_root.local.file["key"]"#),
+            (serde_json::json!(false), r#"source_root.local.file["key"]"#),
+            (InputValue::Null, r#"source_root.local.file["key"]"#),
             (serde_json::json!(42), r#"attachment("report.txt", "text/plain")["key"]"#),
             (serde_json::json!({"nested": "value"}), r#"self.input["nested"]["key"]"#),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"source_root.selected["nested"]["key"]"#,
+                r#"source_root.local.selected["nested"]["key"]"#,
             ),
-            (serde_json::json!({}), r#"source_root.selected[:]"#),
-            (serde_json::json!("value"), r#"source_root.selected[:]"#),
-            (serde_json::json!(["value"]), r#"source_root.selected[true]"#),
+            (serde_json::json!({}), r#"source_root.local.selected[:]"#),
+            (serde_json::json!("value"), r#"source_root.local.selected[:]"#),
+            (serde_json::json!(["value"]), r#"source_root.local.selected[true]"#),
         ] {
             let source = format!(
-                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, file: attachment("report.txt", "text/plain"), selected: source_root.input}};
-(source_node:agent) {{input: source_root.file, output: source_root.output}};
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
+(source_node:agent) {{input: source_root.local.file, output: source_root.output}};
 (source_node)-[:contains]->(source_root);
 (source_node)-[:next]->(source_root);"#
             );
@@ -3935,24 +3935,24 @@ mod tests {
         for (projection, expression, expected) in [
             (
                 serde_json::json!({"name": "report.txt"}),
-                r#"source_root.file["name"]"#,
+                r#"source_root.local.file["name"]"#,
                 value!("report.txt"),
             ),
             (serde_json::json!(["first", "second"]), "self.input[1]", value!("second")),
             (
                 serde_json::json!(["first", "second"]),
-                "source_root.selected[1:]",
+                "source_root.local.selected[1:]",
                 value!(["second"]),
             ),
             (
                 serde_json::json!(["first", "second"]),
-                "[|...source_root.selected|]",
+                "[|...source_root.local.selected|]",
                 value!(["first", "second"]),
             ),
         ] {
             let source = format!(
-                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, file: attachment("report.txt", "text/plain"), selected: source_root.input}};
-(source_node:agent) {{input: source_root.file, output: source_root.output}};
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
+(source_node:agent) {{input: source_root.local.file, output: source_root.output}};
 (source_node)-[:contains]->(source_root);
 (source_node)-[:next]->(source_root);"#
             );
@@ -3966,17 +3966,17 @@ mod tests {
         for (projection, expression, kind) in [
             (
                 serde_json::json!({}),
-                r#"source_root.file["missing"]"#,
+                r#"source_root.local.file["missing"]"#,
                 ErrorKind::MissingObjectKey,
             ),
             (
                 serde_json::json!(["value"]),
-                "source_root.selected[3]",
+                "source_root.local.selected[3]",
                 ErrorKind::IndexOutOfBounds,
             ),
             (
                 serde_json::json!(["value"]),
-                "source_root.selected[0.5]",
+                "source_root.local.selected[0.5]",
                 ErrorKind::NonIntegerIndex,
             ),
             (
@@ -4001,8 +4001,8 @@ mod tests {
             ),
         ] {
             let source = format!(
-                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, file: attachment("report.txt", "text/plain"), selected: source_root.input}};
-(source_node:agent) {{input: source_root.file, output: source_root.output}};
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
+(source_node:agent) {{input: source_root.local.file, output: source_root.output}};
 (source_node)-[:contains]->(source_root);
 (source_node)-[:next]->(source_root);"#
             );
@@ -4035,13 +4035,13 @@ mod tests {
             ),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"[|...self.expected, ...source_root.selected["nested"]|]"#,
-                r#"source_root.selected["nested"]"#,
+                r#"[|...self.expected, ...source_root.local.selected["nested"]|]"#,
+                r#"source_root.local.selected["nested"]"#,
             ),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"[|...source_root.selected["nested"]|]"#,
-                r#"source_root.selected["nested"]"#,
+                r#"[|...source_root.local.selected["nested"]|]"#,
+                r#"source_root.local.selected["nested"]"#,
             ),
             (
                 serde_json::json!("value"),
@@ -4050,7 +4050,7 @@ mod tests {
             ),
         ] {
             let source = format!(
-                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, expected: [|"seed"|], output: {expression}, selected: source_root.input}};
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, expected: [|"seed"|], output: {expression}, local: {{selected: source_root.input}}}};
 (source_node:agent) {{input: attachment("report.txt", "text/plain"), output: source_root.output}};
 (source_node)-[:contains]->(source_root);
 (source_node)-[:next]->(source_root);"#
@@ -4160,8 +4160,8 @@ mod tests {
     #[test]
     fn slices_trace_scope_vars_by_repeat_index() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {messages: [|"q0" , "a0" , "q1" , "a1"|], input: t.input};
-(turn:task {name: "turn"}) {input: t_root.messages [: ${context.index * 2} + 1]};
+            r#"(t_root:task {name: "t"}) {local: {messages: [|"q0" , "a0" , "q1" , "a1"|]}, input: t.input};
+(turn:task {name: "turn"}) {input: t_root.local.messages [: ${context.index * 2} + 1]};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(turn);
@@ -4501,7 +4501,7 @@ mod tests {
 
     #[test]
     fn english_functions_materialize_composable_grammar_and_explicit_context() {
-        let source = r#"(t_root:task {name: "t"}) {output: {sentence: realize(t_root.arrival), combined: combine([|t_root.arrival, t_root.checkin|], "and"), first: refer(t_root.guest, {}), later: refer(t_root.guest, t_root.context), reset: refer(t_root.guest, {}), context: t_root.context, details: unmentioned([|{id: "arrival", text: "The arrival is recorded."}, {id: "key", text: "Your key is at reception."}|], t_root.context), amount: format_number("1234567.125", {locale: "en-IN", fraction_digits: 2}), date: format_date("2026-11-10", {locale: "en-GB"}), time: format_time("17:30", {locale: "en-US"}), composed: compose([|render("Hello {name}.", {name: t_root.guest.label}), realize(t_root.checkin)|])}, guest: {id: "guest_1", label: "Maya", pronouns: {subject: "she", object: "her", possessive_determiner: "her", possessive: "hers"}}, arrival: {clause: {subject: {text: "the guest"}, predicate: {verb: "arrive"}, tense: "future"}}, checkin: {clause: {subject: {text: "the guest"}, predicate: {verb: "check", complement: "in"}, modal: "can"}}, context: remember({}, [|t_root.guest|], [|"arrival"|]), input: t.input};
+        let source = r#"(t_root:task {name: "t"}) {output: {sentence: realize(t_root.local.arrival), combined: combine([|t_root.local.arrival, t_root.local.checkin|], "and"), first: refer(t_root.local.guest, {}), later: refer(t_root.local.guest, t_root.local.context), reset: refer(t_root.local.guest, {}), context: t_root.local.context, details: unmentioned([|{id: "arrival", text: "The arrival is recorded."}, {id: "key", text: "Your key is at reception."}|], t_root.local.context), amount: format_number("1234567.125", {locale: "en-IN", fraction_digits: 2}), date: format_date("2026-11-10", {locale: "en-GB"}), time: format_time("17:30", {locale: "en-US"}), composed: compose([|render("Hello {name}.", {name: t_root.local.guest.label}), realize(t_root.local.checkin)|])}, local: {guest: {id: "guest_1", label: "Maya", pronouns: {subject: "she", object: "her", possessive_determiner: "her", possessive: "hers"}}, arrival: {clause: {subject: {text: "the guest"}, predicate: {verb: "arrive"}, tense: "future"}}, checkin: {clause: {subject: {text: "the guest"}, predicate: {verb: "check", complement: "in"}, modal: "can"}}, context: remember({}, [|t_root.local.guest|], [|"arrival"|])}, input: t.input};
 (t:agent) {input: null, output: t_root.output};
 (t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#;
@@ -4529,8 +4529,8 @@ mod tests {
 
     #[test]
     fn english_variation_uses_scoped_randomness_and_binding_caching() {
-        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.reply, reply: vary("The guest cannot check in.")};
-(t:agent) {input: t_root.reply, output: t_root.output};
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.reply, local: {reply: vary("The guest cannot check in.")}};
+(t:agent) {input: t_root.local.reply, output: t_root.output};
 (t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#;
         let first = plan(compile(source).unwrap(), 32, 7).unwrap();
@@ -4732,8 +4732,8 @@ mod tests {
     #[test]
     fn evaluates_nested_funcs_and_funcs_from_vars() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {input: t.input, style: choice("clear", "vague")};
-(t:agent) {input: [|choice(range(1, 3), "x"), t_root.style|], output: null};
+            r#"(t_root:task {name: "t"}) {input: t.input, local: {style: choice("clear", "vague")}};
+(t:agent) {input: [|choice(range(1, 3), "x"), t_root.local.style|], output: null};
 (t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#,
         )
@@ -4862,7 +4862,7 @@ mod tests {
 
     #[test]
     fn evaluates_dynamic_indexes_within_their_containers() {
-        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.user [choice("a", "b")], user: {a: 1, b: 2}};
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.user [choice("a", "b")], local: {user: {a: 1, b: 2}}};
 (t:agent) {input: [|"a", "b", "c"|][range(0, 2)], output: t_root.output};
 (t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#;
@@ -4885,8 +4885,8 @@ mod tests {
 
     #[test]
     fn evaluates_nested_dynamic_indexes() {
-        let source = r#"(t_root:task {name: "t"}) {input: t.input, matrix: [|[|1, 2|], [|3, 4|]|]};
-(t:agent) {input: t_root.matrix [range(0, 1)][range(0, 1)], output: null};
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, local: {matrix: [|[|1, 2|], [|3, 4|]|]}};
+(t:agent) {input: t_root.local.matrix [range(0, 1)][range(0, 1)], output: null};
 (t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
@@ -5145,7 +5145,7 @@ mod tests {
 
     #[test]
     fn plans_exactly_one_choice_child() {
-        let source = r#"(t_root:task {name: "t"}) {branch_0_selection: range(0, 1), input: t.input};
+        let source = r#"(t_root:task {name: "t"}) {local: {branch_0_selection: range(0, 1)}, input: t.input};
 (a:tool {name: "a"}) {};
 (b:function {name: "b"}) {};
 (t:agent) {input: null, output: null};
@@ -5155,7 +5155,7 @@ mod tests {
 (t)-[:contains]->(b);
 (b)-[:child_of]->(t_root);
 
-(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection == 0}]->(a), -[:next {when: t_root.branch_0_selection == 1}]->(b)];
+(t_root)=[:conditional]=>[-[:next {when: t_root.local.branch_0_selection == 0}]->(a), -[:next {when: t_root.local.branch_0_selection == 1}]->(b)];
 (t)-[:next]->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
 
@@ -5170,14 +5170,14 @@ mod tests {
 
     #[test]
     fn includes_maybe_children_probabilistically() {
-        let source = r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0.5), input: t.input};
+        let source = r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0.5)}, input: t.input};
 (extra:task {name: "extra"}) {};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(extra);
 (extra)-[:child_of]->(t_root);
 
-(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(extra)];
+(t_root)=[:conditional]=>[-[:next {when: t_root.local.branch_0_selection}]->(extra)];
 (t)-[:next]->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 40, 7).unwrap();
 
@@ -5190,14 +5190,14 @@ mod tests {
         // the bounds always include or always skip
         let always = plan(
             compile(
-                r#"(t_root:task {name: "t"}) {branch_0_selection: chance(1), input: t.input};
+                r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(1)}, input: t.input};
 (extra:task {name: "extra"}) {};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(extra);
 (extra)-[:child_of]->(t_root);
 
-(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(extra)];
+(t_root)=[:conditional]=>[-[:next {when: t_root.local.branch_0_selection}]->(extra)];
 (t)-[:next]->(t_root);"#,
             )
             .unwrap(),
@@ -5208,14 +5208,14 @@ mod tests {
         assert!(always.traces.iter().all(|range| range.len() == 2));
         let never = plan(
             compile(
-                r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0), input: t.input};
+                r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0)}, input: t.input};
 (extra:task {name: "extra"}) {};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(extra);
 (extra)-[:child_of]->(t_root);
 
-(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(extra)];
+(t_root)=[:conditional]=>[-[:next {when: t_root.local.branch_0_selection}]->(extra)];
 (t)-[:next]->(t_root);"#,
             )
             .unwrap(),
@@ -5282,14 +5282,14 @@ mod tests {
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "repeat count is not an integer");
 
-        let source = r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0.5), input: t.input};
+        let source = r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0.5)}, input: t.input};
 (turn:task {name: "turn"}) {};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(turn);
 (turn)-[:child_of]->(t_root);
 
-(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(turn)];
+(t_root)=[:conditional]=>[-[:next {when: t_root.local.branch_0_selection}]->(turn)];
 (t)-[:next]->(t_root);"#;
         let mut model = compile(source).unwrap();
         let ModelChild::Maybe(branch) = &mut model.traces[0].children[0] else {
@@ -5339,7 +5339,7 @@ mod tests {
 
     #[test]
     fn plans_dynamic_blocks_reproducibly() {
-        let source = r#"(session_root:task {name: "session"}) {branch_2_selection: chance(0.25), branch_1_selection: range(0, 1), input: session.input};
+        let source = r#"(session_root:task {name: "session"}) {local: {branch_2_selection: chance(0.25), branch_1_selection: range(0, 1)}, input: session.input};
 (turn:task {name: "turn"}) {input: "question ${context.index}"};
 (draft:llm {name: "draft"}) {};
 (get_order_status:tool {name: "get_order_status"}) {};
@@ -5359,8 +5359,8 @@ mod tests {
 (escalation)-[:child_of]->(session_root);
 
 (session_root)=["turns":repeat {count: range (1 , 4)}]=>[-[:next]->(turn)];
-(session_root)=[:conditional]=>[-[:next {when: session_root.branch_1_selection == 0}]->(get_order_status), -[:next {when: session_root.branch_1_selection == 1}]->(summarize_session)];
-(session_root)=[:conditional]=>[-[:next {when: session_root.branch_2_selection}]->(escalation)];
+(session_root)=[:conditional]=>[-[:next {when: session_root.local.branch_1_selection == 0}]->(get_order_status), -[:next {when: session_root.local.branch_1_selection == 1}]->(summarize_session)];
+(session_root)=[:conditional]=>[-[:next {when: session_root.local.branch_2_selection}]->(escalation)];
 (session)-[:next]->(session_root);
 (turn)-[:next]->(draft);"#;
         let model = compile(source).unwrap();
@@ -5385,8 +5385,8 @@ mod tests {
     #[test]
     fn evaluates_root_bindings_once_per_trace() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.x, x: range(0, 1000000)};
-(t:agent) {input: t_root.x, output: t_root.output};
+            r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.x, local: {x: range(0, 1000000)}};
+(t:agent) {input: t_root.local.x, output: t_root.output};
 (t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#,
         )
@@ -5410,7 +5410,7 @@ mod tests {
     fn evaluates_repeat_bindings_once_per_iteration() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(turn:task {name: "turn"}) {input: turn.r, output: turn.r, r: range (0 , 1000000)};
+(turn:task {name: "turn"}) {input: turn.local.r, output: turn.local.r, local: {r: range (0 , 1000000)}};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(turn);
@@ -5438,7 +5438,7 @@ mod tests {
     fn sums_span_bindings_exactly() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(Chat_Completion:llm {name: "Chat Completion"}) {metrics: {prompt_tokens: Chat_Completion.pt, completion_tokens: Chat_Completion.ct, tokens: Chat_Completion.pt + Chat_Completion.ct}, pt: round(lognormal(600, 0.4)), ct: round(lognormal(90, 0.7))};
+(Chat_Completion:llm {name: "Chat Completion"}) {metrics: {prompt_tokens: Chat_Completion.local.pt, completion_tokens: Chat_Completion.local.ct, tokens: Chat_Completion.local.pt + Chat_Completion.local.ct}, local: {pt: round(lognormal(600, 0.4)), ct: round(lognormal(90, 0.7))}};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(Chat_Completion);
@@ -5460,8 +5460,8 @@ mod tests {
     #[test]
     fn interpolates_bindings_consistently_with_value_references() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {input: t.input, metadata: {model: t_root.m}, m: choice("gpt-4o", "gpt-4o-mini")};
-(t:agent) {input: "model: ${t_root.m}", output: null};
+            r#"(t_root:task {name: "t"}) {input: t.input, metadata: {model: t_root.local.m}, local: {m: choice("gpt-4o", "gpt-4o-mini")}};
+(t:agent) {input: "model: ${t_root.local.m}", output: null};
 (t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#,
         )
@@ -5477,9 +5477,9 @@ mod tests {
     #[test]
     fn shares_choice_bindings_across_alternatives() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {branch_0_selection: range(0, 1), input: t.input};
-(a:task {name: "a"}) {input: a.c, output: a.c, c: range (0 , 1000000)};
-(b:task {name: "b"}) {input: a.c, output: a.c};
+            r#"(t_root:task {name: "t"}) {local: {branch_0_selection: range(0, 1)}, input: t.input};
+(a:task {name: "a"}) {input: a.local.c, output: a.local.c, local: {c: range (0 , 1000000)}};
+(b:task {name: "b"}) {input: a.local.c, output: a.local.c};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(a);
@@ -5487,7 +5487,7 @@ mod tests {
 (t)-[:contains]->(b);
 (b)-[:child_of]->(t_root);
 
-(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection == 0}]->(a), -[:next {when: t_root.branch_0_selection == 1}]->(b)];
+(t_root)=[:conditional]=>[-[:next {when: t_root.local.branch_0_selection == 0}]->(a), -[:next {when: t_root.local.branch_0_selection == 1}]->(b)];
 (t)-[:next]->(t_root);"#,
         )
         .unwrap();
@@ -5502,14 +5502,14 @@ mod tests {
     #[test]
     fn evaluates_maybe_bindings_only_on_inclusion() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {branch_0_selection: chance(0.5), input: t.input};
-(escalation:task {name: "escalation"}) {input: escalation.e, e: range (0 , 1000000)};
+            r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0.5)}, input: t.input};
+(escalation:task {name: "escalation"}) {input: escalation.local.e, local: {e: range (0 , 1000000)}};
 (t:agent) {input: null, output: null};
 (t)-[:contains]->(t_root);
 (t)-[:contains]->(escalation);
 (escalation)-[:child_of]->(t_root);
 
-(t_root)=[:conditional]=>[-[:next {when: t_root.branch_0_selection}]->(escalation)];
+(t_root)=[:conditional]=>[-[:next {when: t_root.local.branch_0_selection}]->(escalation)];
 (t)-[:next]->(t_root);"#,
         )
         .unwrap();
@@ -5735,7 +5735,7 @@ mod tests {
     #[test]
     fn reports_branch_outcomes_and_nulls() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {branch_1_selection: chance(0.5), branch_0_selection: range(0, 1), metadata: {picked: t_root.branch_0_selection, resolved: resolved.output != null, retried: t_root.branch_1_selection}, input: t.input};
+            r#"(t_root:task {name: "t"}) {local: {branch_1_selection: chance(0.5), branch_0_selection: range(0, 1)}, metadata: {picked: t_root.local.branch_0_selection, resolved: resolved.output != null, retried: t_root.local.branch_1_selection}, input: t.input};
 (resolved:task {name: "resolved"}) {output: "ok"};
 (escalated:task {name: "escalated"}) {output: "paged"};
 (again:task {name: "again"}) {output: 1};
@@ -5748,8 +5748,8 @@ mod tests {
 (t)-[:contains]->(again);
 (again)-[:child_of]->(t_root);
 
-(t_root)=["outcome":conditional]=>[-[:next {when: t_root.branch_0_selection == 0}]->(resolved), -[:next {when: t_root.branch_0_selection == 1}]->(escalated)];
-(t_root)=["retry":conditional]=>[-[:next {when: t_root.branch_1_selection}]->(again)];
+(t_root)=["outcome":conditional]=>[-[:next {when: t_root.local.branch_0_selection == 0}]->(resolved), -[:next {when: t_root.local.branch_0_selection == 1}]->(escalated)];
+(t_root)=["retry":conditional]=>[-[:next {when: t_root.local.branch_1_selection}]->(again)];
 (t)-[:next]->(t_root);"#,
         )
         .unwrap();

@@ -1,25 +1,27 @@
 # a session with bounded turns, one route, and an optional handoff
 (session:task {name: "support-session"}) {
     input: support.input,
-    turns: range(2, 4),
-    route: choice("lookup", "fallback"),
-    escalated: chance(0.5),
-    output: self.turns == 4 ? turn3.output : self.turns == 3 ? turn2.output : turn1.output,
-    metadata: {product: "billing", escalated: self.escalated},
+    local: {
+        turns: range(2, 4),
+        route: choice("lookup", "fallback"),
+        escalated: chance(0.5),
+    },
+    output: self.local.turns == 4 ? turn3.output : self.local.turns == 3 ? turn2.output : turn1.output,
+    metadata: {product: "billing", escalated: self.local.escalated},
     tags: [|"support", "orders"|],
 }
     =[:conditional]=>[
-        -[:next {when: source.turns > 0}]->(turn0),
-        -[:next {when: source.turns > 1}]->(turn1),
-        -[:next {when: source.turns > 2}]->(turn2),
-        -[:next {when: source.turns > 3}]->(turn3),
+        -[:next {when: source.local.turns > 0}]->(turn0),
+        -[:next {when: source.local.turns > 1}]->(turn1),
+        -[:next {when: source.local.turns > 2}]->(turn2),
+        -[:next {when: source.local.turns > 3}]->(turn3),
     ];
 (session)
     =[:exclusive]=>[
-        -[:next {when: source.route == "lookup"}]->(lookup:tool) {input: session.input, output: {status: "found"}},
-        -[:next {when: source.route == "fallback"}]->(fallback:function) {input: session.input, output: {status: "deferred"}},
+        -[:next {when: source.local.route == "lookup"}]->(lookup:tool) {input: session.input, output: {status: "found"}},
+        -[:next {when: source.local.route == "fallback"}]->(fallback:function) {input: session.input, output: {status: "deferred"}},
     ];
-(session)-[:next {when: source.escalated}]->(handoff:task) {input: session.input, output: "queued"};
+(session)-[:next {when: source.local.escalated}]->(handoff:task) {input: session.input, output: "queued"};
 (support:agent) {input: {request: "Where is my order?", customer: "acct-42"}, output: session.output};
 (support)-[:contains]->(session);
 (support)-[:next]->(session);

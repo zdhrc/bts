@@ -9,6 +9,8 @@ use std::{
 };
 
 const SOURCE: &str = r#"# shared mock data and mock code case
++(patient_lookup:node) {patient_id: {type: "string"}}-[:extends]->(tool);
+
 (intake:agent) {
     input: {patient_id: "p-123"},
     output: request.output,
@@ -22,7 +24,7 @@ const SOURCE: &str = r#"# shared mock data and mock code case
     output: lookup.output,
 };
 
-(request)-[:next, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:tool) {
+(request)-[:next, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
     patient_id: <-,
     input: {patient_id: self.patient_id},
     output: {patient_id: self.patient_id, found: true},
@@ -108,10 +110,10 @@ fn graph_agent_generates_spans_and_runnable_code() {
 fn graph_agent_preserves_sibling_progression_and_inherited_kinds() {
     let source = SOURCE
         .replace("intake:agent", "intake:intake_kind")
-        .replace("lookup:tool", "lookup:lookup_kind")
+        .replace("lookup:patient_lookup", "lookup:lookup_kind")
         .replace("output: lookup.output", "output: finish.output");
     let source = format!(
-        r#"+(intake_kind:node)-[:extends]->(agent); +(lookup_kind:node)-[:extends]->(tool);
+        r#"+(intake_kind:node)-[:extends]->(agent); +(lookup_kind:node)-[:extends]->(patient_lookup);
 {source}
 (intake)-[:contains]->(finish:tool) {{input: intake.input, output: {{patient_id: self.input.patient_id, found: true}}}};
 (lookup)-[:next]->(finish);
@@ -262,8 +264,11 @@ fn graph_agent_rejects_invalid_parenting_and_unsupported_flow() {
 #[test]
 fn graph_bindings_cache_samples_per_invocation() {
     let source = SOURCE
-        .replace("patient_id: <-,", "patient_id: <-, token: hex(8),")
-        .replace("found: true", "found: true, first: self.token, second: self.token");
+        .replace("patient_id: <-,", "patient_id: <-, local: {token: hex(8)},")
+        .replace(
+            "found: true",
+            "found: true, first: self.local.token, second: self.local.token",
+        );
     let generate = || {
         let mut batch = data::generate(
             lower(&source).unwrap(),
@@ -303,7 +308,7 @@ fn typed_propagation_is_checked_by_data_and_generated_code() {
             let source = format!(
                 "+(checked_tool:node) {{patient_id: {{type: \"{ty}\"}}}}-[:extends]->(tool);\n{}",
                 SOURCE
-                    .replace("lookup:tool", "lookup:checked_tool")
+                    .replace("lookup:patient_lookup", "lookup:checked_tool")
                     .replace("\"p-123\"", value)
             );
             let model = lower(&source).unwrap();
@@ -696,8 +701,8 @@ fn repeat_preserves_iteration_scope_and_empty_groups() {
 (root)
     =[:repeat {count: source.input}]=>[
         -[:next]->(work:tool) {
-            token: hex(8),
-            output: {index: context.index, count: context.count, first: self.token, second: self.token},
+            local: {token: hex(8)},
+            output: {index: context.index, count: context.count, first: self.local.token, second: self.local.token},
         },
     ];
 (work)-[:child_of]->(root);
@@ -1426,7 +1431,7 @@ fn junction_results_wait_for_destination_payload_dependencies() {
     }
 }
 
-// the probe cases from the graph contracts plan: a consumer rejection names the offending element
+// valid in the language and unsupported by mocking: a consumer rejection names the offending element
 #[test]
 fn consumer_rejections_point_at_the_offending_element() {
     let fork = r#"
@@ -1434,24 +1439,24 @@ fn consumer_rejections_point_at_the_offending_element() {
 (route)-[:contains]->(request);
 (route)-[:contains]->(answer);
 (route)-[:next]->(request:task) {input: route.input, output: "done"};
-(request)=[:exclusiv]=>[-[:next]->(answer:tool)];
+(request)=[:fork]=>[-[:next]->(answer:tool)];
 (answer)-[:child_of]->(request);
 "#;
     for (source, located, message) in [
         (
-            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:next {whne: true}, :feeds"),
-            "true",
+            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:next {weight: 2}, :feeds"),
+            "2",
             "configured next edges are not supported by mocking yet",
         ),
         (
-            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:nxet, :feeds"),
-            ":nxet",
-            "edge kind \"nxet\" is not supported by mocking yet",
+            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:requires, :feeds"),
+            ":requires",
+            "edge kind \"requires\" is not supported by mocking yet",
         ),
         (
             fork.to_owned(),
-            "=[:exclusiv]=>[-[:next]->(answer:tool)]",
-            "fork kind \"exclusiv\" or its configuration is not supported by mocking yet",
+            "=[:fork]=>[-[:next]->(answer:tool)]",
+            "fork kind \"fork\" or its configuration is not supported by mocking yet",
         ),
     ] {
         let errors = Bundle::compile_module(&source, false).unwrap_err();
@@ -1460,5 +1465,40 @@ fn consumer_rejections_point_at_the_offending_element() {
         assert_eq!(errors[0].what, message);
         assert_eq!(&source[range.start..range.end], located, "{errors:#?}");
         assert_eq!(range.source, 0);
+    }
+    // the probe misspellings from the graph contracts plan never reach the consumer
+    for (source, located, message) in [
+        (
+            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:next {whne: true}, :feeds"),
+            "whne",
+            "unknown property `whne` for built-in kind `next`, did you mean `when`?",
+        ),
+        (
+            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:nxet, :feeds"),
+            "nxet",
+            "unknown edge kind `nxet`, did you mean `next`?",
+        ),
+        (
+            fork.replace(":fork", ":exclusiv"),
+            "exclusiv",
+            "unknown fork kind `exclusiv`, did you mean `exclusive`?",
+        ),
+        (
+            SOURCE.replace("output: lookup.output,", "outptu: lookup.output,"),
+            "outptu",
+            "unknown field `outptu` for kind `task`, did you mean `output`?",
+        ),
+        (
+            SOURCE.replace("(request:task)", "(request:tsak)"),
+            "tsak",
+            "unknown node kind `tsak`, did you mean `task`?",
+        ),
+    ] {
+        let errors = Bundle::compile_module(&source, false).unwrap_err();
+        let found = errors
+            .iter()
+            .find(|error| error.what == message)
+            .unwrap_or_else(|| panic!("{errors:#?}"));
+        assert_eq!(&source[found.r#where.start..found.r#where.end], located);
     }
 }

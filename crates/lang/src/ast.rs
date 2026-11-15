@@ -72,6 +72,8 @@ pub struct GraphFork {
 pub struct GraphJunction {
     /// Required junction kind.
     pub kind: String,
+    /// The source range of the kind name.
+    pub kind_range: SrcRange,
     /// Qualified or unqualified references to input edges.
     pub inputs: Vec<Expr>,
     /// Configuration properties separate from the destination node.
@@ -111,6 +113,8 @@ pub struct GraphHeader {
     pub name_range: Option<SrcRange>,
     /// The required kind, before checking its contract.
     pub kind: String,
+    /// The source range of the kind name.
+    pub kind_range: SrcRange,
     /// Configuration fields, absent when no property object was written.
     pub props: Option<Vec<Attr>>,
     /// The header range, excluding surrounding graph delimiters.

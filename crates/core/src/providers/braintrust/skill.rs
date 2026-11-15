@@ -94,7 +94,7 @@ Inspect the rendered result, not just the source. Check that names, nesting, cha
 
 pub const GRAPH: &str = r#"## Braintrust graph definitions
 
-The CLI and browser interface compile source with the following provider definitions already supplied. Extend these kinds with new definitions rather than redefining them. Node properties configure instances, while node bodies hold fields.
+The CLI and browser interface compile source with the following provider definitions already supplied. Extend these kinds with new definitions rather than redefining them. Node properties configure instances, while node bodies hold fields. A span body takes only the fields its kind declares. Put values that a shape computes for its own expressions under local, for example local: {route: range(0, 1)} read as self.local.route. The local field is never emitted.
 
 An agent describes a behavior graph and does not emit a span. Give it input and output fields, contains edges to its members, and one unconditional next edge to a task or span entry. The entry input references the agent input. Use child_of edges from emitted children to their parent spans. Membership, execution order and span parenting are separate relationships.
 

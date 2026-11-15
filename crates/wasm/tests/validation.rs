@@ -1255,9 +1255,9 @@ fn language_composition_matches_native_samples() {
     let source = r#"(language_agent:agent {name: "language"}) {input: null, output: language.output};
 (language_agent)-[:next]->(language);
 (language:task) {
-    output: {rendered: render("{{{name}}}: {n} {ok} {name}", {name: "Zoë", n: 2, ok: true}), literal: render("{text}", {text: "{untouched}"}), composed: compose([|null, "", "hello", " world "|]), nested: compose([|"Hi!", compose(sample([|"one", "two"|], 2), ", ")|]), empty: compose([|null, ""|]), selected: language.selected, reused: language.selected, duplicates: sample([|"same", "same"|], 2), zero: sample([||], 0)},
+    output: {rendered: render("{{{name}}}: {n} {ok} {name}", {name: "Zoë", n: 2, ok: true}), literal: render("{text}", {text: "{untouched}"}), composed: compose([|null, "", "hello", " world "|]), nested: compose([|"Hi!", compose(sample([|"one", "two"|], 2), ", ")|]), empty: compose([|null, ""|]), selected: language.local.selected, reused: language.local.selected, duplicates: sample([|"same", "same"|], 2), zero: sample([||], 0)},
     input: language_agent.input,
-    selected: sample([|0, 1, 2, 3, 4, 5|], 3)
+    local: {selected: sample([|0, 1, 2, 3, 4, 5|], 3)}
 };
 (language_agent)-[:contains]->(language);"#;
     let options = serde_json::json!({ "count": 32, "over_ms": 3600000, "until_ms": 86400000, "seed": "42" });

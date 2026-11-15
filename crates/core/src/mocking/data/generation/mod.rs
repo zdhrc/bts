@@ -458,7 +458,8 @@ mod experiment_tests {
     #[test]
     fn materializes_fields_from_a_resolved_case_source() {
         let model = crate::providers::braintrust::mocking::compile(
-            r#"(support_root:task {name: "support"}) {input: support.input, source: (support_root)};
+            r#"+(support_task:node) {source: {type: "any"}}-[:extends]->(task);
+(support_root:support_task {name: "support"}) {input: support.input, source: (support_root)};
 (lookup:task {name: "lookup"}) {output: "answer"};
 (support:agent) {input: "question", output: null};
 (support)-[:contains]->(support_root);
@@ -581,8 +582,8 @@ mod experiment_tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"+(text_task:node) {input: {type: "string"}}-[:extends]->(task);
 +(text_tool:node) {output: {type: "string"}}-[:extends]->(tool);
-(workflow_root:task {name: "workflow"}) {input: workflow.input, context: "root variable"};
-(context_node:text_tool {name: "context"}) {output: workflow_root.context};
+(workflow_root:task {name: "workflow"}) {input: workflow.input, local: {context: "root variable"}};
+(context_node:text_tool {name: "context"}) {output: workflow_root.local.context};
 (answer:text_task {name: "answer"}) {input: "task fallback", expected: "task expectation", metadata: {tier: "free", channel: "chat"}, output: "${self.input}/${trim(self.expected)}/${trim(self.metadata.tier)}/${context_node.output}"};
 (reply:llm {name: "reply"}) {input: answer.input, output: answer.output};
 (quality:scorer {name: "quality"}) {score: 0};

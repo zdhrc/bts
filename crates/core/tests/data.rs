@@ -297,9 +297,9 @@ fn incompatible_projection_stops_before_encoding_and_delivery() {
     let source = r#"(archive_agent:agent) {input: null, output: archive.output};
         (archive_agent)-[:contains]->(archive);
         (archive_agent)-[:next]->(archive:task) {
-            file: attachment("report.txt", "text/plain"),
+            local: {file: attachment("report.txt", "text/plain")},
             input: archive_agent.input,
-            output: self.file["name"],
+            output: self.local.file["name"],
         };"#;
     let format = ArchiveFormat {
         projection: Some(json!(["report.txt"])),
@@ -314,7 +314,7 @@ fn incompatible_projection_stops_before_encoding_and_delivery() {
         panic!("expected a planning error, got {error}");
     };
     assert_eq!(cause.kind(), data::generation::EvaluationErrorKind::RefShapeMismatch);
-    assert_eq!(&source[cause.range.start..cause.range.end], r#"self.file["name"]"#);
+    assert_eq!(&source[cause.range.start..cause.range.end], r#"self.local.file["name"]"#);
     assert_eq!(format.encodes.get(), 0);
     assert_eq!(sink.attempts.get(), 0);
     assert!(sink.received.borrow().is_empty());

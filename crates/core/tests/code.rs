@@ -408,7 +408,7 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
 #[test]
 fn language_functions_execute_in_generated_agents() {
     let model = compile(
-        r#"(language_root:task {name: "language"}) {input: language.input, output: {text: render(self.input.template, {name: "Zoë", n: 6.0, ok: true}), composed: compose(self.input.parts), selected: language_root.selected, reused: language_root.selected, all: sample([|"same", "same"|], 2), empty: sample([||], 0), nested: compose([|"Details:", compose(sample([|"one", "two"|], 2), ", ")|])}, selected: sample([|0, 1, 2, 3, 4|], self.input.count)};
+        r#"(language_root:task {name: "language"}) {input: language.input, output: {text: render(self.input.template, {name: "Zoë", n: 6.0, ok: true}), composed: compose(self.input.parts), selected: language_root.local.selected, reused: language_root.local.selected, all: sample([|"same", "same"|], 2), empty: sample([||], 0), nested: compose([|"Details:", compose(sample([|"one", "two"|], 2), ", ")|])}, local: {selected: sample([|0, 1, 2, 3, 4|], self.input.count)}};
 (language:agent) {input: {template: "{{{name}}}: {n} {ok}", count: 2, parts: [|null, "", "Hi!", "there"|]}, output: language_root.output};
 (language)-[:contains]->(language_root);
 (language)-[:next]->(language_root);"#,

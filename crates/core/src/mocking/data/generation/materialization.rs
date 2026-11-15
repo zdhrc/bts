@@ -289,14 +289,14 @@ mod tests {
     #[test]
     fn materializes_nested_spans_and_fields() {
         let model = compile(
-            r#"(support_sessions_root:task {name: "support-sessions"}) {tags: [|"chat", "prod"|], system: """
+            r#"(support_sessions_root:task {name: "support-sessions"}) {tags: [|"chat", "prod"|], local: {system: """
                     You are a concise personal finance assistant.
                     Answer briefly.
-                    """, meta: {model: "gpt-4o-mini", temperature: 0.2}, input: support_sessions.input};
+                    """, meta: {model: "gpt-4o-mini", temperature: 0.2}}, input: support_sessions.input};
 (turn_0:task {name: "turn_0"}) {input: "How did NVDA do today?"};
-(Chat_Completion:llm {name: "Chat Completion"}) {input: [|{role: "system", content: support_sessions_root.system}, {role: "user", content: turn_0.input},|], output: {role: "assistant", content: "NVDA closed down 1.4% at $207.40."}, metadata: support_sessions_root.meta, metrics: {prompt_tokens: 612, completion_tokens: 24, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}};
+(Chat_Completion:llm {name: "Chat Completion"}) {input: [|{role: "system", content: support_sessions_root.local.system}, {role: "user", content: turn_0.input},|], output: {role: "assistant", content: "NVDA closed down 1.4% at $207.40."}, metadata: support_sessions_root.local.meta, metrics: {prompt_tokens: 612, completion_tokens: 24, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}};
 (turn_1:task {name: "turn_1"}) {};
-(Chat_Completion_1:llm {name: "Chat Completion"}) {metadata: support_sessions_root.meta};
+(Chat_Completion_1:llm {name: "Chat Completion"}) {metadata: support_sessions_root.local.meta};
 (support_sessions:agent) {input: null, output: null};
 (support_sessions)-[:contains]->(support_sessions_root);
 (support_sessions)-[:contains]->(turn_0);

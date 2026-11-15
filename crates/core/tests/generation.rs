@@ -214,15 +214,15 @@ fn language_composition_is_seeded_and_preserves_structure() {
     let source = r#"
 (language:task) {
     input: author.input,
-    selected: sample([|0, 1, 2, 3, 4, 5|], 3),
+    local: {selected: sample([|0, 1, 2, 3, 4, 5|], 3)},
     output: {
         rendered: render("{{{name}}}: {n} {ok} {name}", {name: "Zoë", n: 2, ok: true}),
         literal: render("{text}", {text: "{untouched}"}),
         composed: compose([|null, "", "hello", " world "|]),
         nested: compose([|"Hi!", compose(sample([|"one", "two"|], 2), ", ")|]),
         empty: compose([|null, ""|]),
-        selected: self.selected,
-        reused: self.selected,
+        selected: self.local.selected,
+        reused: self.local.selected,
         duplicates: sample([|"same", "same"|], 2),
         zero: sample([||], 0),
     },
@@ -269,7 +269,7 @@ fn language_composition_is_seeded_and_preserves_structure() {
     assert!(selections.len() > 1);
     assert_eq!(
         first.events[0].output.as_ref().unwrap()["selected"].as_array().unwrap(),
-        &[Value::from(1), Value::from(3), Value::from(5)]
+        &[Value::from(0), Value::from(1), Value::from(2)]
     );
 }
 

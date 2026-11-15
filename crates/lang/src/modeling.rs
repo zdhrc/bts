@@ -101,6 +101,8 @@ struct Modeler {
     defaults: HashMap<Slot, Value>,
     // elements whose kind or properties could not be established, checks that read them are skipped
     unchecked: HashSet<ElementId>,
+    // every name a definition statement introduced, including definitions that failed
+    defined: HashSet<String>,
     errors: Diags,
 }
 
@@ -121,6 +123,7 @@ impl Modeler {
             visiting: HashSet::new(),
             defaults: HashMap::new(),
             unchecked: HashSet::new(),
+            defined: HashSet::new(),
             errors: Vec::new(),
         }
     }
@@ -142,6 +145,7 @@ impl Modeler {
             };
             // the parser admits only named heads
             let Some(name) = header.name.as_deref() else { continue };
+            self.defined.insert(name.to_owned());
             let range = header.name_range.unwrap_or(header.range);
             let (relationships, shape_errors) = relationships(&definition.steps);
             let broken = !shape_errors.is_empty();
@@ -183,6 +187,7 @@ impl Modeler {
                         direction: None,
                         props: Vec::new(),
                         fields: Vec::new(),
+                        open: false,
                         traits: Vec::new(),
                         range: entry.range,
                     }));
@@ -283,37 +288,69 @@ impl Modeler {
         }
     }
 
+    // establishes that an instance names a built-in or declared kind of its own construct
+    fn kind(&mut self, owner: ElementId, at: SrcRange) {
+        let (name, construct) = self.element_kind(owner);
+        let declared = self.model.kind_names.get(name).map(|id| self.model.kinds[id.0].construct);
+        let message = if self.model.trait_names.contains_key(name) {
+            format!("`{name}` is a trait, not a kind")
+        } else if let Some(category) = declared.or_else(|| builtin_construct(name)) {
+            if category == construct {
+                return;
+            }
+            "kind does not belong to this graph construct".to_owned()
+        } else if self.defined.contains(name) {
+            // the definition already reported its own failure
+            self.unchecked.insert(owner);
+            return;
+        } else {
+            let known = crate::spec::SPEC
+                .primitives
+                .iter()
+                .filter(|primitive| primitive.construct == construct.name())
+                .map(|primitive| primitive.name)
+                .chain([construct.name()])
+                .chain(
+                    self.model
+                        .kinds
+                        .iter()
+                        .filter(|kind| kind.construct == construct)
+                        .map(|kind| kind.name.as_str()),
+                );
+            format!("unknown {} kind `{name}`{}", construct.name(), suggestion(name, known))
+        };
+        self.errors.extend(error(at, message));
+        self.unchecked.insert(owner);
+    }
+
     fn fields(&mut self, owner: ElementId, property: bool, fields: &[ast::Attr]) {
         let mut fields = fields.to_vec();
-        let (name, _) = self.element_kind(owner);
-        let schema = self.kind_schema(owner).cloned();
-        if property && self.model.trait_names.contains_key(name) {
-            let message = format!("`{name}` is a trait, not a kind");
-            self.errors.extend(error(self.element_range(owner), message));
-            self.unchecked.insert(owner);
-        }
         let (name, construct) = self.element_kind(owner);
-        if property
-            && schema
-                .as_ref()
-                .map(|kind| kind.construct)
-                .or_else(|| builtin_construct(name))
-                .is_some_and(|category| category != construct)
-        {
-            self.errors.extend(error(
-                self.element_range(owner),
-                "kind does not belong to this graph construct",
-            ));
-            self.unchecked.insert(owner);
+        let name = name.to_owned();
+        let schema = self.kind_schema(owner).cloned();
+        // the root node kind takes any property, every other built-in has a fixed set
+        if property && schema.is_none() && name != "node" && builtin_construct(&name) == Some(construct) {
+            let known = primitive_properties(construct, &name, self.element_range(owner));
+            for field in &fields {
+                if !known.iter().any(|entry| entry.name == field.key) {
+                    let hint = suggestion(&field.key, known.iter().map(|entry| entry.name.as_str()));
+                    self.errors.extend(error(
+                        key_range(field),
+                        format!("unknown property `{}` for built-in kind `{name}`{hint}", field.key),
+                    ));
+                }
+            }
         }
         if let Some(kind) = schema {
             let entries = if property { kind.props } else { kind.fields };
-            if property {
+            if property || !kind.open {
+                let what = if property { "property" } else { "field" };
                 for field in &fields {
                     if !entries.iter().any(|entry| entry.name == field.key) {
+                        let hint = suggestion(&field.key, entries.iter().map(|entry| entry.name.as_str()));
                         self.errors.extend(error(
-                            field.range,
-                            format!("unknown property `{}` for declared kind", field.key),
+                            key_range(field),
+                            format!("unknown {what} `{}` for kind `{}`{hint}", field.key, kind.name),
                         ));
                     }
                 }
@@ -390,6 +427,7 @@ impl Modeler {
                     element,
                     node.header.name_range.unwrap_or(node.header.range),
                 );
+                self.kind(element, node.header.kind_range);
                 self.fields(element, true, node.header.props.as_deref().unwrap_or(&[]));
                 self.fields(element, false, node.body.as_deref().unwrap_or(&[]));
                 Anchor::Node(id)
@@ -421,6 +459,7 @@ impl Modeler {
                 });
                 self.edge_state.push(0);
                 self.name(&header.name, element, header.name_range.unwrap_or(header.range));
+                self.kind(element, header.kind_range);
                 self.fields(element, true, header.props.as_deref().unwrap_or(&[]));
                 id
             })
@@ -438,6 +477,7 @@ impl Modeler {
             fork,
             range: junction.range,
         });
+        self.kind(ElementId::Junction(id), junction.kind_range);
         self.fields(ElementId::Junction(id), true, junction.props.as_deref().unwrap_or(&[]));
         self.raw_junctions.push(RawJunction {
             inputs: junction.inputs.clone(),
@@ -499,6 +539,7 @@ impl Modeler {
                         element,
                         fork.header.name_range.unwrap_or(fork.header.range),
                     );
+                    self.kind(element, fork.header.kind_range);
                     self.fields(element, true, fork.header.props.as_deref().unwrap_or(&[]));
                     let branches = fork
                         .entries
@@ -1670,6 +1711,39 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
         .collect()
 }
 
+// the key of a property or field, without its value
+fn key_range(field: &ast::Attr) -> SrcRange {
+    SrcRange {
+        end: field.range.start + field.key.len(),
+        ..field.range
+    }
+}
+
+fn distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, b) in right.iter().enumerate() {
+            let substitution = diagonal + usize::from(a != *b);
+            diagonal = row[j + 1];
+            row[j + 1] = substitution.min(row[j] + 1).min(diagonal + 1);
+        }
+    }
+    row[right.len()]
+}
+
+// names the closest known name when a misspelling is within two edits of it
+fn suggestion<'a>(name: &str, known: impl Iterator<Item = &'a str>) -> String {
+    known
+        .map(|candidate| (distance(name, candidate), candidate))
+        .filter(|(distance, candidate)| *distance <= 2 && *distance < candidate.len())
+        .min()
+        .map(|(_, candidate)| format!(", did you mean `{candidate}`?"))
+        .unwrap_or_default()
+}
+
 fn construct_named(name: &str) -> Option<Construct> {
     [Construct::Node, Construct::Edge, Construct::Fork, Construct::Junction]
         .into_iter()
@@ -1913,6 +1987,8 @@ impl<'a> Definitions<'a> {
             direction: (construct == Construct::Edge).then(|| primitive_direction(base)),
             props: primitive_properties(construct, base, at),
             fields: Vec::new(),
+            // the built-in node kinds take any content field
+            open: true,
             traits: Vec::new(),
             range: at,
         };
@@ -2045,6 +2121,27 @@ impl<'a> Definitions<'a> {
             return Err(errors);
         }
         let mut props = head.header.props.as_deref().unwrap_or(&[]).to_vec();
+        // a declared kind is closed unless it says otherwise, and a closed base stays closed
+        let base_open = std::mem::replace(&mut kind.open, false);
+        if construct == Construct::Node {
+            // open is a reserved header key on node kinds, not a property descriptor
+            let mut seen = false;
+            props.retain(|field| {
+                if field.key != "open" {
+                    return true;
+                }
+                match field.value.kind {
+                    _ if seen => errors.extend(error(field.range, "duplicate schema key")),
+                    ast::ExprKind::Bool(true) if !base_open => {
+                        errors.extend(error(field.range, "a kind cannot reopen the closed root of its base"));
+                    }
+                    ast::ExprKind::Bool(open) => kind.open = open,
+                    _ => errors.extend(error(field.range, "open must be a literal boolean")),
+                }
+                seen = true;
+                false
+            });
+        }
         if construct == Construct::Edge {
             // direction is a reserved header key on edge kinds, not a property descriptor
             let mut seen = false;
@@ -2583,11 +2680,11 @@ impl<'a> GraphCheck<'a> {
     }
 
     fn properties(&self) -> Result<()> {
-        let (kind, construct) = match self.owner {
-            ElementId::Node(id) => (&self.model.nodes[id.0].kind, Construct::Node),
-            ElementId::Edge(id) => (&self.model.edges[id.0].kind, Construct::Edge),
-            ElementId::Fork(id) => (&self.model.forks[id.0].kind, Construct::Fork),
-            ElementId::Junction(id) => (&self.model.junctions[id.0].kind, Construct::Junction),
+        let construct = match self.owner {
+            ElementId::Node(_) => Construct::Node,
+            ElementId::Edge(_) => Construct::Edge,
+            ElementId::Fork(_) => Construct::Fork,
+            ElementId::Junction(_) => Construct::Junction,
         };
         let base = primitive(self.model, self.owner);
         let descriptors = primitive_properties(construct, base, self.range);
@@ -2600,22 +2697,6 @@ impl<'a> GraphCheck<'a> {
             };
             if let Err(diags) = checked {
                 errors.extend(diags);
-            }
-        }
-        if !self.model.kind_names.contains_key(kind)
-            && matches!(
-                base,
-                "network" | "relation" | "incidence" | "weighted" | "each" | "repeat" | "reduce"
-            )
-        {
-            for id in properties(self.model, self.owner) {
-                let binding = &self.model.bindings[id.0];
-                if !descriptors.iter().any(|entry| binding.path == [entry.name.clone()]) {
-                    errors.extend(error(
-                        self.range,
-                        format!("unknown property `{}` for built-in kind `{base}`", binding.path.join(".")),
-                    ));
-                }
             }
         }
         if errors.is_empty() { Ok(()) } else { Err(errors) }

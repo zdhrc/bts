@@ -142,7 +142,8 @@ fn braintrust_provider_schemas_reject_invalid_known_fields_and_properties() {
         let errors = compile_braintrust(source).expect_err(source);
         assert!(errors.iter().all(|error| error.r#where.source == 0), "{errors:#?}");
     }
-    compile_braintrust("(a:tool) {custom: {anything: true}};").unwrap();
+    assert!(compile_braintrust("(a:tool) {custom: {anything: true}};").is_err());
+    compile_braintrust("(a:tool) {local: {anything: true}};").unwrap();
     compile_braintrust(
         "+(custom_tool:node) {custom: {type: \"string\", required: true}}-[:extends]->(tool); (a:custom_tool) {custom: \"value\"};",
     )
@@ -154,11 +155,25 @@ fn braintrust_provider_schemas_reject_invalid_known_fields_and_properties() {
 const PROVIDER_SOURCE: &str = r#"
 +(span:node {name: {type: "string", required: true}}) {
     patient_id: {type: "string"},
+    patient: {type: "object"},
+    description: {type: "string"},
     output: {type: "object", role: "output"},
     metadata: {type: "object", default: {}},
 };
 
 +(tool_span:node)-[:extends]->(span);
+
+# the fixture's working kinds take any content field
++(step:node {open: true, name: {type: "string"}});
++(task:node {open: true, accumulate: {type: "any"}})-[:extends]->(step);
++(tool:node {open: true})-[:extends]->(step);
++(llm:node {open: true, model: {type: "string"}})-[:extends]->(step);
++(function:node {open: true})-[:extends]->(step);
++(agent:node {open: true, label: {type: "string"}, scope: {type: "any"}});
++(scorer:node {open: true, lang: {type: "string"}});
++(dataset:node {open: true});
++(case:node {open: true});
++(experiment:node {open: true});
 "#;
 
 fn compile_fixture() -> bts_lang::Model {
@@ -348,13 +363,13 @@ fn field<'a>(node: &'a GraphNodeDecl, key: &str) -> &'a Expr {
 
 #[test]
 fn separates_declarations_references_properties_and_bodies() {
-    let source = r#"(lookup:tool {name: "patient_lookup"}) {output: {found: true}};
-        (:task); ("patient lookup":tool) {}; ("patient lookup"); (lookup);"#;
+    let source = r#"(lookup:node {name: "patient_lookup"}) {output: {found: true}};
+        (:node); ("patient lookup":node) {}; ("patient lookup"); (lookup);"#;
     let graph = parse(source).unwrap();
     assert_eq!(graph.paths.len(), 5);
     let lookup = declaration(&graph.paths[0].start);
     assert_eq!(lookup.header.name.as_deref(), Some("lookup"));
-    assert_eq!(lookup.header.kind, "tool");
+    assert_eq!(lookup.header.kind, "node");
     assert_eq!(lookup.header.name_range, Some(SrcRange::new(1, 7)));
     assert_eq!(lookup.header.props.as_ref().unwrap()[0].key, "name");
     assert_eq!(lookup.body.as_ref().unwrap()[0].key, "output");
@@ -373,7 +388,7 @@ fn separates_declarations_references_properties_and_bodies() {
 
 #[test]
 fn preserves_edge_lists_cycles_and_complete_source_ranges() {
-    let source = "(a:task)-[advance:next {when: source.ready}, :feeds]->(b:tool)~[retry:next]~>(a);";
+    let source = "(a:node)-[advance:next {when: source.ready}, :feeds]->(b:node)~[retry:next]~>(a);";
     let graph = parse(source).unwrap();
     let path = &graph.paths[0];
     assert_eq!(path.range, SrcRange::new(0, source.len()));
@@ -479,14 +494,14 @@ fn rejects_declarations_in_values_and_content_on_references() {
     for source in [
         "(a) {output: true};",
         "(a {when: true});",
-        "(a:task) {(b:task)};",
-        "(a:task {value: (b:task)});",
-        "(a:task {value: {nested: [|(:task)|]}});",
-        "(a:task) {value: (:task)};",
-        "(a:task) {value: [edge:next]};",
-        "(a:task) {value: [checks].[edge:next]};",
-        "(a:task) {value: (b)-[:next]->(c)};",
-        "(a:task)-[:next]->();",
+        "(a:node) {(b:node)};",
+        "(a:node {value: (b:node)});",
+        "(a:node {value: {nested: [|(:node)|]}});",
+        "(a:node) {value: (:node)};",
+        "(a:node) {value: [edge:next]};",
+        "(a:node) {value: [checks].[edge:next]};",
+        "(a:node) {value: (b)-[:next]->(c)};",
+        "(a:node)-[:next]->();",
     ] {
         assert!(parse(source).is_err(), "unexpectedly accepted {source}");
     }
@@ -495,16 +510,16 @@ fn rejects_declarations_in_values_and_content_on_references() {
 #[test]
 fn requires_separators_and_typed_connections() {
     for source in [
-        "(a:task)",
-        "(a:task),",
-        "(a:task) (b:task);",
-        "(a:task) {one: 1 two: 2};",
-        "(a:task) {one: 1\ntwo: 2};",
-        "(a:task) {nested: {one: 1\ntwo: 2}};",
-        "(a:task {one: 1\ntwo: 2});",
-        "(a:task) {one = 1};",
-        "(a:task) {items: [|1 2|]};",
-        "(a:task) {items: [1, 2]};",
+        "(a:node)",
+        "(a:node),",
+        "(a:node) (b:node);",
+        "(a:node) {one: 1 two: 2};",
+        "(a:node) {one: 1\ntwo: 2};",
+        "(a:node) {nested: {one: 1\ntwo: 2}};",
+        "(a:node {one: 1\ntwo: 2});",
+        "(a:node) {one = 1};",
+        "(a:node) {items: [|1 2|]};",
+        "(a:node) {items: [1, 2]};",
         "(a)-[next]->(b);",
         "(a)-[:next]~>(b);",
         "(a)~[:next]->(b);",
@@ -516,7 +531,7 @@ fn requires_separators_and_typed_connections() {
 
 #[test]
 fn leaves_resolution_and_kind_contracts_for_semantic_validation() {
-    let graph = parse("(unknown)-[:custom]->(:custom {anything: 1}); (same:task); (same:tool);").unwrap();
+    let graph = parse("(unknown)-[:custom]->(:custom {anything: 1}); (same:node); (same:node);").unwrap();
     assert_eq!(graph.paths.len(), 3);
 }
 
@@ -532,7 +547,7 @@ fn points_missing_commas_at_the_next_field() {
 
 #[test]
 fn handles_truncated_graph_input_without_panicking() {
-    let source = r#"(a:tool {name: "lookup"}) {text: "Value ${hex(8)}", items: [|for x in xs: x|]}-[next:next]->(b);"#;
+    let source = r#"(a:node {name: "lookup"}) {text: "Value ${hex(8)}", items: [|for x in xs: x|]}-[next:next]->(b);"#;
     for (end, _) in source.char_indices() {
         let _ = parse(&source[..end]);
     }
@@ -583,7 +598,7 @@ fn attaches_overlapping_junctions_as_siblings() {
 #[test]
 fn parses_root_junctions_with_qualified_inputs_and_following_edges() {
     let source =
-        ">[:accumulate [checks].[coverage], [records],]>>(ready:task) {input: [records].scope}\n    -[:next]->(finish);";
+        ">[:accumulate [checks].[coverage], [records],]>>(ready:node) {input: [records].scope}\n    -[:next]->(finish);";
     let graph = parse(source).unwrap();
     let GraphOrigin::Junction(junction) = &graph.paths[0].start else {
         panic!("expected junction")
@@ -596,7 +611,7 @@ fn parses_root_junctions_with_qualified_inputs_and_following_edges() {
 
 #[test]
 fn preserves_mixed_sibling_continuations_and_cycle_selection() {
-    let source = "(a)\n  =[checks:parallel]=>[-[lookup:next]->(:tool), -[note:next]->(b)]\n    ->([lookup].target)~[:again]~>(a)\n    >[:accumulate [lookup], [note]]>>(done);";
+    let source = "(a)\n  =[checks:parallel]=>[-[lookup:next]->(:node), -[note:next]->(b)]\n    ->([lookup].target)~[:again]~>(a)\n    >[:accumulate [lookup], [note]]>>(done);";
     let graph = parse(source).unwrap();
     let fork = fork(&graph.paths[0].steps[0]);
     assert_eq!(fork.continuations.len(), 2);
@@ -619,7 +634,7 @@ fn allows_one_inline_selector_or_junction() {
 
 #[test]
 fn anchors_graph_layout_to_declarations_not_body_contents() {
-    let source = "(a:task) {\n    text: \"\"\"\n        ->(not_a_selector)\n    \"\"\",\n}\n  =[:parallel]=>[\n    -[to_b:next]->(b:task) {\n        nested: {items: [|1, 2|]},\n    },\n  ]\n    # this comment does not affect attachment\n    ->(b)-[:next]->(done);";
+    let source = "(a:node) {\n    text: \"\"\"\n        ->(not_a_selector)\n    \"\"\",\n}\n  =[:parallel]=>[\n    -[to_b:next]->(b:node) {\n        nested: {items: [|1, 2|]},\n    },\n  ]\n    # this comment does not affect attachment\n    ->(b)-[:next]->(done);";
     let graph = parse(source).unwrap();
     let fork = fork(&graph.paths[0].steps[0]);
     assert_eq!(fork.continuations.len(), 1);
@@ -637,7 +652,7 @@ fn rejects_ambiguous_or_unattached_graph_continuations() {
         "(a)\n    =[:parallel]=>[-[:next]->(b)]\n        ->(b)\n      ->(b);",
         "(a)\n    =[:parallel]=>[-[:next]->(b)]\n        ->(b)\n          ->(b);",
         "(a)\n\t=[:parallel]=>[-[:next]->(b)];",
-        "(a)=[:parallel]=>[-[:next]->(b)] ->(new:task);",
+        "(a)=[:parallel]=>[-[:next]->(b)] ->(new:node);",
     ] {
         assert!(parse(source).is_err(), "unexpectedly accepted {source}");
     }
@@ -663,7 +678,7 @@ fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
 
 #[test]
 fn aligned_continuation_lines_share_an_origin() {
-    let source = "(a:x)\n    -[:next]->(b:x)\n    -[:next]->(c:x)\n    -[:next]->(d:x);";
+    let source = "(a:node)\n    -[:next]->(b:node)\n    -[:next]->(c:node)\n    -[:next]->(d:node);";
     let graph = parse(source).unwrap();
     assert_eq!(graph.paths[0].steps.len(), 1);
     let GraphStep::Arms(arms) = &graph.paths[0].steps[0] else {
@@ -676,7 +691,7 @@ fn aligned_continuation_lines_share_an_origin() {
 
 #[test]
 fn deeper_continuation_lines_chain() {
-    let source = "(a:x)\n    -[:next]->(b:x)\n        -[:next]->(c:x)\n            -[:next]->(d:x);";
+    let source = "(a:node)\n    -[:next]->(b:node)\n        -[:next]->(c:node)\n            -[:next]->(d:node);";
     let graph = parse(source).unwrap();
     assert_eq!(graph.paths[0].steps.len(), 3);
     assert!(graph.paths[0].steps.iter().all(|step| matches!(step, GraphStep::Edge(_))));
@@ -685,31 +700,31 @@ fn deeper_continuation_lines_chain() {
 
 #[test]
 fn a_single_continuation_line_attaches_to_the_last_node_above() {
-    assert_eq!(endpoints("(a:x)\n    -[:next]->(b:x);"), pairs(&[("a", "b")]));
+    assert_eq!(endpoints("(a:node)\n    -[:next]->(b:node);"), pairs(&[("a", "b")]));
     assert_eq!(
-        endpoints("(a:x)-[:next]->(b:x)\n    -[:next]->(c:x);"),
+        endpoints("(a:node)-[:next]->(b:node)\n    -[:next]->(c:node);"),
         pairs(&[("a", "b"), ("b", "c")])
     );
-    let graph = parse("(a:x)-[:next]->(b:x)\n    -[:next]->(c:x);").unwrap();
+    let graph = parse("(a:node)-[:next]->(b:node)\n    -[:next]->(c:node);").unwrap();
     assert_eq!(graph.paths[0].steps.len(), 2);
 }
 
 #[test]
 fn mixes_fan_out_chains_bodies_and_loop_backs() {
-    let source = "(a:x)\n    -[:next]->(b:x)-[:next]->(c:x)\n        -[:next]->(d:x)\n        ~[:next]~>(a)\n    -[:next]->(e:x) {\n        note: 1,\n    }\n    -[:next]->(f:x);";
+    let source = "(a:node)\n    -[:next]->(b:node)-[:next]->(c:node)\n        -[:next]->(d:node)\n        ~[:next]~>(a)\n    -[:next]->(e:node) {\n        note: 1,\n    }\n    -[:next]->(f:node);";
     assert_eq!(
         endpoints(source),
         pairs(&[("a", "b"), ("b", "c"), ("c", "d"), ("c", "a"), ("a", "e"), ("a", "f")])
     );
     assert!(compiled(source).edges[3].cycle);
     // a step after a body on its closing line chains, and the body sets no level
-    let source = "(a:x) {\n        n: 1,\n}-[:next]->(b:x)\n    -[:next]->(c:x)\n    -[:next]->(d:x);";
+    let source = "(a:node) {\n        n: 1,\n}-[:next]->(b:node)\n    -[:next]->(c:node)\n    -[:next]->(d:node);";
     assert_eq!(endpoints(source), pairs(&[("a", "b"), ("b", "c"), ("b", "d")]));
 }
 
 #[test]
 fn fans_out_under_selectors_and_junctions() {
-    let source = "(a:x)=[f:parallel]=>[-[p:next]->(b:x), -[q:next]->(c:x)]\n    ->(b)\n        -[:next]->(d:x)\n        -[:next]->(e:x)\n    >[:accumulate [p], [q]]>>(g:x)\n        -[:next]->(h:x)\n        -[:next]->(i:x);";
+    let source = "(a:node)=[f:parallel]=>[-[p:next]->(b:node), -[q:next]->(c:node)]\n    ->(b)\n        -[:next]->(d:node)\n        -[:next]->(e:node)\n    >[:accumulate [p], [q]]>>(g:node)\n        -[:next]->(h:node)\n        -[:next]->(i:node);";
     assert_eq!(
         endpoints(source),
         pairs(&[("a", "b"), ("a", "c"), ("b", "d"), ("b", "e"), ("g", "h"), ("g", "i")])
@@ -718,7 +733,7 @@ fn fans_out_under_selectors_and_junctions() {
 
 #[test]
 fn a_fork_is_an_arm_beside_aligned_edges() {
-    let source = "(a:x)\n    -[:link]->(b:x)\n    =[f:parallel]=>[-[p:next]->(c:x), -[q:next]->(d:x)]\n        ->(c)-[:next]->(e:x)\n    -[:link]->(g:x);";
+    let source = "(a:node)\n    -[:link]->(b:node)\n    =[f:parallel]=>[-[p:next]->(c:node), -[q:next]->(d:node)]\n        ->(c)-[:next]->(e:node)\n    -[:link]->(g:node);";
     let graph = parse(source).unwrap();
     let GraphStep::Arms(arms) = &graph.paths[0].steps[0] else {
         panic!("expected arms")
@@ -739,24 +754,27 @@ fn rejects_inconsistent_continuation_indentation() {
     let selection = "select a fork target or add a junction before continuing the path";
     for (source, message) in [
         // a dedent to a level no earlier line established
-        ("(a:x)\n        -[:next]->(b:x)\n    -[:next]->(c:x);", indentation),
+        ("(a:node)\n        -[:next]->(b:node)\n    -[:next]->(c:node);", indentation),
         (
-            "(a:x)\n    -[:next]->(b:x)\n        -[:next]->(d:x)\n      -[:next]->(c:x);",
+            "(a:node)\n    -[:next]->(b:node)\n        -[:next]->(d:node)\n      -[:next]->(c:node);",
             indentation,
         ),
         // a continuation line is deeper than the line it attaches to
-        ("(a:x)\n-[:next]->(b:x);", indentation),
-        ("  (a:x)\n    -[:next]->(b:x)\n-[:next]->(c:x);", indentation),
+        ("(a:node)\n-[:next]->(b:node);", indentation),
+        ("  (a:node)\n    -[:next]->(b:node)\n-[:next]->(c:node);", indentation),
         // edge lines do not align with a fork's selectors and junctions
         (
-            "(a:x)=[:parallel]=>[-[:next]->(b:x)]\n    ->(b)\n    -[:next]->(c:x);",
+            "(a:node)=[:parallel]=>[-[:next]->(b:node)]\n    ->(b)\n    -[:next]->(c:node);",
             selection,
         ),
         (
-            "(a:x)\n    =[:parallel]=>[-[:next]->(b:x)]\n        ->(b)\n        -[:next]->(c:x);",
+            "(a:node)\n    =[:parallel]=>[-[:next]->(b:node)]\n        ->(b)\n        -[:next]->(c:node);",
             selection,
         ),
-        ("(a:x)\n    =[:parallel]=>[-[:next]->(b:x)]-[:next]->(c:x);", selection),
+        (
+            "(a:node)\n    =[:parallel]=>[-[:next]->(b:node)]-[:next]->(c:node);",
+            selection,
+        ),
     ] {
         let errors = parse(source).expect_err(source);
         assert_eq!(errors[0].what, message, "{source}");
@@ -846,7 +864,7 @@ fn handles_truncated_forks_and_junctions_without_panicking() {
 #[test]
 fn pattern_references_select_nodes_or_edges_without_declarations() {
     use bts_lang::syntax::GraphPatternNode;
-    let source = "(refs:vars) {node: ?<(collect)-[:next]->(@:tool)>, edge: ?<(collect)-[@:next]->(lookup)>};";
+    let source = "(refs:vars) {node: ?<(collect)-[:next]->(@:node)>, edge: ?<(collect)-[@:next]->(lookup)>};";
     let graph = parse(source).unwrap();
     let refs = declaration(&graph.paths[0].start);
     let ExprKind::PatternRef(node) = &field(refs, "node").kind else {
@@ -857,7 +875,7 @@ fn pattern_references_select_nodes_or_edges_without_declarations() {
         panic!("expected node constraint")
     };
     assert!(target.selected);
-    assert_eq!(target.kind, "tool");
+    assert_eq!(target.kind, "node");
     assert!(!node.steps[0].edges[0].selected);
     let ExprKind::PatternRef(edge) = &field(refs, "edge").kind else {
         panic!("expected pattern")
@@ -865,13 +883,13 @@ fn pattern_references_select_nodes_or_edges_without_declarations() {
     assert!(edge.steps[0].edges[0].selected);
     assert_eq!(edge.steps[0].edges[0].kind, "next");
     assert!(matches!(edge.steps[0].target, GraphPatternNode::Reference(_)));
-    assert_eq!(&source[node.range.start..node.range.end], "?<(collect)-[:next]->(@:tool)>");
+    assert_eq!(&source[node.range.start..node.range.end], "?<(collect)-[:next]->(@:node)>");
 }
 
 #[test]
 fn patterns_preserve_constraints_chains_edge_lists_and_cycles() {
     use bts_lang::syntax::GraphPatternNode;
-    let source = "?<(@:task {name: \"start\"})-[:next {when: score > 1}, :feeds]->(:tool {tags: [|\"a\"|]})~[:again]~>(start)>";
+    let source = "?<(@:node {name: \"start\"})-[:next {when: score > 1}, :feeds]->(:node {tags: [|\"a\"|]})~[:again]~>(start)>";
     let expr = bts_lang::syntax::parse_expression(source).unwrap();
     let ExprKind::PatternRef(pattern) = expr.kind else {
         panic!("expected pattern")
@@ -889,7 +907,7 @@ fn patterns_preserve_constraints_chains_edge_lists_and_cycles() {
 
 #[test]
 fn pattern_references_work_in_endpoints_junctions_and_accessors() {
-    let source = "(a)-[:next]->(?<(b)-[:next]->(@:tool)>); >[:accumulate ?<(a)-[@:next]->(b)>, [other]]>>(done); (values:vars) {name: ?<(a)-[:next]->(@:tool)>.props.name, text: \"Found ${?<(@:tool)>.props.name}\"};";
+    let source = "(a)-[:next]->(?<(b)-[:next]->(@:node)>); >[:accumulate ?<(a)-[@:next]->(b)>, [other]]>>(done); (values:vars) {name: ?<(a)-[:next]->(@:node)>.props.name, text: \"Found ${?<(@:node)>.props.name}\"};";
     let graph = parse(source).unwrap();
     let GraphNode::Reference(expr) = &edge(&graph.paths[0].steps[0]).target else {
         panic!("expected reference")
@@ -911,7 +929,7 @@ fn pattern_references_work_in_endpoints_junctions_and_accessors() {
 #[test]
 fn separates_pattern_closers_from_adjacent_expression_operators() {
     for (operator, op) in [("==", BinOp::Eq), ("!=", BinOp::Ne), (">", BinOp::Gt), (">=", BinOp::Ge)] {
-        let source = format!("?<(@:tool)>{operator}(lookup)");
+        let source = format!("?<(@:node)>{operator}(lookup)");
         let expression = bts_lang::syntax::parse_expression(&source).unwrap();
         let ExprKind::Binary { op: actual, lhs, .. } = expression.kind else {
             panic!("expected binary expression")
@@ -919,15 +937,15 @@ fn separates_pattern_closers_from_adjacent_expression_operators() {
         assert_eq!(actual, op);
         assert!(matches!(lhs.kind, ExprKind::PatternRef(_)));
     }
-    assert!(bts_lang::syntax::parse_expression("?<(@:tool {text: \"> -> ~>\", nested: [|{ready: score >= 2}|]})>").is_ok());
+    assert!(bts_lang::syntax::parse_expression("?<(@:node {text: \"> -> ~>\", nested: [|{ready: score >= 2}|]})>").is_ok());
 }
 
 #[test]
 fn rejects_patterns_with_missing_or_multiple_selection_markers() {
     for source in [
-        "?<(a)-[:next]->(:tool)>",
-        "?<(@:task)-[@:next]->(b)>",
-        "?<(@:task)-[:next]->(@:tool)>",
+        "?<(a)-[:next]->(:node)>",
+        "?<(@:node)-[@:next]->(b)>",
+        "?<(@:node)-[:next]->(@:node)>",
     ] {
         let errors = bts_lang::syntax::parse_expression(source).unwrap_err();
         assert!(
@@ -940,10 +958,10 @@ fn rejects_patterns_with_missing_or_multiple_selection_markers() {
 #[test]
 fn rejects_declarations_and_malformed_steps_in_patterns() {
     for source in [
-        "?<(created:task)-[:next]->(@:tool)>",
-        "?<(a)-[created:next]->(@:tool)>",
-        "?<(@:task) {output: true}>",
-        "?<(@:task {value: (created:tool)})>",
+        "?<(created:node)-[:next]->(@:node)>",
+        "?<(a)-[created:next]->(@:node)>",
+        "?<(@:node) {output: true}>",
+        "?<(@:node {value: (created:node)})>",
         "?<(a)-[@next]->(b)>",
         "?<(a)-[@:next]~>(b)>",
         "?<(a)~[@:next]->(b)>",
@@ -958,7 +976,7 @@ fn rejects_declarations_and_malformed_steps_in_patterns() {
 
 #[test]
 fn handles_truncated_pattern_references_without_panicking() {
-    let source = "?<(@:tool {values: [|1, 2|], text: \"${hex(8)}\"})-[:next]->(done)>";
+    let source = "?<(@:node {values: [|1, 2|], text: \"${hex(8)}\"})-[:next]->(done)>";
     for (end, _) in source.char_indices() {
         let _ = bts_lang::syntax::parse_expression(&source[..end]);
     }
@@ -1004,8 +1022,7 @@ fn expression(source: &str) -> Value {
 
 #[test]
 fn lowers_open_kinds_forward_references_and_identity_aliases() {
-    let model =
-        compiled("(a:anything {custom: true}) {destination: (b)} -[advance:custom]->(a.destination); (b:other) {value: 42};");
+    let model = compiled("(a:node {custom: true}) {destination: (b)} -[advance:link]->(a.destination); (b:node) {value: 42};");
     let bts_lang::ElementId::Node(a) = model.names["a"] else {
         panic!()
     };
@@ -1023,20 +1040,23 @@ fn lowers_open_kinds_forward_references_and_identity_aliases() {
 #[test]
 fn reports_semantic_errors_at_valid_source_ranges() {
     for (source, message) in [
-        ("(a:x); (a:y);", "duplicate graph name"),
-        ("(a:x)-[a:next]->(:x);", "duplicate graph name"),
-        ("(a:x) {value: 1, value: 2};", "duplicate field"),
-        ("(a:x) {props: 1};", "reserved"),
+        ("(a:node); (a:node);", "duplicate graph name"),
+        ("(a:node)-[a:next]->(:node);", "duplicate graph name"),
+        ("(a:node) {value: 1, value: 2};", "duplicate field"),
+        ("(a:node) {props: 1};", "reserved"),
         ("(missing);", "unresolved"),
-        ("(a:x)-[e:next]->(:x); (e);", "boundary"),
-        ("(a:x) {value: [a]};", "boundary"),
-        ("(a:x) {value: self.missing};", "unknown field"),
-        ("(a:x) {value: self.value};", "circular field dependency"),
-        ("(a:x) {value: b.value}; (b:x) {value: a.value};", "circular field dependency"),
-        ("(a:x) {value: source.value};", "endpoint"),
+        ("(a:node)-[e:next]->(:node); (e);", "boundary"),
+        ("(a:node) {value: [a]};", "boundary"),
+        ("(a:node) {value: self.missing};", "unknown field"),
+        ("(a:node) {value: self.value};", "circular field dependency"),
+        (
+            "(a:node) {value: b.value}; (b:node) {value: a.value};",
+            "circular field dependency",
+        ),
+        ("(a:node) {value: source.value};", "endpoint"),
         ("(a:vars {evaluate: \"sometimes\"});", "evaluate"),
-        ("(a:x)-[:next {when: 1}]->(:x);", "boolean"),
-        ("(a:tool); (b:scorer) {value: a.output};", "unknown field"),
+        ("(a:node)-[:next {when: 1}]->(:node);", "boolean"),
+        ("(a:node); (b:node) {value: a.output};", "unknown field"),
     ] {
         let errors = compile(source).expect_err(source);
         assert!(
@@ -1050,7 +1070,7 @@ fn reports_semantic_errors_at_valid_source_ranges() {
             "{errors:#?}"
         );
     }
-    let source = "(first:x);\n(first:y);";
+    let source = "(first:node);\n(first:node);";
     let errors = compile(source).unwrap_err();
     assert_eq!(errors.len(), 2);
     assert!(
@@ -1062,7 +1082,7 @@ fn reports_semantic_errors_at_valid_source_ranges() {
 
 #[test]
 fn retains_explicit_cycles_and_independent_field_dependencies() {
-    let model = compiled("(a:x) {metrics: {base: 3, total: self.metrics.base + 2}} -[:next]->(b:x) ~[:retry]~>(a);");
+    let model = compiled("(a:node) {metrics: {base: 3, total: self.metrics.base + 2}} -[:next]->(b:node) ~[:next]~>(a);");
     assert!(!model.edges[0].cycle);
     assert!(model.edges[1].cycle);
     assert_eq!(model.edges[1].target, model.edges[0].source);
@@ -1088,7 +1108,7 @@ fn preserves_dynamic_binding_identity_through_aliases() {
 #[test]
 fn resolves_edge_context_against_explicit_endpoints() {
     let model = compiled(
-        "(:x) {value: 2} -[e:next {sum: source.value + target.value}]->(:x) {value: 3}; (v:vars) {scope: [e].scope.member, external: context.member};",
+        "+(summed:edge {sum: {type: \"number\"}})-[:extends]->(next); (:node) {value: 2} -[e:summed {sum: source.value + target.value}]->(:node) {value: 3}; (v:vars) {scope: [e].scope.member, external: context.member};",
     );
     let property = &model.bindings[model.edges[0].props[0].0].value;
     assert!(matches!(property, Value::Num(bts_lang::Number::Int(5))));
@@ -1111,7 +1131,7 @@ fn resolves_edge_context_against_explicit_endpoints() {
 #[test]
 fn lowers_overlapping_junctions_without_implicit_connections() {
     let model = compiled(
-        "(a:x)\n    =[f:parallel]=>[-[eb:next]->(b:x), -[ec:next]->(c:x), -[ed:next]->(d:x)]\n        >[:accumulate [eb], [ec]]>>(e:x)\n        >[:accumulate [ec], [ed]]>>(g:x);",
+        "(a:node)\n    =[f:parallel]=>[-[eb:next]->(b:node), -[ec:next]->(c:node), -[ed:next]->(d:node)]\n        >[:accumulate [eb], [ec]]>>(e:node)\n        >[:accumulate [ec], [ed]]>>(g:node);",
     );
     assert_eq!(model.edges.len(), 3);
     assert_eq!(model.junctions.len(), 2);
@@ -1123,43 +1143,43 @@ fn lowers_overlapping_junctions_without_implicit_connections() {
 #[test]
 fn enforces_fork_membership() {
     for source in [
-        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] ->(c); (c:x);",
-        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] >[:accumulate [ec]]>>(d:x); (c:x)-[ec:next]->(b);",
-        "(a:x) =[f:parallel]=>[-[eb:next]->(b:x)]; (c:x)-[ec:next]->(b); (v:vars) {value: [f].[ec]};",
+        "(a:node) =[f:parallel]=>[-[eb:next]->(b:node)] ->(c); (c:node);",
+        "(a:node) =[f:parallel]=>[-[eb:next]->(b:node)] >[:accumulate [ec]]>>(d:node); (c:node)-[ec:next]->(b);",
+        "(a:node) =[f:parallel]=>[-[eb:next]->(b:node)]; (c:node)-[ec:next]->(b); (v:vars) {value: [f].[ec]};",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
-    compiled("(a:x) =[f:parallel]=>[-[eb:next]->(b:x)] ->([f].[eb].target)-[:next]->(c:x);");
+    compiled("(a:node) =[f:parallel]=>[-[eb:next]->(b:node)] ->([f].[eb].target)-[:next]->(c:node);");
 }
 
 #[test]
 fn validates_graph_primitives_without_demanding_defaults() {
     for (kind, guards, valid) in [
-        ("parallel", "-[:next]->(:x), -[:next]->(:x)", true),
-        ("parallel", "-[:next {when: true}]->(:x)", false),
+        ("parallel", "-[:next]->(:node), -[:next]->(:node)", true),
+        ("parallel", "-[:next {when: true}]->(:node)", false),
         (
             "conditional",
-            "-[:next {when: true}]->(:x), -[:next {when: true}]->(:x)",
+            "-[:next {when: true}]->(:node), -[:next {when: true}]->(:node)",
             true,
         ),
         (
             "exclusive",
-            "-[:next {when: false}]->(:x), -[:next {when: false}]->(:x)",
+            "-[:next {when: false}]->(:node), -[:next {when: false}]->(:node)",
             true,
         ),
-        ("exclusive", "-[:next]->(:x), -[:next]->(:x)", false),
+        ("exclusive", "-[:next]->(:node), -[:next]->(:node)", false),
         (
             "exclusive",
-            "-[:next {when: source.flag}]->(:x), -[:next {when: !source.flag}]->(:x)",
+            "-[:next {when: source.flag}]->(:node), -[:next {when: !source.flag}]->(:node)",
             true,
         ),
         (
             "exclusive",
-            "-[:next {when: chance(0.5)}]->(:x), -[:next {when: !chance(0.5)}]->(:x)",
+            "-[:next {when: chance(0.5)}]->(:node), -[:next {when: !chance(0.5)}]->(:node)",
             false,
         ),
     ] {
-        let source = format!("(a:x) {{flag: chance(0.5)}} =[:{kind}]=>[{guards}];");
+        let source = format!("(a:node) {{flag: chance(0.5)}} =[:{kind}]=>[{guards}];");
         assert_eq!(compile(&source).is_ok(), valid, "{source}\n{:?}", compile(&source));
     }
 }
@@ -1167,15 +1187,15 @@ fn validates_graph_primitives_without_demanding_defaults() {
 #[test]
 fn resolves_patterns_by_distinct_identity() {
     let model = compiled(
-        "(a:x)-[e:next {selected: true}]->(b:tool {selected: true}); (a)-[:next]->(b); (v:vars) {node: ?<(a)-[:next]->(@:tool {selected: true})>, edge: ?<(a)-[@:next {selected: true}]->(b)>};",
+        "+(marked:edge {selected: {type: \"boolean\"}})-[:extends]->(next); (a:node)-[e:marked {selected: true}]->(b:node {selected: true}); (a)-[:next]->(b); (v:vars) {node: ?<(a)-[:next]->(@:node {selected: true})>, edge: ?<(a)-[@:marked {selected: true}]->(b)>};",
     );
     let Value::GraphRef { ref_id, .. } = binding(&model, "v", "node").value else {
         panic!()
     };
     assert_eq!(model.refs[ref_id.0].target, model.names["b"]);
     for source in [
-        "(a:x); (v:vars) {value: ?<(a)-[:next]->(@:tool)>};",
-        "(a:x)-[:next]->(b:tool); (a)-[:next]->(c:tool); (v:vars) {value: ?<(a)-[:next]->(@:tool)>};",
+        "(a:node); (v:vars) {value: ?<(a)-[:next]->(@:node)>};",
+        "(a:node)-[:next]->(b:node); (a)-[:next]->(c:node); (v:vars) {value: ?<(a)-[:next]->(@:node)>};",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
@@ -1317,14 +1337,14 @@ fn preserves_function_result_types_and_argument_checks() {
 
 #[test]
 fn resolves_pattern_endpoints_without_unrelated_dependency_cycles() {
-    let model = compiled("(a:task)-[:next]->(b:task); (c:task)-[:copy]->(?<(a)-[:next]->(@:task)>);");
+    let model = compiled("(a:node)-[:next]->(b:node); (c:node)-[:link]->(?<(a)-[:next]->(@:node)>);");
     assert_eq!(model.edges[0].target, model.edges[1].target);
 }
 
 #[test]
 fn proves_complementary_comparisons_without_conflating_calls() {
     compiled(
-        "(a:x) {n: range(1, 9)} =[:exclusive]=>[-[:next {when: source.n > 5}]->(:x), -[:next {when: !${source.n > 5}}]->(:x)];",
+        "(a:node) {n: range(1, 9)} =[:exclusive]=>[-[:next {when: source.n > 5}]->(:node), -[:next {when: !${source.n > 5}}]->(:node)];",
     );
 }
 
@@ -1365,9 +1385,9 @@ fn reserves_contextual_names_without_reserving_field_keys() {
     for name in ["self", "source", "target", "context", "true", "false", "null"] {
         for source in [
             format!("({name}:task);"),
-            format!("(\"{name}\":task);"),
-            format!("(:task)-[{name}:next]->(:task);"),
-            format!("(:task)=[{name}:parallel]=>[-[:next]->(:task)];"),
+            format!("(\"{name}\":node);"),
+            format!("(:node)-[{name}:next]->(:node);"),
+            format!("(:node)=[{name}:parallel]=>[-[:next]->(:node)];"),
         ] {
             let errors = compile(&source).expect_err(&source);
             assert!(errors.iter().any(|error| error.what.contains("reserved graph name")));
@@ -1376,13 +1396,13 @@ fn reserves_contextual_names_without_reserving_field_keys() {
     for name in ["self", "source", "target", "context"] {
         assert!(compile(&format!("(a:vars) {{values: [|for {name} in [|1|]: {name}|]}};")).is_err());
     }
-    compiled("(a:task) {source: 1, target: 2, context: 3, self: 4};");
+    compiled("(a:node) {source: 1, target: 2, context: 3, self: 4};");
 }
 
 #[test]
 fn resolves_graph_identities_through_collections_and_static_expressions() {
     let model = compiled(
-        r#"(a:task) {value: 7}; (b:task);
+        r#"(a:node) {value: 7}; (b:node);
         (refs:vars) {
             nodes: [|(a), (b)|],
             alias: self.nodes,
@@ -1407,15 +1427,16 @@ fn resolves_graph_identities_through_collections_and_static_expressions() {
         binding(&model, "refs", "nested_value").value,
         Value::Num(bts_lang::Number::Int(7))
     ));
-    assert!(compile("(a:task); (v:vars) {nodes: [|(a)|], index: range(0, 1)}; (v.nodes[v.index]);").is_err());
+    assert!(compile("(a:node); (v:vars) {nodes: [|(a)|], index: range(0, 1)}; (v.nodes[v.index]);").is_err());
 }
 
 #[test]
 fn resolves_edge_expressions_and_stored_fork_paths() {
     let model = compiled(
-        r#"(a:task) =[split:parallel]=>[-[input_left:next {limit: 3}]->(:task), -[input_right:next]->(:task)];
+        r#"+(limited:edge {limit: {type: "number"}})-[:extends]->(next);
+        (a:node) =[split:parallel]=>[-[input_left:limited {limit: 3}]->(:node), -[input_right:next]->(:node)];
         (refs:vars) {paths: [split].paths, edges: [|[input_left], [input_right]|], alias: self.edges[0]};
-        (refs.paths[0][0].target)-[follow:next {limit: [refs.alias].props.limit}]->(b:task);
+        (refs.paths[0][0].target)-[follow:limited {limit: [refs.alias].props.limit}]->(b:node);
         >[:accumulate [refs.alias], [refs.edges[1]]]>>(b);"#,
     );
     assert_eq!(model.edges[2].source, model.edges[0].target);
@@ -1425,8 +1446,8 @@ fn resolves_edge_expressions_and_stored_fork_paths() {
         Value::Num(bts_lang::Number::Int(3))
     ));
     for source in [
-        "(a:task); (v:vars) {node: (a), wrong: [self.node]};",
-        "(a:task)-[edge:next]->(b:task); (v:vars) {edge: [edge]}; (v.edge);",
+        "(a:node); (v:vars) {node: (a), wrong: [self.node]};",
+        "(a:node)-[edge:next]->(b:node); (v:vars) {edge: [edge]}; (v.edge);",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
@@ -1435,9 +1456,11 @@ fn resolves_edge_expressions_and_stored_fork_paths() {
 #[test]
 fn keeps_junction_properties_separate_from_destination_properties() {
     let source = r#"(config:vars) {policy: "all"};
-        (a:task) =[f:parallel]=>[-[input_left:next]->(b:task), -[input_right:next]->(c:task)]
-            >[:accumulate {mode: config.policy, correlate: context.request_id} [input_left], [input_right]]>>(d:task {accumulate: "each"});
-        >[:custom {custom: [input_right].target} [input_left]]>>(d);"#;
+        (a:node) =[f:parallel]=>[-[input_left:next]->(b:node), -[input_right:next]->(c:node)]
+            >[:gathered {mode: config.policy, correlate: context.request_id} [input_left], [input_right]]>>(d:node {accumulate: "each"});
+        >[:custom {custom: [input_right].target} [input_left]]>>(d);
+        +(gathered:junction {mode: {type: "string"}})-[:extends]->(accumulate);
+        +(custom:junction {custom: {type: "any"}});"#;
     let ast = parse(source).unwrap();
     let GraphOrigin::Junction(junction) = &fork(&ast.paths[1].steps[0]).continuations[0].start else {
         panic!()
@@ -1463,9 +1486,9 @@ fn keeps_junction_properties_separate_from_destination_properties() {
         "{limit: 1, limit: 2}",
         "{limit: config.missing}",
         "{limit: upper(2)}",
-        "{limit: (bad:task)}",
+        "{limit: (bad:node)}",
     ] {
-        let source = format!("(a:task)-[edge:next]->(b:task); >[:accumulate {props} [edge]]>>(c:task);");
+        let source = format!("(a:node)-[edge:next]->(b:node); >[:accumulate {props} [edge]]>>(c:node);");
         assert!(compile(&source).is_err(), "{source}");
     }
 }
@@ -1473,15 +1496,16 @@ fn keeps_junction_properties_separate_from_destination_properties() {
 #[test]
 fn cycle_edges_keep_independent_kinds_properties_and_references() {
     let model = compiled(
-        r#"(settings:vars) {limit: 3};
-        (a:task)-[advance:next]->(b:task)
-            ~[retry:next {max_attempts: settings.limit}, feedback:feeds {value: source.props}]~>(a);
+        r#"+(attempted:edge {max_attempts: {type: "number"}})-[:extends]->(next);
+        (settings:vars) {limit: 3};
+        (a:node)-[advance:next]->(b:node)
+            ~[retry:attempted {max_attempts: settings.limit}, feedback:feeds {value: source.props}]~>(a);
         (refs:vars) {retry_edge: [retry], limit: [retry].props.max_attempts};"#,
     );
     assert_eq!(model.edges.len(), 3);
     assert!(!model.edges[0].cycle);
     assert!(model.edges[1].cycle && model.edges[2].cycle);
-    assert_eq!(model.edges[1].kind, "next");
+    assert_eq!(model.edges[1].kind, "attempted");
     assert_eq!(model.edges[2].kind, "feeds");
     assert_ne!(model.edges[1].props, model.edges[2].props);
     assert!(matches!(
@@ -1494,7 +1518,7 @@ fn cycle_edges_keep_independent_kinds_properties_and_references() {
 fn matches_parallel_edges_without_enumerating_permutations() {
     let headers = (0..16).map(|i| format!("edge_{i}:link")).collect::<Vec<_>>().join(",");
     let constraints = vec![":link"; 16].join(",");
-    let source = format!("(a:task)-[{headers}]->(b:task); (refs:vars) {{selected: ?<(a)-[{constraints}]->(@:task)>}};");
+    let source = format!("(a:node)-[{headers}]->(b:node); (refs:vars) {{selected: ?<(a)-[{constraints}]->(@:node)>}};");
     let model = compiled(&source);
     let Value::GraphRef { ref_id, .. } = binding(&model, "refs", "selected").value else {
         panic!()
@@ -1502,12 +1526,12 @@ fn matches_parallel_edges_without_enumerating_permutations() {
     assert_eq!(model.refs[ref_id.0].target, model.names["b"]);
 
     compiled(
-        "(a:x)-[one:link {special: true}, two:link]->(b:x); (v:vars) {selected: ?<(a)-[:link, @:link {special: true}]->(b)>};",
+        "+(tagged:edge {special: {type: \"boolean\"}})-[:extends]->(link); (a:node)-[one:tagged {special: true}, two:link]->(b:node); (v:vars) {selected: ?<(a)-[:link, @:tagged {special: true}]->(b)>};",
     );
     for source in [
-        "(a:x)-[one:link, two:link]->(b:x); (v:vars) {selected: ?<(a)-[@:link, :link]->(b)>};",
-        "(a:x)-[one:link]->(b:x); (v:vars) {selected: ?<(a)-[:link, :link]->(@:x)>};",
-        "(a:x)-[one:link {p: true}, two:link, three:link]->(b:x); (v:vars) {selected: ?<(a)-[:link {p: true}, :link {p: true}, :link]->(@:x)>};",
+        "(a:node)-[one:link, two:link]->(b:node); (v:vars) {selected: ?<(a)-[@:link, :link]->(b)>};",
+        "(a:node)-[one:link]->(b:node); (v:vars) {selected: ?<(a)-[:link, :link]->(@:node)>};",
+        "(a:node)-[one:link {p: true}, two:link, three:link]->(b:node); (v:vars) {selected: ?<(a)-[:link {p: true}, :link {p: true}, :link]->(@:node)>};",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
@@ -1535,8 +1559,8 @@ fn proves_common_exclusive_conditions_and_preserves_independent_draws() {
         ("context.route == \"billing\"", "context.route == \"appointments\"", false),
     ] {
         let source = format!(
-            r#"(a:task) {{flag: chance(0.5), alias: self.flag, route: context.route, n: range(0, 10), draw: range(1, 2), other_draw: range(1, 2)}}
-            =[:exclusive]=>[-[:next {{when: {left}}}]->(:task), -[:next {{when: {right}}}]->(:task)];"#
+            r#"(a:node) {{flag: chance(0.5), alias: self.flag, route: context.route, n: range(0, 10), draw: range(1, 2), other_draw: range(1, 2)}}
+            =[:exclusive]=>[-[:next {{when: {left}}}]->(:node), -[:next {{when: {right}}}]->(:node)];"#
         );
         assert_eq!(compile(&source).is_ok(), valid, "{source}\n{:?}", compile(&source));
     }
@@ -1552,36 +1576,40 @@ fn requires_typed_junctions_with_enclosed_properties() {
     ] {
         assert!(parse(source).is_err(), "{source}");
     }
-    let model = compiled("(a:x)-[edge:link]->(b:x); >[:custom {policy: 1} [edge]]>>(b);");
+    let model = compiled(
+        "+(custom:junction {policy: {type: \"number\"}}); (a:node)-[edge:link]->(b:node); >[:custom {policy: 1} [edge]]>>(b);",
+    );
     assert_eq!(model.junctions[0].kind, "custom");
     assert_eq!(model.junctions[0].props.len(), 1);
 }
 
 #[test]
-fn registers_edge_primitives_without_closing_consumer_kinds() {
+fn registers_edge_primitives_and_requires_defined_consumer_kinds() {
     for kind in ["link", "next", "requires", "contains", "feeds"] {
         let primitive = bts_lang::spec::SPEC.primitive("edge", kind).unwrap();
         assert_eq!(primitive.name, kind);
-        let model = compiled(&format!("(a:custom)-[:{kind}]->(b:custom);"));
+        let model = compiled(&format!("(a:node)-[:{kind}]->(b:node);"));
         assert_eq!(model.edges[0].kind, kind);
     }
     assert!(bts_lang::spec::SPEC.primitive("edge", "parallel").is_none());
-    compiled("(a:custom)-[:consumer_kind {custom: 1}]->(b:custom);");
+    let consumer = "(a:node)-[:consumer_kind {custom: 1}]->(b:node);";
+    assert!(compile(consumer).is_err());
+    compiled(&format!("+(consumer_kind:edge {{custom: {{type: \"number\"}}}}); {consumer}"));
 }
 
 #[test]
 fn validates_builtin_junction_configuration() {
-    let definitions = "(a:task)-[input_left:link]->(b:task); (a)-[input_right:link]->(c:task);";
+    let definitions = "(a:node)-[input_left:link]->(b:node); (a)-[input_right:link]->(c:node);";
     for kind in ["accumulate", "merge", "first", "quorum"] {
         assert!(bts_lang::spec::SPEC.primitive("junction", kind).is_some());
         let props = if kind == "quorum" { "{count: 2}" } else { "{}" };
         let model = compiled(&format!(
-            "{definitions} >[:{kind} {props} [input_left], [input_right]]>>(d:task);"
+            "{definitions} >[:{kind} {props} [input_left], [input_right]]>>(d:node);"
         ));
         assert_eq!(model.junctions[0].kind, kind);
         assert!(
             compile(&format!(
-                "{definitions} >[:{kind} {props} [input_left], [input_left]]>>(d:task);"
+                "{definitions} >[:{kind} {props} [input_left], [input_left]]>>(d:node);"
             ))
             .is_err()
         );
@@ -1596,13 +1624,13 @@ fn validates_builtin_junction_configuration() {
     ] {
         assert!(
             compile(&format!(
-                "{definitions} >[:quorum {props} [input_left], [input_right]]>>(d:task);"
+                "{definitions} >[:quorum {props} [input_left], [input_right]]>>(d:node);"
             ))
             .is_err()
         );
     }
     compiled(&format!(
-        "{definitions} (config:vars) {{count: 1 + 1}}; >[:quorum {{count: config.count}} [input_left], [input_right]]>>(d:task);"
+        "{definitions} (config:vars) {{count: 1 + 1}}; >[:quorum {{count: config.count}} [input_left], [input_right]]>>(d:node);"
     ));
 }
 
@@ -1610,7 +1638,7 @@ fn validates_builtin_junction_configuration() {
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     use bts_lang::{ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.definitions.len(), 11);
+    assert_eq!(ast.definitions.len(), 14);
     assert_eq!(ast.definitions[0].head.header.kind, "node");
     assert_eq!(ast.definitions[1].head.header.kind, "edge");
     assert_eq!(ast.definitions[2].head.header.kind, "fork");
@@ -1641,10 +1669,7 @@ fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
         }
     ));
     assert!(matches!(binding(&model, "patient_step", "metadata").value, Value::Object(_)));
-    assert!(matches!(
-        binding(&model, "patient_step", "extra_content").value,
-        Value::Str(_)
-    ));
+    assert!(matches!(binding(&model, "patient_step", "note").value, Value::Str(_)));
     let ElementId::Edge(delivery) = model.names["patient_delivery"] else {
         panic!()
     };
@@ -1671,7 +1696,7 @@ fn resolves_forward_kind_bases_and_validates_specialization() {
     let model = compiled(
         r#"+(child:node) {value: {required: true}}-[:extends]->(base);
         +(base:node {name: {type: "string", default: "example"}}) {value: {type: "number"}};
-        (a:child) {value: 2, extra: true};"#,
+        (a:child) {value: 2};"#,
     );
     assert_eq!(model.kinds[0].base_kind, Some(model.kind_names["base"]));
     assert!(
@@ -1700,7 +1725,7 @@ fn resolves_forward_kind_bases_and_validates_specialization() {
 
 #[test]
 fn keeps_properties_strict_and_fields_open_with_typed_defaults() {
-    let schema = r#"+(record:node {name: {type: "string", required: true}, enabled: {type: "boolean", default: true}}) {value: {type: "number", required: true}, fallback: {type: "object", default: {}}};"#;
+    let schema = r#"+(record:node {open: true, name: {type: "string", required: true}, enabled: {type: "boolean", default: true}}) {value: {type: "number", required: true}, fallback: {type: "object", default: {}}};"#;
     compiled(&format!(
         "{schema} (a:record {{name: \"a\"}}) {{value: 2, arbitrary: [|1, 2|]}};"
     ));
@@ -1727,7 +1752,7 @@ fn keeps_properties_strict_and_fields_open_with_typed_defaults() {
 
 #[test]
 fn feeds_references_input_destinations_without_reading_them() {
-    let schema = "+(receiver:node) {id: {type: \"string\", required: true}};";
+    let schema = "+(receiver:node) {id: {type: \"string\", required: true}, upper: {type: \"string\"}};";
     let model = compiled(&format!(
         "{schema} (a:node) {{id: \"p-1\"}} -[:feeds {{value: source.id, into: target.id}}]->(b:receiver) {{id: <-, upper: upper(self.id)}};"
     ));
@@ -1793,7 +1818,7 @@ fn rejects_invalid_kind_placements_and_handles_truncated_declarations() {
 #[test]
 fn upstream_requirements_suppress_defaults_and_allow_alternative_suppliers() {
     let model = compiled(
-        r#"+(receiver:node) {id: {type: "string", default: "fallback"}};
+        r#"+(receiver:node {open: true}) {id: {type: "string", default: "fallback"}};
         (b:receiver) {id: <-, text: "Patient ${self.id}"};
         (a:node)-[:feeds {value: "first", into: target.id}]->(b);
         (c:node)-[:feeds {value: "second", into: target.id}]->(b);
@@ -1820,7 +1845,7 @@ fn upstream_requirements_suppress_defaults_and_allow_alternative_suppliers() {
 
 #[test]
 fn preserves_schema_types_through_context_and_aliases() {
-    let schema = r#"+(record:node {label: {type: "string"}}) {id: {type: "string"}};"#;
+    let schema = r#"+(record:node {open: true, label: {type: "string"}}) {id: {type: "string"}};"#;
     let model = compiled(&format!(
         r#"{schema} (a:record {{label: context.label}}) {{id: context.id, alias: self.id, text: "${{self.alias}} ${{self.props.label}}"}};"#
     ));
@@ -1903,8 +1928,9 @@ fn undirected_edges_match_in_reverse_without_changing_endpoint_identity() {
     use bts_lang::{Direction, ElementId};
     let source = r#"
         (a:node) {value: 2}; (b:node) {value: 3};
-        (a)-[ab:link {sum: left.value + right.value}]-(b);
-        (refs:node) {edge: ?<(b)-[@:link]-(a)>, l: [ab].left, r: [ab].right};
+        (a)-[ab:summed {sum: left.value + right.value}]-(b);
+        +(summed:edge {sum: {type: "number"}})-[:extends]->(link);
+        (refs:node) {edge: ?<(b)-[@:summed]-(a)>, l: [ab].left, r: [ab].right};
     "#;
     let ast = parse(source).unwrap();
     assert_eq!(edge(&ast.paths[2].steps[0]).direction, Direction::Undirected);
@@ -1939,7 +1965,7 @@ fn inherits_and_narrows_edge_direction_allowances() {
         +(friendship:edge {direction: "undirected"})-[:extends]->(link);
         +(close_friend:edge)-[:extends]->(friendship);
         (a:node)-[:close_friend]-(b:node);
-        (a)-[:custom]-(b); (a)-[:custom]->(b);
+        (a)-[:link]-(b); (a)-[:link]->(b);
     "#,
     );
     assert_eq!(
@@ -2301,7 +2327,7 @@ fn empty_user_modules_do_not_bypass_provider_validation() {
     assert!(compile_with_definitions(source, &definitions).is_err());
     let model = compile_module_with_definitions(source, &definitions, true).unwrap();
     assert!(model.nodes.is_empty());
-    assert_eq!(model.kinds.len(), 2);
+    assert_eq!(model.kinds.len(), 12);
     assert!(
         compile_module_with_definitions(
             source,
@@ -2319,7 +2345,7 @@ fn empty_user_modules_do_not_bypass_provider_validation() {
     let model = compile_with_definitions(
         Source {
             name: "user.bt",
-            text: "(a:custom);",
+            text: "(a:node);",
         },
         &[],
     )
@@ -2348,7 +2374,7 @@ fn input_roles_preserve_fallbacks_without_folding_caller_reads() {
     assert!(matches!(binding("selected").value, Value::Cond { .. }));
 
     let source = r#"
-+(payload:node) {input: {type: "number", role: "input"}};
++(payload:node {open: true}) {input: {type: "number", role: "input"}};
 (a:payload) {input: 1, first: a.input, second: a.input};
 "#;
     let model = bts_lang::semantics::compile(source).unwrap();
@@ -2385,17 +2411,17 @@ fn input_roles_preserve_fallbacks_without_folding_caller_reads() {
 #[test]
 fn repeat_forks_require_nonnegative_integer_counts() {
     for source in [
-        "(a:task)=[:repeat {count: 0}]=>[-[:next]->(b:task)];",
-        "(a:task)=[:repeat {count: context.count}]=>[-[:next]->(b:task)];",
+        "(a:node)=[:repeat {count: 0}]=>[-[:next]->(b:node)];",
+        "(a:node)=[:repeat {count: context.count}]=>[-[:next]->(b:node)];",
     ] {
         compiled(source);
     }
     for source in [
-        "(a:task)=[:repeat]=>[-[:next]->(b:task)];",
-        "(a:task)=[:repeat {count: -1}]=>[-[:next]->(b:task)];",
-        "(a:task)=[:repeat {count: 1.5}]=>[-[:next]->(b:task)];",
-        "(a:task)=[:repeat {count: true}]=>[-[:next]->(b:task)];",
-        "(a:task)=[:repeat {count: 2}]=>[-[:next {when: true}]->(b:task)];",
+        "(a:node)=[:repeat]=>[-[:next]->(b:node)];",
+        "(a:node)=[:repeat {count: -1}]=>[-[:next]->(b:node)];",
+        "(a:node)=[:repeat {count: 1.5}]=>[-[:next]->(b:node)];",
+        "(a:node)=[:repeat {count: true}]=>[-[:next]->(b:node)];",
+        "(a:node)=[:repeat {count: 2}]=>[-[:next {when: true}]->(b:node)];",
     ] {
         assert!(bts_lang::semantics::compile(source).is_err(), "{source}");
     }
@@ -2513,14 +2539,14 @@ fn a_kind_has_its_traits_and_those_of_its_base() {
             -[:on]->(edge);
         +(span:node) {input: {type: "any"}}
             -[:has]->(metered);
-        +(tool:node {service: {type: "string"}}) {metrics: {required: true}}
+        +(tool:node {service: {type: "string"}}) {metrics: {required: true}, shown: {type: "string"}}
             -[:extends]->(span)
             -[:has]->(audited)
             -[:has]->(metered);
         +(reviewed:edge)
             -[:extends]->(link)
             -[:has]->(audited);
-        (a:tool {service: "billing", auditor: "ops"}) {metrics: {tokens: 3}, unit: self.props.unit}
+        (a:tool {service: "billing", auditor: "ops"}) {metrics: {tokens: 3}, shown: self.props.unit}
             -[:reviewed {auditor: "ops"}]->(b:span);
         "#,
     );
@@ -2542,7 +2568,7 @@ fn a_kind_has_its_traits_and_those_of_its_base() {
     assert_eq!(metrics.ty, FieldType::Object);
     assert!(metrics.required);
     assert!(tool.props.iter().any(|field| field.name == "unit"));
-    assert!(matches!(&binding(&model, "a", "unit").value, Value::Str(unit) if unit == "ms"));
+    assert!(matches!(&binding(&model, "a", "shown").value, Value::Str(unit) if unit == "ms"));
     // trait properties are strict like any declared property, and trait fields are typed
     for source in [
         "+(m:trait {unit: {type: \"string\"}})-[:on]->(node); +(k:node)-[:has]->(m); (a:k {typo: 1});",
@@ -2624,7 +2650,7 @@ fn a_trait_extends_one_trait_and_narrows_where_it_applies() {
             "only nodes have content fields",
             "+(m:trait) {metrics: {type: \"object\"}}\n -[:on]->(node)\n -[:on]->(edge);",
         ),
-        ("+(m:trait)-[:on]->(node); (a:m);", "`m` is a trait, not a kind", "(a:m)"),
+        ("+(m:trait)-[:on]->(node); (a:m);", "`m` is a trait, not a kind", "m"),
         ("+(m:trait)-[:on]->(node); +(m:node);", "duplicate kind or trait name", "m"),
         ("+(trait:node);", "reserved", "trait"),
     ] {
@@ -2716,5 +2742,111 @@ fn locates_definition_relationship_errors() {
     }
     // a kind that fails is reported once, and kinds built on it stay quiet
     let errors = located("+(k:node)-[:has]->(missing); +(d:node)-[:extends]->(k); (a:d {anything: 1});");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+}
+
+#[test]
+fn closed_roots_unknown_kinds_and_strict_properties_are_located_errors() {
+    use bts_lang::FieldType;
+    let model = compiled(
+        r#"
+        +(record:node) {value: {type: "number"}, payload: {type: "object"}, anything: {type: "any"}};
+        +(notes:node {open: true}) {title: {type: "string"}};
+        +(sealed:node {open: false})-[:extends]->(notes);
+        +(settings:node {open: true})-[:extends]->(vars);
+        (a:record) {value: 1, payload: {free: {form: true}}, anything: [|1, "two"|]};
+        (b:notes) {title: "t", extra: 1};
+        (c:sealed) {title: "t"};
+        (d:settings) {limit: 3};
+        (e:node {any: "property"}) {any: "field"};
+        (f:vars) {free: 1};
+        "#,
+    );
+    let kind = |name: &str| &model.kinds[model.kind_names[name].0];
+    assert!(!kind("record").open && kind("notes").open && !kind("sealed").open && kind("settings").open);
+    assert_eq!(binding(&model, "b", "title").ty, FieldType::String);
+    assert!(!kind("notes").props.iter().any(|field| field.name == "open"));
+    let record = "+(record:node {name: {type: \"string\"}}) {output: {type: \"any\"}};";
+    for (source, message, at) in [
+        (
+            format!("{record} (a:record) {{outptu: 1}};"),
+            "unknown field `outptu` for kind `record`, did you mean `output`?",
+            "outptu",
+        ),
+        (
+            format!("{record} (a:record) {{unrelated: 1}};"),
+            "unknown field `unrelated` for kind `record`",
+            "unrelated",
+        ),
+        (
+            format!("{record} (a:record {{nmae: \"x\"}});"),
+            "unknown property `nmae` for kind `record`, did you mean `name`?",
+            "nmae",
+        ),
+        (
+            format!("{record} (a:recrod);"),
+            "unknown node kind `recrod`, did you mean `record`?",
+            "recrod",
+        ),
+        ("(q:tol);".to_owned(), "unknown node kind `tol`", "tol"),
+        (
+            "(a:node)-[:nxet]->(b:node);".to_owned(),
+            "unknown edge kind `nxet`, did you mean `next`?",
+            "nxet",
+        ),
+        (
+            "(a:node)=[:exclusiv]=>[-[:next]->(b:node)];".to_owned(),
+            "unknown fork kind `exclusiv`, did you mean `exclusive`?",
+            "exclusiv",
+        ),
+        (
+            "(a:node)-[e:link]->(b:node); >[:acumulate [e]]>>(c:node);".to_owned(),
+            "unknown junction kind `acumulate`, did you mean `accumulate`?",
+            "acumulate",
+        ),
+        (
+            "(a:node)-[:next {whne: true}]->(b:node);".to_owned(),
+            "unknown property `whne` for built-in kind `next`, did you mean `when`?",
+            "whne",
+        ),
+        (
+            "(a:node)-[:link {label: 1}]->(b:node);".to_owned(),
+            "unknown property `label` for built-in kind `link`",
+            "label",
+        ),
+        (
+            "(a:vars {evalaute: \"once\"});".to_owned(),
+            "unknown property `evalaute` for built-in kind `vars`, did you mean `evaluate`?",
+            "evalaute",
+        ),
+        (
+            "+(base:node); +(k:node {open: true})-[:extends]->(base);".to_owned(),
+            "a kind cannot reopen the closed root of its base",
+            "open: true",
+        ),
+        (
+            "+(k:node {open: \"yes\"});".to_owned(),
+            "open must be a literal boolean",
+            "open: \"yes\"",
+        ),
+        (
+            "+(k:node {open: true, open: false});".to_owned(),
+            "duplicate schema key",
+            "open: false",
+        ),
+        (
+            "+(k:edge {open: true});".to_owned(),
+            "schema descriptors must be objects",
+            "true",
+        ),
+    ] {
+        let errors = located(&source);
+        assert!(
+            errors.iter().any(|(what, text)| what == message && text == at),
+            "{source}\n{errors:#?}"
+        );
+    }
+    // an instance of a definition that failed is not also reported as an unknown kind
+    let errors = located("+(k:node)-[:has]->(missing); (a:k) {anything: 1};");
     assert_eq!(errors.len(), 1, "{errors:#?}");
 }

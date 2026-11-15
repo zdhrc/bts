@@ -529,13 +529,13 @@ fn dry_run_resolves_context_references_in_expressions() {
 (conversation:task) {
     input: conversation_agent.input,
     output: null,
-    messages: [|"q0", "a0", "q1", "a1", "q2", "a2"|]
+    local: {messages: [|"q0", "a0", "q1", "a1", "q2", "a2"|]}
 };
 (conversation_agent)-[:contains]->(conversation);
 (conversation) =[:repeat {count: 3}]=>[-[:next]->(chat)];
 (chat:llm) {
-    input: conversation.messages[: ${context.index * 2} + 1],
-    output: conversation.messages[${context.index * 2} + 1],
+    input: conversation.local.messages[: ${context.index * 2} + 1],
+    output: conversation.local.messages[${context.index * 2} + 1],
     metrics: {turn: context.index + 1, of: context.count}
 };
 (conversation_agent)-[:contains]->(chat);
@@ -2640,10 +2640,12 @@ fn agent_scalar_expressions_preserve_integer_and_short_circuit_semantics() {
 (expressions)-[:next]->(values);
 (values:task) {
     input: expressions.input,
-    output: {sum: values.amount + self.input.d, difference: values.amount - self.input.d, product: values.amount * self.input.d, quotient: values.amount / self.input.d, sum_quotient: ${values.amount + self.input.d} / 4, sum_text: format("{}", values.amount + self.input.d), remainder: values.amount % self.input.d, negated: - values.amount, less: values.amount < self.input.d, at_most: values.amount <= self.input.d, greater: values.amount > self.input.d, at_least: values.amount >= self.input.d, unequal: values.amount != self.input.d, guarded: self.input.guard && values.guarded_value, fallback: ! self.input.guard || values.guarded_value, text: "n=${self.input.n}, flag=${self.input.guard}"},
-    amount: self.input.n,
-    guarded_value: self.input.missing,
-    unused_value: self.input.also_missing
+    output: {sum: values.local.amount + self.input.d, difference: values.local.amount - self.input.d, product: values.local.amount * self.input.d, quotient: values.local.amount / self.input.d, sum_quotient: ${values.local.amount + self.input.d} / 4, sum_text: format("{}", values.local.amount + self.input.d), remainder: values.local.amount % self.input.d, negated: - values.local.amount, less: values.local.amount < self.input.d, at_most: values.local.amount <= self.input.d, greater: values.local.amount > self.input.d, at_least: values.local.amount >= self.input.d, unequal: values.local.amount != self.input.d, guarded: self.input.guard && values.local.guarded_value, fallback: ! self.input.guard || values.local.guarded_value, text: "n=${self.input.n}, flag=${self.input.guard}"},
+    local: {
+        amount: self.input.n,
+        guarded_value: self.input.missing,
+        unused_value: self.input.also_missing,
+    }
 };
 (expressions)-[:contains]->(values);
 ("float-values":agent) {input: {n: 6.0, nested:[|6.0|]}, output: ("trace_float-values").output};
@@ -2912,20 +2914,20 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
         r#"(branches:agent) {input: {}, output: root.output};
 (branches)-[:contains, :next]->(root:task) {
     input: branches.input,
-    route: range(0, 1),
+    local: {route: range(0, 1)},
     output: {
-        chosen: self.route,
-        selected: self.route == 0 ? left_route.output : right_route.output,
-        left: self.route == 0 ? left_route.output : null,
-        right: self.route == 1 ? right_route.output : null,
+        chosen: self.local.route,
+        selected: self.local.route == 0 ? left_route.output : right_route.output,
+        left: self.local.route == 0 ? left_route.output : null,
+        right: self.local.route == 1 ? right_route.output : null,
         absent: null,
         present: good.output,
         batch: results.output,
     },
 };
 (root) =[:exclusive]=>[
-    -[:next {when: source.route == 0}]->(left_route:tool) {output: {side: "left", other: null}},
-    -[:next {when: source.route == 1}]->(right_route:tool) {output: {side: "right", other: null}},
+    -[:next {when: source.local.route == 0}]->(left_route:tool) {output: {side: "left", other: null}},
+    -[:next {when: source.local.route == 1}]->(right_route:tool) {output: {side: "right", other: null}},
 ];
 (root) =[:conditional]=>[
     -[:next {when: false}]->(bad:tool) {output: root.input.missing},
@@ -2933,18 +2935,17 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
 ];
 (root)
     =[:repeat {count: 2}]=>[-[item:next]->(row:task) {
-        included: chance(0.5),
-        pick: self.included ? range(0, 1) : -1,
+        local: {included: chance(0.5), pick: self.local.included ? range(0, 1) : -1},
         output: {
-            included: self.included, chosen: self.included ? self.pick : null,
-            result: self.included && self.pick == 0 ? fast.output : null,
-            other: self.included && self.pick == 1 ? manual.output : null,
+            included: self.local.included, chosen: self.local.included ? self.local.pick : null,
+            result: self.local.included && self.local.pick == 0 ? fast.output : null,
+            other: self.local.included && self.local.pick == 1 ? manual.output : null,
         },
     }]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [item]]>>(results:task) {output: context.accumulator};
 (row) =[:exclusive]=>[
-    -[:next {when: source.included && source.pick == 0}]->(fast:tool) {output: format("request-{}", context.index)},
-    -[:next {when: source.included && source.pick == 1}]->(manual:tool) {output: format("request-{}", context.index)},
+    -[:next {when: source.local.included && source.local.pick == 0}]->(fast:tool) {output: format("request-{}", context.index)},
+    -[:next {when: source.local.included && source.local.pick == 1}]->(manual:tool) {output: format("request-{}", context.index)},
 ];
 (branches)-[:contains]->(left_route)-[:child_of]->(root);
 (branches)-[:contains]->(right_route)-[:child_of]->(root);
@@ -3235,8 +3236,8 @@ fn agent_random_values_are_cached_scoped_and_lazy() {
 (random)-[:next]->(t);
 (t:task) {
     input: random.input,
-    output: {shared: t.shared, copy: t.shared, forward: later.output, forward_copy: later.output, chosen: choice("safe", self.input.missing), weighted: weighted([|self.input.missing, 0|],[|"safe", 1|]), certain: chance(1), impossible: chance(0), float_division: range(1.0, 1.0) / 2, float_text: format("{}", range(1.0, 1.0)), normal: normal(10, 2), lognormal: lognormal(2, 0.3), exponential: exponential(3), pareto: pareto(2, 3), beta: beta(2, 3), poisson: poisson(6), large_poisson: poisson(1000000), uuid: uuid(), hex: hex(12), alphanum: alphanum(16), noise: noise(20), rows: row_results.output},
-    shared: range(10, 20)
+    output: {shared: t.local.shared, copy: t.local.shared, forward: later.output, forward_copy: later.output, chosen: choice("safe", self.input.missing), weighted: weighted([|self.input.missing, 0|],[|"safe", 1|]), certain: chance(1), impossible: chance(0), float_division: range(1.0, 1.0) / 2, float_text: format("{}", range(1.0, 1.0)), normal: normal(10, 2), lognormal: lognormal(2, 0.3), exponential: exponential(3), pareto: pareto(2, 3), beta: beta(2, 3), poisson: poisson(6), large_poisson: poisson(1000000), uuid: uuid(), hex: hex(12), alphanum: alphanum(16), noise: noise(20), rows: row_results.output},
+    local: {shared: range(10, 20)}
 };
 (random)-[:contains]->(t);
 (t)-[:next]->(later);
@@ -3249,8 +3250,8 @@ fn agent_random_values_are_cached_scoped_and_lazy() {
     =[:repeat {count: 2}]=>[-[row_arrival:next]->(row)]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [row_arrival]]>>(row_results:task) {output: context.accumulator};
 (row:tool) {
-    row_value: range(1, 100),
-    output: {value: row.row_value, copy: row.row_value}
+    local: {row_value: range(1, 100)},
+    output: {value: row.local.row_value, copy: row.local.row_value}
 };
 (random)-[:contains]->(row);
 (row)-[:child_of]->(t);
@@ -3467,16 +3468,15 @@ fn agent_native_values_preserve_results_names_and_lazy_failures() {
 (native)-[:next]->(t);
 (t:task) {
     input: native.input,
-    output: {value: calculate.output, guarded: false && t.unused},
-    root_request: 6,
-    unused: self.input.missing
+    output: {value: calculate.output, guarded: false && t.local.unused},
+    local: {root_request: 6, unused: self.input.missing}
 };
 (native)-[:contains]->(t);
 (t)-[:next]->(calculate);
 (calculate:tool) {
-    input: {base: t.root_request},
-    output: {amount: calculate.next * 2, copy: calculate.next, label: upper("ready")},
-    next: self.input.base + 1
+    input: {base: t.local.root_request},
+    output: {amount: calculate.local.next * 2, copy: calculate.local.next, label: upper("ready")},
+    local: {next: self.input.base + 1}
 };
 (native)-[:contains]->(calculate);
 (calculate)-[:child_of]->(t);

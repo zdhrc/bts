@@ -305,6 +305,7 @@ impl<'src> Parser<'src> {
         self.expect(token!(Gt), ErrorKind::UnexpectedToken)?;
         self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
         self.expect(token!(Colon), ErrorKind::ExpectedGraphKind)?;
+        let kind_range = self.peek().range;
         let kind = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
         let props = if self.check(token!(LBrace)) {
             Some(self.parse_graph_fields()?)
@@ -321,6 +322,7 @@ impl<'src> Parser<'src> {
         let end = self.tokens[self.index - 1].range.end;
         Some(GraphJunction {
             kind,
+            kind_range,
             inputs,
             props,
             target,
@@ -472,6 +474,7 @@ impl<'src> Parser<'src> {
             None
         };
         self.expect(token!(Colon), ErrorKind::ExpectedGraphKind)?;
+        let kind_range = self.peek().range;
         let kind = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
         let props = if self.check(token!(LBrace)) {
             Some(self.parse_graph_fields()?)
@@ -483,6 +486,7 @@ impl<'src> Parser<'src> {
             name,
             name_range,
             kind,
+            kind_range,
             props,
             range: self.range(start, end),
         })

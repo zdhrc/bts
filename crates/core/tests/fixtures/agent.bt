@@ -1,3 +1,5 @@
++(patient_lookup:node) {patient_id: {type: "string"}}-[:extends]->(tool);
+
 # a behavior graph for scheduling intake, with two possible patient journeys
 (intake:agent) {
     input: {patient_id: "p-123", reason: "Schedule a follow-up appointment"},
@@ -17,7 +19,7 @@
 };
 
 # progression and data transfer are separate edges between the same nodes
-(request)-[:next, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:tool) {
+(request)-[:next, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
     patient_id: <-,
     input: {patient_id: self.patient_id},
     output: {

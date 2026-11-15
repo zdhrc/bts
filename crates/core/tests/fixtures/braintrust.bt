@@ -31,7 +31,6 @@
     input: {patient_id: self.patient_id},
     output: {found: true},
     duration: 0.2,
-    extra_content: "open fields remain available",
 };
 
 (lookup)-[:next]->(route:task) {output: "appointments"}

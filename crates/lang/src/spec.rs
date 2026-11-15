@@ -898,12 +898,12 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.schemas"),
-        summary: "The braces in a definition head hold property descriptors and its body holds field descriptors, mirroring an instance's properties and content. Only node kinds and traits on node have a body. On an edge kind the header key direction is reserved: it takes directed, undirected or either instead of a descriptor. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. Each descriptor accepts type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role does not install an operation. The input role preserves references to the field and its nested values as runtime reads, even when its authored fallback is constant. Consumers may supply a value at that boundary. Constant folding and branch proofs cannot assume the fallback is the supplied value. Output roles preserve field reference identity without installing evaluation behavior. Other roles remain descriptive metadata. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
+        summary: "The braces in a definition head hold property descriptors and its body holds field descriptors, mirroring an instance's properties and content. Only node kinds and traits on node have a body. On an edge kind the header key direction is reserved: it takes directed, undirected or either instead of a descriptor. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. On a node kind the header key open is reserved: it takes a literal boolean instead of a descriptor. A node kind is closed unless open is true, and a kind whose base is closed cannot set it. Each descriptor accepts type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role does not install an operation. The input role preserves references to the field and its nested values as runtime reads, even when its authored fallback is constant. Consumers may supply a value at that boundary. Constant folding and branch proofs cannot assume the fallback is the supplied value. Output roles preserve field reference identity without installing evaluation behavior. Other roles remain descriptive metadata. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.inheritance"),
-        summary: "Extensions inherit properties, fields, requiredness, defaults, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict, while content fields remain open and extensible. Described content fields still receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
+        summary: "Extensions inherit properties, fields, requiredness, defaults, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict. Content fields are strict for a closed kind and free for an open one. Described content fields receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
     },
     RuleDesc {
         tags: &[],
@@ -928,7 +928,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.direction"),
-        summary: "Ordinary connectors are -[headers]-> for directed edges and -[headers]- for undirected edges. Each declaration creates a distinct identity, including parallel edges and self-connections. The root edge kind, link and undeclared kinds permit either direction. next, requires, contains and feeds require directed edges. incidence requires undirected edges. Direction is set in an edge kind's definition header, not an instance property. Directed and undirected connections can coexist between the same nodes.",
+        summary: "Ordinary connectors are -[headers]-> for directed edges and -[headers]- for undirected edges. Each declaration creates a distinct identity, including parallel edges and self-connections. The root edge kind and link permit either direction. next, requires, contains and feeds require directed edges. incidence requires undirected edges. Direction is set in an edge kind's definition header, not an instance property. Directed and undirected connections can coexist between the same nodes.",
     },
     RuleDesc {
         tags: &[],
@@ -989,7 +989,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
         tags: &[],
         id: Id::new("kind.sources"),
         // provider schemas are opt-in data contracts, not installed runtime operations
-        summary: "Callers may supply named definition sources before compilation through semantics::compile_with_definitions or compile_module_with_definitions. Definition sources contain only definitions, for kinds and traits, and cannot declare graph instances or paths. Supplied and user definitions share one namespace and one inheritance and validation system. Forward references across sources are allowed. Duplicate names, reserved names, unknown bases or traits, inheritance cycles and cross-construct extension remain errors. Supplied definitions are registered in caller order followed by user definitions, without override precedence. Unknown instance kinds remain open under the existing rules. Source ranges retain local byte offsets and a source index, with user source at zero and definitions in caller order starting at one. Models retain source names and resolved kind identities. Empty user source follows the explicit allow_empty policy independently of supplied definitions, and supplied kinds are still validated when empty user source is allowed. No package loading, provider execution or external I/O occurs.",
+        summary: "Callers may supply named definition sources before compilation through semantics::compile_with_definitions or compile_module_with_definitions. Definition sources contain only definitions, for kinds and traits, and cannot declare graph instances or paths. Supplied and user definitions share one namespace and one inheritance and validation system. Forward references across sources are allowed. Duplicate names, reserved names, unknown bases or traits, inheritance cycles and cross-construct extension remain errors. Supplied definitions are registered in caller order followed by user definitions, without override precedence. Unknown instance kinds are errors. Source ranges retain local byte offsets and a source index, with user source at zero and definitions in caller order starting at one. Models retain source names and resolved kind identities. Empty user source follows the explicit allow_empty policy independently of supplied definitions, and supplied kinds are still validated when empty user source is allowed. No package loading, provider execution or external I/O occurs.",
     },
     RuleDesc {
         tags: &[],
@@ -1004,7 +1004,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.fields"),
-        summary: "Undeclared kinds remain open identifiers without domain schemas. The network, relation, incidence, weighted, each, repeat and reduce built-ins have fixed configuration properties, with additional properties introduced through kind extension. Declared kinds enforce strict property schemas while allowing additional content fields. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values.",
+        summary: "Every instance kind is a built-in or a declared kind. An unknown kind is an error at the kind name. Properties are strict for every kind except the root node kind. A built-in accepts its fixed configuration properties, edge kinds also accept when, weight and max_traversals, and a declared kind accepts those of its base plus its own. Content fields are strict for a closed node kind and free for an open one. The built-in node kinds are open. A declared node kind is closed unless it sets open. A closed kind still holds free-form content under a declared field of type any or object. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values. An unknown name reports the nearest declared name when one is close.",
     },
     RuleDesc {
         tags: &[],
@@ -1019,7 +1019,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.junctions"),
-        summary: "A junction requires an open kind and preserves its explicitly listed input edges and destination. Optional properties follow the kind inside the junction brackets, before its input references. Properties belong to the junction, not its destination, and use the ordinary expression rules. Context reads in those properties belong to the junction. Inputs of an attached junction belong to the attached fork. Root junctions can join separately declared edges. Overlapping input sets on sibling junctions are allowed and do not create implicit edges between their destinations. Built-in junction input lists contain distinct edge identities. Grouped junctions use correlate as an explicit group key when supplied, otherwise a runtime consumer must supply the activation group. Independent groups must not be combined implicitly. Each input has an ordered queue within its execution group and correlation partition. Group closure occurs when no runnable or in-flight work can produce further arrivals, not through silence or elapsed time. A waiting junction alone does not keep the group open. An agent execution owns the default group, each iteration owns a nested group, and cycle visits preserve their group. Correlation partitions a group without extending its lifetime. The kind determines the combination behavior, properties configure it.",
+        summary: "A junction requires a kind and preserves its explicitly listed input edges and destination. Optional properties follow the kind inside the junction brackets, before its input references. Properties belong to the junction, not its destination, and use the ordinary expression rules. Context reads in those properties belong to the junction. Inputs of an attached junction belong to the attached fork. Root junctions can join separately declared edges. Overlapping input sets on sibling junctions are allowed and do not create implicit edges between their destinations. Built-in junction input lists contain distinct edge identities. Grouped junctions use correlate as an explicit group key when supplied, otherwise a runtime consumer must supply the activation group. Independent groups must not be combined implicitly. Each input has an ordered queue within its execution group and correlation partition. Group closure occurs when no runnable or in-flight work can produce further arrivals, not through silence or elapsed time. A waiting junction alone does not keep the group open. An agent execution owns the default group, each iteration owns a nested group, and cycle visits preserve their group. Correlation partitions a group without extending its lifetime. The kind determines the combination behavior, properties configure it.",
     },
     RuleDesc {
         tags: &[],
@@ -1398,10 +1398,34 @@ const EXAMPLES: &[Example] = &[
     },
     Example {
         tags: &[],
+        id: Id::new("example.closed-kind"),
+        summary: "A declared kind takes only its declared fields",
+        note: "The misspelled field is rejected at its key, with the nearest declared name.",
+        source: r#"+(record:node) {value: {type: "number"}}; (a:record) {valeu: 1};"#,
+        valid: false,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.open-kind"),
+        summary: "An open kind takes any field",
+        note: "The open header key keeps the free content of the root node kind.",
+        source: "+(notes:node {open: true}); (a:notes) {anything: 1};",
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.unknown-kind"),
+        summary: "An unknown kind is an error",
+        note: "Every kind is a built-in or a definition, for nodes, edges, forks and junctions alike.",
+        source: "(a:node)-[:nxet]->(b:node);",
+        valid: false,
+    },
+    Example {
+        tags: &[],
         id: Id::new("example.graph"),
         summary: "A graph with a forward reference",
-        note: "Kinds are open names, with no domain field schemas.",
-        source: "(a:custom)-[:next]->(b); (b:custom);",
+        note: "The root node kind takes any property and field.",
+        source: "(a:node)-[:next]->(b); (b:node);",
         valid: true,
     },
     Example {
@@ -1409,7 +1433,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.fan-out"),
         summary: "Aligned continuation lines share an origin",
         note: "All three edges leave a. Writing them as separate statements means the same.",
-        source: "(a:custom)\n    -[:next]->(b:custom)\n    -[:next]->(c:custom)\n    -[:next]->(d:custom);",
+        source: "(a:node)\n    -[:next]->(b:node)\n    -[:next]->(c:node)\n    -[:next]->(d:node);",
         valid: true,
     },
     Example {
@@ -1417,7 +1441,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.chain"),
         summary: "Deeper continuation lines chain",
         note: "Each line continues from the last node of the line it sits under, so the edges run a to b, b to c and c to d.",
-        source: "(a:custom)\n    -[:next]->(b:custom)\n        -[:next]->(c:custom)\n            -[:next]->(d:custom);",
+        source: "(a:node)\n    -[:next]->(b:node)\n        -[:next]->(c:node)\n            -[:next]->(d:node);",
         valid: true,
     },
     Example {
@@ -1433,7 +1457,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.duplicate"),
         summary: "Names are globally unique",
         note: "Kinds do not create namespaces.",
-        source: "(a:first); (a:second);",
+        source: "(a:node); (a:vars);",
         valid: false,
     },
     Example {
@@ -1513,7 +1537,7 @@ reference_expression = expression
             "Fork entries contain exactly one ordinary directed or undirected edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
             "Root paths require semicolons. Internal entries require commas between entries on one line or multiple lines. A trailing comma is optional, including for a single entry. Array and object spreads use ...expression in an entry position.",
             "References use parentheses and brackets, arrays use [| |], expression grouping uses ${ }.",
-            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Definitions provide local kind schemas, same-category extension and traits. Package loading and runtime operation registration remain future work. Schema declarations do not install executable behavior. Consumers must honor inherited primitive contracts or explicitly reject unsupported capabilities.",
+            "Every kind is a built-in or a declared name. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Definitions provide local kind schemas, same-category extension and traits. Package loading and runtime operation registration remain future work. Schema declarations do not install executable behavior. Consumers must honor inherited primitive contracts or explicitly reject unsupported capabilities.",
         ],
     },
     expressions: EXPRESSIONS,

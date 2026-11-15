@@ -227,6 +227,8 @@ pub struct Kind {
     pub props: Vec<FieldSchema>,
     /// Effective node content schema, including inherited entries.
     pub fields: Vec<FieldSchema>,
+    /// Whether a node of this kind accepts content fields the kind does not declare.
+    pub open: bool,
     /// Every trait this kind has, including those of its base and the traits they extend.
     pub traits: Vec<TraitId>,
     /// Declaration location.

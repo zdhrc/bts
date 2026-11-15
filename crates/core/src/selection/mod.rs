@@ -488,23 +488,23 @@ mod tests {
         model
     }
 
-    const AGENTS: &str = r#"(source_root:task {name: "source"}) {input: source_node.input, output: "answer", identifier: range (1 , 100)};
-(source_node:agent) {input: {id: source_root.identifier}, output: source_root.output};
+    const AGENTS: &str = r#"(source_root:task {name: "source"}) {input: source_node.input, output: "answer", local: {identifier: range (1 , 100)}};
+(source_node:agent) {input: {id: source_root.local.identifier}, output: source_root.output};
 (source_node)-[:contains]->(source_root);
 (source_node)-[:next]->(source_root);
-(oldest_root:task {name: "oldest"}) {input: oldest.input, output: self.input, identifier: range (1 , 100)};
+(oldest_root:task {name: "oldest"}) {input: oldest.input, output: self.input, local: {identifier: range (1 , 100)}};
 (oldest:agent) {input: "oldest", output: oldest_root.output};
 (oldest)-[:contains]->(oldest_root);
 (oldest)-[:next]->(oldest_root);
-(baseline_root:task {name: "baseline"}) {input: baseline.input, output: self.input, identifier: range (1 , 100)};
+(baseline_root:task {name: "baseline"}) {input: baseline.input, output: self.input, local: {identifier: range (1 , 100)}};
 (baseline:agent) {input: "baseline", output: baseline_root.output};
 (baseline)-[:contains]->(baseline_root);
 (baseline)-[:next]->(baseline_root);
-(candidate_root:task {name: "candidate"}) {input: candidate.input, output: self.input, identifier: range (1 , 100)};
+(candidate_root:task {name: "candidate"}) {input: candidate.input, output: self.input, local: {identifier: range (1 , 100)}};
 (candidate:agent) {input: "candidate", output: candidate_root.output};
 (candidate)-[:contains]->(candidate_root);
 (candidate)-[:next]->(candidate_root);
-(other_root:task {name: "other"}) {input: other.input, output: self.input, identifier: range (1 , 100)};
+(other_root:task {name: "other"}) {input: other.input, output: self.input, local: {identifier: range (1 , 100)}};
 (other:agent) {input: "other", output: other_root.output};
 (other)-[:contains]->(other_root);
 (other)-[:next]->(other_root);
