@@ -54,6 +54,15 @@ impl From<&str> for Error {
     }
 }
 
+// the first edge of the step holding `id`, searched through fan-out arms
+fn edge_bundle(steps: &[graph::PathStep], id: usize) -> Option<usize> {
+    steps.iter().find_map(|step| match step {
+        graph::PathStep::Edges(ids) if ids.contains(&graph::EdgeId(id)) => ids.first().map(|id| id.0),
+        graph::PathStep::Arms(arms) => arms.iter().find_map(|arm| edge_bundle(arm, id)),
+        _ => None,
+    })
+}
+
 fn located(range: graph::SrcRange, what: impl Into<String>) -> Error {
     Error {
         what: what.into(),
@@ -568,11 +577,7 @@ fn lower_flow(
             .paths
             .iter()
             .chain(graph.forks.iter().flat_map(|fork| fork.continuations.iter()))
-            .flat_map(|path| path.steps.iter())
-            .find_map(|step| match step {
-                graph::PathStep::Edges(ids) if ids.contains(&graph::EdgeId(id)) => ids.first().map(|id| id.0),
-                _ => None,
-            })
+            .find_map(|path| edge_bundle(&path.steps, id))
             .unwrap_or(id);
         edges.push(execution::FlowEdge {
             id,
