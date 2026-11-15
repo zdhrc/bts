@@ -897,6 +897,25 @@ def _occurrence(span):
     return {key: _value(_read(span, key)) for key in ("input", "output", "expected", "metadata")}
 
 
+def _fork_pick(branches, random_source):
+    weights = []
+    for branch in branches:
+        values = [_num(value) for value in branch]
+        if any(not _math.isfinite(value) or value < 0 or value != values[0] for value in values):
+            raise ValueError("weighted branch weights must agree and be finite nonnegative numbers")
+        weights.append(values[0] if values else 0)
+    scale = max(weights, default=0)
+    if scale == 0: return -1
+    draw = random_source() * sum(weight / scale for weight in weights)
+    pick = -1
+    for index, weight in enumerate(weights):
+        if weight > 0:
+            pick = index
+            draw -= weight / scale
+            if draw < 0: break
+    return pick
+
+
 def _require_arrivals(ready):
     if ready is not True: raise ValueError("accumulate group closed with a missing listed input")
     return 1
@@ -912,6 +931,243 @@ def _score_span(span, parent, name, score, reason):
     if reason is not None: fields["metadata"] = {"reason": reason}
     span.log(**fields)
     parent.log(scores={**parent.fields.get("scores", {}), name: score})
+
+
+def _flow_property(occ, binding, read):
+    key = str(binding)
+    if key not in occ["properties"]: occ["properties"][key] = _lazy(lambda: _value(read()))
+    return occ["properties"][key]()
+
+
+def _flow_input(occ, binding, kind):
+    if str(binding) not in occ["supplied"]: raise ValueError("upstream value was not supplied")
+    return _check_type(occ["supplied"][str(binding)], kind)
+
+
+def _flow_read(flow, occ, node, binding):
+    candidates = [occ] if occ["node"]["id"] == node else occ["scope"].get(node)
+    if candidates is None: candidates = [other for other in flow["occurrences"] if other["started"] and other["node"]["id"] == node and other["group"] == occ["group"]]
+    if len(candidates) != 1:
+        raise ValueError("referenced occurrence is not available" if not candidates else "ambiguous occurrence reference, read context.arrivals instead")
+    if not candidates[0]["started"]: raise ValueError("referenced occurrence is not available")
+    return candidates[0]["bindings"][str(binding)]()
+
+
+def _flow_context(flow, occ, path):
+    key = path[0]
+    skip = 1
+    if key == "history":
+        if len(path) < 2: raise ValueError("history requires a node name")
+        name = path[1]
+        if not any(node["key"] == name for node in flow["nodes"]): raise ValueError("unknown history node")
+        value = []
+        for previous in flow["occurrences"]:
+            if previous["completed"] and previous["completion"] < occ["prior"] and previous["history"] == occ["history"] and previous["node"]["key"] == name:
+                value.append({key: _flow_read(flow, previous, previous["node"]["id"], previous["node"]["fields"][key]) if key in previous["node"]["fields"] else None for key in ("input", "output", "expected", "metadata")})
+        skip = 2
+    elif key == "trace_index": value = 0
+    elif key in occ["context"]: value = occ["context"][key]
+    elif occ["node"]["kind"] == "scorer" and key in ("input", "output", "expected", "metadata"):
+        parent = occ["scope"][occ["node"]["parent"]][0]
+        value = _flow_read(flow, parent, parent["node"]["id"], parent["node"]["fields"][key]) if key in parent["node"]["fields"] else None
+    else: raise ValueError("context." + key + " is unavailable")
+    for key in path[skip:]: value = _index(value, key)
+    return value
+
+
+def _flow_run(plan, input, random_source, logger, missing):
+    flow = {"occurrences": [], "joins": [], "counters": {}, "groups": 1, "nodes": plan["nodes"], "completed": 0}
+    nodes = {node["id"]: node for node in plan["nodes"]}
+    edges = {edge["id"]: edge for edge in plan["edges"]}
+    queue, pending = [], []
+    def prop(occ, props, key, default=None):
+        return props[key](flow, occ) if key in props else default
+    def merge_scope(target, source):
+        for node, values in source.items():
+            found = target.setdefault(node, [])
+            for value in values:
+                if not any(value is old for old in found): found.append(value)
+    def add(node_id, scope, group, context, supplied, history=0):
+        if len(flow["occurrences"]) >= 10000: raise ValueError("graph execution budget exceeded (10000 occurrences)")
+        node = nodes[node_id]
+        parents = scope.get(node["parent"], []) if node["parent"] is not None else []
+        if node["parent"] is not None and len(parents) != 1: raise ValueError("span parent occurrence is unavailable or ambiguous")
+        if not parents and flow["occurrences"]: raise ValueError("a cycle cannot create another root span inside one trace")
+        kind = "maybe" if node["kind"] in ("node", "vars") else "task" if node["kind"] == "span" else node["kind"]
+        index = len(flow["occurrences"])
+        span = Span(node["name"], kind, parents[0]["span"] if parents else None, logger, str(index))
+        occ = {"node": node, "index": index, "scope": {key: list(value) for key, value in scope.items()}, "group": group, "context": dict(context), "supplied": dict(supplied), "span": span, "terminal": True, "properties": {}, "history": history, "started": False, "completed": False, "prior": 0, "completion": None}
+        occ["scope"][node_id] = [occ]
+        occ["bindings"] = {key: _lazy(lambda fn=fn: _value(fn(flow, occ))) for key, fn in node["bindings"].items()}
+        if index == 0 and input is not missing: occ["bindings"][str(plan["input"])] = lambda: input
+        for key, binding in node["fields"].items():
+            if key in ("input", "output", "expected", "error", "metadata", "metrics", "tags", "duration"):
+                span.fields[key] = _lazy(lambda binding=binding: _flow_read(flow, occ, node_id, binding))
+        flow["occurrences"].append(occ)
+        return occ
+    def join_for(junction, group, occ):
+        definition = plan["junctions"][junction]
+        correlation = _value(prop(occ, definition["props"], "correlate"))
+        for join in flow["joins"]:
+            if join["junction"] == junction and join["group"] == group and join["correlation"] == correlation: return join
+        join = {"junction": junction, "group": group, "correlation": correlation, "source": occ, "queues": [[] for _ in definition["inputs"]], "arrivals": [], "emitted": False, "closed": False}
+        flow["joins"].append(join)
+        return join
+    def emit(join, arrivals, accumulator=missing):
+        source = join["source"]
+        scope = {} if arrivals else {key: list(value) for key, value in source["scope"].items()}
+        for arrival in arrivals:
+            merge_scope(scope, arrival["occ"]["scope"])
+            arrival["occ"]["terminal"] = False
+        context = dict(source["context"])
+        context["arrivals"] = [{"edge": edges[arrival["edge"]]["name"], "value": arrival["value"]} for arrival in arrivals]
+        if accumulator is not missing: context["accumulator"] = accumulator
+        join["emitted"] = True
+        queue.append(add(plan["junctions"][join["junction"]]["target"], scope, join["group"], context, {}, source["history"]))
+    def arrive(edge, occ, group, value, result):
+        for index, definition in enumerate(plan["junctions"]):
+            if edge not in definition["inputs"]: continue
+            if (prop(occ, definition["props"], "observe", "arrival") == "result") != result: continue
+            join = join_for(index, group, occ)
+            if join["closed"]: raise ValueError("arrival reached a closed junction group")
+            arrival = {"edge": edge, "occ": occ, "value": value}
+            kind = definition["kind"]
+            if kind == "merge": emit(join, [arrival])
+            elif kind == "first":
+                if not join["emitted"]: emit(join, [arrival])
+            elif kind == "reduce": join["arrivals"].append(arrival)
+            elif kind == "accumulate":
+                join["queues"][definition["inputs"].index(edge)].append(arrival)
+                if all(join["queues"]): emit(join, [items.pop(0) for items in join["queues"]])
+            elif kind == "quorum" and not join["emitted"]:
+                if not any(old["edge"] == edge for old in join["arrivals"]): join["arrivals"].append(arrival)
+                if len(join["arrivals"]) == _count(prop(occ, definition["props"], "count")):
+                    emit(join, sorted(join["arrivals"], key=lambda item: definition["inputs"].index(item["edge"])))
+    root = add(plan["root"], {}, 0, {}, {})
+    queue.append(root)
+    try:
+        while True:
+            while queue:
+                occ = queue.pop(0)
+                occ["prior"] = flow["completed"]
+                occ["started"] = True
+                node, group = occ["node"]["id"], occ["group"]
+                for index, definition in enumerate(plan["junctions"]):
+                    activates = any(fork["id"] == definition["fork"] and fork["source"] == node for fork in plan["forks"]) if definition["fork"] is not None else any(edges[edge]["source"] == node for edge in definition["inputs"])
+                    if activates and "correlate" not in definition["props"]: join_for(index, group, occ)
+                for edge in plan["edges"]:
+                    if edge["source"] == node and edge["kind"] == "requires":
+                        required = occ["scope"].get(edge["target"], [])
+                        if len(required) != 1 or not required[0]["completed"]: raise ValueError("required prerequisite occurrence is not complete")
+                bundles = []
+                independent = {}
+                for edge in plan["edges"]:
+                    if edge["source"] == node and edge["fork"] is None:
+                        independent.setdefault(edge["bundle"], []).append(edge["id"])
+                supplies = [edges[edge] for branch in independent.values() if not any(edges[edge]["kind"] == "next" for edge in branch) for edge in branch if edges[edge]["kind"] == "feeds"]
+                for branch in independent.values():
+                    first = edges[branch[0]]
+                    extra = [edge["id"] for edge in supplies if edge["target"] == first["target"] and edge["cycle"] == first["cycle"]] if any(edges[edge]["kind"] == "next" for edge in branch) else []
+                    bundles.append((branch + extra, group, None))
+                for fork in plan["forks"]:
+                    if fork["source"] != node: continue
+                    if fork["kind"] in ("each", "repeat"):
+                        if fork["kind"] == "each" and _count(prop(occ, fork["props"], "concurrency", 1)) == 0: raise ValueError("each concurrency must be a positive integer")
+                        count = _count(prop(occ, fork["props"], "count")) if fork["kind"] == "repeat" else 0
+                        if count > 10000: raise ValueError("repeat exceeds execution budget")
+                        items = prop(occ, fork["props"], "items") if fork["kind"] == "each" else [None] * count
+                        if not isinstance(items, list): raise TypeError("each items must be an array")
+                        if len(items) > 10000: raise ValueError("repeat exceeds execution budget")
+                        history = flow["groups"]
+                        flow["groups"] += 1
+                        for index, item in enumerate(items):
+                            target_group = flow["groups"]
+                            flow["groups"] += 1
+                            bundles.extend((branch, target_group, (index, len(items), item, history)) for branch in fork["branches"])
+                    else:
+                        eligible = [index for index, branch in enumerate(fork["branches"]) if all(_boolean(prop(occ, edges[edge]["props"], "when", True)) for edge in branch)]
+                        if fork["kind"] == "exclusive" and len(eligible) > 1: raise ValueError("exclusive fork selected multiple branches")
+                        if fork["kind"] == "weighted":
+                            weights = [[prop(occ, edges[edge]["props"], "weight") for edge in branch] if index in eligible else [0] for index, branch in enumerate(fork["branches"])]
+                            picked = _fork_pick(weights, random_source)
+                            eligible = [] if picked < 0 else [picked]
+                        bundles.extend((fork["branches"][index], group, None) for index in eligible)
+                for branch, target_group, iteration in bundles:
+                    active = [edges[edge] for edge in branch if edges[edge]["fork"] is not None or _boolean(prop(occ, edges[edge]["props"], "when", True))]
+                    if not any(edge["kind"] == "next" for edge in active): continue
+                    supplied, observations = {}, []
+                    context = dict(occ["context"])
+                    if iteration is not None: context.update(zip(("index", "count", "item"), iteration))
+                    for edge in active:
+                        if edge["cycle"] and edge["kind"] == "next":
+                            limit = _count(prop(occ, edge["props"], "max_traversals", 10000))
+                            key = (group, edge["id"])
+                            count = flow["counters"].get(key, 0)
+                            if count >= limit: raise ValueError("cycle max_traversals exceeded")
+                            flow["counters"][key] = count + 1
+                        value = prop(occ, edge["props"], "value")
+                        if edge["into"] is not None:
+                            key = str(edge["into"])
+                            if key in supplied: raise ValueError("multiple values supplied to one field")
+                            supplied[key] = value
+                        observations.append((edge["id"], value))
+                    target = add(active[0]["target"], occ["scope"], target_group, context, supplied, iteration[3] if iteration is not None else occ["history"])
+                    occ["terminal"] = False
+                    queue.append(target)
+                    pending.extend([edge, target, group, value, False] for edge, value in observations)
+                remaining = []
+                for observation in pending:
+                    edge, target, group, value, notified = observation
+                    if not target["started"]:
+                        remaining.append(observation)
+                        continue
+                    if not notified:
+                        arrive(edge, target, group, value, False)
+                        observation[4] = True
+                    if any(edge in definition["inputs"] and prop(target, definition["props"], "observe", "arrival") == "result" for definition in plan["junctions"]):
+                        try: value = _flow_read(flow, target, target["node"]["id"], target["node"]["fields"]["output"]) if "output" in target["node"]["fields"] else None
+                        except ValueError as error:
+                            if str(error) != "referenced occurrence is not available": raise
+                            remaining.append(observation)
+                            continue
+                        arrive(edge, target, group, value, True)
+                pending[:] = remaining
+                occ["completed"] = True
+                occ["completion"] = flow["completed"]
+                flow["completed"] += 1
+            open_joins = [join for join in flow["joins"] if not join["closed"] and not any(observation[2] == join["group"] and observation[0] in plan["junctions"][join["junction"]]["inputs"] for observation in pending)]
+            if not open_joins:
+                if pending: raise ValueError("referenced occurrence is not available at group closure")
+                break
+            join = max(open_joins, key=lambda item: (plan["junctions"][item["junction"]]["kind"] == "reduce", item["group"]))
+            definition = plan["junctions"][join["junction"]]
+            if definition["kind"] == "accumulate" and (not join["emitted"] or any(join["queues"])): raise ValueError("accumulate group closed with a missing listed input")
+            if definition["kind"] == "quorum" and not join["emitted"]: raise ValueError("quorum group closed without enough distinct inputs")
+            if definition["kind"] == "reduce":
+                source = join["source"]
+                accumulator = prop(source, definition["props"], "initial")
+                if prop(source, definition["props"], "order", "source") == "source": join["arrivals"].sort(key=lambda arrival: (arrival["occ"]["index"], arrival["edge"]))
+                for arrival in join["arrivals"]:
+                    old = source["context"]
+                    source["context"] = {**old, "accumulator": accumulator, "arrival": {"edge": edges[arrival["edge"]]["name"], "value": arrival["value"]}}
+                    try: accumulator = prop(source, definition["props"], "combine")
+                    finally: source["context"] = old
+                emit(join, join["arrivals"], accumulator)
+            join["closed"] = True
+        final_scope = {}
+        for occ in flow["occurrences"]:
+            if occ["terminal"]: merge_scope(final_scope, occ["scope"])
+        root["scope"].update(final_scope)
+        for occ in flow["occurrences"]:
+            if occ["node"]["kind"] == "scorer":
+                fields = occ["node"]["fields"]
+                _score_span(occ["span"], occ["span"].parent, occ["node"]["name"], _flow_read(flow, occ, occ["node"]["id"], fields["score"]), _flow_read(flow, occ, occ["node"]["id"], fields["reason"]) if "reason" in fields else None)
+        output = plan["output"](flow, root)
+        return _agent_result(_details(root["span"]), output)
+    except Exception as error:
+        root["span"].fail(error)
+        raise
+    finally: root["span"].close_all()
 
 
 def _agent_result(details, output):
@@ -1114,6 +1370,28 @@ function _occurrence(span: Span): Record<string, unknown> {
     return Object.fromEntries(["input", "output", "expected", "metadata"].map(key => [key, _value(_read(span, key))]))
 }
 
+function _fork_pick(branches: unknown[][], randomSource: () => number): number {
+    const weights = branches.map(branch => {
+        const values = branch.map(_num)
+        if (values.some(value => !Number.isFinite(value) || value < 0 || value !== values[0])) {
+            throw new Error("weighted branch weights must agree and be finite nonnegative numbers")
+        }
+        return values[0] ?? 0
+    })
+    const scale = weights.reduce((maximum, weight) => Math.max(maximum, weight), 0)
+    if (scale === 0) return -1
+    let draw = randomSource() * weights.reduce((total, weight) => total + weight / scale, 0)
+    let pick = -1
+    for (let index = 0; index < weights.length; index++) {
+        if (weights[index] > 0) {
+            pick = index
+            draw -= weights[index] / scale
+            if (draw < 0) break
+        }
+    }
+    return pick
+}
+
 function _require_arrivals(ready: unknown): number {
     if (ready !== true) throw new Error("accumulate group closed with a missing listed input")
     return 1
@@ -1133,6 +1411,251 @@ function _score_span(span: Span, parent: Span, name: string, score: unknown, rea
     span.log(fields)
     parent.log({scores: {...(parent.fields.scores as Record<string, unknown> ?? {}), [name]: value}})
 }
+
+function _flow_property(occ: any, binding: number, read: () => unknown): unknown {
+    const key = String(binding)
+    occ.properties[key] ??= _lazy(() => _value(read()))
+    return occ.properties[key]()
+}
+function _flow_input(occ: any, binding: number, kind: string): unknown {
+    if (!(String(binding) in occ.supplied)) throw new Error("upstream value was not supplied")
+    return _check_type(occ.supplied[String(binding)], kind)
+}
+function _flow_read(flow: any, occ: any, node: number, binding: number): any {
+    const candidates = occ.node.id === node ? [occ] : occ.scope[node] ?? flow.occurrences.filter((other: any) => other.started && other.node.id === node && other.group === occ.group)
+    if (candidates.length !== 1) throw new Error(candidates.length === 0 ? "referenced occurrence is not available" : "ambiguous occurrence reference, read context.arrivals instead")
+    if (!candidates[0].started) throw new Error("referenced occurrence is not available")
+    return candidates[0].bindings[String(binding)]()
+}
+function _flow_context(flow: any, occ: any, path: string[]): any {
+    const key = path[0]
+    let value: any, skip = 1
+    if (key === "history") {
+        if (path.length < 2) throw new Error("history requires a node name")
+        if (!flow.nodes.some((node: any) => node.key === path[1])) throw new Error("unknown history node")
+        value = flow.occurrences.filter((previous: any) => previous.completed && previous.completion < occ.prior && previous.history === occ.history && previous.node.key === path[1]).map((previous: any) => Object.fromEntries(["input", "output", "expected", "metadata"].map(key => [key, key in previous.node.fields ? _flow_read(flow, previous, previous.node.id, previous.node.fields[key]) : null])))
+        skip = 2
+    } else if (key === "trace_index") value = 0
+    else if (key in occ.context) value = occ.context[key]
+    else if (occ.node.kind === "scorer" && ["input", "output", "expected", "metadata"].includes(key)) {
+        const parent = occ.scope[occ.node.parent][0]
+        value = key in parent.node.fields ? _flow_read(flow, parent, parent.node.id, parent.node.fields[key]) : null
+    } else throw new Error("context." + key + " is unavailable")
+    for (const key of path.slice(skip)) value = _index(value, key)
+    return value
+}
+function _flow_run(plan: any, input: unknown, randomSource: () => number, logger: any, missing: unknown): any {
+    const flow: any = {occurrences: [], joins: [], counters: new Map(), groups: 1, nodes: plan.nodes, completed: 0}
+    const nodes: any = Object.fromEntries(plan.nodes.map((node: any) => [node.id, node]))
+    const edges: any = Object.fromEntries(plan.edges.map((edge: any) => [edge.id, edge]))
+    const queue: any[] = []
+    let pending: any[] = []
+    const prop = (occ: any, props: any, key: string, fallback: any = null): any => key in props ? props[key](flow, occ) : fallback
+    const copyScope = (scope: any): any => Object.fromEntries(Object.entries(scope).map(([key, value]) => [key, [...value as any[]]]))
+    function mergeScope(target: any, source: any): void {
+        for (const [node, values] of Object.entries(source)) {
+            const found = target[node] ??= []
+            for (const value of values as any[]) if (!found.includes(value)) found.push(value)
+        }
+    }
+    function add(nodeId: number, scope: any, group: number, context: any, supplied: any, history = 0): any {
+        if (flow.occurrences.length >= 10000) throw new Error("graph execution budget exceeded (10000 occurrences)")
+        const node = nodes[nodeId], parents = node.parent === null ? [] : scope[node.parent] ?? []
+        if (node.parent !== null && parents.length !== 1) throw new Error("span parent occurrence is unavailable or ambiguous")
+        if (parents.length === 0 && flow.occurrences.length > 0) throw new Error("a cycle cannot create another root span inside one trace")
+        const kind = ["node", "vars"].includes(node.kind) ? "maybe" : node.kind === "span" ? "task" : node.kind
+        const index = flow.occurrences.length
+        const span = new Span(node.name, kind, parents.length ? parents[0].span : null, logger, String(index))
+        const occ: any = {node, index, scope: copyScope(scope), group, context: {...context}, supplied: {...supplied}, span, terminal: true, properties: {}, history, started: false, completed: false, prior: 0, completion: null}
+        occ.scope[nodeId] = [occ]
+        occ.bindings = Object.fromEntries(Object.entries(node.bindings).map(([key, fn]) => [key, _lazy(() => _value((fn as any)(flow, occ)))]))
+        if (index === 0 && input !== missing) occ.bindings[String(plan.input)] = () => input
+        for (const [key, binding] of Object.entries(node.fields)) {
+            if (["input", "output", "expected", "error", "metadata", "metrics", "tags", "duration"].includes(key)) span.fields[key] = _lazy(() => _flow_read(flow, occ, nodeId, binding as number))
+        }
+        flow.occurrences.push(occ)
+        return occ
+    }
+    function correlationKey(value: any): string {
+        if (Array.isArray(value)) return "[" + value.map(correlationKey).join(",") + "]"
+        if (value !== null && typeof value === "object") return "{" + Object.keys(value).sort().map(key => JSON.stringify(key) + ":" + correlationKey(value[key])).join(",") + "}"
+        return JSON.stringify(value)
+    }
+    function joinFor(junction: number, group: number, occ: any): any {
+        const definition = plan.junctions[junction], correlation = _serialize(prop(occ, definition.props, "correlate"))
+        const found = flow.joins.find((join: any) => join.junction === junction && join.group === group && correlationKey(join.correlation) === correlationKey(correlation))
+        if (found) return found
+        const join = {junction, group, correlation, source: occ, queues: definition.inputs.map(() => []), arrivals: [], emitted: false, closed: false}
+        flow.joins.push(join)
+        return join
+    }
+    function emit(join: any, arrivals: any[], accumulator: any = missing): void {
+        const source = join.source, scope = arrivals.length ? {} : copyScope(source.scope)
+        for (const arrival of arrivals) {mergeScope(scope, arrival.occ.scope); arrival.occ.terminal = false}
+        const context: any = {...source.context, arrivals: arrivals.map(arrival => ({edge: edges[arrival.edge].name, value: arrival.value}))}
+        if (accumulator !== missing) context.accumulator = accumulator
+        join.emitted = true
+        queue.push(add(plan.junctions[join.junction].target, scope, join.group, context, {}, source.history))
+    }
+    function arrive(edge: number, occ: any, group: number, value: any, result: boolean): void {
+        plan.junctions.forEach((definition: any, index: number) => {
+            if (!definition.inputs.includes(edge) || (prop(occ, definition.props, "observe", "arrival") === "result") !== result) return
+            const join = joinFor(index, group, occ), arrival = {edge, occ, value}
+            if (join.closed) throw new Error("arrival reached a closed junction group")
+            switch (definition.kind) {
+                case "merge": emit(join, [arrival]); break
+                case "first": if (!join.emitted) emit(join, [arrival]); break
+                case "reduce": join.arrivals.push(arrival); break
+                case "accumulate":
+                    join.queues[definition.inputs.indexOf(edge)].push(arrival)
+                    if (join.queues.every((items: any[]) => items.length)) emit(join, join.queues.map((items: any[]) => items.shift()))
+                    break
+                case "quorum":
+                    if (join.emitted) break
+                    if (!join.arrivals.some((old: any) => old.edge === edge)) join.arrivals.push(arrival)
+                    if (join.arrivals.length === _count(prop(occ, definition.props, "count"))) emit(join, [...join.arrivals].sort((a, b) => definition.inputs.indexOf(a.edge) - definition.inputs.indexOf(b.edge)))
+                    break
+            }
+        })
+    }
+    const root = add(plan.root, {}, 0, {}, {})
+    queue.push(root)
+    try {
+        for (;;) {
+            while (queue.length) {
+                const occ = queue.shift(), node = occ.node.id, group = occ.group
+                occ.prior = flow.completed
+                occ.started = true
+                for (const edge of plan.edges) {
+                    if (edge.source === node && edge.kind === "requires") {
+                        const required = occ.scope[edge.target] ?? []
+                        if (required.length !== 1 || !required[0].completed) throw new Error("required prerequisite occurrence is not complete")
+                    }
+                }
+                plan.junctions.forEach((definition: any, index: number) => {
+                    const activates = definition.fork !== null ? plan.forks.some((fork: any) => fork.id === definition.fork && fork.source === node) : definition.inputs.some((edge: number) => edges[edge].source === node)
+                    if (activates && !("correlate" in definition.props)) joinFor(index, group, occ)
+                })
+                const bundles: any[] = [], independent = new Map<string, number[]>()
+                for (const edge of plan.edges) {
+                    if (edge.source === node && edge.fork === null) {
+                        const key = String(edge.bundle)
+                        if (!independent.has(key)) independent.set(key, [])
+                        independent.get(key)!.push(edge.id)
+                    }
+                }
+                const supplies = [...independent.values()].filter(branch => !branch.some(edge => edges[edge].kind === "next")).flat().map(edge => edges[edge]).filter(edge => edge.kind === "feeds")
+                for (const branch of independent.values()) {
+                    const first = edges[branch[0]]
+                    const extra = branch.some(edge => edges[edge].kind === "next") ? supplies.filter(edge => edge.target === first.target && edge.cycle === first.cycle).map(edge => edge.id) : []
+                    bundles.push([[...branch, ...extra], group, null])
+                }
+                for (const fork of plan.forks) {
+                    if (fork.source !== node) continue
+                    if (["each", "repeat"].includes(fork.kind)) {
+                        if (fork.kind === "each" && _count(prop(occ, fork.props, "concurrency", 1)) === 0) throw new Error("each concurrency must be a positive integer")
+                        const count = fork.kind === "repeat" ? _count(prop(occ, fork.props, "count")) : 0
+                        if (count > 10000) throw new Error("repeat exceeds execution budget")
+                        const items = fork.kind === "each" ? prop(occ, fork.props, "items") : Array(count).fill(null)
+                        if (!Array.isArray(items)) throw new Error("each items must be an array")
+                        if (items.length > 10000) throw new Error("repeat exceeds execution budget")
+                        const history = flow.groups++
+                        items.forEach((item, index) => {
+                            const targetGroup = flow.groups++
+                            for (const branch of fork.branches) bundles.push([branch, targetGroup, [index, items.length, item, history]])
+                        })
+                    } else {
+                        let eligible: number[] = []
+                        fork.branches.forEach((branch: number[], index: number) => {if (branch.every(edge => _boolean(prop(occ, edges[edge].props, "when", true)))) eligible.push(index)})
+                        if (fork.kind === "exclusive" && eligible.length > 1) throw new Error("exclusive fork selected multiple branches")
+                        if (fork.kind === "weighted") {
+                            const weights = fork.branches.map((branch: number[], index: number) => eligible.includes(index) ? branch.map(edge => prop(occ, edges[edge].props, "weight")) : [0])
+                            const picked = _fork_pick(weights, randomSource)
+                            eligible = picked < 0 ? [] : [picked]
+                        }
+                        for (const index of eligible) bundles.push([fork.branches[index], group, null])
+                    }
+                }
+                for (const [branch, targetGroup, iteration] of bundles) {
+                    const active = branch.map((edge: number) => edges[edge]).filter((edge: any) => edge.fork !== null || _boolean(prop(occ, edge.props, "when", true)))
+                    if (!active.some((edge: any) => edge.kind === "next")) continue
+                    const supplied: any = {}, observations: any[] = [], context = {...occ.context}
+                    if (iteration !== null) Object.assign(context, {index: iteration[0], count: iteration[1], item: iteration[2]})
+                    for (const edge of active) {
+                        if (edge.cycle && edge.kind === "next") {
+                            const limit = _count(prop(occ, edge.props, "max_traversals", 10000)), key = `${group}:${edge.id}`, count = flow.counters.get(key) ?? 0
+                            if (count >= limit) throw new Error("cycle max_traversals exceeded")
+                            flow.counters.set(key, count + 1)
+                        }
+                        const value = prop(occ, edge.props, "value")
+                        if (edge.into !== null) {
+                            const key = String(edge.into)
+                            if (key in supplied) throw new Error("multiple values supplied to one field")
+                            supplied[key] = value
+                        }
+                        observations.push([edge.id, value])
+                    }
+                    const target = add(active[0].target, occ.scope, targetGroup, context, supplied, iteration !== null ? iteration[3] : occ.history)
+                    occ.terminal = false
+                    queue.push(target)
+                    for (const [edge, value] of observations) pending.push([edge, target, group, value, false])
+                }
+                const remaining: any[] = []
+                for (const observation of pending) {
+                    const [edge, target, group, value, notified] = observation
+                    if (!target.started) {remaining.push(observation); continue}
+                    if (!notified) {arrive(edge, target, group, value, false); observation[4] = true}
+                    if (plan.junctions.some((definition: any) => definition.inputs.includes(edge) && prop(target, definition.props, "observe", "arrival") === "result")) {
+                        let result: any
+                        try {result = "output" in target.node.fields ? _flow_read(flow, target, target.node.id, target.node.fields.output) : null}
+                        catch (error) {
+                            if (!(error instanceof Error) || error.message !== "referenced occurrence is not available") throw error
+                            remaining.push(observation)
+                            continue
+                        }
+                        arrive(edge, target, group, result, true)
+                    }
+                }
+                pending = remaining
+                occ.completed = true
+                occ.completion = flow.completed++
+            }
+            const open = flow.joins.filter((join: any) => !join.closed && !pending.some(observation => observation[2] === join.group && plan.junctions[join.junction].inputs.includes(observation[0]))).sort((a: any, b: any) => Number(plan.junctions[b.junction].kind === "reduce") - Number(plan.junctions[a.junction].kind === "reduce") || b.group - a.group)
+            if (!open.length) {
+                if (pending.length) throw new Error("referenced occurrence is not available at group closure")
+                break
+            }
+            const join = open[0], definition = plan.junctions[join.junction]
+            if (definition.kind === "accumulate" && (!join.emitted || join.queues.some((items: any[]) => items.length))) throw new Error("accumulate group closed with a missing listed input")
+            if (definition.kind === "quorum" && !join.emitted) throw new Error("quorum group closed without enough distinct inputs")
+            if (definition.kind === "reduce") {
+                const source = join.source
+                let accumulator = prop(source, definition.props, "initial")
+                if (prop(source, definition.props, "order", "source") === "source") join.arrivals.sort((a: any, b: any) => a.occ.index - b.occ.index || a.edge - b.edge)
+                for (const arrival of join.arrivals) {
+                    const old = source.context
+                    source.context = {...old, accumulator, arrival: {edge: edges[arrival.edge].name, value: arrival.value}}
+                    try {accumulator = prop(source, definition.props, "combine")} finally {source.context = old}
+                }
+                emit(join, join.arrivals, accumulator)
+            }
+            join.closed = true
+        }
+        const finalScope = {}
+        for (const occ of flow.occurrences) if (occ.terminal) mergeScope(finalScope, occ.scope)
+        Object.assign(root.scope, finalScope)
+        for (const occ of flow.occurrences) {
+            if (occ.node.kind === "scorer") {
+                const fields = occ.node.fields
+                _score_span(occ.span, occ.span.parent, occ.node.name, _flow_read(flow, occ, occ.node.id, fields.score), "reason" in fields ? _flow_read(flow, occ, occ.node.id, fields.reason) : null)
+            }
+        }
+        const output = plan.output(flow, root)
+        return _agent_result(_details(root.span), output)
+    } catch(error) {root.span.fail(error); throw error}
+    finally {root.span.closeAll()}
+}
+
 
 function _agent_result(details: any, output: unknown): any {
     details.output = _serialize(output);

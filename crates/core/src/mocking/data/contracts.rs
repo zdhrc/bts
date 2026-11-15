@@ -49,6 +49,8 @@ use crate::dsl::{Automation, Dataset, Experiment, Facet, Object, Scorer, SrcRang
 /// reference indexes and type guarantees. A default model is empty.
 #[derive(Debug, Clone, Default)]
 pub struct Model {
+    /// Occurrence-based plans indexed by their root definition.
+    pub flows: Vec<Flow>,
     /// Whether consumers must preserve the lowered progression order.
     pub ordered: bool,
     /// Root trace definitions in declaration order.
@@ -370,4 +372,58 @@ pub enum CtxRef {
     RepeatIndexAt(NodeId),
     /// The count of the innermost repeat.
     RepeatCount,
+}
+
+/// A graph execution plan with independent occurrence scopes.
+#[derive(Debug, Clone)]
+pub struct Flow {
+    pub root: NodeId,
+    pub input: usize,
+    pub nodes: Vec<FlowNode>,
+    pub edges: Vec<FlowEdge>,
+    pub forks: Vec<FlowFork>,
+    pub junctions: Vec<FlowJunction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowNode {
+    pub id: NodeId,
+    pub key: String,
+    pub name: String,
+    pub kind: String,
+    pub parent: Option<NodeId>,
+    pub bindings: Vec<(usize, Value)>,
+    pub fields: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowEdge {
+    pub id: usize,
+    pub bundle: usize,
+    pub name: Value,
+    pub source: NodeId,
+    pub target: NodeId,
+    pub kind: String,
+    pub cycle: bool,
+    pub into: Option<usize>,
+    pub props: Vec<(String, Value)>,
+    pub fork: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowFork {
+    pub id: usize,
+    pub source: NodeId,
+    pub kind: String,
+    pub branches: Vec<Vec<usize>>,
+    pub props: Vec<(String, Value)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowJunction {
+    pub target: NodeId,
+    pub kind: String,
+    pub inputs: Vec<usize>,
+    pub props: Vec<(String, Value)>,
+    pub fork: Option<usize>,
 }

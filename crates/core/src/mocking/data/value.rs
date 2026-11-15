@@ -317,6 +317,19 @@ pub mod expr {
     /// cause failures such as an invalid index or numeric overflow.
     #[derive(Debug, Clone)]
     pub enum Func {
+        /// Reads a binding from the selected graph occurrence.
+        FlowRead {
+            node: super::super::super::NodeId,
+            binding: usize,
+        },
+        /// Caches an edge or fork property for its source occurrence.
+        FlowProperty { binding: usize, value: Box<Value> },
+        /// Reads occurrence-local runtime context.
+        FlowContext(Vec<String>),
+        /// Requires a value supplied by an incoming edge.
+        FlowInput { binding: usize, ty: bts_lang::FieldType },
+        /// Selects one eligible fork branch, or minus one when none qualify.
+        ForkPick(Vec<Vec<Value>>),
         /// Requires every listed junction input before activating its target.
         Arrivals { ready: Box<Value> },
         /// Checks the value delivered to a schema-constrained field.

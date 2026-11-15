@@ -220,7 +220,7 @@ impl<'src> Parser<'src> {
         self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
         let mut entries = Vec::new();
         loop {
-            if !self.check(token!(Minus)) {
+            if !matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde) {
                 self.errors.push(Error::new(ErrorKind::ExpectedForkEntry, self.peek().range));
                 return None;
             }

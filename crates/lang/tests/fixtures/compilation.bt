@@ -455,7 +455,7 @@
 
 # consumers sample weighted branches using their seeded evaluation context
 (graph_a)
-    =[:weighted {count: 1}]=>[
+    =[:weighted]=>[
         -[:next {weight: 3}]->(graph_b),
         -[:next {weight: 1}]->(graph_c),
     ];
@@ -490,3 +490,24 @@
     =[:repeat {count: 3}]=>[
         -[:next]->(attempt:tool) {input: context.history.attempt, output: {index: context.index, count: context.count}},
     ];
+
+# loop-back and exit are alternatives, with explicit data carried into the next visit
+(cycle_lookup:node) {input: <-, output: context.lookup_result};
+(cycle_check:node) {output: context.retry_decision};
+(cycle_finish:node);
+(cycle_lookup)-[:next]->(cycle_check)
+    =[:exclusive]=>[
+        ~[:next {when: source.output.retry, max_traversals: 3},
+          :feeds {when: source.output.retry, value: source.output.next_input, into: target.input}]~>(cycle_lookup),
+        -[:next {when: !source.output.retry}]->(cycle_finish),
+    ];
+
+# junction results remain explicit rather than overwriting destination fields
+(graph_a)
+    =[:parallel]=>[
+        -[arrival_a:next]->(arrival_left:node),
+        -[arrival_b:next]->(arrival_right:node),
+    ]
+        >[:merge [arrival_a], [arrival_b]]>>(merged:node) {arrivals: context.arrivals}
+        >[:first [arrival_a], [arrival_b]]>>(winner:node) {arrivals: context.arrivals}
+        >[:quorum {count: 2} [arrival_a], [arrival_b]]>>(quorum_result:node) {arrivals: context.arrivals};

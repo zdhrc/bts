@@ -1391,6 +1391,7 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
     if construct == Construct::Edge {
         names.push(("when", FieldType::Boolean, false));
         names.push(("weight", FieldType::Number, false));
+        names.push(("max_traversals", FieldType::Number, false));
     }
     match primitive {
         "feeds" => names.extend([("value", FieldType::Any, false), ("into", FieldType::Any, false)]),
@@ -1416,7 +1417,7 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
             ("unique", FieldType::Boolean, false),
         ]),
         "incidence" => names.push(("role", FieldType::String, false)),
-        "weighted" => names.push(("count", FieldType::Number, false)),
+
         "repeat" => names.push(("count", FieldType::Number, true)),
         "each" => names.extend([("items", FieldType::Array, true), ("concurrency", FieldType::Number, false)]),
         "reduce" => names.extend([
@@ -2182,6 +2183,20 @@ fn validate_graph(model: &mut Model) -> Result<()> {
     let mut incidences: HashMap<NodeId, Vec<(NodeId, String)>> = HashMap::new();
     for (i, edge) in model.edges.iter().enumerate() {
         let owner = ElementId::Edge(EdgeId(i));
+        let check = GraphCheck {
+            model,
+            owner,
+            range: edge.range,
+        };
+        if let Some(limit) = check.prop("max_traversals") {
+            if !edge.cycle {
+                return check.error("max_traversals requires a cycle edge");
+            }
+            check.typed(limit, FieldType::Number)?;
+            if expr::constant(limit) {
+                check.count(limit, "max_traversals")?;
+            }
+        }
         if primitive(model, owner) == "incidence" {
             let check = GraphCheck {
                 model,
@@ -2265,14 +2280,11 @@ fn validate_graph(model: &mut Model) -> Result<()> {
                 }
             }
             "weighted" => {
-                let count = check.positive_count("count", Some(1))?;
-                if count.is_some_and(|count| count > fork.branches.len()) {
-                    return check.error("weighted count must be positive and no larger than its branch count");
+                if check.prop("count").is_some() {
+                    return check.error("weighted selects exactly one branch and does not accept count");
                 }
-                let mut possible = 0;
                 for branch in &fork.branches {
                     let mut branch_weight = None;
-                    let mut eligible = true;
                     for edge in branch {
                         let edge_check = GraphCheck {
                             model,
@@ -2280,7 +2292,7 @@ fn validate_graph(model: &mut Model) -> Result<()> {
                             range: model.edges[edge.0].range,
                         };
                         let weight = match edge_check.prop("weight") {
-                            None => Some(1.0),
+                            None => return edge_check.error("weighted branches require an explicit weight"),
                             Some(Value::Num(Number::Int(value))) => Some(*value as f64),
                             Some(Value::Num(Number::Float(value))) => Some(*value),
                             Some(value) if !expr::constant(value) => None,
@@ -2295,16 +2307,7 @@ fn validate_graph(model: &mut Model) -> Result<()> {
                             }
                             branch_weight = Some(weight);
                         }
-                        if matches!(edge_check.prop("when"), Some(Value::Bool(false))) {
-                            eligible = false;
-                        }
                     }
-                    if eligible && branch_weight.is_none_or(|weight| weight > 0.0) {
-                        possible += 1;
-                    }
-                }
-                if possible < count.unwrap_or(1) {
-                    return check.error("weighted fork has too few potentially eligible positive-weight branches");
                 }
             }
             _ => {}

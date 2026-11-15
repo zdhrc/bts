@@ -16,15 +16,15 @@ pub fn compile(source: &str) -> Result<execution::Model, String> {
     super::Bundle::compile(source)
 }
 
-/// Lowers provider behavior graphs into the shared mocking execution model.
+/// Lowers provider behavior graphs into shared mocking execution plans.
 ///
-/// Unsupported control flow is rejected before either mocking consumer runs.
 /// Membership, progression and span parenting remain separate relationships.
-/// The entry task reads agent input. Agent output is independent of span output. Members form one
-/// directed progression graph and one rooted span tree whose nesting preserves that order.
-/// Guarded, conditional, exclusive and parallel splits are supported.
-/// Iteration forks and attached accumulate junctions retain their activation scopes.
-/// Unsupported cycle and junction policies produce lowering errors.
+/// Acyclic nested behavior uses a static plan. Cycles and junctions retain
+/// occurrence scopes, queues and group closure in a graph plan.
+/// Both consumers enforce traversal limits and a 10000 occurrence budget.
+/// One trace has one entry span, so loop-back targets must be its descendants.
+/// Authored error payloads are trace data, not failed runtime operations.
+/// Expression errors abort generation. Mocking does not dispatch cancellable operations.
 pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
     let mut result = execution::Model {
         ordered: true,
@@ -34,7 +34,20 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
         if !inherits(model, &node.kind, "agent") {
             continue;
         }
-        let mut lowerer = AgentLowering::new(model, graph::NodeId(index), &mut result)?;
+        let agent = graph::NodeId(index);
+        let members: HashSet<_> = model
+            .edges
+            .iter()
+            .filter(|edge| edge.source == agent && inherits(model, &edge.kind, "contains"))
+            .map(|edge| edge.target)
+            .collect();
+        if model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
+            || model.junctions.iter().any(|junction| members.contains(&junction.target))
+        {
+            lower_flow(model, agent, &members, &mut result)?;
+            continue;
+        }
+        let mut lowerer = AgentLowering::new(model, agent, &mut result)?;
         lowerer.lower()?;
     }
     for (index, node) in model.nodes.iter().enumerate() {
@@ -52,6 +65,7 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
             inputs: HashMap::new(),
             building: vec![],
             callable: true,
+            flow: false,
             result: &mut result,
         };
         let kind = if let Some(judge) = lowerer.binding(id, "judge") {
@@ -265,9 +279,261 @@ fn resource_value(
         inputs: HashMap::new(),
         building: vec![],
         callable: true,
+        flow: false,
         result,
     }
     .value(value)
+}
+
+fn lower_flow(
+    graph: &graph::Model,
+    agent: graph::NodeId,
+    members: &HashSet<graph::NodeId>,
+    result: &mut execution::Model,
+) -> Result<(), String> {
+    let entries: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.source == agent && inherits(graph, &edge.kind, "next"))
+        .collect();
+    if entries.len() != 1 || !entries[0].props.is_empty() || entries[0].fork.is_some() || entries[0].cycle {
+        return Err("agent needs one unconditional entry edge".into());
+    }
+    let root = entries[0].target;
+    if !members.contains(&root) {
+        return Err("agent entry must be a member".into());
+    }
+    if !inherits(graph, &graph.nodes[root.0].kind, "task") && graph.nodes[root.0].kind != "span" {
+        return Err("the entry must be a task or span".into());
+    }
+    let mut parents = HashMap::new();
+    for edge in &graph.edges {
+        if members.contains(&edge.source)
+            && inherits(graph, &edge.kind, "child_of")
+            && (!members.contains(&edge.target) || !edge.props.is_empty() || parents.insert(edge.source, edge.target).is_some())
+        {
+            return Err("child_of needs one unconfigured member parent".into());
+        }
+    }
+    if parents.contains_key(&root) {
+        return Err("entry span cannot have a parent".into());
+    }
+    for node in members {
+        let mut cursor = *node;
+        let mut seen = HashSet::new();
+        while cursor != root {
+            if !seen.insert(cursor) {
+                return Err("span parenting cannot contain cycles".into());
+            }
+            cursor = *parents
+                .get(&cursor)
+                .ok_or("each member needs a child_of path to the entry span")?;
+        }
+    }
+    let mut lowerer = AgentLowering {
+        graph,
+        agent,
+        root,
+        order: (0..graph.nodes.len())
+            .map(graph::NodeId)
+            .filter(|n| members.contains(n))
+            .collect(),
+        guards: HashMap::new(),
+        parents: parents.clone(),
+        inputs: HashMap::new(),
+        building: vec![],
+        callable: false,
+        flow: true,
+        result,
+    };
+    let input = lowerer.binding(agent, "input").ok_or("agent needs input")?;
+    let root_input = lowerer.binding(root, "input").ok_or("entry span needs input")?;
+    if !matches!(graph.bindings[root_input.0].value, graph::Value::BindingRef(id, _) if id == input) {
+        return Err("entry span input must reference the agent input".into());
+    }
+    let output = lowerer.binding(agent, "output").ok_or("agent needs output")?;
+    let output = lowerer.binding_value(output)?;
+    let mut nodes = vec![];
+    for node in lowerer.order.clone() {
+        let kind = ["scorer", "tool", "llm", "function", "task", "span", "vars", "node"]
+            .into_iter()
+            .find(|kind| inherits(graph, &graph.nodes[node.0].kind, kind))
+            .ok_or("unsupported graph execution node kind")?;
+        let mut bindings = Vec::new();
+        for (id, binding) in graph.bindings.iter().enumerate() {
+            if binding.owner == graph::ElementId::Node(node)
+                || (node == root
+                    && binding.owner == graph::ElementId::Node(agent)
+                    && binding.path.first().is_some_and(|key| key == "input"))
+            {
+                bindings.push((id, lowerer.binding_value(graph::BindingId(id))?));
+            }
+        }
+        let fields = graph.nodes[node.0]
+            .fields
+            .iter()
+            .filter_map(|id| {
+                let binding = &graph.bindings[id.0];
+                (binding.path.len() == 1).then(|| (binding.path[0].clone(), id.0))
+            })
+            .collect();
+        nodes.push(execution::FlowNode {
+            id: AgentLowering::id(node),
+            key: graph.nodes[node.0].name.clone().unwrap_or_else(|| format!("node_{}", node.0)),
+            name: lowerer.name(node)?,
+            kind: kind.into(),
+            parent: parents.get(&node).copied().map(AgentLowering::id),
+            bindings,
+            fields,
+        });
+    }
+    let mut edges = vec![];
+    for (id, edge) in graph.edges.iter().enumerate() {
+        if !members.contains(&edge.source) || inherits(graph, &edge.kind, "child_of") {
+            continue;
+        }
+        if !members.contains(&edge.target) || edge.direction != graph::Direction::Directed {
+            return Err("execution edges require directed member endpoints".into());
+        }
+        if edge.cycle && edge.target == root {
+            return Err("cycle edges cannot target the trace entry span".into());
+        }
+        let kind = ["next", "feeds", "link", "requires", "contains"]
+            .into_iter()
+            .find(|kind| inherits(graph, &edge.kind, kind))
+            .ok_or("unsupported execution edge kind")?;
+        let mut props = vec![];
+        let mut into = None;
+        for prop in &edge.props {
+            let binding = &graph.bindings[prop.0];
+            if binding.path == ["into"] {
+                if let graph::Value::FieldRef(target) = binding.value {
+                    if graph.bindings[target.0].owner != graph::ElementId::Node(edge.target)
+                        || !matches!(graph.bindings[target.0].value, graph::Value::Input { .. })
+                    {
+                        return Err("feeds destination must declare an upstream field on its target".into());
+                    }
+                    into = Some(target.0)
+                }
+            } else {
+                if !["when", "weight", "value", "max_traversals"].contains(&binding.path[0].as_str()) {
+                    return Err(format!("unsupported execution edge property {}", binding.path[0]));
+                }
+                props.push((binding.path[0].clone(), lowerer.flow_property(*prop)?));
+            }
+        }
+        if kind == "feeds" && (into.is_none() || !props.iter().any(|(key, _)| key == "value")) {
+            return Err("feeds requires value and into".into());
+        }
+        let bundle = graph
+            .paths
+            .iter()
+            .chain(graph.forks.iter().flat_map(|fork| fork.continuations.iter()))
+            .flat_map(|path| path.steps.iter())
+            .find_map(|step| match step {
+                graph::PathStep::Edges(ids) if ids.contains(&graph::EdgeId(id)) => ids.first().map(|id| id.0),
+                _ => None,
+            })
+            .unwrap_or(id);
+        edges.push(execution::FlowEdge {
+            id,
+            bundle,
+            name: edge
+                .name
+                .clone()
+                .map(execution::Value::Str)
+                .unwrap_or(execution::Value::Num(execution::Number::Int(id as i64))),
+            source: AgentLowering::id(edge.source),
+            target: AgentLowering::id(edge.target),
+            kind: kind.into(),
+            cycle: edge.cycle,
+            into,
+            props,
+            fork: edge.fork.map(|f| f.0),
+        });
+    }
+    let mut forks = vec![];
+    for (id, fork) in graph
+        .forks
+        .iter()
+        .enumerate()
+        .filter(|(_, fork)| members.contains(&fork.source))
+    {
+        let kind = ["parallel", "conditional", "exclusive", "weighted", "each", "repeat"]
+            .into_iter()
+            .find(|kind| inherits(graph, &fork.kind, kind))
+            .ok_or("unsupported fork execution kind")?;
+        let props = fork
+            .props
+            .iter()
+            .map(|id| Ok((graph.bindings[id.0].path[0].clone(), lowerer.flow_property(*id)?)))
+            .collect::<Result<_, String>>()?;
+        forks.push(execution::FlowFork {
+            id,
+            source: AgentLowering::id(fork.source),
+            kind: kind.into(),
+            branches: fork.branches.iter().map(|b| b.iter().map(|e| e.0).collect()).collect(),
+            props,
+        });
+    }
+    let mut junctions = vec![];
+    for junction in graph.junctions.iter().filter(|j| members.contains(&j.target)) {
+        let kind = ["accumulate", "merge", "first", "quorum", "reduce"]
+            .into_iter()
+            .find(|kind| inherits(graph, &junction.kind, kind))
+            .ok_or("unsupported junction execution kind")?;
+        if junction.inputs.iter().any(|id| !edges.iter().any(|edge| edge.id == id.0)) {
+            return Err("junction inputs must belong to the current agent".into());
+        }
+        let props = junction
+            .props
+            .iter()
+            .map(|id| Ok((graph.bindings[id.0].path[0].clone(), lowerer.flow_property(*id)?)))
+            .collect::<Result<_, String>>()?;
+        junctions.push(execution::FlowJunction {
+            target: AgentLowering::id(junction.target),
+            kind: kind.into(),
+            inputs: junction.inputs.iter().map(|e| e.0).collect(),
+            props,
+            fork: junction.fork.map(|f| f.0),
+        });
+    }
+    let root_id = AgentLowering::id(root);
+    let fields = lowerer.fields(root)?;
+    let name = lowerer.name(root)?;
+    lowerer.result.traces.push(execution::Trace {
+        node: root_id,
+        name,
+        fields,
+        bindings: vec![],
+        children: vec![],
+    });
+    let entrypoint = execution::RefId(lowerer.result.refs.len() as u32);
+    lowerer.result.refs.push(execution::ResolvedRef {
+        module: Some(root_id),
+        up: 0,
+        steps: vec![],
+        accessor: execution::Accessor::Block {
+            node: root_id,
+            kind: "trace",
+        },
+        path: vec![],
+        range: graph.nodes[agent.0].range,
+    });
+    lowerer.result.agents.push(execution::Agent {
+        name: node_name(graph, agent)?,
+        entrypoint,
+        output,
+    });
+    lowerer.result.flows.push(execution::Flow {
+        root: root_id,
+        input: input.0,
+        nodes,
+        edges,
+        forks,
+        junctions,
+    });
+    Ok(())
 }
 
 fn lower_resources(graph: &graph::Model, result: &mut execution::Model) -> Result<(), String> {
@@ -409,6 +675,7 @@ struct AgentLowering<'a> {
     inputs: HashMap<graph::BindingId, graph::BindingId>,
     building: Vec<graph::BindingId>,
     callable: bool,
+    flow: bool,
     result: &'a mut execution::Model,
 }
 
@@ -427,7 +694,10 @@ impl<'a> AgentLowering<'a> {
             if fork.source != agent && !members.contains(&fork.source) {
                 continue;
             }
-            if !["parallel", "conditional", "exclusive", "each", "repeat"]
+            if fork.source == agent && inherits(graph, &fork.kind, "weighted") {
+                return Err("agent entry must be unconditional, not a weighted selection".into());
+            }
+            if !["parallel", "conditional", "exclusive", "each", "repeat", "weighted"]
                 .iter()
                 .any(|kind| inherits(graph, &fork.kind, kind))
                 || (!inherits(graph, &fork.kind, "each") && !inherits(graph, &fork.kind, "repeat") && !fork.props.is_empty())
@@ -458,10 +728,19 @@ impl<'a> AgentLowering<'a> {
             if inherits(graph, kind, "next") {
                 let mut guards = Vec::new();
                 for id in &edge.props {
-                    if graph.bindings[id.0].path != ["when"] {
-                        return Err("configured next edges are not supported by mocking yet".into());
+                    match graph.bindings[id.0].path[0].as_str() {
+                        "when" => guards.push(*id),
+                        "weight"
+                            if graph.forks.iter().any(|fork| {
+                                inherits(graph, &fork.kind, "weighted")
+                                    && fork
+                                        .branches
+                                        .iter()
+                                        .flatten()
+                                        .any(|id| std::ptr::eq(&graph.edges[id.0], edge))
+                            }) => {}
+                        _ => return Err("configured next edges are not supported by mocking yet".into()),
                     }
-                    guards.push(*id);
                 }
                 let targets = next.entry(edge.source).or_default();
                 if targets.iter().any(|(target, _)| *target == edge.target) {
@@ -487,6 +766,15 @@ impl<'a> AgentLowering<'a> {
                                 into = Some(id);
                             }
                         }
+                        Some("weight" | "when")
+                            if graph.forks.iter().any(|fork| {
+                                inherits(graph, &fork.kind, "weighted")
+                                    && fork
+                                        .branches
+                                        .iter()
+                                        .flatten()
+                                        .any(|id| std::ptr::eq(&graph.edges[id.0], edge))
+                            }) => {}
                         _ => return Err("configured feeds edges are not supported by mocking yet".into()),
                     }
                 }
@@ -604,6 +892,7 @@ impl<'a> AgentLowering<'a> {
             inputs,
             building: vec![],
             callable: false,
+            flow: false,
             result,
         })
     }
@@ -671,8 +960,25 @@ impl<'a> AgentLowering<'a> {
             }
         }
         bindings.extend(self.fork_bindings(self.root)?);
-        let guard_ids: std::collections::BTreeSet<_> = self.guards.values().flatten().copied().collect();
+        let guard_ids: std::collections::BTreeSet<_> = self
+            .guards
+            .values()
+            .flatten()
+            .copied()
+            .chain(
+                self.graph
+                    .forks
+                    .iter()
+                    .filter(|fork| self.order.contains(&fork.source) && inherits(self.graph, &fork.kind, "weighted"))
+                    .flat_map(|fork| fork.branches.iter().flatten())
+                    .flat_map(|edge| self.graph.edges[edge.0].props.iter().copied())
+                    .filter(|id| self.graph.bindings[id.0].path == ["when"]),
+            )
+            .collect();
         for id in guard_ids {
+            if self.weighted_guard(id) {
+                continue;
+            }
             if let graph::ElementId::Edge(edge) = self.graph.bindings[id.0].owner
                 && self.each_ancestor(self.graph.edges[edge.0].source).is_some()
             {
@@ -753,14 +1059,165 @@ impl<'a> AgentLowering<'a> {
             .flat_map(|fork| fork.props.iter().copied())
             .filter(|id| matches!(self.graph.bindings[id.0].path[0].as_str(), "count" | "items"))
             .collect();
-        ids.into_iter()
-            .map(|id| {
-                Ok(execution::Binding {
-                    name: format!("fork_input_{}", id.0),
-                    value: self.binding_value(id)?,
+        let mut bindings = self.weighted_bindings(node)?;
+        bindings.extend(
+            ids.into_iter()
+                .map(|id| {
+                    Ok(execution::Binding {
+                        name: format!("fork_input_{}", id.0),
+                        value: self.binding_value(id)?,
+                    })
                 })
+                .collect::<Result<Vec<_>, String>>()?,
+        );
+        Ok(bindings)
+    }
+
+    fn weighted_branches(&self, node: graph::NodeId) -> Vec<(usize, usize)> {
+        let mut result = Vec::new();
+        for (index, fork) in self.graph.forks.iter().enumerate() {
+            if !inherits(self.graph, &fork.kind, "weighted") {
+                continue;
+            }
+            for (branch, edges) in fork.branches.iter().enumerate() {
+                let mut pending: Vec<_> = edges.iter().map(|id| self.graph.edges[id.0].target).collect();
+                let mut seen = HashSet::new();
+                while let Some(current) = pending.pop() {
+                    if !seen.insert(current) {
+                        continue;
+                    }
+                    if current == node {
+                        result.push((index, branch));
+                        break;
+                    }
+                    pending.extend(
+                        self.graph
+                            .edges
+                            .iter()
+                            .filter(|edge| edge.source == current && !edge.cycle && inherits(self.graph, &edge.kind, "next"))
+                            .map(|edge| edge.target),
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    fn node_condition(&self, node: graph::NodeId) -> execution::Value {
+        let mut condition = self.condition(&self.guards[&node]);
+        for (fork, branch) in self.weighted_branches(node) {
+            let selected = execution::Value::Binary {
+                op: execution::BinOp::Eq,
+                lhs: Box::new(execution::Value::VarRef(format!("fork_pick_{fork}"))),
+                rhs: Box::new(execution::Value::Num(execution::Number::Int(branch as i64))),
+                range: self.graph.forks[fork].range,
+            };
+            condition = execution::Value::Binary {
+                op: execution::BinOp::And,
+                lhs: Box::new(condition),
+                rhs: Box::new(selected),
+                range: self.graph.nodes[node.0].range,
+            };
+        }
+        condition
+    }
+
+    fn weighted_guard(&self, id: graph::BindingId) -> bool {
+        let graph::ElementId::Edge(edge) = self.graph.bindings[id.0].owner else {
+            return false;
+        };
+        self.graph.edges[edge.0]
+            .fork
+            .is_some_and(|fork| inherits(self.graph, &self.graph.forks[fork.0].kind, "weighted"))
+    }
+
+    fn weighted_owner(&self, fork: &graph::Fork) -> graph::NodeId {
+        let mut owner = fork.source;
+        loop {
+            let encloses = fork.branches.iter().flatten().all(|id| {
+                let mut node = self.graph.edges[id.0].target;
+                loop {
+                    if node == owner {
+                        return true;
+                    }
+                    let Some(parent) = self.parents.get(&node) else { return false };
+                    node = *parent;
+                }
+            });
+            if encloses {
+                return owner;
+            }
+            owner = self.parents[&owner];
+        }
+    }
+
+    fn weighted_bindings(&mut self, owner: graph::NodeId) -> Result<Vec<execution::Binding>, String> {
+        let forks: Vec<_> = self
+            .graph
+            .forks
+            .iter()
+            .enumerate()
+            .filter(|(_, fork)| {
+                self.order.contains(&fork.source)
+                    && inherits(self.graph, &fork.kind, "weighted")
+                    && self.weighted_owner(fork) == owner
             })
-            .collect()
+            .map(|(i, fork)| (i, fork.clone()))
+            .collect();
+        let mut bindings = Vec::new();
+        for (index, fork) in forks {
+            for id in fork
+                .branches
+                .iter()
+                .flatten()
+                .flat_map(|edge| self.graph.edges[edge.0].props.clone())
+                .filter(|id| self.graph.bindings[id.0].path == ["when"])
+                .collect::<Vec<_>>()
+            {
+                bindings.push(execution::Binding {
+                    name: format!("guard_{}", id.0),
+                    value: self.binding_value(id)?,
+                });
+            }
+            let mut branches = Vec::new();
+            for branch in &fork.branches {
+                let mut guard = execution::Value::Bool(true);
+                for edge in branch {
+                    for id in &self.graph.edges[edge.0].props {
+                        if self.graph.bindings[id.0].path == ["when"] {
+                            guard = execution::Value::Binary {
+                                op: execution::BinOp::And,
+                                lhs: Box::new(guard),
+                                rhs: Box::new(execution::Value::VarRef(format!("guard_{}", id.0))),
+                                range: fork.range,
+                            };
+                        }
+                    }
+                }
+                let mut weights = Vec::new();
+                for edge in branch {
+                    let id = *self.graph.edges[edge.0]
+                        .props
+                        .iter()
+                        .find(|id| self.graph.bindings[id.0].path == ["weight"])
+                        .ok_or("weighted branch needs weight")?;
+                    weights.push(execution::Value::Cond {
+                        cond: Box::new(guard.clone()),
+                        then: Box::new(self.binding_value(id)?),
+                        otherwise: Box::new(execution::Value::Num(execution::Number::Int(0))),
+                    });
+                }
+                branches.push(weights);
+            }
+            bindings.push(execution::Binding {
+                name: format!("fork_pick_{index}"),
+                value: execution::Value::Func {
+                    func: execution::Func::ForkPick(branches),
+                    range: fork.range,
+                },
+            });
+        }
+        Ok(bindings)
     }
 
     fn iteration_bindings(&mut self, index: usize) -> Result<Vec<execution::Binding>, String> {
@@ -782,7 +1239,7 @@ impl<'a> AgentLowering<'a> {
                         .is_some_and(|(i, _)| i == index) =>
                 {
                     match binding.path[0].as_str() {
-                        "when" => Some(format!("guard_{id}")),
+                        "when" if !self.weighted_guard(graph::BindingId(id)) => Some(format!("guard_{id}")),
                         "value" => Some(format!("edge_value_{id}")),
                         _ => None,
                     }
@@ -921,20 +1378,23 @@ impl<'a> AgentLowering<'a> {
                     })
                 };
                 let guards = &self.guards[&node];
-                if guards.is_empty() && self.junction(node).is_none() {
+                if guards.is_empty() && self.junction(node).is_none() && self.weighted_branches(node).is_empty() {
                     return Ok(span);
                 }
-                let condition = self.condition(guards);
+                let condition = self.node_condition(node);
                 let active = if let Some(junction) = self.junction(node) {
-                    let guards: Vec<_> = junction
-                        .inputs
-                        .iter()
-                        .flat_map(|id| self.guards[&self.graph.edges[id.0].target].clone())
-                        .collect();
+                    let ready =
+                        junction
+                            .inputs
+                            .iter()
+                            .fold(execution::Value::Bool(true), |ready, id| execution::Value::Binary {
+                                op: execution::BinOp::And,
+                                lhs: Box::new(ready),
+                                rhs: Box::new(self.node_condition(self.graph.edges[id.0].target)),
+                                range: junction.range,
+                            });
                     execution::Value::Func {
-                        func: execution::Func::Arrivals {
-                            ready: Box::new(self.condition(&guards)),
-                        },
+                        func: execution::Func::Arrivals { ready: Box::new(ready) },
                         range: junction.range,
                     }
                 } else {
@@ -1070,6 +1530,21 @@ impl<'a> AgentLowering<'a> {
 
     fn reference(&mut self, id: graph::BindingId) -> Result<execution::Value, String> {
         let binding = &self.graph.bindings[id.0];
+        if self.flow {
+            if let graph::ElementId::Node(node) = binding.owner {
+                if node != self.agent && !self.order.contains(&node) {
+                    return Err("graph occurrence references must belong to the current agent".into());
+                }
+                return Ok(execution::Value::Func {
+                    func: execution::Func::FlowRead {
+                        node: Self::id(if node == self.agent { self.root } else { node }),
+                        binding: id.0,
+                    },
+                    range: binding.range,
+                });
+            }
+            return self.flow_property(id);
+        }
         if self.callable && binding.owner == graph::ElementId::Node(self.root) {
             return self.binding_value(id);
         }
@@ -1151,7 +1626,10 @@ impl<'a> AgentLowering<'a> {
                             execution::CtxRef::RepeatIndexAt(self.each_id(index)),
                         )));
                     }
-                    if !self.guards[&node].is_empty() || self.junction(node).is_some() {
+                    if !self.guards[&node].is_empty()
+                        || self.junction(node).is_some()
+                        || !self.weighted_branches(node).is_empty()
+                    {
                         steps.push(execution::Step::Child {
                             candidates: vec![self.guard_id(node)],
                             position: None,
@@ -1181,6 +1659,20 @@ impl<'a> AgentLowering<'a> {
         })
     }
 
+    fn flow_property(&mut self, id: graph::BindingId) -> Result<execution::Value, String> {
+        let value = self.binding_value(id)?;
+        if matches!(self.graph.bindings[id.0].owner, graph::ElementId::Junction(_)) {
+            return Ok(value);
+        }
+        Ok(execution::Value::Func {
+            func: execution::Func::FlowProperty {
+                binding: id.0,
+                value: Box::new(value),
+            },
+            range: self.graph.bindings[id.0].range,
+        })
+    }
+
     fn binding_value(&mut self, id: graph::BindingId) -> Result<execution::Value, String> {
         if self.building.contains(&id) {
             return Err("circular value propagation".into());
@@ -1195,6 +1687,17 @@ impl<'a> AgentLowering<'a> {
         use execution::Value as V;
         use graph::Value as G;
         Ok(match value {
+            G::Input { binding, ty } if self.flow => V::Func {
+                func: execution::Func::FlowInput {
+                    binding: binding.0,
+                    ty: *ty,
+                },
+                range: self.graph.bindings[binding.0].range,
+            },
+            G::Context { path, .. } if self.flow => V::Func {
+                func: execution::Func::FlowContext(path.clone()),
+                range: self.graph.nodes[self.root.0].range,
+            },
             G::Input { binding, ty } => {
                 let source = *self.inputs.get(binding).ok_or("upstream field has no feeds edge")?;
                 let value = execution::Value::VarRef(format!("edge_value_{}", source.0));
@@ -1219,7 +1722,7 @@ impl<'a> AgentLowering<'a> {
                         && child.path.len() > parent.path.len()
                         && child.path.starts_with(&parent.path)
                 });
-                if internal {
+                if internal && !self.flow {
                     self.binding_value(*id)?
                 } else {
                     let mut value = self.reference(*id)?;

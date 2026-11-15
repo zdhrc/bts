@@ -948,7 +948,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.weighted"),
-        summary: "weighted forks select count eligible branches without replacement. count is a positive integer defaulting to one. A branch weight is a finite nonnegative number specified on its edges, defaulting to one. All edges within one branch must have the same weight. A branch is eligible only when all its edge guards pass. Zero-weight and statically false branches cannot contribute to the available count. Compilation rejects insufficient potentially eligible branches. Known invalid counts and weights fail compilation. A runtime consumer evaluates dynamic counts, weights and guards, enforces the same bounds and branch-weight agreement, checks that enough positive-weight branches remain, then samples proportional to weights using its seeded context. Weighted selection is separate from exclusive guard disjointness.",
+        summary: "weighted forks select exactly one eligible branch using relative weights and seeded randomness. Each edge in a branch requires an explicit finite nonnegative weight and bundled weights must agree. Evaluate all branch guards before evaluating its weights. Zero excludes a branch. If no positive-weight branch qualifies, no branch is selected and that path stops. Each activation samples again. count is not supported. Known invalid weights fail compilation and dynamic weights are checked by the consumer.",
     },
     RuleDesc {
         tags: &[],
@@ -963,7 +963,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.groups"),
-        summary: "A fork activation creates an occurrence group. each tracks its item and branch occurrences separately. A group closes explicitly after all contributing occurrences settle, including failures and cancellations. Outside a fork a consumer must supply group identity and a closing event. Silence and elapsed time do not close groups implicitly. Independent groups are never combined implicitly. Definition identity, occurrence identity, ancestry, correlation and observation identity are distinct runtime responsibilities. An accumulate junction takes one observation per listed input within its group. reduce consumes repeated observations, including multiple occurrences of the same listed edge.",
+        summary: "An execution has a default occurrence group. each and repeat create nested iteration groups and retain a shared batch identity for history. Attached junctions observe the fork batch in its enclosing group, so repeated branches can contribute multiple arrivals. Junctions inside an iteration use that iteration group. Cycle visits preserve their enclosing group. A group closes explicitly after all contributing occurrences settle, including failures and cancellations. Outside a fork a consumer must supply group identity and a closing event. Silence and elapsed time do not close groups implicitly. Independent groups are never combined implicitly. Definition identity, occurrence identity, ancestry, correlation and observation identity are distinct runtime responsibilities. An accumulate junction repeatedly consumes one observation per listed input within its group in FIFO order. Unmatched arrivals or a missing listed input fail at closure. reduce consumes repeated observations, including multiple occurrences of the same listed edge.",
     },
     RuleDesc {
         tags: &[],
@@ -1009,7 +1009,12 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.junctions"),
-        summary: "A junction requires an open kind and preserves its explicitly listed input edges and destination. Optional properties follow the kind inside the junction brackets, before its input references. Properties belong to the junction, not its destination, and use the ordinary expression rules. Context reads in those properties belong to the junction. Inputs of an attached junction belong to the attached fork. Root junctions can join separately declared edges. Overlapping input sets on sibling junctions are allowed and do not create implicit edges between their destinations. Built-in junction input lists contain distinct edge identities. Grouped junctions use correlate as an explicit group key when supplied, otherwise a runtime consumer must supply the activation group. Independent groups must not be combined implicitly. Buffering repeated arrivals, group lifetime and inactive-input policies remain runtime contract work. The kind determines the combination behavior, properties configure it.",
+        summary: "A junction requires an open kind and preserves its explicitly listed input edges and destination. Optional properties follow the kind inside the junction brackets, before its input references. Properties belong to the junction, not its destination, and use the ordinary expression rules. Context reads in those properties belong to the junction. Inputs of an attached junction belong to the attached fork. Root junctions can join separately declared edges. Overlapping input sets on sibling junctions are allowed and do not create implicit edges between their destinations. Built-in junction input lists contain distinct edge identities. Grouped junctions use correlate as an explicit group key when supplied, otherwise a runtime consumer must supply the activation group. Independent groups must not be combined implicitly. Each input has an ordered queue within its execution group and correlation partition. Group closure occurs when no runnable or in-flight work can produce further arrivals, not through silence or elapsed time. A waiting junction alone does not keep the group open. An agent execution owns the default group, each iteration owns a nested group, and cycle visits preserve their group. Correlation partitions a group without extending its lifetime. The kind determines the combination behavior, properties configure it.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("graph.junction-scope"),
+        summary: "Junction targets explicitly read context.arrivals records with edge and value keys. Junctions do not merge arrival values into target fields. merge and first inherit the forwarded arrival scope. accumulate, quorum and reduce combine contributing scopes. References shared by those scopes resolve only when they identify the same occurrence. Different occurrences of one definition are ambiguous, rather than selecting whichever completed last. Targets disambiguate through explicitly carried arrival values. Mocking processes arrivals deterministically in scheduled order.",
     },
     RuleDesc {
         tags: &[],
@@ -1019,7 +1024,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.cycles"),
-        summary: "Cycle punctuation explicitly marks directed loop-back behavior, independently of mathematical cycles. It always requires ~[headers]~> with an arrowhead. There is no undirected loop-back connector. Ordinary self-connections are allowed in either direction category. Compilation does not require a marked edge to close a topological cycle or require unmarked edges to form a DAG. Network acyclicity checks inspect all selected connections regardless of loop markers. Graph cycles do not permit circular field dependencies.",
+        summary: "Cycle punctuation explicitly marks directed loop-back behavior, independently of mathematical cycles. It always requires ~[headers]~> with an arrowhead. There is no undirected loop-back connector. Ordinary self-connections are allowed in either direction category. Compilation does not require a marked edge to close a topological cycle or require unmarked edges to form a DAG. Network acyclicity checks inspect all selected connections regardless of loop markers. Graph cycles do not permit circular field dependencies. Each traversed loop-back creates a fresh target occurrence and evaluates its outgoing paths again. source denotes the current occurrence and target the new occurrence. Explicit feeds supplies values before target evaluation, with no implicit copying of prior fields. max_traversals is an optional nonnegative integer bound on traversals of that edge within its execution group. A qualifying traversal beyond the limit fails rather than silently terminating. Mocking also enforces a 10000 occurrence execution budget per agent invocation. Cycle edges can be fork branches and do not implicitly suppress other outgoing edges. Exclusive forks express mutually exclusive retry and exit paths. context.history exposes completed earlier occurrences in the current execution or repetition batch and excludes in-flight occurrences. Its view is fixed when the reading occurrence starts, even when its fields are evaluated later.",
     },
     RuleDesc {
         tags: &[],
@@ -1221,7 +1226,7 @@ const PRIMITIVES: &[PrimitiveDesc] = &[
     PrimitiveDesc {
         name: "weighted",
         construct: "fork",
-        summary: "Select count eligible branches without replacement using nonnegative branch weights and the consumer seeded evaluation context. Count defaults to one and omitted weights to one. All edges in a branch must agree on weight and all their guards must pass. Runtime eligibility must leave enough positive-weight branches.",
+        summary: "Select one eligible branch using explicit nonnegative relative weights and seeded randomness. All edges in a branch must agree on weight and all their guards must pass. No positive eligible weight means no selection. Each activation samples again.",
     },
     PrimitiveDesc {
         name: "repeat",
@@ -1236,27 +1241,27 @@ const PRIMITIVES: &[PrimitiveDesc] = &[
     PrimitiveDesc {
         name: "reduce",
         construct: "junction",
-        summary: "Fold repeated observations within one group using initial and combine. The combine expression reads context.accumulator and context.arrival.value. Emit once at explicit group closure, or initial for an empty group. Observation mode selects edge arrivals or destination occurrence results.",
+        summary: "Fold repeated observations within one group using initial and combine. The combine expression reads context.accumulator and context.arrival.value. Emit once at group closure, or initial for an empty group. The target reads the folded value through context.accumulator and all consumed arrivals through context.arrivals in processing order. Observation mode selects edge arrivals or destination occurrence results.",
     },
     PrimitiveDesc {
         name: "accumulate",
         construct: "junction",
-        summary: "Collect one arrival from every listed input within a correlation group, then emit one grouped arrival to the target. Keep each input edge's data separately addressable. Repeated arrivals from one input do not satisfy another input.",
+        summary: "Queue arrivals separately for each listed input within a correlation group. Repeatedly consume one arrival from each queue and create a fresh target occurrence. context.arrivals contains edge and value records in declared input order. Missing inputs or unmatched leftovers fail at group closure. Arrivals are consumed once per junction, independently of overlapping junctions.",
     },
     PrimitiveDesc {
         name: "merge",
         construct: "junction",
-        summary: "Forward each incoming arrival independently to the target with its input identity and data preserved. Do not wait for other inputs or combine their scopes.",
+        summary: "Forward each incoming arrival independently to a fresh target occurrence with its input identity and data preserved. context.arrivals contains that single arrival. Do not wait for other inputs or combine their scopes.",
     },
     PrimitiveDesc {
         name: "first",
         construct: "junction",
-        summary: "Emit the earliest arrival within a correlation group to the target, preserving its input identity and data. Emit at most once per group. This does not implicitly cancel upstream work.",
+        summary: "Emit the earliest arrival within a correlation group to the target, preserving its input identity and data. Emit at most once per group and ignore later arrivals. No arrivals means no emission. context.arrivals contains the winning arrival. This does not implicitly cancel upstream work.",
     },
     PrimitiveDesc {
         name: "quorum",
         construct: "junction",
-        summary: "Emit one grouped arrival after count distinct listed inputs have arrived within a correlation group. Preserve the contributing input identities and data. count is a required constant integer from one through the number of listed inputs. Repeated arrivals from one input count once.",
+        summary: "Emit one grouped arrival after count distinct listed inputs have arrived within a correlation group. Preserve the contributing input identities and data. count is a required constant integer from one through the number of listed inputs. Repeated arrivals from one input count once. Select once per group and ignore later arrivals. An unmet quorum fails at closure. context.arrivals lists contributing inputs in declared input order.",
     },
     PrimitiveDesc {
         name: "link",
@@ -1414,7 +1419,7 @@ header = [name], ":", kind, [fields]
 headers = header, {",", header}, [","]
 edge = "-[", headers, ("]->" | "]-"), node
 cycle = "~[", headers, "]~>", node
-fork = "=[", header, "]=>[", edge, {",", edge}, [","], "]", {attached_path}
+fork = "=[", header, "]=>[", (edge | cycle), {",", (edge | cycle)}, [","], "]", {attached_path}
 selector = "->(", reference_expression, ")"
 junction = ">[:", kind, [fields], junction_input, {",", junction_input}, [","], "]>>", node
 junction_input = edge_reference | pattern

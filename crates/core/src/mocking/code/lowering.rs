@@ -1128,36 +1128,41 @@ mod execution {
         let all_bindings = model.bindings.iter().chain(&trace.bindings).cloned().collect::<Vec<_>>();
         let mut direct_ctx = ctx.clone();
         direct_ctx.direct = true;
-        let mut body = match scope(
-            Some(&trace.fields),
-            &all_bindings,
-            &trace.children,
-            "root",
-            &direct_ctx,
-            lang,
-            true,
-        ) {
-            Ok(mut work) => {
-                work.push(Statement::Return(Expr::call(
-                    "_agent_result",
-                    vec![
-                        Expr::call("_details", vec!["root".into()]),
-                        expression(output, &direct_ctx, lang)?,
-                    ],
-                )));
-                vec![Statement::TraceScope {
-                    scope: "root".into(),
-                    body: work,
-                }]
-            }
-            Err(error) if model.ordered => return Err(error),
-            Err(_) => {
-                let mut work = scope(Some(&trace.fields), &all_bindings, &trace.children, "root", &ctx, lang, true)?;
-                work.push(Statement::Return(Expr::call(
-                    "_agent_result",
-                    vec![Expr::call("_details", vec!["root".into()]), expression(output, &ctx, lang)?],
-                )));
-                work
+        let flow = model.flows.iter().find(|flow| flow.root == trace.node);
+        let mut body = if let Some(flow) = flow {
+            vec![Statement::Return(flow_expression(flow, output, &ctx, lang)?)]
+        } else {
+            match scope(
+                Some(&trace.fields),
+                &all_bindings,
+                &trace.children,
+                "root",
+                &direct_ctx,
+                lang,
+                true,
+            ) {
+                Ok(mut work) => {
+                    work.push(Statement::Return(Expr::call(
+                        "_agent_result",
+                        vec![
+                            Expr::call("_details", vec!["root".into()]),
+                            expression(output, &direct_ctx, lang)?,
+                        ],
+                    )));
+                    vec![Statement::TraceScope {
+                        scope: "root".into(),
+                        body: work,
+                    }]
+                }
+                Err(error) if model.ordered => return Err(error),
+                Err(_) => {
+                    let mut work = scope(Some(&trace.fields), &all_bindings, &trace.children, "root", &ctx, lang, true)?;
+                    work.push(Statement::Return(Expr::call(
+                        "_agent_result",
+                        vec![Expr::call("_details", vec!["root".into()]), expression(output, &ctx, lang)?],
+                    )));
+                    work
+                }
             }
         };
         let tokens = code::references(&body).contains(&Dependency::Variable("_tokens".into()));
@@ -1178,7 +1183,9 @@ mod execution {
             ],
         };
         let mut function = code::Function::new("_execute", parameters);
-        function.declare("root", scope_expr(&trace.name, "task", Expr::Null))?;
+        if flow.is_none() {
+            function.declare("root", scope_expr(&trace.name, "task", Expr::Null))?;
+        }
         function.body.append(&mut body);
         let parameters = function.parameters[..2].to_vec();
         let details_name = if lang == ScorerLang::Python {
@@ -1248,6 +1255,131 @@ mod execution {
             functions,
             contracts,
         })
+    }
+
+    fn flow_expression(flow: &crate::dsl::Flow, output: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr, String> {
+        let callback = |value: &Value| -> Result<Expr, String> {
+            let parameters = ["_flow", "_occ"]
+                .into_iter()
+                .map(|name| {
+                    let parameter = code::Parameter::new(name);
+                    if lang == ScorerLang::Typescript {
+                        parameter.typed("any")
+                    } else {
+                        parameter
+                    }
+                })
+                .collect();
+            Ok(expression(value, ctx, lang)?.lambda(parameters))
+        };
+        let props = |values: &[(String, Value)]| -> Result<Expr, String> {
+            Ok(Expr::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), callback(value)?)))
+                    .collect::<Result<_, String>>()?,
+            ))
+        };
+        let nodes = flow
+            .nodes
+            .iter()
+            .map(|node| {
+                Ok(Expr::Object(vec![
+                    ("id".into(), Expr::number(node.id.0)),
+                    ("name".into(), Expr::string(&node.name)),
+                    ("key".into(), Expr::string(&node.key)),
+                    ("kind".into(), Expr::string(&node.kind)),
+                    ("parent".into(), node.parent.map(|n| Expr::number(n.0)).unwrap_or(Expr::Null)),
+                    (
+                        "bindings".into(),
+                        Expr::Object(
+                            node.bindings
+                                .iter()
+                                .map(|(id, value)| Ok((id.to_string(), callback(value)?)))
+                                .collect::<Result<_, String>>()?,
+                        ),
+                    ),
+                    (
+                        "fields".into(),
+                        Expr::Object(node.fields.iter().map(|(key, id)| (key.clone(), Expr::number(id))).collect()),
+                    ),
+                ]))
+            })
+            .collect::<Result<_, String>>()?;
+        let edges = flow
+            .edges
+            .iter()
+            .map(|edge| {
+                Ok(Expr::Object(vec![
+                    ("id".into(), Expr::number(edge.id)),
+                    ("bundle".into(), Expr::number(edge.bundle)),
+                    ("name".into(), expression(&edge.name, ctx, lang)?),
+                    ("source".into(), Expr::number(edge.source.0)),
+                    ("target".into(), Expr::number(edge.target.0)),
+                    ("kind".into(), Expr::string(&edge.kind)),
+                    ("cycle".into(), Expr::Bool(edge.cycle)),
+                    ("into".into(), edge.into.map(Expr::number).unwrap_or(Expr::Null)),
+                    ("fork".into(), edge.fork.map(Expr::number).unwrap_or(Expr::Null)),
+                    ("props".into(), props(&edge.props)?),
+                ]))
+            })
+            .collect::<Result<_, String>>()?;
+        let forks = flow
+            .forks
+            .iter()
+            .map(|fork| {
+                Ok(Expr::Object(vec![
+                    ("id".into(), Expr::number(fork.id)),
+                    ("source".into(), Expr::number(fork.source.0)),
+                    ("kind".into(), Expr::string(&fork.kind)),
+                    ("props".into(), props(&fork.props)?),
+                    (
+                        "branches".into(),
+                        Expr::Array(
+                            fork.branches
+                                .iter()
+                                .map(|branch| Expr::Array(branch.iter().map(Expr::number).collect()))
+                                .collect(),
+                        ),
+                    ),
+                ]))
+            })
+            .collect::<Result<_, String>>()?;
+        let junctions = flow
+            .junctions
+            .iter()
+            .map(|junction| {
+                Ok(Expr::Object(vec![
+                    ("target".into(), Expr::number(junction.target.0)),
+                    ("kind".into(), Expr::string(&junction.kind)),
+                    ("props".into(), props(&junction.props)?),
+                    ("fork".into(), junction.fork.map(Expr::number).unwrap_or(Expr::Null)),
+                    (
+                        "inputs".into(),
+                        Expr::Array(junction.inputs.iter().map(Expr::number).collect()),
+                    ),
+                ]))
+            })
+            .collect::<Result<_, String>>()?;
+        let plan = Expr::Object(vec![
+            ("root".into(), Expr::number(flow.root.0)),
+            ("input".into(), Expr::number(flow.input)),
+            ("nodes".into(), Expr::Array(nodes)),
+            ("edges".into(), Expr::Array(edges)),
+            ("forks".into(), Expr::Array(forks)),
+            ("junctions".into(), Expr::Array(junctions)),
+            ("output".into(), callback(output)?),
+        ]);
+        Ok(Expr::call(
+            "_flow_run",
+            vec![
+                plan,
+                "input".into(),
+                random_name(lang).into(),
+                "logger".into(),
+                "_MISSING".into(),
+            ],
+        ))
     }
 
     fn scope_expr(name: &str, kind: &str, parent: Expr) -> Expr {
@@ -4872,6 +5004,42 @@ mod expressions {
             )
         };
         Ok(match func {
+            Func::FlowRead { node, binding } => Expr::call(
+                "_flow_read",
+                vec!["_flow".into(), "_occ".into(), Expr::number(node.0), Expr::number(binding)],
+            ),
+            Func::FlowProperty { binding, value } => Expr::call(
+                "_flow_property",
+                vec!["_occ".into(), Expr::number(binding), expr(value)?.lambda(vec![])],
+            ),
+            Func::FlowContext(path) => Expr::call(
+                "_flow_context",
+                vec![
+                    "_flow".into(),
+                    "_occ".into(),
+                    Expr::Array(path.iter().map(Expr::string).collect()),
+                ],
+            ),
+            Func::FlowInput { binding, ty } => Expr::call(
+                "_flow_input",
+                vec![
+                    "_occ".into(),
+                    Expr::number(binding),
+                    Expr::string(format!("{ty:?}").to_lowercase()),
+                ],
+            ),
+            Func::ForkPick(branches) => Expr::call(
+                "_fork_pick",
+                vec![
+                    Expr::Array(
+                        branches
+                            .iter()
+                            .map(|branch| Ok(Expr::Array(branch.iter().map(expr).collect::<Result<_, String>>()?)))
+                            .collect::<Result<_, String>>()?,
+                    ),
+                    random(),
+                ],
+            ),
             Func::Arrivals { ready } => call("_require_arrivals", &[ready])?,
             Func::Check { value, ty } => Expr::call(
                 "_check_type",
@@ -5387,7 +5555,13 @@ pub(crate) mod scoring {
                 }
             };
             Ok(match func {
-                Func::Check { .. } | Func::Arrivals { .. } => {
+                Func::Check { .. }
+                | Func::Arrivals { .. }
+                | Func::ForkPick(_)
+                | Func::FlowRead { .. }
+                | Func::FlowContext(_)
+                | Func::FlowProperty { .. }
+                | Func::FlowInput { .. } => {
                     return Err(Error::Unsupported {
                         what: "runtime schema checks",
                     });

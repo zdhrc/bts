@@ -681,7 +681,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 55);
+    assert_eq!(graph.paths.len(), 60);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -851,7 +851,7 @@ fn handles_truncated_pattern_references_without_panicking() {
 #[test]
 fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
     let model = compile_fixture();
-    assert_eq!(model.paths.len(), 55);
+    assert_eq!(model.paths.len(), 60);
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
     assert!(model.forks.len() > 5);
@@ -1953,14 +1953,13 @@ fn relation_incidence_roles_preserve_hyperedge_identity() {
 #[test]
 fn weighted_each_and_reduce_validate_configuration_without_executing() {
     for (props, weights, valid) in [
-        ("count: 1", "3", true),
-        ("count: 2", "3", true),
-        ("count: 3", "3", false),
-        ("count: 0", "3", false),
-        ("count: 1", "-1", false),
-        ("count: 2", "0", false),
-        ("count: 1", "\"heavy\"", false),
-        ("count: context.count", "1", true),
+        ("", "3", true),
+        ("count: 1", "3", false),
+        ("count: 2", "3", false),
+        ("", "-1", false),
+        ("", "0", true),
+        ("", "\"heavy\"", false),
+        ("", "context.weight", true),
     ] {
         let source = format!(
             "(a:node) =[:weighted {{{props}}}]=>[-[:next {{weight: {weights}}}]->(b:node), -[:next {{weight: 1}}]->(c:node)];"
@@ -1968,10 +1967,9 @@ fn weighted_each_and_reduce_validate_configuration_without_executing() {
         assert_eq!(compile(&source).is_ok(), valid, "{source}");
     }
     compiled("(a:node) =[:weighted]=>[-[:link {weight: 2}, :link {weight: 2}]-(b:node)];");
-    compiled("(a:node) =[:weighted {count: context.count}]=>[-[:next {weight: context.weight}]->(b:node)];");
-    compiled("(a:node) =[:weighted]=>[-[:link {when: context.flag}, :link {when: true}]-(b:node)];");
+    compiled("(a:node) =[:weighted]=>[-[:next {weight: 0, when: false}]->(b:node)];");
     compiled("(a:node) =[:each {items: context.items, concurrency: context.limit}]=>[-[:next]->(b:node)];");
-    assert!(compile("(a:node) =[:weighted]=>[-[:next {when: false}]->(b:node)];").is_err());
+    assert!(compile("(a:node) =[:weighted]=>[-[:next]->(b:node)];").is_err());
     assert!(compile("(a:node) =[:weighted]=>[-[:link {weight: 1}, :link {weight: 2}]-(b:node)];").is_err());
     for props in ["", "{items: 1}", "{items: [||], concurrency: 0}"] {
         assert!(compile(&format!("(a:node) =[:each {props}]=>[-[:next]->(b:node)];")).is_err());
@@ -2260,4 +2258,38 @@ fn repeat_forks_require_nonnegative_integer_counts() {
     ] {
         assert!(bts_lang::semantics::compile(source).is_err(), "{source}");
     }
+}
+
+#[test]
+fn cycle_traversal_limits_belong_to_cycle_edges() {
+    for limit in ["0", "3", "context.limit"] {
+        compiled(&format!("(a:node)~[:next {{max_traversals: {limit}}}]~>(a);"));
+    }
+    for limit in ["-1", "1.5", "true", "\"three\""] {
+        assert!(compile(&format!("(a:node)~[:next {{max_traversals: {limit}}}]~>(a);")).is_err());
+    }
+    assert!(compile("(a:node)-[:next {max_traversals: 3}]->(b:node);").is_err());
+}
+
+#[test]
+fn fork_branches_preserve_cycle_identity_and_bundle_configuration() {
+    let model = compiled(
+        r#"
+(a:node) {output: context.decision};
+(b:node) {input: <-};
+(a) =[:exclusive]=>[
+    ~[retry:next {when: source.output.retry, max_traversals: 3},
+      carried:feeds {when: source.output.retry, value: source.output.value, into: target.input}]~>(b),
+    -[done:next {when: !source.output.retry}]->(finish:node),
+];
+"#,
+    );
+    let fork = &model.forks[0];
+    assert_eq!(fork.branches[0].len(), 2);
+    assert!(fork.branches[0].iter().all(|edge| model.edges[edge.0].cycle));
+    assert!(!model.edges[fork.branches[1][0].0].cycle);
+    assert_eq!(
+        model.edges[fork.branches[0][0].0].target,
+        model.edges[fork.branches[0][1].0].target
+    );
 }
