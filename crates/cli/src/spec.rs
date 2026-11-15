@@ -106,7 +106,7 @@ pub(crate) static SPEC: Spec = Spec {
             path: &["sync", "datasets"],
             guidance: &[
                 "Removing a previously synced dataset block deletes its remote dataset on the next sync. .bt/bts/state.json tracks ownership by project ID and shape path. Definitions shared by another shape are retained. An empty shape can remove all datasets previously synced from it; --select can address a previously synced dataset that is now absent locally. Dry runs do not write state.",
-                "A dataset block may set `description` and contain named cases. Use typed module references such as `trace[\"name\"]` for sources. Sync reconciles all rows, including deleting cases absent locally, and writes changed source traces before their rows. Use `--dry-run` to review changes. --select accepts a dataset traversal, such as dataset.regressions or dataset[\"Regression cases\"]; repeat it to select multiple datasets. Only selected datasets and their required source traces are reconciled.",
+                "A dataset node may set `description` and a `cases` array of case references such as `[|(invoice_case)|]`. Cases can capture a node with `source: (request)` or supply inline input and expected fields. Sync reconciles all rows, including deleting cases absent locally, and writes changed source traces before their rows. Use `--dry-run` to review changes. --select accepts a dataset traversal, such as dataset.regressions or dataset[\"Regression cases\"]; repeat it to select multiple datasets. Only selected datasets and their required source traces are reconciled.",
             ],
             examples: &["bts sync datasets --from shape.bt --select 'dataset.regressions' --dry-run"],
         },

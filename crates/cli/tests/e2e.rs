@@ -4108,3 +4108,76 @@ fn graph_fixture_runs_cycles_weighted_forks_and_juncts_through_the_cli() {
     assert!(String::from_utf8_lossy(&failed.stderr).contains("max_traversals"));
     fs::remove_file(shape).unwrap();
 }
+
+#[test]
+fn all_examples_compile_and_trace_examples_generate() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut examples: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "bt"))
+        .collect();
+    examples.sort();
+    assert!(!examples.is_empty());
+    for path in examples {
+        let checked = bts().args(["check", "syntax"]).arg(&path).output().unwrap();
+        assert!(
+            checked.status.success(),
+            "{}: {}",
+            path.display(),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        let source = fs::read_to_string(&path).unwrap();
+        let model = bts_core::providers::braintrust::Bundle::compile(&source).unwrap();
+        if model.agents.is_empty() {
+            assert!(!model.scorers.is_empty(), "{} has no executable example", path.display());
+            continue;
+        }
+        let generated = bts()
+            .args(["write", "traces", "--from"])
+            .arg(&path)
+            .args(["--count", "12", "--over", "1h", "--seed", "42", "--dry-run"])
+            .env_remove("BRAINTRUST_API_KEY")
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}: {}",
+            path.display(),
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let payload: JsonValue = serde_json::from_slice(&generated.stdout).unwrap();
+        assert!(!payload["events"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn recovery_example_previews_both_versions_against_all_cases() {
+    let shape = write_shape(include_str!("../../../examples/experiments.bt"));
+    let output = bts()
+        .args(["write", "experiments", "--from"])
+        .arg(&shape)
+        .args(["--seed", "42", "--dry-run"])
+        .env_remove("BRAINTRUST_API_KEY")
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let preview: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let experiments = preview["experiments"].as_array().unwrap();
+    assert_eq!(experiments.len(), 2);
+    for experiment in experiments {
+        let improved = experiment["name"] == "recovery-improved";
+        let results = experiment["results"].as_array().unwrap();
+        assert_eq!(results.len(), 5);
+        let mut matches = 0;
+        for result in results {
+            let root = &result["events"][0];
+            if root["output"]["action"] == root["expected"]["action"] {
+                matches += 1;
+            }
+            assert_eq!(root["output"]["reply"], result["events"][2]["output"]["content"]);
+        }
+        assert_eq!(matches, if improved { 5 } else { 3 });
+    }
+}

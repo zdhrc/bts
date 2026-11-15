@@ -1,124 +1,44 @@
-# multi-turn conversation -- variance axes: which conversation runs and how
-# many turns it has. length comes from authoring alternatives of different
-# lengths, not from stamping a template turn.
-
-vars {
-    system = """
-        You are a support assistant for a billing product.
-        Be concise; cite the relevant policy when you refuse.
-        """
-    meta = { model = "gpt-4o-mini", provider = "openai", temperature = 0.3 }
-}
-
-trace "billing-support" {
-    # the root exchange follows whichever conversation the choice picks:
-    # `chosen` is the 0-based pick, and ?: only evaluates the taken side
-    input = choice.conversation.chosen == 0
-        ? choice.conversation.task.turn_0.input
-        : choice.conversation.repeat.refund_dispute[0].task.turn_0.input
-    output = choice.conversation.chosen == 0
-        ? choice.conversation.task.turn_0.output
-        : choice.conversation.repeat.refund_dispute[0].task.turn_2.output
-    metadata = { conversation_id = uuid(), entrypoint = "web-chat" }
-    tags = ["support", "billing"]
-
-    # add alternatives to widen the pool; each one is a complete conversation
-    choice "conversation" {
-        # one-turn conversation: quick answer, user leaves
-        task "turn_0" {
-            input = "Can I get invoices with our VAT number on them?"
-            output = "Yes -- add it under Billing Settings > Tax IDs and future invoices will include it."
-
-            llm "Chat Completion" {
-                # the message list replays the enclosing turn's own fields
-                input = [
-                    { role = "system", content = var.system },
-                    { role = "user", content = task.turn_0.input },
-                ]
-                output = { role = "assistant", content = task.turn_0.output }
-                metadata = var.meta
-                # token counts computed from the actual content, summed in place
-                metrics = {
-                    prompt_tokens = tokens(self.input)
-                    completion_tokens = tokens(self.output)
-                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                    time_to_first_token = 0.34
-                }
-            }
-        }
-
-        # three-turn conversation: a repeat with count = 1 stamps its children
-        # once and adds no span, so it groups the turns into one alternative
-        repeat "refund_dispute" {
-            count = 1
-
-            task "turn_0" {
-                input = "I was charged twice this month."
-                output = "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added."
-
-                llm "Chat Completion" {
-                    input = [
-                        { role = "system", content = var.system },
-                        { role = "user", content = task.turn_0.input },
-                    ]
-                    output = { role = "assistant", content = task.turn_0.output }
-                    metadata = var.meta
-                    metrics = {
-                        prompt_tokens = tokens(self.input)
-                        completion_tokens = tokens(self.output)
-                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                        time_to_first_token = 0.29
-                    }
-                }
-            }
-
-            task "turn_1" {
-                input = "We didn't add any seats."
-                output = "The seat was added by jordan@ on the 4th; I can remove it and refund the difference."
-
-                llm "Chat Completion" {
-                    # later turns replay the earlier turns' fields instead of
-                    # copying the history by hand
-                    input = [
-                        { role = "system", content = var.system },
-                        { role = "user", content = task.turn_0.input },
-                        { role = "assistant", content = task.turn_0.output },
-                        { role = "user", content = task.turn_1.input },
-                    ]
-                    output = { role = "assistant", content = task.turn_1.output }
-                    metadata = var.meta
-                    metrics = {
-                        prompt_tokens = tokens(self.input)
-                        completion_tokens = tokens(self.output)
-                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                        time_to_first_token = 0.31
-                    }
-                }
-            }
-
-            task "turn_2" {
-                input = "Yes, please refund it."
-                output = "Done -- the refund lands in 3-5 business days."
-
-                llm "Chat Completion" {
-                    input = [
-                        { role = "system", content = var.system },
-                        { role = "user", content = task.turn_0.input },
-                        { role = "assistant", content = task.turn_0.output },
-                        { role = "user", content = task.turn_1.input },
-                        { role = "assistant", content = task.turn_1.output },
-                        { role = "user", content = task.turn_2.input },
-                    ]
-                    output = { role = "assistant", content = task.turn_2.output }
-                    metadata = var.meta
-                    metrics = {
-                        prompt_tokens = tokens(self.input)
-                        completion_tokens = tokens(self.output)
-                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                        time_to_first_token = 0.27
-                    }
-                }
-            }
-        }
-    }
-}
+# sample a whole conversation so each turn has a coherent history and outcome
+(billing:agent) {
+    input: choice(
+        [|
+            {role: "user", content: "Can I get invoices with our VAT number on them?"},
+            {role: "assistant", content: "Yes, add it under Billing Settings > Tax IDs and future invoices will include it."},
+        |],
+        [|
+            {role: "user", content: "I was charged twice this month."},
+            {role: "assistant", content: "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added."},
+            {role: "user", content: "We didn't add any seats."},
+            {role: "assistant", content: "The seat was added by jordan@ on the 4th. I can remove it and refund the difference."},
+            {role: "user", content: "Yes, please refund it."},
+            {role: "assistant", content: "Done. The refund lands in 3-5 business days."},
+        |],
+    ),
+    output: request.output,
+};
+(billing)-[:contains, :next]->(request:task {name: "billing-support"}) {
+    input: billing.input,
+    turns: billing.input,
+    output: self.turns[len(self.turns) - 1],
+    metadata: {conversation_id: uuid(), entrypoint: "web-chat"},
+    tags: [|"support", "billing"|],
+};
+(request)
+    =[:repeat {count: len(request.turns) / 2}]=>[
+        -[:next]->(turn:task) {
+            input: request.turns[context.index * 2],
+            output: request.turns[context.index * 2 + 1],
+        },
+    ]
+        ->(turn)-[:next]->(reply:llm {name: "Chat Completion"}) {
+            input: [|
+                {role: "system", content: "You are a support assistant for a billing product. Be concise and cite the relevant policy when you refuse."},
+                ...request.turns[:context.index * 2 + 1],
+            |],
+            output: turn.output,
+            metadata: {model: "gpt-4o-mini", provider: "openai", temperature: 0.3},
+            duration: range(0.3, 0.8),
+            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
+        };
+(billing)-[:contains]->(turn)-[:child_of]->(request);
+(billing)-[:contains]->(reply)-[:child_of]->(turn);

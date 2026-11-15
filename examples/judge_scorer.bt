@@ -1,14 +1,8 @@
-# an llm grades each response against labeled options
-# built as a Braintrust SDK prompt scorer for deployment
-
-scorer "helpfulness" {
-    judge {
-        model = "gpt-4o-mini"
-        prompt = """
-            Rate how helpful the response is to the user's request.
-            Request: ${input}
-            Response: ${output}
-            """
-        options = { excellent = 1.0, good = 0.6, poor = 0.2 }
+# build a judge scorer that grades responses against labeled options
+(helpfulness:scorer) {
+    judge: {
+        model: "gpt-4o-mini",
+        prompt: "Rate how helpful the response is to the user's request.\n            Request: ${context.input}\n            Response: ${context.output}",
+        options: {excellent: 1.0, good: 0.6, poor: 0.2},
     }
-}
+};

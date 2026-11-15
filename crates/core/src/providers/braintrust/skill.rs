@@ -38,13 +38,13 @@ Most traces should show ordinary, competent work. Include a smaller share of mod
 
 Dream up happy and unhappy paths from the world's actual tasks, constraints, and customer goals. Include varied situations within each path, not one script repeated with different names. A useful problem may emerge from several small decisions rather than one obvious failure. Avoid making every unusual case the exact issue a facet or scorer is meant to find.
 
-One shape generates every trace in a run. Literal content repeats unchanged. Ask what differs between trace 0 and trace 99. Vary intents and outcomes with authored alternatives, turn and step counts with `repeat`, and correlated rare paths with `maybe`. Skew volume toward common cases and give long or unusual cases a smaller share. Never use an index as customer-facing content. Use `choice` around whole alternative paths so their messages, tool calls, and outcomes agree. Use `weighted` or a long-tailed distribution when common cases should dominate.
+One shape generates every trace in a run. Literal content repeats unchanged. Ask what differs between trace 0 and trace 99. Vary intents and outcomes with authored alternatives, turn and step counts with `repeat` forks, and correlated rare paths with guarded `conditional` or `exclusive` forks. Skew volume toward common cases and give long or unusual cases a smaller share. Never use an index as customer-facing content. Use `exclusive` or `weighted` forks for whole alternative paths so their messages, tool calls, and outcomes agree. Use value functions such as `choice` and `weighted` for data variation.
 
 Working result: scenario families with plausible frequencies, varied details, and causes for both ordinary and unusual outcomes.
 
 ### 5. Make the behavior observable
 
-Decide which inputs, tool results, agent decisions, and outputs a person must see to understand each outcome. If the customer has an existing tracing scheme, follow its real execution path where possible. Otherwise, create a tree whose nesting reflects responsibility and whose data shows cause and effect. Carry facts forward with block references so later decisions agree with earlier evidence. Detailed naming, payload, and metric guidance lives in the separate Braintrust presentation reference.
+Decide which inputs, tool results, agent decisions, and outputs a person must see to understand each outcome. If the customer has an existing tracing scheme, follow its real execution path where possible. Otherwise, create a tree whose nesting reflects responsibility and whose data shows cause and effect. Carry facts forward with node references so later decisions agree with earlier evidence. Detailed naming, payload, and metric guidance lives in the separate Braintrust presentation reference.
 
 Working result: a trace tree that lets a person follow the cause of each outcome from input through agent decisions to final output.
 
@@ -80,7 +80,7 @@ Name the root for the application's entrypoint. Name child spans for stable oper
 
 ### Inputs, outputs, and causality
 
-Give each span the input it consumed and the output it produced. Carry facts through the workflow with block references. A tool result should inform the decision and answer that follow it. Inside `repeat`, select authored turns by `repeat.index` and include earlier turns in later LLM inputs. If a failure changes the answer, gate its error, retry, and escalation together. A person should be able to follow the cause of the final answer through the tree.
+Give each span the input it consumed and the output it produced. Carry facts through the workflow with node references. A tool result should inform the decision and answer that follow it. Inside a `repeat` fork, select authored turns by `context.index` and include earlier turns in later LLM inputs. If a failure changes the answer, gate its error, retry, and escalation together. A person should be able to follow the cause of the final answer through the tree.
 
 Use chat messages for LLM inputs and an assistant message for the output so the conversation renders usefully. Put model parameters on LLM spans and arguments and results on tool spans. Keep model and provider consistent within a trace unless the workflow actually changes them.
 

@@ -1,55 +1,40 @@
-# error and escalation paths -- variance axis: failure rate. real populations
-# fail a few percent of the time; maybe gates the whole correlated failure, so
-# the error and the escalation land together or not at all.
-
-vars {
-    meta = { model = "gpt-4o-mini", provider = "openai" }
+# one sampled decision keeps the failed charge, escalation and retry consistent
+(payments:agent) {input: "Charge the June invoice for acct_9W31.", output: request.output};
+(payments)-[:contains, :next]->(request:task {name: "payments-agent"}) {
+    input: payments.input,
+    output: charge.output,
+    failed: chance(0.07),
+    metadata: {run_id: uuid(), retried: self.failed},
+    tags: [|"payments"|],
+};
+(request)-[:next]->(confirm:llm {name: "Chat Completion"}) {
+    input: [|
+        {role: "system", content: "You are a payments agent. Confirm the invoice before charging."},
+        {role: "user", content: request.input},
+    |],
+    output: {role: "assistant", content: "The June invoice is $1,240.00. Charging the card on file."},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
 }
-
-trace "payments-agent" {
-    input = "Charge the June invoice for acct_9W31."
-    output = "Charged $1,240.00 against the card on file."
-    # whether this run hit the failure path rides along as queryable metadata
-    metadata = { run_id = uuid(), retried = maybe.failure.included }
-    # tags are static per shape: they cannot follow the maybe branch, so tag
-    # the population, not the outcome
-    tags = ["payments"]
-
-    llm "Chat Completion" {
-        input = [
-            { role = "system", content = "You are a payments agent. Confirm the invoice before charging." },
-            { role = "user", content = trace.input },
-        ]
-        output = { role = "assistant", content = "June invoice is $1,240.00; charging the card on file." }
-        metadata = var.meta
-        metrics = {
-            prompt_tokens = tokens(self.input)
-            completion_tokens = tokens(self.output)
-            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-            time_to_first_token = 0.32
+    =[:exclusive]=>[
+        -[failed:next {when: request.failed}]->(declined:tool {name: "charge_customer"}) {
+            input: {account: "acct_9W31", amount_usd: 1240},
+            output: null,
+            error: "card_declined: insufficient_funds",
+        },
+        -[healthy:next {when: !request.failed}]->(ready:task) {output: "Primary card ready"},
+    ]
+        ->(declined)-[:next]->(escalate:task {name: "escalate_to_human"}) {
+            input: "Charge declined (${declined.error}). Review before retrying.",
+            output: "Ticket PAY-4411 approved a retry against the backup card.",
         }
-    }
-
-    # 7% of traces show a failed first attempt and a human escalation before
-    # the charge finally succeeds
-    maybe "failure" {
-        chance = 0.07
-
-        tool "charge_customer" {
-            input = { account = "acct_9W31", amount_usd = 1240.0 }
-            output = null
-            error = "card_declined: insufficient_funds"
-        }
-
-        task "escalate_to_human" {
-            # the nearest charge_customer wins: this reads the failing sibling
-            input = "charge declined (${tool.charge_customer.error}); needs manual review before retry"
-            output = "ticket PAY-4411 approved a retry against the backup card"
-        }
-    }
-
-    tool "charge_customer" {
-        input = { account = "acct_9W31", amount_usd = 1240.0 }
-        output = { status = "succeeded", charge_id = format("ch_{}", alphanum(14)) }
-    }
-}
+        >[:first {observe: "result"} [failed], [healthy]]>>(charge);
+(charge:tool {name: "charge_customer"}) {
+    input: {account: "acct_9W31", amount_usd: 1240, card: request.failed ? "backup" : "primary"},
+    output: {status: "succeeded", charge_id: format("ch_{}", alphanum(14))},
+};
+(payments)-[:contains]->(confirm)-[:child_of]->(request);
+(payments)-[:contains]->(declined)-[:child_of]->(request);
+(payments)-[:contains]->(escalate)-[:child_of]->(request);
+(payments)-[:contains]->(charge)-[:child_of]->(request);
+(payments)-[:contains]->(ready)-[:child_of]->(request);

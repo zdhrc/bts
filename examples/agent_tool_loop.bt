@@ -1,71 +1,49 @@
-# agent loop with tool calls -- variance axes: how many rounds run and which
-# tool each round calls. rounds carry history: each llm call replays what
-# earlier rounds said, and the closing answer reads the loop's last message.
-
-vars {
-    system = "You are an ops agent. Inspect the cluster with tools before answering."
-    meta = { model = "claude-sonnet-4-5", provider = "anthropic", max_tokens = 1024 }
-}
-
-trace "ops-agent" {
-    input = "Why is checkout-api throwing 502s?"
-    # the trace answers with whatever the closing span actually said
-    output = llm["anthropic.messages.create"].output.content
-    metadata = { run_id = uuid() }
-    tags = ["agent", "ops"]
-
-    repeat "rounds" {
-        # most runs settle in one or two rounds, with a long tail
-        count = weighted([1, 5], [2, 3], [3, 1.5], [4, 0.5])
-
-        llm "anthropic.messages.create" {
-            # the message list grows by one assistant turn per round
-            input = [
-                { role = "system", content = var.system },
-                { role = "user", content = trace.input },
-                ...repeat.rounds[:repeat.index].llm["anthropic.messages.create"].output,
-            ]
-            # the narration agrees with whichever tool this round actually calls
-            output = { role = "assistant", content = choice.tool_call.chosen == 0
+# each round retains earlier assistant messages and chooses one diagnostic tool
+(ops:agent) {input: "Why is checkout-api throwing 502s?", output: closing.output.content};
+(ops)-[:contains, :next]->(request:task {name: "ops-agent"}) {
+    input: ops.input,
+    output: closing.output.content,
+    metadata: {run_id: uuid()},
+    tags: [|"agent", "ops"|],
+};
+(request)
+    =[:repeat {count: weighted([|1, 5|], [|2, 3|], [|3, 1.5|], [|4, 0.5|])}]=>[
+        -[rounds:next]->(inspect:llm {name: "anthropic.messages.create"}) {
+            route: range(0, 1),
+            input: {
+                system: "You are an ops agent. Inspect the cluster with tools before answering.",
+                request: request.input,
+                history: context.history.inspect,
+            },
+            output: {role: "assistant", content: self.route == 0
                 ? "Checking the pod status for checkout-api."
-                : "Pulling the recent checkout-api logs." }
-            metadata = var.meta
-            # prompt cost tracks the growing history exactly
-            metrics = {
-                prompt_tokens = tokens(self.input)
-                completion_tokens = tokens(self.output)
-                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                time_to_first_token = 0.62
-            }
-        }
-
-        choice "tool_call" {
-            tool "get_pod_status" {
-                input = { namespace = "prod", selector = "app=checkout-api" }
-                output = { ready = choice("1/3", "2/3", "3/3"), restarts = poisson(2) }
-            }
-
-            tool "get_recent_logs" {
-                input = { service = "checkout-api", lines = 200 }
-                output = { error_count = poisson(6), sample = "upstream connect error or disconnect before headers" }
-            }
-        }
-    }
-
-    # the closing answer sits outside the loop and replays the whole run
-    llm "anthropic.messages.create" {
-        input = [
-            { role = "system", content = var.system },
-            { role = "user", content = trace.input },
-            ...repeat.rounds[:].llm["anthropic.messages.create"].output,
-        ]
-        output = { role = "assistant", content = "checkout-api is crash-looping on a bad config value; rolling back now." }
-        metadata = var.meta
-        metrics = {
-            prompt_tokens = tokens(self.input)
-            completion_tokens = tokens(self.output)
-            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-            time_to_first_token = 0.71
-        }
-    }
-}
+                : "Pulling the recent checkout-api logs."},
+            metadata: {model: "claude-sonnet-4-5", provider: "anthropic", max_tokens: 1024},
+            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
+        },
+    ]
+        ->(inspect)
+            =[:exclusive]=>[
+                -[:next {when: inspect.route == 0}]->(pods:tool {name: "get_pod_status"}) {
+                    input: {namespace: "prod", selector: "app=checkout-api"},
+                    output: {ready: choice("1/3", "2/3", "3/3"), restarts: poisson(2)},
+                },
+                -[:next {when: inspect.route == 1}]->(logs:tool {name: "get_recent_logs"}) {
+                    input: {service: "checkout-api", lines: 200},
+                    output: {error_count: poisson(6), sample: "upstream connect error or disconnect before headers"},
+                },
+            ]
+        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [rounds]]>>(closing:llm {name: "anthropic.messages.create"}) {
+            input: [|
+                {role: "system", content: "Summarize the investigation and the next action."},
+                {role: "user", content: request.input},
+                ...context.accumulator,
+            |],
+            output: {role: "assistant", content: "checkout-api is crash-looping. Review the recent configuration change and roll it back if it caused the failures."},
+            metadata: {model: "claude-sonnet-4-5", provider: "anthropic", max_tokens: 1024},
+            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
+        };
+(ops)-[:contains]->(inspect)-[:child_of]->(request);
+(ops)-[:contains]->(pods)-[:child_of]->(request);
+(ops)-[:contains]->(logs)-[:child_of]->(request);
+(ops)-[:contains]->(closing)-[:child_of]->(request);
