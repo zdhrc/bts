@@ -15,6 +15,30 @@ fn error(range: SrcRange, what: impl Into<String>) -> Diags {
     }]
 }
 
+// keeps the diagnostics of both sides when either fails
+fn both<A, B>(a: Result<A>, b: Result<B>) -> Result<(A, B)> {
+    match (a, b) {
+        (Ok(a), Ok(b)) => Ok((a, b)),
+        (a, b) => Err(a.err().into_iter().chain(b.err()).flatten().collect()),
+    }
+}
+
+// the first of each identical diagnostic, in reporting order
+fn dedup(diags: Diags) -> Diags {
+    let mut seen = HashSet::new();
+    diags
+        .into_iter()
+        .filter(|diag| seen.insert((diag.what.clone(), diag.r#where.source, diag.r#where.start, diag.r#where.end)))
+        .collect()
+}
+
+// resolution states shared by kinds, edges, forks and junctions
+const PENDING: u8 = 0;
+const RESOLVING: u8 = 1;
+const RESOLVED: u8 = 2;
+// the failure was already reported, dependents fail with no diagnostics of their own
+const FAILED: u8 = 3;
+
 #[derive(Clone)]
 enum Anchor {
     Node(NodeId),
@@ -75,6 +99,8 @@ struct Modeler {
     slots: HashMap<Slot, BindingId>,
     visiting: HashSet<Slot>,
     defaults: HashMap<Slot, Value>,
+    // elements whose kind or properties could not be established, checks that read them are skipped
+    unchecked: HashSet<ElementId>,
     errors: Diags,
 }
 
@@ -94,31 +120,48 @@ impl Modeler {
             slots: HashMap::new(),
             visiting: HashSet::new(),
             defaults: HashMap::new(),
+            unchecked: HashSet::new(),
             errors: Vec::new(),
         }
     }
 
-    fn kinds(&mut self, declarations: &[ast::KindDecl]) -> Result<()> {
+    fn kinds(&mut self, declarations: &[ast::KindDecl]) {
         for (index, declaration) in declarations.iter().enumerate() {
             if builtin_construct(&declaration.name).is_some() || reserved_name(&declaration.name) {
-                return Err(error(declaration.range, "kind name is reserved"));
-            }
-            if self
-                .model
-                .kind_names
-                .insert(declaration.name.clone(), KindId(index))
-                .is_some()
-            {
-                return Err(error(declaration.range, "duplicate kind name"));
+                self.errors.extend(error(declaration.range, "kind name is reserved"));
+            } else if self.model.kind_names.contains_key(&declaration.name) {
+                self.errors.extend(error(declaration.range, "duplicate kind name"));
+            } else {
+                self.model.kind_names.insert(declaration.name.clone(), KindId(index));
             }
         }
         let mut kinds = vec![None; declarations.len()];
-        let mut states = vec![0; declarations.len()];
+        let mut states = vec![PENDING; declarations.len()];
         for index in 0..declarations.len() {
-            resolve_kind(index, declarations, &self.model.kind_names, &mut states, &mut kinds)?;
+            if let Err(diags) = resolve_kind(index, declarations, &self.model.kind_names, &mut states, &mut kinds) {
+                self.errors.extend(diags);
+            }
         }
-        self.model.kinds = kinds.into_iter().map(|kind| kind.expect("resolved kind")).collect();
-        Ok(())
+        // instances of a kind that failed to resolve are left unchecked rather than checked against a partial schema
+        self.model.kind_names.retain(|_, id| kinds[id.0].is_some());
+        self.model.kinds = kinds
+            .into_iter()
+            .zip(declarations)
+            .map(|(kind, declaration)| {
+                // only reachable with errors recorded, so the model holding this placeholder is never returned
+                kind.unwrap_or_else(|| Kind {
+                    name: declaration.name.clone(),
+                    base: declaration.base.clone(),
+                    base_kind: None,
+                    construct: declaration.construct,
+                    primitive: declaration.base.clone(),
+                    direction: None,
+                    props: Vec::new(),
+                    fields: Vec::new(),
+                    range: declaration.range,
+                })
+            })
+            .collect();
     }
 
     fn element_kind(&self, owner: ElementId) -> (&str, Construct) {
@@ -213,6 +256,7 @@ impl Modeler {
                 self.element_range(owner),
                 "kind does not belong to this graph construct",
             ));
+            self.unchecked.insert(owner);
         }
         if let Some(kind) = schema {
             let entries = if property { kind.props } else { kind.fields };
@@ -243,6 +287,7 @@ impl Modeler {
                             range: entry.range,
                         });
                     } else if entry.required {
+                        self.unchecked.insert(owner);
                         self.errors.extend(error(
                             self.element_range(owner),
                             format!(
@@ -431,113 +476,192 @@ impl Modeler {
         }
     }
 
+    // reports a resolution failure once, later dependents fail without repeating it
+    fn unresolved<T>(&mut self, element: ElementId, diags: Diags) -> Result<T> {
+        match element {
+            ElementId::Edge(id) => self.edge_state[id.0] = FAILED,
+            ElementId::Fork(id) => self.fork_state[id.0] = FAILED,
+            ElementId::Junction(id) => self.junction_state[id.0] = FAILED,
+            ElementId::Node(_) => {}
+        }
+        self.errors.extend(diags);
+        Err(Vec::new())
+    }
+
     fn resolve_edge(&mut self, id: EdgeId) -> Result<()> {
-        if self.edge_state[id.0] == 2 {
-            return Ok(());
+        match self.edge_state[id.0] {
+            RESOLVED => return Ok(()),
+            FAILED => return Err(Vec::new()),
+            RESOLVING => return Err(error(self.model.edges[id.0].range, "circular static endpoint dependency")),
+            _ => {}
         }
-        if self.edge_state[id.0] == 1 {
-            return Err(error(self.model.edges[id.0].range, "circular static endpoint dependency"));
-        }
-        self.edge_state[id.0] = 1;
+        self.edge_state[id.0] = RESOLVING;
         let raw = self.raw_edges[id.0].clone();
-        let source = self.endpoint(&raw.source)?;
-        let target = self.endpoint(&raw.target)?;
-        self.model.edges[id.0].source = source;
-        self.model.edges[id.0].target = target;
-        self.edge_state[id.0] = 2;
-        Ok(())
+        let source = self.endpoint(&raw.source);
+        let target = self.endpoint(&raw.target);
+        match both(source, target) {
+            Ok((source, target)) => {
+                self.model.edges[id.0].source = source;
+                self.model.edges[id.0].target = target;
+                self.edge_state[id.0] = RESOLVED;
+                Ok(())
+            }
+            Err(diags) => self.unresolved(ElementId::Edge(id), diags),
+        }
     }
 
     fn resolve_fork(&mut self, id: ForkId) -> Result<()> {
-        if self.fork_state[id.0] == 2 {
-            return Ok(());
+        match self.fork_state[id.0] {
+            RESOLVED => return Ok(()),
+            FAILED => return Err(Vec::new()),
+            RESOLVING => return Err(error(self.model.forks[id.0].range, "circular static fork dependency")),
+            _ => {}
         }
-        if self.fork_state[id.0] == 1 {
-            return Err(error(self.model.forks[id.0].range, "circular static fork dependency"));
-        }
-        self.fork_state[id.0] = 1;
+        self.fork_state[id.0] = RESOLVING;
         let raw = self.raw_forks[id.0].clone();
-        self.model.forks[id.0].source = self.endpoint(&raw.source)?;
-        for branch in self.model.forks[id.0].branches.clone() {
-            for edge in branch {
-                self.resolve_edge(edge)?
+        let mut diags = Vec::new();
+        let mut failed = false;
+        match self.endpoint(&raw.source) {
+            Ok(source) => self.model.forks[id.0].source = source,
+            Err(more) => {
+                failed = true;
+                diags.extend(more);
             }
         }
-        self.fork_state[id.0] = 2;
+        for edge in self.model.forks[id.0].branches.clone().into_iter().flatten() {
+            if let Err(more) = self.resolve_edge(edge) {
+                failed = true;
+                diags.extend(more);
+            }
+        }
+        if failed {
+            return self.unresolved(ElementId::Fork(id), diags);
+        }
+        self.fork_state[id.0] = RESOLVED;
         Ok(())
+    }
+
+    fn junction_input(&mut self, id: JunctionId, expr: &ast::Expr) -> Result<EdgeId> {
+        let cursor = self.cursor(expr, Some(ElementId::Junction(id)))?;
+        let ElementId::Edge(edge) = self.element(cursor, expr.range)? else {
+            return Err(error(expr.range, "junction inputs must reference edges"));
+        };
+        self.resolve_edge(edge)?;
+        if let Some(fork) = self.model.junctions[id.0].fork
+            && self.model.edges[edge.0].fork != Some(fork)
+        {
+            return Err(error(expr.range, "junction input does not belong to the attached fork"));
+        }
+        Ok(edge)
     }
 
     fn resolve_junction(&mut self, id: JunctionId) -> Result<()> {
-        if self.junction_state[id.0] == 2 {
-            return Ok(());
+        match self.junction_state[id.0] {
+            RESOLVED => return Ok(()),
+            FAILED => return Err(Vec::new()),
+            RESOLVING => return Err(error(self.model.junctions[id.0].range, "circular static junction dependency")),
+            _ => {}
         }
-        if self.junction_state[id.0] == 1 {
-            return Err(error(self.model.junctions[id.0].range, "circular static junction dependency"));
-        }
-        self.junction_state[id.0] = 1;
+        self.junction_state[id.0] = RESOLVING;
         let raw = self.raw_junctions[id.0].clone();
-        let owner = Some(ElementId::Junction(id));
+        let mut diags = Vec::new();
+        let mut failed = false;
         let mut inputs = Vec::new();
         for expr in &raw.inputs {
-            let cursor = self.cursor(expr, owner)?;
-            let ElementId::Edge(edge) = self.element(cursor, expr.range)? else {
-                return Err(error(expr.range, "junction inputs must reference edges"));
-            };
-            self.resolve_edge(edge)?;
-            if let Some(fork) = self.model.junctions[id.0].fork
-                && self.model.edges[edge.0].fork != Some(fork)
-            {
-                return Err(error(expr.range, "junction input does not belong to the attached fork"));
+            match self.junction_input(id, expr) {
+                Ok(edge) => inputs.push(edge),
+                Err(more) => {
+                    failed = true;
+                    diags.extend(more);
+                }
             }
-            inputs.push(edge);
+        }
+        match self.endpoint(&raw.target) {
+            Ok(target) => self.model.junctions[id.0].target = target,
+            Err(more) => {
+                failed = true;
+                diags.extend(more);
+            }
+        }
+        if failed {
+            return self.unresolved(ElementId::Junction(id), diags);
         }
         self.model.junctions[id.0].inputs = inputs;
-        self.model.junctions[id.0].target = self.endpoint(&raw.target)?;
-        self.junction_state[id.0] = 2;
+        self.junction_state[id.0] = RESOLVED;
         Ok(())
     }
 
-    fn lower_path(&mut self, path: RawPath) -> Result<GraphPath> {
-        let origin = match path.origin {
-            RawOrigin::Node(anchor) => PathOrigin::Node(self.endpoint(&anchor)?),
+    fn lower_origin(&mut self, origin: RawOrigin, range: SrcRange) -> Result<PathOrigin> {
+        match origin {
+            RawOrigin::Node(anchor) => Ok(PathOrigin::Node(self.endpoint(&anchor)?)),
             RawOrigin::Selector(fork, anchor) => {
-                self.resolve_fork(fork)?;
-                let target = self.endpoint(&anchor)?;
+                // the selector is resolved even under a failed fork so its own mistake is reported
+                let target = self.endpoint(&anchor);
+                let resolved = self.resolve_fork(fork);
+                let (target, ()) = both(target, resolved)?;
                 if !self.model.forks[fork.0]
                     .branches
                     .iter()
                     .flatten()
                     .any(|edge| self.model.edges[edge.0].target == target)
                 {
-                    return Err(error(path.range, "selector target does not belong to the attached fork"));
+                    return Err(error(range, "selector target does not belong to the attached fork"));
                 }
-                PathOrigin::Selector { fork, target }
+                Ok(PathOrigin::Selector { fork, target })
             }
             RawOrigin::Junction(id) => {
                 self.resolve_junction(id)?;
-                PathOrigin::Junction(id)
+                Ok(PathOrigin::Junction(id))
             }
-        };
-        for step in &path.steps {
+        }
+    }
+
+    // every step is resolved even after a failure, `false` means a diagnostic was recorded
+    fn resolve_steps(&mut self, steps: &[PathStep]) -> bool {
+        let mut resolved = true;
+        for step in steps {
             match step {
                 PathStep::Edges(edges) => {
                     for edge in edges {
-                        self.resolve_edge(*edge)?
+                        if let Err(diags) = self.resolve_edge(*edge) {
+                            self.errors.extend(diags);
+                            resolved = false;
+                        }
                     }
                 }
                 PathStep::Fork(fork) => {
-                    self.resolve_fork(*fork)?;
-                    let continuations = self.continuations[fork.0]
+                    if let Err(diags) = self.resolve_fork(*fork) {
+                        self.errors.extend(diags);
+                        resolved = false;
+                    }
+                    let continuations: Vec<_> = self.continuations[fork.0]
                         .clone()
                         .into_iter()
                         .map(|path| self.lower_path(path))
-                        .collect::<Result<Vec<_>>>()?;
-                    self.model.forks[fork.0].continuations = continuations;
+                        .collect();
+                    if continuations.iter().all(Option::is_some) {
+                        self.model.forks[fork.0].continuations = continuations.into_iter().flatten().collect();
+                    } else {
+                        resolved = false;
+                    }
                 }
             }
         }
-        Ok(GraphPath {
-            origin,
+        resolved
+    }
+
+    // every step is resolved even after a failure, `None` means a diagnostic was recorded
+    fn lower_path(&mut self, path: RawPath) -> Option<GraphPath> {
+        let origin = match self.lower_origin(path.origin, path.range) {
+            Ok(origin) => Some(origin),
+            Err(diags) => {
+                self.errors.extend(diags);
+                None
+            }
+        };
+        let resolved = self.resolve_steps(&path.steps);
+        Some(GraphPath {
+            origin: origin.filter(|_| resolved)?,
             steps: path.steps,
             range: path.range,
         })
@@ -1060,14 +1184,13 @@ impl Modeler {
         Ok(*selected.iter().next().expect("one distinct element"))
     }
 
-    fn lower_fields(&mut self) -> Result<()> {
+    fn lower_fields(&mut self) {
         let owners: Vec<_> = (0..self.model.nodes.len())
             .map(|i| ElementId::Node(NodeId(i)))
             .chain((0..self.model.edges.len()).map(|i| ElementId::Edge(EdgeId(i))))
             .chain((0..self.model.forks.len()).map(|i| ElementId::Fork(ForkId(i))))
             .chain((0..self.model.junctions.len()).map(|i| ElementId::Junction(JunctionId(i))))
             .collect();
-        let mut errors = Vec::new();
         for owner in owners {
             for property in [true, false] {
                 let mut ids = Vec::new();
@@ -1081,7 +1204,10 @@ impl Modeler {
                         field.range,
                     ) {
                         Ok(id) => ids.push(id),
-                        Err(diags) => errors.extend(diags),
+                        Err(diags) => {
+                            self.errors.extend(diags);
+                            self.unchecked.insert(owner);
+                        }
                     }
                 }
                 match owner {
@@ -1099,7 +1225,6 @@ impl Modeler {
                 }
             }
         }
-        if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
 
     fn property(&self, owner: ElementId, name: &str) -> Option<BindingId> {
@@ -1140,6 +1265,10 @@ impl Modeler {
     fn validate_primitives(&self) -> Result<()> {
         let mut errors = Vec::new();
         for (i, junction) in self.model.junctions.iter().enumerate() {
+            // these checks read the junction's inputs and properties
+            if self.junction_state[i] != RESOLVED || self.unchecked.contains(&ElementId::Junction(JunctionId(i))) {
+                continue;
+            }
             if matches!(
                 self.primitive(ElementId::Junction(JunctionId(i))),
                 "accumulate" | "merge" | "first" | "quorum" | "reduce"
@@ -1169,7 +1298,8 @@ impl Modeler {
             }
         }
         for (i, _node) in self.model.nodes.iter().enumerate() {
-            if self.primitive(ElementId::Node(NodeId(i))) == "vars"
+            if !self.unchecked.contains(&ElementId::Node(NodeId(i)))
+                && self.primitive(ElementId::Node(NodeId(i))) == "vars"
                 && let Some(id) = self.property(ElementId::Node(NodeId(i)), "evaluate")
             {
                 let binding = &self.model.bindings[id.0];
@@ -1189,6 +1319,9 @@ impl Modeler {
                     self.model.edges[i].range,
                     "edge direction is not permitted by its kind",
                 ));
+            }
+            if self.unchecked.contains(&owner) {
+                continue;
             }
             if self.primitive(owner) == "feeds"
                 && let Some(into) = self.property(owner, "into")
@@ -1245,6 +1378,13 @@ impl Modeler {
                     for j in i + 1..fork.branches.len() {
                         for left in &fork.branches[i] {
                             for right in &fork.branches[j] {
+                                // a guard that failed to lower cannot be compared
+                                if [left, right]
+                                    .iter()
+                                    .any(|edge| self.unchecked.contains(&ElementId::Edge(**edge)))
+                                {
+                                    continue;
+                                }
                                 let guard = |edge| {
                                     self.property(ElementId::Edge(edge), "when")
                                         .map(|id| self.model.bindings[id.0].value.clone())
@@ -1305,7 +1445,17 @@ fn schema_string(expr: &ast::Expr) -> Result<String> {
 }
 
 fn schema_fields(expr: &ast::Expr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    let mut errors = Vec::new();
     for field in schema_entries(expr)? {
+        if let Err(diags) = schema_field(field, inherited) {
+            errors.extend(diags);
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    {
         let previous = inherited.iter().find(|entry| entry.name == field.key).cloned();
         let mut schema = previous.clone().unwrap_or(FieldSchema {
             name: field.key.clone(),
@@ -1458,11 +1608,33 @@ fn resolve_kind(
     if let Some(kind) = &kinds[index] {
         return Ok(kind.clone());
     }
-    let declaration = &declarations[index];
-    if states[index] == 1 {
-        return Err(error(declaration.range, "circular kind extension"));
+    match states[index] {
+        FAILED => return Err(Vec::new()),
+        RESOLVING => return Err(error(declarations[index].range, "circular kind extension")),
+        _ => {}
     }
-    states[index] = 1;
+    states[index] = RESOLVING;
+    match resolve_kind_declaration(index, declarations, names, states, kinds) {
+        Ok(kind) => {
+            states[index] = RESOLVED;
+            kinds[index] = Some(kind.clone());
+            Ok(kind)
+        }
+        Err(diags) => {
+            states[index] = FAILED;
+            Err(diags)
+        }
+    }
+}
+
+fn resolve_kind_declaration(
+    index: usize,
+    declarations: &[ast::KindDecl],
+    names: &std::collections::BTreeMap<String, KindId>,
+    states: &mut [u8],
+    kinds: &mut [Option<Kind>],
+) -> Result<Kind> {
+    let declaration = &declarations[index];
     let mut kind = if let Some(base) = names.get(&declaration.base) {
         let mut kind = resolve_kind(base.0, declarations, names, states, kinds)?;
         if kind.construct != declaration.construct {
@@ -1492,37 +1664,43 @@ fn resolve_kind(
     kind.base = declaration.base.clone();
     kind.range = declaration.range;
     let mut seen = HashSet::new();
+    let mut errors = Vec::new();
     for field in &declaration.schema {
         if !seen.insert(&field.key) {
-            return Err(error(field.range, "duplicate kind schema section"));
+            errors.extend(error(field.range, "duplicate kind schema section"));
+            continue;
         }
-        match field.key.as_str() {
-            "direction" if kind.construct == Construct::Edge => {
-                let direction = match schema_string(&field.value)?.as_str() {
-                    "directed" => Directions::Directed,
-                    "undirected" => Directions::Undirected,
-                    "either" => Directions::Either,
-                    _ => return Err(error(field.range, "direction must be directed, undirected or either")),
-                };
-                if kind.direction != Some(Directions::Either) && kind.direction != Some(direction) {
-                    return Err(error(
-                        field.range,
-                        "an extension cannot widen or contradict its base direction",
-                    ));
-                }
-                kind.direction = Some(direction);
-            }
-            "props" => schema_fields(&field.value, &mut kind.props)?,
-            "fields" if kind.construct == Construct::Node => schema_fields(&field.value, &mut kind.fields)?,
-            _ => return Err(error(field.range, "expected props, or fields for a node kind")),
+        let section = match field.key.as_str() {
+            "direction" if kind.construct == Construct::Edge => kind_direction(field, &mut kind),
+            "props" => schema_fields(&field.value, &mut kind.props),
+            "fields" if kind.construct == Construct::Node => schema_fields(&field.value, &mut kind.fields),
+            _ => Err(error(field.range, "expected props, or fields for a node kind")),
+        };
+        if let Err(diags) = section {
+            errors.extend(diags);
         }
     }
     if kind.fields.iter().any(|field| field.name == "props") {
-        return Err(error(kind.range, "props is reserved for node properties"));
+        errors.extend(error(kind.range, "props is reserved for node properties"));
     }
-    states[index] = 2;
-    kinds[index] = Some(kind.clone());
-    Ok(kind)
+    if errors.is_empty() { Ok(kind) } else { Err(errors) }
+}
+
+fn kind_direction(field: &ast::Attr, kind: &mut Kind) -> Result<()> {
+    let direction = match schema_string(&field.value)?.as_str() {
+        "directed" => Directions::Directed,
+        "undirected" => Directions::Undirected,
+        "either" => Directions::Either,
+        _ => return Err(error(field.range, "direction must be directed, undirected or either")),
+    };
+    if kind.direction != Some(Directions::Either) && kind.direction != Some(direction) {
+        return Err(error(
+            field.range,
+            "an extension cannot widen or contradict its base direction",
+        ));
+    }
+    kind.direction = Some(direction);
+    Ok(())
 }
 
 // find one distinct edge per constraint without enumerating their permutations
@@ -1753,23 +1931,42 @@ fn disjoint(a: &Value, b: &Value, bindings: &[Binding]) -> bool {
 
 pub(super) fn model(ast: ast::GraphDocument) -> Result<Model> {
     let mut modeler = Modeler::new();
-    modeler.kinds(&ast.kinds)?;
+    // no phase stops the next one: a failed element is marked, and later checks that
+    // depend on it are skipped, so each independent mistake is reported once
+    modeler.kinds(&ast.kinds);
     let paths: Vec<_> = ast.paths.iter().map(|path| modeler.path(path, None)).collect();
-    if !modeler.errors.is_empty() {
-        return Err(modeler.errors);
-    }
     if paths.is_empty() && ast.kinds.is_empty() {
         return Err(error(SrcRange::new(0, 0), "expected at least one graph statement"));
     }
     let mut resolved = Vec::new();
     for path in paths {
-        resolved.push(modeler.lower_path(path)?)
+        resolved.extend(modeler.lower_path(path));
     }
     modeler.model.paths = resolved;
-    modeler.lower_fields()?;
-    modeler.validate_primitives()?;
-    validate_graph(&mut modeler.model)?;
-    Ok(modeler.model)
+    modeler.lower_fields();
+    if let Err(diags) = modeler.validate_primitives() {
+        modeler.errors.extend(diags);
+    }
+    let states = [&modeler.edge_state, &modeler.fork_state, &modeler.junction_state];
+    let unresolved: HashSet<_> = (states[0].iter().enumerate())
+        .filter_map(|(i, state)| (*state != RESOLVED).then_some(ElementId::Edge(EdgeId(i))))
+        .chain(
+            (states[1].iter().enumerate()).filter_map(|(i, state)| (*state != RESOLVED).then_some(ElementId::Fork(ForkId(i)))),
+        )
+        .chain(
+            (states[2].iter().enumerate())
+                .filter_map(|(i, state)| (*state != RESOLVED).then_some(ElementId::Junction(JunctionId(i)))),
+        )
+        .collect();
+    debug_assert!(unresolved.is_empty() || !modeler.errors.is_empty());
+    if let Err(diags) = validate_graph(&mut modeler.model, &modeler.unchecked, &unresolved) {
+        modeler.errors.extend(diags);
+    }
+    if modeler.errors.is_empty() {
+        Ok(modeler.model)
+    } else {
+        Err(dedup(modeler.errors))
+    }
 }
 
 struct GraphCheck<'a> {
@@ -1922,11 +2119,15 @@ impl<'a> GraphCheck<'a> {
         };
         let base = primitive(self.model, self.owner);
         let descriptors = primitive_properties(construct, base, self.range);
+        let mut errors = Vec::new();
         for descriptor in &descriptors {
-            if let Some(value) = self.prop(&descriptor.name) {
-                self.typed(value, descriptor.ty)?;
-            } else if descriptor.required {
-                return self.error(format!("missing required property `{}`", descriptor.name));
+            let checked = match self.prop(&descriptor.name) {
+                Some(value) => self.typed(value, descriptor.ty),
+                None if descriptor.required => self.error(format!("missing required property `{}`", descriptor.name)),
+                None => Ok(()),
+            };
+            if let Err(diags) = checked {
+                errors.extend(diags);
             }
         }
         if !self.model.kind_names.contains_key(kind)
@@ -1938,17 +2139,18 @@ impl<'a> GraphCheck<'a> {
             for id in properties(self.model, self.owner) {
                 let binding = &self.model.bindings[id.0];
                 if !descriptors.iter().any(|entry| binding.path == [entry.name.clone()]) {
-                    return self.error(format!(
-                        "unknown property `{}` for built-in kind `{base}`",
-                        binding.path.join(".")
+                    errors.extend(error(
+                        self.range,
+                        format!("unknown property `{}` for built-in kind `{base}`", binding.path.join(".")),
                     ));
                 }
             }
         }
-        Ok(())
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
 
-    fn network(&self, node: NodeId) -> Result<Network> {
+    // `None` when a selected edge has no resolved endpoints to validate against
+    fn network(&self, node: NodeId, unresolved: &HashSet<ElementId>) -> Result<Option<Network>> {
         let nodes: Vec<_> = self
             .references("nodes", true)?
             .into_iter()
@@ -1965,6 +2167,9 @@ impl<'a> GraphCheck<'a> {
                 _ => unreachable!(),
             })
             .collect();
+        if edges.iter().any(|id| unresolved.contains(&ElementId::Edge(*id))) {
+            return Ok(None);
+        }
         let members: HashSet<_> = nodes.iter().copied().collect();
         for id in &edges {
             let edge = &self.model.edges[id.0];
@@ -2003,7 +2208,7 @@ impl<'a> GraphCheck<'a> {
         if network.validate != ValidationStage::Materialized {
             self.structure(&network)?;
         }
-        Ok(network)
+        Ok(Some(network))
     }
 
     fn structure(&self, network: &Network) -> Result<()> {
@@ -2149,7 +2354,16 @@ fn properties(model: &Model, owner: ElementId) -> &[BindingId] {
     }
 }
 
-fn validate_graph(model: &mut Model) -> Result<()> {
+// each check reports its own failure and the rest still run, checks that read an
+// unresolved or unchecked element are skipped because its mistake is already reported
+fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved: &HashSet<ElementId>) -> Result<()> {
+    let mut unchecked = unchecked.clone();
+    let mut errors = Vec::new();
+    let mut keep = |result: Result<()>| {
+        if let Err(diags) = result {
+            errors.extend(diags);
+        }
+    };
     for (owner, range) in model
         .nodes
         .iter()
@@ -2177,10 +2391,18 @@ fn validate_graph(model: &mut Model) -> Result<()> {
                 .map(|(i, junction)| (ElementId::Junction(JunctionId(i)), junction.range)),
         )
     {
-        GraphCheck { model, owner, range }.properties()?;
+        if !unchecked.contains(&owner)
+            && let Err(diags) = (GraphCheck { model, owner, range }).properties()
+        {
+            // the kind-specific checks below would describe the same property mistakes again
+            unchecked.insert(owner);
+            keep(Err(diags));
+        }
     }
     let mut networks = Vec::new();
     let mut incidences: HashMap<NodeId, Vec<(NodeId, String)>> = HashMap::new();
+    // false once an incidence could not be attributed, relation counts would then be wrong
+    let mut incidences_complete = true;
     for (i, edge) in model.edges.iter().enumerate() {
         let owner = ElementId::Edge(EdgeId(i));
         let check = GraphCheck {
@@ -2188,62 +2410,84 @@ fn validate_graph(model: &mut Model) -> Result<()> {
             owner,
             range: edge.range,
         };
-        if let Some(limit) = check.prop("max_traversals") {
-            if !edge.cycle {
-                return check.error("max_traversals requires a cycle edge");
-            }
-            check.typed(limit, FieldType::Number)?;
-            if expr::constant(limit) {
-                check.count(limit, "max_traversals")?;
-            }
+        let known = !unchecked.contains(&owner);
+        if known && let Some(limit) = check.prop("max_traversals") {
+            keep((|| {
+                if !edge.cycle {
+                    return check.error("max_traversals requires a cycle edge");
+                }
+                check.typed(limit, FieldType::Number)?;
+                if expr::constant(limit) {
+                    check.count(limit, "max_traversals")?;
+                }
+                Ok(())
+            })());
         }
         if primitive(model, owner) == "incidence" {
-            let check = GraphCheck {
-                model,
-                owner,
-                range: edge.range,
-            };
+            if !known || unresolved.contains(&owner) {
+                incidences_complete = false;
+                continue;
+            }
             let left = primitive(model, ElementId::Node(edge.source)) == "relation";
             let right = primitive(model, ElementId::Node(edge.target)) == "relation";
-            if left == right {
-                return check.error("incidence requires exactly one relation endpoint");
-            }
-            let role = check.choice("role", "member", &["member", "input", "output"])?;
-            let (relation, participant) = if left {
-                (edge.source, edge.target)
+            let role = if left == right {
+                check.error("incidence requires exactly one relation endpoint")
             } else {
-                (edge.target, edge.source)
+                check.choice("role", "member", &["member", "input", "output"])
             };
-            incidences.entry(relation).or_default().push((participant, role.to_owned()));
+            match role {
+                Ok(role) => {
+                    let (relation, participant) = if left {
+                        (edge.source, edge.target)
+                    } else {
+                        (edge.target, edge.source)
+                    };
+                    incidences.entry(relation).or_default().push((participant, role.to_owned()));
+                }
+                Err(diags) => {
+                    incidences_complete = false;
+                    keep(Err(diags));
+                }
+            }
         }
     }
     for (i, node) in model.nodes.iter().enumerate() {
         let id = NodeId(i);
         let owner = ElementId::Node(id);
+        if unchecked.contains(&owner) {
+            continue;
+        }
         let check = GraphCheck {
             model,
             owner,
             range: node.range,
         };
         match primitive(model, owner) {
-            "network" => networks.push(check.network(id)?),
-            "relation" => {
+            "network" => match check.network(id, unresolved) {
+                Ok(network) => networks.extend(network),
+                Err(diags) => keep(Err(diags)),
+            },
+            "relation" if incidences_complete => {
                 let entries = incidences.get(&id).map(Vec::as_slice).unwrap_or_default();
                 let inputs = entries.iter().filter(|(_, role)| role == "input").count();
                 let outputs = entries.iter().filter(|(_, role)| role == "output").count();
                 if inputs + outputs > 0 && (inputs == 0 || outputs == 0 || inputs + outputs != entries.len()) {
-                    return check.error("directed relations require input and output incidences without member roles");
+                    keep(check.error("directed relations require input and output incidences without member roles"));
                 }
-                if check.boolean("unique", true)? {
+                keep(check.boolean("unique", true).and_then(|unique| {
                     let mut seen = HashSet::new();
-                    if entries.iter().any(|entry| !seen.insert(entry)) {
+                    if unique && entries.iter().any(|entry| !seen.insert(entry)) {
                         return check.error("duplicate relation participant in the same role");
                     }
-                }
+                    Ok(())
+                }));
                 for (name, count) in [("participants", entries.len()), ("inputs", inputs), ("outputs", outputs)] {
-                    if !within(count, check.bounds(name)?) {
-                        return check.error(format!("relation violates {name} bounds"));
-                    }
+                    keep(check.bounds(name).and_then(|bounds| {
+                        if !within(count, bounds) {
+                            return check.error(format!("relation violates {name} bounds"));
+                        }
+                        Ok(())
+                    }));
                 }
             }
             _ => {}
@@ -2256,54 +2500,77 @@ fn validate_graph(model: &mut Model) -> Result<()> {
             owner,
             range: fork.range,
         };
+        let known = !unchecked.contains(&owner);
+        let branch_checks = || {
+            fork.branches
+                .iter()
+                .flatten()
+                .filter(|edge| !unchecked.contains(&ElementId::Edge(**edge)))
+                .map(|edge| GraphCheck {
+                    model,
+                    owner: ElementId::Edge(*edge),
+                    range: model.edges[edge.0].range,
+                })
+        };
         match primitive(model, owner) {
             "each" | "repeat" => {
-                if primitive(model, owner) == "repeat" {
-                    let count = check.required("count")?;
-                    check.typed(count, FieldType::Number)?;
-                    if expr::constant(count) {
-                        check.count(count, "count")?;
-                    }
-                } else {
-                    check.typed(check.required("items")?, FieldType::Array)?;
-                    check.positive_count("concurrency", None)?;
+                if known {
+                    keep((|| {
+                        if primitive(model, owner) == "repeat" {
+                            let count = check.required("count")?;
+                            check.typed(count, FieldType::Number)?;
+                            if expr::constant(count) {
+                                check.count(count, "count")?;
+                            }
+                        } else {
+                            check.typed(check.required("items")?, FieldType::Array)?;
+                            check.positive_count("concurrency", None)?;
+                        }
+                        Ok(())
+                    })());
                 }
-                for edge in fork.branches.iter().flatten() {
-                    let edge_check = GraphCheck {
-                        model,
-                        owner: ElementId::Edge(*edge),
-                        range: model.edges[edge.0].range,
-                    };
+                for edge_check in branch_checks() {
                     if edge_check.prop("when").is_some() {
-                        return edge_check.error("each and repeat run every listed branch and do not allow branch guards");
+                        keep(edge_check.error("each and repeat run every listed branch and do not allow branch guards"));
                     }
                 }
             }
             "weighted" => {
-                if check.prop("count").is_some() {
-                    return check.error("weighted selects exactly one branch and does not accept count");
+                if known && check.prop("count").is_some() {
+                    keep(check.error("weighted selects exactly one branch and does not accept count"));
                 }
                 for branch in &fork.branches {
                     let mut branch_weight = None;
                     for edge in branch {
+                        if unchecked.contains(&ElementId::Edge(*edge)) {
+                            continue;
+                        }
                         let edge_check = GraphCheck {
                             model,
                             owner: ElementId::Edge(*edge),
                             range: model.edges[edge.0].range,
                         };
                         let weight = match edge_check.prop("weight") {
-                            None => return edge_check.error("weighted branches require an explicit weight"),
+                            None => {
+                                keep(edge_check.error("weighted branches require an explicit weight"));
+                                continue;
+                            }
                             Some(Value::Num(Number::Int(value))) => Some(*value as f64),
                             Some(Value::Num(Number::Float(value))) => Some(*value),
                             Some(value) if !expr::constant(value) => None,
-                            _ => return edge_check.error("weighted branch weight must be a nonnegative number"),
+                            _ => {
+                                keep(edge_check.error("weighted branch weight must be a nonnegative number"));
+                                continue;
+                            }
                         };
                         if let Some(weight) = weight {
                             if !weight.is_finite() || weight < 0.0 {
-                                return edge_check.error("weighted branch weight must be finite and nonnegative");
+                                keep(edge_check.error("weighted branch weight must be finite and nonnegative"));
+                                continue;
                             }
                             if branch_weight.is_some_and(|previous| previous != weight) {
-                                return edge_check.error("all edges in a weighted branch must have the same weight");
+                                keep(edge_check.error("all edges in a weighted branch must have the same weight"));
+                                continue;
                             }
                             branch_weight = Some(weight);
                         }
@@ -2315,25 +2582,27 @@ fn validate_graph(model: &mut Model) -> Result<()> {
     }
     for (i, junction) in model.junctions.iter().enumerate() {
         let owner = ElementId::Junction(JunctionId(i));
-        if matches!(
-            primitive(model, owner),
-            "accumulate" | "merge" | "first" | "quorum" | "reduce"
-        ) {
+        if !unchecked.contains(&owner)
+            && matches!(
+                primitive(model, owner),
+                "accumulate" | "merge" | "first" | "quorum" | "reduce"
+            )
+        {
             let check = GraphCheck {
                 model,
                 owner,
                 range: junction.range,
             };
-            check.choice("observe", "arrival", &["arrival", "result"])?;
-            check.choice("on_failure", "fail", &["fail", "skip"])?;
-            check.choice("on_cancel", "fail", &["fail", "skip"])?;
+            keep(check.choice("observe", "arrival", &["arrival", "result"]).map(drop));
+            keep(check.choice("on_failure", "fail", &["fail", "skip"]).map(drop));
+            keep(check.choice("on_cancel", "fail", &["fail", "skip"]).map(drop));
             if primitive(model, owner) == "reduce" {
-                check.required("initial")?;
-                check.required("combine")?;
-                check.choice("order", "source", &["source", "arrival"])?;
+                keep(check.required("initial").map(drop));
+                keep(check.required("combine").map(drop));
+                keep(check.choice("order", "source", &["source", "arrival"]).map(drop));
             }
         }
     }
     model.networks = networks;
-    Ok(())
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
 }

@@ -37,7 +37,10 @@ pub mod semantics {
 
     /// Parses source, resolves references, and checks the language's semantic rules.
     ///
-    /// Returns diagnostics from the first failing phase. Empty source is rejected.
+    /// Lexing or parsing errors are returned without validating. Validation reports
+    /// every independent mistake in the module once, each at its own location, and
+    /// skips checks that depend on an element that already failed. Identical
+    /// diagnostics are reported once. Empty source is rejected.
     /// Runtime-dependent values are retained as expressions for consumers to evaluate.
     /// Successful compilation does not guarantee that every runtime evaluation succeeds.
     /// Modifying the returned model can invalidate its references and type guarantees.

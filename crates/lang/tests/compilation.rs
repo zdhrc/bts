@@ -2293,3 +2293,61 @@ fn fork_branches_preserve_cycle_identity_and_bundle_configuration() {
         model.edges[fork.branches[0][1].0].target
     );
 }
+
+#[test]
+fn reports_every_independent_mistake_at_its_own_location_without_cascades() {
+    let source = r#"
+(start:node) {value: 1};
+(start:node) {value: 2};
+(start)-[:next]->(a:node) {seen: missing.value, again: self.seen};
+(a)-[:next {when: 5}]->(b:node);
+(b)-[:next]->(nowhere)-[:next]->(c:node);
+(c)=[:parallel]=>[-[one:next]->(d:node), -[two:next]->(e:node)]
+    >[:quorum {count: 9} [one], [ghost]]>>(f:node);
+"#;
+    let errors = compile(source).unwrap_err();
+    let reported: Vec<_> = errors
+        .iter()
+        .map(|error| (&source[error.r#where.start..error.r#where.end], error.what.as_str()))
+        .collect();
+    let expected = [
+        // a duplicate name, with a note on the first declaration
+        ("start", "duplicate graph name `start`"),
+        ("start", "previous declaration of `start`"),
+        // an unresolved endpoint, reported once for the two edges that share it
+        ("nowhere", "unresolved graph name `nowhere`"),
+        // a bad junction input, without a quorum count error for the unresolved junction
+        ("ghost", "unresolved graph name `ghost`"),
+        // an unresolved field reference, reported once although `again` reads the same field
+        ("missing.value", "unresolved graph name `missing`"),
+        // a guard with the wrong type
+        ("when: 5", "expects boolean operands"),
+    ];
+    assert_eq!(reported.len(), expected.len(), "{reported:#?}");
+    for ((text, what), (expected_text, expected_what)) in reported.iter().zip(expected) {
+        assert_eq!(*text, expected_text, "{reported:#?}");
+        assert!(what.contains(expected_what), "{reported:#?}");
+    }
+    assert!(errors.iter().all(|error| error.when == DiagPhase::Validation));
+}
+
+#[test]
+fn reports_every_broken_kind_declaration_without_checking_its_instances() {
+    let source = r#"
++(orphan::nothing {});
++(typo::node {props: {a: {type: "strin"}, b: {required: 1}}});
++(derived::orphan {});
+(x:derived {anything: 1});
+(y:typo {anything: 1});
+"#;
+    let errors = compile(source).unwrap_err();
+    let reported: Vec<_> = errors.iter().map(|error| error.what.as_str()).collect();
+    assert_eq!(
+        reported,
+        [
+            "unknown base kind `nothing`",
+            "unknown schema value type",
+            "required must be a literal boolean",
+        ]
+    );
+}
