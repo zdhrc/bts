@@ -1,8 +1,8 @@
 # provider definitions are supplied by the host
-+(patient_lookup::tool {
-    props: {resource: {type: "string", default: "patients"}},
-    fields: {patient_id: {type: "string", required: true}},
-});
++(patient_lookup:node {resource: {type: "string", default: "patients"}}) {
+    patient_id: {type: "string", required: true},
+}
+    -[:extends]->(tool);
 
 (intake:agent {name: "Hospital intake", description: "Identify a patient and route their request"}) {
     input: {patient_id: "p-123"},

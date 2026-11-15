@@ -111,7 +111,7 @@ fn graph_agent_preserves_sibling_progression_and_inherited_kinds() {
         .replace("lookup:tool", "lookup:lookup_kind")
         .replace("output: lookup.output", "output: finish.output");
     let source = format!(
-        r#"+(intake_kind::agent {{}}); +(lookup_kind::tool {{}});
+        r#"+(intake_kind:node)-[:extends]->(agent); +(lookup_kind:node)-[:extends]->(tool);
 {source}
 (intake)-[:contains]->(finish:tool) {{input: intake.input, output: {{patient_id: self.input.patient_id, found: true}}}};
 (lookup)-[:next]->(finish);
@@ -301,7 +301,7 @@ fn typed_propagation_is_checked_by_data_and_generated_code() {
         for valid in [true, false] {
             let value = if valid { value } else { "null" };
             let source = format!(
-                "+(checked_tool::tool {{fields: {{patient_id: {{type: \"{ty}\"}}}}}});\n{}",
+                "+(checked_tool:node) {{patient_id: {{type: \"{ty}\"}}}}-[:extends]->(tool);\n{}",
                 SOURCE
                     .replace("lookup:tool", "lookup:checked_tool")
                     .replace("\"p-123\"", value)

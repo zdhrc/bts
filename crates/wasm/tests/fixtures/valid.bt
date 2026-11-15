@@ -1,4 +1,4 @@
-+(lookup_tool::tool {props: {service: {type: "string", required: true}}});
++(lookup_tool:node {service: {type: "string", required: true}})-[:extends]->(tool);
 
 # retries, a weighted route and two results reconciled into one payload
 (workflow:agent) {input: 2, output: finish.output};

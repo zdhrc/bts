@@ -94,7 +94,7 @@ fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
                 .any(|edge| edge.source.0 == node("request") && edge.target.0 == node("lookup") && edge.kind == kind)
         );
     }
-    compile_braintrust("+(special_agent::agent {}); (a:special_agent) {input: 1, output: self.input};").unwrap();
+    compile_braintrust("+(special_agent:node)-[:extends]->(agent); (a:special_agent) {input: 1, output: self.input};").unwrap();
 }
 
 #[test]
@@ -114,12 +114,12 @@ fn braintrust_span_parenting_preserves_direction_and_extension() {
                 && model.nodes[edge.target.0].name.as_deref() == Some(parent)
         }));
     }
-    let declarations = "+-[nested::child_of {}]-; (parent:task); (child:tool);";
+    let declarations = "+(nested:edge)-[:extends]->(child_of); (parent:task); (child:tool);";
     compile_braintrust(&format!("{declarations} (child)-[:nested]->(parent);")).unwrap();
     for edge in ["(child)-[:child_of]-(parent);", "(child)-[:nested]-(parent);"] {
         assert!(compile_braintrust(&format!("{declarations} {edge}")).is_err());
     }
-    assert!(compile_braintrust("+-[nested::child_of {direction: \"either\"}]-; (a:task);").is_err());
+    assert!(compile_braintrust("+(nested:edge {direction: \"either\"})-[:extends]->(child_of); (a:task);").is_err());
 }
 
 #[test]
@@ -144,26 +144,21 @@ fn braintrust_provider_schemas_reject_invalid_known_fields_and_properties() {
     }
     compile_braintrust("(a:tool) {custom: {anything: true}};").unwrap();
     compile_braintrust(
-        "+(custom_tool::tool {fields: {custom: {type: \"string\", required: true}}}); (a:custom_tool) {custom: \"value\"};",
+        "+(custom_tool:node) {custom: {type: \"string\", required: true}}-[:extends]->(tool); (a:custom_tool) {custom: \"value\"};",
     )
     .unwrap();
-    assert!(compile_braintrust("+(tool::node {}); (a:tool);").is_err());
+    assert!(compile_braintrust("+(tool:node); (a:tool);").is_err());
 }
 
 // illustrative provider definitions, not the final Braintrust schema
 const PROVIDER_SOURCE: &str = r#"
-+(span::node {
-    props: {
-        name: {type: "string", required: true},
-    },
-    fields: {
-        patient_id: {type: "string"},
-        output: {type: "object", role: "output"},
-        metadata: {type: "object", default: {}},
-    },
-});
++(span:node {name: {type: "string", required: true}}) {
+    patient_id: {type: "string"},
+    output: {type: "object", role: "output"},
+    metadata: {type: "object", default: {}},
+};
 
-+(tool_span::span {});
++(tool_span:node)-[:extends]->(span);
 "#;
 
 fn compile_fixture() -> bts_lang::Model {
@@ -803,7 +798,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 61);
+    assert_eq!(graph.paths.len(), 62);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -973,11 +968,20 @@ fn handles_truncated_pattern_references_without_panicking() {
 #[test]
 fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
     let model = compile_fixture();
-    assert_eq!(model.paths.len(), 61);
+    assert_eq!(model.paths.len(), 62);
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
     assert!(model.forks.len() > 5);
     assert!(model.junctions.len() > 2);
+    let traits = |kind: &str| -> Vec<&str> {
+        model.kinds[model.kind_names[kind].0]
+            .traits
+            .iter()
+            .map(|id| model.traits[id.0].name.as_str())
+            .collect()
+    };
+    assert_eq!(traits("patient_export"), ["consented", "audited", "retained"]);
+    assert_eq!(traits("audited_data"), ["audited"]);
 }
 
 fn compiled(source: &str) -> bts_lang::Model {
@@ -1604,13 +1608,13 @@ fn validates_builtin_junction_configuration() {
 
 #[test]
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
-    use bts_lang::{Construct, ElementId, FieldType};
+    use bts_lang::{ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.kinds.len(), 6);
-    assert_eq!(ast.kinds[0].construct, Construct::Node);
-    assert_eq!(ast.kinds[1].construct, Construct::Edge);
-    assert_eq!(ast.kinds[2].construct, Construct::Fork);
-    assert_eq!(ast.kinds[3].construct, Construct::Junction);
+    assert_eq!(ast.definitions.len(), 11);
+    assert_eq!(ast.definitions[0].head.header.kind, "node");
+    assert_eq!(ast.definitions[1].head.header.kind, "edge");
+    assert_eq!(ast.definitions[2].head.header.kind, "fork");
+    assert_eq!(ast.definitions[3].head.header.kind, "junction");
     let marker = field(node_declaration(&edge(&ast.paths[37].steps[0]).target), "patient_id");
     assert!(matches!(marker.kind, ExprKind::Upstream));
     assert_eq!(&COMPILATION_SOURCE[marker.range.start..marker.range.end], "<-");
@@ -1665,30 +1669,30 @@ fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
 #[test]
 fn resolves_forward_kind_bases_and_validates_specialization() {
     let model = compiled(
-        r#"+(child::base {fields: {value: {required: true}}});
-        +(base::node {props: {name: {type: "string", default: "example"}}, fields: {value: {type: "number"}}});
+        r#"+(child:node) {value: {required: true}}-[:extends]->(base);
+        +(base:node {name: {type: "string", default: "example"}}) {value: {type: "number"}};
         (a:child) {value: 2, extra: true};"#,
     );
     assert_eq!(model.kinds[0].base_kind, Some(model.kind_names["base"]));
     assert!(
-        bts_lang::semantics::compile_module("+(only::node {});", true)
+        bts_lang::semantics::compile_module("+(only:node);", true)
             .unwrap()
             .kinds
             .len()
             == 1
     );
     for source in [
-        "+(a::b {}); +(b::a {});",
-        "+(a::missing {});",
-        "+(a::node {}); +(a::node {});",
-        "+(node::node {});",
-        "+(self::node {});",
-        "+(a::feeds {});",
-        "+-[a::node {}]-;",
-        "+(base::node {}); (:base)-[:base]->(:node);",
-        "+(base::node {fields: {v: {type: \"string\", required: true}}}); +(child::base {fields: {v: {required: false}}});",
-        "+(base::node {fields: {v: {type: \"string\"}}}); +(child::base {fields: {v: {type: \"number\"}}});",
-        "+(base::node {fields: {v: {type: \"any\", default: \"text\"}}}); +(child::base {fields: {v: {type: \"number\"}}});",
+        "+(a:node)-[:extends]->(b); +(b:node)-[:extends]->(a);",
+        "+(a:node)-[:extends]->(missing);",
+        "+(a:node); +(a:node);",
+        "+(node:node);",
+        "+(self:node);",
+        "+(a:node)-[:extends]->(feeds);",
+        "+(a:edge)-[:extends]->(node);",
+        "+(base:node); (:base)-[:base]->(:node);",
+        "+(base:node) {v: {type: \"string\", required: true}}; +(child:node) {v: {required: false}}-[:extends]->(base);",
+        "+(base:node) {v: {type: \"string\"}}; +(child:node) {v: {type: \"number\"}}-[:extends]->(base);",
+        "+(base:node) {v: {type: \"any\", default: \"text\"}}; +(child:node) {v: {type: \"number\"}}-[:extends]->(base);",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
@@ -1696,7 +1700,7 @@ fn resolves_forward_kind_bases_and_validates_specialization() {
 
 #[test]
 fn keeps_properties_strict_and_fields_open_with_typed_defaults() {
-    let schema = r#"+(record::node {props: {name: {type: "string", required: true}, enabled: {type: "boolean", default: true}}, fields: {value: {type: "number", required: true}, fallback: {type: "object", default: {}}}});"#;
+    let schema = r#"+(record:node {name: {type: "string", required: true}, enabled: {type: "boolean", default: true}}) {value: {type: "number", required: true}, fallback: {type: "object", default: {}}};"#;
     compiled(&format!(
         "{schema} (a:record {{name: \"a\"}}) {{value: 2, arbitrary: [|1, 2|]}};"
     ));
@@ -1711,11 +1715,11 @@ fn keeps_properties_strict_and_fields_open_with_typed_defaults() {
         assert!(compile(&format!("{schema} {instance}")).is_err(), "{instance}");
     }
     for schema in [
-        "+(bad::node {props: {v: {type: \"imaginary\"}}});",
-        "+(bad::node {props: {v: {type: \"number\", default: \"wrong\"}}});",
-        "+(bad::node {fields: {v: {default: range(1, 2)}}});",
-        "+(bad::node {fields: {props: {}}});",
-        "+(bad::node {fields: {v: {typo: true}}});",
+        "+(bad:node {v: {type: \"imaginary\"}});",
+        "+(bad:node {v: {type: \"number\", default: \"wrong\"}});",
+        "+(bad:node) {v: {default: range(1, 2)}};",
+        "+(bad:node) {props: {}};",
+        "+(bad:node) {v: {typo: true}};",
     ] {
         assert!(compile(schema).is_err(), "{schema}");
     }
@@ -1723,7 +1727,7 @@ fn keeps_properties_strict_and_fields_open_with_typed_defaults() {
 
 #[test]
 fn feeds_references_input_destinations_without_reading_them() {
-    let schema = "+(receiver::node {fields: {id: {type: \"string\", required: true}}});";
+    let schema = "+(receiver:node) {id: {type: \"string\", required: true}};";
     let model = compiled(&format!(
         "{schema} (a:node) {{id: \"p-1\"}} -[:feeds {{value: source.id, into: target.id}}]->(b:receiver) {{id: <-, upper: upper(self.id)}};"
     ));
@@ -1747,23 +1751,23 @@ fn feeds_references_input_destinations_without_reading_them() {
 #[test]
 fn specialized_primitives_keep_their_builtin_validation() {
     for source in [
-        "+=[choice::exclusive {}]=; (:node)=[:choice]=>[-[:next]->(:node), -[:next]->(:node)];",
-        "+=[all::parallel {}]=; (:node)=[:all]=>[-[:next {when: true}]->(:node)];",
-        "+>[some::quorum {}]>>; (:node)-[e:link]->(:node); >[:some {count: 2} [e]]>>(:node);",
-        "+(values::vars {}); (:values {evaluate: \"sometimes\"});",
+        "+(choice:fork)-[:extends]->(exclusive); (:node)=[:choice]=>[-[:next]->(:node), -[:next]->(:node)];",
+        "+(all:fork)-[:extends]->(parallel); (:node)=[:all]=>[-[:next {when: true}]->(:node)];",
+        "+(some:junction)-[:extends]->(quorum); (:node)-[e:link]->(:node); >[:some {count: 2} [e]]>>(:node);",
+        "+(values:node)-[:extends]->(vars); (:values {evaluate: \"sometimes\"});",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
-    compiled("+>[joined::accumulate {}]>>; (:node)-[e:link]->(:node); >[:joined [e]]>>(:node);");
+    compiled("+(joined:junction)-[:extends]->(accumulate); (:node)-[e:link]->(:node); >[:joined [e]]>>(:node);");
 }
 
 #[test]
 fn rejects_invalid_kind_placements_and_handles_truncated_declarations() {
     let sources = [
-        "+(span::node {fields: {input: {type: \"string\"}}});",
-        "+-[payload::feeds {props: {label: {type: \"string\"}}}]-;",
-        "+=[split::parallel {}]=;",
-        "+>[joined::accumulate {}]>>;",
+        "+(span:node) {input: {type: \"string\"}};",
+        "+(payload:edge {label: {type: \"string\"}})-[:extends]->(feeds);",
+        "+(split:fork)-[:extends]->(parallel);",
+        "+(joined:junction)-[:extends]->(accumulate);",
         "(a:node) {id: <-};",
     ];
     for source in sources {
@@ -1773,13 +1777,13 @@ fn rejects_invalid_kind_placements_and_handles_truncated_declarations() {
         }
     }
     for source in [
-        "(a:node) {kind: +(span::node {})};",
-        "+(span::node {}); (a:span {name: <-});",
-        "+(span::node {fields: {input: {default: <-}}});",
+        "(a:node) {kind: +(span:node)};",
+        "+(span:node); (a:span {name: <-});",
+        "+(span:node) {input: {default: <-}};",
         "+(span: :node {});",
-        "+(span::node {}) {extra: 1};",
-        "+(span::node {}); (a:span) {values: [|<-|]};",
-        "+(span::node {}); (a:span) {input: <- + 1};",
+        "+(span:node) {extra: 1};",
+        "+(span:node); (a:span) {values: [|<-|]};",
+        "+(span:node); (a:span) {input: <- + 1};",
         ">>[:accumulate [e]]->(a);",
     ] {
         assert!(compile(source).is_err(), "{source}");
@@ -1789,7 +1793,7 @@ fn rejects_invalid_kind_placements_and_handles_truncated_declarations() {
 #[test]
 fn upstream_requirements_suppress_defaults_and_allow_alternative_suppliers() {
     let model = compiled(
-        r#"+(receiver::node {fields: {id: {type: "string", default: "fallback"}}});
+        r#"+(receiver:node) {id: {type: "string", default: "fallback"}};
         (b:receiver) {id: <-, text: "Patient ${self.id}"};
         (a:node)-[:feeds {value: "first", into: target.id}]->(b);
         (c:node)-[:feeds {value: "second", into: target.id}]->(b);
@@ -1816,7 +1820,7 @@ fn upstream_requirements_suppress_defaults_and_allow_alternative_suppliers() {
 
 #[test]
 fn preserves_schema_types_through_context_and_aliases() {
-    let schema = r#"+(record::node {props: {label: {type: "string"}}, fields: {id: {type: "string"}}});"#;
+    let schema = r#"+(record:node {label: {type: "string"}}) {id: {type: "string"}};"#;
     let model = compiled(&format!(
         r#"{schema} (a:record {{label: context.label}}) {{id: context.id, alias: self.id, text: "${{self.alias}} ${{self.props.label}}"}};"#
     ));
@@ -1832,7 +1836,7 @@ fn preserves_schema_types_through_context_and_aliases() {
         );
     }
     let source = format!(
-        r#"{schema} +(receiver::node {{fields: {{id: {{type: "number"}}}}}});
+        r#"{schema} +(receiver:node) {{id: {{type: "number"}}}};
         (a:record) {{id: context.id}} -[:feeds {{value: source.id, into: target.id}}]->(b:receiver) {{id: <-}};"#
     );
     assert!(
@@ -1845,7 +1849,7 @@ fn preserves_schema_types_through_context_and_aliases() {
 
 #[test]
 fn checks_every_possible_conditional_type() {
-    let schema = r#"+(record::node {fields: {id: {type: "string"}}});"#;
+    let schema = r#"+(record:node) {id: {type: "string"}};"#;
     for value in [
         "context.flag ? \"yes\" : 42",
         "context.flag ? 42 : \"yes\"",
@@ -1874,17 +1878,23 @@ fn checks_every_possible_conditional_type() {
 
 #[test]
 fn requires_identifier_kind_names_for_every_construct() {
-    for (open, close, base) in [
-        ("+(", ")", "node"),
-        ("+-[", "]-", "edge"),
-        ("+=[", "]=", "fork"),
-        ("+>[", "]>>", "junction"),
-    ] {
-        compiled(&format!("{open}patient_kind::{base} {{}}{close};"));
+    for construct in ["node", "edge", "fork", "junction", "trait -[:on]->(node)"] {
+        let (construct, relationship) = construct.split_once(' ').unwrap_or((construct, ""));
+        compiled(&format!("+(patient_kind:{construct}){relationship};"));
         for name in ["\"patient span\"", "\"patient_kind\""] {
-            let errors = parse(&format!("{open}{name}::{base} {{}}{close};")).unwrap_err();
+            let errors = parse(&format!("+({name}:{construct}){relationship};")).unwrap_err();
             assert!(errors.iter().all(|error| error.when == DiagPhase::Parsing));
         }
+    }
+    for source in [
+        "+(span);",
+        "+(:node);",
+        "+>[:accumulate [e]]>>(a:node);",
+        "+-[a:link]-;",
+        "+(a::node {});",
+    ] {
+        let errors = parse(source).unwrap_err();
+        assert!(errors.iter().all(|error| error.when == DiagPhase::Parsing), "{source}");
     }
 }
 
@@ -1926,8 +1936,8 @@ fn inherits_and_narrows_edge_direction_allowances() {
     use bts_lang::Directions;
     let model = compiled(
         r#"
-        +-[friendship::link {direction: "undirected"}]-;
-        +-[close_friend::friendship {}]-;
+        +(friendship:edge {direction: "undirected"})-[:extends]->(link);
+        +(close_friend:edge)-[:extends]->(friendship);
         (a:node)-[:close_friend]-(b:node);
         (a)-[:custom]-(b); (a)-[:custom]->(b);
     "#,
@@ -1937,13 +1947,13 @@ fn inherits_and_narrows_edge_direction_allowances() {
         Some(Directions::Undirected)
     );
     for source in [
-        "+-[bad::next {direction: \"either\"}]-;",
-        "+-[base::link {direction: \"undirected\"}]-; +-[bad::base {direction: \"directed\"}]-;",
-        "+(bad::node {direction: \"either\"});",
-        "+-[bad::link {direction: \"sideways\"}]-;",
+        "+(bad:edge {direction: \"either\"})-[:extends]->(next);",
+        "+(base:edge {direction: \"undirected\"})-[:extends]->(link); +(bad:edge {direction: \"directed\"})-[:extends]->(base);",
+        "+(bad:node {direction: \"either\"});",
+        "+(bad:edge {direction: \"sideways\"})-[:extends]->(link);",
         "(a:node)-[:next]-(b:node);",
         "(a:node)-[:feeds]-(b:node);",
-        "+-[friendship::link {direction: \"undirected\"}]-; (a:node)~[:friendship]~>(a);",
+        "+(friendship:edge {direction: \"undirected\"})-[:extends]->(link); (a:node)~[:friendship]~>(a);",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
@@ -2049,8 +2059,8 @@ fn checks_network_cycles_connectivity_and_multigraph_counts() {
 fn relation_incidence_roles_preserve_hyperedge_identity() {
     compiled(
         r#"
-        +(conversion::relation {props: {label: {type: "string"}}});
-        +-[participant::incidence {}]-;
+        +(conversion:node {label: {type: "string"}})-[:extends]->(relation);
+        +(participant:edge)-[:extends]->(incidence);
         (r:conversion {label: "convert", inputs: {min: 2}, outputs: {min: 1}, participants: {max: 3}});
         (a:node)-[:participant {role: "input"}]-(r);
         (r)-[:participant {role: "input"}]-(b:node);
@@ -2097,7 +2107,7 @@ fn weighted_each_and_reduce_validate_configuration_without_executing() {
         assert!(compile(&format!("(a:node) =[:each {props}]=>[-[:next]->(b:node)];")).is_err());
     }
     let source = r#"
-        +=[batch::each {}]=; +>[sum::reduce {}]>>;
+        +(batch:fork)-[:extends]->(each); +(sum:junction)-[:extends]->(reduce);
         (a:node) =[work:batch {items: context.records}]=>[-[done:next]->(b:node) {item: context.item, index: context.index}]
             >[:sum {observe: "result", initial: 0, combine: context.accumulator + context.arrival.value, on_failure: "skip"} [done]]>>(c:node);
     "#;
@@ -2148,8 +2158,8 @@ fn provider_definitions_extend_and_preserve_source_identity() {
     assert_eq!(span.range.source, 1);
     assert_eq!(tool.range.source, 1);
     assert_eq!(local.range.source, 0);
-    assert!(PROVIDER_SOURCE[span.range.start..span.range.end].starts_with("+(span::node"));
-    assert!(COMPILATION_SOURCE[local.range.start..local.range.end].starts_with("+(patient_lookup::tool_span"));
+    assert!(PROVIDER_SOURCE[span.range.start..span.range.end].starts_with("+(span:node"));
+    assert!(COMPILATION_SOURCE[local.range.start..local.range.end].starts_with("+(patient_lookup:node"));
     let metadata = local.fields.iter().find(|field| field.name == "metadata").unwrap();
     assert_eq!(metadata.range.source, 1);
 }
@@ -2159,17 +2169,17 @@ fn supplied_kinds_cover_every_construct_and_cross_source_forward_inheritance() {
     let definitions = [
         Source {
             name: "derived.bt",
-            text: "+(tool_span::span {}); +-[delivery::feeds {}]-; +=[split::parallel {}]=; +>[join::accumulate {}]>>;",
+            text: "+(tool_span:node)-[:extends]->(span); +(delivery:edge)-[:extends]->(feeds); +(split:fork)-[:extends]->(parallel); +(join:junction)-[:extends]->(accumulate);",
         },
         Source {
             name: "base.bt",
-            text: "+(span::node {fields: {id: {type: \"string\"}}});",
+            text: "+(span:node) {id: {type: \"string\"}};",
         },
     ];
     let source = Source {
         name: "user.bt",
         text: r#"
-        +(special::tool_span {});
+        +(special:node)-[:extends]->(tool_span);
         (a:special) {id: "p-1"}
             =[branches:split]=>[
                 -[one:delivery {value: source.id, into: target.id}]->(b:tool_span) {id: <-},
@@ -2189,15 +2199,27 @@ fn supplied_kinds_cover_every_construct_and_cross_source_forward_inheritance() {
 #[test]
 fn provider_conflicts_and_inheritance_errors_use_the_existing_rules() {
     for (user, first, second, message, source_index) in [
-        ("+(span::node {});", "+(span::node {});", "", "duplicate kind", 0),
-        ("(a:node);", "+(span::node {});", "+(span::node {});", "duplicate kind", 2),
-        ("(a:node);", "+(node::node {});", "", "reserved", 1),
-        ("(a:node);", "+(span::missing {});", "", "unknown base", 1),
-        ("(a:node);", "+(span::tool_span {});", "+(tool_span::span {});", "circular", 1),
-        ("(a:node);", "+(span::delivery {});", "+-[delivery::link {}]-;", "crosses", 1),
+        ("+(span:node);", "+(span:node);", "", "duplicate kind", 0),
+        ("(a:node);", "+(span:node);", "+(span:node);", "duplicate kind", 2),
+        ("(a:node);", "+(node:node);", "", "reserved", 1),
+        ("(a:node);", "+(span:node)-[:extends]->(missing);", "", "unknown base", 1),
         (
-            "+(local::span {props: {name: {required: false}}});",
-            "+(span::node {props: {name: {type: \"string\", required: true}}});",
+            "(a:node);",
+            "+(span:node)-[:extends]->(tool_span);",
+            "+(tool_span:node)-[:extends]->(span);",
+            "circular",
+            1,
+        ),
+        (
+            "(a:node);",
+            "+(span:node)-[:extends]->(delivery);",
+            "+(delivery:edge)-[:extends]->(link);",
+            "crosses",
+            1,
+        ),
+        (
+            "+(local:node {name: {required: false}})-[:extends]->(span);",
+            "+(span:node {name: {type: \"string\", required: true}});",
             "",
             "required",
             0,
@@ -2229,11 +2251,8 @@ fn provider_conflicts_and_inheritance_errors_use_the_existing_rules() {
 fn supplied_sources_report_local_ranges_in_every_phase() {
     for (text, phase) in [
         ("# é\n`", DiagPhase::Lexing),
-        ("# é\n+(span::node {", DiagPhase::Parsing),
-        (
-            "# é\n+(span::node {fields: {id: {type: \"unknown\"}}});",
-            DiagPhase::Validation,
-        ),
+        ("# é\n+(span:node {", DiagPhase::Parsing),
+        ("# é\n+(span:node) {id: {type: \"unknown\"}};", DiagPhase::Validation),
         ("# é\n(a:node);", DiagPhase::Validation),
     ] {
         let error = compile_with_definitions(
@@ -2288,7 +2307,7 @@ fn empty_user_modules_do_not_bypass_provider_validation() {
             source,
             &[Source {
                 name: "invalid.bt",
-                text: "+(span::missing {});",
+                text: "+(span:node)-[:extends]->(missing);",
             }],
             true
         )
@@ -2329,7 +2348,7 @@ fn input_roles_preserve_fallbacks_without_folding_caller_reads() {
     assert!(matches!(binding("selected").value, Value::Cond { .. }));
 
     let source = r#"
-+(payload::node {fields: {input: {type: "number", role: "input"}}});
++(payload:node) {input: {type: "number", role: "input"}};
 (a:payload) {input: 1, first: a.input, second: a.input};
 "#;
     let model = bts_lang::semantics::compile(source).unwrap();
@@ -2353,7 +2372,7 @@ fn input_roles_preserve_fallbacks_without_folding_caller_reads() {
     }
 
     let source = r#"
-+(flags::node {fields: {first: {type: "boolean", role: "input"}, second: {type: "boolean", role: "input"}}});
++(flags:node) {first: {type: "boolean", role: "input"}, second: {type: "boolean", role: "input"}};
 (a:flags) {first: true, second: false}
     =[:exclusive]=>[
         -[:next {when: a.first}]->(b:node),
@@ -2456,9 +2475,9 @@ fn reports_every_independent_mistake_at_its_own_location_without_cascades() {
 #[test]
 fn reports_every_broken_kind_declaration_without_checking_its_instances() {
     let source = r#"
-+(orphan::nothing {});
-+(typo::node {props: {a: {type: "strin"}, b: {required: 1}}});
-+(derived::orphan {});
++(orphan:node)-[:extends]->(nothing);
++(typo:node {a: {type: "strin"}, b: {required: 1}});
++(derived:node)-[:extends]->(orphan);
 (x:derived {anything: 1});
 (y:typo {anything: 1});
 "#;
@@ -2472,4 +2491,230 @@ fn reports_every_broken_kind_declaration_without_checking_its_instances() {
             "required must be a literal boolean",
         ]
     );
+}
+
+fn located(source: &str) -> Vec<(String, String)> {
+    compile(source)
+        .unwrap_err()
+        .into_iter()
+        .map(|diag| (diag.what, source[diag.r#where.start..diag.r#where.end].to_owned()))
+        .collect()
+}
+
+#[test]
+fn a_kind_has_its_traits_and_those_of_its_base() {
+    use bts_lang::{Construct, FieldType};
+    let model = compiled(
+        r#"
+        +(metered:trait {unit: {type: "string", default: "ms"}}) {metrics: {type: "object"}}
+            -[:on]->(node);
+        +(audited:trait {auditor: {type: "string"}})
+            -[:on]->(node)
+            -[:on]->(edge);
+        +(span:node) {input: {type: "any"}}
+            -[:has]->(metered);
+        +(tool:node {service: {type: "string"}}) {metrics: {required: true}}
+            -[:extends]->(span)
+            -[:has]->(audited)
+            -[:has]->(metered);
+        +(reviewed:edge)
+            -[:extends]->(link)
+            -[:has]->(audited);
+        (a:tool {service: "billing", auditor: "ops"}) {metrics: {tokens: 3}, unit: self.props.unit}
+            -[:reviewed {auditor: "ops"}]->(b:span);
+        "#,
+    );
+    let names = |kind: &str| -> Vec<&str> {
+        model.kinds[model.kind_names[kind].0]
+            .traits
+            .iter()
+            .map(|id| model.traits[id.0].name.as_str())
+            .collect()
+    };
+    assert_eq!(names("span"), ["metered"]);
+    assert_eq!(names("tool"), ["metered", "audited"]);
+    assert_eq!(names("reviewed"), ["audited"]);
+    let audited = &model.traits[model.trait_names["audited"].0];
+    assert_eq!(audited.on, [Construct::Node, Construct::Edge]);
+    assert!(!model.kind_names.contains_key("metered"));
+    let tool = &model.kinds[model.kind_names["tool"].0];
+    let metrics = tool.fields.iter().find(|field| field.name == "metrics").unwrap();
+    assert_eq!(metrics.ty, FieldType::Object);
+    assert!(metrics.required);
+    assert!(tool.props.iter().any(|field| field.name == "unit"));
+    assert!(matches!(&binding(&model, "a", "unit").value, Value::Str(unit) if unit == "ms"));
+    // trait properties are strict like any declared property, and trait fields are typed
+    for source in [
+        "+(m:trait {unit: {type: \"string\"}})-[:on]->(node); +(k:node)-[:has]->(m); (a:k {typo: 1});",
+        "+(m:trait) {metrics: {type: \"object\"}}-[:on]->(node); +(k:node)-[:has]->(m); (a:k) {metrics: 1};",
+    ] {
+        assert!(compile(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn a_trait_extends_one_trait_and_narrows_where_it_applies() {
+    use bts_lang::Construct;
+    let model = compiled(
+        r#"
+        +(metered:trait {unit: {type: "string"}})
+            -[:on]->(node)
+            -[:on]->(edge);
+        +(billed:trait {unit: {required: true}}) {cost: {type: "number"}}
+            -[:extends]->(metered)
+            -[:on]->(node);
+        +(timed:trait)-[:extends]->(metered);
+        +(base:node)-[:has]->(metered);
+        +(priced:node)
+            -[:extends]->(base)
+            -[:has]->(billed);
+        (a:priced {unit: "usd"}) {cost: 2};
+        "#,
+    );
+    let billed = &model.traits[model.trait_names["billed"].0];
+    assert_eq!(billed.base, Some(model.trait_names["metered"]));
+    assert_eq!(billed.on, [Construct::Node]);
+    assert_eq!(
+        model.traits[model.trait_names["timed"].0].on,
+        [Construct::Node, Construct::Edge]
+    );
+    let priced = &model.kinds[model.kind_names["priced"].0];
+    assert_eq!(priced.traits, [model.trait_names["metered"], model.trait_names["billed"]]);
+    assert!(priced.props.iter().any(|field| field.name == "unit" && field.required));
+    assert_eq!(priced.props.iter().filter(|field| field.name == "unit").count(), 1);
+    for (source, message, at) in [
+        (
+            "+(m:trait)-[:on]->(node); +(b:trait)\n -[:extends]->(m)\n -[:on]->(fork);",
+            "trait `m` is not on fork",
+            "-[:on]->(fork)",
+        ),
+        (
+            "+(m:trait)-[:on]->(node); +(b:trait)\n -[:on]->(node)\n -[:has]->(m);",
+            "cannot have traits",
+            "-[:has]->(m)",
+        ),
+        (
+            "+(k:node); +(b:trait)-[:extends]->(k);",
+            "can only extend a trait",
+            "-[:extends]->(k)",
+        ),
+        (
+            "+(b:trait)-[:extends]->(missing);",
+            "unknown trait `missing`",
+            "-[:extends]->(missing)",
+        ),
+        (
+            "+(a:trait)-[:extends]->(b); +(b:trait)-[:extends]->(a);",
+            "circular trait extension",
+            "+(a:trait)-[:extends]->(b);",
+        ),
+        (
+            "+(m:trait)-[:on]->(node); +(n:trait)-[:on]->(node); +(b:trait)\n -[:extends]->(m)\n -[:extends]->(n);",
+            "at most one trait",
+            "-[:extends]->(n)",
+        ),
+        (
+            "+(m:trait {unit: {type: \"string\"}});",
+            "at least one `on`",
+            "+(m:trait {unit: {type: \"string\"}});",
+        ),
+        ("+(m:trait)-[:on]->(span);", "`on` targets a construct", "-[:on]->(span)"),
+        (
+            "+(m:trait) {metrics: {type: \"object\"}}\n -[:on]->(node)\n -[:on]->(edge);",
+            "only nodes have content fields",
+            "+(m:trait) {metrics: {type: \"object\"}}\n -[:on]->(node)\n -[:on]->(edge);",
+        ),
+        ("+(m:trait)-[:on]->(node); (a:m);", "`m` is a trait, not a kind", "(a:m)"),
+        ("+(m:trait)-[:on]->(node); +(m:node);", "duplicate kind or trait name", "m"),
+        ("+(trait:node);", "reserved", "trait"),
+    ] {
+        let errors = located(source);
+        assert!(
+            errors.iter().any(|(what, text)| what.contains(message) && text == at),
+            "{source}\n{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn locates_definition_relationship_errors() {
+    let traits =
+        "+(m:trait) {metrics: {type: \"object\"}}-[:on]->(node); +(n:trait) {metrics: {type: \"object\"}}-[:on]->(node);";
+    for (source, message, at) in [
+        ("+(k:node)-[:extends]->(missing);".to_owned(), "unknown base kind `missing`", "-[:extends]->(missing)"),
+        ("+(k:node)-[:has]->(missing);".to_owned(), "unknown trait `missing`", "-[:has]->(missing)"),
+        ("+(b:node); +(k:node)-[:has]->(b);".to_owned(), "`b` is a kind, not a trait", "-[:has]->(b)"),
+        ("+(k:node)-[:has]->(vars);".to_owned(), "`vars` is a kind, not a trait", "-[:has]->(vars)"),
+        (
+            "+(a:node); +(b:node); +(k:node)\n -[:extends]->(a)\n -[:extends]->(b);".to_owned(),
+            "a kind extends one base",
+            "-[:extends]->(b)",
+        ),
+        ("+(k:node)-[:extends]->(feeds);".to_owned(), "crosses graph construct categories", "-[:extends]->(feeds)"),
+        (
+            "+(e:edge); +(k:node)-[:extends]->(e);".to_owned(),
+            "crosses graph construct categories",
+            "-[:extends]->(e)",
+        ),
+        (
+            format!("{traits} +(k:node)\n -[:has]->(m)\n -[:has]->(n);"),
+            "field `metrics` is declared by both trait `m` and trait `n`",
+            "-[:has]->(n)",
+        ),
+        (
+            "+(m:trait) {input: {type: \"any\"}}-[:on]->(node); +(b:node) {input: {type: \"any\"}}; +(k:node)\n -[:extends]->(b)\n -[:has]->(m);"
+                .to_owned(),
+            "trait `m` declares field `input`, which `k` already has from its base",
+            "-[:has]->(m)",
+        ),
+        (
+            "+(m:trait {when: {type: \"boolean\"}})-[:on]->(edge); +(k:edge)-[:has]->(m);".to_owned(),
+            "trait `m` declares property `when`",
+            "-[:has]->(m)",
+        ),
+        (
+            "+(m:trait)-[:on]->(node); +(k:edge)-[:has]->(m);".to_owned(),
+            "trait `m` is not on edge",
+            "-[:has]->(m)",
+        ),
+        (
+            "+(a:node)-[:extends]->(b); +(b:node)-[:extends]->(a);".to_owned(),
+            "circular kind extension",
+            "+(a:node)-[:extends]->(b);",
+        ),
+        ("+(m:trait)-[:on]->(node); +(k:node)-[:extends]->(m);".to_owned(), "a kind cannot extend a trait", "-[:extends]->(m)"),
+        ("+(k:node)-[:on]->(node);".to_owned(), "`on` belongs to a trait definition", "-[:on]->(node)"),
+        ("+(tool:span);".to_owned(), "a definition head names its construct", "tool:span"),
+        ("+(k:node)-[:calls]->(node);".to_owned(), "unknown relationship `calls`", ":calls"),
+        ("+(b:node); +(k:node)-[:extends, :has]->(b);".to_owned(), "holds one relationship", "-[:extends, :has]->(b)"),
+        ("+(k:node)-[:extends]->(b:node);".to_owned(), "references a definition by name", "-[:extends]->(b:node)"),
+        ("+(b:node); +(k:node)-[e:extends]->(b);".to_owned(), "no name and no properties", "e:extends"),
+        ("+(b:node); +(k:node)-[:extends]-(b);".to_owned(), "is written -[:kind]->", "-[:extends]-(b)"),
+        (
+            "+(m:trait)-[:on]->(node); +(b:node); +(k:node)-[:extends]->(b)-[:has]->(m);".to_owned(),
+            "starts at the definition head",
+            "-[:has]->(m)",
+        ),
+        (
+            "+(m:trait)-[:on]->(node); +(b:node); +(k:node)-[:extends]->(b)\n -[:has]->(m);".to_owned(),
+            "starts at the definition head",
+            "-[:has]->(m)",
+        ),
+        (
+            "+(k:node)=[:parallel]=>[-[:next]->(:node)];".to_owned(),
+            "relationship edges only",
+            "=[:parallel]=>[-[:next]->(:node)]",
+        ),
+        ("+(k:fork) {label: {type: \"string\"}};".to_owned(), "only node kinds have content fields", "label: {type: \"string\"}"),
+        ("+(k:node {direction: \"directed\"});".to_owned(), "schema descriptors must be objects", "\"directed\""),
+    ] {
+        let errors = located(&source);
+        assert!(
+            errors.iter().any(|(what, text)| what.contains(message) && text == at),
+            "{source}\n{errors:#?}"
+        );
+    }
+    // a kind that fails is reported once, and kinds built on it stay quiet
+    let errors = located("+(k:node)-[:has]->(missing); +(d:node)-[:extends]->(k); (a:d {anything: 1});");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
 }

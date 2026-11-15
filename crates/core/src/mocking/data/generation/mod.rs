@@ -579,8 +579,8 @@ mod experiment_tests {
     #[test]
     fn dataset_fields_drive_selected_subtree_and_preserve_original_scopes() {
         let model = crate::providers::braintrust::mocking::compile(
-            r#"+(text_task::task {fields: {input: {type: "string"}}});
-+(text_tool::tool {fields: {output: {type: "string"}}});
+            r#"+(text_task:node) {input: {type: "string"}}-[:extends]->(task);
++(text_tool:node) {output: {type: "string"}}-[:extends]->(tool);
 (workflow_root:task {name: "workflow"}) {input: workflow.input, context: "root variable"};
 (context_node:text_tool {name: "context"}) {output: workflow_root.context};
 (answer:text_task {name: "answer"}) {input: "task fallback", expected: "task expectation", metadata: {tier: "free", channel: "chat"}, output: "${self.input}/${trim(self.expected)}/${trim(self.metadata.tier)}/${context_node.output}"};

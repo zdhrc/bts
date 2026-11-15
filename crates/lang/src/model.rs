@@ -10,6 +10,10 @@ pub struct Model {
     pub kinds: Vec<Kind>,
     /// Kind names live separately from graph instance names.
     pub kind_names: BTreeMap<String, KindId>,
+    /// Resolved traits with inherited entries.
+    pub traits: Vec<Trait>,
+    /// Trait names share the kind namespace, so no name is in both maps.
+    pub trait_names: BTreeMap<String, TraitId>,
     /// Node definitions in declaration order.
     pub nodes: Vec<Node>,
     /// Directed and undirected connections, including explicit loop-back edges.
@@ -45,6 +49,7 @@ identity!(BindingId, "A binding index within its owning model.");
 identity!(RefId, "A reference index within its owning model.");
 
 identity!(KindId, "A kind schema index within its owning model.");
+identity!(TraitId, "A trait index within its owning model.");
 
 /// The graph construct described by a kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +227,26 @@ pub struct Kind {
     pub props: Vec<FieldSchema>,
     /// Effective node content schema, including inherited entries.
     pub fields: Vec<FieldSchema>,
+    /// Every trait this kind has, including those of its base and the traits they extend.
+    pub traits: Vec<TraitId>,
     /// Declaration location.
+    pub range: SrcRange,
+}
+
+/// A resolved trait: a schema that kinds attach, with no behavior of its own.
+#[derive(Debug, Clone)]
+pub struct Trait {
+    /// Declared trait name.
+    pub name: String,
+    /// The trait this one extends.
+    pub base: Option<TraitId>,
+    /// Constructs whose kinds may have this trait.
+    pub on: Vec<Construct>,
+    /// Effective property schema, including entries of extended traits.
+    pub props: Vec<FieldSchema>,
+    /// Effective node content schema, including entries of extended traits.
+    pub fields: Vec<FieldSchema>,
+    /// Definition location.
     pub range: SrcRange,
 }
 

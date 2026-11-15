@@ -1319,7 +1319,7 @@ fn graph_fixture_runs_cycles_weighted_forks_and_juncts() {
 
 #[wasm_bindgen_test]
 fn provider_definition_conflicts_point_to_the_user_declaration() {
-    let result = validate("+(span::node {});");
+    let result = validate("+(span:node);");
     assert_eq!(result["valid"], false);
     assert!(
         result["diagnostics"]

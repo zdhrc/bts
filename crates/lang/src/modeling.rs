@@ -125,43 +125,85 @@ impl Modeler {
         }
     }
 
-    fn kinds(&mut self, declarations: &[ast::KindDecl]) {
-        for (index, declaration) in declarations.iter().enumerate() {
-            if builtin_construct(&declaration.name).is_some() || reserved_name(&declaration.name) {
-                self.errors.extend(error(declaration.range, "kind name is reserved"));
-            } else if self.model.kind_names.contains_key(&declaration.name) {
-                self.errors.extend(error(declaration.range, "duplicate kind name"));
+    fn definitions(&mut self, definitions: &[ast::Definition]) {
+        let mut resolver = Definitions::default();
+        for definition in definitions {
+            let header = &definition.head.header;
+            let defined = match construct_named(&header.kind) {
+                Some(construct) => Defined::Kind(construct),
+                None if header.kind == "trait" => Defined::Trait,
+                None => {
+                    self.errors.extend(error(
+                        header.range,
+                        "a definition head names its construct: node, edge, fork, junction or trait",
+                    ));
+                    continue;
+                }
+            };
+            // the parser admits only named heads
+            let Some(name) = header.name.as_deref() else { continue };
+            let range = header.name_range.unwrap_or(header.range);
+            let (relationships, shape_errors) = relationships(&definition.steps);
+            let broken = !shape_errors.is_empty();
+            self.errors.extend(shape_errors);
+            if builtin_construct(name).is_some() || reserved_name(name) || name == "trait" {
+                self.errors.extend(error(range, "definition name is reserved"));
+            } else if resolver.names.contains_key(name) {
+                self.errors.extend(error(range, "duplicate kind or trait name"));
             } else {
-                self.model.kind_names.insert(declaration.name.clone(), KindId(index));
+                resolver.add(name, defined, &definition.head, relationships, definition.range, broken);
             }
         }
-        let mut kinds = vec![None; declarations.len()];
-        let mut states = vec![PENDING; declarations.len()];
-        for index in 0..declarations.len() {
-            if let Err(diags) = resolve_kind(index, declarations, &self.model.kind_names, &mut states, &mut kinds) {
+        for index in 0..resolver.entries.len() {
+            let resolved = match resolver.entries[index].defined {
+                Defined::Kind(construct) => resolver.resolve_kind(index, construct).map(drop),
+                Defined::Trait => resolver.resolve_trait(index).map(drop),
+            };
+            if let Err(diags) = resolved {
                 self.errors.extend(diags);
             }
         }
-        // instances of a kind that failed to resolve are left unchecked rather than checked against a partial schema
-        self.model.kind_names.retain(|_, id| kinds[id.0].is_some());
-        self.model.kinds = kinds
-            .into_iter()
-            .zip(declarations)
-            .map(|(kind, declaration)| {
-                // only reachable with errors recorded, so the model holding this placeholder is never returned
-                kind.unwrap_or_else(|| Kind {
-                    name: declaration.name.clone(),
-                    base: declaration.base.clone(),
-                    base_kind: None,
-                    construct: declaration.construct,
-                    primitive: declaration.base.clone(),
-                    direction: None,
-                    props: Vec::new(),
-                    fields: Vec::new(),
-                    range: declaration.range,
-                })
-            })
-            .collect();
+        // an instance of a definition that failed to resolve is left unchecked rather than checked against a partial schema
+        for (index, entry) in resolver.entries.iter().enumerate() {
+            let name = entry.name.to_owned();
+            match entry.defined {
+                Defined::Kind(construct) => {
+                    let id = KindId(self.model.kinds.len());
+                    let kind = resolver.kinds[index].take();
+                    if kind.is_some() {
+                        self.model.kind_names.insert(name.clone(), id);
+                    }
+                    // a placeholder is only reachable with errors recorded, so the model holding it is never returned
+                    self.model.kinds.push(kind.unwrap_or_else(|| Kind {
+                        name,
+                        base: construct.name().to_owned(),
+                        base_kind: None,
+                        construct,
+                        primitive: construct.name().to_owned(),
+                        direction: None,
+                        props: Vec::new(),
+                        fields: Vec::new(),
+                        traits: Vec::new(),
+                        range: entry.range,
+                    }));
+                }
+                Defined::Trait => {
+                    let id = TraitId(self.model.traits.len());
+                    let resolved = resolver.traits[index].take();
+                    if resolved.is_some() {
+                        self.model.trait_names.insert(name.clone(), id);
+                    }
+                    self.model.traits.push(resolved.unwrap_or_else(|| Trait {
+                        name,
+                        base: None,
+                        on: Vec::new(),
+                        props: Vec::new(),
+                        fields: Vec::new(),
+                        range: entry.range,
+                    }));
+                }
+            }
+        }
     }
 
     fn element_kind(&self, owner: ElementId) -> (&str, Construct) {
@@ -243,8 +285,14 @@ impl Modeler {
 
     fn fields(&mut self, owner: ElementId, property: bool, fields: &[ast::Attr]) {
         let mut fields = fields.to_vec();
-        let (name, construct) = self.element_kind(owner);
+        let (name, _) = self.element_kind(owner);
         let schema = self.kind_schema(owner).cloned();
+        if property && self.model.trait_names.contains_key(name) {
+            let message = format!("`{name}` is a trait, not a kind");
+            self.errors.extend(error(self.element_range(owner), message));
+            self.unchecked.insert(owner);
+        }
+        let (name, construct) = self.element_kind(owner);
         if property
             && schema
                 .as_ref()
@@ -1458,14 +1506,29 @@ fn schema_string(expr: &ast::Expr) -> Result<String> {
     }
 }
 
-fn schema_fields(expr: &ast::Expr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+// descriptors written directly in a definition's header braces or body
+fn schema_attrs(attrs: &[ast::Attr], inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    let mut seen = HashSet::new();
     let mut errors = Vec::new();
-    for field in schema_entries(expr)? {
-        if let Err(diags) = schema_field(field, inherited) {
+    for attr in attrs {
+        if !seen.insert(&attr.key) {
+            errors.extend(error(attr.range, "duplicate schema key"));
+        } else if let Err(diags) = schema_field(attr.clone(), inherited) {
             errors.extend(diags);
         }
     }
     if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+// an entry replacing an inherited one may only restrict it
+fn narrows(previous: &FieldSchema, schema: &FieldSchema, range: SrcRange) -> Result<()> {
+    if previous.ty != FieldType::Any && schema.ty != previous.ty {
+        return Err(error(range, "an extension cannot change an inherited field type"));
+    }
+    if previous.required && !schema.required {
+        return Err(error(range, "an extension cannot make a required field optional"));
+    }
+    Ok(())
 }
 
 fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
@@ -1516,12 +1579,7 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
             }
         }
         if let Some(previous) = &previous {
-            if previous.ty != FieldType::Any && schema.ty != previous.ty {
-                return Err(error(field.range, "an extension cannot change an inherited field type"));
-            }
-            if previous.required && !schema.required {
-                return Err(error(field.range, "an extension cannot make a required field optional"));
-            }
+            narrows(previous, &schema, field.range)?;
         }
         if let Some(default) = &schema.default {
             expr::schema_type(
@@ -1612,92 +1670,492 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
         .collect()
 }
 
-fn resolve_kind(
-    index: usize,
-    declarations: &[ast::KindDecl],
-    names: &std::collections::BTreeMap<String, KindId>,
-    states: &mut [u8],
-    kinds: &mut [Option<Kind>],
-) -> Result<Kind> {
-    if let Some(kind) = &kinds[index] {
-        return Ok(kind.clone());
+fn construct_named(name: &str) -> Option<Construct> {
+    [Construct::Node, Construct::Edge, Construct::Fork, Construct::Junction]
+        .into_iter()
+        .find(|construct| construct.name() == name)
+}
+
+// what a definition head declares
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Defined {
+    Kind(Construct),
+    Trait,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    Extends,
+    Has,
+    On,
+}
+
+#[derive(Clone)]
+struct Relationship {
+    relation: Relation,
+    target: String,
+    // the connector and its target
+    range: SrcRange,
+}
+
+struct DefinitionEntry<'a> {
+    name: &'a str,
+    defined: Defined,
+    head: &'a ast::GraphNodeDecl,
+    relationships: Vec<Relationship>,
+    range: SrcRange,
+}
+
+// kinds and traits resolve together because they share one namespace
+#[derive(Default)]
+struct Definitions<'a> {
+    entries: Vec<DefinitionEntry<'a>>,
+    names: HashMap<&'a str, usize>,
+    // position within the model's kind or trait table
+    ids: Vec<usize>,
+    states: Vec<u8>,
+    kinds: Vec<Option<Kind>>,
+    traits: Vec<Option<Trait>>,
+    // the trait entry that supplied a property (true) or field (false) of a kind
+    origins: Vec<HashMap<(bool, String), usize>>,
+}
+
+impl<'a> Definitions<'a> {
+    fn add(
+        &mut self,
+        name: &'a str,
+        defined: Defined,
+        head: &'a ast::GraphNodeDecl,
+        relationships: Vec<Relationship>,
+        range: SrcRange,
+        broken: bool,
+    ) {
+        let id = self
+            .entries
+            .iter()
+            .filter(|entry| (entry.defined == Defined::Trait) == (defined == Defined::Trait))
+            .count();
+        self.names.insert(name, self.entries.len());
+        self.entries.push(DefinitionEntry {
+            name,
+            defined,
+            head,
+            relationships,
+            range,
+        });
+        self.ids.push(id);
+        // malformed relationships were reported where they were read
+        self.states.push(if broken { FAILED } else { PENDING });
+        self.kinds.push(None);
+        self.traits.push(None);
+        self.origins.push(HashMap::new());
     }
-    match states[index] {
-        FAILED => return Err(Vec::new()),
-        RESOLVING => return Err(error(declarations[index].range, "circular kind extension")),
-        _ => {}
-    }
-    states[index] = RESOLVING;
-    match resolve_kind_declaration(index, declarations, names, states, kinds) {
-        Ok(kind) => {
-            states[index] = RESOLVED;
-            kinds[index] = Some(kind.clone());
-            Ok(kind)
+
+    fn enter(&mut self, index: usize, cycle: &str) -> Result<()> {
+        match self.states[index] {
+            FAILED => Err(Vec::new()),
+            RESOLVING => Err(error(self.entries[index].range, cycle)),
+            _ => {
+                self.states[index] = RESOLVING;
+                Ok(())
+            }
         }
-        Err(diags) => {
-            states[index] = FAILED;
-            Err(diags)
+    }
+
+    fn resolve_trait(&mut self, index: usize) -> Result<Trait> {
+        if let Some(resolved) = &self.traits[index] {
+            return Ok(resolved.clone());
+        }
+        self.enter(index, "circular trait extension")?;
+        let resolved = self.resolve_trait_definition(index);
+        self.states[index] = if resolved.is_ok() { RESOLVED } else { FAILED };
+        self.traits[index] = resolved.as_ref().ok().cloned();
+        resolved
+    }
+
+    fn resolve_trait_definition(&mut self, index: usize) -> Result<Trait> {
+        let entry = &self.entries[index];
+        let (name, head, range) = (entry.name, entry.head, entry.range);
+        let mut errors = Vec::new();
+        let mut base = None;
+        let mut extended = false;
+        let mut on: Vec<(Construct, SrcRange)> = Vec::new();
+        for relationship in &entry.relationships {
+            let target = relationship.target.as_str();
+            match relationship.relation {
+                Relation::Has => errors.extend(error(
+                    relationship.range,
+                    "a trait cannot have traits, it may extend one trait",
+                )),
+                Relation::On => match construct_named(target) {
+                    Some(construct) => {
+                        if !on.iter().any(|(listed, _)| *listed == construct) {
+                            on.push((construct, relationship.range));
+                        }
+                    }
+                    None => errors.extend(error(
+                        relationship.range,
+                        "`on` targets a construct: node, edge, fork or junction",
+                    )),
+                },
+                Relation::Extends if extended => {
+                    errors.extend(error(relationship.range, "a trait extends at most one trait"));
+                }
+                Relation::Extends => {
+                    extended = true;
+                    match self.names.get(target) {
+                        Some(&found) if self.entries[found].defined == Defined::Trait => base = Some(found),
+                        None if builtin_construct(target).is_none() => {
+                            errors.extend(error(relationship.range, format!("unknown trait `{target}`")));
+                        }
+                        _ => errors.extend(error(
+                            relationship.range,
+                            format!("a trait can only extend a trait, `{target}` is a kind"),
+                        )),
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let mut resolved = match base {
+            Some(base) => {
+                let mut resolved = self.resolve_trait(base)?;
+                for (construct, at) in &on {
+                    if !resolved.on.contains(construct) {
+                        errors.extend(error(
+                            *at,
+                            format!(
+                                "trait `{}` is not on {}, an extension can only narrow where it applies",
+                                resolved.name,
+                                construct.name()
+                            ),
+                        ));
+                    }
+                }
+                resolved.base = Some(TraitId(self.ids[base]));
+                resolved
+            }
+            None => Trait {
+                name: String::new(),
+                base: None,
+                on: Vec::new(),
+                props: Vec::new(),
+                fields: Vec::new(),
+                range,
+            },
+        };
+        resolved.name = name.to_owned();
+        resolved.range = range;
+        if !on.is_empty() {
+            resolved.on = on.into_iter().map(|(construct, _)| construct).collect();
+        }
+        if resolved.on.is_empty() {
+            errors.extend(error(range, "a trait needs at least one `on` relationship"));
+        }
+        if let Err(diags) = schema_attrs(head.header.props.as_deref().unwrap_or(&[]), &mut resolved.props) {
+            errors.extend(diags);
+        }
+        if let Err(diags) = schema_attrs(head.body.as_deref().unwrap_or(&[]), &mut resolved.fields) {
+            errors.extend(diags);
+        }
+        if !resolved.fields.is_empty() && resolved.on.iter().any(|construct| *construct != Construct::Node) {
+            errors.extend(error(
+                range,
+                "only nodes have content fields, a trait with fields applies to node alone",
+            ));
+        }
+        if resolved.fields.iter().any(|field| field.name == "props") {
+            errors.extend(error(range, "props is reserved for node properties"));
+        }
+        if errors.is_empty() { Ok(resolved) } else { Err(errors) }
+    }
+
+    fn resolve_kind(&mut self, index: usize, construct: Construct) -> Result<Kind> {
+        if let Some(kind) = &self.kinds[index] {
+            return Ok(kind.clone());
+        }
+        self.enter(index, "circular kind extension")?;
+        let resolved = self.resolve_kind_definition(index, construct);
+        self.states[index] = if resolved.is_ok() { RESOLVED } else { FAILED };
+        self.kinds[index] = resolved.as_ref().ok().cloned();
+        resolved
+    }
+
+    fn resolve_kind_definition(&mut self, index: usize, construct: Construct) -> Result<Kind> {
+        let entry = &self.entries[index];
+        let (name, head, range) = (entry.name, entry.head, entry.range);
+        let relationships = entry.relationships.clone();
+        let mut errors = Vec::new();
+        let mut base = None;
+        let mut has = Vec::new();
+        for relationship in &relationships {
+            match relationship.relation {
+                Relation::On => errors.extend(error(relationship.range, "`on` belongs to a trait definition")),
+                Relation::Has => has.push(relationship),
+                Relation::Extends if base.is_some() => {
+                    errors.extend(error(relationship.range, "a kind extends one base"));
+                }
+                Relation::Extends => base = Some(relationship),
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let crosses = |at: SrcRange| error(at, "kind extension crosses graph construct categories");
+        let root = |base: &str, at: SrcRange| Kind {
+            name: String::new(),
+            base: base.to_owned(),
+            base_kind: None,
+            construct,
+            primitive: base.to_owned(),
+            direction: (construct == Construct::Edge).then(|| primitive_direction(base)),
+            props: primitive_properties(construct, base, at),
+            fields: Vec::new(),
+            traits: Vec::new(),
+            range: at,
+        };
+        let mut origins = HashMap::new();
+        let mut kind = match base {
+            None => root(construct.name(), range),
+            Some(relationship) => {
+                let target = relationship.target.as_str();
+                match self.names.get(target).copied() {
+                    Some(found) => {
+                        let Defined::Kind(base_construct) = self.entries[found].defined else {
+                            return Err(error(
+                                relationship.range,
+                                format!("a kind cannot extend a trait, attach `{target}` with has"),
+                            ));
+                        };
+                        if base_construct != construct {
+                            return Err(crosses(relationship.range));
+                        }
+                        let mut kind = self.resolve_kind(found, base_construct)?;
+                        kind.base_kind = Some(KindId(self.ids[found]));
+                        kind.base = target.to_owned();
+                        origins = self.origins[found].clone();
+                        kind
+                    }
+                    None => {
+                        let found = builtin_construct(target)
+                            .ok_or_else(|| error(relationship.range, format!("unknown base kind `{target}`")))?;
+                        if found != construct {
+                            return Err(crosses(relationship.range));
+                        }
+                        root(target, range)
+                    }
+                }
+            }
+        };
+        kind.name = name.to_owned();
+        kind.range = range;
+        // a dependency that already reported its own failure fails this kind without another diagnostic
+        let mut failed = false;
+        for relationship in has {
+            let target = relationship.target.as_str();
+            let found = match self.names.get(target).copied() {
+                Some(found) if self.entries[found].defined == Defined::Trait => found,
+                None if builtin_construct(target).is_none() => {
+                    errors.extend(error(relationship.range, format!("unknown trait `{target}`")));
+                    continue;
+                }
+                _ => {
+                    errors.extend(error(relationship.range, format!("`{target}` is a kind, not a trait")));
+                    continue;
+                }
+            };
+            let attached = match self.resolve_trait(found) {
+                Ok(attached) => attached,
+                Err(diags) => {
+                    errors.extend(diags);
+                    failed = true;
+                    continue;
+                }
+            };
+            if !attached.on.contains(&construct) {
+                errors.extend(error(
+                    relationship.range,
+                    format!("trait `{target}` is not on {}", construct.name()),
+                ));
+                continue;
+            }
+            if kind.traits.contains(&TraitId(self.ids[found])) {
+                continue;
+            }
+            // the trait and every trait it extends
+            let mut lineage = vec![found];
+            let mut next = attached.base;
+            while let Some(base) = next {
+                let Some(position) = (0..self.entries.len())
+                    .find(|&entry| self.entries[entry].defined == Defined::Trait && self.ids[entry] == base.0)
+                else {
+                    break;
+                };
+                lineage.push(position);
+                next = self.traits[position].as_ref().and_then(|extended| extended.base);
+            }
+            for (property, supplied) in [(true, &attached.props), (false, &attached.fields)] {
+                let entries = if property { &mut kind.props } else { &mut kind.fields };
+                let what = if property { "property" } else { "field" };
+                for field in supplied {
+                    let key = (property, field.name.clone());
+                    let Some(position) = entries.iter().position(|entry| entry.name == field.name) else {
+                        entries.push(field.clone());
+                        origins.insert(key, found);
+                        continue;
+                    };
+                    match origins.get(&key).copied() {
+                        // an extended trait already supplied this entry, the extension restricts it
+                        Some(origin) if lineage.contains(&origin) => {
+                            match narrows(&entries[position], field, relationship.range) {
+                                Ok(()) => {
+                                    entries[position] = field.clone();
+                                    origins.insert(key, found);
+                                }
+                                Err(diags) => errors.extend(diags),
+                            }
+                        }
+                        Some(origin) => errors.extend(error(
+                            relationship.range,
+                            format!(
+                                "{what} `{}` is declared by both trait `{}` and trait `{target}`",
+                                field.name, self.entries[origin].name
+                            ),
+                        )),
+                        None => errors.extend(error(
+                            relationship.range,
+                            format!(
+                                "trait `{target}` declares {what} `{}`, which `{name}` already has from its base",
+                                field.name
+                            ),
+                        )),
+                    }
+                }
+            }
+            for member in lineage {
+                let id = TraitId(self.ids[member]);
+                if !kind.traits.contains(&id) {
+                    kind.traits.push(id);
+                }
+            }
+        }
+        if failed && errors.is_empty() {
+            return Err(errors);
+        }
+        let mut props = head.header.props.as_deref().unwrap_or(&[]).to_vec();
+        if construct == Construct::Edge {
+            // direction is a reserved header key on edge kinds, not a property descriptor
+            let mut seen = false;
+            props.retain(|field| {
+                if field.key != "direction" {
+                    return true;
+                }
+                if seen {
+                    errors.extend(error(field.range, "duplicate schema key"));
+                } else if let Err(diags) = kind_direction(field, &mut kind) {
+                    errors.extend(diags);
+                }
+                seen = true;
+                false
+            });
+        }
+        if let Err(diags) = schema_attrs(&props, &mut kind.props) {
+            errors.extend(diags);
+        }
+        let body = head.body.as_deref().unwrap_or(&[]);
+        if construct != Construct::Node && !body.is_empty() {
+            errors.extend(error(body[0].range, "only node kinds have content fields"));
+        } else if let Err(diags) = schema_attrs(body, &mut kind.fields) {
+            errors.extend(diags);
+        }
+        if kind.fields.iter().any(|field| field.name == "props") {
+            errors.extend(error(kind.range, "props is reserved for node properties"));
+        }
+        if errors.is_empty() {
+            self.origins[index] = origins;
+            Ok(kind)
+        } else {
+            Err(errors)
         }
     }
 }
 
-fn resolve_kind_declaration(
-    index: usize,
-    declarations: &[ast::KindDecl],
-    names: &std::collections::BTreeMap<String, KindId>,
-    states: &mut [u8],
-    kinds: &mut [Option<Kind>],
-) -> Result<Kind> {
-    let declaration = &declarations[index];
-    let mut kind = if let Some(base) = names.get(&declaration.base) {
-        let mut kind = resolve_kind(base.0, declarations, names, states, kinds)?;
-        if kind.construct != declaration.construct {
-            return Err(error(declaration.range, "kind extension crosses graph construct categories"));
+fn step_range(step: &ast::GraphStep) -> SrcRange {
+    match step {
+        ast::GraphStep::Edge(edge) => edge.range,
+        ast::GraphStep::Fork(fork) => fork.range,
+        ast::GraphStep::Arms(arms) => step_range(&arms[0][0]),
+    }
+}
+
+// every relationship is one edge from the definition head
+fn relationships(steps: &[ast::GraphStep]) -> (Vec<Relationship>, Diags) {
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    let arms: Vec<&[ast::GraphStep]> = match steps {
+        [ast::GraphStep::Arms(arms)] => arms.iter().map(Vec::as_slice).collect(),
+        _ => vec![steps],
+    };
+    for arm in arms {
+        let Some((first, rest)) = arm.split_first() else { continue };
+        match first {
+            ast::GraphStep::Edge(step) => match relationship(step) {
+                Ok(relationship) => found.push(relationship),
+                Err(diags) => errors.extend(diags),
+            },
+            other => errors.extend(error(step_range(other), "a definition takes relationship edges only")),
         }
-        kind.base_kind = Some(*base);
-        kind
-    } else {
-        let construct = builtin_construct(&declaration.base)
-            .ok_or_else(|| error(declaration.range, format!("unknown base kind `{}`", declaration.base)))?;
-        if construct != declaration.construct {
-            return Err(error(declaration.range, "kind extension crosses graph construct categories"));
+        if let Some(next) = rest.first() {
+            errors.extend(error(
+                step_range(next),
+                "a relationship starts at the definition head, write each one on its own aligned line",
+            ));
         }
-        Kind {
-            name: String::new(),
-            base: declaration.base.clone(),
-            base_kind: None,
-            construct,
-            primitive: declaration.base.clone(),
-            direction: (construct == Construct::Edge).then(|| primitive_direction(&declaration.base)),
-            props: primitive_properties(construct, &declaration.base, declaration.range),
-            fields: Vec::new(),
-            range: declaration.range,
+    }
+    (found, errors)
+}
+
+fn relationship(step: &ast::GraphEdgeStep) -> Result<Relationship> {
+    let [header] = step.edges.as_slice() else {
+        return Err(error(step.range, "a relationship edge holds one relationship"));
+    };
+    let relation = match header.kind.as_str() {
+        "extends" => Relation::Extends,
+        "has" => Relation::Has,
+        "on" => Relation::On,
+        other => {
+            return Err(error(
+                header.range,
+                format!("unknown relationship `{other}`, expected extends, has or on"),
+            ));
         }
     };
-    kind.name = declaration.name.clone();
-    kind.base = declaration.base.clone();
-    kind.range = declaration.range;
-    let mut seen = HashSet::new();
-    let mut errors = Vec::new();
-    for field in &declaration.schema {
-        if !seen.insert(&field.key) {
-            errors.extend(error(field.range, "duplicate kind schema section"));
-            continue;
-        }
-        let section = match field.key.as_str() {
-            "direction" if kind.construct == Construct::Edge => kind_direction(field, &mut kind),
-            "props" => schema_fields(&field.value, &mut kind.props),
-            "fields" if kind.construct == Construct::Node => schema_fields(&field.value, &mut kind.fields),
-            _ => Err(error(field.range, "expected props, or fields for a node kind")),
-        };
-        if let Err(diags) = section {
-            errors.extend(diags);
-        }
+    if header.name.is_some() || header.props.is_some() {
+        return Err(error(header.range, "a relationship edge has no name and no properties"));
     }
-    if kind.fields.iter().any(|field| field.name == "props") {
-        errors.extend(error(kind.range, "props is reserved for node properties"));
+    if step.cycle || step.direction != Direction::Directed {
+        return Err(error(step.range, "a relationship edge is written -[:kind]->"));
     }
-    if errors.is_empty() { Ok(kind) } else { Err(errors) }
+    let target = match &step.target {
+        ast::GraphNode::Reference(ast::Expr {
+            kind: ast::ExprKind::GraphRef { target, .. },
+            ..
+        }) => match &target.kind {
+            ast::ExprKind::Ref { path } if path.len() == 1 => Some(path[0].clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Err(error(step.range, "a relationship target references a definition by name"));
+    };
+    Ok(Relationship {
+        relation,
+        target,
+        range: step.range,
+    })
 }
 
 fn kind_direction(field: &ast::Attr, kind: &mut Kind) -> Result<()> {
@@ -1947,9 +2405,9 @@ pub(super) fn model(ast: ast::GraphDocument) -> Result<Model> {
     let mut modeler = Modeler::new();
     // no phase stops the next one: a failed element is marked, and later checks that
     // depend on it are skipped, so each independent mistake is reported once
-    modeler.kinds(&ast.kinds);
+    modeler.definitions(&ast.definitions);
     let paths: Vec<_> = ast.paths.iter().map(|path| modeler.path(path, None)).collect();
-    if paths.is_empty() && ast.kinds.is_empty() {
+    if paths.is_empty() && ast.definitions.is_empty() {
         return Err(error(SrcRange::new(0, 0), "expected at least one graph statement"));
     }
     let mut resolved = Vec::new();

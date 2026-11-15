@@ -4,24 +4,20 @@ use std::fmt;
 /// Candidate graph paths before semantic validation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphDocument {
-    /// Kind declarations in source order.
-    pub kinds: Vec<KindDecl>,
+    /// Definition statements in source order.
+    pub definitions: Vec<Definition>,
     /// Root paths in source order.
     pub paths: Vec<GraphPath>,
 }
 
-/// A schema declaration for one graph construct.
+/// A `+` statement defining one kind or trait.
 #[derive(Debug, Clone, PartialEq)]
-pub struct KindDecl {
-    /// The graph construct this kind specializes.
-    pub construct: crate::model::Construct,
-    /// The new kind name.
-    pub name: String,
-    /// The base kind name.
-    pub base: String,
-    /// Schema descriptors.
-    pub schema: Vec<Attr>,
-    /// Complete declaration location.
+pub struct Definition {
+    /// The defined name, its construct, property descriptors and field descriptors.
+    pub head: GraphNodeDecl,
+    /// Relationship edges, before checking that each one starts at the head.
+    pub steps: Vec<GraphStep>,
+    /// Complete statement location.
     pub range: SrcRange,
 }
 

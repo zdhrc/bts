@@ -363,32 +363,16 @@
 
 # span and tool_span are supplied by the provider source in compilation.rs
 # local kinds inherit strict properties and open content fields
-+(patient_lookup::tool_span {
-    props: {
-        resource: {type: "string", default: "patients"},
-    },
-    fields: {
-        patient_id: {required: true},
-    },
-});
++(patient_lookup:node {resource: {type: "string", default: "patients"}}) {
+    patient_id: {required: true},
+}
+    -[:extends]->(tool_span);
 
-+-[patient_data::feeds {
-    props: {
-        label: {type: "string", default: "patient identity"},
-    },
-}]-;
++(patient_data:edge {label: {type: "string", default: "patient identity"}})-[:extends]->(feeds);
 
-+=[patient_checks_kind::parallel {
-    props: {
-        label: {type: "string"},
-    },
-}]=;
++(patient_checks_kind:fork {label: {type: "string"}})-[:extends]->(parallel);
 
-+>[patient_join::accumulate {
-    props: {
-        label: {type: "string"},
-    },
-}]>>;
++(patient_join:junction {label: {type: "string"}})-[:extends]->(accumulate);
 
 # an incoming field is a requirement, its destination reference does not read it
 (patient_request:span {name: "Patient request"}) {
@@ -417,7 +401,7 @@
         ]>>(typed_result:span {name: "Collected results"});
 
 # undirected endpoints keep their authored positions when matched in reverse
-+-[friendship::link {direction: "undirected", props: {weight: {type: "number"}}}]-;
++(friendship:edge {direction: "undirected", weight: {type: "number"}})-[:extends]->(link);
 (graph_a:node) {affinity: 4, records: [|1, 2, 3|]};
 (graph_b:node) {affinity: 2};
 (graph_c:node);
@@ -478,7 +462,7 @@
         } [processed]]>>(total:node) {value: <-};
 
 # caller inputs retain references even when their authored fallback is constant
-+(supplied_values::node {fields: {payload: {type: "object", role: "input"}}});
++(supplied_values:node) {payload: {type: "object", role: "input"}};
 (caller_values:supplied_values) {
     payload: {count: 2, enabled: true},
     observed: self.payload.count,
@@ -522,3 +506,38 @@
     ]
         >[:accumulate [to_page], [to_email]]>>(dispatch_done:task)
     ~[:next {max_traversals: 1}]~>(dispatch);
+
+# traits add properties and fields to the kinds that have them, without behavior of their own
+# a trait lists the constructs it applies to, and may extend one trait to narrow them
++(audited:trait {auditor: {type: "string", default: "records"}})
+    -[:on]->(node)
+    -[:on]->(edge);
+
++(consented:trait) {consent: {type: "boolean", required: true}}
+    -[:extends]->(audited)
+    -[:on]->(node);
+
++(retained:trait {retention_days: {type: "number", default: 30}})
+    -[:on]->(node);
+
++(patient_export:node {format: {type: "string", default: "fhir"}}) {
+    patient_id: {type: "string"},
+}
+    -[:extends]->(patient_lookup)
+    -[:has]->(consented)
+    -[:has]->(retained);
+
++(audited_data:edge)
+    -[:extends]->(patient_data)
+    -[:has]->(audited);
+
+(export_request:span {name: "Export request"}) {
+    patient_id: "p-500",
+}
+    -[:audited_data {value: source.patient_id, into: target.patient_id, auditor: "privacy"}]->
+        (export_records:patient_export {name: "Export records", retention_days: 7}) {
+            patient_id: <-,
+            consent: true,
+            kept_for: self.props.retention_days,
+            checked_by: self.props.auditor,
+        };

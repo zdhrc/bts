@@ -67,7 +67,7 @@ pub mod semantics {
 
     /// Compiles user source together with caller-supplied kind definitions.
     ///
-    /// Definition sources may contain only kind declarations. All kinds share one
+    /// Definition sources may contain only definitions. All kinds and traits share one
     /// namespace and resolve together, including forward references across sources.
     /// Duplicate names are errors, including identical declarations.
     /// Source ranges use local byte offsets and a source index. Index zero identifies
@@ -103,18 +103,18 @@ pub mod semantics {
         }
 
         let mut ast = document(source, 0)?;
-        let empty = ast.paths.is_empty() && ast.kinds.is_empty();
-        let mut kinds = Vec::new();
+        let empty = ast.paths.is_empty() && ast.definitions.is_empty();
+        let mut supplied_definitions = Vec::new();
         for (index, definition) in definitions.iter().enumerate() {
             let supplied = document(*definition, index + 1)?;
             if let Some(path) = supplied.paths.first() {
                 return Err(vec![Diag {
                     when: DiagPhase::Validation,
-                    what: "definition sources may contain only kind declarations".to_owned(),
+                    what: "definition sources may contain only definitions".to_owned(),
                     r#where: path.range,
                 }]);
             }
-            kinds.extend(supplied.kinds);
+            supplied_definitions.extend(supplied.definitions);
         }
         if empty && !allow_empty {
             return Err(vec![Diag {
@@ -123,9 +123,9 @@ pub mod semantics {
                 r#where: SrcRange::new(0, 0),
             }]);
         }
-        kinds.append(&mut ast.kinds);
-        ast.kinds = kinds;
-        let mut compiled = if ast.paths.is_empty() && ast.kinds.is_empty() {
+        supplied_definitions.append(&mut ast.definitions);
+        ast.definitions = supplied_definitions;
+        let mut compiled = if ast.paths.is_empty() && ast.definitions.is_empty() {
             Model::default()
         } else {
             tracing::info_span!("model").in_scope(|| model(ast))?
@@ -148,8 +148,8 @@ pub mod syntax {
     pub use crate::ast::GraphDocument as Ast;
     pub use crate::ast::{Attr, BinOp, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
     pub use crate::ast::{
-        GraphDocument, GraphEdgeStep, GraphFork, GraphHeader, GraphJunction, GraphNode, GraphNodeDecl, GraphOrigin, GraphPath,
-        GraphReferenceKind, GraphStep, KindDecl,
+        Definition, GraphDocument, GraphEdgeStep, GraphFork, GraphHeader, GraphJunction, GraphNode, GraphNodeDecl, GraphOrigin,
+        GraphPath, GraphReferenceKind, GraphStep,
     };
     pub use crate::ast::{GraphPattern, GraphPatternConstraint, GraphPatternNode, GraphPatternStep};
 

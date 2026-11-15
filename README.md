@@ -147,12 +147,10 @@ See [parallel workers](examples/fanout_parallel_workers.bt), [tool loops](exampl
 
 ### Extend a kind
 
-Kinds can add schemas to existing primitives or provider definitions. For example, append this to `support.bt`:
+A definition starts with `+` and is written like a `node`: its header holds property descriptors, its body holds field descriptors, and an `extends` `edge` names its base. Kinds can add schemas to existing primitives or provider definitions. For example, append this to `support.bt`:
 
 ```bts
-+(billing_lookup::tool {
-    props: {service: {type: "string", required: true}},
-});
++(billing_lookup:node {service: {type: "string", required: true}})-[:extends]->(tool);
 ```
 
 Then change `(search:tool)` to `(search:billing_lookup {service: "billing"})`. Properties inside the `node` header configure that instance and are checked against the inherited schema. The body remains its data and expressions. This extension adds a contract, not a service implementation.

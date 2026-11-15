@@ -79,13 +79,13 @@ mod tests {
 
     #[test]
     fn provider_definition_conflicts_point_to_the_user_declaration() {
-        let source = "+(span::node {});";
+        let source = "+(span:node);";
         let errors = bts_core::providers::braintrust::Bundle::compile_module(source, false).unwrap_err();
         let report = SourceDiags::new("shape.bt", source, errors).to_string();
         assert!(report.contains("shape.bt:"));
         assert!(!report.contains("braintrust.bt:"));
-        assert!(report.contains("duplicate kind name"));
-        assert!(report.contains("+(span::node"));
+        assert!(report.contains("duplicate kind or trait name"));
+        assert!(report.contains("+(span:node"));
     }
 
     #[test]

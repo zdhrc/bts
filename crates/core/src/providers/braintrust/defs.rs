@@ -13,84 +13,74 @@ pub const SOURCE: Source<'static> = Source {
 # context.history.<node_name> contains earlier completed input/output/expected/metadata records
 # accumulate targets receive context.arrivals in listed edge order and fail on missing inputs
 # neutral node and vars steps carry values and descendants without emitting spans
-+(agent::node {
-    props: {
-        name: {type: "string"},
-        description: {type: "string"},
-    },
-    fields: {
-        input: {type: "any", role: "input"},
-        output: {type: "any", role: "output"},
-        expected: {type: "any", role: "input"},
-        metadata: {type: "object", role: "input"},
-    },
-});
++(agent:node {
+    name: {type: "string"},
+    description: {type: "string"},
+}) {
+    input: {type: "any", role: "input"},
+    output: {type: "any", role: "output"},
+    expected: {type: "any", role: "input"},
+    metadata: {type: "object", role: "input"},
+};
 
 # provider schemas describe span data, they do not execute or emit spans
 # names are optional so anonymous graph nodes remain usable
 # value ranges, tag element types, and emission rules need provider validation
-+(span::node {
-    props: {
-        name: {type: "string"},
-    },
-    fields: {
-        input: {type: "any", role: "input"},
-        output: {type: "any", role: "output"},
-        expected: {type: "any", role: "input"},
-        error: {type: "any"},
-        metadata: {type: "object", role: "input"},
-        metrics: {type: "object"},
-        scores: {type: "object"},
-        tags: {type: "array"},
-        duration: {type: "number"},
-    },
-});
++(span:node {name: {type: "string"}}) {
+    input: {type: "any", role: "input"},
+    output: {type: "any", role: "output"},
+    expected: {type: "any", role: "input"},
+    error: {type: "any"},
+    metadata: {type: "object", role: "input"},
+    metrics: {type: "object"},
+    scores: {type: "object"},
+    tags: {type: "array"},
+    duration: {type: "number"},
+};
 
-+(tool::span {});
-+(task::span {});
-+(llm::span {});
-+(function::span {});
++(tool:node)-[:extends]->(span);
++(task:node)-[:extends]->(span);
++(llm:node)-[:extends]->(span);
++(function:node)-[:extends]->(span);
 
 # child_of points from an emitted child span to its parent span
 # it does not schedule either endpoint or transfer values
 # consumers keep the parent open through its children
 # endpoint and hierarchy validation still require provider integration
-+-[child_of::link {direction: "directed"}]-;
++(child_of:edge {direction: "directed"})-[:extends]->(link);
 
 # one scorer expression supports emitted spans and callable scorer functions
 # context reads the parent span during emission and caller arguments in a function
-+(scorer::span {
-    props: {
-        lang: {type: "string"},
-        file: {type: "string"},
-    },
-    fields: {
-        score: {type: "number"},
-        steps: {type: "array"},
-        judge: {type: "object"},
-        reason: {type: "string"},
-    },
-});
++(scorer:node {
+    lang: {type: "string"},
+    file: {type: "string"},
+}) {
+    score: {type: "number"},
+    steps: {type: "array"},
+    judge: {type: "object"},
+    reason: {type: "string"},
+}
+    -[:extends]->(span);
 
 # datasets and evaluations connect authored cases to modeled behavior
-+(dataset::node {props: {name: {type: "string"}}, fields: {description: {type: "string"}, cases: {type: "array", required: true}}});
-+(case::node {props: {name: {type: "string"}}, fields: {
++(dataset:node {name: {type: "string"}}) {description: {type: "string"}, cases: {type: "array", required: true}};
++(case:node {name: {type: "string"}}) {
     input: {type: "any"}, source: {type: "any"}, traces: {type: "array"},
     expected: {type: "any"}, metadata: {type: "object"}, tags: {type: "array"},
-}});
-+(experiment::node {props: {name: {type: "string"}}, fields: {
+};
++(experiment:node {name: {type: "string"}}) {
     description: {type: "string"}, dataset: {type: "any", required: true},
     task: {type: "any", required: true}, scorers: {type: "array", required: true}, baseline: {type: "any"},
-}});
+};
 # facets and automation rules are resources rather than emitted spans
-+(facet::node {props: {name: {type: "string"}}, fields: {
++(facet:node {name: {type: "string"}}) {
     prompt: {type: "string", required: true}, description: {type: "string"},
     no_match_pattern: {type: "string"},
-}});
-+(automation::node {props: {name: {type: "string"}}, fields: {
+};
++(automation:node {name: {type: "string"}}) {
     type: {type: "string", required: true}, scorers: {type: "array"}, facets: {type: "array"},
     scope: {type: "string"}, root: {type: "boolean"}, span_names: {type: "array"},
     sampling_rate: {type: "number"}, enabled: {type: "boolean"},
-}});
+};
 "#,
 };

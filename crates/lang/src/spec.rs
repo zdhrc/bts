@@ -893,17 +893,27 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.declarations"),
-        summary: "The + marker introduces a root kind declaration. Its boundary identifies node, edge, fork or junction, and :: names its base. Bases resolve forward to declared kinds or built-in roots and primitives. Kind names must be unquoted identifiers in declarations, base references and instances. They are unique in a namespace separate from instance names, cannot shadow built-ins or reserved names, and cannot form inheritance cycles. Bases and instances must use the same construct category. A declaration-only module is valid. Derived kinds retain their base primitive validation and operation identity.",
+        summary: "The + marker introduces a root definition, written as a graph statement. Its head is a node declaration whose name is the defined name and whose kind names the construct: node, edge, fork, junction or trait. Edges from the head relate it to other definitions: extends names its base, has attaches a trait and on lists the constructs a trait applies to. A kind without extends derives from its construct root. Bases resolve forward to declared kinds or built-in roots and primitives. Names must be unquoted identifiers in definitions, relationship targets and instances. Kinds and traits are unique in one namespace separate from instance names, cannot shadow built-ins or reserved names, and cannot form inheritance cycles. A kind extends at most one base, and bases and instances must use the same construct category. A definition-only module is valid. Derived kinds retain their base primitive validation and operation identity.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.schemas"),
-        summary: "Kind descriptors accept props and, for nodes, fields. Edge kind descriptors also accept direction with values directed, undirected or either. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. Each maps names to descriptors with type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role does not install an operation. The input role preserves references to the field and its nested values as runtime reads, even when its authored fallback is constant. Consumers may supply a value at that boundary. Constant folding and branch proofs cannot assume the fallback is the supplied value. Output roles preserve field reference identity without installing evaluation behavior. Other roles remain descriptive metadata. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
+        summary: "The braces in a definition head hold property descriptors and its body holds field descriptors, mirroring an instance's properties and content. Only node kinds and traits on node have a body. On an edge kind the header key direction is reserved: it takes directed, undirected or either instead of a descriptor. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. Each descriptor accepts type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role does not install an operation. The input role preserves references to the field and its nested values as runtime reads, even when its authored fallback is constant. Consumers may supply a value at that boundary. Constant folding and branch proofs cannot assume the fallback is the supplied value. Output roles preserve field reference identity without installing evaluation behavior. Other roles remain descriptive metadata. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.inheritance"),
-        summary: "Extensions inherit properties, fields, requiredness, defaults and roles. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict, while content fields remain open and extensible. Described content fields still receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
+        summary: "Extensions inherit properties, fields, requiredness, defaults, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict, while content fields remain open and extensible. Described content fields still receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("kind.relationships"),
+        summary: "A relationship is one unnamed directed edge without properties from the definition head to a name: -[:extends]->(base), -[:has]->(trait) or -[:on]->(construct). Targets are references resolved in the kind namespace, never declarations. One relationship may follow the head on its line. Two or more are aligned continuation lines, so each starts at the head. A relationship that continues from another relationship's target, an edge list, a fork, a loop-back or an undirected edge is an error. Kinds accept extends and has. Traits accept extends and on.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: Id::new("kind.traits"),
+        summary: "A trait is a named schema of property and field descriptors that kinds attach with has. It carries no primitive behavior and cannot be instantiated. A trait lists the constructs it applies to with on, and a kind may only have traits that are on its construct. Only nodes have content fields, so a trait with fields is on node alone. A trait may extend one trait: it inherits that trait's entries under the kind inheritance rules and its on list, and may list on only to narrow it. A trait cannot use has. A kind's traits are those of its base, those it attaches and every trait they extend, and attaching one it already has changes nothing. Trait entries are merged after the base and before the kind's own descriptors, which may restrict them like inherited entries. An entry declared by two unrelated traits, or by a trait and the kind's base, is an error at the has relationship. Models retain each kind's traits.",
     },
     RuleDesc {
         tags: &[],
@@ -918,7 +928,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.direction"),
-        summary: "Ordinary connectors are -[headers]-> for directed edges and -[headers]- for undirected edges. Each declaration creates a distinct identity, including parallel edges and self-connections. The root edge kind, link and undeclared kinds permit either direction. next, requires, contains and feeds require directed edges. incidence requires undirected edges. Direction is an edge kind descriptor alongside props, not an instance property. Directed and undirected connections can coexist between the same nodes.",
+        summary: "Ordinary connectors are -[headers]-> for directed edges and -[headers]- for undirected edges. Each declaration creates a distinct identity, including parallel edges and self-connections. The root edge kind, link and undeclared kinds permit either direction. next, requires, contains and feeds require directed edges. incidence requires undirected edges. Direction is set in an edge kind's definition header, not an instance property. Directed and undirected connections can coexist between the same nodes.",
     },
     RuleDesc {
         tags: &[],
@@ -979,12 +989,12 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
         tags: &[],
         id: Id::new("kind.sources"),
         // provider schemas are opt-in data contracts, not installed runtime operations
-        summary: "Callers may supply named definition sources before compilation through semantics::compile_with_definitions or compile_module_with_definitions. Definition sources use ordinary kind declaration syntax for nodes, edges, forks and junctions, and cannot declare graph instances or paths. Supplied and user kinds share one namespace and one inheritance and validation system. Forward inheritance across sources is allowed. Duplicate names, reserved names, unknown bases, inheritance cycles and cross-construct extension remain errors. Supplied definitions are registered in caller order followed by user definitions, without override precedence. Unknown instance kinds remain open under the existing rules. Source ranges retain local byte offsets and a source index, with user source at zero and definitions in caller order starting at one. Models retain source names and resolved kind identities. Empty user source follows the explicit allow_empty policy independently of supplied declarations, and supplied kinds are still validated when empty user source is allowed. No package loading, provider execution or external I/O occurs.",
+        summary: "Callers may supply named definition sources before compilation through semantics::compile_with_definitions or compile_module_with_definitions. Definition sources contain only definitions, for kinds and traits, and cannot declare graph instances or paths. Supplied and user definitions share one namespace and one inheritance and validation system. Forward references across sources are allowed. Duplicate names, reserved names, unknown bases or traits, inheritance cycles and cross-construct extension remain errors. Supplied definitions are registered in caller order followed by user definitions, without override precedence. Unknown instance kinds remain open under the existing rules. Source ranges retain local byte offsets and a source index, with user source at zero and definitions in caller order starting at one. Models retain source names and resolved kind identities. Empty user source follows the explicit allow_empty policy independently of supplied definitions, and supplied kinds are still validated when empty user source is allowed. No package loading, provider execution or external I/O occurs.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.contracts"),
-        summary: "Kind schemas describe configuration and data. Primitive validators enforce structural and value rules. Runtime operations are optional and are supplied by consumers. Derived kinds retain inherited validation and operation identity, and may add restrictions. A schema alone cannot give arbitrary properties executable meaning. Caller-supplied definition sources provide schema integration. Provider registry loading, package identity and executable operation registration remain separate integration work. Existing compilation retains the contracts needed by that work without executing consumer operations.",
+        summary: "Kind schemas describe configuration and data. Primitive validators enforce structural and value rules. Runtime operations are optional and are supplied by consumers. Derived kinds retain inherited validation and operation identity, and may add restrictions. Traits add schema entries without operations. A schema alone cannot give arbitrary properties executable meaning. Caller-supplied definition sources provide schema integration. Provider registry loading, package identity and executable operation registration remain separate integration work. Existing compilation retains the contracts needed by that work without executing consumer operations.",
     },
     RuleDesc {
         tags: &[],
@@ -1349,7 +1359,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.kind-input"),
         summary: "A typed upstream input and a field destination",
         note: "Compilation retains the input and destination identities without delivering data.",
-        source: r#"+(receiver::node {fields: {id: {type: "string", required: true}}}); (a:node) {id: "p-1"} -[:feeds {value: source.id, into: target.id}]->(b:receiver) {id: <-};"#,
+        source: r#"+(receiver:node) {id: {type: "string", required: true}}; (a:node) {id: "p-1"} -[:feeds {value: source.id, into: target.id}]->(b:receiver) {id: <-};"#,
         valid: true,
     },
     Example {
@@ -1357,16 +1367,34 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.kind-property"),
         summary: "Declared properties are strict",
         note: "Additional content fields are allowed, additional properties are rejected.",
-        source: r#"+(record::node {props: {name: {type: "string"}}}); (a:record {typo: true});"#,
+        source: r#"+(record:node {name: {type: "string"}}); (a:record {typo: true});"#,
         valid: false,
     },
     Example {
         tags: &[],
         id: Id::new("example.kind-junction"),
         summary: "A junction kind retains its base operation",
-        note: "The kind boundary and the instance boundary use the same graph construct.",
-        source: "+>[joined::accumulate {}]>>; (:node)-[e:link]->(:node); >[:joined [e]]>>(:node);",
+        note: "The head names the junction construct, and extends names the base whose operation the kind keeps.",
+        source: "+(joined:junction)-[:extends]->(accumulate); (:node)-[e:link]->(:node); >[:joined [e]]>>(:node);",
         valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.trait"),
+        summary: "A kind has a trait's properties and fields",
+        note: "The trait applies to node kinds. Its property goes in the instance header and its field in the body.",
+        source: r#"+(metered:trait {unit: {type: "string", default: "ms"}}) {metrics: {type: "object", required: true}}-[:on]->(node); +(lookup:node)-[:has]->(metered); (a:lookup {unit: "s"}) {metrics: {elapsed: 2}};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.trait-collision"),
+        summary: "Two traits cannot declare the same field",
+        note: "The error is reported at the second has relationship.",
+        source: r#"+(metered:trait) {metrics: {type: "object"}}-[:on]->(node); +(counted:trait) {metrics: {type: "object"}}-[:on]->(node); +(lookup:node)
+    -[:has]->(metered)
+    -[:has]->(counted);"#,
+        valid: false,
     },
     Example {
         tags: &[],
@@ -1425,9 +1453,10 @@ pub static SPEC: Spec = Spec {
     summary: "A language for defining graphs, references and expressions without domain-specific node schemas.",
     surface: SurfaceDesc {
         notation: "Typed graph elements with comma-separated properties and content fields.",
-        grammar: r#"document = { (root_path | kind_declaration), ";" }
-kind_declaration = "+(", kind_schema, ")" | "+-[", kind_schema, "]-" | "+=[", kind_schema, "]=" | "+>[", kind_schema, "]>>"
-kind_schema = identifier, "::", kind, fields
+        grammar: r#"document = { (root_path | definition), ";" }
+definition = "+(", identifier, ":", construct, [fields], ")", [fields], {relationship}
+construct = "node" | "edge" | "fork" | "junction" | "trait"
+relationship = "-[:", ("extends" | "has" | "on"), "]->(", identifier, ")"
 root_path = (node | junction), steps
 attached_path = (selector | junction), steps
 steps = {edge | cycle}, [fork | arms]
@@ -1477,13 +1506,14 @@ reference_expression = expression
             "This grammar describes token forms. The layout rules below constrain arm and attached_path repetition and legal positions. Scalar and template tokenization includes quoted, multiline and heredoc strings, interpolation, finite numbers, booleans and null.",
             "Spaces establish continuation levels, with no fixed width. A step that begins a line is a continuation line, and it is indented deeper than the line it attaches to. Aligned continuation lines are siblings. A dedent returns to an established level. Tabs are not indentation. Delimited values and strings do not create graph scope.",
             "Each arm begins a continuation line. Its origin is the last node of the nearest shallower line, so aligned arms share one origin and a deeper line continues the chain. Steps on one line chain, including a step that follows a node body on its closing line. A fork may be an arm, and arms aligned with it after its attached paths share its origin.",
+            "A definition's relationships follow the arm rules: one may sit on the head's line, and two or more each begin an aligned continuation line.",
             "One selector or junction may continue a fork on the same line. Another sibling requires a new aligned line. Its attachment is to the enclosing fork, never the preceding sibling's final node. Edge and cycle lines do not align with a fork's selectors and junctions.",
             "The <- marker is legal only as the entire value of a direct instance node content field. It is not an expression and is forbidden in properties, nested objects, arrays and schema descriptors.",
             "Node bodies contain only fields. Node declarations are legal at path origins and connection targets. No declarations occur in expression values or properties. Empty node parentheses are invalid.",
             "Fork entries contain exactly one ordinary directed or undirected edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
             "Root paths require semicolons. Internal entries require commas between entries on one line or multiple lines. A trailing comma is optional, including for a single entry. Array and object spreads use ...expression in an entry position.",
             "References use parentheses and brackets, arrays use [| |], expression grouping uses ${ }.",
-            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Kind declarations provide local schemas and same-category extension. Package loading and runtime operation registration remain future work. Schema declarations do not install executable behavior. Consumers must honor inherited primitive contracts or explicitly reject unsupported capabilities.",
+            "Node, edge, fork and junction kinds are open identifiers. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Definitions provide local kind schemas, same-category extension and traits. Package loading and runtime operation registration remain future work. Schema declarations do not install executable behavior. Consumers must honor inherited primitive contracts or explicitly reject unsupported capabilities.",
         ],
     },
     expressions: EXPRESSIONS,

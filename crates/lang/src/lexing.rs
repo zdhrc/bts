@@ -62,7 +62,6 @@ pub(super) enum TokenKind {
     Bang,
     Question,
     Colon,
-    DoubleColon,
 
     Ident(String),
     String(String),
@@ -188,10 +187,7 @@ impl<'src> Lexer<'src> {
                 }
                 None => tokens.push(Token::new(TokenKind::Question, idx, idx + 1)),
             },
-            ':' => match self.lex_trailing(':') {
-                Some(end) => tokens.push(Token::new(TokenKind::DoubleColon, idx, end)),
-                None => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
-            },
+            ':' => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
             '=' => match self.lex_paired(ch) {
                 Some(end) => tokens.push(Token::new(TokenKind::EqEq, idx, end)),
                 None => match self.lex_trailing('>') {
@@ -932,7 +928,7 @@ mod tests {
 
     #[test]
     fn lexes_graph_punctuation_with_exact_ranges() {
-        let source = "-> ~> ~ >> ?<> @ ; [| |] => <- ::";
+        let source = "-> ~> ~ >> ?<> @ ; [| |] => <-";
         let tokens = Lexer::new(source).lex().unwrap();
         let expected = [
             (TokenKind::Arrow, "->"),
@@ -947,7 +943,6 @@ mod tests {
             (TokenKind::ArrayClose, "|]"),
             (TokenKind::FatArrow, "=>"),
             (TokenKind::Upstream, "<-"),
-            (TokenKind::DoubleColon, "::"),
         ];
         assert_eq!(tokens.len(), expected.len() + 1);
         for (token, (kind, spelling)) in tokens.iter().zip(expected) {

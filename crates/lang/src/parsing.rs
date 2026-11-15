@@ -54,11 +54,11 @@ impl<'src> Parser<'src> {
 
     fn parse_graph(mut self) -> Result<GraphDocument, Errors> {
         let mut paths = Vec::new();
-        let mut kinds = Vec::new();
+        let mut definitions = Vec::new();
         while !self.eof() {
             if self.check(token!(Plus)) {
-                match self.parse_kind() {
-                    Some(kind) => kinds.push(kind),
+                match self.parse_definition() {
+                    Some(definition) => definitions.push(definition),
                     None => break,
                 }
                 continue;
@@ -69,65 +69,35 @@ impl<'src> Parser<'src> {
             }
         }
         if self.errors.is_empty() {
-            Ok(GraphDocument { paths, kinds })
+            Ok(GraphDocument { paths, definitions })
         } else {
             Err(self.errors)
         }
     }
 
-    fn parse_kind(&mut self) -> Option<crate::ast::KindDecl> {
-        use crate::model::Construct;
+    // a definition is a root path whose head declares a name with an unquoted identifier
+    fn parse_definition(&mut self) -> Option<crate::ast::Definition> {
         let start = self.peek().range.start;
         self.expect(token!(Plus), ErrorKind::UnexpectedToken)?;
-        let construct = match self.next().kind {
-            TokenKind::LParen => Construct::Node,
-            TokenKind::Minus => {
-                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
-                Construct::Edge
-            }
-            TokenKind::Equals => {
-                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
-                Construct::Fork
-            }
-            TokenKind::Gt => {
-                self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
-                Construct::Junction
-            }
-            _ => {
-                self.errors
-                    .push(Error::new(ErrorKind::UnexpectedToken, self.tokens[self.index - 1].range));
-                return None;
-            }
-        };
-        let name = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
-        self.expect(token!(DoubleColon), ErrorKind::UnexpectedToken)?;
-        let base = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
-        let schema = self.parse_graph_fields()?;
-        match construct {
-            Construct::Node => {
-                self.expect(token!(RParen), ErrorKind::UnexpectedToken)?;
-            }
-            Construct::Edge => {
-                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
-                self.expect(token!(Minus), ErrorKind::UnexpectedToken)?;
-            }
-            Construct::Fork => {
-                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
-                self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
-            }
-            Construct::Junction => {
-                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
-                self.expect(token!(Junction), ErrorKind::UnexpectedToken)?;
-            }
+        if !self.check(token!(LParen)) || !matches!(self.peek_ahead().kind, TokenKind::Ident(_)) {
+            let range = if self.check(token!(LParen)) {
+                self.peek_ahead().range
+            } else {
+                self.peek().range
+            };
+            self.errors.push(Error::new(ErrorKind::ExpectedDefinitionHead, range));
+            return None;
         }
-        let end = self.peek().range.end;
-        self.expect(token!(Semicolon), ErrorKind::ExpectedStatementEnd)?;
-        Some(crate::ast::KindDecl {
-            construct,
-            name,
-            base,
-            schema,
-            range: self.range(start, end),
+        let head_range = self.peek().range;
+        let path = self.parse_graph_path()?;
+        let GraphOrigin::Node(GraphNode::Declaration(head)) = path.start else {
+            self.errors.push(Error::new(ErrorKind::ExpectedDefinitionHead, head_range));
+            return None;
+        };
+        Some(crate::ast::Definition {
+            head,
+            steps: path.steps,
+            range: self.range(start, path.range.end),
         })
     }
 
@@ -1127,6 +1097,7 @@ pub(super) enum ErrorKind {
     ExpectedGraphNode,
     ExpectedGraphName,
     ExpectedGraphKind,
+    ExpectedDefinitionHead,
     ExpectedStatementEnd,
     ExpectedFieldComma,
     ReferenceBody,
@@ -1158,6 +1129,7 @@ impl fmt::Display for ErrorKind {
             Self::ExpectedGraphNode => "expected a node declaration or reference",
             Self::ExpectedGraphName => "expected an identifier or plain quoted graph name",
             Self::ExpectedGraphKind => "expected a required graph kind after `:`",
+            Self::ExpectedDefinitionHead => "expected a definition head such as `(name:node)` after `+`",
             Self::ExpectedStatementEnd => "expected `;` after a graph statement",
             Self::ExpectedFieldComma => "expected `,` between fields",
             Self::ReferenceBody => "a node reference cannot attach a body",
