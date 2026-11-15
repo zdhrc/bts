@@ -51,11 +51,12 @@
             output: "The fraud check adds 70-90ms per call at p95.",
             metadata: {model: "gpt-4o", provider: "openai"},
         };
-(supervisor)-[:contains]->(delegate)-[:child_of]->(request);
-(supervisor)-[:contains]->(metrics_agent)-[:child_of]->(request);
-(supervisor)-[:contains]->(metrics_reply)-[:child_of]->(metrics_agent);
-(supervisor)-[:contains]->(diff_agent)-[:child_of]->(request);
-(supervisor)-[:contains]->(diff_reply)-[:child_of]->(diff_agent);
-(supervisor)-[:contains]->(synthesis)-[:child_of]->(request);
-(supervisor)-[:contains]->(profiler)-[:child_of]->(request);
-(supervisor)-[:contains]->(profile_reply)-[:child_of]->(profiler);
+(supervisor)
+    -[:contains]->(delegate)-[:child_of]->(request)
+    -[:contains]->(metrics_agent)-[:child_of]->(request)
+    -[:contains]->(metrics_reply)-[:child_of]->(metrics_agent)
+    -[:contains]->(diff_agent)-[:child_of]->(request)
+    -[:contains]->(diff_reply)-[:child_of]->(diff_agent)
+    -[:contains]->(synthesis)-[:child_of]->(request)
+    -[:contains]->(profiler)-[:child_of]->(request)
+    -[:contains]->(profile_reply)-[:child_of]->(profiler);
