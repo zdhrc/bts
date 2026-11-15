@@ -1,8 +1,26 @@
 # bts
 
-It's "another synthetics generator".
+A framework for turning graph definitions into behavior models.
 
-`bts` creates synthetic workflows in [Braintrust](https://braintrust.dev): traces, runnable mock agents, datasets, scorer-backed experiments, and Topics automations. Describe a workflow in a shape file, then generate varied traffic over a historical time window, build regression cases, and compare versions with real scorer results.
+Define a graph in a `.bt` shape file using `nodes`, `edges`, `forks`, and `juncts`. Kinds and properties give those elements meaning, while fields and expressions describe their data. Together, they can model relationships, data flow, alternative paths, repeated steps, and how results come together.
+
+The language compiles these definitions into a resolved graph. Consumers interpret that graph as a behavior model using the kinds and capabilities they support. A model can describe a single expected path or many possible behaviors, with different consumers producing different results from the same definition.
+
+Use the CLI for authoring and generation workflows, embed the Rust libraries in your own tools, or use the WebAssembly API in a browser application. The language, generation APIs, and provider integrations can work together or be used separately for the parts you need.
+
+## How it fits together
+
+| Surface | What it provides |
+| --- | --- |
+| [Language](crates/lang/) | Graph syntax, expressions, references, kind definitions, and validation. Compile shapes into a resolved graph model without running them or connecting to a service. |
+| [Core APIs](crates/core/) | Mock data generation and code generation, with separate steps for evaluating behavior, formatting results, planning files, and delivering output. |
+| [Providers](crates/core/src/providers/) | Bundles of kind definitions and supported capabilities that connect graphs to a particular system's data, code, and workflows. |
+| [CLI](crates/cli/) | Commands to validate shapes, preview data, build code, synchronize resources, and generate authoring skills. |
+| [WebAssembly API](#browser-wasm) | Validation, generation, code builds, and trace delivery for applications that supply their own UI, storage, and transport. |
+
+Providers bundle the definitions and capabilities needed for a particular use. Their kind definitions participate in compilation, and their integration code interprets the resulting graph for supported workflows. The Braintrust provider supplies kinds such as `agent`, `span`, `tool`, `llm`, and `scorer`, along with trace formatting, generated-code integration, and workflows for datasets, experiments, and automations. These build on the language's graph primitives, keeping domain-specific contracts and behavior in the provider.
+
+With the Braintrust provider, an agent's behavior model can produce synthetic traces or callable mock code. Dataset and scorer definitions can stand on their own or join an agent in an evaluation workflow. You can validate the graph, preview generated data locally, build code, or deliver results as separate operations. The examples below use this provider to show how these pieces fit together.
 
 ## Install
 
@@ -12,279 +30,243 @@ Prebuilt binaries for macOS and Linux (arm64 and x86_64) install to `~/.local/bi
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/zdhrc/bts/releases/latest/download/bts-installer.sh | sh
 ```
 
-Verify with `bts --version`. Later, `bts update` fetches and installs the latest release in place.
+Verify with `bts --version`. Later, `bts update` fetches and installs the latest release in place. To build from source, run `cargo install --path crates/cli` from the repository root. Installer-managed updates are not available for source builds.
 
-To build from source instead, `cargo install --path crates/cli` from a clone of this repo (edition 2024, so Rust 1.85 or newer). Source builds have no install receipt, so `bts update` only works for installer-managed installs.
+## Teach your coding agent the language
 
-## Quickstart
-
-Initialize the directory you'll generate traces from:
+Install the generated skill before asking a language model to write `.bt` files:
 
 ```sh
-bts init
+bts setup skill codex --scope local
+# or
+bts setup skill claude --scope local
 ```
 
-This scaffolds `.bt/bts/config.toml`, an optional file controlling runtime behavior (see [Configuration](#configuration)). The `.bt` directory is a shared home for Braintrust tooling; everything `bts` owns — config, run logs — lives under its own `.bt/bts/` corner.
+The skill combines the language reference, Braintrust kind definitions, authoring guidance, and CLI usage. It gives your coding agent the syntax and rules for the installed version, instead of relying on guesses from similar languages. Regenerate it after updating `bts`.
 
-Next, install the `bts` agent skill so Claude Code or Codex can write and debug shape files with the full language reference on hand:
+Start with a concrete request, for example:
+
+> Use the bts skill to model a support agent that looks up an invoice, answers routine questions, and escalates missing records. Keep the lookup and response consistent. Save it as support.bt, validate it, and preview a small seeded batch without writing to Braintrust.
+
+Describe the inputs, expected outcomes, alternative paths, and relationships that matter. Ask the agent to inspect the generated payload as well as validate the source. Compilation checks the graph and its definitions, but sampled data still needs review for coherent conversations, correct parentage, and meaningful variation.
 
 ```sh
-bts setup skill claude    # or codex; --scope local|user|global
+bts check syntax support.bt
+bts write traces --from support.bt --count 5 --over 1h --seed 42 --dry-run
 ```
 
-Select a Braintrust project with `bt switch`. Both scorer builds and live writes use
-the selected project's name and ID from `.bt/config.json`. Writing also requires an API key:
+Neither command requires a project or API key. Start small, inspect the output, then broaden the scenarios. The [examples](examples/) provide complete shapes for conversations, tool loops, parallel work, datasets, and evaluation.
 
-```sh
-export BRAINTRUST_API_KEY="sk-..."
-```
+## Read a shape
 
-`BRAINTRUST_API_URL` can optionally override the default API endpoint. The project context
-and API key are not needed for `check` or `--dry-run`.
-
-Then describe a trace in a shape file (see [The shape language](#the-shape-language)) and write a batch:
-
-```sh
-bts write traces --from shape.bt --count 200 --over 24h
-```
-
-## The shape language
-
-A shape file (`.bt`) describes a workflow and the data around it. Save this small example as `shape.bt`:
+This graph models a support agent that looks up an article and uses it in a response. Braintrust kinds describe the agent and its steps, while `edges` define membership, progression, data flow, and span parenting. Save it as `support.bt`:
 
 ```bts
-vars { answer = "Download invoices from Billing > Invoices." }
+(support:agent) {
+    input: {question: "Where can I download my invoices?"},
+    output: reply.output,
+};
 
-trace "support" {
-    input = { question = "Where can I download my invoices?" }
-    output = llm.reply.output
-    tags = ["billing"]
+(support)-[:contains, :next]->(request:task) {
+    input: support.input,
+    output: reply.output,
+    tags: [|"billing"|],
+};
 
-    tool "search" {
-        input = trace.input.question
-        output = var.answer
-    }
-    llm "reply" {
-        input = { question = trace.input.question, article = tool.search.output }
-        output = tool.search.output
-        duration = range(0.4, 1.2)
-    }
+(request)-[:next]->(search:tool) {
+    input: {query: request.input.question},
+    output: {article: "Download invoices from Billing > Invoices."},
 }
+    -[:next, :feeds {
+        value: {question: request.input.question, article: source.output.article},
+        into: target.input,
+    }]->(reply:llm) {
+        input: <-,
+        output: self.input.article,
+        duration: range(0.4, 0.8),
+    };
 
-scorer "answer-correctness" {
-    code { score = output == expected ? 1 : 0 }
-}
-
-dataset "support-cases" {
-    case "invoices" {
-        input = { question = "Where can I download my invoices?" }
-        expected = var.answer
-    }
-}
-
-facet "Request type" {
-    prompt = "Describe the customer's request in a short phrase."
-}
-automation "support-topics" {
-    type = "topics"
-    facets = ["Request type"]
-    scope = "trace"
-}
-
-experiment "support-check" {
-    dataset = dataset["support-cases"]
-    task = trace.support
-    scorers = [scorer["answer-correctness"]]
-}
+(support)-[:contains]->(search)-[:child_of]->(request);
+(support)-[:contains]->(reply)-[:child_of]->(request);
 ```
 
-The trace's inputs and outputs are synthetic. Scorers and Topics run in Braintrust against that data. Here's what you can do with each part.
+`(search:tool)` declares a named `node`. `(search)` refers to it. The body holds fields, which can contain literals, expressions, and references to other `nodes`. Arrays use `[|...|]`. Commas separate fields and array items, and semicolons end root statements.
 
-### Traces
+`Edges` state different relationships explicitly:
 
-Nest `task`, `llm`, `tool`, and `function` spans to show a workflow. References connect their inputs and outputs; expressions vary durations, token counts, metadata, and content. Use `repeat`, `choice`, and `maybe` to vary the structure too:
+| Relationship | Purpose in this shape |
+| --- | --- |
+| `contains` | Makes a `node` a member of the agent's behavior graph |
+| `next` | Selects the entry step or advances execution |
+| `feeds` | Supplies a value to a field marked `<-` |
+| `child_of` | Makes an emitted span a child of another span |
+
+The Braintrust provider interprets the `agent` `node` and its connected members as a behavior model. During trace generation, the agent does not emit a span itself. Its entry task becomes the trace root. Membership, execution order, and span parenting are expressed separately.
+
+`tool`, `llm`, and `task` are Braintrust kinds built on the language's `node` primitive. In mock generation they describe data and spans, not real tool or model calls. The `reply` reads the lookup's actual article, keeping the response consistent with the evidence in the trace.
+
+### Branch and reconcile
+
+`Forks` make possible paths visible in the graph. This standalone shape models alternative routes. When evaluated, it chooses one route and collects its result:
 
 ```bts
-trace "support-session" {
-    repeat "turns" {
-        count = range(1, 4)
-        task "turn" {
-            input = "question ${repeat.index}"
-            output = "answer ${repeat.index}"
-        }
-    }
-    maybe "escalation" {
-        chance = 0.25
-        task "handoff" { output = "Escalated to tier 2." }
-    }
-}
+(intake:agent) {input: "Find my patient record", output: finish.output};
+(intake)-[:contains, :next]->(intake_request:task) {
+    input: intake.input,
+    output: finish.output,
+};
+(intake_request)-[:next]->(lookup:tool) {
+    input: intake_request.input,
+    output: {found: chance(0.8)},
+};
+
+(lookup)
+    =[:exclusive]=>[
+        -[known:next {when: source.output.found}]->(schedule:task) {
+            output: "Route to scheduling",
+        },
+        -[unknown:next {when: !source.output.found}]->(register:task) {
+            output: "Route to registration",
+        },
+    ]
+        >[:first {observe: "result"} [known], [unknown]]>>(finish:task) {
+            output: context.arrivals[0].value,
+        };
+
+(intake)-[:contains]->(lookup)-[:child_of]->(intake_request);
+(intake)-[:contains]->(schedule)-[:child_of]->(intake_request);
+(intake)-[:contains]->(register)-[:child_of]->(intake_request);
+(intake)-[:contains]->(finish)-[:child_of]->(intake_request);
 ```
 
-```sh
-bts write traces --from shape.bt --count 200 --over 24h
-```
+`exclusive` chooses a qualifying branch. `first` observes a selected branch's result and supplies it to `finish`. `Node` names identify definitions, while named `edges` such as `[known]` identify the `junct`'s inputs. Indentation attaches continuations to the correct `fork`.
 
-See [multi-turn conversations](examples/multi_turn_conversation.bt), [agent tool loops](examples/agent_tool_loop.bt), and [supervisors and subagents](examples/supervisor_and_subagents.bt) for richer workflows.
+Other kinds express other behaviors: `parallel` splits work across branches, `weighted` samples alternatives, `repeat` creates a count of occurrences, and `each` distributes array items. `Juncts` such as `accumulate` and `reduce` combine results. Explicit cycle `edges` use `~[:next]~>` and can carry guards and traversal limits.
 
-### Scorers
+See [parallel workers](examples/fanout_parallel_workers.bt), [tool loops](examples/agent_tool_loop.bt), [multi-turn conversations](examples/multi_turn_conversation.bt), and [supervisor delegation](examples/supervisor_and_subagents.bt). The generated skill documents the available kinds, their properties, and runtime constraints.
 
-Code scorers evaluate `input`, `output`, `expected`, and `metadata`. You can also use an LLM judge:
+### Extend a kind
+
+Kinds can add schemas to existing primitives or provider definitions. For example, append this to `support.bt`:
 
 ```bts
-scorer "helpfulness" {
-    judge {
-        model = "gpt-4o-mini"
-        prompt = "Rate the response to this request. Request: ${input}. Response: ${output}."
-        options = { helpful = 1, unhelpful = 0 }
-    }
-}
++(billing_lookup::tool {
+    props: {service: {type: "string", required: true}},
+});
 ```
 
-Code builds require `uvx` (installed with `uv`) for Python or `npx` (installed with npm) for TypeScript. Both scorer and agent builds format generated source with pinned Ruff or Prettier versions. The first uncached build needs network access to download the formatter.
+Then change `(search:tool)` to `(search:billing_lookup {service: "billing"})`. Properties inside the `node` header configure that instance and are checked against the inherited schema. The body remains its data and expressions. This extension adds a contract, not a service implementation.
 
-Build scorers into Python or TypeScript SDK source files:
+## Use the model
+
+The following workflows consume the support graph through the Braintrust provider. Generate data from its possible behaviors, build a mock implementation, or add definitions for evaluation and resource management.
+
+### Generate traces
+
+Preview locally before writing a population:
 
 ```sh
-bts build --from shape.bt --lang typescript
+bts write traces --from support.bt --count 20 --over 1h --seed 42 --dry-run
 ```
 
-The build prints the `bt functions push` command and directory to run it from. Once deployed, functions can score experiments or incoming traces. Add an automation to apply the judge to replies:
+For live writes, install the Braintrust `bt` CLI separately, select a project with `bt switch`, and set `BRAINTRUST_API_KEY`. The selected project is read from `.bt/config.json`. `BRAINTRUST_API_URL` can override the default API endpoint.
+
+```sh
+bts write traces --from support.bt --count 200 --over 24h
+```
+
+Use `--rate 20/h` instead of `--count` for a traffic rate, or `--offset 1d` to move the window into the past. `--seed` reproduces sampled values, and `--json` makes the run summary machine-readable.
+
+### Build a mock agent
+
+Build the same shape into callable Python or TypeScript:
+
+```sh
+bts build agent --from support.bt --lang python --out generated/python
+bts build agent --from support.bt --lang typescript --out generated/typescript
+```
+
+Builds use `uvx` for pinned Ruff formatting or `npx` for pinned Prettier formatting. The first uncached build needs network access. Generated Python requires Python 3.10 or newer, and generated TypeScript requires `Node`.js 24.2 or newer.
+
+For Python:
+
+```sh
+cd generated/python
+uv sync
+uv run python -c 'from agents.support_agent import run; print(run({"question": "Where are my invoices?"}))'
+```
+
+Call `run(input)` to supply an input, or `run()` for the authored fallback. Python also exports `run_details` and `run_traced`, and TypeScript exports `runDetails` and `runTraced`, to inspect spans or attach a Braintrust parent span. The mock executes authored behavior without contacting LLMs or tools. Agent-only shapes require no project or API key to build or run.
+
+Authored durations appear in detailed results without delaying execution. Traced spans use actual execution time. Generated agents accept an injectable random source but do not reproduce native `--seed` sampling. Local attachments remain unsupported in generated agents.
+
+### Add cases and scorers
+
+Append these definitions to `support.bt`:
 
 ```bts
-automation "review-replies" {
-    type = "scorer"
-    scorers = ["helpfulness"]
-    scope = "span"
-    span_names = ["reply"]
-}
+(invoice_case:case) {
+    input: {question: "Where can I download my invoices?"},
+    expected: "Download invoices from Billing > Invoices.",
+    tags: [|"billing"|],
+};
+
+(regressions:dataset) {cases: [|(invoice_case)|]};
+(correctness:scorer) {score: context.output == context.expected ? 1 : 0};
+
+(support_check:experiment) {
+    dataset: (regressions),
+    task: (request),
+    scorers: [|(correctness)|],
+};
 ```
+
+The experiment supplies each case's input to the task and scores its result. Scorers read `context.input`, `context.output`, `context.expected`, and `context.metadata`. A scorer can also define a `judge` object with a model, prompt, and scored options, as shown in [judge_scorer.bt](examples/judge_scorer.bt).
+
+Cases can use inline values or capture a graph `node` through `source: (search)`. See [dataset cases](examples/dataset_cases.bt) for whole traces, individual spans, and field references. [experiments.bt](examples/experiments.bt) compares basic and improved account recovery against the same five cases, linking the improved experiment with `baseline: ("recovery-baseline")`.
 
 ```sh
-bts sync automation scorers --from shape.bt
+bts write experiments --from support.bt --dry-run
+bts sync datasets --from support.bt
+bts build scorers --from support.bt --lang python
 ```
 
-See [code scorers](examples/code_scorer.bt), [LLM judges](examples/judge_scorer.bt), and [online scoring](examples/scoring_automations.bt).
+Dataset sync reconciles rows, including removing cases no longer defined locally. Scorer builds print the `bt functions push` command and directory to run it from. After syncing the dataset and deploying scorers, run `bts write experiments --from support.bt` to evaluate generated results with the deployed functions.
 
-### Agents
-
-An `agent` declares a callable mock whose behavior comes from a whole trace:
-
-```bts
-agent "support" { entrypoint = trace.support }
-trace "support" {
-    input = { question = "Where are my invoices?" }
-    output = "You asked: ${self.input.question}"
-}
-```
-
-`bts build agent --from shape.bt --lang python --out generated` emits modules under `src/agents`. Call `run(input)` to supply an input or `run()` to use the authored input. Python also exports `run_details` and `run_traced`, and TypeScript exports `runDetails` and `runTraced`, for inspecting spans or attaching a Braintrust parent span. These agents execute authored mock behavior without making LLM or tool calls.
-
-The [customer-support example](examples/customer_support_agent.bt) includes an agent, inline dataset cases, and code scorers. Select a project with `bt switch` before building its eval entrypoint. A shape without experiments does not require a project or API key to build or run its agent.
-
-For Python 3.10 or newer:
+Agent builds also emit local eval entrypoints when experiments are present. Select a project with `bt switch` before building them. From the generated Python directory, run:
 
 ```sh
-bts build agent --from examples/customer_support_agent.bt --lang python --out generated/python
-(
-    cd generated/python
-    uv sync
-    uv run python -c 'from agents.customer_support_agent import run; print(run())'
-    uv run bt eval --runner python src/evals/customer_support_eval.py --no-send-logs
-)
+uv run bt eval --runner python src/evals/support_check_eval.py --no-send-logs
 ```
 
-For Node.js 24.2 or newer:
+`--no-send-logs` prevents uploading results. Code scorers run locally, while judge scorers still call models and incur inference costs. Eval datasets are sampled at build time with `--seed` (default `42`). Rebuild after changing cases or scorers. The [customer-support example](examples/customer_support_agent.bt) shows a larger agent with dataset cases and multiple scorers.
+
+### Apply automations
+
+Scorer automations select spans for deployed scoring functions. Topics automations connect facet prompts to conversation analysis. Both are graph `node` definitions managed by the Braintrust provider.
 
 ```sh
-bts build agent --from examples/customer_support_agent.bt --lang typescript --out generated/typescript
-(
-    cd generated/typescript
-    npm install
-    npm run build
-    node --input-type=module -e 'import {run} from "./src/agents/customer_support_agent.mts"; console.log(run())'
-    bt eval --runner node src/evals/customer_support.eval.ts --no-send-logs
-)
+bts sync automation scorers --from examples/scoring_automations.bt --dry-run
+bts sync automation topics --from examples/topics_automations.bt --dry-run
 ```
 
-Install `bt` separately for these eval commands. `--no-send-logs` evaluates the local cases without uploading results. Omit it to create a Braintrust experiment with your configured credentials, or use `--dev` for the eval development server. Generated evals pass only the case input to the agent and keep expected answers available to scorers. Import agent or scorer implementation modules when you only need their functions. Eval entrypoints register during CLI discovery and execute during a normal import. Import `evals/<name>_definition.py` or `evals/<name>.definition.ts` to inspect cases or call `evaluate` without starting a run.
-
-Choose an agent or experiment with repeatable `--select` flags. Selecting an agent includes its evals. Selecting an experiment includes its agent, dataset, scorers, and baseline chain. Omit selection to build every agent and experiment:
-
-```sh
-bts build agent --from shape.bt --select 'agent.support' --lang python --out generated
-bts build agent --from shape.bt --select 'experiment.improved' --seed 42 --lang typescript --out generated
-```
-
-Generated eval datasets support dynamic inline expressions, trace sources, span sources, and ordered groups. Cases are sampled at build time with `--seed` (default `42`), so rebuilding with the same source and seed reproduces the cases. Trace and span sources supply their input and use their output as expected unless the case overrides it. Groups become ordered arrays of inputs and expected outputs. Repeated references within a case share the same sampled instance. Case metadata and tags are preserved.
-
-Both code and judge scorers run locally through the Braintrust SDK. Judge evals use the authored prompt, model, and choice scores through `autoevals`, without a separate scorer deployment. Running judge scorers requires model credentials and incurs inference costs even with `--no-send-logs`. Rebuild with `bts build agent` after changing a local judge. `bts build scorers` generates its deployment registration.
-
-Eval builds also emit an ordered suite runner: `uv run python src/evals/run_evals.py` or `node src/evals/run-evals.mts`. It runs baselines first and links candidates to the experiment IDs returned by those runs. Add `--no-send-logs` to execute the suite locally without uploading comparisons. Individual `bt eval` entrypoints remain available and resolve an authored baseline by its existing experiment name.
-
-Agent entrypoints must be whole traces. Local attachments and nested scorer spans remain unsupported in generated agents. Use the existing trace and experiment commands for those shapes.
-
-Generated agents accept an injectable random source, but do not reproduce `bts write traces --seed` sampling. Authored durations appear in the detailed results without delaying execution. Traced spans use actual execution time.
-
-### Datasets
-
-Author cases with inputs, expected results, metadata, and tags, or capture a whole trace or selected span as a case:
-
-```bts
-dataset "search-cases" {
-    case "invoice-lookup" {
-        span = trace.support.tool.search
-        tags = ["billing"]
-    }
-}
-```
-
-```sh
-bts sync datasets --from shape.bt
-```
-
-Sync keeps Braintrust datasets aligned with the cases in your file as you add, change, or remove them. See [dataset cases](examples/dataset_cases.bt) for the different ways to create rows.
-
-### Topics
-
-Facets describe the signals you want to discover. Topics automations use them to group conversations in Braintrust, such as billing requests or reasons customers might leave:
-
-```sh
-bts sync automation topics --from shape.bt
-```
-
-Sync the automation before writing traces. See [Topics automations](examples/topics_automations.bt) for conversations covering renewal costs, unresolved issues, and customers who change their minds after a fix.
-
-### Experiments
-
-An experiment connects a dataset, a trace or span to generate, and deployed scorers. Each row supplies the task's input; the task generates a synthetic result and the scorers produce its scores.
-
-After syncing the dataset and deploying the scorers:
-
-```sh
-bts write experiments --from shape.bt --select 'experiment["support-check"]'
-```
-
-Repeat `--select` to choose several experiments, or omit it to write all. Add `baseline = experiment["baseline-name"]` to compare against another experiment in the same write. `--dry-run` previews local cases and generated tasks without invoking scorers.
-
-See [the account recovery comparison](examples/experiments.bt) for baseline and improved flows, five cases, and three scorers.
-
-The full language reference is generated by `bts setup skill`; [examples/](examples/) has complete workflows to start from.
+These previews require Braintrust access to compare against existing resources. Omit `--dry-run` to apply the changes. Deploy scorer functions before syncing scorer automations, and sync Topics automations before generating their trace population.
 
 ## Handy commands
 
 ```sh
-bts check syntax shape.bt                                    # validate a shape file (`-` reads stdin)
-bts write traces --from shape.bt --count 5 --over 1h --dry-run # preview traces
-bts write experiments --from shape.bt --dry-run               # preview experiment tasks
-bts check logs --last                                        # inspect the most recent run
-bts update                                                  # update to the latest release
+bts check syntax support.bt
+bts check perf support.bt --count 100 --over 1h
+bts check logs --last
+bts setup skill codex --scope local
+bts update
 ```
 
-Use `--rate 20/h` instead of `--count` for a traffic rate, and `--offset 1d` to move a trace window into the past. `--seed` reproduces sampled values; it doesn't control deployed scorer randomness. Live writes print a summary; `--json` makes it machine-readable. Run logs live under `.bt/bts/logs/`.
+CLI resource selectors, such as `--select 'agent.support'`, use command-line traversal syntax. Within a shape file, use graph references such as `(support)`.
 
 ## Browser (wasm)
 
-The browser package validates shapes, generates Braintrust trace payloads, builds scorer and agent codebases, and writes traces through a host-supplied transport. For releases that include browser support, download `bts-wasm-web.tar.gz` from the [release assets](https://github.com/zdhrc/bts/releases). To build an unreleased checkout locally with `wasm-pack` 0.15.0 installed:
+The browser package validates shapes, generates Braintrust trace payloads, builds scorer and agent codebases, and writes traces through a host-supplied transport. Download `bts-wasm-web.tar.gz` from the [release assets](https://github.com/zdhrc/bts/releases), or build locally with `wasm-pack` 0.15.0 installed:
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -298,7 +280,13 @@ import init, { generate, validate, type GenerateOptions } from "./bts-wasm/bts_w
 
 await init();
 
-const source = 'trace "support" { output = choice("resolved", "escalated") }';
+const source = `
+(support:agent) {input: "Help with billing", output: request.output};
+(support)-[:contains, :next]->(request:task) {
+    input: support.input,
+    output: choice("resolved", "escalated"),
+};
+`;
 const validation = validate(source);
 if (!validation.valid) throw new Error(JSON.stringify(validation.diagnostics));
 
@@ -316,9 +304,11 @@ console.log(preview.value.payload.events);
 
 Supply the seed as a decimal `u64` string, either `count` or `rate_per_second`, and either `over_ms` or `start_ms`. Time options are integer milliseconds: `start_ms` and `until_ms` are epoch timestamps, while `over_ms` and optional `offset_ms` are durations. `until_ms` defaults to the current time. Repeating a payload requires an explicit time window and `id_prefix` as well as the seed. Use a fresh prefix for each independent write, and reuse it only when intentionally retrying the same batch.
 
-Diagnostic ranges are UTF-8 byte offsets into the source, not JavaScript string indexes. Generation and build failures return `{ ok: false, error }` with a stage, message, and diagnostics. Generated JavaScript numeric values must fit the safe integer range. `spec()` returns the language reference, and `skill()` returns authoring guidance for an agent hosted by your application. For shapes containing scorers, `build(source, { project: "My Project", lang: "typescript", files: {} })` returns planned files for the host to save. Generate an agent codebase with:
+Diagnostic ranges are UTF-8 byte offsets, not JavaScript string indexes. A diagnostic with a `source` name refers to that provider definition source rather than the user shape. Generation and build failures return `{ ok: false, error }` with a stage, message, and diagnostics. Generated JavaScript numeric values must fit the safe integer range. `spec()` returns the language reference, and `skill()` returns authoring guidance for an agent hosted by your application. For shapes containing scorers, `build(source, { project: "My Project", lang: "typescript", files: {} })` returns planned files for the host to save. Generate an agent codebase with:
 
 ```ts
+import { build } from "./bts-wasm/bts_wasm.js";
+
 const result = build(source, {
   target: "agent",
   lang: "typescript",
@@ -384,8 +374,8 @@ keep_runs = 20            # run log files kept before the oldest are pruned
 request_timeout = "30s"   # per-request timeout for Braintrust API calls
 ```
 
-Everything is optional and shown here with its default. The `BTS_LOG` environment variable overrides `log.level` for a single run — `BTS_LOG=debug bts write ...` — and `off` disables the run log entirely.
+Everything is optional and shown here with its default. The `BTS_LOG` environment variable overrides `log.level` for a single run, `BTS_LOG=debug bts write ...`, and `off` disables the run log entirely.
 
 ## License
 
-[GNU AGPL-3.0](LICENSE). Free to use, modify, and share — but any software built on it, including software offered as a network service, must be released under the AGPL as well.
+[GNU AGPL-3.0](LICENSE). Free to use, modify, and share, but any software built on it, including software offered as a network service, must be released under the AGPL as well.

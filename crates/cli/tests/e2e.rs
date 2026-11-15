@@ -4152,6 +4152,34 @@ fn all_examples_compile_and_trace_examples_generate() {
 }
 
 #[test]
+fn readme_graph_examples_compile_with_their_documented_additions() {
+    let readme = include_str!("../../../README.md");
+    let blocks: Vec<_> = readme
+        .split("```bts\n")
+        .skip(1)
+        .map(|section| section.split_once("\n```").unwrap().0)
+        .collect();
+    assert_eq!(blocks.len(), 4);
+    for source in [
+        blocks[0].to_owned(),
+        blocks[1].to_owned(),
+        format!("{}\n{}", blocks[0], blocks[2]).replace("(search:tool)", "(search:billing_lookup {service: \"billing\"})"),
+        format!("{}\n{}", blocks[0], blocks[3]),
+    ] {
+        let shape = write_shape(&source);
+        let generated = bts()
+            .args(["write", "traces", "--from"])
+            .arg(&shape)
+            .args(["--count", "4", "--over", "1h", "--seed", "42", "--dry-run"])
+            .env_remove("BRAINTRUST_API_KEY")
+            .output()
+            .unwrap();
+        fs::remove_file(shape).unwrap();
+        assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+    }
+}
+
+#[test]
 fn recovery_example_previews_both_versions_against_all_cases() {
     let shape = write_shape(include_str!("../../../examples/experiments.bt"));
     let output = bts()
