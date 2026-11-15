@@ -1,4 +1,14 @@
 # retrieval, ranking and an answer share the same document evidence
+# a retrieval step states how many documents it considered, whatever span kind it is
++(retrieval:trait) {considered: {type: "number", required: true}}
+    -[:on]->(node);
++(doc_search:node)
+    -[:extends]->(tool)
+    -[:has]->(retrieval);
++(doc_rerank:node)
+    -[:extends]->(task)
+    -[:has]->(retrieval);
+
 (docs_qa:agent) {input: "How do I rotate API keys?", output: answer.output.content};
 (docs_qa)-[:contains, :next]->(request:task) {
     input: docs_qa.input,
@@ -6,14 +16,16 @@
     metadata: {request_id: uuid()},
     tags: [|"rag"|],
 };
-(request)-[:next]->(search:tool {name: "search_docs"}) {
+(request)-[:next]->(search:doc_search {name: "search_docs"}) {
     duration: lognormal(0.4, 0.3),
-    input: {query: request.input, top_k: 8},
+    considered: 8,
+    input: {query: request.input, top_k: self.considered},
     output: {doc_ids: [|"doc_112", "doc_089", "doc_331"|], scores: [|0.91, 0.63, 0.44|]},
 }
-    -[:next]->(rerank:task) {
+    -[:next]->(rerank:doc_rerank) {
         duration: 0.12,
-        input: {candidates: len(search.output.doc_ids)},
+        considered: len(search.output.doc_ids),
+        input: {candidates: self.considered},
         output: {kept: search.output.doc_ids[:2]},
     }
         -[:next]->(answer:llm {name: "Chat Completion"}) {
