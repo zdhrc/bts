@@ -1,7 +1,7 @@
 use crate::cmd::Distribution;
 use crate::config::parse_duration;
+use crate::data;
 use crate::diag::SourceDiags;
-use crate::{data, dsl};
 use bts_core::mocking::data::Format as _;
 use bts_core::providers::DataProvider;
 use bts_core::providers::braintrust::mocking::data as braintrust_data;
@@ -74,7 +74,7 @@ impl Args {
             for _ in 0..self.iterations.get() {
                 let started = Instant::now();
                 let model = tracing::info_span!("compile")
-                    .in_scope(|| dsl::semantics::compile(&source))
+                    .in_scope(|| bts_core::providers::braintrust::Bundle::compile_module(&source, false))
                     .map_err(|diags| Error::Invalid {
                         details: SourceDiags::new(&source_name, &source, diags),
                     })?;

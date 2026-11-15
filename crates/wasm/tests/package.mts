@@ -18,10 +18,10 @@ function assert(condition: unknown, message: string): asserts condition {
 export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
     await init({ module_or_path: bytes });
 
-    const source = 'trace "run" { output = "hello" }';
+    const source = '(a:agent) {input: null, output: run.output}; (a)-[:contains, :next]->(run:task) {input: a.input, output: "hello"};';
     const validation = validate(source);
     assert(validation.valid && validation.diagnostics.length === 0, "valid source was rejected");
-    const invalid = validate('trace "run" { output = var.missing }');
+    const invalid = validate('(a:agent) {input: null, output: missing.output};');
     assert(!invalid.valid && invalid.diagnostics[0]?.phase === "validation", "missing semantic diagnostic");
     assert(typeof spec() === "object" && spec() !== null, "missing language reference");
     assert(skill().includes("generate(source, options)"), "missing browser guidance");
@@ -39,11 +39,11 @@ export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
     assert(generated.value.event_count === 2 && generated.value.payload.events.length === 2, "missing events");
     assert(generated.value.payload.events.every(event => event.output === "hello"), "unexpected event output");
 
-    const rejected = generate('trace "run" { output = var.missing }', options);
+    const rejected = generate('(a:agent) {input: null, output: missing.output};', options);
     if (rejected.ok) throw new Error("invalid source generated successfully");
     assert(rejected.error.stage === "compile" && rejected.error.diagnostics.length > 0, "missing operation error");
 
-    const built = build('scorer "quality" { code { score = 0.5 } }', {
+    const built = build('(quality:scorer) {score: 0.5};', {
         project: "Package Check",
         lang: "typescript",
     });
@@ -60,8 +60,8 @@ export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
         files: { "hello_agent.mts": previous },
     };
     const agentSource = `
-agent "hello" { entrypoint = trace.hello }
-trace "hello" { input = { name = "Ada" } output = "Hello \${self.input.name}" }
+(hello:agent) {input: {name: "Ada"}, output: request.output};
+(hello)-[:contains, :next]->(request:task) {input: hello.input, output: "Hello \${self.input.name}"};
 `;
     const agent = build(agentSource, agentOptions);
     if (!agent.ok) throw new Error(`${agent.error.stage}: ${agent.error.message}`);
@@ -70,9 +70,9 @@ trace "hello" { input = { name = "Ada" } output = "Hello \${self.input.name}" }
     assert(agent.value.removals.length === 1 && agent.value.removals[0].path === "hello_agent.mts"
         && agent.value.removals[0].expected === previous, "missing guarded removal");
     const evaluationSource = `${agentSource}
-scorer "quality" { code { score = output == expected ? 1 : 0 } }
-dataset "cases" { case "sampled" { input = { name = choice("Ada", "Grace", "Linus") } expected = "Hello Ada" } }
-experiment "hello" { dataset = dataset.cases task = trace.hello scorers = [scorer.quality] }
+(quality:scorer) {score: context.output == context.expected ? 1 : 0};
+(cases:dataset) {cases: [|(sampled)|]}; (sampled:case) {input: {name: choice("Ada", "Grace", "Linus")}, expected: "Hello Ada"};
+(hello_eval:experiment {name: "hello"}) {dataset: (cases), task: (request), scorers: [|(quality)|]};
 `;
     const evaluation = build(evaluationSource, {
         target: "agent", lang: "python", project: "Package Check", seed: "18446744073709551615",

@@ -82,5 +82,15 @@ pub const SOURCE: Source<'static> = Source {
     description: {type: "string"}, dataset: {type: "any", required: true},
     task: {type: "any", required: true}, scorers: {type: "array", required: true}, baseline: {type: "any"},
 }});
+# facets and automation rules are resources rather than emitted spans
++(facet::node {props: {name: {type: "string"}}, fields: {
+    prompt: {type: "string", required: true}, description: {type: "string"},
+    no_match_pattern: {type: "string"},
+}});
++(automation::node {props: {name: {type: "string"}}, fields: {
+    type: {type: "string", required: true}, scorers: {type: "array"}, facets: {type: "array"},
+    scope: {type: "string"}, root: {type: "boolean"}, span_names: {type: "array"},
+    sampling_rate: {type: "number"}, enabled: {type: "boolean"},
+}});
 "#,
 };

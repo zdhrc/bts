@@ -2,7 +2,7 @@ use crate::config::Settings;
 use crate::diag::SourceDiags;
 use crate::logging;
 use crate::providers::{AgentAdapter, CodeAdapter, braintrust};
-use crate::{code, dsl, selection};
+use crate::{code, selection};
 use bts_core::providers::CodeProvider;
 use code::AgentTarget as _;
 use std::{env, fmt, fs, path::PathBuf};
@@ -53,10 +53,10 @@ enum Lang {
 }
 
 impl Lang {
-    fn into_model(self) -> dsl::ScorerLang {
+    fn into_model(self) -> bts_core::mocking::ScorerLang {
         match self {
-            Self::Python => dsl::ScorerLang::Python,
-            Self::Typescript => dsl::ScorerLang::Typescript,
+            Self::Python => bts_core::mocking::ScorerLang::Python,
+            Self::Typescript => bts_core::mocking::ScorerLang::Typescript,
         }
     }
 }
@@ -115,7 +115,10 @@ impl Args {
         <A::Provider as CodeProvider>::Target: code::AgentTarget,
     {
         let model = selection::agents(&self.compile::<A>()?, &self.select).map_err(BuildError::Selection)?;
-        let lang = self.lang.map(Lang::into_model).unwrap_or(dsl::ScorerLang::Python);
+        let lang = self
+            .lang
+            .map(Lang::into_model)
+            .unwrap_or(bts_core::mocking::ScorerLang::Python);
         let target = adapter
             .agent_target(&model, self.seed.unwrap_or(42))
             .map_err(BuildError::Adapter)?;
@@ -133,14 +136,14 @@ impl Args {
         self.write(plan, adapter, model.scorers.len())
     }
 
-    fn compile<A: CodeAdapter>(&self) -> Result<dsl::Model, ExecutionError<A>> {
+    fn compile<A: CodeAdapter>(&self) -> Result<bts_core::mocking::Model, ExecutionError<A>> {
         let source = fs::read_to_string(&self.from).map_err(|source| BuildError::ReadShape {
             path: self.from.clone(),
             source,
         })?;
         let source_name = self.from.display().to_string();
         tracing::info_span!("compile")
-            .in_scope(|| dsl::semantics::compile(&source))
+            .in_scope(|| bts_core::providers::braintrust::Bundle::compile_module(&source, false))
             .map_err(|diags| BuildError::InvalidShape {
                 details: SourceDiags::new(&source_name, &source, diags),
             })
@@ -343,7 +346,7 @@ mod tests {
         impl AgentAdapter for SelectedAgent {
             fn agent_target(
                 &self,
-                model: &dsl::Model,
+                model: &bts_core::mocking::Model,
                 seed: u64,
             ) -> Result<bts_core::providers::braintrust::mocking::code::CodeTarget, Self::Error> {
                 assert_eq!(model.agents.len(), 1);
@@ -357,13 +360,34 @@ mod tests {
         let path = std::env::temp_dir().join(format!("bts-agent-selection-{}.bt", uuid::Uuid::new_v4()));
         fs::write(
             &path,
-            r#"trace "standalone" { output = "hello" }
-               trace "unrelated" { output = "other" }
-               agent "standalone" { entrypoint = trace.standalone }
-               agent "unrelated" { entrypoint = trace.unrelated }
-               dataset "cases" { case "one" { input = "question" } }
-               scorer "quality" { code { score = 1 } }
-               experiment "unrelated" { task = trace.unrelated dataset = dataset.cases scorers = [scorer.quality] }"#,
+            r#"(agent_standalone:agent {name: "standalone"}) {input: null, output: standalone.output};
+(agent_standalone)-[:next]->(standalone);
+(standalone:task) {
+    output: "hello",
+    input: agent_standalone.input
+};
+(agent_standalone)-[:contains]->(standalone);
+(agent_unrelated:agent {name: "unrelated"}) {input: null, output: unrelated.output};
+(agent_unrelated)-[:next]->(unrelated);
+(unrelated:task) {
+    output: "other",
+    input: agent_unrelated.input
+};
+(agent_unrelated)-[:contains]->(unrelated);
+(cases:dataset) {
+    cases: [|(one)|]
+};
+(one:case) {
+    input: "question"
+};
+(quality:scorer) {
+    score: 1
+};
+(experiment_unrelated:experiment {name: "unrelated"}) {
+    task: (unrelated),
+    dataset: (cases),
+    scorers: [|(quality)|]
+};"#,
         )
         .unwrap();
         let cli = TestCli::parse_from([
@@ -417,7 +441,13 @@ mod tests {
             }
         }
         let path = std::env::temp_dir().join(format!("bts-scorer-adapter-{}.bt", uuid::Uuid::new_v4()));
-        fs::write(&path, r#"scorer "quality" { code { score = 1 } }"#).unwrap();
+        fs::write(
+            &path,
+            r#"(quality:scorer) {
+    score: 1
+};"#,
+        )
+        .unwrap();
         let cli = TestCli::parse_from(["build", "--from", path.to_str().unwrap()]);
         let result = cli.args.execute(&ScorerOnly);
         fs::remove_file(path).unwrap();

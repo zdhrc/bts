@@ -41,7 +41,69 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
             .filter(|edge| edge.source == agent && inherits(model, &edge.kind, "contains"))
             .map(|edge| edge.target)
             .collect();
-        if model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
+        let entry = model
+            .edges
+            .iter()
+            .find(|edge| edge.source == agent && inherits(model, &edge.kind, "next"))
+            .map(|edge| edge.target);
+        // child-owned computed fields need an occurrence-local binding cache
+        let computed_children = members.iter().any(|id| {
+            Some(*id) != entry
+                && inherits(model, &model.nodes[id.0].kind, "span")
+                && model.nodes[id.0].fields.iter().any(|field| {
+                    let binding = &model.bindings[field.0];
+                    binding.path.len() == 1
+                        && !matches!(
+                            binding.value,
+                            graph::Value::Input { .. }
+                                | graph::Value::Str(_)
+                                | graph::Value::Num(_)
+                                | graph::Value::Bool(_)
+                                | graph::Value::Null
+                                | graph::Value::Func {
+                                    func: graph::Func::Range(_)
+                                        | graph::Func::Normal { .. }
+                                        | graph::Func::Lognormal { .. }
+                                        | graph::Func::Exponential { .. }
+                                        | graph::Func::Pareto { .. }
+                                        | graph::Func::Beta { .. }
+                                        | graph::Func::Poisson { .. }
+                                        | graph::Func::Chance { .. }
+                                        | graph::Func::Uuid
+                                        | graph::Func::Hex { .. }
+                                        | graph::Func::Alphanum { .. },
+                                    ..
+                                }
+                        )
+                        && !matches!(
+                            binding.path[0].as_str(),
+                            "input"
+                                | "output"
+                                | "expected"
+                                | "error"
+                                | "metadata"
+                                | "metrics"
+                                | "tags"
+                                | "scores"
+                                | "duration"
+                                | "score"
+                                | "reason"
+                        )
+                })
+        });
+        let nested_dependencies = model.bindings.iter().any(|binding| {
+            let graph::Value::BindingRef(target, _) = binding.value else {
+                return false;
+            };
+            let target = &model.bindings[target.0];
+            matches!(binding.owner, graph::ElementId::Node(node) if members.contains(&node))
+                && target.owner != binding.owner
+                && target.path.len() > 1
+                && matches!(target.path[0].as_str(), "metadata" | "metrics")
+        });
+        if computed_children
+            || nested_dependencies
+            || model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
             || model.junctions.iter().any(|junction| members.contains(&junction.target))
         {
             lower_flow(model, agent, &members, &mut result)?;
@@ -144,7 +206,13 @@ pub fn lower(model: &graph::Model) -> Result<execution::Model, String> {
     if model.nodes.is_empty() {
         return Ok(result);
     }
-    if result.agents.is_empty() && result.scorers.is_empty() && result.datasets.is_empty() && result.experiments.is_empty() {
+    if result.agents.is_empty()
+        && result.scorers.is_empty()
+        && result.datasets.is_empty()
+        && result.experiments.is_empty()
+        && result.facets.is_empty()
+        && result.automations.is_empty()
+    {
         return Err("the graph declares no agent or scorer nodes".into());
     }
     Ok(result)
@@ -539,7 +607,10 @@ fn lower_flow(
 fn lower_resources(graph: &graph::Model, result: &mut execution::Model) -> Result<(), String> {
     for (index, node) in graph.nodes.iter().enumerate() {
         let id = graph::NodeId(index);
-        if !inherits(graph, &node.kind, "dataset") && !inherits(graph, &node.kind, "experiment") {
+        if !["dataset", "experiment", "facet", "automation"]
+            .iter()
+            .any(|kind| inherits(graph, &node.kind, kind))
+        {
             continue;
         }
         let name = node_name(graph, id)?;
@@ -550,7 +621,101 @@ fn lower_resources(graph: &graph::Model, result: &mut execution::Model) -> Resul
                 _ => Err("description must be a constant string".to_owned()),
             })
             .transpose()?;
-        if inherits(graph, &node.kind, "dataset") {
+        let string = |key: &str| -> Result<Option<String>, String> {
+            field(graph, id, key)
+                .map(|value| match resolved(graph, value) {
+                    graph::Value::Str(value) => Ok(value.clone()),
+                    _ => Err(format!("{name}.{key} must be a constant string")),
+                })
+                .transpose()
+        };
+        let boolean = |key: &str, default: bool| -> Result<bool, String> {
+            match field(graph, id, key).map(|value| resolved(graph, value)) {
+                None => Ok(default),
+                Some(graph::Value::Bool(value)) => Ok(*value),
+                _ => Err(format!("{name}.{key} must be a constant boolean")),
+            }
+        };
+        let strings = |key: &str| -> Result<Vec<String>, String> {
+            let Some(value) = field(graph, id, key) else {
+                return Ok(vec![]);
+            };
+            let graph::Value::Array(array) = resolved(graph, value) else {
+                return Err(format!("{name}.{key} must be an array"));
+            };
+            array
+                .elem
+                .iter()
+                .map(|item| match item {
+                    graph::ArrayElem::Item(value) => match resolved(graph, value) {
+                        graph::Value::Str(value) => Ok(value.clone()),
+                        _ => Err(format!("{name}.{key} must contain constant strings")),
+                    },
+                    _ => Err(format!("{name}.{key} must contain explicit entries")),
+                })
+                .collect()
+        };
+        if inherits(graph, &node.kind, "facet") {
+            result.facets.push(execution::Facet {
+                prompt: string("prompt")?.ok_or_else(|| format!("{name} needs prompt"))?,
+                no_match_pattern: string("no_match_pattern")?,
+                name,
+                description,
+            });
+        } else if inherits(graph, &node.kind, "automation") {
+            let kind = match string("type")?.as_deref() {
+                Some("scorer") => {
+                    let scorers = strings("scorers")?;
+                    if scorers.is_empty() {
+                        return Err(format!("{name} needs scorers"));
+                    }
+                    if field(graph, id, "facets").is_some() {
+                        return Err(format!("{name} cannot mix scorers and facets"));
+                    }
+                    if string("scope")?.as_deref().is_some_and(|scope| scope != "span") {
+                        return Err(format!("{name} scorer scope must be span"));
+                    }
+                    execution::AutomationKind::Scorer {
+                        scorers,
+                        root: boolean("root", false)?,
+                        span_names: strings("span_names")?,
+                    }
+                }
+                Some("topics") => {
+                    let facets = strings("facets")?;
+                    if facets.is_empty() {
+                        return Err(format!("{name} needs facets"));
+                    }
+                    if field(graph, id, "scorers").is_some()
+                        || field(graph, id, "root").is_some()
+                        || field(graph, id, "span_names").is_some()
+                    {
+                        return Err(format!("{name} topics cannot configure scorer targeting"));
+                    }
+                    if string("scope")?.as_deref().is_some_and(|scope| scope != "trace") {
+                        return Err(format!("{name} topics scope must be trace"));
+                    }
+                    execution::AutomationKind::Topics { facets }
+                }
+                _ => return Err(format!("{name} type must be scorer or topics")),
+            };
+            let sampling_rate = match field(graph, id, "sampling_rate").map(|v| resolved(graph, v)) {
+                None => 1.0,
+                Some(graph::Value::Num(graph::Number::Int(value))) => *value as f64,
+                Some(graph::Value::Num(graph::Number::Float(value))) => *value,
+                _ => return Err(format!("{name} sampling_rate must be a constant number")),
+            };
+            if !sampling_rate.is_finite() || !(0.0..=1.0).contains(&sampling_rate) {
+                return Err(format!("{name} sampling_rate must be between zero and one"));
+            }
+            let enabled = boolean("enabled", true)?;
+            result.automations.push(execution::Automation {
+                name,
+                kind,
+                sampling_rate,
+                enabled,
+            });
+        } else if inherits(graph, &node.kind, "dataset") {
             let mut cases = Vec::new();
             for case in node_refs(graph, required("cases")?, Some("case"))? {
                 let source = if let Some(value) = field(graph, case, "input") {

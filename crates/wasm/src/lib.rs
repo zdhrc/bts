@@ -6,6 +6,7 @@ const TYPES: &str = r#"
 export interface Diagnostic {
   phase: "lexing" | "parsing" | "validation" | "generation";
   message: string;
+  source?: string;
   range: { start: number; end: number };
 }
 export interface ValidationResult { valid: boolean; diagnostics: Diagnostic[] }
@@ -134,8 +135,8 @@ fn options<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, Operatio
     serde_wasm_bindgen::from_value(value).map_err(|error| OperationError::new("options", error))
 }
 
-fn compile_source(source: &str) -> Result<bts_lang::Model, OperationError> {
-    bts_lang::semantics::compile(source).map_err(|diagnostics| OperationError {
+fn compile_source(source: &str) -> Result<bts_core::mocking::Model, OperationError> {
+    bts_core::providers::braintrust::Bundle::compile_module(source, false).map_err(|diagnostics| OperationError {
         stage: "compile",
         message: "source is invalid".to_owned(),
         diagnostics,
@@ -326,9 +327,12 @@ struct WebDiagnostic<'a>(&'a bts_lang::Diag);
 
 impl Serialize for WebDiagnostic<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut diagnostic = serializer.serialize_struct("Diagnostic", 3)?;
+        let mut diagnostic = serializer.serialize_struct("Diagnostic", if self.0.r#where.source == 1 { 4 } else { 3 })?;
         diagnostic.serialize_field("phase", &self.0.when.to_string())?;
         diagnostic.serialize_field("message", &self.0.what)?;
+        if self.0.r#where.source == 1 {
+            diagnostic.serialize_field("source", bts_core::providers::braintrust::Bundle::DEFINITIONS.name)?;
+        }
         diagnostic.serialize_field("range", &WebRange(&self.0.r#where))?;
         diagnostic.end()
     }
@@ -351,7 +355,9 @@ impl Serialize for WebRange<'_> {
 /// Diagnostic ranges use UTF-8 byte offsets into the original source.
 #[wasm_bindgen(unchecked_return_type = "ValidationResult")]
 pub fn validate(source: &str) -> Result<JsValue, JsValue> {
-    let diagnostics = bts_lang::semantics::compile(source).err().unwrap_or_default();
+    let diagnostics = bts_core::providers::braintrust::Bundle::compile_module(source, false)
+        .err()
+        .unwrap_or_default();
     serde_wasm_bindgen::to_value(&ValidationResult {
         valid: diagnostics.is_empty(),
         diagnostics: diagnostics.iter().map(WebDiagnostic).collect(),
@@ -512,8 +518,8 @@ pub fn build(
         }
         let model = compile_source(source)?;
         let language = build_options.lang.map(|language| match language {
-            BuildLanguage::Python => bts_lang::ScorerLang::Python,
-            BuildLanguage::Typescript => bts_lang::ScorerLang::Typescript,
+            BuildLanguage::Python => bts_core::mocking::ScorerLang::Python,
+            BuildLanguage::Typescript => bts_core::mocking::ScorerLang::Typescript,
         });
         let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new(
             build_options.project.as_deref().unwrap_or_default(),
@@ -527,7 +533,7 @@ pub fn build(
         let plan = match build_options.target {
             BuildTarget::Scorers => {
                 if model.scorers.is_empty() {
-                    return Err(OperationError::new("build", "the shape declares no scorer blocks"));
+                    return Err(OperationError::new("build", "the graph declares no scorer nodes"));
                 }
                 let assembly = code::assemble(&model.scorers, language, &code::languages::Languages, &target)
                     .map_err(|error| OperationError::new("build", error))?;
@@ -545,7 +551,7 @@ pub fn build(
                 if !model.experiments.is_empty() && build_options.project.is_none() {
                     return Err(OperationError::new("options", "project is required for agent evals"));
                 }
-                let language = language.unwrap_or(bts_lang::ScorerLang::Python);
+                let language = language.unwrap_or(bts_core::mocking::ScorerLang::Python);
                 let assembly =
                     code::assemble_agents(&model, language, &target).map_err(|error| OperationError::new("build", error))?;
                 let assembly = target

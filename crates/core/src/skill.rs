@@ -36,7 +36,14 @@ pub fn assemble_braintrust(
         match part {
             Part::BraintrustWorkflow => output.push_str(crate::providers::braintrust::skill::WORKFLOW),
             Part::BraintrustPresentation => output.push_str(crate::providers::braintrust::skill::PRESENTATION),
-            Part::Language => output.push_str(&reference(spec)),
+            Part::Language => {
+                output.push_str(&reference(spec));
+                output.push_str(crate::providers::braintrust::skill::GRAPH);
+                output.push_str(&fenced_code(
+                    "bts",
+                    crate::providers::braintrust::Bundle::DEFINITIONS.text.trim(),
+                ));
+            }
         }
     }
     if let Some(interface_reference) = interface_reference {

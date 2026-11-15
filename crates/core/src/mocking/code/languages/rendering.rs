@@ -1002,7 +1002,7 @@ def _flow_run(plan, input, random_source, logger, missing):
         if index == 0 and input is not missing: occ["bindings"][str(plan["input"])] = lambda: input
         for key, binding in node["fields"].items():
             if key in ("input", "output", "expected", "error", "metadata", "metrics", "tags", "duration"):
-                span.fields[key] = _lazy(lambda binding=binding: _flow_read(flow, occ, node_id, binding))
+                span.fields[key] = _lazy(lambda binding=binding, key=key: _duration(_flow_read(flow, occ, node_id, binding)) if key == "duration" else _flow_read(flow, occ, node_id, binding))
         flow["occurrences"].append(occ)
         return occ
     def join_for(junction, group, occ):
@@ -1145,12 +1145,12 @@ def _flow_run(plan, input, random_source, logger, missing):
             if definition["kind"] == "quorum" and not join["emitted"]: raise ValueError("quorum group closed without enough distinct inputs")
             if definition["kind"] == "reduce":
                 source = join["source"]
-                accumulator = prop(source, definition["props"], "initial")
+                accumulator = _value(prop(source, definition["props"], "initial"))
                 if prop(source, definition["props"], "order", "source") == "source": join["arrivals"].sort(key=lambda arrival: (arrival["occ"]["index"], arrival["edge"]))
                 for arrival in join["arrivals"]:
                     old = source["context"]
                     source["context"] = {**old, "accumulator": accumulator, "arrival": {"edge": edges[arrival["edge"]]["name"], "value": arrival["value"]}}
-                    try: accumulator = prop(source, definition["props"], "combine")
+                    try: accumulator = _value(prop(source, definition["props"], "combine"))
                     finally: source["context"] = old
                 emit(join, join["arrivals"], accumulator)
             join["closed"] = True
@@ -1471,7 +1471,7 @@ function _flow_run(plan: any, input: unknown, randomSource: () => number, logger
         occ.bindings = Object.fromEntries(Object.entries(node.bindings).map(([key, fn]) => [key, _lazy(() => _value((fn as any)(flow, occ)))]))
         if (index === 0 && input !== missing) occ.bindings[String(plan.input)] = () => input
         for (const [key, binding] of Object.entries(node.fields)) {
-            if (["input", "output", "expected", "error", "metadata", "metrics", "tags", "duration"].includes(key)) span.fields[key] = _lazy(() => _flow_read(flow, occ, nodeId, binding as number))
+            if (["input", "output", "expected", "error", "metadata", "metrics", "tags", "duration"].includes(key)) span.fields[key] = _lazy(() => key === "duration" ? _duration(_flow_read(flow, occ, nodeId, binding as number)) : _flow_read(flow, occ, nodeId, binding as number))
         }
         flow.occurrences.push(occ)
         return occ
@@ -1630,12 +1630,12 @@ function _flow_run(plan: any, input: unknown, randomSource: () => number, logger
             if (definition.kind === "quorum" && !join.emitted) throw new Error("quorum group closed without enough distinct inputs")
             if (definition.kind === "reduce") {
                 const source = join.source
-                let accumulator = prop(source, definition.props, "initial")
+                let accumulator = _value(prop(source, definition.props, "initial"))
                 if (prop(source, definition.props, "order", "source") === "source") join.arrivals.sort((a: any, b: any) => a.occ.index - b.occ.index || a.edge - b.edge)
                 for (const arrival of join.arrivals) {
                     const old = source.context
                     source.context = {...old, accumulator, arrival: {edge: edges[arrival.edge].name, value: arrival.value}}
-                    try {accumulator = prop(source, definition.props, "combine")} finally {source.context = old}
+                    try {accumulator = _value(prop(source, definition.props, "combine"))} finally {source.context = old}
                 }
                 emit(join, join.arrivals, accumulator)
             }

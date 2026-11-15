@@ -25,7 +25,13 @@ impl fmt::Display for SourceDiags {
             if index > 0 {
                 formatter.write_str("\n")?;
             }
-            formatter.write_str(&diag.render(&self.source_name, &self.source))?;
+            let definition = bts_core::providers::braintrust::Bundle::DEFINITIONS;
+            let (name, source) = if diag.r#where.source == 1 {
+                (definition.name, definition.text)
+            } else {
+                (self.source_name.as_str(), self.source.as_str())
+            };
+            formatter.write_str(&diag.render(name, source))?;
         }
         Ok(())
     }
@@ -58,7 +64,7 @@ mod tests {
 
     #[test]
     fn preserves_language_diagnostics_until_rendering() {
-        let source = "trace \"run\" {\n\toutput = }";
+        let source = "(run:task) {\n\toutput: }";
         let diags = crate::dsl::semantics::compile(source).unwrap_err();
         let expected = diags
             .iter()
@@ -69,6 +75,17 @@ mod tests {
         assert_eq!(report.diags, diags);
         assert_eq!(report.source, source);
         assert_eq!(report.to_string(), expected);
+    }
+
+    #[test]
+    fn provider_definition_conflicts_point_to_the_user_declaration() {
+        let source = "+(span::node {});";
+        let errors = bts_core::providers::braintrust::Bundle::compile_module(source, false).unwrap_err();
+        let report = SourceDiags::new("shape.bt", source, errors).to_string();
+        assert!(report.contains("shape.bt:"));
+        assert!(!report.contains("braintrust.bt:"));
+        assert!(report.contains("duplicate kind name"));
+        assert!(report.contains("+(span::node"));
     }
 
     #[test]

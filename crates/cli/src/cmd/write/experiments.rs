@@ -1,6 +1,5 @@
 use crate::config::Settings;
 use crate::diag::SourceDiags;
-use crate::dsl;
 use crate::logging;
 use crate::selection::ResourceSelector;
 use bts_core::providers::DataProvider;
@@ -45,7 +44,7 @@ impl Args {
 
     fn execute(self, settings: &Settings) -> Result<(), Error> {
         let source = fs::read_to_string(&self.from).map_err(Error::Read)?;
-        let model = dsl::semantics::compile(&source)
+        let model = bts_core::providers::braintrust::Bundle::compile_module(&source, false)
             .map_err(|errors| Error::Invalid(SourceDiags::new(&self.from.display().to_string(), &source, errors)))?;
         bts_core::providers::braintrust::features::experiments::validate_selection(&model, &self.select)?;
         let seed = self.seed.unwrap_or_else(rand::random);

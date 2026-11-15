@@ -48,14 +48,14 @@ where
 {
     fn agent_target(
         &self,
-        model: &crate::dsl::Model,
+        model: &bts_core::mocking::Model,
         seed: u64,
     ) -> Result<<Self::Provider as CodeProvider>::Target, Self::Error>;
 
     fn assemble_agents(
         &self,
-        model: &crate::dsl::Model,
-        lang: crate::dsl::ScorerLang,
+        model: &bts_core::mocking::Model,
+        lang: bts_core::mocking::ScorerLang,
         target: &<Self::Provider as CodeProvider>::Target,
     ) -> Result<code::Assembly, String> {
         code::assemble_agents(model, lang, target)

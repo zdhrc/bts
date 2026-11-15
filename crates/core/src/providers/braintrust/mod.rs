@@ -25,15 +25,26 @@ impl Bundle {
 
     /// Compiles source with this provider's definitions and lowers its mocking behavior.
     pub fn compile(source: &str) -> Result<crate::mocking::Model, String> {
-        let graph = bts_lang::semantics::compile_with_definitions(
+        Self::compile_module(source, false).map_err(|errors| format!("{errors:?}"))
+    }
+
+    /// Compiles provider source while preserving diagnostics and the empty module policy.
+    pub fn compile_module(source: &str, allow_empty: bool) -> Result<crate::mocking::Model, bts_lang::Diags> {
+        let graph = bts_lang::semantics::compile_module_with_definitions(
             bts_lang::semantics::Source {
                 name: "input.bt",
                 text: source,
             },
             &[Self::DEFINITIONS],
-        )
-        .map_err(|errors| format!("{errors:?}"))?;
-        Self::lower(&graph)
+            allow_empty,
+        )?;
+        Self::lower(&graph).map_err(|what| {
+            vec![bts_lang::Diag {
+                when: bts_lang::DiagPhase::Validation,
+                what,
+                r#where: bts_lang::SrcRange::new(0, 0),
+            }]
+        })
     }
 
     /// Lowers an agent graph for the shared mock data and mock code consumers.

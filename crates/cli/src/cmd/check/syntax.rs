@@ -1,5 +1,5 @@
 use crate::diag::SourceDiags;
-use crate::dsl::semantics::compile;
+use bts_core::providers::braintrust::Bundle;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -26,7 +26,7 @@ impl Args {
             (self.path.display().to_string(), src)
         };
 
-        match compile(&src) {
+        match Bundle::compile_module(&src, false) {
             Ok(_) => {
                 println!("{source_name}: valid");
                 Ok(())

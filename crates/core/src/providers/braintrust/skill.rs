@@ -91,3 +91,17 @@ Use durations and token counts that fit the content. Derive counts with `tokens(
 Inspect the rendered result, not just the source. Check that names, nesting, chat messages, tool payloads, timing, and final output help a viewer understand what happened without a spoken explanation.
 
 "#;
+
+pub const GRAPH: &str = r#"## Braintrust graph definitions
+
+The CLI and browser interface compile source with the following provider definitions already supplied. Extend these kinds with new kind declarations rather than redeclaring them. Node properties configure instances, while node bodies hold fields.
+
+An agent describes a behavior graph and does not emit a span. Give it input and output fields, contains edges to its members, and one unconditional next edge to a task or span entry. The entry input references the agent input. Use child_of edges from emitted children to their parent spans. Membership, execution order and span parenting are separate relationships.
+
+Next edges schedule steps, feeds edges supply fields marked <-, forks select or repeat paths, and typed juncts combine arrivals. Cycles create fresh occurrences with an execution budget and optional max_traversals. Read grouped results through context.arrivals and reductions through context.accumulator. Computed child fields and nested payload dependencies use occurrence-local evaluation when the static plan cannot preserve their scope.
+
+Scorer nodes supply a score expression or judge object and optional lang and file properties. Callable scorers read context.input, context.output, context.expected and context.metadata. Dataset cases refer to graph nodes through source or supply inline input. Experiments reference a dataset, task and scorer nodes. Facet and automation nodes are synchronization resources, not emitted spans.
+
+These are mock behaviors. Tool and llm nodes describe emitted data rather than calling external services. Syntax validation does not guarantee that runtime expressions succeed.
+
+"#;
