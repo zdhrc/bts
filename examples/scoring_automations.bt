@@ -2,13 +2,13 @@
 ("password-reset-assistant_agent")-[:next]->("password-reset-assistant");
 ("password-reset-assistant":task) {
     input: ("password-reset-assistant_agent").input,
-    output: ("password-reset-assistant").route == 0 ? ("delivered-reset").output : ("password-reset-assistant").route == 1 ? ("delivery-failed-reset").output : ("blocked-reset").output,
-    metadata: {required_steps: ("password-reset-assistant").route == 2 ?[|"lookup_account"|] :[|"lookup_account", "issue_reset_link", "send_reset_email"|]},
+    output: ("password-reset-assistant").local.route == 0 ? ("delivered-reset").output : ("password-reset-assistant").local.route == 1 ? ("delivery-failed-reset").output : ("blocked-reset").output,
+    metadata: {required_steps: ("password-reset-assistant").local.route == 2 ?[|"lookup_account"|] :[|"lookup_account", "issue_reset_link", "send_reset_email"|]},
     tags: [|"support", "password-reset"|],
-    route: range(0, 2)
+    local: {route: range(0, 2)}
 };
 ("password-reset-assistant_agent")-[:contains]->("password-reset-assistant");
-("password-reset-assistant") =[:exclusive]=>[-[:next {when: source.route == 0}]->("delivered-reset"), -[:next {when: source.route == 1}]->("delivery-failed-reset"), -[:next {when: source.route == 2}]->("blocked-reset")];
+("password-reset-assistant") =[:exclusive]=>[-[:next {when: source.local.route == 0}]->("delivered-reset"), -[:next {when: source.local.route == 1}]->("delivery-failed-reset"), -[:next {when: source.local.route == 2}]->("blocked-reset")];
 ("delivered-reset":task) {
     input: ("password-reset-assistant").input,
     output: {status: "sent", reply: ("draft-reset-reply").output.content, actions: [|{step: "lookup_account", status: ("verify-reset-request").output.lookup.status}, {step: "issue_reset_link", status: ("execute-reset").output.link.status}, {step: "send_reset_email", status: ("execute-reset").output.delivery.status},|]}

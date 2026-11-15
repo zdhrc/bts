@@ -29,8 +29,8 @@
         output: {kept: search.output.doc_ids[:2]},
     }
         -[:next]->(answer:llm {name: "Chat Completion"}) {
-            gen_time: lognormal(2.4, 0.4),
-            duration: self.gen_time,
+            local: {gen_time: lognormal(2.4, 0.4)},
+            duration: self.local.gen_time,
             input: {
                 system: "Answer using only the provided documents. Cite doc ids.",
                 question: request.input,
@@ -46,7 +46,7 @@
                 prompt_tokens: tokens(self.input),
                 completion_tokens: tokens(self.output),
                 tokens: tokens(self.input) + tokens(self.output),
-                time_to_first_token: self.gen_time * range(0.1, 0.25),
+                time_to_first_token: self.local.gen_time * range(0.1, 0.25),
             },
         };
 (docs_qa)-[:contains]->(search)-[:child_of]->(request);

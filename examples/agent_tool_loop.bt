@@ -9,13 +9,13 @@
 (request)
     =[:repeat {count: weighted([|1, 5|], [|2, 3|], [|3, 1.5|], [|4, 0.5|])}]=>[
         -[rounds:next]->(inspect:llm {name: "anthropic.messages.create"}) {
-            route: range(0, 1),
+            local: {route: range(0, 1)},
             input: {
                 system: "You are an ops agent. Inspect the cluster with tools before answering.",
                 request: request.input,
                 history: context.history.inspect,
             },
-            output: {role: "assistant", content: self.route == 0
+            output: {role: "assistant", content: self.local.route == 0
                 ? "Checking the pod status for checkout-api."
                 : "Pulling the recent checkout-api logs."},
             metadata: {model: "claude-sonnet-4-5", provider: "anthropic", max_tokens: 1024},
@@ -24,11 +24,11 @@
     ]
         ->(inspect)
             =[:exclusive]=>[
-                -[:next {when: inspect.route == 0}]->(pods:tool {name: "get_pod_status"}) {
+                -[:next {when: inspect.local.route == 0}]->(pods:tool {name: "get_pod_status"}) {
                     input: {namespace: "prod", selector: "app=checkout-api"},
                     output: {ready: choice("1/3", "2/3", "3/3"), restarts: poisson(2)},
                 },
-                -[:next {when: inspect.route == 1}]->(logs:tool {name: "get_recent_logs"}) {
+                -[:next {when: inspect.local.route == 1}]->(logs:tool {name: "get_recent_logs"}) {
                     input: {service: "checkout-api", lines: 200},
                     output: {error_count: poisson(6), sample: "upstream connect error or disconnect before headers"},
                 },

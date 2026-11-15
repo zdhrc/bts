@@ -3,8 +3,8 @@
 (supervisor)-[:contains, :next]->(request:task {name: "research-supervisor"}) {
     input: supervisor.input,
     output: synthesis.output.content,
-    profiled: chance(0.4),
-    metadata: {run_id: uuid(), profiled: self.profiled},
+    local: {profiled: chance(0.4)},
+    metadata: {run_id: uuid(), profiled: self.local.profiled},
     tags: [|"multi-agent"|],
 };
 (request)-[:next]->(delegate:llm {name: "Chat Completion"}) {
@@ -41,7 +41,7 @@
 # an optional specialist follows the synthesis without becoming a required junct input
 (synthesis)
     =[:conditional]=>[
-        -[:next {when: request.profiled}]->(profiler:task {name: "profiler_agent"}) {
+        -[:next {when: request.local.profiled}]->(profiler:task {name: "profiler_agent"}) {
             input: "Profile the fraud check under load.",
             output: profile_reply.output,
         },

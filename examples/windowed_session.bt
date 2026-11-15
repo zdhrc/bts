@@ -2,19 +2,19 @@
 (copilot:agent) {input: null, output: request.output};
 (copilot)-[:contains, :next]->(request:task {name: "copilot-window"}) {
     input: copilot.input,
-    position: range(0, 1),
-    output: self.position == 0 ? opening.output : later.output,
-    metadata: {session_id: format("sess_{}", hex(10)), window: self.position == 0 ? 0 : 3},
+    local: {position: range(0, 1)},
+    output: self.local.position == 0 ? opening.output : later.output,
+    metadata: {session_id: format("sess_{}", hex(10)), window: self.local.position == 0 ? 0 : 3},
     tags: [|"copilot"|],
 };
 (request)
     =[:exclusive]=>[
-        -[:next {when: request.position == 0}]->(opening:task {name: "turn"}) {
+        -[:next {when: request.local.position == 0}]->(opening:task {name: "turn"}) {
             input: "Why does my worker pool deadlock on shutdown?",
             output: "Your workers block on the results channel. Drain results before joining them.",
             metadata: {window: 0},
         },
-        -[:next {when: request.position == 1}]->(later:task {name: "turn"}) {
+        -[:next {when: request.local.position == 1}]->(later:task {name: "turn"}) {
             input: "Now the shutdown races with the metrics flush.",
             output: "Flush from the shutdown coordinator after the workers have joined.",
             metadata: {window: 3},

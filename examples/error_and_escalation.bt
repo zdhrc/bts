@@ -3,8 +3,8 @@
 (payments)-[:contains, :next]->(request:task {name: "payments-agent"}) {
     input: payments.input,
     output: charge.output,
-    failed: chance(0.07),
-    metadata: {run_id: uuid(), retried: self.failed},
+    local: {failed: chance(0.07)},
+    metadata: {run_id: uuid(), retried: self.local.failed},
     tags: [|"payments"|],
 };
 (request)-[:next]->(confirm:llm {name: "Chat Completion"}) {
@@ -17,12 +17,12 @@
     metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
 }
     =[:exclusive]=>[
-        -[failed:next {when: request.failed}]->(declined:tool {name: "charge_customer"}) {
+        -[failed:next {when: request.local.failed}]->(declined:tool {name: "charge_customer"}) {
             input: {account: "acct_9W31", amount_usd: 1240},
             output: null,
             error: "card_declined: insufficient_funds",
         },
-        -[healthy:next {when: !request.failed}]->(ready:task) {output: "Primary card ready"},
+        -[healthy:next {when: !request.local.failed}]->(ready:task) {output: "Primary card ready"},
     ]
         ->(declined)-[:next]->(escalate:task {name: "escalate_to_human"}) {
             input: "Charge declined (${declined.error}). Review before retrying.",
@@ -30,7 +30,7 @@
         }
         >[:first {observe: "result"} [failed], [healthy]]>>(charge);
 (charge:tool {name: "charge_customer"}) {
-    input: {account: "acct_9W31", amount_usd: 1240, card: request.failed ? "backup" : "primary"},
+    input: {account: "acct_9W31", amount_usd: 1240, card: request.local.failed ? "backup" : "primary"},
     output: {status: "succeeded", charge_id: format("ch_{}", alphanum(14))},
 };
 (payments)-[:contains]->(confirm)-[:child_of]->(request);

@@ -89,24 +89,24 @@
 ("subscription-support_agent")-[:next]->("subscription-support");
 ("subscription-support":task) {
     input: ("subscription-support_agent").input,
-    output: ("subscription-support").turns[len (("subscription-support").turns) - 1],
+    output: ("subscription-support").local.turns[len (("subscription-support").local.turns) - 1],
     metadata: {conversation_id: uuid (), channel: "web-chat"},
     tags: [|"support", "subscriptions"|],
-    turns: ("subscription-support_agent").input
+    local: {turns: ("subscription-support_agent").input}
 };
 
 ("subscription-support_agent")-[:contains]->("subscription-support");
-("subscription-support") =[:repeat {count: len (("subscription-support").turns) / 2}]=>[-[:next]->(turn)];
+("subscription-support") =[:repeat {count: len (("subscription-support").local.turns) / 2}]=>[-[:next]->(turn)];
 (turn:task) {
-    input: ("subscription-support").turns[context.index * 2],
-    output: ("subscription-support").turns[context.index * 2 + 1]
+    input: ("subscription-support").local.turns[context.index * 2],
+    output: ("subscription-support").local.turns[context.index * 2 + 1]
 };
 
 ("subscription-support_agent")-[:contains]->(turn);
 (turn)-[:child_of]->("subscription-support");
 (turn)-[:next]->("draft-reply");
 ("draft-reply":llm) {
-    input: ("subscription-support").turns[: context.index * 2 + 1],
+    input: ("subscription-support").local.turns[: context.index * 2 + 1],
     output: turn.output,
     metadata: {model: "glm-5.2"},
     duration: lognormal (0.8, 0.35),
