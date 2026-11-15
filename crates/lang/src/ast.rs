@@ -1,14 +1,6 @@
 use crate::diag::SrcRange;
 use std::fmt;
 
-/// The parsed declarations of a module, before semantic validation.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg(test)]
-pub struct Ast {
-    /// Declarations in source order.
-    pub decls: Vec<Decl>,
-}
-
 /// Candidate graph paths before semantic validation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphDocument {
@@ -196,32 +188,6 @@ pub struct GraphPatternStep {
     /// The destination reference or constraint.
     pub target: GraphPatternNode,
     /// The connection and destination range.
-    pub range: SrcRange,
-}
-
-/// A block or field assignment as written in source.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg(test)]
-pub enum Decl {
-    /// A nested block declaration.
-    Block(Block),
-    /// A named field assignment.
-    Attr(Attr),
-}
-
-/// A parsed block whose keyword, fields, and placement have not been validated.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg(test)]
-pub struct Block {
-    /// The block keyword as written, without checking whether it is supported.
-    pub kind: String,
-    /// The name written in source.
-    pub name: Option<String>,
-    /// The name literal’s source range, if the block is named.
-    pub name_range: Option<SrcRange>,
-    /// Declarations in source order.
-    pub decls: Vec<Decl>,
-    /// The expression’s byte range in the original source.
     pub range: SrcRange,
 }
 
