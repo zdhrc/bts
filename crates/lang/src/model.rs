@@ -125,6 +125,152 @@ impl Construct {
             Self::Junction => "junction",
         }
     }
+    /// The root kind of this construct.
+    pub fn root(self) -> Primitive {
+        match self {
+            Self::Node => Primitive::Node,
+            Self::Edge => Primitive::Edge,
+            Self::Fork => Primitive::Fork,
+            Self::Junction => Primitive::Junction,
+        }
+    }
+}
+
+/// A kind the language defines: a construct root or a built-in primitive.
+///
+/// Every element resolves to one, whatever kind it was authored with, since a
+/// derived kind keeps the primitive of its base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Primitive {
+    /// The root node kind.
+    Node,
+    /// The root edge kind.
+    Edge,
+    /// The root fork kind.
+    Fork,
+    /// The root junction kind.
+    Junction,
+    /// A node that validates a set of nodes and edges as a network.
+    Network,
+    /// A node that relates participants.
+    Relation,
+    /// A node that holds values.
+    Vars,
+    /// An edge that attaches a participant to a relation.
+    Incidence,
+    /// An edge that associates two nodes.
+    Link,
+    /// An edge that schedules its target after its source.
+    Next,
+    /// An edge that makes its target wait for its source.
+    Requires,
+    /// An edge that makes its target a member of its source.
+    Contains,
+    /// An edge that supplies a value to a field of its target.
+    Feeds,
+    /// A fork that selects one branch by weight.
+    Weighted,
+    /// A fork that runs its branches a number of times.
+    Repeat,
+    /// A fork that runs its branches once for each item.
+    Each,
+    /// A fork that runs every branch.
+    Parallel,
+    /// A fork that runs every branch whose guard holds.
+    Conditional,
+    /// A fork that runs the one branch whose guard holds.
+    Exclusive,
+    /// A junction that folds its arrivals into one value.
+    Reduce,
+    /// A junction that collects its arrivals.
+    Accumulate,
+    /// A junction that passes each arrival on.
+    Merge,
+    /// A junction that passes the first arrival on.
+    First,
+    /// A junction that waits for a number of arrivals.
+    Quorum,
+}
+impl Primitive {
+    /// Every primitive, roots first.
+    pub const ALL: [Self; 24] = [
+        Self::Node,
+        Self::Edge,
+        Self::Fork,
+        Self::Junction,
+        Self::Network,
+        Self::Relation,
+        Self::Vars,
+        Self::Incidence,
+        Self::Link,
+        Self::Next,
+        Self::Requires,
+        Self::Contains,
+        Self::Feeds,
+        Self::Weighted,
+        Self::Repeat,
+        Self::Each,
+        Self::Parallel,
+        Self::Conditional,
+        Self::Exclusive,
+        Self::Reduce,
+        Self::Accumulate,
+        Self::Merge,
+        Self::First,
+        Self::Quorum,
+    ];
+    /// The kind name authors write.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Edge => "edge",
+            Self::Fork => "fork",
+            Self::Junction => "junction",
+            Self::Network => "network",
+            Self::Relation => "relation",
+            Self::Vars => "vars",
+            Self::Incidence => "incidence",
+            Self::Link => "link",
+            Self::Next => "next",
+            Self::Requires => "requires",
+            Self::Contains => "contains",
+            Self::Feeds => "feeds",
+            Self::Weighted => "weighted",
+            Self::Repeat => "repeat",
+            Self::Each => "each",
+            Self::Parallel => "parallel",
+            Self::Conditional => "conditional",
+            Self::Exclusive => "exclusive",
+            Self::Reduce => "reduce",
+            Self::Accumulate => "accumulate",
+            Self::Merge => "merge",
+            Self::First => "first",
+            Self::Quorum => "quorum",
+        }
+    }
+    /// The construct the primitive belongs to.
+    pub fn construct(self) -> Construct {
+        match self {
+            Self::Node | Self::Network | Self::Relation | Self::Vars => Construct::Node,
+            Self::Edge | Self::Incidence | Self::Link | Self::Next | Self::Requires | Self::Contains | Self::Feeds => {
+                Construct::Edge
+            }
+            Self::Fork | Self::Weighted | Self::Repeat | Self::Each | Self::Parallel | Self::Conditional | Self::Exclusive => {
+                Construct::Fork
+            }
+            Self::Junction | Self::Reduce | Self::Accumulate | Self::Merge | Self::First | Self::Quorum => Construct::Junction,
+        }
+    }
+    /// The primitive a built-in kind name means within a construct.
+    pub fn named(construct: Construct, name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|primitive| primitive.construct() == construct && primitive.name() == name)
+    }
+    /// Whether this is a construct root, which installs no behavior of its own.
+    pub fn is_root(self) -> bool {
+        self == self.construct().root()
+    }
 }
 
 /// A schema value type independent of runtime evaluation.
@@ -274,7 +420,7 @@ pub struct Kind {
     /// Resolved base identity for a user-defined base.
     pub base_kind: Option<KindId>,
     /// Inherited primitive or neutral root operation.
-    pub primitive: String,
+    pub primitive: Primitive,
     /// Edge direction allowance, absent for other constructs.
     pub direction: Option<Directions>,
     /// Effective property schema, including inherited entries.
@@ -334,6 +480,8 @@ pub struct Node {
     pub name: Option<String>,
     /// Open node-kind identifier.
     pub kind: String,
+    /// The language primitive the kind resolves to.
+    pub primitive: Primitive,
     /// Configuration properties.
     pub props: Vec<BindingId>,
     /// Content fields.
@@ -349,6 +497,8 @@ pub struct Edge {
     pub name: Option<String>,
     /// Open edge-kind identifier.
     pub kind: String,
+    /// The language primitive the kind resolves to.
+    pub primitive: Primitive,
     /// Instance orientation.
     pub direction: Direction,
     /// Source or authored left node.
@@ -372,6 +522,8 @@ pub struct Fork {
     pub name: Option<String>,
     /// Authored kind, including the built-in graph primitives.
     pub kind: String,
+    /// The language primitive the kind resolves to.
+    pub primitive: Primitive,
     /// Source node.
     pub source: NodeId,
     /// Configuration properties.
@@ -389,6 +541,8 @@ pub struct Fork {
 pub struct Junction {
     /// Authored kind defining how incoming data is combined.
     pub kind: String,
+    /// The language primitive the kind resolves to.
+    pub primitive: Primitive,
     /// Exact incoming edge identities.
     pub inputs: Vec<EdgeId>,
     /// Configuration properties without an implied arrival policy.

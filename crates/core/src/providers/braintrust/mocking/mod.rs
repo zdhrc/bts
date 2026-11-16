@@ -617,7 +617,7 @@ fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Er
         None => "this step".to_owned(),
     };
     for edge in graph.edges.iter().filter(|edge| edge.source == agent) {
-        if inherits(graph, &edge.kind, "contains") {
+        if edge.primitive == graph::Primitive::Contains {
             return Err(located(
                 edge.range,
                 "agent membership comes from the entry edge, remove this `contains` edge",
@@ -633,7 +633,7 @@ fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Er
     let entries: Vec<_> = graph
         .edges
         .iter()
-        .filter(|edge| edge.source == agent && inherits(graph, &edge.kind, "next"))
+        .filter(|edge| edge.source == agent && edge.primitive == graph::Primitive::Next)
         .map(|edge| edge.target)
         .collect();
     // members are the nodes the entry leads to along next edges and through junctions
@@ -645,7 +645,7 @@ fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Er
         }
         pending.extend(
             (graph.edges.iter())
-                .filter(|edge| edge.source == node && inherits(graph, &edge.kind, "next"))
+                .filter(|edge| edge.source == node && edge.primitive == graph::Primitive::Next)
                 .map(|edge| edge.target),
         );
         pending.extend(
@@ -709,7 +709,7 @@ fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Er
     if let [entry] = entries.as_slice() {
         let missing = |node: &graph::NodeId| node != entry && !parents.contains_key(node);
         if let Some(edge) = (graph.edges.iter())
-            .find(|edge| edge.source == *entry && inherits(graph, &edge.kind, "next") && missing(&edge.target))
+            .find(|edge| edge.source == *entry && edge.primitive == graph::Primitive::Next && missing(&edge.target))
         {
             return Err(located(
                 edge.range,

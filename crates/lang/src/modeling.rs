@@ -208,7 +208,7 @@ impl Modeler {
                         base: construct.name().to_owned(),
                         base_kind: None,
                         construct,
-                        primitive: construct.name().to_owned(),
+                        primitive: construct.root(),
                         direction: None,
                         props: Vec::new(),
                         fields: Vec::new(),
@@ -254,8 +254,16 @@ impl Modeler {
         self.model.kind_names.get(name).map(|id| &self.model.kinds[id.0])
     }
 
-    fn primitive(&self, owner: ElementId) -> &str {
+    fn primitive(&self, owner: ElementId) -> Primitive {
         primitive(&self.model, owner)
+    }
+
+    // kinds are declared before any element, so an element's primitive is known when it is created
+    fn resolved(&self, construct: Construct, kind: &str) -> Primitive {
+        match self.model.kind_names.get(kind) {
+            Some(id) => self.model.kinds[id.0].primitive,
+            None => builtin(construct, kind),
+        }
     }
 
     fn field_type(&self, slot: &Slot) -> FieldType {
@@ -270,7 +278,7 @@ impl Modeler {
                     return None;
                 }
                 let (name, construct) = self.element_kind(slot.owner);
-                primitive_properties(construct, name, self.element_range(slot.owner))
+                primitive_properties(builtin(construct, name), self.element_range(slot.owner))
                     .into_iter()
                     .find(|field| field.name == slot.path[0])
                     .map(|field| field.ty)
@@ -359,7 +367,7 @@ impl Modeler {
         let schema = self.kind_schema(owner).cloned();
         // the root node kind takes any property, every other built-in has a fixed set
         if property && schema.is_none() && name != "node" && builtin_construct(&name) == Some(construct) {
-            let known = primitive_properties(construct, &name, self.element_range(owner));
+            let known = primitive_properties(builtin(construct, &name), self.element_range(owner));
             for field in &fields {
                 if !known.iter().any(|entry| entry.name == field.key) {
                     let hint = suggestion(&field.key, known.iter().map(|entry| entry.name.as_str()));
@@ -446,6 +454,7 @@ impl Modeler {
                 let element = ElementId::Node(id);
                 self.model.nodes.push(Node {
                     name: node.header.name.clone(),
+                    primitive: self.resolved(Construct::Node, &node.header.kind),
                     kind: node.header.kind.clone(),
                     props: Vec::new(),
                     fields: Vec::new(),
@@ -473,6 +482,7 @@ impl Modeler {
                 let element = ElementId::Edge(id);
                 self.model.edges.push(Edge {
                     name: header.name.clone(),
+                    primitive: self.resolved(Construct::Edge, &header.kind),
                     kind: header.kind.clone(),
                     source: NodeId(usize::MAX),
                     target: NodeId(usize::MAX),
@@ -499,6 +509,7 @@ impl Modeler {
         let id = JunctionId(self.model.junctions.len());
         let target = self.node(&junction.target, fork.map(ElementId::Fork));
         self.model.junctions.push(Junction {
+            primitive: self.resolved(Construct::Junction, &junction.kind),
             kind: junction.kind.clone(),
             inputs: Vec::new(),
             props: Vec::new(),
@@ -553,6 +564,7 @@ impl Modeler {
                     let element = ElementId::Fork(id);
                     self.model.forks.push(Fork {
                         name: fork.header.name.clone(),
+                        primitive: self.resolved(Construct::Fork, &fork.header.kind),
                         kind: fork.header.kind.clone(),
                         source: NodeId(usize::MAX),
                         props: Vec::new(),
@@ -900,7 +912,7 @@ impl Modeler {
                 ty: self.field_type(slot),
             });
         }
-        if slot.property && slot.path == ["into"] && self.primitive(slot.owner) == "feeds" {
+        if slot.property && slot.path == ["into"] && self.primitive(slot.owner) == Primitive::Feeds {
             let ElementId::Edge(edge) = slot.owner else {
                 return Err(error(expr.range, "destination requires an edge"));
             };
@@ -1436,7 +1448,7 @@ impl Modeler {
             return names(if provides { &kind.provides } else { &kind.requires });
         }
         let (name, construct) = self.element_kind(owner);
-        let (provided, required) = primitive_context(construct, name, SrcRange::new(0, 0));
+        let (provided, required) = primitive_context(builtin(construct, name), SrcRange::new(0, 0));
         names(if provides { &provided } else { &required })
     }
 
@@ -1475,7 +1487,7 @@ impl Modeler {
             let mut arriving: Vec<(NodeId, Keys)> = Vec::new();
             for (index, edge) in model.edges.iter().enumerate() {
                 // keys that reach a node travel along next edges only
-                let mut keys = if primitive(model, ElementId::Edge(EdgeId(index))) == "next" {
+                let mut keys = if primitive(model, ElementId::Edge(EdgeId(index))) == Primitive::Next {
                     leaving(&reach, edge.source)
                 } else {
                     Keys::new()
@@ -1595,10 +1607,7 @@ impl Modeler {
             if self.junction_state[i] != RESOLVED || self.unchecked.contains(&ElementId::Junction(JunctionId(i))) {
                 continue;
             }
-            if matches!(
-                self.primitive(ElementId::Junction(JunctionId(i))),
-                "accumulate" | "merge" | "first" | "quorum" | "reduce"
-            ) {
+            if !self.primitive(ElementId::Junction(JunctionId(i))).is_root() {
                 let distinct: HashSet<_> = junction.inputs.iter().copied().collect();
                 if distinct.len() != junction.inputs.len() {
                     errors.extend(error(
@@ -1607,7 +1616,7 @@ impl Modeler {
                     ));
                 }
             }
-            if self.primitive(ElementId::Junction(JunctionId(i))) == "quorum" {
+            if self.primitive(ElementId::Junction(JunctionId(i))) == Primitive::Quorum {
                 match self.property(ElementId::Junction(JunctionId(i)), "count") {
                     Some(id) => {
                         let binding = &self.model.bindings[id.0];
@@ -1625,7 +1634,7 @@ impl Modeler {
         }
         for (i, _node) in self.model.nodes.iter().enumerate() {
             if !self.unchecked.contains(&ElementId::Node(NodeId(i)))
-                && self.primitive(ElementId::Node(NodeId(i))) == "vars"
+                && self.primitive(ElementId::Node(NodeId(i))) == Primitive::Vars
                 && let Some(id) = self.property(ElementId::Node(NodeId(i)), "evaluate")
             {
                 let binding = &self.model.bindings[id.0];
@@ -1649,7 +1658,7 @@ impl Modeler {
             if self.unchecked.contains(&owner) {
                 continue;
             }
-            if self.primitive(owner) == "feeds"
+            if self.primitive(owner) == Primitive::Feeds
                 && let Some(into) = self.property(owner, "into")
             {
                 let destination = &self.model.bindings[into.0];
@@ -1689,7 +1698,7 @@ impl Modeler {
             }
         }
         for (fork_index, fork) in self.model.forks.iter().enumerate() {
-            if self.primitive(ElementId::Fork(ForkId(fork_index))) == "parallel" {
+            if self.primitive(ElementId::Fork(ForkId(fork_index))) == Primitive::Parallel {
                 for edge in fork.branches.iter().flatten() {
                     if let Some(id) = self.property(ElementId::Edge(*edge), "when") {
                         errors.extend(error(
@@ -1699,7 +1708,7 @@ impl Modeler {
                     }
                 }
             }
-            if self.primitive(ElementId::Fork(ForkId(fork_index))) == "exclusive" {
+            if self.primitive(ElementId::Fork(ForkId(fork_index))) == Primitive::Exclusive {
                 for i in 0..fork.branches.len() {
                     for j in i + 1..fork.branches.len() {
                         for left in &fork.branches[i] {
@@ -1855,7 +1864,7 @@ fn context_key(attr: &ast::Attr, inherited: &mut Vec<FieldSchema>, provides: boo
 }
 
 // the context a built-in kind declares in the language reference
-fn primitive_context(construct: Construct, primitive: &str, range: SrcRange) -> (Vec<FieldSchema>, Vec<FieldSchema>) {
+fn primitive_context(primitive: Primitive, range: SrcRange) -> (Vec<FieldSchema>, Vec<FieldSchema>) {
     let schemas = |keys: &[crate::spec::ContextDesc]| {
         keys.iter()
             .map(|key| FieldSchema {
@@ -1869,7 +1878,7 @@ fn primitive_context(construct: Construct, primitive: &str, range: SrcRange) -> 
             })
             .collect()
     };
-    match crate::spec::SPEC.primitive(construct.name(), primitive) {
+    match crate::spec::SPEC.primitive(primitive.construct().name(), primitive.name()) {
         Some(found) => (schemas(found.provides), schemas(found.requires)),
         None => (Vec::new(), Vec::new()),
     }
@@ -1962,15 +1971,21 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
     Ok(())
 }
 
-fn primitive_direction(kind: &str) -> Directions {
-    match kind {
-        "next" | "requires" | "contains" | "feeds" => Directions::Directed,
-        "incidence" => Directions::Undirected,
+fn primitive_direction(primitive: Primitive) -> Directions {
+    match primitive {
+        Primitive::Next | Primitive::Requires | Primitive::Contains | Primitive::Feeds => Directions::Directed,
+        Primitive::Incidence => Directions::Undirected,
         _ => Directions::Either,
     }
 }
 
-fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) -> Vec<FieldSchema> {
+// the primitive a kind name means when no definition declares it, an unknown name installs nothing
+fn builtin(construct: Construct, name: &str) -> Primitive {
+    Primitive::named(construct, name).unwrap_or(construct.root())
+}
+
+fn primitive_properties(primitive: Primitive, range: SrcRange) -> Vec<FieldSchema> {
+    let construct = primitive.construct();
     let mut names = Vec::new();
     if construct == Construct::Edge {
         names.push(("when", FieldType::Boolean, false));
@@ -1978,11 +1993,11 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
         names.push(("max_traversals", FieldType::Number, false));
     }
     match primitive {
-        "feeds" => names.extend([("value", FieldType::Any, false), ("into", FieldType::Any, false)]),
-        "accumulate" | "first" => names.push(("correlate", FieldType::Any, false)),
-        "quorum" => names.extend([("correlate", FieldType::Any, false), ("count", FieldType::Number, true)]),
-        "vars" => names.push(("evaluate", FieldType::String, false)),
-        "network" => names.extend([
+        Primitive::Feeds => names.extend([("value", FieldType::Any, false), ("into", FieldType::Any, false)]),
+        Primitive::Accumulate | Primitive::First => names.push(("correlate", FieldType::Any, false)),
+        Primitive::Quorum => names.extend([("correlate", FieldType::Any, false), ("count", FieldType::Number, true)]),
+        Primitive::Vars => names.push(("evaluate", FieldType::String, false)),
+        Primitive::Network => names.extend([
             ("nodes", FieldType::Array, true),
             ("edges", FieldType::Array, true),
             ("validate", FieldType::String, false),
@@ -1994,17 +2009,17 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
             ("outgoing", FieldType::Object, false),
             ("degree", FieldType::Object, false),
         ]),
-        "relation" => names.extend([
+        Primitive::Relation => names.extend([
             ("participants", FieldType::Object, false),
             ("inputs", FieldType::Object, false),
             ("outputs", FieldType::Object, false),
             ("unique", FieldType::Boolean, false),
         ]),
-        "incidence" => names.push(("role", FieldType::String, false)),
+        Primitive::Incidence => names.push(("role", FieldType::String, false)),
 
-        "repeat" => names.push(("count", FieldType::Number, true)),
-        "each" => names.extend([("items", FieldType::Array, true), ("concurrency", FieldType::Number, false)]),
-        "reduce" => names.extend([
+        Primitive::Repeat => names.push(("count", FieldType::Number, true)),
+        Primitive::Each => names.extend([("items", FieldType::Array, true), ("concurrency", FieldType::Number, false)]),
+        Primitive::Reduce => names.extend([
             ("correlate", FieldType::Any, false),
             ("initial", FieldType::Any, true),
             ("combine", FieldType::Any, true),
@@ -2012,7 +2027,7 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
         ]),
         _ => {}
     }
-    if construct == Construct::Junction && matches!(primitive, "accumulate" | "merge" | "first" | "quorum" | "reduce") {
+    if construct == Construct::Junction && !primitive.is_root() {
         names.extend([
             ("observe", FieldType::String, false),
             ("on_failure", FieldType::String, false),
@@ -2330,15 +2345,16 @@ impl<'a> Definitions<'a> {
         }
         let crosses = |at: SrcRange| error(at, "kind extension crosses graph construct categories");
         let root = |base: &str, at: SrcRange| {
-            let (provides, requires) = primitive_context(construct, base, at);
+            let primitive = builtin(construct, base);
+            let (provides, requires) = primitive_context(primitive, at);
             Kind {
                 name: String::new(),
                 base: base.to_owned(),
                 base_kind: None,
                 construct,
-                primitive: base.to_owned(),
-                direction: (construct == Construct::Edge).then(|| primitive_direction(base)),
-                props: primitive_properties(construct, base, at),
+                primitive,
+                direction: (construct == Construct::Edge).then(|| primitive_direction(primitive)),
+                props: primitive_properties(primitive, at),
                 fields: Vec::new(),
                 // the built-in node kinds take any content field
                 open: true,
@@ -3079,14 +3095,7 @@ impl<'a> GraphCheck<'a> {
     }
 
     fn properties(&self) -> Result<()> {
-        let construct = match self.owner {
-            ElementId::Node(_) => Construct::Node,
-            ElementId::Edge(_) => Construct::Edge,
-            ElementId::Fork(_) => Construct::Fork,
-            ElementId::Junction(_) => Construct::Junction,
-        };
-        let base = primitive(self.model, self.owner);
-        let descriptors = primitive_properties(construct, base, self.range);
+        let descriptors = primitive_properties(primitive(self.model, self.owner), self.range);
         let mut errors = Vec::new();
         for descriptor in &descriptors {
             let checked = match self.prop(&descriptor.name) {
@@ -3283,18 +3292,13 @@ fn within(count: usize, bounds: DegreeBounds) -> bool {
     bounds.min.is_none_or(|min| count >= min) && bounds.max.is_none_or(|max| count <= max)
 }
 
-fn primitive(model: &Model, owner: ElementId) -> &str {
-    let kind = match owner {
-        ElementId::Node(id) => &model.nodes[id.0].kind,
-        ElementId::Edge(id) => &model.edges[id.0].kind,
-        ElementId::Fork(id) => &model.forks[id.0].kind,
-        ElementId::Junction(id) => &model.junctions[id.0].kind,
-    };
-    model
-        .kind_names
-        .get(kind)
-        .map(|id| model.kinds[id.0].primitive.as_str())
-        .unwrap_or(kind)
+fn primitive(model: &Model, owner: ElementId) -> Primitive {
+    match owner {
+        ElementId::Node(id) => model.nodes[id.0].primitive,
+        ElementId::Edge(id) => model.edges[id.0].primitive,
+        ElementId::Fork(id) => model.forks[id.0].primitive,
+        ElementId::Junction(id) => model.junctions[id.0].primitive,
+    }
 }
 
 fn properties(model: &Model, owner: ElementId) -> &[BindingId] {
@@ -3375,13 +3379,13 @@ fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved:
                 Ok(())
             })());
         }
-        if primitive(model, owner) == "incidence" {
+        if primitive(model, owner) == Primitive::Incidence {
             if !known || unresolved.contains(&owner) {
                 incidences_complete = false;
                 continue;
             }
-            let left = primitive(model, ElementId::Node(edge.source)) == "relation";
-            let right = primitive(model, ElementId::Node(edge.target)) == "relation";
+            let left = primitive(model, ElementId::Node(edge.source)) == Primitive::Relation;
+            let right = primitive(model, ElementId::Node(edge.target)) == Primitive::Relation;
             let role = if left == right {
                 check.error("incidence requires exactly one relation endpoint")
             } else {
@@ -3415,11 +3419,11 @@ fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved:
             range: node.range,
         };
         match primitive(model, owner) {
-            "network" => match check.network(id, unresolved) {
+            Primitive::Network => match check.network(id, unresolved) {
                 Ok(network) => networks.extend(network),
                 Err(diags) => keep(Err(diags)),
             },
-            "relation" if incidences_complete => {
+            Primitive::Relation if incidences_complete => {
                 let entries = incidences.get(&id).map(Vec::as_slice).unwrap_or_default();
                 let inputs = entries.iter().filter(|(_, role)| role == "input").count();
                 let outputs = entries.iter().filter(|(_, role)| role == "output").count();
@@ -3465,10 +3469,10 @@ fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved:
                 })
         };
         match primitive(model, owner) {
-            "each" | "repeat" => {
+            Primitive::Each | Primitive::Repeat => {
                 if known {
                     keep((|| {
-                        if primitive(model, owner) == "repeat" {
+                        if primitive(model, owner) == Primitive::Repeat {
                             let count = check.required("count")?;
                             check.typed(count, FieldType::Number)?;
                             if expr::constant(count) {
@@ -3487,7 +3491,7 @@ fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved:
                     }
                 }
             }
-            "weighted" => {
+            Primitive::Weighted => {
                 if known && check.prop("count").is_some() {
                     keep(check.error("weighted selects exactly one branch and does not accept count"));
                 }
@@ -3534,12 +3538,7 @@ fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved:
     }
     for (i, junction) in model.junctions.iter().enumerate() {
         let owner = ElementId::Junction(JunctionId(i));
-        if !unchecked.contains(&owner)
-            && matches!(
-                primitive(model, owner),
-                "accumulate" | "merge" | "first" | "quorum" | "reduce"
-            )
-        {
+        if !unchecked.contains(&owner) && !primitive(model, owner).is_root() {
             let check = GraphCheck {
                 model,
                 owner,
@@ -3548,7 +3547,7 @@ fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved:
             keep(check.choice("observe", "arrival", &["arrival", "result"]).map(drop));
             keep(check.choice("on_failure", "fail", &["fail", "skip"]).map(drop));
             keep(check.choice("on_cancel", "fail", &["fail", "skip"]).map(drop));
-            if primitive(model, owner) == "reduce" {
+            if primitive(model, owner) == Primitive::Reduce {
                 keep(check.required("initial").map(drop));
                 keep(check.required("combine").map(drop));
                 keep(check.choice("order", "source", &["source", "arrival"]).map(drop));

@@ -4,7 +4,7 @@ use bts_lang::syntax::{
     BinOp, Expr, ExprKind, GraphNode, GraphNodeDecl, GraphOrigin, GraphReferenceKind, GraphStep, ObjectItem, TemplatePart,
     parse,
 };
-use bts_lang::{DiagPhase, Value, semantics::compile, syntax::parse_traversal};
+use bts_lang::{DiagPhase, Primitive, Value, semantics::compile, syntax::parse_traversal};
 
 const COMPILATION_SOURCE: &str = include_str!("fixtures/compilation.bt");
 
@@ -30,7 +30,7 @@ fn braintrust_provider_schemas_compile_inherited_spans_and_propagation() {
     for name in ["tool", "task", "llm", "function", "scorer"] {
         let kind = model.kinds.iter().find(|kind| kind.name == name).unwrap();
         assert_eq!(kind.base, "span");
-        assert_eq!(kind.primitive, "node");
+        assert_eq!(kind.primitive, Primitive::Node);
         assert_eq!(kind.range.source, 1);
         assert!(
             kind.fields
@@ -1724,7 +1724,7 @@ fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
         model
             .kinds
             .iter()
-            .any(|kind| kind.name == "patient_data" && kind.primitive == "feeds")
+            .any(|kind| kind.name == "patient_data" && kind.primitive == Primitive::Feeds)
     );
     assert!(model.junctions.iter().any(|junction| junction.kind == "patient_join"));
 }
@@ -2260,10 +2260,33 @@ fn supplied_kinds_cover_every_construct_and_cross_source_forward_inheritance() {
     "#,
     };
     let model = compile_with_definitions(source, &definitions).unwrap();
-    assert_eq!(model.kinds[model.kind_names["special"].0].primitive, "node");
-    assert_eq!(model.kinds[model.kind_names["delivery"].0].primitive, "feeds");
-    assert_eq!(model.kinds[model.kind_names["split"].0].primitive, "parallel");
-    assert_eq!(model.kinds[model.kind_names["join"].0].primitive, "accumulate");
+    assert_eq!(model.kinds[model.kind_names["special"].0].primitive, Primitive::Node);
+    assert_eq!(model.kinds[model.kind_names["delivery"].0].primitive, Primitive::Feeds);
+    assert_eq!(model.kinds[model.kind_names["split"].0].primitive, Primitive::Parallel);
+    assert_eq!(model.kinds[model.kind_names["join"].0].primitive, Primitive::Accumulate);
+    // every element carries the primitive its kind resolves to
+    let named = |name: &str| model.nodes.iter().find(|node| node.name.as_deref() == Some(name)).unwrap();
+    assert_eq!(named("a").primitive, Primitive::Node);
+    assert_eq!(
+        model
+            .edges
+            .iter()
+            .find(|edge| edge.name.as_deref() == Some("one"))
+            .unwrap()
+            .primitive,
+        Primitive::Feeds
+    );
+    assert_eq!(
+        model
+            .edges
+            .iter()
+            .find(|edge| edge.name.as_deref() == Some("two"))
+            .unwrap()
+            .primitive,
+        Primitive::Next
+    );
+    assert_eq!(model.forks[0].primitive, Primitive::Parallel);
+    assert_eq!(model.junctions[0].primitive, Primitive::Accumulate);
     assert_eq!(model.kinds[model.kind_names["span"].0].range.source, 2);
 }
 
@@ -3285,5 +3308,26 @@ fn provided_context_keys_carry_values_lowered_for_each_element() {
             }),
             "{source}\n{errors:#?}"
         );
+    }
+}
+
+#[test]
+fn primitives_match_the_language_reference() {
+    // the reference lists every primitive that is not a construct root, under the same construct
+    for described in bts_lang::spec::SPEC.primitives {
+        let construct = Primitive::ALL
+            .into_iter()
+            .find(|primitive| primitive.is_root() && primitive.name() == described.construct)
+            .unwrap()
+            .construct();
+        let primitive = Primitive::named(construct, described.name);
+        assert!(primitive.is_some(), "{} has no primitive", described.name);
+    }
+    for primitive in Primitive::ALL {
+        assert_eq!(Primitive::named(primitive.construct(), primitive.name()), Some(primitive));
+        if !primitive.is_root() {
+            let described = bts_lang::spec::SPEC.primitive(primitive.construct().name(), primitive.name());
+            assert!(described.is_some(), "{} is not in the reference", primitive.name());
+        }
     }
 }
