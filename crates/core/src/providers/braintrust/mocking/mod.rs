@@ -9,7 +9,7 @@ pub mod data;
 
 use crate::mocking as execution;
 use bts_lang as graph;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Compiles source with the Braintrust definitions for the mocking consumers.
 pub fn compile(source: &str) -> Result<execution::Model, String> {
@@ -18,7 +18,7 @@ pub fn compile(source: &str) -> Result<execution::Model, String> {
 
 /// Lowers provider behavior graphs into shared mocking execution plans.
 ///
-/// Membership, progression and span parenting remain separate relationships.
+/// Membership is every step the entry leads to, and a calls edge makes its target a child span.
 /// Acyclic nested behavior uses a static plan. Cycles and junctions retain
 /// occurrence scopes, queues and group closure in a graph plan.
 /// Both consumers enforce traversal limits and a 10000 occurrence budget.
@@ -95,12 +95,7 @@ fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
             continue;
         }
         let agent = graph::NodeId(index);
-        let members: HashSet<_> = model
-            .edges
-            .iter()
-            .filter(|edge| edge.source == agent && inherits(model, &edge.kind, "contains"))
-            .map(|edge| edge.target)
-            .collect();
+        let Structure { members, parents } = structure(model, agent)?;
         let entry = model
             .edges
             .iter()
@@ -166,7 +161,7 @@ fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
             || model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
             || model.junctions.iter().any(|junction| members.contains(&junction.target))
         {
-            lower_flow(model, agent, &members, &mut result).at(node.range)?;
+            lower_flow(model, agent, &members, parents, &mut result).at(node.range)?;
             continue;
         }
         let mut lowerer = AgentLowering::new(model, agent, &mut result).at(node.range)?;
@@ -425,6 +420,7 @@ fn lower_flow(
     graph: &graph::Model,
     agent: graph::NodeId,
     members: &HashSet<graph::NodeId>,
+    parents: HashMap<graph::NodeId, graph::NodeId>,
     result: &mut execution::Model,
 ) -> Result<(), Error> {
     let entries: Vec<_> = graph
@@ -436,20 +432,8 @@ fn lower_flow(
         return Err("agent needs one unconditional entry edge".into());
     }
     let root = entries[0].target;
-    if !members.contains(&root) {
-        return Err(located(entries[0].range, "agent entry must be a member"));
-    }
     if !inherits(graph, &graph.nodes[root.0].kind, "task") && graph.nodes[root.0].kind != "span" {
         return Err(located(graph.nodes[root.0].range, "the entry must be a task or span"));
-    }
-    let mut parents = HashMap::new();
-    for edge in &graph.edges {
-        if members.contains(&edge.source)
-            && inherits(graph, &edge.kind, "child_of")
-            && (!members.contains(&edge.target) || !edge.props.is_empty() || parents.insert(edge.source, edge.target).is_some())
-        {
-            return Err(located(edge.range, "child_of needs one unconfigured member parent"));
-        }
     }
     if parents.contains_key(&root) {
         return Err(located(graph.nodes[root.0].range, "entry span cannot have a parent"));
@@ -463,7 +447,7 @@ fn lower_flow(
             }
             cursor = *parents
                 .get(&cursor)
-                .ok_or("each member needs a child_of path to the entry span")
+                .ok_or("each step after the entry needs a parent span")
                 .at(graph.nodes[cursor.0].range)?;
         }
     }
@@ -530,7 +514,7 @@ fn lower_flow(
     }
     let mut edges = vec![];
     for (id, edge) in graph.edges.iter().enumerate() {
-        if !members.contains(&edge.source) || inherits(graph, &edge.kind, "child_of") {
+        if !members.contains(&edge.source) {
             continue;
         }
         if !members.contains(&edge.target) || edge.direction != graph::Direction::Directed {
@@ -903,6 +887,135 @@ fn scorer_steps(value: Option<execution::Value>) -> Result<Vec<execution::Scorer
         .collect()
 }
 
+/// An agent's members and the parent of each member below the entry.
+struct Structure {
+    members: HashSet<graph::NodeId>,
+    parents: HashMap<graph::NodeId, graph::NodeId>,
+}
+
+// membership and parenting are derived from the edges the entry leads to
+fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Error> {
+    let named = |node: graph::NodeId| match &graph.nodes[node.0].name {
+        Some(name) => format!("`{name}`"),
+        None => "this step".to_owned(),
+    };
+    for edge in graph.edges.iter().filter(|edge| edge.source == agent) {
+        if inherits(graph, &edge.kind, "contains") {
+            return Err(located(
+                edge.range,
+                "agent membership comes from the entry edge, remove this `contains` edge",
+            ));
+        }
+        if inherits(graph, &edge.kind, "calls") {
+            return Err(located(
+                edge.range,
+                "an agent emits no span, enter its first step with a `next` edge",
+            ));
+        }
+    }
+    let entries: Vec<_> = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.source == agent && inherits(graph, &edge.kind, "next"))
+        .map(|edge| edge.target)
+        .collect();
+    // members are the nodes the entry leads to along next edges and through junctions
+    let mut members = HashSet::new();
+    let mut pending = entries.clone();
+    while let Some(node) = pending.pop() {
+        if !members.insert(node) {
+            continue;
+        }
+        pending.extend(
+            (graph.edges.iter())
+                .filter(|edge| edge.source == node && inherits(graph, &edge.kind, "next"))
+                .map(|edge| edge.target),
+        );
+        pending.extend(
+            (graph.junctions.iter())
+                .filter(|junction| junction.inputs.iter().any(|input| graph.edges[input.0].source == node))
+                .map(|junction| junction.target),
+        );
+    }
+    // a member's parent is the source of the calls edge that supplies its parent key
+    let mut parents = HashMap::new();
+    for index in 0..graph.nodes.len() {
+        let node = graph::NodeId(index);
+        // an edge back to the entry is a cycle, which each lowering reports itself
+        if !members.contains(&node) || entries.contains(&node) {
+            continue;
+        }
+        let sources: BTreeSet<_> = (graph.context.get(index).into_iter().flatten())
+            .filter(|supply| supply.key == "parent")
+            .flat_map(|supply| &supply.suppliers)
+            .filter_map(|supplier| match supplier {
+                graph::ElementId::Edge(edge) => Some(graph.edges[edge.0].source),
+                _ => None,
+            })
+            .filter(|source| members.contains(source))
+            .collect();
+        let sources: Vec<_> = sources.into_iter().collect();
+        match sources.as_slice() {
+            [] => {}
+            [parent] => {
+                parents.insert(node, *parent);
+            }
+            [first, second, ..] => {
+                if let Some(junction) = graph.junctions.iter().find(|junction| junction.target == node) {
+                    let inputs: Option<Vec<_>> = (junction.inputs.iter())
+                        .map(|input| graph.edges[input.0].name.as_ref().map(|name| format!("`{name}`")))
+                        .collect();
+                    let inputs = match inputs {
+                        Some(names) if names.len() > 1 => {
+                            format!(" {} and {}", names[..names.len() - 1].join(", "), names[names.len() - 1])
+                        }
+                        _ => String::new(),
+                    };
+                    return Err(located(
+                        junction.range,
+                        format!("junction inputs{inputs} give {} different parent spans", named(node)),
+                    ));
+                }
+                return Err(located(
+                    graph.nodes[index].range,
+                    format!(
+                        "{} is reached under different parent spans, {} and {}",
+                        named(node),
+                        named(*first),
+                        named(*second)
+                    ),
+                ));
+            }
+        }
+    }
+    // without a calls edge out of the entry, its first step would be a second root
+    if let [entry] = entries.as_slice() {
+        let missing = |node: &graph::NodeId| node != entry && !parents.contains_key(node);
+        if let Some(edge) = (graph.edges.iter())
+            .find(|edge| edge.source == *entry && inherits(graph, &edge.kind, "next") && missing(&edge.target))
+        {
+            return Err(located(
+                edge.range,
+                format!(
+                    "{} has no parent span, go down from {} with a `calls` edge",
+                    named(edge.target),
+                    named(*entry)
+                ),
+            ));
+        }
+        if let Some(node) = (0..graph.nodes.len())
+            .map(graph::NodeId)
+            .find(|node| members.contains(node) && missing(node))
+        {
+            return Err(located(
+                graph.nodes[node.0].range,
+                format!("{} has no parent span", named(node)),
+            ));
+        }
+    }
+    Ok(Structure { members, parents })
+}
+
 fn inherits(model: &graph::Model, kind: &str, base: &str) -> bool {
     let mut name = kind;
     for _ in 0..=model.kinds.len() {
@@ -931,14 +1044,9 @@ struct AgentLowering<'a> {
 
 impl<'a> AgentLowering<'a> {
     fn new(graph: &'a graph::Model, agent: graph::NodeId, result: &'a mut execution::Model) -> Result<Self, Error> {
-        let mut members = HashSet::new();
-        for edge in &graph.edges {
-            if edge.source == agent && inherits(graph, &edge.kind, "contains") && !members.insert(edge.target) {
-                return Err(located(edge.range, "duplicate agent membership"));
-            }
-        }
+        let Structure { members, parents } = structure(graph, agent)?;
         if members.is_empty() {
-            return Err("agent needs explicit contains membership".into());
+            return Err("agent needs one next entry edge".into());
         }
         for fork in &graph.forks {
             if fork.source != agent && !members.contains(&fork.source) {
@@ -965,7 +1073,6 @@ impl<'a> AgentLowering<'a> {
             }
         }
         let mut next: HashMap<graph::NodeId, Vec<(graph::NodeId, Vec<graph::BindingId>)>> = HashMap::new();
-        let mut parents = HashMap::new();
         let mut inputs = HashMap::new();
         for edge in &graph.edges {
             if edge.source != agent && !members.contains(&edge.source) {
@@ -978,9 +1085,6 @@ impl<'a> AgentLowering<'a> {
                 return Err(located(edge.range, "agent edges must target a member of the same agent"));
             }
             let kind = &edge.kind;
-            if inherits(graph, kind, "contains") && edge.source == agent {
-                continue;
-            }
             if inherits(graph, kind, "next") {
                 let mut guards = Vec::new();
                 for id in &edge.props {
@@ -1011,13 +1115,6 @@ impl<'a> AgentLowering<'a> {
                     ));
                 }
                 targets.push((edge.target, guards));
-            } else if inherits(graph, kind, "child_of") {
-                if edge.source == agent || !edge.props.is_empty() {
-                    return Err(located(edge.range, "child_of requires span endpoints without configuration"));
-                }
-                if parents.insert(edge.source, edge.target).is_some() {
-                    return Err(located(edge.range, "a span cannot have multiple child_of parents"));
-                }
             } else if inherits(graph, kind, "feeds") {
                 let mut value = None;
                 let mut into = None;
@@ -1155,7 +1252,7 @@ impl<'a> AgentLowering<'a> {
             let range = graph.nodes[node.0].range;
             let parent = parents
                 .get(node)
-                .ok_or("each non-root span needs a child_of parent")
+                .ok_or("each step after the entry needs a parent span")
                 .at(range)?;
             if !order[..position].contains(parent) {
                 return Err(located(range, "a span parent must be entered before its child"));
@@ -1875,17 +1972,13 @@ impl<'a> AgentLowering<'a> {
             && !self.order.contains(&node)
             && node != self.agent
         {
-            let owners = self
-                .graph
-                .edges
-                .iter()
-                .filter(|edge| {
-                    edge.target == node
-                        && inherits(self.graph, &edge.kind, "contains")
-                        && inherits(self.graph, &self.graph.nodes[edge.source.0].kind, "agent")
-                })
-                .map(|edge| edge.source)
-                .collect::<Vec<_>>();
+            let mut owners = Vec::new();
+            for (index, candidate) in self.graph.nodes.iter().enumerate() {
+                let agent = graph::NodeId(index);
+                if inherits(self.graph, &candidate.kind, "agent") && structure(self.graph, agent)?.members.contains(&node) {
+                    owners.push(agent);
+                }
+            }
             if owners.len() != 1 {
                 return Err("external value references need one owning agent".into());
             }
@@ -2014,6 +2107,9 @@ impl<'a> AgentLowering<'a> {
                 },
                 range: self.graph.bindings[binding.0].range,
             },
+            G::Context { path, .. } if path.first().is_some_and(|key| key == "parent") => {
+                return Err("`context.parent` is supplied to the provider and cannot be read by a field".into());
+            }
             G::Context { path, .. } if self.flow => V::Func {
                 func: execution::Func::FlowContext(path.clone()),
                 range: self.graph.nodes[self.root.0].range,

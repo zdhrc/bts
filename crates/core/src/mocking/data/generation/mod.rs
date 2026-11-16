@@ -296,7 +296,6 @@ mod snapshot_tests {
         let model = compile(
             r#"(sample_root:task {name: "sample"}) {input: sample.input, output: self.input.first + self.input.second};
 (sample:agent) {input: {first: range (1 , 1000000000), second: range (1 , 1000000000)}, output: sample_root.output};
-(sample)-[:contains]->(sample_root);
 (sample)-[:next]->(sample_root);
 (dataset_cases_inline:case {name: "inline"}) {input: (sample_root).input, expected: (sample_root).output, metadata: {first: (sample_root).input.first}, tags: [|"sample-${(sample_root).input.second}"|]};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_inline)|]};"#,
@@ -319,15 +318,9 @@ mod snapshot_tests {
 (answer:task {name: "answer"}) {input: support_root.input.request};
 (reply:tool {name: "reply"}) {input: {query: answer.input}, output: {answer: "answer", request: self.input.query}};
 (support:agent) {input: {request: "question"}, output: support_root.output};
-(support)-[:contains]->(support_root);
-(support)-[:contains]->(answer);
-(answer)-[:child_of]->(support_root);
-(support)-[:contains]->(reply);
-(reply)-[:child_of]->(answer);
-(support)-[:next]->(support_root)-[:next]->(answer)-[:next]->(reply);
+(support)-[:next]->(support_root)-[:calls]->(answer)-[:calls]->(reply);
 (deferred_root:task {name: "deferred"}) {input: deferred.input, output: 1 / range (0 , 0)};
 (deferred:agent) {input: "question", output: deferred_root.output};
-(deferred)-[:contains]->(deferred_root);
 (deferred)-[:next]->(deferred_root);
 (dataset_cases_trace:case {name: "trace"}) {source: (support_root)};
 (dataset_cases_span:case {name: "span"}) {source: (reply)};
@@ -362,11 +355,9 @@ mod snapshot_tests {
         let model = compile(
             r#"(first_root:task {name: "first"}) {input: first.input, output: self.input.number * 2};
 (first:agent) {input: {label: "first", number: range (1 , 1000000)}, output: first_root.output};
-(first)-[:contains]->(first_root);
 (first)-[:next]->(first_root);
 (second_root:task {name: "second"}) {input: second.input, output: self.input.number * 2};
 (second:agent) {input: {label: "second", number: range (1 , 1000000)}, output: second_root.output};
-(second)-[:contains]->(second_root);
 (second)-[:next]->(second_root);
 (dataset_cases_group:case {name: "group"}) {traces: [|(second_root) , (first_root) , (second_root)|]};
 (dataset_cases_override:case {name: "override"}) {traces: [|(second_root) , (first_root)|], expected: "reviewed group"};
@@ -397,13 +388,9 @@ mod snapshot_tests {
             r#"(empty_root:task {name: "empty"}) {input: empty.input};
 (empty_1:task {name: "empty"}) {};
 (empty:agent) {input: null, output: null};
-(empty)-[:contains]->(empty_root);
-(empty)-[:contains]->(empty_1);
-(empty_1)-[:child_of]->(empty_root);
-(empty)-[:next]->(empty_root)-[:next]->(empty_1);
+(empty)-[:next]->(empty_root)-[:calls]->(empty_1);
 (answer_root:task {name: "answer"}) {output: "answer", input: answer.input};
 (answer:agent) {input: null, output: answer_root.output};
-(answer)-[:contains]->(answer_root);
 (answer)-[:next]->(answer_root);
 (dataset_cases_trace:case {name: "trace"}) {source: (empty_root)};
 (dataset_cases_span:case {name: "span"}) {source: (empty_1)};
@@ -426,7 +413,6 @@ mod snapshot_tests {
         let model = compile(
             r#"(document_root:task {name: "document"}) {input: document.input};
 (document:agent) {input: attachment ("report.txt" , "text/plain"), output: null};
-(document)-[:contains]->(document_root);
 (document)-[:next]->(document_root);
 (dataset_cases_inline:case {name: "inline"}) {input: {files: [|attachment ("report.txt" , "text/plain")|]}};
 (dataset_cases_trace:case {name: "trace"}) {source: (document_root)};
@@ -462,10 +448,7 @@ mod experiment_tests {
 (support_root:support_task {name: "support"}) {input: support.input, source: (support_root)};
 (lookup:task {name: "lookup"}) {output: "answer"};
 (support:agent) {input: "question", output: null};
-(support)-[:contains]->(support_root);
-(support)-[:contains]->(lookup);
-(lookup)-[:child_of]->(support_root);
-(support)-[:next]->(support_root)-[:next]->(lookup);
+(support)-[:next]->(support_root)-[:calls]->(lookup);
 (dataset_cases_whole:case {name: "whole"}) {source: support_root.source};
 (dataset_cases_span:case {name: "span"}) {source: (lookup)};
 (dataset_cases_fields:case {name: "fields"}) {input: support_root.source.input, expected: lookup.output};
@@ -485,26 +468,14 @@ mod experiment_tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"
 (workflow:agent) {input: "outer", output: null};
-(workflow)-[:contains]->(root);
-(workflow)-[:contains]->(unused);
-(workflow)-[:contains]->(selected);
-(workflow)-[:contains]->(first);
-(workflow)-[:contains]->(second);
 (workflow)-[:next]->(root:task) {input: workflow.input};
-(root)=[:repeat {count: range(-2, -1)}]=>[-[:next]->(unused:tool) {output: "unused"}];
-(unused)-[:child_of]->(root);
-(root)-[:next]->(selected:task {name: "answer"}) {
+(root)=[:repeat {count: range(-2, -1)}]=>[-[:calls]->(unused:tool) {output: "unused"}];
+(root)-[:calls]->(selected:task {name: "answer"}) {
  input: "fallback", output: self.input == "use" ? details.output : "no dependency"
-}-[:next]->(first:llm) {output: second.output}-[:next]->(second:llm) {output: "reply"};
-(selected)-[:child_of]->(root);
-(first)-[:child_of]->(selected);
-(second)-[:child_of]->(selected);
+}-[:calls]->(first:llm) {output: second.output}-[:next]->(second:llm) {output: "reply"};
 (context_agent:agent) {input: null, output: null};
-(context_agent)-[:contains]->(details);
-(context_agent)-[:contains]->(context_unused);
 (context_agent)-[:next]->(details:task) {input: context_agent.input, output: "support context"};
-(details)=[:repeat {count: range(-2, -1)}]=>[-[:next]->(context_unused:tool) {output: "unused"}];
-(context_unused)-[:child_of]->(details);
+(details)=[:repeat {count: range(-2, -1)}]=>[-[:calls]->(context_unused:tool) {output: "unused"}];
 
 (one:case) {input: "question"};
 (cases:dataset) {cases: [|(one)|]};
@@ -537,10 +508,8 @@ mod experiment_tests {
     fn selected_trace_skips_unrelated_errors_but_reports_used_dependency_errors() {
         let source = r#"
 (good:agent) {input: "fallback", output: selected.output};
-(good)-[:contains]->(selected);
 (good)-[:next]->(selected:task) {input: good.input, output: "ok"};
 (bad:agent) {input: null, output: bad_root.output};
-(bad)-[:contains]->(bad_root);
 (bad)-[:next]->(bad_root:task) {input: bad.input, output: 1 / range(0, 0)};
 
 (one:case) {input: "question"};
@@ -588,16 +557,7 @@ mod experiment_tests {
 (reply:llm {name: "reply"}) {input: answer.input, output: answer.output};
 (quality:scorer {name: "quality"}) {score: 0};
 (workflow:agent) {input: "outer fallback", output: null};
-(workflow)-[:contains]->(workflow_root);
-(workflow)-[:contains]->(context_node);
-(context_node)-[:child_of]->(workflow_root);
-(workflow)-[:contains]->(answer);
-(answer)-[:child_of]->(workflow_root);
-(workflow)-[:contains]->(reply);
-(reply)-[:child_of]->(answer);
-(workflow)-[:contains]->(quality);
-(quality)-[:child_of]->(answer);
-(workflow)-[:next]->(workflow_root)-[:next]->(context_node)-[:next]->(answer)-[:next]->(reply)-[:next]->(quality);
+(workflow)-[:next]->(workflow_root)-[:calls]->(context_node)-[:next]->(answer)-[:calls]->(reply)-[:next]->(quality);
 (dataset_cases_one:case {name: "one"}) {input: "dataset input"};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
 (quality_function:scorer {name: "quality"}) {score: 1};
@@ -627,11 +587,8 @@ mod experiment_tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"
 (t:agent) {input: "fallback", output: selected.output};
-(t)-[:contains]->(selected);
-(t)-[:contains]->(lookup);
 (t)-[:next]->(selected:task) {input: t.input, output: self.input};
-(selected)=[:repeat {count: 2}]=>[-[:next]->(lookup:tool) {input: selected.input, output: context.index}];
-(lookup)-[:child_of]->(selected);
+(selected)=[:repeat {count: 2}]=>[-[:calls]->(lookup:tool) {input: selected.input, output: context.index}];
 
 (one:case) {input: "question"};
 (cases:dataset) {cases: [|(one)|]};

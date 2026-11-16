@@ -437,7 +437,6 @@ mod agent_tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {output: "hello", input: hello.input};
 (hello:agent) {input: null, output: t_root.output};
-(hello)-[:contains]->(t_root);
 (hello)-[:next]->(t_root);"#,
         )
         .unwrap();

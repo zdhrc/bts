@@ -16,19 +16,15 @@ const SIMPLE_SHAPE: &str = r#"(conversation_agent:agent {name: "conversation"}) 
     input: conversation_agent.input,
     output: null
 };
-(conversation_agent)-[:contains]->(conversation);
-(conversation)-[:next]->(turn);
+(conversation)-[:calls]->(turn);
 (turn:task);
-(conversation_agent)-[:contains]->(turn);
-(turn)-[:child_of]->(conversation);
-(turn)-[:next]->("gpt-4o-mini");
+(turn)-[:calls]->("gpt-4o-mini");
 ("gpt-4o-mini":llm) {
     input: "Hello ${context.trace_index}",
     output: choice(true, false) ? "Hi!" : "Hey!",
     metrics: {tokens: 2 * 2, latency: range(1, 5) * 100}
 };
-(conversation_agent)-[:contains]->("gpt-4o-mini");
-("gpt-4o-mini")-[:child_of]->(turn);"#;
+"#;
 
 #[test]
 fn experiment_selection_errors_precede_credentials_and_seed_output() {
@@ -38,7 +34,6 @@ fn experiment_selection_errors_precede_credentials_and_seed_output() {
     input: t_agent.input,
     output: t.input
 };
-(t_agent)-[:contains]->(t);
 (cases:dataset) {
     cases: [|(one)|]
 };
@@ -119,46 +114,34 @@ fn experiment_dry_run_selects_tasks_without_auth_or_scorer_calls() {
     input: workflow_agent.input,
     output: null
 };
-(workflow_agent)-[:contains]->(workflow);
-(workflow) =[:repeat {count: range(- 2, - 1)}]=>[-[:next]->(unused_unused)];
+(workflow) =[:repeat {count: range(- 2, - 1)}]=>[-[:calls]->(unused_unused)];
 (unused_unused:tool {name: "unused"}) {
     output: "unused"
 };
-(workflow_agent)-[:contains]->(unused_unused);
-(unused_unused)-[:child_of]->(workflow);
-(workflow)-[:next]->(answer);
+(workflow)-[:calls]->(answer);
 (answer:task) {
     input: "fallback",
     output: self.input == "blocked" ? "Cannot recover this account" : "Recovery instructions sent"
 };
-(workflow_agent)-[:contains]->(answer);
-(answer)-[:child_of]->(workflow);
-(answer)-[:next]->(reply);
+(answer)-[:calls]->(reply);
 (reply:llm) {
     input: answer.input,
     output: answer.output
 };
-(workflow_agent)-[:contains]->(reply);
-(reply)-[:child_of]->(answer);
-(answer)-[:next]->(quality);
+(answer)-[:calls]->(quality);
 (quality:scorer) {
     score: 0
 };
-(workflow_agent)-[:contains]->(quality);
-(quality)-[:child_of]->(answer);
 (unrelated_agent:agent {name: "unrelated"}) {input: null, output: unrelated.output};
 (unrelated_agent)-[:next]->(unrelated);
 (unrelated:task) {
     input: unrelated_agent.input,
     output: null
 };
-(unrelated_agent)-[:contains]->(unrelated);
-(unrelated) =[:repeat {count: range(- 2, - 1)}]=>[-[:next]->(unused_unused_)];
+(unrelated) =[:repeat {count: range(- 2, - 1)}]=>[-[:calls]->(unused_unused_)];
 (unused_unused_:tool {name: "unused"}) {
     output: "unused"
 };
-(unrelated_agent)-[:contains]->(unused_unused_);
-(unused_unused_)-[:child_of]->(unrelated);
 (scorer_quality:scorer {name: "quality"}) {
     score: context.output == context.expected ? 1 : 0
 };
@@ -224,7 +207,6 @@ fn experiment_upload_failure_reports_completed_runs_in_human_and_json_output() {
     input: t_agent.input,
     output: t.input
 };
-(t_agent)-[:contains]->(t);
 (cases:dataset) {
     cases: [|(one)|]
 };
@@ -377,20 +359,15 @@ fn write_filter_omits_synthetic_scorers_without_changing_application_values() {
     input: support_agent.input,
     output: weighted([|"resolved", 3|],[|"escalated", 1|])
 };
-(support_agent)-[:contains]->(support);
-(support)-[:next]->("Chat Completion");
+(support)-[:calls]->("Chat Completion");
 ("Chat Completion":llm) {
     output: support.output
 };
-(support_agent)-[:contains]->("Chat Completion");
-("Chat Completion")-[:child_of]->(support);
-("Chat Completion")-[:next]->("answer-quality");
+("Chat Completion")-[:calls]->("answer-quality");
 ("answer-quality":scorer) {
     score: clamp(normal(0.75, 0.1), 0, 1),
     reason: format("Observed {}", support.output)
 };
-(support_agent)-[:contains]->("answer-quality");
-("answer-quality")-[:child_of]->("Chat Completion");
 ("scorer_answer-quality":scorer {name: "answer-quality"}) {
     score: context.output == "resolved" ? 1 : 0
 };"#,
@@ -460,28 +437,18 @@ fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     input: session_agent.input,
     output: null
 };
-(session_agent)-[:contains]->(session);
-(session) =[:repeat {count: range(1, 4)}]=>[-[:next]->(turn)];
+(session) =[:repeat {count: range(1, 4)}]=>[-[:calls]->(turn)];
 (turn:task) {
     input: "question ${context.index}"
 };
-(session_agent)-[:contains]->(turn);
-(turn)-[:child_of]->(session);
-(turn)-[:next]->(draft);
+(turn)-[:calls]->(draft);
 (draft:llm);
-(session_agent)-[:contains]->(draft);
-(draft)-[:child_of]->(turn);
-(session) =[:weighted]=>[-[:next {weight: 1}]->(get_order_status), -[:next {weight: 1}]->(summarize_session)];
+(session) =[:weighted]=>[-[:calls {weight: 1}]->(get_order_status), -[:calls {weight: 1}]->(summarize_session)];
 (get_order_status:tool);
-(session_agent)-[:contains]->(get_order_status);
-(get_order_status)-[:child_of]->(session);
 (summarize_session:function);
-(session_agent)-[:contains]->(summarize_session);
-(summarize_session)-[:child_of]->(session);
-(session) =[:conditional]=>[-[:next {when: chance(0.25)}]->(escalation)];
+(session) =[:conditional]=>[-[:calls {when: chance(0.25)}]->(escalation)];
 (escalation:task);
-(session_agent)-[:contains]->(escalation);
-(escalation)-[:child_of]->(session);"#,
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -531,15 +498,13 @@ fn dry_run_resolves_context_references_in_expressions() {
     output: null,
     local: {messages: [|"q0", "a0", "q1", "a1", "q2", "a2"|]}
 };
-(conversation_agent)-[:contains]->(conversation);
-(conversation) =[:repeat {count: 3}]=>[-[:next]->(chat)];
+(conversation) =[:repeat {count: 3}]=>[-[:calls]->(chat)];
 (chat:llm) {
     input: conversation.local.messages[: ${context.index * 2} + 1],
     output: conversation.local.messages[${context.index * 2} + 1],
     metrics: {turn: context.index + 1, of: context.count}
 };
-(conversation_agent)-[:contains]->(chat);
-(chat)-[:child_of]->(conversation);"#,
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -617,13 +582,11 @@ fn dry_run_honors_span_durations() {
     input: session_agent.input,
     output: null
 };
-(session_agent)-[:contains]->(session);
-(session)-[:next]->(chat);
+(session)-[:calls]->(chat);
 (chat:llm) {
     duration: 2.5
 };
-(session_agent)-[:contains]->(chat);
-(chat)-[:child_of]->(session);"#,
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -654,7 +617,7 @@ fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     input: t_agent.input,
     output: null
 };
-(t_agent)-[:contains]->(t);"#,
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -682,15 +645,13 @@ fn threads_referenced_content_across_spans() {
     input: support_agent.input,
     output: chat.output.content
 };
-(support_agent)-[:contains]->(support);
-(support)-[:next]->(chat);
+(support)-[:calls]->(chat);
 (chat:llm) {
     input: [|{role: "user", content: support.input}|],
     output: {role: "assistant", content: choice("Yes -- add it under Billing Settings.", "Yes, in Tax IDs.")},
     metrics: {prompt_tokens: round(lognormal(400, 0.3)), completion_tokens: round(lognormal(40, 0.5)), tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}
 };
-(support_agent)-[:contains]->(chat);
-(chat)-[:child_of]->(support);"#,
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -756,7 +717,7 @@ fn uploads_an_attachment_before_inserting_its_reference() {
     fs::write(&file, contents).unwrap();
     let path_literal = serde_json::to_string(&file.display().to_string()).unwrap();
     let shape = write_shape(&format!(
-        "(review_agent:agent) {{input: {{document: attachment({path_literal}, \"application/pdf\")}}, output: null}}; (review_agent)-[:contains, :next]->(review:task) {{input: review_agent.input}};"
+        "(review_agent:agent) {{input: {{document: attachment({path_literal}, \"application/pdf\")}}, output: null}}; (review_agent)-[:next]->(review:task) {{input: review_agent.input}};"
     ));
     let project_id = Uuid::new_v4();
     let root = write_project_context(project_id);
@@ -824,25 +785,18 @@ fn filtered_blocks_do_not_upload_attachments_or_emit_scorer_spans() {
     input: review_agent.input,
     output: null
 };
-(review_agent)-[:contains]->(review);
-(review)-[:next]->("attachment-holder");
+(review)-[:calls]->("attachment-holder");
 ("attachment-holder":task) {
     output: attachment("filtered-out.pdf", "application/pdf")
 };
-(review_agent)-[:contains]->("attachment-holder");
-("attachment-holder")-[:child_of]->(review);
-(review)-[:next]->(scored);
+(review)-[:calls]->(scored);
 (scored:task) {
     output: "ok"
 };
-(review_agent)-[:contains]->(scored);
-(scored)-[:child_of]->(review);
-(scored)-[:next]->("inline-score");
+(scored)-[:calls]->("inline-score");
 ("inline-score":scorer) {
     score: 1
 };
-(review_agent)-[:contains]->("inline-score");
-("inline-score")-[:child_of]->(scored);
 ("scorer_inline-score":scorer {name: "inline-score"}) {
     score: 1
 };"#,
@@ -894,7 +848,7 @@ fn attachment_keys_are_run_scoped_and_distinguish_full_paths() {
     fs::write(
         &shape,
         format!(
-            "(review_agent:agent) {{input: {{first: attachment({first_name}, \"application/pdf\"), same: attachment({first_path}, \"application/pdf\"), second: attachment({second_path}, \"application/pdf\"), other_type: attachment({first_path}, \"text/plain\")}}, output: null}}; (review_agent)-[:contains, :next]->(review:task) {{input: review_agent.input}};"
+            "(review_agent:agent) {{input: {{first: attachment({first_name}, \"application/pdf\"), same: attachment({first_path}, \"application/pdf\"), second: attachment({second_path}, \"application/pdf\"), other_type: attachment({first_path}, \"text/plain\")}}, output: null}}; (review_agent)-[:next]->(review:task) {{input: review_agent.input}};"
         ),
     )
     .unwrap();
@@ -944,7 +898,7 @@ fn resolves_relative_attachments_from_the_shape_directory() {
     input: review_agent.input,
     output: null
 };
-(review_agent)-[:contains]->(review);"#,
+"#,
     )
     .unwrap();
     let project_id = Uuid::new_v4();
@@ -1973,7 +1927,6 @@ fn sync_dataset_selection_skips_unselected_source_generation() {
     input: unavailable_agent.input,
     output: null
 };
-(unavailable_agent)-[:contains]->(unavailable);
 (keep:dataset) {
     cases: [|(inline)|]
 };
@@ -2156,7 +2109,7 @@ fn syntax_check_validates_files_and_stdin_semantics() {
     output: "hello",
     input: valid_agent.input
 };
-(valid_agent)-[:contains]->(valid);"#,
+"#,
     );
     let output = bts().args(["check", "syntax"]).arg(&shape).output().unwrap();
     fs::remove_file(&shape).unwrap();
@@ -2171,7 +2124,7 @@ fn syntax_check_validates_files_and_stdin_semantics() {
     output: "hello",
     input: valid_agent.input
 };
-(valid_agent)-[:contains]->(valid);"#,
+"#,
             None,
         ),
         (
@@ -2181,7 +2134,7 @@ fn syntax_check_validates_files_and_stdin_semantics() {
     output: missing.output,
     input: invalid_agent.input
 };
-(invalid_agent)-[:contains]->(invalid);"#,
+"#,
             Some("validation error"),
         ),
         ("(run:task) {output: }", Some("parsing error")),
@@ -2216,7 +2169,7 @@ const AGENT_HELLO_WORLD: &str = r#"("hello-world":agent) {input: "Hello, world!"
     input: ("hello-world").input,
     output: self.input
 };
-("hello-world")-[:contains]->("trace_hello-world");"#;
+"#;
 
 fn write_eval_sdk_stub(root: &std::path::Path, lang: &str) {
     if lang == "python" {
@@ -2303,7 +2256,7 @@ fn agent_typescript_builds_and_runs_without_project_or_sdk() {
     output: {label: "ordinary key", values:[|true, false, null, 42, 1.5, "hello\nworld"|]},
     input: literals.input
 };
-(literals)-[:contains]->(trace_literals);"#,
+"#,
         ),
     )
     .unwrap();
@@ -2647,7 +2600,6 @@ fn agent_scalar_expressions_preserve_integer_and_short_circuit_semantics() {
         unused_value: self.input.also_missing,
     }
 };
-(expressions)-[:contains]->(values);
 ("float-values":agent) {input: {n: 6.0, nested:[|6.0|]}, output: ("trace_float-values").output};
 ("float-values")-[:next]->("trace_float-values");
 ("trace_float-values":task {name: "float-values"}) {
@@ -2655,13 +2607,11 @@ fn agent_scalar_expressions_preserve_integer_and_short_circuit_semantics() {
     metadata: {number: number.output},
     output: {input_quotient: self.input.n / 4, input_text: format("{}", self.input.n), array_quotient: self.input.nested[0] / 4, child_quotient: number.output / 4, child_text: format("{}", number.output), metadata_quotient: self.metadata.number / 4, metadata_text: format("{}", self.metadata.number), arithmetic_quotient: ${6.5 - 0.5} / 4, arithmetic_text: format("{}", 6.5 - 0.5)}
 };
-("float-values")-[:contains]->("trace_float-values");
-("trace_float-values")-[:next]->(number);
+("trace_float-values")-[:calls]->(number);
 (number:tool) {
     output: 6.0
 };
-("float-values")-[:contains]->(number);
-(number)-[:child_of]->("trace_float-values");"#;
+"#;
     fs::write(root.join("shape.bt"), source).unwrap();
     let preview = bts()
         .current_dir(&root)
@@ -2788,67 +2738,45 @@ fn agent_collections_and_nested_repeats_run_in_both_languages() {
     input: collections.input,
     output: {names:[|("same-name").output, ("same name").output, ("123 lookup").output, class.output, ("!!!").output|], selected: self.input.values[self.input.index], sliced: self.input.values[self.input.start : self.input.end], length: len(self.input.text), results: row_results.output, first: row_results.output[0], tail: row_results.output[1 : 99], empty: never_results.output}
 };
-(collections)-[:contains]->(t);
-(t)-[:next]->("same-name");
+(t)-[:calls]->("same-name");
 ("same-name":tool) {
     output: "first"
 };
-(collections)-[:contains]->("same-name");
-("same-name")-[:child_of]->(t);
-(t)-[:next]->("same name");
+(t)-[:calls]->("same name");
 ("same name":tool) {
     output: "second"
 };
-(collections)-[:contains]->("same name");
-("same name")-[:child_of]->(t);
-(t)-[:next]->("123 lookup");
+(t)-[:calls]->("123 lookup");
 ("123 lookup":tool) {
     output: "numeric"
 };
-(collections)-[:contains]->("123 lookup");
-("123 lookup")-[:child_of]->(t);
-(t)-[:next]->(class);
+(t)-[:calls]->(class);
 (class:tool) {
     output: "keyword"
 };
-(collections)-[:contains]->(class);
-(class)-[:child_of]->(t);
-(t)-[:next]->("!!!");
+(t)-[:calls]->("!!!");
 ("!!!":tool) {
     output: "punctuation"
 };
-(collections)-[:contains]->("!!!");
-("!!!")-[:child_of]->(t);
 (t)
-    =[:repeat {count: 2}]=>[-[row_arrival:next]->(row)]
+    =[:repeat {count: 2}]=>[-[row_arrival:calls]->(row)]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [row_arrival]]>>(row_results:task) {output: context.accumulator};
 (row:task) {
     output: cell_results.output
 };
-(collections)-[:contains]->(row);
-(row)-[:child_of]->(t);
 (row)
-    =[:repeat {count: 2}]=>[-[cell_arrival:next]->(cell)]
+    =[:repeat {count: 2}]=>[-[cell_arrival:calls]->(cell)]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [cell_arrival]]>>(cell_results:task) {output: context.accumulator};
 (cell:tool) {
     output: {index: context.index, count: context.count, label: "cell-${context.index}"}
 };
-(collections)-[:contains]->(cell);
-(cell)-[:child_of]->(row);
 (t)
-    =[:repeat {count: 0}]=>[-[never_arrival:next]->(never)]
+    =[:repeat {count: 0}]=>[-[never_arrival:calls]->(never)]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [never_arrival]]>>(never_results:task) {output: context.accumulator};
 (never:tool) {
     output: "unreachable"
 };
-(collections)-[:contains]->(never);
-(never)-[:child_of]->(t);
-(collections)-[:contains]->(row_results);
-(row_results)-[:child_of]->(t);
-(collections)-[:contains]->(cell_results);
-(cell_results)-[:child_of]->(row);
-(collections)-[:contains]->(never_results);
-(never_results)-[:child_of]->(t);"#,
+"#,
     )
     .unwrap();
     for lang in ["python", "typescript"] {
@@ -2912,7 +2840,7 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
     fs::write(
         root.join("branches.bt"),
         r#"(branches:agent) {input: {}, output: root.output};
-(branches)-[:contains, :next]->(root:task) {
+(branches)-[:next]->(root:task) {
     input: branches.input,
     local: {route: range(0, 1)},
     output: {
@@ -2926,15 +2854,15 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
     },
 };
 (root) =[:exclusive]=>[
-    -[:next {when: source.local.route == 0}]->(left_route:tool) {output: {side: "left", other: null}},
-    -[:next {when: source.local.route == 1}]->(right_route:tool) {output: {side: "right", other: null}},
+    -[:calls {when: source.local.route == 0}]->(left_route:tool) {output: {side: "left", other: null}},
+    -[:calls {when: source.local.route == 1}]->(right_route:tool) {output: {side: "right", other: null}},
 ];
 (root) =[:conditional]=>[
-    -[:next {when: false}]->(bad:tool) {output: root.input.missing},
-    -[:next {when: true}]->(good:tool) {output: "yes"},
+    -[:calls {when: false}]->(bad:tool) {output: root.input.missing},
+    -[:calls {when: true}]->(good:tool) {output: "yes"},
 ];
 (root)
-    =[:repeat {count: 2}]=>[-[item:next]->(row:task) {
+    =[:repeat {count: 2}]=>[-[item:calls]->(row:task) {
         local: {included: chance(0.5), pick: self.local.included ? range(0, 1) : -1},
         output: {
             included: self.local.included, chosen: self.local.included ? self.local.pick : null,
@@ -2944,17 +2872,9 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
     }]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [item]]>>(results:task) {output: context.accumulator};
 (row) =[:exclusive]=>[
-    -[:next {when: source.local.included && source.local.pick == 0}]->(fast:tool) {output: format("request-{}", context.index)},
-    -[:next {when: source.local.included && source.local.pick == 1}]->(manual:tool) {output: format("request-{}", context.index)},
+    -[:calls {when: source.local.included && source.local.pick == 0}]->(fast:tool) {output: format("request-{}", context.index)},
+    -[:calls {when: source.local.included && source.local.pick == 1}]->(manual:tool) {output: format("request-{}", context.index)},
 ];
-(branches)-[:contains]->(left_route)-[:child_of]->(root);
-(branches)-[:contains]->(right_route)-[:child_of]->(root);
-(branches)-[:contains]->(bad)-[:child_of]->(root);
-(branches)-[:contains]->(good)-[:child_of]->(root);
-(branches)-[:contains]->(row)-[:child_of]->(root);
-(branches)-[:contains]->(fast)-[:child_of]->(row);
-(branches)-[:contains]->(manual)-[:child_of]->(row);
-(branches)-[:contains]->(results)-[:child_of]->(root);
 "#,
     )
     .unwrap();
@@ -3046,38 +2966,30 @@ fn agent_text_numeric_fields_and_forward_references_match_planner() {
     duration: self.input.duration,
     output: {upper: upper(trim(self.input.text)), lower: lower(trim(self.input.text)), replaced: replace(self.input.text, "|", "/"), unchanged: replace(self.input.text, "", "ignored"), parts: split(trim(self.input.text), self.input.separator), joined: join(self.input.items, ","), rendered: render("{{{name}}}: {n} {ok}", {name: self.metadata.first, n: 6.0, ok: true}), composed: compose([|null, "", "Hi!", render("{text}", {text: self.metadata.first})|]), sampled: sample([|"one", "two"|], 2), sample_empty: sample([||], 0), has: contains(self.input.items, "alpha"), distinct: contains(self.input.items, 1), starts: starts_with(trim(self.input.text), "Straße"), ends: ends_with(trim(self.input.text), "HELLO"), formatted: format("{}:{}", self.metadata.first, self.metrics.total), spread:[|"start",...self.input.items, "end"|], float_division: self.input.number / - 2, float_remainder: self.input.number % 2, float_text: format("{}", max(self.input.number, 4)), clamped: clamp(self.input.number, - 2, 2), rounded: round(self.input.number), floored: floor(self.input.number), ceiling: ceil(self.input.number), absolute: abs(self.input.number), smallest: min(self.input.number, 4, - 1), largest: max(self.input.number, 4, - 1), forward: earlier.output, expected: self.expected.answer, absent_error: self.error, error_only: ("error-only").error, selected:[|self.input.text, self.input.does_not_exist|][self.input.index]}
 };
-(fields)-[:contains]->(t);
-(t)-[:next]->("error-only");
+(t)-[:calls]->("error-only");
 ("error-only":tool) {
     error: "timeout",
     duration: 0.01
 };
-(fields)-[:contains]->("error-only");
-("error-only")-[:child_of]->(t);
-(t)-[:next]->(earlier);
+(t)-[:calls]->(earlier);
 (earlier:tool) {
     input: later.output,
     output: self.input,
     metadata: {status: self.output},
     duration: 0.15
 };
-(fields)-[:contains]->(earlier);
-(earlier)-[:child_of]->(t);
-(t)-[:next]->(later);
+(t)-[:calls]->(later);
 (later:tool) {
     input: inner.output,
     output: format("{}", self.input),
     error: "reservation-unavailable"
 };
-(fields)-[:contains]->(later);
-(later)-[:child_of]->(t);
-(later)-[:next]->(inner);
+(later)-[:calls]->(inner);
 (inner:function) {
     output: t.metadata.first,
     duration: 0.2
 };
-(fields)-[:contains]->(inner);
-(inner)-[:child_of]->(later);"#,
+"#,
     )
     .unwrap();
     let preview = bts()
@@ -3239,24 +3151,18 @@ fn agent_random_values_are_cached_scoped_and_lazy() {
     output: {shared: t.local.shared, copy: t.local.shared, forward: later.output, forward_copy: later.output, chosen: choice("safe", self.input.missing), weighted: weighted([|self.input.missing, 0|],[|"safe", 1|]), certain: chance(1), impossible: chance(0), float_division: range(1.0, 1.0) / 2, float_text: format("{}", range(1.0, 1.0)), normal: normal(10, 2), lognormal: lognormal(2, 0.3), exponential: exponential(3), pareto: pareto(2, 3), beta: beta(2, 3), poisson: poisson(6), large_poisson: poisson(1000000), uuid: uuid(), hex: hex(12), alphanum: alphanum(16), noise: noise(20), rows: row_results.output},
     local: {shared: range(10, 20)}
 };
-(random)-[:contains]->(t);
-(t)-[:next]->(later);
+(t)-[:calls]->(later);
 (later:tool) {
     output: range(100, 200)
 };
-(random)-[:contains]->(later);
-(later)-[:child_of]->(t);
 (t)
-    =[:repeat {count: 2}]=>[-[row_arrival:next]->(row)]
+    =[:repeat {count: 2}]=>[-[row_arrival:calls]->(row)]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [row_arrival]]>>(row_results:task) {output: context.accumulator};
 (row:tool) {
     local: {row_value: range(1, 100)},
     output: {value: row.local.row_value, copy: row.local.row_value}
 };
-(random)-[:contains]->(row);
-(row)-[:child_of]->(t);
-(random)-[:contains]->(row_results);
-(row_results)-[:child_of]->(t);"#,
+"#,
     )
     .unwrap();
     for lang in ["python", "typescript"] {
@@ -3350,26 +3256,20 @@ fn agent_traces_execution_and_preserves_partial_failures() {
     input: workflow.input,
     output: compute.output
 };
-(workflow)-[:contains]->(trace_workflow);
-(trace_workflow)-[:next]->(first);
+(trace_workflow)-[:calls]->(first);
 (first:tool) {
     output: range(1, 2)
 };
-(workflow)-[:contains]->(first);
-(first)-[:child_of]->(trace_workflow);
-(trace_workflow)-[:next]->(compute);
+(trace_workflow)-[:calls]->(compute);
 (compute:tool) {
     input: trace_workflow.input,
     output: 10 / self.input.divisor
 };
-(workflow)-[:contains]->(compute);
-(compute)-[:child_of]->(trace_workflow);
-(trace_workflow)-[:next]->("never-on-failure");
+(trace_workflow)-[:calls]->("never-on-failure");
 ("never-on-failure":tool) {
     output: "done"
 };
-(workflow)-[:contains]->("never-on-failure");
-("never-on-failure")-[:child_of]->(trace_workflow);"#,
+"#,
     )
     .unwrap();
     for lang in ["python", "typescript"] {
@@ -3471,21 +3371,17 @@ fn agent_native_values_preserve_results_names_and_lazy_failures() {
     output: {value: calculate.output, guarded: false && t.local.unused},
     local: {root_request: 6, unused: self.input.missing}
 };
-(native)-[:contains]->(t);
-(t)-[:next]->(calculate);
+(t)-[:calls]->(calculate);
 (calculate:tool) {
     input: {base: t.local.root_request},
     output: {amount: calculate.local.next * 2, copy: calculate.local.next, label: upper("ready")},
     local: {next: self.input.base + 1}
 };
-(native)-[:contains]->(calculate);
-(calculate)-[:child_of]->(t);
-(t) =[:repeat {count: 2}]=>[-[:next]->(check)];
+(t) =[:repeat {count: 2}]=>[-[:calls]->(check)];
 (check:tool) {
     output: context.index
 };
-(native)-[:contains]->(check);
-(check)-[:child_of]->(t);"#,
+"#,
     )
     .unwrap();
     for lang in ["python", "typescript"] {
@@ -3544,7 +3440,6 @@ fn scorer_rebuild_updates_existing_agent_evals_in_both_languages() {
     input: support.input,
     output: self.input
 };
-(support)-[:contains]->(trace_support);
 (cases:dataset) {
     cases: [|(hello)|]
 };
@@ -3669,7 +3564,6 @@ fn agent_evals_register_and_run_with_braintrust_sdks() {
     input: judged.input,
     output: self.input.question
 };
-(judged)-[:contains]->(trace_judged);
 ("judged-cases":dataset) {
     cases: [|(one)|]
 };
@@ -3886,49 +3780,41 @@ fn selected_agent_evals_snapshot_dynamic_and_source_cases() {
     input: echo.input,
     output: self.input
 };
-(echo)-[:contains]->(trace_echo);
 (group:agent) {input: [|0|], output: trace_group.output};
 (group)-[:next]->(trace_group);
 (trace_group:task {name: "group"}) {
     input: group.input,
     output: self.input
 };
-(group)-[:contains]->(trace_group);
 (unrelated:agent) {input: null, output: trace_unrelated.output};
 (unrelated)-[:next]->(trace_unrelated);
 (trace_unrelated:task {name: "unrelated"}) {
     output: attachment("unused.pdf", "application/pdf"),
     input: unrelated.input
 };
-(unrelated)-[:contains]->(trace_unrelated);
 (source_agent:agent {name: "source"}) {input: range(1, 1000000), output: source_task.output};
 (source_agent)-[:next]->(source_task);
 (source_task:task {name: "source"}) {
     input: source_agent.input,
     output: self.input
 };
-(source_agent)-[:contains]->(source_task);
-(source_task)-[:next]->(part);
+(source_task)-[:calls]->(part);
 (part:tool) {
     input: 7,
     output: self.input
 };
-(source_agent)-[:contains]->(part);
-(part)-[:child_of]->(source_task);
 (second_agent:agent {name: "second"}) {input: 8, output: second.output};
 (second_agent)-[:next]->(second);
 (second:task) {
     input: second_agent.input,
     output: self.input
 };
-(second_agent)-[:contains]->(second);
 (third_agent:agent {name: "third"}) {input: 9, output: third.output};
 (third_agent)-[:next]->(third);
 (third:task) {
     input: third_agent.input,
     output: self.input
 };
-(third_agent)-[:contains]->(third);
 (cases:dataset) {
     cases: [|(dynamic), (trace), (span)|]
 };

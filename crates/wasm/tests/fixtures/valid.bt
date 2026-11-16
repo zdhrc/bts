@@ -2,9 +2,9 @@
 
 # retries, a weighted route and two results reconciled into one payload
 (workflow:agent) {input: 2, output: finish.output};
-(workflow)-[:contains, :next]->(request:task) {input: workflow.input, output: finish.output};
+(workflow)-[:next]->(request:task) {input: workflow.input, output: finish.output};
 
-(request)-[:next, :feeds {value: 0, into: target.attempt}]->(attempt:lookup_tool {service: "patients"}) {
+(request)-[:calls, :feeds {value: 0, into: target.attempt}]->(attempt:lookup_tool {service: "patients"}) {
     attempt: <-,
     output: self.attempt + 1,
 };
@@ -24,12 +24,3 @@
         -[to_records:next]->(records:tool) {output: {attempts: attempt.output, found: true}},
     ]
         >[:accumulate {observe: "result"} [to_coverage], [to_records]]>>(finish:task) {output: context.arrivals};
-
-(workflow)-[:contains]->(attempt)-[:child_of]->(request);
-(workflow)-[:contains]->(route)-[:child_of]->(request);
-(workflow)-[:contains]->(primary)-[:child_of]->(request);
-(workflow)-[:contains]->(backup)-[:child_of]->(request);
-(workflow)-[:contains]->(selected)-[:child_of]->(request);
-(workflow)-[:contains]->(coverage)-[:child_of]->(request);
-(workflow)-[:contains]->(records)-[:child_of]->(request);
-(workflow)-[:contains]->(finish)-[:child_of]->(request);

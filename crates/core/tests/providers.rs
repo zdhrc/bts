@@ -118,7 +118,6 @@ fn generate_and_send<B: DataProvider>(bundle: &B, client: &B::Client) -> RunResu
         model: compile(
             r#"(flow_root:task {name: "flow"}) {output: "ok", input: flow.input};
 (flow:agent) {input: null, output: flow_root.output};
-(flow)-[:contains]->(flow_root);
 (flow)-[:next]->(flow_root);"#,
         )
         .unwrap(),

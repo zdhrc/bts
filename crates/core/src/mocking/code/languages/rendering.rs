@@ -4408,7 +4408,7 @@ mod english_tests {
 
     fn native(operation: &str, args: &[Value]) -> Value {
         let source = format!(
-            "(language_root:task {{name: \"language\"}}) {{output: {operation} ({}), input: language.input}};\n(language:agent) {{input: null, output: language_root.output}};\n(language)-[:contains]->(language_root);\n(language)-[:next]->(language_root);",
+            "(language_root:task {{name: \"language\"}}) {{output: {operation} ({}), input: language.input}};\n(language:agent) {{input: null, output: language_root.output}};\n(language)-[:next]->(language_root);",
             args.iter().map(literal).collect::<Vec<_>>().join(", ")
         );
         let model =

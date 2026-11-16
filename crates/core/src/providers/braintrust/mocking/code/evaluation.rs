@@ -344,7 +344,6 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(task_root:task {name: "task"}) {input: task.input, output: self.input};
 (task:agent) {input: "hello", output: task_root.output};
-(task)-[:contains]->(task_root);
 (task)-[:next]->(task_root);
 (dataset_cases_one:case {name: "one"}) {input: "hello"};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
@@ -379,7 +378,6 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(task_root:task {name: "task"}) {input: task.input, output: self.input};
 (task:agent) {input: "hello", output: task_root.output};
-(task)-[:contains]->(task_root);
 (task)-[:next]->(task_root);
 (dataset_cases_one:case {name: "one"}) {input: "hello"};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
@@ -462,11 +460,9 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(baseline_root:task {name: "baseline"}) {input: baseline.input, output: "baseline"};
 (baseline:agent) {input: "question", output: baseline_root.output};
-(baseline)-[:contains]->(baseline_root);
 (baseline)-[:next]->(baseline_root);
 (candidate_root:task {name: "candidate"}) {input: candidate.input, output: "candidate"};
 (candidate:agent) {input: "question", output: candidate_root.output};
-(candidate)-[:contains]->(candidate_root);
 (candidate)-[:next]->(candidate_root);
 (dataset_cases_one:case {name: "one"}) {input: "question", expected: "answer"};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};

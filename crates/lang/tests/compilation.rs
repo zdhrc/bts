@@ -56,7 +56,7 @@ fn braintrust_provider_schemas_compile_inherited_spans_and_propagation() {
 }
 
 #[test]
-fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
+fn braintrust_agent_keeps_entry_and_dataflow_separate() {
     compile_braintrust(include_str!("../../core/tests/fixtures/agent.bt")).unwrap();
     let model = compile_braintrust(BRAINTRUST_FIXTURE).unwrap();
     let agent = model.kinds.iter().find(|kind| kind.name == "agent").unwrap();
@@ -70,15 +70,8 @@ fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
             .unwrap()
     };
     let intake = node("intake");
-    let members: Vec<_> = model
-        .edges
-        .iter()
-        .filter(|edge| edge.source.0 == intake && edge.kind == "contains")
-        .collect();
-    assert_eq!(members.len(), 6);
-    for name in ["request", "lookup", "route", "reply", "format_reply", "grade"] {
-        assert!(members.iter().any(|edge| edge.target.0 == node(name)));
-    }
+    // the entry edge is the agent's only edge, membership is not authored
+    assert_eq!(model.edges.iter().filter(|edge| edge.source.0 == intake).count(), 1);
     let entries: Vec<_> = model
         .edges
         .iter()
@@ -86,7 +79,7 @@ fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
         .collect();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].target.0, node("request"));
-    for kind in ["next", "feeds"] {
+    for kind in ["calls", "feeds"] {
         assert!(
             model
                 .edges
@@ -98,28 +91,41 @@ fn braintrust_agent_keeps_membership_entry_and_dataflow_separate() {
 }
 
 #[test]
-fn braintrust_span_parenting_preserves_direction_and_extension() {
+fn braintrust_calls_supplies_parents_and_keeps_its_direction() {
     let model = compile_braintrust(BRAINTRUST_FIXTURE).unwrap();
-    let parents: Vec<_> = model.edges.iter().filter(|edge| edge.kind == "child_of").collect();
-    assert_eq!(parents.len(), 5);
-    for (child, parent) in [
+    // each step's parent is the source of the calls edge that supplies its parent key
+    let parent = |child: &str| -> Vec<&str> {
+        let bts_lang::ElementId::Node(id) = model.names[child] else {
+            panic!("{child}")
+        };
+        (model.context[id.0].iter())
+            .filter(|supply| supply.key == "parent")
+            .flat_map(|supply| &supply.suppliers)
+            .map(|supplier| match supplier {
+                bts_lang::ElementId::Edge(edge) => {
+                    assert_eq!(model.edges[edge.0].kind, "calls");
+                    model.nodes[model.edges[edge.0].source.0].name.as_deref().unwrap()
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert!(parent("request").is_empty());
+    for (child, expected) in [
         ("lookup", "request"),
         ("route", "request"),
         ("reply", "route"),
         ("format_reply", "request"),
         ("grade", "request"),
     ] {
-        assert!(parents.iter().any(|edge| {
-            model.nodes[edge.source.0].name.as_deref() == Some(child)
-                && model.nodes[edge.target.0].name.as_deref() == Some(parent)
-        }));
+        assert_eq!(parent(child), [expected], "{child}");
     }
-    let declarations = "+(nested:edge)-[:extends]->(child_of); (parent:task); (child:tool);";
-    compile_braintrust(&format!("{declarations} (child)-[:nested]->(parent);")).unwrap();
-    for edge in ["(child)-[:child_of]-(parent);", "(child)-[:nested]-(parent);"] {
+    let declarations = "+(nested:edge)-[:extends]->(calls); (parent:task); (child:tool);";
+    compile_braintrust(&format!("{declarations} (parent)-[:nested]->(child);")).unwrap();
+    for edge in ["(parent)-[:calls]-(child);", "(parent)-[:nested]-(child);"] {
         assert!(compile_braintrust(&format!("{declarations} {edge}")).is_err());
     }
-    assert!(compile_braintrust("+(nested:edge {direction: \"either\"})-[:extends]->(child_of); (a:task);").is_err());
+    assert!(compile_braintrust("+(nested:edge {direction: \"either\"})-[:extends]->(calls); (a:task);").is_err());
 }
 
 #[test]
@@ -818,7 +824,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 62);
+    assert_eq!(graph.paths.len(), 63);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -988,7 +994,19 @@ fn handles_truncated_pattern_references_without_panicking() {
 #[test]
 fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
     let model = compile_fixture();
-    assert_eq!(model.paths.len(), 62);
+    assert_eq!(model.paths.len(), 63);
+    // the fixture's handoff edge supplies its key to both steps downstream
+    let supplied = |node: &str| {
+        let bts_lang::ElementId::Node(id) = model.names[node] else {
+            panic!("{node}")
+        };
+        (model.context[id.0].iter())
+            .find(|supply| supply.key == "assigned_by")
+            .map(|supply| supply.suppliers.clone())
+    };
+    assert!(supplied("triage").is_none());
+    assert!(matches!(supplied("assess").as_deref(), Some([bts_lang::ElementId::Edge(_)])));
+    assert_eq!(supplied("assess"), supplied("discharge"));
     assert!(model.nodes.len() > 30);
     assert!(model.edges.len() > 30);
     assert!(model.forks.len() > 5);
@@ -1657,7 +1675,7 @@ fn validates_builtin_junction_configuration() {
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     use bts_lang::{ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.definitions.len(), 18);
+    assert_eq!(ast.definitions.len(), 19);
     assert_eq!(ast.definitions[0].head.header.kind, "trait");
     assert_eq!(ast.definitions[3].head.header.kind, "node");
     assert_eq!(ast.definitions[4].head.header.kind, "edge");
@@ -3091,5 +3109,103 @@ fn context_reads_name_declared_keys_that_reach_them() {
         let range = errors[0].r#where;
         let found = &source[range.start..range.end];
         assert!(found.starts_with(at), "{source}\n{found}");
+    }
+}
+
+#[test]
+fn edge_kinds_provide_context_and_models_record_suppliers() {
+    let definitions = r#"
+        +(delegated:edge {direction: "directed", note: {type: "any"}})
+            -[:extends]->(next)
+            -[:provides {owner: {type: "string"}}]->(context);
+        +(gated:edge {direction: "directed"})
+            -[:extends]->(requires)
+            -[:provides {owner: {type: "string"}}]->(context);
+        +(owning:node {open: true})-[:provides {owner: {type: "string"}}]->(context);
+        +(counted:edge {direction: "directed"})
+            -[:extends]->(next)
+            -[:provides {index: {type: "number"}}]->(context);
+        +(claimed:junction)
+            -[:extends]->(merge)
+            -[:provides {owner: {type: "string"}}]->(context);
+    "#;
+    let model = compiled(&format!(
+        r#"{definitions}
+        (a:node)-[e1:delegated]->(b:node) {{by: context.owner}};
+        (b)-[:next]->(c:node) {{by: context.owner}};
+        (c)-[e2:delegated]->(d:node) {{by: context.owner}};
+        (d)~[:next]~>(d);
+        (a)-[e3:gated]->(g:node) {{by: context.owner}};
+        (c)-[:requires]->(h:node);
+        (n:owning)-[:next]->(p:node) {{by: context.owner}};
+        (n)-[e4:delegated]->(q:node) {{by: context.owner}};
+        (b)-[e5:delegated]->(q);
+        (r:node)=[f:repeat {{count: 2}}]=>[-[e6:counted]->(s:node) {{at: context.index}}, -[e7:next]->(t:node) {{at: context.index}}];
+        (u:node)=[:parallel]=>[-[e8:delegated]->(v:node), -[e9:delegated]->(w:node)]
+            >[:merge [e8], [e9]]>>(x:node) {{by: context.owner}};
+        (u2:node)=[:parallel]=>[-[e10:delegated]->(v2:node), -[e11:next]->(w2:node)]
+            >[:claimed [e10], [e11]]>>(x2:node) {{by: context.owner}};
+        "#
+    ));
+    let suppliers = |node: &str, key: &str| -> Vec<bts_lang::ElementId> {
+        let bts_lang::ElementId::Node(id) = model.names[node] else {
+            panic!("{node}")
+        };
+        (model.context[id.0].iter())
+            .find(|supply| supply.key == key)
+            .map(|supply| supply.suppliers.clone())
+            .unwrap_or_default()
+    };
+    let named = |names: &[&str]| -> Vec<bts_lang::ElementId> {
+        let mut ids: Vec<_> = names.iter().map(|name| model.names[*name]).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(model.context.len(), model.nodes.len());
+    // the key reaches the edge's target and continues along next
+    assert_eq!(suppliers("a", "owner"), []);
+    assert_eq!(suppliers("b", "owner"), named(&["e1"]));
+    assert_eq!(suppliers("c", "owner"), named(&["e1"]));
+    // the nearest provider on a path supplies the key, also around a loop-back
+    assert_eq!(suppliers("d", "owner"), named(&["e2"]));
+    // an edge kind provides its own keys whatever its primitive, and carries nothing else across
+    assert_eq!(suppliers("g", "owner"), named(&["e3"]));
+    assert_eq!(suppliers("h", "owner"), []);
+    // a node kind supplies along next, and an edge kind is nearer than its source node
+    assert_eq!(suppliers("p", "owner"), named(&["n"]));
+    // two paths give two suppliers
+    assert_eq!(suppliers("q", "owner"), named(&["e4", "e5"]));
+    // an edge kind is nearer than its fork
+    assert_eq!(suppliers("s", "index"), named(&["e6"]));
+    assert_eq!(suppliers("t", "index"), named(&["f"]));
+    // a junction target receives what its input edges carry
+    assert_eq!(suppliers("x", "owner"), named(&["e8", "e9"]));
+    // a junction kind is nearer than its input edges
+    assert_eq!(
+        suppliers("x2", "owner"),
+        [bts_lang::ElementId::Junction(bts_lang::JunctionId(1))]
+    );
+
+    for (source, at) in [
+        // the key does not reach the edge's source
+        ("(a:node) {by: context.owner}; (a)-[:delegated]->(b:node);", "context.owner"),
+        // an edge does not read the keys its own kind provides
+        ("(a:node)-[:delegated {note: context.owner}]->(b:node);", "context.owner"),
+        // an edge of another primitive carries no keys from its source
+        (
+            "(n:owning)-[:gated]->(g:node); (n)-[:requires]->(h:node) {by: context.owner};",
+            "context.owner",
+        ),
+    ] {
+        let source = format!("{definitions}{source}");
+        let errors = compile(&source).unwrap_err();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:#?}");
+        assert!(
+            errors[0].what.starts_with("context key `owner` is not available here"),
+            "{}",
+            errors[0].what
+        );
+        let range = errors[0].r#where;
+        assert!(source[range.start..range.end].starts_with(at), "{source}");
     }
 }

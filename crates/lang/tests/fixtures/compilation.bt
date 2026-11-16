@@ -508,6 +508,14 @@
         -[:next {when: !source.output.retry}]->(cycle_finish),
     ];
 
+# an edge kind provides context to its target, and the key continues along next edges
++(handoff:edge {direction: "directed"})
+    -[:extends]->(next)
+    -[:provides {assigned_by: {type: "string"}}]->(context);
+(triage:task)
+    -[:handoff]->(assess:task) {input: {assigned_by: context.assigned_by}}
+        -[:next]->(discharge:task) {input: {assigned_by: context.assigned_by}};
+
 # junction results remain explicit rather than overwriting destination fields
 (graph_a)
     =[:parallel]=>[

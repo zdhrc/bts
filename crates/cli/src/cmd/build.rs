@@ -366,14 +366,12 @@ mod tests {
     output: "hello",
     input: agent_standalone.input
 };
-(agent_standalone)-[:contains]->(standalone);
 (agent_unrelated:agent {name: "unrelated"}) {input: null, output: unrelated.output};
 (agent_unrelated)-[:next]->(unrelated);
 (unrelated:task) {
     output: "other",
     input: agent_unrelated.input
 };
-(agent_unrelated)-[:contains]->(unrelated);
 (cases:dataset) {
     cases: [|(one)|]
 };

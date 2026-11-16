@@ -632,11 +632,9 @@ mod tests {
 
     const SOURCE: &str = r#"(old_root:task {name: "old"}) {input: old.input, output: "wrong"};
 (old:agent) {input: "fallback", output: old_root.output};
-(old)-[:contains]->(old_root);
 (old)-[:next]->(old_root);
 (new_root:task {name: "new"}) {input: new.input, output: new_root.input};
 (new:agent) {input: "fallback", output: new_root.output};
-(new)-[:contains]->(new_root);
 (new)-[:next]->(new_root);
 (dataset_cases_local:case {name: "local"}) {input: "local value"};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_local)|]};

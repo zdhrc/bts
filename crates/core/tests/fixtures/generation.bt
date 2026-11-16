@@ -11,75 +11,52 @@
     tags: [|"support", "orders"|],
 }
     =[:conditional]=>[
-        -[:next {when: source.local.turns > 0}]->(turn0),
-        -[:next {when: source.local.turns > 1}]->(turn1),
-        -[:next {when: source.local.turns > 2}]->(turn2),
-        -[:next {when: source.local.turns > 3}]->(turn3),
+        -[:calls {when: source.local.turns > 0}]->(turn0),
+        -[:calls {when: source.local.turns > 1}]->(turn1),
+        -[:calls {when: source.local.turns > 2}]->(turn2),
+        -[:calls {when: source.local.turns > 3}]->(turn3),
     ];
 (session)
     =[:exclusive]=>[
-        -[:next {when: source.local.route == "lookup"}]->(lookup:tool) {input: session.input, output: {status: "found"}},
-        -[:next {when: source.local.route == "fallback"}]->(fallback:function) {input: session.input, output: {status: "deferred"}},
+        -[:calls {when: source.local.route == "lookup"}]->(lookup:tool) {input: session.input, output: {status: "found"}},
+        -[:calls {when: source.local.route == "fallback"}]->(fallback:function) {input: session.input, output: {status: "deferred"}},
     ];
-(session)-[:next {when: source.local.escalated}]->(handoff:task) {input: session.input, output: "queued"};
+(session)-[:calls {when: source.local.escalated}]->(handoff:task) {input: session.input, output: "queued"};
 (support:agent) {input: {request: "Where is my order?", customer: "acct-42"}, output: session.output};
-(support)-[:contains]->(session);
 (support)-[:next]->(session);
 (turn0:task {name: "turn"}) {
     input: {index: 0, request: session.input.request},
     output: "answer 0",
-}-[:next]->(draft0:llm {name: "draft"}) {
+}-[:calls]->(draft0:llm {name: "draft"}) {
     input: turn0.input,
     output: {role: "assistant", content: turn0.output},
     metadata: {model: "gpt-4o-mini", provider: "openai"},
     metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
 };
-(support)-[:contains]->(turn0);
-(support)-[:contains]->(draft0);
-(turn0)-[:child_of]->(session);
-(draft0)-[:child_of]->(turn0);
 (turn1:task {name: "turn"}) {
     input: {index: 1, request: session.input.request},
     output: "answer 1",
-}-[:next]->(draft1:llm {name: "draft"}) {
+}-[:calls]->(draft1:llm {name: "draft"}) {
     input: turn1.input,
     output: {role: "assistant", content: turn1.output},
     metadata: {model: "gpt-4o-mini", provider: "openai"},
     metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
 };
-(support)-[:contains]->(turn1);
-(support)-[:contains]->(draft1);
-(turn1)-[:child_of]->(session);
-(draft1)-[:child_of]->(turn1);
 (turn2:task {name: "turn"}) {
     input: {index: 2, request: session.input.request},
     output: "answer 2",
-}-[:next]->(draft2:llm {name: "draft"}) {
+}-[:calls]->(draft2:llm {name: "draft"}) {
     input: turn2.input,
     output: {role: "assistant", content: turn2.output},
     metadata: {model: "gpt-4o-mini", provider: "openai"},
     metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
 };
-(support)-[:contains]->(turn2);
-(support)-[:contains]->(draft2);
-(turn2)-[:child_of]->(session);
-(draft2)-[:child_of]->(turn2);
 (turn3:task {name: "turn"}) {
     input: {index: 3, request: session.input.request},
     output: "answer 3",
-}-[:next]->(draft3:llm {name: "draft"}) {
+}-[:calls]->(draft3:llm {name: "draft"}) {
     input: turn3.input,
     output: {role: "assistant", content: turn3.output},
     metadata: {model: "gpt-4o-mini", provider: "openai"},
     metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
 };
-(support)-[:contains]->(turn3);
-(support)-[:contains]->(draft3);
-(turn3)-[:child_of]->(session);
-(draft3)-[:child_of]->(turn3);
-(support)-[:contains]->(lookup);
-(lookup)-[:child_of]->(session);
-(support)-[:contains]->(fallback);
-(fallback)-[:child_of]->(session);
-(support)-[:contains]->(handoff);
-(handoff)-[:child_of]->(session);

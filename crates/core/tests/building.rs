@@ -82,7 +82,6 @@ fn agent_build_preserves_scorers_from_other_shapes_with_matching_experiment_name
     let agents = compile(
         r#"(support_root:task {name: "support"}) {input: support.input, output: "hello"};
 (support:agent) {input: "hi", output: support_root.output};
-(support)-[:contains]->(support_root);
 (support)-[:next]->(support_root);
 (dataset_cases_one:case {name: "one"}) {input: "hi", expected: "hello"};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
@@ -232,7 +231,6 @@ fn python_packages_include_agents_and_scorers_in_either_build_order() {
     let model = compile(
         r#"(support_root:task {name: "support"}) {output: "hello", input: support.input};
 (support:agent) {input: null, output: support_root.output};
-(support)-[:contains]->(support_root);
 (support)-[:next]->(support_root);
 ("quality":scorer) {score: 0.5};"#,
     )

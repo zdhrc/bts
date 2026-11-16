@@ -25,12 +25,12 @@ fn validates_agent_entrypoints() {
     output: "hello",
     input: support.input
 };
-(support)-[:contains]->(request);"#;
+"#;
     assert_eq!(validate(valid), serde_json::json!({"valid": true, "diagnostics": []}));
     for source in [
         r#"(support:agent) {input: null, output: null};"#,
         r#"(support:agent) {input: null, output: null}; (support)-[:next]->(missing);"#,
-        r#"(support:agent) {input: null, output: null}; (request:tool) {input: support.input}; (support)-[:contains, :next]->(request);"#,
+        r#"(support:agent) {input: null, output: null}; (request:tool) {input: support.input}; (support)-[:next]->(request);"#,
     ] {
         let result = validate(source);
         assert_eq!(result["valid"], false, "{source}");
@@ -55,7 +55,7 @@ fn reports_semantic_errors() {
     output: missing.missing,
     input: hello_agent.input
 };
-(hello_agent)-[:contains]->(hello);"#,
+"#,
     );
     assert_eq!(result["valid"], false);
     assert_eq!(result["diagnostics"][0]["phase"], "validation");
@@ -158,13 +158,11 @@ fn builds_callable_agents_without_a_project_in_both_languages() {
     input: hello.input,
     output: greet.output
 };
-(hello)-[:contains]->(trace_hello);
-(trace_hello)-[:next]->(greet);
+(trace_hello)-[:calls]->(greet);
 (greet:tool) {
     output: "Hello ${trace_hello.input.name}"
 };
-(hello)-[:contains]->(greet);
-(greet)-[:child_of]->(trace_hello);"#;
+"#;
     for (lang, extension, language) in [
         ("python", "py", bts_core::mocking::ScorerLang::Python),
         ("typescript", "mts", bts_core::mocking::ScorerLang::Typescript),
@@ -211,21 +209,18 @@ const AGENT_EVALS: &str = r#"(helper:agent) {input: null, output: trace_helper.o
     output: "helper",
     input: helper.input
 };
-(helper)-[:contains]->(trace_helper);
 (first:agent) {input: 1, output: trace_first.output};
 (first)-[:next]->(trace_first);
 (trace_first:task {name: "first"}) {
     input: first.input,
     output: self.input
 };
-(first)-[:contains]->(trace_first);
 (second:agent) {input: 2, output: trace_second.output};
 (second)-[:next]->(trace_second);
 (trace_second:task {name: "second"}) {
     input: second.input,
     output: self.input
 };
-(second)-[:contains]->(trace_second);
 (quality:scorer) {
     score: context.output == context.expected ? 1 : 0
 };
@@ -331,7 +326,7 @@ fn agent_builds_return_guarded_removals_with_safe_paths() {
     output: "hello",
     input: hello.input
 };
-(hello)-[:contains]->(trace_hello);"#,
+"#,
         &serde_json::json!({ "target": "agent", "files": { "hello_agent.py": previous, "hello_agent_agent.py": "# user code\n" } }),
     );
     assert_eq!(result["ok"], true, "{result}");
@@ -478,7 +473,7 @@ fn build_returns_planning_errors_without_partial_files() {
     input: run_agent.input,
     output: null
 };
-(run_agent)-[:contains]->(run);"#,
+"#,
             serde_json::json!({ "project": "Browser Project" }),
         ),
         (
@@ -511,7 +506,7 @@ fn rejects_random_string_lengths_that_do_not_fit_wasm() {
     let options = serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" });
     for expression in ["hex(4294967296)", "alphanum(4294967297)"] {
         let source = format!(
-            r#"(a:agent) {{input: null, output: run.output}}; (a)-[:contains, :next]->(run:task) {{input: a.input, output: {expression}}};"#
+            r#"(a:agent) {{input: null, output: run.output}}; (a)-[:next]->(run:task) {{input: a.input, output: {expression}}};"#
         );
         let validation = validate(&source);
         assert_eq!(validation["valid"], false, "{expression}: {validation}");
@@ -544,7 +539,7 @@ fn clamps_large_slice_bounds_for_literals_fields_and_iterations() {
             let source = format!(
                 r#"
                 (a:agent) {{input: [|1, 2|], output: run.output}};
-                (a)-[:contains, :next]->(run:task) {{
+                (a)-[:next]->(run:task) {{
                     input: a.input,
                     output: {{
                         literal_start: [|1, 2|][{bound}:],
@@ -556,10 +551,8 @@ fn clamps_large_slice_bounds_for_literals_fields_and_iterations() {
                     }},
                 }};
                 (run)
-                    =[:repeat {{count: 2}}]=>[-[round:next]->(step:task) {{output: context.index}}]
+                    =[:repeat {{count: 2}}]=>[-[round:calls]->(step:task) {{output: context.index}}]
                         >[:reduce {{observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]}} [round]]>>(results:task) {{output: context.accumulator}};
-                (a)-[:contains]->(step)-[:child_of]->(run);
-                (a)-[:contains]->(results)-[:child_of]->(run);
                 "#
             );
             let validation = validate(&source);
@@ -590,7 +583,7 @@ fn rejects_negative_and_noninteger_slice_bounds() {
                 bound.to_owned()
             };
             let source = format!(
-                r#"(a:agent) {{input: null, output: run.output}}; (a)-[:contains, :next]->(run:task) {{input: a.input, output: [|1, 2|][:{expression}]}};"#
+                r#"(a:agent) {{input: null, output: run.output}}; (a)-[:next]->(run:task) {{input: a.input, output: [|1, 2|][:{expression}]}};"#
             );
             let validation = validate(&source);
             assert_eq!(validation["valid"], dynamic, "{expression}: {validation}");
@@ -636,29 +629,23 @@ fn generation_matches_shared_core_with_filtering_tokens_and_maximum_seed() {
     metadata: {channel: "web", attempt: context.trace_index},
     tags: [|"billing"|]
 };
-(support_agent)-[:contains]->(support);
-(support)-[:next]->(answer);
+(support)-[:calls]->(answer);
 (answer:task) {
     output: {status: "resolved", message: "Open Billing and select the invoice you need.", follow_up: null}
 };
-(support_agent)-[:contains]->(answer);
-(answer)-[:child_of]->(support);
-(answer)-[:next]->(draft);
+(answer)-[:calls]->(draft);
 (draft:llm) {
     input: "hello",
     output: "hello",
     duration: 0.25,
     metrics: {literal_tokens: tokens("hello"), prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)}
 };
-(support_agent)-[:contains]->(draft);
-(draft)-[:child_of]->(answer);
-(answer)-[:next]->(lookup);
+(answer)-[:calls]->(lookup);
 (lookup:tool) {
     input: {query: "invoice"},
     output: {found: true}
 };
-(support_agent)-[:contains]->(lookup);
-(lookup)-[:child_of]->(answer);"#;
+"#;
     let filter = r#"block.kind != "tool""#;
     let result = generate_result(
         source,
@@ -721,7 +708,7 @@ fn relative_count_and_absolute_rate_windows_generate_the_same_population() {
     output: range(1, 5),
     input: run_agent.input
 };
-(run_agent)-[:contains]->(run);"#;
+"#;
     let relative = generate_result(
         source,
         &serde_json::json!({
@@ -767,7 +754,7 @@ fn generation_rejects_ambiguous_or_unrepresentable_options() {
     input: run_agent.input,
     output: null
 };
-(run_agent)-[:contains]->(run);"#;
+"#;
     for overrides in [
         serde_json::json!({ "rate_per_second": 1 }),
         serde_json::json!({ "start_ms": 1000 }),
@@ -795,7 +782,7 @@ fn generation_returns_authored_attachment_descriptors_without_filesystem_resolut
     input: review_agent.input,
     output: self.input
 };
-(review_agent)-[:contains]->(review);"#;
+"#;
     let result = generate_result(
         source,
         &serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" }),
@@ -911,7 +898,7 @@ async fn write_sends_shared_payload_bytes_and_returns_acknowledged_rows() {
     output: "hello",
     input: run_agent.input
 };
-(run_agent)-[:contains]->(run);"#;
+"#;
     let fixture = write_test_transport("success");
     let generation_options = write_generation_options();
     let result = write_result(source, &generation_options, &write_options(), &fixture).await;
@@ -953,7 +940,7 @@ async fn write_reports_final_http_rejections_without_retrying() {
     input: run_agent.input,
     output: null
 };
-(run_agent)-[:contains]->(run);"#,
+"#,
         &write_generation_options(),
         &write_options(),
         &fixture,
@@ -983,7 +970,7 @@ async fn write_times_out_and_aborts_the_host_request() {
     input: run_agent.input,
     output: null
 };
-(run_agent)-[:contains]->(run);"#,
+"#,
         &write_generation_options(),
         &options,
         &fixture,
@@ -1006,7 +993,7 @@ async fn write_rejects_invalid_inputs_and_attachments_before_transport() {
     input: run_agent.input,
     output: null
 };
-(run_agent)-[:contains]->(run);"#;
+"#;
     let mut missing_seed = write_generation_options();
     missing_seed.as_object_mut().unwrap().remove("seed");
     let mut invalid_project = write_options();
@@ -1023,7 +1010,7 @@ async fn write_rejects_invalid_inputs_and_attachments_before_transport() {
     output: ,
     input: run_agent.input
 };
-(run_agent)-[:contains]->(run);"#,
+"#,
             write_generation_options(),
             write_options(),
             "compile",
@@ -1039,7 +1026,7 @@ async fn write_rejects_invalid_inputs_and_attachments_before_transport() {
     input: run_agent.input,
     output: null
 };
-(run_agent)-[:contains]->(run);"#,
+"#,
             write_generation_options(),
             write_options(),
             "write",
@@ -1066,7 +1053,7 @@ async fn write_reports_malformed_transport_responses_as_failures() {
     input: run_agent.input,
     output: null
 };
-(run_agent)-[:contains]->(run);"#,
+"#,
             &write_generation_options(),
             &write_options(),
             &fixture,
@@ -1090,7 +1077,7 @@ fn generation_returns_unsafe_javascript_integers_as_serialization_failures() {
     output: 9007199254740992,
     input: run_agent.input
 };
-(run_agent)-[:contains]->(run);"#,
+"#,
         &serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" }),
     );
     assert_eq!(result["ok"], false, "{result}");
@@ -1107,7 +1094,7 @@ fn generation_preserves_evaluation_diagnostics_and_unicode_byte_ranges() {
     input: ("café 🦀_agent").input,
     output: null
 };
-("café 🦀_agent")-[:contains]->("café 🦀");"#;
+"#;
     let result = generate_result(
         source,
         &serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" }),
@@ -1133,7 +1120,7 @@ fn generation_preserves_special_json_object_keys() {
     let options = serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" });
     let options = serde::Serialize::serialize(&options, &serde_wasm_bindgen::Serializer::json_compatible()).unwrap();
     let result = bts_wasm::generate(
-        r#"(a:agent) {input: null, output: run.output}; (a)-[:contains, :next]->(run:task) {input: a.input, output: {for key in [|"__proto__"|]: key => {marker: true}}};"#,
+        r#"(a:agent) {input: null, output: run.output}; (a)-[:next]->(run:task) {input: a.input, output: {for key in [|"__proto__"|]: key => {marker: true}}};"#,
         options,
     )
     .expect("generation must return failures as data");
@@ -1154,7 +1141,7 @@ fn matches_native_seeded_samples() {
     output: {integer: range(- 10, 10), choice: choice("alpha", "beta", "gamma"), weighted: weighted([|"steady", 3|],[|"burst", 1|]), chance: chance(0.5), uuid: uuid(), hex: hex(8), alphanum: alphanum(8)},
     input: sampling_agent.input
 };
-(sampling_agent)-[:contains]->(sampling);"#;
+"#;
     // captured from the native graph generator with the same source and seeds
     let expected = [
         (
@@ -1259,7 +1246,7 @@ fn language_composition_matches_native_samples() {
     input: language_agent.input,
     local: {selected: sample([|0, 1, 2, 3, 4, 5|], 3)}
 };
-(language_agent)-[:contains]->(language);"#;
+"#;
     let options = serde_json::json!({ "count": 32, "over_ms": 3600000, "until_ms": 86400000, "seed": "42" });
     let result = generate_result(source, &options);
     assert_eq!(result["ok"], true, "{result}");
@@ -1271,7 +1258,7 @@ fn language_composition_matches_native_samples() {
     assert_eq!(output["nested"], "Hi! one, two");
     for expression in [r#"render("{missing}", {})"#, "compose([|1|])", "sample([|1|], 2)"] {
         let source = format!(
-            r#"(a:agent) {{input: null, output: t.output}}; (a)-[:contains, :next]->(t:task) {{input: a.input, output: {expression}}};"#
+            r#"(a:agent) {{input: null, output: t.output}}; (a)-[:next]->(t:task) {{input: a.input, output: {expression}}};"#
         );
         let result = generate_result(&source, &options);
         assert_eq!(result["ok"], false, "{expression}");

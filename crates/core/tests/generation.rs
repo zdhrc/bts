@@ -113,7 +113,6 @@ fn preserves_native_seeded_samples() {
             },
         };
         (sampler:agent) {input: null, output: sampling.output};
-        (sampler)-[:contains]->(sampling);
         (sampler)-[:next]->(sampling);
     "#;
     // captured from the original 64-bit native generator
@@ -228,7 +227,6 @@ fn language_composition_is_seeded_and_preserves_structure() {
     },
 };
 (author:agent) {input: null, output: language.output};
-(author)-[:contains]->(language);
 (author)-[:next]->(language);
 "#;
     let generate = || {
@@ -290,7 +288,7 @@ fn language_composition_rejects_invalid_values() {
         "sample([|1|], 1.0)",
     ] {
         let source = format!(
-            "(t:task) {{input: a.input, output: {expression}}}; (a:agent) {{input: null, output: t.output}}; (a)-[:contains]->(t); (a)-[:next]->(t);"
+            "(t:task) {{input: a.input, output: {expression}}}; (a:agent) {{input: null, output: t.output}}; (a)-[:next]->(t);"
         );
         let model = compile(&source).unwrap();
         assert!(

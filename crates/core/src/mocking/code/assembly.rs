@@ -363,11 +363,9 @@ mod agent_tests {
         let model = compile(
             r#"(count_root:task {name: "count"}) {output: tokens("hello"), input: count.input};
 (count:agent) {input: null, output: count_root.output};
-(count)-[:contains]->(count_root);
 (count)-[:next]->(count_root);
 (plain_root:task {name: "plain"}) {output: "hello", input: plain.input};
 (plain:agent) {input: null, output: plain_root.output};
-(plain)-[:contains]->(plain_root);
 (plain)-[:next]->(plain_root);"#,
         )
         .unwrap();
@@ -404,10 +402,8 @@ mod agent_tests {
         let target = CodeTarget::new("");
         for source in [
             r#"(first:agent {name: "a-b"}) {input: null, output: "ok"};
-(first)-[:contains]->(first_root);
 (first)-[:next]->(first_root:task) {input: first.input};
 (second:agent {name: "a_b"}) {input: null, output: "ok"};
-(second)-[:contains]->(second_root);
 (second)-[:next]->(second_root:task) {input: second.input};"#,
             "(quality:scorer) {score: 1};",
         ] {
@@ -418,7 +414,6 @@ mod agent_tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {output: 9007199254740993, input: a.input};
 (a:agent) {input: null, output: t_root.output};
-(a)-[:contains]->(t_root);
 (a)-[:next]->(t_root);"#,
         )
         .unwrap();

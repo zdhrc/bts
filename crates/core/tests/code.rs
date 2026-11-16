@@ -363,7 +363,6 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
     let model = compile(
         r#"(request_root:task {name: "request"}) {output: "hello", input: support.input};
 (support:agent) {input: null, output: request_root.output};
-(support)-[:contains]->(request_root);
 (support)-[:next]->(request_root);"#,
     )
     .unwrap();
@@ -410,7 +409,6 @@ fn language_functions_execute_in_generated_agents() {
     let model = compile(
         r#"(language_root:task {name: "language"}) {input: language.input, output: {text: render(self.input.template, {name: "Zoë", n: 6.0, ok: true}), composed: compose(self.input.parts), selected: language_root.local.selected, reused: language_root.local.selected, all: sample([|"same", "same"|], 2), empty: sample([||], 0), nested: compose([|"Details:", compose(sample([|"one", "two"|], 2), ", ")|])}, local: {selected: sample([|0, 1, 2, 3, 4|], self.input.count)}};
 (language:agent) {input: {template: "{{{name}}}: {n} {ok}", count: 2, parts: [|null, "", "Hi!", "there"|]}, output: language_root.output};
-(language)-[:contains]->(language_root);
 (language)-[:next]->(language_root);"#,
     )
     .unwrap();
@@ -645,7 +643,7 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         )
     };
     let source = format!(
-        "(numeric_root:task {{name: \"numeric\"}}) {{input: numeric.input, output: [|{}|]}};\n(numeric:agent) {{input: {{n: 2}}, output: numeric_root.output}};\n(numeric)-[:contains]->(numeric_root);\n(numeric)-[:next]->(numeric_root);",
+        "(numeric_root:task {{name: \"numeric\"}}) {{input: numeric.input, output: [|{}|]}};\n(numeric:agent) {{input: {{n: 2}}, output: numeric_root.output}};\n(numeric)-[:next]->(numeric_root);",
         cases
             .iter()
             .map(|(expression, _)| render(expression))
@@ -670,7 +668,7 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
     for expression in invalid {
         assert!(
             generate(&format!(
-                "(t_root:task {{name: \"t\"}}) {{input: t.input, output: sample ([|1 , 2|] , {expression})}};\n(t:agent) {{input: {{n: 2}}, output: t_root.output}};\n(t)-[:contains]->(t_root);\n(t)-[:next]->(t_root);"
+                "(t_root:task {{name: \"t\"}}) {{input: t.input, output: sample ([|1 , 2|] , {expression})}};\n(t:agent) {{input: {{n: 2}}, output: t_root.output}};\n(t)-[:next]->(t_root);"
             ))
             .is_err(),
             "{expression}"

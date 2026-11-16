@@ -1124,7 +1124,6 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(one_root:task {name: "one"}) {input: one.input};
 (one:agent) {input: "question", output: null};
-(one)-[:contains]->(one_root);
 (one)-[:next]->(one_root);
 (dataset_cases_group:case {name: "group"}) {traces: [|(one_root) , (one_root)|]};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_group)|]};"#,
@@ -1239,7 +1238,6 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(one_root:task {name: "one"}) {input: one.input};
 (one:agent) {input: null, output: null};
-(one)-[:contains]->(one_root);
 (one)-[:next]->(one_root);
 (dataset_cases_one:case {name: "one"}) {source: (one_root)};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};"#,

@@ -490,23 +490,18 @@ mod tests {
 
     const AGENTS: &str = r#"(source_root:task {name: "source"}) {input: source_node.input, output: "answer", local: {identifier: range (1 , 100)}};
 (source_node:agent) {input: {id: source_root.local.identifier}, output: source_root.output};
-(source_node)-[:contains]->(source_root);
 (source_node)-[:next]->(source_root);
 (oldest_root:task {name: "oldest"}) {input: oldest.input, output: self.input, local: {identifier: range (1 , 100)}};
 (oldest:agent) {input: "oldest", output: oldest_root.output};
-(oldest)-[:contains]->(oldest_root);
 (oldest)-[:next]->(oldest_root);
 (baseline_root:task {name: "baseline"}) {input: baseline.input, output: self.input, local: {identifier: range (1 , 100)}};
 (baseline:agent) {input: "baseline", output: baseline_root.output};
-(baseline)-[:contains]->(baseline_root);
 (baseline)-[:next]->(baseline_root);
 (candidate_root:task {name: "candidate"}) {input: candidate.input, output: self.input, local: {identifier: range (1 , 100)}};
 (candidate:agent) {input: "candidate", output: candidate_root.output};
-(candidate)-[:contains]->(candidate_root);
 (candidate)-[:next]->(candidate_root);
 (other_root:task {name: "other"}) {input: other.input, output: self.input, local: {identifier: range (1 , 100)}};
 (other:agent) {input: "other", output: other_root.output};
-(other)-[:contains]->(other_root);
 (other)-[:next]->(other_root);
 ("quality":scorer) {score: 1};
 ("unrelated":scorer) {score: 0};
@@ -615,7 +610,6 @@ mod tests {
         let mut model = crate::providers::braintrust::mocking::compile(
             r#"(shared_root:task {name: "shared"}) {output: "answer", input: second.input};
 (second:agent) {input: null, output: shared_root.output};
-(second)-[:contains]->(shared_root);
 (second)-[:next]->(shared_root);
 ("quality":scorer) {score: 1};
 (dataset_cases_one:case {name: "one"}) {input: "question"};
@@ -645,15 +639,12 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(first_root:task {name: "first"}) {output: "first", input: a_b.input};
 (a_b:agent {name: "a-b"}) {input: null, output: first_root.output};
-(a_b)-[:contains]->(first_root);
 (a_b)-[:next]->(first_root);
 (second_root:task {name: "second"}) {output: "second", input: a_b_1.input};
 (a_b_1:agent {name: "a_b"}) {input: null, output: second_root.output};
-(a_b_1)-[:contains]->(second_root);
 (a_b_1)-[:next]->(second_root);
 (safe_root:task {name: "safe"}) {output: "safe", input: safe.input};
 (safe:agent) {input: null, output: safe_root.output};
-(safe)-[:contains]->(safe_root);
 (safe)-[:next]->(safe_root);
 ("quality":scorer) {score: 1};
 (dataset_cases_one:case {name: "one"}) {input: "hello"};

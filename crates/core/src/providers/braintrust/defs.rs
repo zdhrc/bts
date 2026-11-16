@@ -5,8 +5,7 @@ pub const SOURCE: Source<'static> = Source {
     name: "braintrust.bt",
     text: r#"
 # agents describe behavior for mock data and mock code without emitting a span
-# contains declares membership, next selects entry and progression
-# neither relationship establishes span parenting
+# one next edge enters the first step, and every step it leads to belongs to the agent
 # input supplies authored fallback data or caller input, output describes the result
 # agent output does not overwrite any emitted span output
 # each and repeat keep values scoped to their current occurrence
@@ -47,11 +46,12 @@ pub const SOURCE: Source<'static> = Source {
 +(llm:node)-[:extends]->(span);
 +(function:node)-[:extends]->(span);
 
-# child_of points from an emitted child span to its parent span
-# it does not schedule either endpoint or transfer values
-# consumers keep the parent open through its children
-# endpoint and hierarchy validation still require provider integration
-+(child_of:edge {direction: "directed"})-[:extends]->(link);
+# calls schedules its target like next and goes down a level
+# its target and the steps that follow along next edges are children of its source
+# next stays on the level it is on, and consumers keep the parent open through its children
++(calls:edge {direction: "directed"})
+    -[:extends]->(next)
+    -[:provides {parent: {type: "object"}}]->(context);
 
 # one scorer expression supports emitted spans and callable scorer functions
 # context reads the parent span during emission and caller arguments in a function

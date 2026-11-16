@@ -16,21 +16,16 @@ const SOURCE: &str = r#"# shared mock data and mock code case
     output: request.output,
 };
 
-(intake)-[:contains]->(request);
-(intake)-[:contains]->(lookup);
-
 (intake)-[:next]->(request:task) {
     input: intake.input,
     output: lookup.output,
 };
 
-(request)-[:next, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
+(request)-[:calls, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
     patient_id: <-,
     input: {patient_id: self.patient_id},
     output: {patient_id: self.patient_id, found: true},
 };
-
-(lookup)-[:child_of]->(request);
 "#;
 
 fn lower(source: &str) -> Result<bts_core::mocking::Model, String> {
@@ -115,9 +110,7 @@ fn graph_agent_preserves_sibling_progression_and_inherited_kinds() {
     let source = format!(
         r#"+(intake_kind:node)-[:extends]->(agent); +(lookup_kind:node)-[:extends]->(patient_lookup);
 {source}
-(intake)-[:contains]->(finish:tool) {{input: intake.input, output: {{patient_id: self.input.patient_id, found: true}}}};
-(lookup)-[:next]->(finish);
-(finish)-[:child_of]->(request);
+(lookup)-[:next]->(finish:tool) {{input: intake.input, output: {{patient_id: self.input.patient_id, found: true}}}};
 "#
     );
     check_agent(&source, true);
@@ -239,19 +232,32 @@ fn execute_generated(model: &bts_core::mocking::Model, lang: ScorerLang, program
 #[test]
 fn graph_agent_rejects_invalid_parenting_and_unsupported_flow() {
     for (source, message) in [
-        (SOURCE.replace("(lookup)-[:child_of]->(request);", ""), "needs a child_of"),
         (
-            SOURCE.replace("(lookup)-[:child_of]->(request);", "(lookup)-[:child_of]->(lookup);"),
-            "before its child",
+            SOURCE.replace("(request)-[:calls, :feeds", "(request)-[:next, :feeds"),
+            "`lookup` has no parent span, go down from `request` with a `calls` edge",
         ),
-        (format!("{SOURCE}\n(request)-[:child_of]->(lookup);"), "entry span"),
-        (format!("{SOURCE}\n(lookup)-[:child_of]->(request);"), "multiple child_of"),
+        (
+            format!("{SOURCE}\n(request)-[:calls]->(other:task) {{output: 1}}; (other)-[:calls]->(lookup);"),
+            "`lookup` is reached under different parent spans, `request` and `other`",
+        ),
+        (
+            format!("{SOURCE}\n(intake)-[:contains]->(lookup);"),
+            "agent membership comes from the entry edge, remove this `contains` edge",
+        ),
+        (
+            SOURCE.replace("(intake)-[:next]->(request:task)", "(intake)-[:calls]->(request:task)"),
+            "an agent emits no span, enter its first step with a `next` edge",
+        ),
+        (
+            SOURCE.replace("found: true}", "found: true, under: context.parent}"),
+            "`context.parent` is supplied to the provider and cannot be read by a field",
+        ),
         (format!("{SOURCE}\n(lookup)~[:next]~>(request);"), "cycle edges"),
         (format!("{SOURCE}\n(request)-[:next]->(lookup);"), "multiple next"),
         (
             SOURCE.replace(
-                ":next, :feeds {value: source.input.patient_id, into: target.patient_id}",
-                ":next",
+                ":calls, :feeds {value: source.input.patient_id, into: target.patient_id}",
+                ":calls",
             ),
             "no feeds edge",
         ),
@@ -405,19 +411,14 @@ fn agent_result_does_not_overwrite_span_output() {
 fn guarded_forks_select_the_same_spans_in_data_and_code() {
     let source = r#"
 (intake:agent) {input: {route: "lookup"}, output: request.output};
-(intake)-[:contains]->(request);
-(intake)-[:contains]->(lookup);
-(intake)-[:contains]->(fallback);
 (intake)-[:next]->(request:task) {
     input: intake.input,
     output: self.input.route == "lookup" ? lookup.output: self.input.route == "fallback" ? fallback.output: "none",
 }
     =[:exclusive]=>[
-        -[:next {when: source.input.route == "lookup"}]->(lookup:tool) {output: "found"},
-        -[:next {when: source.input.route == "fallback"}]->(fallback:tool) {output: "deferred"},
+        -[:calls {when: source.input.route == "lookup"}]->(lookup:tool) {output: "found"},
+        -[:calls {when: source.input.route == "fallback"}]->(fallback:tool) {output: "deferred"},
     ];
-(lookup)-[:child_of]->(request);
-(fallback)-[:child_of]->(request);
 "#;
     for (route, result, count) in [("lookup", "found", 2), ("fallback", "deferred", 2), ("other", "none", 1)] {
         let source = source.replacen("route: \"lookup\"", &format!("route: \"{route}\""), 1);
@@ -471,14 +472,11 @@ fn scorer_node_supports_span_and_callable_behaviors() {
     use code::Emitter;
     let source = r#"
 (checker:agent) {input: "yes", output: root.output};
-(checker)-[:contains]->(root);
-(checker)-[:contains]->(quality);
 (checker)-[:next]->(root:task) {input: checker.input, output: self.input, expected: "yes"};
-(root)-[:next {when: source.input != "skip"}]->(quality:scorer {file: "checks"}) {
+(root)-[:calls {when: source.input != "skip"}]->(quality:scorer {file: "checks"}) {
     score: context.output == context.expected ? 1: 0,
     reason: "compared output to expected",
 };
-(quality)-[:child_of]->(root);
 "#;
     let model = lower(source).unwrap();
     let batch = data::generate(
@@ -563,20 +561,13 @@ fn scorer_node_supports_span_and_callable_behaviors() {
 fn accumulate_groups_results_and_rejects_missing_inputs() {
     let source = r#"
 (joined:agent) {input: true, output: finish.output};
-(joined)-[:contains]->(root);
-(joined)-[:contains]->(left_task);
-(joined)-[:contains]->(right_task);
-(joined)-[:contains]->(finish);
 (joined)-[:next]->(root:task) {input: joined.input};
 (root)
     =[:conditional]=>[
-        -[first:next {when: source.input}]->(left_task:tool) {output: "first"},
-        -[second:next]->(right_task:tool) {output: "second"},
+        -[first:calls {when: source.input}]->(left_task:tool) {output: "first"},
+        -[second:calls]->(right_task:tool) {output: "second"},
     ]
         >[:accumulate {observe: "result"} [second], [first]]>>(finish:task) {output: context.arrivals};
-(left_task)-[:child_of]->(root);
-(right_task)-[:child_of]->(root);
-(finish)-[:child_of]->(root);
 "#;
     let expected = json!([{"edge": "second", "value": "second"}, {"edge": "first", "value": "first"}]);
     let model = lower(source).unwrap();
@@ -640,14 +631,11 @@ console.log(JSON.stringify(ok));
 fn each_materializes_distinct_occurrences() {
     let source = r#"
 (batch:agent) {input: [|"a", "b", "c"|], output: "done"};
-(batch)-[:contains]->(root);
-(batch)-[:contains]->(work);
 (batch)-[:next]->(root:task) {input: batch.input};
 (root)
     =[:each {items: source.input}]=>[
-        -[:next]->(work:tool) {input: context.item, output: {value: self.input, index: context.index}},
+        -[:calls]->(work:tool) {input: context.item, output: {value: self.input, index: context.index}},
     ];
-(work)-[:child_of]->(root);
 "#;
     let model = lower(source).unwrap();
     let batch = data::generate(
@@ -695,17 +683,14 @@ fn each_materializes_distinct_occurrences() {
 fn repeat_preserves_iteration_scope_and_empty_groups() {
     let source = r#"
 (batch:agent) {input: 3, output: "done"};
-(batch)-[:contains]->(root);
-(batch)-[:contains]->(work);
 (batch)-[:next]->(root:task) {input: batch.input};
 (root)
     =[:repeat {count: source.input}]=>[
-        -[:next]->(work:tool) {
+        -[:calls]->(work:tool) {
             local: {token: hex(8)},
             output: {index: context.index, count: context.count, first: self.local.token, second: self.local.token},
         },
     ];
-(work)-[:child_of]->(root);
 "#;
     let model = lower(source).unwrap();
     let batch = data::generate(
@@ -760,22 +745,21 @@ fn repeat_preserves_iteration_scope_and_empty_groups() {
 fn repeat_history_contains_only_completed_earlier_occurrences() {
     let source = r#"
 (history_agent:agent) {input: 3, output: "done"};
-(history_agent)-[:contains]->(root);
-(history_agent)-[:contains]->(turn);
 (history_agent)-[:next]->(root:task) {input: history_agent.input};
 (root)
     =[:repeat {count: source.input}]=>[
-        -[:next]->(turn:task) {
+        -[:calls]->(turn:task) {
             input: context.history.turn,
             output: context.index,
         },
     ];
-(turn)-[:child_of]->(root);
 "#;
     for nested in [false, true] {
         let source = if nested {
-            source.replace("(root)\n    =[:repeat", "(root)=[:repeat {count: 2}]=>[-[:next]->(group:task) {input: root.input}];\n(history_agent)-[:contains]->(group);\n(group)-[:child_of]->(root);\n(group)\n    =[:repeat")
-                .replace("(turn)-[:child_of]->(root)", "(turn)-[:child_of]->(group)")
+            source.replace(
+                "(root)\n    =[:repeat",
+                "(root)=[:repeat {count: 2}]=>[-[:calls]->(group:task) {input: root.input}];\n(group)\n    =[:repeat",
+            )
         } else {
             source.to_owned()
         };
@@ -839,16 +823,11 @@ fn repeat_history_contains_only_completed_earlier_occurrences() {
 fn weighted_forks_select_once_and_allow_no_selection() {
     let source = r#"
 (router:agent) {input: {enabled: true, weight: 8}, output: root.output};
-(router)-[:contains]->(root);
-(router)-[:contains]->(a);
-(router)-[:contains]->(b);
 (router)-[:next]->(root:task) {input: router.input, output: "done"};
 (root) =[:weighted]=>[
-    -[:next {weight: source.input.weight, when: source.input.enabled}]->(a:tool) {output: "a"},
-    -[:next {weight: 2, when: source.input.enabled}]->(b:tool) {output: "b"},
+    -[:calls {weight: source.input.weight, when: source.input.enabled}]->(a:tool) {output: "a"},
+    -[:calls {weight: 2, when: source.input.enabled}]->(b:tool) {output: "b"},
 ];
-(a)-[:child_of]->(root);
-(b)-[:child_of]->(root);
 "#;
     let model = lower(source).unwrap();
     let run = |model| {
@@ -931,19 +910,12 @@ console.log(JSON.stringify(selected.output));
 fn weighted_forks_resample_in_each_repetition_scope() {
     let source = r#"
 (router:agent) {input: true, output: "done"};
-(router)-[:contains]->(root);
-(router)-[:contains]->(turn);
-(router)-[:contains]->(a);
-(router)-[:contains]->(b);
 (router)-[:next]->(root:task) {input: router.input};
-(root) =[:repeat {count: 3}]=>[-[:next]->(turn:task) {input: context.index}];
+(root) =[:repeat {count: 3}]=>[-[:calls]->(turn:task) {input: context.index}];
 (turn) =[:weighted]=>[
-    -[:next {weight: source.input == 0 ? 1 : 0}]->(a:tool) {output: "a"},
-    -[:next {weight: source.input == 0 ? 0 : 1}]->(b:tool) {output: "b"},
+    -[:calls {weight: source.input == 0 ? 1 : 0}]->(a:tool) {output: "a"},
+    -[:calls {weight: source.input == 0 ? 0 : 1}]->(b:tool) {output: "b"},
 ];
-(turn)-[:child_of]->(root);
-(a)-[:child_of]->(turn);
-(b)-[:child_of]->(turn);
 "#;
     let model = lower(source).unwrap();
     let batch = data::generate(
@@ -981,12 +953,8 @@ fn weighted_forks_resample_in_each_repetition_scope() {
 
 const CYCLE_SOURCE: &str = r#"
 (retrying:agent) {input: {attempt: 0}, output: finish.output};
-(retrying)-[:contains]->(root);
-(retrying)-[:contains]->(lookup);
-(retrying)-[:contains]->(check);
-(retrying)-[:contains]->(finish);
 (retrying)-[:next]->(root:task) {input: retrying.input, output: finish.output};
-(root)-[:next, :feeds {value: source.input, into: target.input}]->(lookup:tool) {
+(root)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool) {
     input: <-,
     output: {attempt: self.input.attempt, earlier: len(context.history.lookup)},
 };
@@ -995,9 +963,6 @@ const CYCLE_SOURCE: &str = r#"
     ~[:next {when: source.output.retry, max_traversals: 3}, :feeds {when: source.output.retry, value: source.output.next_input, into: target.input}]~>(lookup),
     -[:next {when: !source.output.retry}]->(finish:task) {output: lookup.output},
 ];
-(lookup)-[:child_of]->(root);
-(check)-[:child_of]->(root);
-(finish)-[:child_of]->(root);
 "#;
 
 fn flow_batch(source: &str) -> data::EventBatch {
@@ -1080,19 +1045,12 @@ fn cycles_create_fresh_occurrences_carry_inputs_and_preserve_history() {
 fn junction_strategies_execute_in_native_python_and_typescript() {
     let source = r#"
 (joined:agent) {input: true, output: "done"};
-(joined)-[:contains]->(root);
-(joined)-[:contains]->(left_task);
-(joined)-[:contains]->(right_task);
-(joined)-[:contains]->(finish);
 (joined)-[:next]->(root:task) {input: joined.input};
 (root) =[:parallel]=>[
-    -[a:next]->(left_task:tool) {output: 2},
-    -[b:next]->(right_task:tool) {output: 3},
+    -[a:calls]->(left_task:tool) {output: 2},
+    -[b:calls]->(right_task:tool) {output: 3},
 ]
     >[:STRATEGY {observe: "result" CONFIG} [b], [a]]>>(finish:task) {output: RESULT};
-(left_task)-[:child_of]->(root);
-(right_task)-[:child_of]->(root);
-(finish)-[:child_of]->(root);
 "#;
     for (kind, config, result, expected) in [
         (
@@ -1176,19 +1134,12 @@ fn flow_code_error(model: &bts_core::mocking::Model, name: &str, message: &str) 
 
 const QUEUED_SOURCE: &str = r#"
 (joined:agent) {input: true, output: "done"};
-(joined)-[:contains]->(root);
-(joined)-[:contains]->(left_task);
-(joined)-[:contains]->(right_task);
-(joined)-[:contains]->(finish);
 (joined)-[:next]->(root:task) {input: joined.input};
 (root) =[:repeat {count: 3}]=>[
-    -[a:next]->(left_task:tool) {output: context.index + 1},
-    -[b:next]->(right_task:tool) {output: context.index + 10},
+    -[a:calls]->(left_task:tool) {output: context.index + 1},
+    -[b:calls]->(right_task:tool) {output: context.index + 10},
 ]
     >[:accumulate {observe: "result"} [b], [a]]>>(finish:task) {output: context.arrivals};
-(left_task)-[:child_of]->(root);
-(right_task)-[:child_of]->(root);
-(finish)-[:child_of]->(root);
 "#;
 
 #[test]
@@ -1277,15 +1228,10 @@ fn junction_queues_consume_repeated_inputs_and_reduce_at_closure() {
 fn cycles_and_junctions_fail_explicitly_without_partial_success() {
     let ambiguous = r#"
 (joined:agent) {input: true, output: finish.output};
-(joined)-[:contains]->(root);
-(joined)-[:contains]->(shared);
-(joined)-[:contains]->(finish);
 (joined)-[:next]->(root:task) {input: joined.input};
 (shared:tool) {output: 1};
-(root) =[:parallel]=>[-[a:next]->(shared), -[b:next]->(shared)]
+(root) =[:parallel]=>[-[a:calls]->(shared), -[b:calls]->(shared)]
     >[:accumulate {observe: "result"} [a], [b]]>>(finish:task) {output: shared.output};
-(shared)-[:child_of]->(root);
-(finish)-[:child_of]->(root);
 "#;
     for (source, name, message) in [
         (
@@ -1301,7 +1247,7 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
         (
             QUEUED_SOURCE
                 .replace(":repeat {count: 3}", ":conditional")
-                .replace("[a:next]", "[a:next {when: false}]")
+                .replace("[a:calls]", "[a:calls {when: false}]")
                 .replace("context.index + 1", "1")
                 .replace("context.index + 10", "10")
                 .replace(":accumulate", ":quorum")
@@ -1330,11 +1276,8 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
 #[test]
 fn cycle_groups_keep_limits_and_values_separate_inside_repetition() {
     let source = CYCLE_SOURCE.replace("output: finish.output", "output: \"done\"")
-        .replace("(root)-[:next, :feeds {value: source.input, into: target.input}]->(lookup:tool)",
-            "(retrying)-[:contains]->(turn); (root) =[:repeat {count: 2}]=>[-[:next]->(turn:task) {input: root.input}]; (turn)-[:child_of]->(root); (turn)-[:next, :feeds {value: source.input, into: target.input}]->(lookup:tool)")
-        .replace("(lookup)-[:child_of]->(root)","(lookup)-[:child_of]->(turn)")
-        .replace("(check)-[:child_of]->(root)","(check)-[:child_of]->(turn)")
-        .replace("(finish)-[:child_of]->(root)","(finish)-[:child_of]->(turn)")
+        .replace("(root)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool)",
+            "(root) =[:repeat {count: 2}]=>[-[:calls]->(turn:task) {input: root.input}]; (turn)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool)")
         .replace("max_traversals: 3","max_traversals: 2");
     let batch = flow_batch(&source);
     let outputs: Vec<_> = batch
@@ -1400,9 +1343,7 @@ fn junction_results_wait_for_destination_payload_dependencies() {
         .replace("=[:repeat {count: 3}]", "=[:parallel]")
         .replace("output: context.index + 10", "output: 10")
         .replace("output: context.index + 1", "output: child.output");
-    let source = format!(
-        "{source}\n(joined)-[:contains]->(child); (left_task)-[:next]->(child:tool) {{output: 1}}; (child)-[:child_of]->(left_task);"
-    );
+    let source = format!("{source}\n(left_task)-[:calls]->(child:tool) {{output: 1}};");
     let expected = json!([{ "edge":"b", "value":10 },{ "edge":"a", "value":1 }]);
     let batch = flow_batch(&source);
     assert_eq!(
@@ -1436,26 +1377,23 @@ fn junction_results_wait_for_destination_payload_dependencies() {
 fn consumer_rejections_point_at_the_offending_element() {
     let fork = r#"
 (route:agent) {input: "question", output: request.output};
-(route)-[:contains]->(request);
-(route)-[:contains]->(answer);
 (route)-[:next]->(request:task) {input: route.input, output: "done"};
-(request)=[:fork]=>[-[:next]->(answer:tool)];
-(answer)-[:child_of]->(request);
+(request)=[:fork]=>[-[:calls]->(answer:tool)];
 "#;
     for (source, located, message) in [
         (
-            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:next {weight: 2}, :feeds"),
+            format!("{SOURCE}\n(lookup)-[:next {{weight: 2}}]->(finish:tool) {{output: 1}};"),
             "2",
             "configured next edges are not supported by mocking yet",
         ),
         (
-            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:requires, :feeds"),
+            format!("{SOURCE}\n(request)-[:requires]->(lookup);"),
             ":requires",
             "edge kind \"requires\" is not supported by mocking yet",
         ),
         (
             fork.to_owned(),
-            "=[:fork]=>[-[:next]->(answer:tool)]",
+            "=[:fork]=>[-[:calls]->(answer:tool)]",
             "fork kind \"fork\" or its configuration is not supported by mocking yet",
         ),
     ] {
@@ -1469,12 +1407,12 @@ fn consumer_rejections_point_at_the_offending_element() {
     // the probe misspellings from the graph contracts plan never reach the consumer
     for (source, located, message) in [
         (
-            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:next {whne: true}, :feeds"),
+            format!("{SOURCE}\n(lookup)-[:next {{whne: true}}]->(finish:tool) {{output: 1}};"),
             "whne",
             "unknown property `whne` for built-in kind `next`, did you mean `when`?",
         ),
         (
-            SOURCE.replace("(request)-[:next, :feeds", "(request)-[:nxet, :feeds"),
+            format!("{SOURCE}\n(lookup)-[:nxet]->(finish:tool) {{output: 1}};"),
             "nxet",
             "unknown edge kind `nxet`, did you mean `next`?",
         ),
@@ -1517,4 +1455,206 @@ fn consumer_rejections_point_at_the_offending_element() {
     );
     let range = errors[0].r#where;
     assert_eq!(&source[range.start..range.end], "context.arivals");
+}
+
+// each span as (name, input, parent name, parent input), in emission order
+fn span_parents(batch: &data::EventBatch) -> Vec<(String, Value, String, Value)> {
+    let input = |event: &data::Event| event.input.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
+    (batch.events.iter())
+        .map(|event| {
+            let parent =
+                (event.span_parents.first()).map(|id| batch.events.iter().find(|parent| &parent.span_id == id).unwrap());
+            (
+                event.name.clone(),
+                input(event),
+                parent.map_or(String::new(), |parent| parent.name.clone()),
+                parent.map_or(Value::Null, input),
+            )
+        })
+        .collect()
+}
+
+fn parent_names(batch: &data::EventBatch) -> Vec<(String, String)> {
+    (span_parents(batch).into_iter())
+        .map(|(name, _, parent, _)| (name, parent))
+        .collect()
+}
+
+fn names(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(name, parent)| ((*name).to_owned(), (*parent).to_owned()))
+        .collect()
+}
+
+#[test]
+fn calls_parents_each_occurrence_of_a_repeated_step() {
+    // a static plan: every reply sits under the turn of its own iteration
+    let repeated = r#"
+(chat:agent) {input: "hi", output: request.output};
+(chat)-[:next]->(request:task) {input: chat.input, output: "done"};
+(request)
+    =[:repeat {count: 3}]=>[
+        -[:calls]->(turn:task) {input: context.index, output: "turn"},
+    ]
+        ->(turn)-[:calls]->(reply:llm) {input: turn.input, output: "reply"};
+"#;
+    let spans = span_parents(&flow_batch(repeated));
+    assert_eq!(spans.len(), 7);
+    for index in 0..3 {
+        assert!(spans.contains(&("turn".into(), json!(index), "request".into(), json!("hi"))));
+        assert!(spans.contains(&("reply".into(), json!(index), "turn".into(), json!(index))));
+    }
+    // each iterates over items the same way
+    let iterated = r#"
+(chat:agent) {input: "hi", output: request.output};
+(chat)-[:next]->(request:task) {input: chat.input, output: "done", local: {files: [|"a.txt", "b.txt"|]}};
+(request)
+    =[:each {items: request.local.files}]=>[
+        -[:calls]->(file:task) {input: context.item, output: "read"},
+    ]
+        ->(file)-[:calls]->(parse:tool) {input: file.input, output: "parsed"};
+"#;
+    let spans = span_parents(&flow_batch(iterated));
+    assert_eq!(spans.len(), 5);
+    for item in ["a.txt", "b.txt"] {
+        assert!(spans.contains(&("file".into(), json!(item), "request".into(), json!("hi"))));
+        assert!(spans.contains(&("parse".into(), json!(item), "file".into(), json!(item))));
+    }
+    // a flow plan: the junction makes this agent a flow, and each probe sits under its own round
+    let flowing = r#"
+(chat:agent) {input: "hi", output: closing.output};
+(chat)-[:next]->(request:task) {input: chat.input, output: closing.output};
+(request)
+    =[:repeat {count: 3}]=>[
+        -[rounds:calls]->(inspect:task) {input: context.index, output: context.index},
+    ]
+        ->(inspect)-[:calls]->(probe:tool) {input: inspect.input, output: "probed"}
+        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [rounds]]>>(closing:llm) {
+            input: context.accumulator,
+            output: "summary",
+        };
+"#;
+    let model = lower(flowing).unwrap();
+    assert_eq!(model.flows.len(), 1);
+    let spans = span_parents(&flow_batch(flowing));
+    assert_eq!(spans.len(), 8);
+    for index in 0..3 {
+        assert!(spans.contains(&("inspect".into(), json!(index), "request".into(), json!("hi"))));
+        assert!(spans.contains(&("probe".into(), json!(index), "inspect".into(), json!(index))));
+    }
+    assert!(spans.contains(&("closing".into(), json!([0, 1, 2]), "request".into(), json!("hi"))));
+}
+
+#[test]
+fn next_from_a_nested_task_returns_to_its_level() {
+    let source = r#"
+(chat:agent) {input: "hi", output: request.output};
+(chat)-[:next]->(request:task) {input: chat.input, output: summary.output};
+(request)-[:calls]->(plan:llm) {input: request.input, output: "plan"}
+    -[:next]->(research:task) {input: plan.output, output: read.output}
+        -[:calls]->(search:tool) {input: research.input, output: "hits"}
+            -[:next]->(read:tool) {input: search.output, output: "notes"};
+(research)-[:next]->(summary:llm) {input: read.output, output: "summary"};
+"#;
+    assert_eq!(
+        parent_names(&flow_batch(source)),
+        names(&[
+            ("request", ""),
+            ("plan", "request"),
+            ("research", "request"),
+            ("search", "research"),
+            ("read", "research"),
+            ("summary", "request"),
+        ])
+    );
+    // the steps inside a task are declared before the step that follows it
+    let reordered = source.replace(
+        "(chat)-[:next]->(request:task) {input: chat.input, output: summary.output};",
+        "(chat)-[:next]->(request:task) {input: chat.input, output: summary.output};\n(research)-[:next]->(summary);",
+    );
+    let reordered = reordered.replace(
+        "(research)-[:next]->(summary:llm) {input: read.output, output: \"summary\"};",
+        "(summary:llm) {input: read.output, output: \"summary\"};",
+    );
+    assert!(
+        lower(&reordered)
+            .unwrap_err()
+            .contains("progression reenters a completed parent span")
+    );
+}
+
+#[test]
+fn a_junction_target_takes_the_parent_its_inputs_carry() {
+    let source = r#"
+(chat:agent) {input: "hi", output: synthesis.output};
+(chat)-[:next]->(request:task) {input: chat.input, output: synthesis.output};
+(request)-[:calls]->(delegate:llm) {input: request.input, output: "split"}
+    =[:parallel]=>[
+        -[a:next]->(metrics:task) {input: "pull metrics", output: metrics_reply.output},
+        -[b:next]->(diff:task) {input: "diff releases", output: diff_reply.output},
+    ]
+        ->(metrics)-[:calls]->(metrics_reply:llm) {input: metrics.input, output: "p95 up"}
+        ->(diff)-[:calls]->(diff_reply:llm) {input: diff.input, output: "new check"}
+        >[:accumulate {observe: "result"} [a], [b]]>>(synthesis:llm) {input: context.arrivals, output: "answer"};
+"#;
+    assert_eq!(
+        parent_names(&flow_batch(source)),
+        names(&[
+            ("request", ""),
+            ("delegate", "request"),
+            ("metrics", "request"),
+            ("metrics_reply", "metrics"),
+            ("diff", "request"),
+            ("diff_reply", "diff"),
+            ("synthesis", "request"),
+        ])
+    );
+    // inputs that disagree are rejected at the junction
+    let disagreeing = source.replace("-[a:next]->", "-[a:calls]->");
+    let errors = Bundle::compile_module(&disagreeing, false).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(
+        errors[0].what,
+        "junction inputs `a` and `b` give `synthesis` different parent spans"
+    );
+    let range = errors[0].r#where;
+    assert!(
+        disagreeing[range.start..range.end].starts_with(">[:accumulate"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn agents_share_a_step_under_their_own_parents() {
+    let source = r#"
+(first:agent) {input: "one", output: first_request.output};
+(second:agent) {input: "two", output: second_request.output};
+(first)-[:next]->(first_request:task) {input: first.input, output: "first done"};
+(second)-[:next]->(second_request:task) {input: second.input, output: "second done"};
+(first_request)-[:calls]->(lookup:tool) {input: "key", output: "value"};
+(second_request)-[:calls]->(lookup);
+"#;
+    let model = lower(source).unwrap();
+    let mut seen = Vec::new();
+    for trace in 0..4 {
+        let batch = data::generate(
+            model.clone(),
+            4,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            42 + trace,
+            &(),
+        )
+        .unwrap();
+        seen.extend(parent_names(&batch));
+    }
+    for pair in names(&[("lookup", "first_request"), ("lookup", "second_request")]) {
+        assert!(seen.contains(&pair), "{pair:?} in {seen:?}");
+    }
+    assert!(
+        seen.iter()
+            .all(|(name, parent)| name != "lookup" || parent.ends_with("_request"))
+    );
 }

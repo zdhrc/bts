@@ -6,20 +6,14 @@
     output: reply.output,
 };
 
-(intake)-[:contains]->(request);
-(intake)-[:contains]->(lookup);
-(intake)-[:contains]->(schedule);
-(intake)-[:contains]->(register);
-(intake)-[:contains]->(reply);
-
 (intake)-[:next]->(request:task) {
     input: intake.input,
     output: reply.output,
     metadata: {workflow: "hospital-intake"},
 };
 
-# progression and data transfer are separate edges between the same nodes
-(request)-[:next, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
+# going down a level and data transfer are separate edges between the same nodes
+(request)-[:calls, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
     patient_id: <-,
     input: {patient_id: self.patient_id},
     output: {
@@ -56,9 +50,3 @@
     },
     metadata: {operation: "compose_intake_response"},
 };
-
-# span parenting is independent of progression
-(lookup)-[:child_of]->(request);
-(schedule)-[:child_of]->(request);
-(register)-[:child_of]->(request);
-(reply)-[:child_of]->(request);

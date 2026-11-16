@@ -796,16 +796,7 @@ mod tests {
 (third:task {name: "third"}) {};
 (fourth:task {name: "fourth"}) {};
 (send:agent) {input: null, output: null};
-(send)-[:contains]->(send_root);
-(send)-[:contains]->(first);
-(first)-[:child_of]->(send_root);
-(send)-[:contains]->(second);
-(second)-[:child_of]->(send_root);
-(send)-[:contains]->(third);
-(third)-[:child_of]->(send_root);
-(send)-[:contains]->(fourth);
-(fourth)-[:child_of]->(send_root);
-(send)-[:next]->(send_root)-[:next]->(first)-[:next]->(second)-[:next]->(third)-[:next]->(fourth);"#,
+(send)-[:next]->(send_root)-[:calls]->(first)-[:next]->(second)-[:next]->(third)-[:next]->(fourth);"#,
         )
         .unwrap();
         let events = data::generate(
@@ -841,7 +832,6 @@ mod tests {
         let model = compile(
             r#"(example_root:task {name: "example"}) {input: example.input};
 (example:agent) {input: null, output: null};
-(example)-[:contains]->(example_root);
 (example)-[:next]->(example_root);"#,
         )
         .unwrap();

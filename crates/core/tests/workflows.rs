@@ -12,7 +12,6 @@ fn previews_experiments_through_the_public_api() {
     let model = bts_core::providers::braintrust::mocking::compile(
         r#"(answer_root:task {name: "answer"}) {input: answer.input, output: answer_root.input};
 (answer:agent) {input: "fallback", output: answer_root.output};
-(answer)-[:contains]->(answer_root);
 (answer)-[:next]->(answer_root);
 (dataset_cases_question:case {name: "question"}) {input: "hello"};
 (dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_question)|]};
@@ -62,7 +61,6 @@ fn prepares_preview_attachments_without_reading_or_uploading_files() {
     let model = bts_core::providers::braintrust::mocking::compile(
         r#"(review_root:task {name: "review"}) {input: review.input};
 (review:agent) {input: {first: attachment("report.pdf", "application/pdf"), second: attachment("report.pdf", "application/pdf")}, output: null};
-(review)-[:contains]->(review_root);
 (review)-[:next]->(review_root);"#,
     )
     .unwrap();
@@ -138,7 +136,6 @@ fn generation_errors_keep_their_kind_range_and_diagnostic_conversion() {
     use std::error::Error as _;
     let source = r#"(run_root:task {name: "run"}) {output: 1 / context.trace_index, input: run.input};
 (run:agent) {input: null, output: run_root.output};
-(run)-[:contains]->(run_root);
 (run)-[:next]->(run_root);"#;
     let error = data::generate(
         bts_core::providers::braintrust::mocking::compile(source).unwrap(),
@@ -169,7 +166,6 @@ fn materialization_errors_expose_the_failure_and_event() {
         bts_core::providers::braintrust::mocking::compile(
             r#"(run_root:task {name: "run"}) {input: run.input};
 (run:agent) {input: null, output: null};
-(run)-[:contains]->(run_root);
 (run)-[:next]->(run_root);"#,
         )
         .unwrap(),
@@ -226,11 +222,8 @@ fn experiment_preview_keeps_the_underlying_generation_failure() {
     let model = bts_core::providers::braintrust::mocking::compile(
         r#"
         (run:agent) {input: null, output: null};
-        (run)-[:contains]->(root);
-        (run)-[:contains]->(step);
         (run)-[:next]->(root:task) {input: run.input};
-        (root)=[:repeat {count: range(-2, -1)}]=>[-[:next]->(step:tool)];
-        (step)-[:child_of]->(root);
+        (root)=[:repeat {count: range(-2, -1)}]=>[-[:calls]->(step:tool)];
         (one:case) {input: "hello"};
         (cases:dataset) {cases: [|(one)|]};
         (quality:scorer) {score: 1};

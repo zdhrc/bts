@@ -298,16 +298,8 @@ mod tests {
 (turn_1:task {name: "turn_1"}) {};
 (Chat_Completion_1:llm {name: "Chat Completion"}) {metadata: support_sessions_root.local.meta};
 (support_sessions:agent) {input: null, output: null};
-(support_sessions)-[:contains]->(support_sessions_root);
-(support_sessions)-[:contains]->(turn_0);
-(turn_0)-[:child_of]->(support_sessions_root);
-(support_sessions)-[:contains]->(Chat_Completion);
-(Chat_Completion)-[:child_of]->(turn_0);
-(support_sessions)-[:contains]->(turn_1);
-(turn_1)-[:child_of]->(support_sessions_root);
-(support_sessions)-[:contains]->(Chat_Completion_1);
-(Chat_Completion_1)-[:child_of]->(turn_1);
-(support_sessions)-[:next]->(support_sessions_root)-[:next]->(turn_0)-[:next]->(Chat_Completion)-[:next]->(turn_1)-[:next]->(Chat_Completion_1);"#,
+(support_sessions)-[:next]->(support_sessions_root)-[:calls]->(turn_0)-[:calls]->(Chat_Completion);
+(turn_0)-[:next]->(turn_1)-[:calls]->(Chat_Completion_1);"#,
         )
         .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
@@ -376,10 +368,7 @@ mod tests {
         let source = r#"(example_root:task {name: "example"}) {expected: "4", error: {message: "timeout"}, input: example.input};
 (step:task {name: "step"}) {};
 (example:agent) {input: null, output: null};
-(example)-[:contains]->(example_root);
-(example)-[:contains]->(step);
-(step)-[:child_of]->(example_root);
-(example)-[:next]->(example_root)-[:next]->(step);"#;
+(example)-[:next]->(example_root)-[:calls]->(step);"#;
         let model = compile(source).unwrap();
         let events = materialize(
             plan(model, 1, 0).unwrap(),
@@ -436,14 +425,7 @@ mod tests {
 (b:task {name: "b"}) {};
 (c:llm {name: "c"}) {duration: 1.5};
 (t:agent) {input: null, output: null};
-(t)-[:contains]->(t_root);
-(t)-[:contains]->(a);
-(a)-[:child_of]->(t_root);
-(t)-[:contains]->(b);
-(b)-[:child_of]->(t_root);
-(t)-[:contains]->(c);
-(c)-[:child_of]->(b);
-(t)-[:next]->(t_root)-[:next]->(a)-[:next]->(b)-[:next]->(c);"#;
+(t)-[:next]->(t_root)-[:calls]->(a)-[:next]->(b)-[:calls]->(c);"#;
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
@@ -475,7 +457,6 @@ mod tests {
     fn rejects_windows_shorter_than_the_longest_trace() {
         let source = r#"(t_root:task {name: "t"}) {duration: 7200, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:contains]->(t_root);
 (t)-[:next]->(t_root);"#;
         let error = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
@@ -493,7 +474,6 @@ mod tests {
         let model = compile(
             r#"(example_root:task {name: "example"}) {input: example.input};
 (example:agent) {input: null, output: null};
-(example)-[:contains]->(example_root);
 (example)-[:next]->(example_root);"#,
         )
         .unwrap();
@@ -519,7 +499,6 @@ mod tests {
         let model = compile(
             r#"(example_root:task {name: "example"}) {input: example.input};
 (example:agent) {input: null, output: null};
-(example)-[:contains]->(example_root);
 (example)-[:next]->(example_root);"#,
         )
         .unwrap();

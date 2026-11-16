@@ -176,13 +176,10 @@ fn downstream_capabilities_generate_project_and_deliver_with_their_own_receipt()
             input: {files: [|attachment("report.txt", "text/plain")|]},
             output: archive.output,
         };
-        (archive_agent)-[:contains]->(archive);
-        (archive_agent)-[:contains]->(copy);
         (archive_agent)-[:next]->(archive:task) {
             input: archive_agent.input,
             output: self.input["files"][0]["name"],
-        }-[:next]->(copy:tool) {input: archive.input, output: archive.input["files"][0]};
-        (copy)-[:child_of]->(archive);
+        }-[:calls]->(copy:tool) {input: archive.input, output: archive.input["files"][0]};
     "#;
     let format = ArchiveFormat::default();
     let sink = ArchiveSink::default();
@@ -218,7 +215,6 @@ fn encoding_failure_prevents_delivery() {
     let error = data::run(
         request(
             r#"(archive_agent:agent) {input: null, output: archive.output};
-            (archive_agent)-[:contains]->(archive);
             (archive_agent)-[:next]->(archive:task) {input: archive_agent.input, output: "ready"};"#,
             &WriteFilter::default(),
         ),
@@ -244,7 +240,6 @@ fn delivery_failure_preserves_the_downstream_typed_cause() {
     let error = data::run(
         request(
             r#"(archive_agent:agent) {input: null, output: archive.output};
-            (archive_agent)-[:contains]->(archive);
             (archive_agent)-[:next]->(archive:task) {input: archive_agent.input, output: "ready"};"#,
             &WriteFilter::default(),
         ),
@@ -272,7 +267,6 @@ fn delivery_failure_preserves_the_downstream_typed_cause() {
 #[test]
 fn unsupported_projection_preserves_the_source_range_and_stops_before_encoding() {
     let source = r#"(archive_agent:agent) {input: attachment("report.txt", "text/plain"), output: archive.output};
-        (archive_agent)-[:contains]->(archive);
         (archive_agent)-[:next]->(archive:task) {input: archive_agent.input, output: self.input["name"]};"#;
     let format = ArchiveFormat {
         attachments: false,
@@ -295,7 +289,6 @@ fn unsupported_projection_preserves_the_source_range_and_stops_before_encoding()
 #[test]
 fn incompatible_projection_stops_before_encoding_and_delivery() {
     let source = r#"(archive_agent:agent) {input: null, output: archive.output};
-        (archive_agent)-[:contains]->(archive);
         (archive_agent)-[:next]->(archive:task) {
             local: {file: attachment("report.txt", "text/plain")},
             input: archive_agent.input,
