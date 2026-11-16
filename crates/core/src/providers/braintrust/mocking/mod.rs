@@ -381,9 +381,6 @@ fn lower_flow(
     if !inherits(graph, &graph.nodes[root.0].kind, "task") && graph.nodes[root.0].kind != "span" {
         return Err(located(graph.nodes[root.0].range, "the entry must be a task or span"));
     }
-    if parents.contains_key(&root) {
-        return Err(located(graph.nodes[root.0].range, "entry span cannot have a parent"));
-    }
     for node in members {
         let mut cursor = *node;
         let mut seen = HashSet::new();
@@ -1218,17 +1215,12 @@ impl<'a> AgentLowering<'a> {
                 }
             }
         }
-        if parents.contains_key(&root) {
-            return Err(located(graph.nodes[root.0].range, "the entry span cannot have a parent"));
-        }
-        for (position, node) in order.iter().enumerate().skip(1) {
-            let range = graph.nodes[node.0].range;
-            let parent = parents
-                .get(node)
-                .ok_or("each step after the entry needs a parent span")
-                .at(range)?;
-            if !order[..position].contains(parent) {
-                return Err(located(range, "a span parent must be entered before its child"));
+        for node in order.iter().skip(1) {
+            if !parents.contains_key(node) {
+                return Err(located(
+                    graph.nodes[node.0].range,
+                    "each step after the entry needs a parent span",
+                ));
             }
         }
         // nested span execution must preserve the explicit progression order
