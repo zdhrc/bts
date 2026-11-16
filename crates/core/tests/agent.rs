@@ -965,7 +965,7 @@ const CYCLE_SOURCE: &str = r#"
 ];
 "#;
 
-fn flow_batch(source: &str) -> data::EventBatch {
+fn one_trace(source: &str) -> data::EventBatch {
     data::generate(
         lower(source).unwrap(),
         1,
@@ -978,7 +978,7 @@ fn flow_batch(source: &str) -> data::EventBatch {
     .unwrap()
 }
 
-fn flow_code(model: &bts_core::mocking::Model, name: &str) -> Vec<Value> {
+fn generated_runs(model: &bts_core::mocking::Model, name: &str) -> Vec<Value> {
     [ScorerLang::Python, ScorerLang::Typescript]
         .into_iter()
         .map(|lang| match lang {
@@ -1003,7 +1003,7 @@ fn flow_code(model: &bts_core::mocking::Model, name: &str) -> Vec<Value> {
 #[test]
 fn cycles_create_fresh_occurrences_carry_inputs_and_preserve_history() {
     let model = lower(CYCLE_SOURCE).unwrap();
-    let batch = flow_batch(CYCLE_SOURCE);
+    let batch = one_trace(CYCLE_SOURCE);
     let names = ["root", "lookup", "check", "lookup", "check", "lookup", "check", "finish"];
     assert_eq!(
         batch.events.iter().map(|event| event.name.as_str()).collect::<Vec<_>>(),
@@ -1015,7 +1015,7 @@ fn cycles_create_fresh_occurrences_carry_inputs_and_preserve_history() {
             json!({"attempt":index,"earlier":index})
         );
     }
-    for result in flow_code(&model, "retrying") {
+    for result in generated_runs(&model, "retrying") {
         assert_eq!(result["output"], json!({"attempt":2,"earlier":2}));
         assert_eq!(
             result["spans"]
@@ -1084,7 +1084,7 @@ fn junction_strategies_execute_in_native_python_and_typescript() {
             .replace("CONFIG", config)
             .replace("RESULT", result);
         let model = lower(&source).unwrap();
-        let batch = flow_batch(&source);
+        let batch = one_trace(&source);
         assert_eq!(
             json!(
                 batch
@@ -1097,7 +1097,7 @@ fn junction_strategies_execute_in_native_python_and_typescript() {
             expected,
             "{kind}"
         );
-        for generated in flow_code(&model, "joined") {
+        for generated in generated_runs(&model, "joined") {
             assert_eq!(
                 json!(
                     generated["spans"]
@@ -1115,7 +1115,7 @@ fn junction_strategies_execute_in_native_python_and_typescript() {
     }
 }
 
-fn flow_code_error(model: &bts_core::mocking::Model, name: &str, message: &str) {
+fn generated_failure(model: &bts_core::mocking::Model, name: &str, message: &str) {
     let python = format!(
         "from {name}_agent import run_details\nimport json\ntry:\n    run_details()\nexcept Exception as error:\n    assert {message:?} in str(error), str(error)\nelse:\n    raise AssertionError('expected failure')\nprint(json.dumps(True))"
     );
@@ -1195,7 +1195,7 @@ fn junction_queues_consume_repeated_inputs_and_reduce_at_closure() {
         ),
     ] {
         let model = lower(&source).unwrap();
-        let batch = flow_batch(&source);
+        let batch = one_trace(&source);
         assert_eq!(
             json!(
                 batch
@@ -1207,7 +1207,7 @@ fn junction_queues_consume_repeated_inputs_and_reduce_at_closure() {
             ),
             expected
         );
-        for generated in flow_code(&model, "joined") {
+        for generated in generated_runs(&model, "joined") {
             assert_eq!(
                 json!(
                     generated["spans"]
@@ -1226,6 +1226,7 @@ fn junction_queues_consume_repeated_inputs_and_reduce_at_closure() {
 
 #[test]
 fn cycles_and_junctions_fail_explicitly_without_partial_success() {
+    // one step reached along two edges would run twice, which is refused before anything runs
     let ambiguous = r#"
 (joined:agent) {input: true, output: finish.output};
 (joined)-[:next]->(root:task) {input: joined.input};
@@ -1233,6 +1234,8 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
 (root) =[:parallel]=>[-[a:calls]->(shared), -[b:calls]->(shared)]
     >[:accumulate {observe: "result"} [a], [b]]>>(finish:task) {output: shared.output};
 "#;
+    let error = lower(ambiguous).unwrap_err();
+    assert!(error.contains("multiple next edges to one target"), "{error}");
     for (source, name, message) in [
         (
             CYCLE_SOURCE.replace("max_traversals: 3", "max_traversals: 1"),
@@ -1255,7 +1258,6 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
             "joined",
             "quorum group closed",
         ),
-        (ambiguous.to_owned(), "joined", "ambiguous occurrence"),
     ] {
         let model = lower(&source).unwrap();
         let error = data::generate(
@@ -1269,7 +1271,7 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
         )
         .unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
-        flow_code_error(&model, name, message);
+        generated_failure(&model, name, message);
     }
 }
 
@@ -1279,7 +1281,7 @@ fn cycle_groups_keep_limits_and_values_separate_inside_repetition() {
         .replace("(root)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool)",
             "(root) =[:repeat {count: 2}]=>[-[:calls]->(turn:task) {input: root.input}]; (turn)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool)")
         .replace("max_traversals: 3","max_traversals: 2");
-    let batch = flow_batch(&source);
+    let batch = one_trace(&source);
     let outputs: Vec<_> = batch
         .events
         .iter()
@@ -1290,7 +1292,7 @@ fn cycle_groups_keep_limits_and_values_separate_inside_repetition() {
         outputs.iter().map(|value| value["attempt"].clone()).collect::<Vec<_>>(),
         vec![json!(0), json!(1), json!(2), json!(0), json!(1), json!(2)]
     );
-    for generated in flow_code(&lower(&source).unwrap(), "retrying") {
+    for generated in generated_runs(&lower(&source).unwrap(), "retrying") {
         assert_eq!(
             generated["spans"]
                 .as_array()
@@ -1311,12 +1313,12 @@ fn weighted_cycles_preserve_named_history_and_budget_failures() {
         .replace("when: source.output.retry", "weight: 1, when: source.output.retry")
         .replace("when: !source.output.retry", "weight: 1, when: !source.output.retry")
         .replace("(lookup:tool)", "(lookup:tool {name: \"patient_lookup\"})");
-    let batch = flow_batch(&source);
+    let batch = one_trace(&source);
     assert_eq!(
         batch.events.last().unwrap().output.as_ref().unwrap().project(&()).unwrap(),
         json!({"attempt":2,"earlier":2})
     );
-    for generated in flow_code(&lower(&source).unwrap(), "retrying") {
+    for generated in generated_runs(&lower(&source).unwrap(), "retrying") {
         assert_eq!(generated["output"], json!({"attempt":2,"earlier":2}));
     }
     let infinite = CYCLE_SOURCE
@@ -1334,7 +1336,7 @@ fn weighted_cycles_preserve_named_history_and_budget_failures() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("execution budget"), "{error}");
-    flow_code_error(&model, "retrying", "execution budget");
+    generated_failure(&model, "retrying", "execution budget");
 }
 
 #[test]
@@ -1345,7 +1347,7 @@ fn junction_results_wait_for_destination_payload_dependencies() {
         .replace("output: context.index + 1", "output: child.output");
     let source = format!("{source}\n(left_task)-[:calls]->(child:tool) {{output: 1}};");
     let expected = json!([{ "edge":"b", "value":10 },{ "edge":"a", "value":1 }]);
-    let batch = flow_batch(&source);
+    let batch = one_trace(&source);
     assert_eq!(
         batch
             .events
@@ -1359,7 +1361,7 @@ fn junction_results_wait_for_destination_payload_dependencies() {
             .unwrap(),
         expected
     );
-    for generated in flow_code(&lower(&source).unwrap(), "joined") {
+    for generated in generated_runs(&lower(&source).unwrap(), "joined") {
         assert_eq!(
             generated["spans"]
                 .as_array()
@@ -1389,12 +1391,12 @@ fn consumer_rejections_point_at_the_offending_element() {
         (
             format!("{SOURCE}\n(request)-[:requires]->(lookup);"),
             ":requires",
-            "edge kind \"requires\" is not supported by mocking yet",
+            "edge kind `requires` is not supported by Braintrust mocking",
         ),
         (
             fork.to_owned(),
             "=[:fork]=>[-[:calls]->(answer:tool)]",
-            "fork kind \"fork\" or its configuration is not supported by mocking yet",
+            "fork kind `fork` is not supported by Braintrust mocking",
         ),
     ] {
         let errors = Bundle::compile_module(&source, false).unwrap_err();
@@ -1499,7 +1501,7 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
     ]
         ->(turn)-[:calls]->(reply:llm) {input: turn.input, output: "reply"};
 "#;
-    let spans = span_parents(&flow_batch(repeated));
+    let spans = span_parents(&one_trace(repeated));
     assert_eq!(spans.len(), 7);
     for index in 0..3 {
         assert!(spans.contains(&("turn".into(), json!(index), "request".into(), json!("hi"))));
@@ -1515,7 +1517,7 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
     ]
         ->(file)-[:calls]->(parse:tool) {input: file.input, output: "parsed"};
 "#;
-    let spans = span_parents(&flow_batch(iterated));
+    let spans = span_parents(&one_trace(iterated));
     assert_eq!(spans.len(), 5);
     for item in ["a.txt", "b.txt"] {
         assert!(spans.contains(&("file".into(), json!(item), "request".into(), json!("hi"))));
@@ -1536,8 +1538,7 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
         };
 "#;
     let model = lower(flowing).unwrap();
-    assert!(model.flows.is_empty(), "a reduce over rounds needs no flow interpreter");
-    let spans = span_parents(&flow_batch(flowing));
+    let spans = span_parents(&one_trace(flowing));
     assert_eq!(spans.len(), 8);
     for index in 0..3 {
         assert!(spans.contains(&("inspect".into(), json!(index), "request".into(), json!("hi"))));
@@ -1549,7 +1550,7 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
         .iter()
         .map(|(name, input, _, _)| (name.clone(), input.clone()))
         .collect();
-    for details in flow_code(&model, "chat") {
+    for details in generated_runs(&model, "chat") {
         let code: Vec<_> = (details["spans"].as_array().unwrap().iter())
             .map(|span| (span["name"].as_str().unwrap().to_owned(), span["input"].clone()))
             .collect();
@@ -1569,7 +1570,7 @@ fn next_from_a_nested_task_returns_to_its_level() {
 (research)-[:next]->(summary:llm) {input: read.output, output: "summary"};
 "#;
     assert_eq!(
-        parent_names(&flow_batch(source)),
+        parent_names(&one_trace(source)),
         names(&[
             ("request", ""),
             ("plan", "request"),
@@ -1610,7 +1611,7 @@ fn a_junction_target_takes_the_parent_its_inputs_carry() {
         >[:accumulate {observe: "result"} [a], [b]]>>(synthesis:llm) {input: context.arrivals, output: "answer"};
 "#;
     assert_eq!(
-        parent_names(&flow_batch(source)),
+        parent_names(&one_trace(source)),
         names(&[
             ("request", ""),
             ("delegate", "request"),
@@ -1689,7 +1690,7 @@ fn a_step_after_a_rounds_step_runs_in_every_round() {
         ("act", json!({"round": 1, "thought": 1})),
     ]
     .map(|(name, input)| (name.to_owned(), input));
-    let batch = flow_batch(source);
+    let batch = one_trace(source);
     let spans = span_parents(&batch);
     let data: Vec<_> = spans
         .iter()
@@ -1700,7 +1701,7 @@ fn a_step_after_a_rounds_step_runs_in_every_round() {
         spans.iter().skip(1).all(|(_, _, parent, _)| parent == "request"),
         "every step is a child of the request"
     );
-    for details in flow_code(&lower(source).unwrap(), "loop") {
+    for details in generated_runs(&lower(source).unwrap(), "loop") {
         let code: Vec<_> = (details["spans"].as_array().unwrap().iter())
             .map(|span| (span["name"].as_str().unwrap().to_owned(), span["input"].clone()))
             .collect();
@@ -1742,7 +1743,7 @@ fn definitions_supply_context_values_to_data_and_code() {
         ("reply", reply(1), json!("ok")),
     ]
     .map(|(name, input, output)| (name.to_owned(), input, output));
-    let batch = flow_batch(source);
+    let batch = one_trace(source);
     let data: Vec<_> = (batch.events.iter())
         .map(|event| {
             let project = |value: &Option<data::Value>| value.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
@@ -1751,8 +1752,7 @@ fn definitions_supply_context_values_to_data_and_code() {
         .collect();
     assert_eq!(data, expected);
     let model = lower(source).unwrap();
-    assert!(model.flows.is_empty());
-    for details in flow_code(&model, "support") {
+    for details in generated_runs(&model, "support") {
         let code: Vec<_> = (details["spans"].as_array().unwrap().iter())
             .map(|span| {
                 (
@@ -1769,7 +1769,7 @@ fn definitions_supply_context_values_to_data_and_code() {
     let unsupplied = source.replace(", value: self.props.tenant", "");
     assert_eq!(
         lower(&unsupplied).unwrap_err(),
-        "unsupported mocking context field \"tenant\""
+        "context key `tenant` is not supplied by Braintrust mocking"
     );
     // two suppliers on two paths leave the reader without one value
     let ambiguous = r#"

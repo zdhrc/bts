@@ -19,9 +19,10 @@ pub fn compile(source: &str) -> Result<execution::Model, String> {
 /// Lowers provider behavior graphs into shared mocking execution plans.
 ///
 /// Membership is every step the entry leads to, and a calls edge makes its target a child span.
-/// Acyclic nested behavior uses a static plan. Cycles and junctions retain
-/// occurrence scopes, queues and group closure in a graph plan.
-/// Both consumers enforce traversal limits and a 10000 occurrence budget.
+/// An agent lowers to one nested plan. A fork that iterates becomes a repeat of its rounds,
+/// a loop-back becomes a repeat that runs again while its guard holds, and a junction target
+/// runs once for each emission of its junction.
+/// Both consumers enforce traversal limits, and a loop-back without one stops at 10000 traversals.
 /// One trace has one entry span, so loop-back targets must be its descendants.
 /// Authored error payloads are trace data, not failed runtime operations.
 /// Expression errors abort generation. Mocking does not dispatch cancellable operations.
@@ -54,15 +55,6 @@ impl From<&str> for Error {
     }
 }
 
-// the first edge of the step holding `id`, searched through fan-out arms
-fn edge_bundle(steps: &[graph::PathStep], id: usize) -> Option<usize> {
-    steps.iter().find_map(|step| match step {
-        graph::PathStep::Edges(ids) if ids.contains(&graph::EdgeId(id)) => ids.first().map(|id| id.0),
-        graph::PathStep::Arms(arms) => arms.iter().find_map(|arm| edge_bundle(arm, id)),
-        _ => None,
-    })
-}
-
 fn located(range: graph::SrcRange, what: impl Into<String>) -> Error {
     Error {
         what: what.into(),
@@ -91,46 +83,19 @@ fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
         ..Default::default()
     };
     for (index, node) in model.nodes.iter().enumerate() {
-        if !inherits(model, &node.kind, "agent") {
+        if !model.derives(&node.kind, "agent") {
             continue;
         }
         let agent = graph::NodeId(index);
-        let Structure { members, parents } = structure(model, agent)?;
-        if model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source)) {
-            lower_flow(model, agent, &members, parents, &mut result).at(node.range)?;
-            continue;
-        }
-        if model.junctions.iter().any(|junction| members.contains(&junction.target)) {
-            // the tree covers a junction on its own fork, any other junction walks as a flow
-            let saved = result.clone();
-            let tree = AgentLowering::new(model, agent, &mut result).and_then(|mut lowerer| lowerer.lower());
-            if tree.is_err() {
-                result = saved;
-                lower_flow(model, agent, &members, parents, &mut result).at(node.range)?;
-            }
-            continue;
-        }
         let mut lowerer = AgentLowering::new(model, agent, &mut result).at(node.range)?;
         lowerer.lower().at(node.range)?;
     }
     for (index, node) in model.nodes.iter().enumerate() {
-        if !inherits(model, &node.kind, "scorer") {
+        if !model.derives(&node.kind, "scorer") {
             continue;
         }
         let id = graph::NodeId(index);
-        let mut lowerer = AgentLowering {
-            graph: model,
-            agent: id,
-            root: id,
-            order: vec![id],
-            guards: HashMap::new(),
-            parents: HashMap::new(),
-            inputs: HashMap::new(),
-            building: vec![],
-            callable: true,
-            flow: false,
-            result: &mut result,
-        };
+        let mut lowerer = AgentLowering::callable(model, id, &mut result);
         let kind = if let Some(judge) = lowerer.binding(id, "judge") {
             if lowerer.binding(id, "score").is_some() || lowerer.binding(id, "steps").is_some() {
                 return Err(located(node.range, "a scorer must select expressions or a judge"));
@@ -247,7 +212,7 @@ fn node_ref(graph: &graph::Model, value: &graph::Value, kind: Option<&str>) -> R
     let graph::ElementId::Node(node) = graph.refs[ref_id.0].target else {
         return Err("expected a node reference".into());
     };
-    if kind.is_some_and(|kind| !inherits(graph, &graph.nodes[node.0].kind, kind)) {
+    if kind.is_some_and(|kind| !graph.derives(&graph.nodes[node.0].kind, kind)) {
         return Err(format!("expected a {} node", kind.unwrap()).into());
     }
     Ok(node)
@@ -283,7 +248,7 @@ fn node_name(graph: &graph::Model, node: graph::NodeId) -> Result<String, Error>
 }
 
 fn span_ref(graph: &graph::Model, node: graph::NodeId, result: &mut execution::Model) -> Result<execution::RefId, Error> {
-    if inherits(graph, &graph.nodes[node.0].kind, "agent") {
+    if graph.derives(&graph.nodes[node.0].kind, "agent") {
         let name = node_name(graph, node)?;
         return result
             .agents
@@ -345,268 +310,9 @@ fn resource_value(
     value: &graph::Value,
     result: &mut execution::Model,
 ) -> Result<execution::Value, Error> {
-    AgentLowering {
-        graph,
-        agent: node,
-        root: node,
-        order: vec![node],
-        guards: HashMap::new(),
-        parents: HashMap::new(),
-        inputs: HashMap::new(),
-        building: vec![],
-        callable: true,
-        flow: false,
-        result,
-    }
-    .value(value)
-    .at(graph.nodes[node.0].range)
-}
-
-fn lower_flow(
-    graph: &graph::Model,
-    agent: graph::NodeId,
-    members: &HashSet<graph::NodeId>,
-    parents: HashMap<graph::NodeId, graph::NodeId>,
-    result: &mut execution::Model,
-) -> Result<(), Error> {
-    let entries: Vec<_> = graph
-        .edges
-        .iter()
-        .filter(|edge| edge.source == agent && inherits(graph, &edge.kind, "next"))
-        .collect();
-    if entries.len() != 1 || !entries[0].props.is_empty() || entries[0].fork.is_some() || entries[0].cycle {
-        return Err("agent needs one unconditional entry edge".into());
-    }
-    let root = entries[0].target;
-    if !inherits(graph, &graph.nodes[root.0].kind, "task") && graph.nodes[root.0].kind != "span" {
-        return Err(located(graph.nodes[root.0].range, "the entry must be a task or span"));
-    }
-    for node in members {
-        let mut cursor = *node;
-        let mut seen = HashSet::new();
-        while cursor != root {
-            if !seen.insert(cursor) {
-                return Err(located(graph.nodes[cursor.0].range, "span parenting cannot contain cycles"));
-            }
-            cursor = *parents
-                .get(&cursor)
-                .ok_or("each step after the entry needs a parent span")
-                .at(graph.nodes[cursor.0].range)?;
-        }
-    }
-    let mut lowerer = AgentLowering {
-        graph,
-        agent,
-        root,
-        order: (0..graph.nodes.len())
-            .map(graph::NodeId)
-            .filter(|n| members.contains(n))
-            .collect(),
-        guards: HashMap::new(),
-        parents: parents.clone(),
-        inputs: HashMap::new(),
-        building: vec![],
-        callable: false,
-        flow: true,
-        result,
-    };
-    let input = lowerer.binding(agent, "input").ok_or("agent needs input")?;
-    let root_input = lowerer.binding(root, "input").ok_or("entry span needs input")?;
-    if !matches!(graph.bindings[root_input.0].value, graph::Value::BindingRef(id, _) if id == input) {
-        return Err(located(
-            graph.bindings[root_input.0].range,
-            "entry span input must reference the agent input",
-        ));
-    }
-    let output = lowerer.binding(agent, "output").ok_or("agent needs output")?;
-    let output = lowerer.binding_value(output)?;
-    let mut nodes = vec![];
-    for node in lowerer.order.clone() {
-        let kind = ["scorer", "tool", "llm", "function", "task", "span", "vars", "node"]
-            .into_iter()
-            .find(|kind| inherits(graph, &graph.nodes[node.0].kind, kind))
-            .ok_or("unsupported graph execution node kind")
-            .at(graph.nodes[node.0].range)?;
-        let mut bindings = Vec::new();
-        for (id, binding) in graph.bindings.iter().enumerate() {
-            if binding.owner == graph::ElementId::Node(node)
-                || (node == root
-                    && binding.owner == graph::ElementId::Node(agent)
-                    && binding.path.first().is_some_and(|key| key == "input"))
-            {
-                bindings.push((id, lowerer.binding_value(graph::BindingId(id))?));
-            }
-        }
-        let fields = graph.nodes[node.0]
-            .fields
-            .iter()
-            .filter_map(|id| {
-                let binding = &graph.bindings[id.0];
-                (binding.path.len() == 1).then(|| (binding.path[0].clone(), id.0))
-            })
-            .collect();
-        nodes.push(execution::FlowNode {
-            id: AgentLowering::id(node),
-            key: graph.nodes[node.0].name.clone().unwrap_or_else(|| format!("node_{}", node.0)),
-            name: lowerer.name(node)?,
-            kind: kind.into(),
-            parent: parents.get(&node).copied().map(AgentLowering::id),
-            bindings,
-            fields,
-        });
-    }
-    let mut edges = vec![];
-    for (id, edge) in graph.edges.iter().enumerate() {
-        if !members.contains(&edge.source) {
-            continue;
-        }
-        if !members.contains(&edge.target) || edge.direction != graph::Direction::Directed {
-            return Err(located(edge.range, "execution edges require directed member endpoints"));
-        }
-        if edge.cycle && edge.target == root {
-            return Err(located(edge.range, "cycle edges cannot target the trace entry span"));
-        }
-        let kind = ["next", "feeds", "link", "requires", "contains"]
-            .into_iter()
-            .find(|kind| inherits(graph, &edge.kind, kind))
-            .ok_or("unsupported execution edge kind")
-            .at(edge.range)?;
-        let mut props = vec![];
-        let mut into = None;
-        for prop in &edge.props {
-            let binding = &graph.bindings[prop.0];
-            if binding.path == ["into"] {
-                if let graph::Value::FieldRef(target) = binding.value {
-                    if graph.bindings[target.0].owner != graph::ElementId::Node(edge.target)
-                        || !matches!(graph.bindings[target.0].value, graph::Value::Input { .. })
-                    {
-                        return Err(located(
-                            binding.range,
-                            "feeds destination must declare an upstream field on its target",
-                        ));
-                    }
-                    into = Some(target.0)
-                }
-            } else {
-                if !["when", "weight", "value", "max_traversals"].contains(&binding.path[0].as_str()) {
-                    return Err(located(
-                        binding.range,
-                        format!("unsupported execution edge property {}", binding.path[0]),
-                    ));
-                }
-                props.push((binding.path[0].clone(), lowerer.flow_property(*prop)?));
-            }
-        }
-        if kind == "feeds" && (into.is_none() || !props.iter().any(|(key, _)| key == "value")) {
-            return Err(located(edge.range, "feeds requires value and into"));
-        }
-        let bundle = graph
-            .paths
-            .iter()
-            .chain(graph.forks.iter().flat_map(|fork| fork.continuations.iter()))
-            .find_map(|path| edge_bundle(&path.steps, id))
-            .unwrap_or(id);
-        edges.push(execution::FlowEdge {
-            id,
-            bundle,
-            name: edge
-                .name
-                .clone()
-                .map(execution::Value::Str)
-                .unwrap_or(execution::Value::Num(execution::Number::Int(id as i64))),
-            source: AgentLowering::id(edge.source),
-            target: AgentLowering::id(edge.target),
-            kind: kind.into(),
-            cycle: edge.cycle,
-            into,
-            props,
-            fork: edge.fork.map(|f| f.0),
-        });
-    }
-    let mut forks = vec![];
-    for (id, fork) in graph
-        .forks
-        .iter()
-        .enumerate()
-        .filter(|(_, fork)| members.contains(&fork.source))
-    {
-        let kind = ["parallel", "conditional", "exclusive", "weighted", "each", "repeat"]
-            .into_iter()
-            .find(|kind| inherits(graph, &fork.kind, kind))
-            .ok_or("unsupported fork execution kind")
-            .at(fork.range)?;
-        let props = fork
-            .props
-            .iter()
-            .map(|id| Ok((graph.bindings[id.0].path[0].clone(), lowerer.flow_property(*id)?)))
-            .collect::<Result<_, Error>>()?;
-        forks.push(execution::FlowFork {
-            id,
-            source: AgentLowering::id(fork.source),
-            kind: kind.into(),
-            branches: fork.branches.iter().map(|b| b.iter().map(|e| e.0).collect()).collect(),
-            props,
-        });
-    }
-    let mut junctions = vec![];
-    for junction in graph.junctions.iter().filter(|j| members.contains(&j.target)) {
-        let kind = ["accumulate", "merge", "first", "quorum", "reduce"]
-            .into_iter()
-            .find(|kind| inherits(graph, &junction.kind, kind))
-            .ok_or("unsupported junction execution kind")
-            .at(junction.range)?;
-        if junction.inputs.iter().any(|id| !edges.iter().any(|edge| edge.id == id.0)) {
-            return Err(located(junction.range, "junction inputs must belong to the current agent"));
-        }
-        let props = junction
-            .props
-            .iter()
-            .map(|id| Ok((graph.bindings[id.0].path[0].clone(), lowerer.flow_property(*id)?)))
-            .collect::<Result<_, Error>>()?;
-        junctions.push(execution::FlowJunction {
-            target: AgentLowering::id(junction.target),
-            kind: kind.into(),
-            inputs: junction.inputs.iter().map(|e| e.0).collect(),
-            props,
-            fork: junction.fork.map(|f| f.0),
-        });
-    }
-    let root_id = AgentLowering::id(root);
-    let fields = lowerer.fields(root)?;
-    let name = lowerer.name(root)?;
-    lowerer.result.traces.push(execution::Trace {
-        node: root_id,
-        name,
-        fields,
-        bindings: vec![],
-        children: vec![],
-    });
-    let entrypoint = execution::RefId(lowerer.result.refs.len() as u32);
-    lowerer.result.refs.push(execution::ResolvedRef {
-        module: Some(root_id),
-        up: 0,
-        steps: vec![],
-        accessor: execution::Accessor::Block {
-            node: root_id,
-            kind: "trace",
-        },
-        path: vec![],
-        range: graph.nodes[agent.0].range,
-    });
-    lowerer.result.agents.push(execution::Agent {
-        name: node_name(graph, agent)?,
-        entrypoint,
-        output,
-    });
-    lowerer.result.flows.push(execution::Flow {
-        root: root_id,
-        input: input.0,
-        nodes,
-        edges,
-        forks,
-        junctions,
-    });
-    Ok(())
+    AgentLowering::callable(graph, node, result)
+        .value(value)
+        .at(graph.nodes[node.0].range)
 }
 
 fn lower_resources(graph: &graph::Model, result: &mut execution::Model) -> Result<(), Error> {
@@ -621,7 +327,7 @@ fn lower_resource(graph: &graph::Model, id: graph::NodeId, result: &mut executio
     let node = &graph.nodes[id.0];
     if !["dataset", "experiment", "facet", "automation"]
         .iter()
-        .any(|kind| inherits(graph, &node.kind, kind))
+        .any(|kind| graph.derives(&node.kind, kind))
     {
         return Ok(());
     }
@@ -667,14 +373,14 @@ fn lower_resource(graph: &graph::Model, id: graph::NodeId, result: &mut executio
             })
             .collect()
     };
-    if inherits(graph, &node.kind, "facet") {
+    if graph.derives(&node.kind, "facet") {
         result.facets.push(execution::Facet {
             prompt: string("prompt")?.ok_or_else(|| format!("{name} needs prompt"))?,
             no_match_pattern: string("no_match_pattern")?,
             name,
             description,
         });
-    } else if inherits(graph, &node.kind, "automation") {
+    } else if graph.derives(&node.kind, "automation") {
         let kind = match string("type")?.as_deref() {
             Some("scorer") => {
                 let scorers = strings("scorers")?;
@@ -727,7 +433,7 @@ fn lower_resource(graph: &graph::Model, id: graph::NodeId, result: &mut executio
             sampling_rate,
             enabled,
         });
-    } else if inherits(graph, &node.kind, "dataset") {
+    } else if graph.derives(&node.kind, "dataset") {
         let mut cases = Vec::new();
         for case in node_refs(graph, required("cases")?, Some("case"))? {
             let source = if let Some(value) = field(graph, case, "input") {
@@ -849,7 +555,7 @@ fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Er
                 "agent membership comes from the entry edge, remove this `contains` edge",
             ));
         }
-        if inherits(graph, &edge.kind, "calls") {
+        if graph.derives(&edge.kind, "calls") {
             return Err(located(
                 edge.range,
                 "an agent emits no span, enter its first step with a `next` edge",
@@ -959,16 +665,50 @@ fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Er
     Ok(Structure { members, parents })
 }
 
-fn inherits(model: &graph::Model, kind: &str, base: &str) -> bool {
-    let mut name = kind;
-    for _ in 0..=model.kinds.len() {
-        if name == base {
-            return true;
-        }
-        let Some(id) = model.kind_names.get(name) else { return false };
-        name = &model.kinds[id.0].base;
-    }
-    false
+// steps that run more than once inside their parent span
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum Group {
+    // the rounds of an each or repeat fork
+    Round(usize),
+    // the rounds of a loop-back, named by the step it returns to
+    Loop(graph::NodeId),
+    // the emissions of a junction, named by its index
+    Emit(usize),
+}
+
+// where a scoped value is evaluated: once for a span, or once for each iteration of a group
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scope {
+    Span(graph::NodeId),
+    Group(Group),
+}
+
+// how a reference reads a group other than at the reader's own iteration
+#[derive(Clone, Copy)]
+enum Across {
+    // every iteration
+    All,
+    // the iterations before the reader's
+    Before,
+    // the iteration before the reader's
+    Previous,
+}
+
+// where a route through the plan ends
+#[derive(Clone, Copy)]
+enum End {
+    Span,
+    Guard,
+    Iteration(Group),
+}
+
+// a child of a span with the groups it runs in on that level, widest first
+type Member = (Vec<Group>, execution::Child);
+
+// a loop-back edge and the step it leaves
+struct LoopBack {
+    edge: graph::EdgeId,
+    source: graph::NodeId,
 }
 
 struct AgentLowering<'a> {
@@ -979,33 +719,77 @@ struct AgentLowering<'a> {
     guards: HashMap<graph::NodeId, Vec<graph::BindingId>>,
     parents: HashMap<graph::NodeId, graph::NodeId>,
     inputs: HashMap<graph::BindingId, graph::BindingId>,
+    // values fed along a loop-back, by the field they supply
+    carried: HashMap<graph::BindingId, graph::BindingId>,
+    // loop-backs by the step they return to
+    loops: HashMap<graph::NodeId, LoopBack>,
+    // the positions in `order` of a step and everything it leads to
+    ranges: HashMap<graph::NodeId, (usize, usize)>,
     building: Vec<graph::BindingId>,
+    across: Vec<(Group, Across)>,
+    // the groups a value is read in, when that is not where the value being built is declared
+    readers: Vec<Vec<Group>>,
+    // whether a fold hands its combine expression bare values, not arrival records
+    raw_fold: bool,
     callable: bool,
-    flow: bool,
     result: &'a mut execution::Model,
 }
 
+// the path a supplied context value is lowered under, which no author can write
+const CONTEXT_VALUE: &str = "@context";
+
+// how a junction primitive combines what arrives, the capability check admits no other junction
+fn emission_kind(primitive: graph::Primitive) -> execution::EmissionKind {
+    match primitive {
+        graph::Primitive::Merge => execution::EmissionKind::Merge,
+        graph::Primitive::First => execution::EmissionKind::First,
+        graph::Primitive::Quorum => execution::EmissionKind::Quorum,
+        graph::Primitive::Reduce => execution::EmissionKind::Reduce,
+        _ => execution::EmissionKind::Accumulate,
+    }
+}
+
 impl<'a> AgentLowering<'a> {
+    // lowers the values of one node that is not walked as an agent
+    fn callable(graph: &'a graph::Model, node: graph::NodeId, result: &'a mut execution::Model) -> Self {
+        Self {
+            graph,
+            agent: node,
+            root: node,
+            order: vec![node],
+            guards: HashMap::new(),
+            parents: HashMap::new(),
+            inputs: HashMap::new(),
+            carried: HashMap::new(),
+            loops: HashMap::new(),
+            ranges: HashMap::new(),
+            building: vec![],
+            across: vec![],
+            readers: vec![],
+            raw_fold: false,
+            callable: true,
+            result,
+        }
+    }
+
     fn new(graph: &'a graph::Model, agent: graph::NodeId, result: &'a mut execution::Model) -> Result<Self, Error> {
         let Structure { members, parents } = structure(graph, agent)?;
         if members.is_empty() {
             return Err("agent needs one next entry edge".into());
         }
+        let iterates =
+            |fork: &graph::Fork| fork.primitive == graph::Primitive::Each || fork.primitive == graph::Primitive::Repeat;
         for fork in &graph.forks {
             if fork.source != agent && !members.contains(&fork.source) {
                 continue;
             }
-            if fork.source == agent && inherits(graph, &fork.kind, "weighted") {
+            if fork.source == agent && fork.primitive == graph::Primitive::Weighted {
                 return Err(located(
                     fork.range,
                     "agent entry must be unconditional, not a weighted selection",
                 ));
             }
-            if !["parallel", "conditional", "exclusive", "each", "repeat", "weighted"]
-                .iter()
-                .any(|kind| inherits(graph, &fork.kind, kind))
-                || (!inherits(graph, &fork.kind, "each") && !inherits(graph, &fork.kind, "repeat") && !fork.props.is_empty())
-            {
+            if !iterates(fork) && !fork.props.is_empty() {
                 return Err(located(
                     fork.range,
                     format!(
@@ -1015,33 +799,31 @@ impl<'a> AgentLowering<'a> {
                 ));
             }
         }
+        let weighted = |edge: &graph::Edge| {
+            edge.fork
+                .is_some_and(|fork| graph.forks[fork.0].primitive == graph::Primitive::Weighted)
+        };
         let mut next: HashMap<graph::NodeId, Vec<(graph::NodeId, Vec<graph::BindingId>)>> = HashMap::new();
         let mut inputs = HashMap::new();
-        for edge in &graph.edges {
+        let mut carried = HashMap::new();
+        let mut loops: HashMap<graph::NodeId, LoopBack> = HashMap::new();
+        for (index, edge) in graph.edges.iter().enumerate() {
             if edge.source != agent && !members.contains(&edge.source) {
                 continue;
             }
-            if edge.cycle || edge.direction != graph::Direction::Directed {
-                return Err(located(edge.range, "mocking requires directed paths without cycle edges"));
+            if edge.direction != graph::Direction::Directed {
+                return Err(located(edge.range, "mocking requires directed paths"));
             }
             if !members.contains(&edge.target) {
                 return Err(located(edge.range, "agent edges must target a member of the same agent"));
             }
-            let kind = &edge.kind;
-            if inherits(graph, kind, "next") {
+            if edge.primitive == graph::Primitive::Next {
                 let mut guards = Vec::new();
                 for id in &edge.props {
                     match graph.bindings[id.0].path[0].as_str() {
                         "when" => guards.push(*id),
-                        "weight"
-                            if graph.forks.iter().any(|fork| {
-                                inherits(graph, &fork.kind, "weighted")
-                                    && fork
-                                        .branches
-                                        .iter()
-                                        .flatten()
-                                        .any(|id| std::ptr::eq(&graph.edges[id.0], edge))
-                            }) => {}
+                        "max_traversals" if edge.cycle => {}
+                        "weight" if weighted(edge) => {}
                         _ => {
                             return Err(located(
                                 graph.bindings[id.0].range,
@@ -1049,6 +831,26 @@ impl<'a> AgentLowering<'a> {
                             ));
                         }
                     }
+                }
+                if edge.cycle {
+                    // a loop-back is not walked, it repeats the steps its target leads to
+                    if edge.fork.is_some_and(|fork| iterates(&graph.forks[fork.0])) {
+                        return Err(located(
+                            edge.range,
+                            "a loop-back cannot be a branch of an each or repeat fork",
+                        ));
+                    }
+                    let back = LoopBack {
+                        edge: graph::EdgeId(index),
+                        source: edge.source,
+                    };
+                    if loops.insert(edge.target, back).is_some() {
+                        return Err(located(
+                            edge.range,
+                            "more than one loop-back to one step is not supported by mocking yet",
+                        ));
+                    }
+                    continue;
                 }
                 let targets = next.entry(edge.source).or_default();
                 if targets.iter().any(|(target, _)| *target == edge.target) {
@@ -1058,7 +860,7 @@ impl<'a> AgentLowering<'a> {
                     ));
                 }
                 targets.push((edge.target, guards));
-            } else if inherits(graph, kind, "feeds") {
+            } else if edge.primitive == graph::Primitive::Feeds {
                 let mut value = None;
                 let mut into = None;
                 for id in &edge.props {
@@ -1070,15 +872,9 @@ impl<'a> AgentLowering<'a> {
                                 into = Some(id);
                             }
                         }
-                        Some("weight" | "when")
-                            if graph.forks.iter().any(|fork| {
-                                inherits(graph, &fork.kind, "weighted")
-                                    && fork
-                                        .branches
-                                        .iter()
-                                        .flatten()
-                                        .any(|id| std::ptr::eq(&graph.edges[id.0], edge))
-                            }) => {}
+                        // a loop-back carries its value whenever it is traversed
+                        Some("when") if edge.cycle => {}
+                        Some("weight" | "when") if weighted(edge) => {}
                         _ => {
                             return Err(located(
                                 binding.range,
@@ -1098,17 +894,15 @@ impl<'a> AgentLowering<'a> {
                         "feeds destination must declare an upstream value with <-",
                     ));
                 }
-                if inputs.insert(into, value).is_some() {
+                let supplied = if edge.cycle { &mut carried } else { &mut inputs };
+                if supplied.insert(into, value).is_some() {
                     return Err(located(
                         edge.range,
                         "multiple feeds to one field require an accumulation policy",
                     ));
                 }
             } else {
-                return Err(located(
-                    edge.range,
-                    format!("edge kind {kind:?} is not supported by mocking yet"),
-                ));
+                unreachable!("the capability check admits next and feeds edges only");
             }
         }
         let mut joined = HashSet::new();
@@ -1116,58 +910,46 @@ impl<'a> AgentLowering<'a> {
             if !members.contains(&junction.target) {
                 continue;
             }
-            let reduce = inherits(graph, &junction.kind, "reduce");
-            if !reduce && !inherits(graph, &junction.kind, "accumulate") && !inherits(graph, &junction.kind, "first") {
-                return Err(located(
-                    junction.range,
-                    "mocking currently requires accumulate, first or reduce junctions",
-                ));
-            }
             if !joined.insert(junction.target) {
                 return Err(located(
                     junction.range,
                     "multiple junction groups to one target require occurrence policies",
                 ));
             }
-            let fork = junction
-                .fork
-                .ok_or("mocking junctions need an attached fork to define their group")
-                .at(junction.range)?;
-            let source = graph.forks[fork.0].source;
+            // a junction without a fork joins the edges of one step
+            let source = match junction.fork {
+                Some(fork) => graph.forks[fork.0].source,
+                None => {
+                    let mut sources = junction.inputs.iter().map(|input| graph.edges[input.0].source);
+                    let first = sources.next().ok_or("a junction needs an input").at(junction.range)?;
+                    if sources.any(|source| source != first) {
+                        return Err(located(
+                            junction.range,
+                            "a junction without a fork must join edges that leave one step",
+                        ));
+                    }
+                    first
+                }
+            };
             if !members.contains(&source) {
                 return Err(located(junction.range, "junction group must belong to the same agent"));
             }
-            let rounds =
-                inherits(graph, &graph.forks[fork.0].kind, "each") || inherits(graph, &graph.forks[fork.0].kind, "repeat");
-            if reduce {
-                // the tree folds the result of one step across the rounds of its fork
-                let result = junction.props.iter().any(|id| {
-                    graph.bindings[id.0].path == ["observe"]
-                        && matches!(&graph.bindings[id.0].value, graph::Value::Str(mode) if mode == "result")
-                });
-                let source = junction.props.iter().all(|id| {
-                    graph.bindings[id.0].path != ["order"]
-                        || matches!(&graph.bindings[id.0].value, graph::Value::Str(order) if order == "source")
-                });
-                let branch = |id: &graph::EdgeId| graph.forks[fork.0].branches.iter().flatten().any(|edge| edge == id);
-                if !rounds || !result || !source || junction.inputs.len() != 1 || !branch(&junction.inputs[0]) {
-                    return Err(located(junction.range, "this reduce junction walks as a flow"));
-                }
-            } else if rounds {
-                // rounds feed a junction one arrival each, which only the flow walk queues
-                return Err(located(junction.range, "a junction on a repeating fork walks as a flow"));
-            }
             for id in &junction.props {
                 let binding = &graph.bindings[id.0];
-                if reduce && matches!(binding.path[0].as_str(), "initial" | "combine" | "order") {
-                    continue;
-                }
-                if binding.path != ["observe"]
-                    || !matches!(&binding.value, graph::Value::Str(mode) if mode == "arrival" || mode == "result")
-                {
+                let text =
+                    |allowed: &[&str]| matches!(&binding.value, graph::Value::Str(value) if allowed.contains(&value.as_str()));
+                let supported = match binding.path[0].as_str() {
+                    "observe" => text(&["arrival", "result"]),
+                    "correlate" => true,
+                    "count" => junction.primitive == graph::Primitive::Quorum,
+                    "initial" | "combine" => junction.primitive == graph::Primitive::Reduce,
+                    "order" => junction.primitive == graph::Primitive::Reduce && text(&["source", "arrival"]),
+                    _ => false,
+                };
+                if !supported {
                     return Err(located(
                         binding.range,
-                        "mocking junctions support observe with one group per fork activation",
+                        format!("junction property `{}` is not supported by mocking yet", binding.path[0]),
                     ));
                 }
             }
@@ -1180,6 +962,7 @@ impl<'a> AgentLowering<'a> {
         let root = entries[0].0;
         let mut order = vec![];
         let mut guards = HashMap::new();
+        let mut ranges = HashMap::new();
         fn walk(
             graph: &graph::Model,
             node: graph::NodeId,
@@ -1187,6 +970,7 @@ impl<'a> AgentLowering<'a> {
             next: &HashMap<graph::NodeId, Vec<(graph::NodeId, Vec<graph::BindingId>)>>,
             order: &mut Vec<graph::NodeId>,
             guards: &mut HashMap<graph::NodeId, Vec<graph::BindingId>>,
+            ranges: &mut HashMap<graph::NodeId, (usize, usize)>,
         ) -> Result<(), Error> {
             if guards.insert(node, inherited.clone()).is_some() {
                 return Err(located(
@@ -1194,17 +978,19 @@ impl<'a> AgentLowering<'a> {
                     "repeated arrivals require a junction or an occurrence policy",
                 ));
             }
+            let start = order.len();
             order.push(node);
             for (target, local) in next.get(&node).into_iter().flatten() {
                 let mut combined = inherited.clone();
                 combined.extend(local);
-                walk(graph, *target, combined, next, order, guards)?;
+                walk(graph, *target, combined, next, order, guards, ranges)?;
             }
+            ranges.insert(node, (start, order.len()));
             Ok(())
         }
-        walk(graph, root, vec![], &next, &mut order, &mut guards)?;
+        walk(graph, root, vec![], &next, &mut order, &mut guards, &mut ranges)?;
         for edge in &graph.edges {
-            if members.contains(&edge.source) && inherits(graph, &edge.kind, "feeds") {
+            if members.contains(&edge.source) && edge.primitive == graph::Primitive::Feeds && !edge.cycle {
                 let source = order.iter().position(|node| *node == edge.source);
                 let target = order.iter().position(|node| *node == edge.target);
                 if source >= target {
@@ -1240,6 +1026,62 @@ impl<'a> AgentLowering<'a> {
         if nested != order {
             return Err("progression reenters a completed parent span".into());
         }
+        // a loop-back repeats its target and every step the target leads to
+        for (target, back) in &loops {
+            let edge = &graph.edges[back.edge.0];
+            if *target == root {
+                return Err(located(edge.range, "cycle edges cannot target the trace entry span"));
+            }
+            let (start, end) = ranges[target];
+            if !order[start..end].contains(&back.source) {
+                return Err(located(
+                    edge.range,
+                    "a loop-back must return to a step that leads to its source",
+                ));
+            }
+            let level = parents[target];
+            for node in &order[start..end] {
+                let mut cursor = *node;
+                while parents.get(&cursor) != Some(&level) {
+                    cursor = *parents.get(&cursor).ok_or_else(|| {
+                        located(
+                            graph.nodes[node.0].range,
+                            "a step repeated by a loop-back must stay under the span that holds the loop",
+                        )
+                    })?;
+                }
+            }
+        }
+        for (into, value) in &carried {
+            let graph::ElementId::Node(target) = graph.bindings[into.0].owner else {
+                continue;
+            };
+            if !loops.contains_key(&target) {
+                return Err(located(
+                    graph.bindings[value.0].range,
+                    "a feeds loop-back needs a next loop-back to the same step",
+                ));
+            }
+            if !inputs.contains_key(into) {
+                return Err(located(
+                    graph.bindings[into.0].range,
+                    "the first round of a loop needs a feeds edge for this field",
+                ));
+            }
+        }
+        for (into, _) in inputs.iter().filter(|(into, _)| !carried.contains_key(into)) {
+            if let graph::ElementId::Node(target) = graph.bindings[into.0].owner
+                && let Some(back) = loops.get(&target)
+            {
+                return Err(located(
+                    graph.edges[back.edge.0].range,
+                    format!(
+                        "this loop-back must feed `{}`, a new round does not keep the earlier value",
+                        graph.bindings[into.0].path.join(".")
+                    ),
+                ));
+            }
+        }
         Ok(Self {
             graph,
             agent,
@@ -1248,9 +1090,14 @@ impl<'a> AgentLowering<'a> {
             guards,
             parents,
             inputs,
+            carried,
+            loops,
+            ranges,
             building: vec![],
+            across: vec![],
+            readers: vec![],
+            raw_fold: false,
             callable: false,
-            flow: false,
             result,
         })
     }
@@ -1277,7 +1124,7 @@ impl<'a> AgentLowering<'a> {
                 "shared agent entry spans are not supported by mocking yet",
             ));
         }
-        if !inherits(self.graph, root_kind, "task") && root_kind != "span" {
+        if !self.graph.derives(root_kind, "task") && root_kind != "span" {
             return Err(located(
                 self.graph.nodes[self.root.0].range,
                 "the first mocking span must be a task or span",
@@ -1304,26 +1151,28 @@ impl<'a> AgentLowering<'a> {
         for (index, binding) in self.graph.bindings.iter().enumerate() {
             if let graph::ElementId::Node(node) = binding.owner
                 && self.order.contains(&node)
-                && self.each_ancestor(node).is_none()
+                && self.enclosing(node).is_none()
                 && !binding.property
                 && !matches!(resolved(self.graph, &binding.value), graph::Value::GraphRef { .. })
-                && (!inherits(self.graph, &self.graph.nodes[node.0].kind, "span")
+                && (!self.graph.derives(&self.graph.nodes[node.0].kind, "span")
                     || Self::field(binding.path.first().map(String::as_str).unwrap_or("")).is_none())
             {
                 bindings.push(execution::Binding {
                     name: format!("binding_{index}"),
+                    label: None,
                     value: self.binding_value(graph::BindingId(index))?,
                 });
             }
         }
         for edge in &self.graph.edges {
-            if !self.order.contains(&edge.source) || self.each_ancestor(edge.source).is_some() {
+            if !self.order.contains(&edge.source) || self.enclosing(edge.source).is_some() {
                 continue;
             }
             for id in &edge.props {
                 if self.graph.bindings[id.0].path == ["value"] {
                     bindings.push(execution::Binding {
                         name: format!("edge_value_{}", id.0),
+                        label: None,
                         value: self.binding_value(*id)?,
                     });
                 }
@@ -1339,7 +1188,7 @@ impl<'a> AgentLowering<'a> {
                 self.graph
                     .forks
                     .iter()
-                    .filter(|fork| self.order.contains(&fork.source) && inherits(self.graph, &fork.kind, "weighted"))
+                    .filter(|fork| self.order.contains(&fork.source) && fork.primitive == graph::Primitive::Weighted)
                     .flat_map(|fork| fork.branches.iter().flatten())
                     .flat_map(|edge| self.graph.edges[edge.0].props.iter().copied())
                     .filter(|id| self.graph.bindings[id.0].path == ["when"]),
@@ -1350,22 +1199,28 @@ impl<'a> AgentLowering<'a> {
                 continue;
             }
             if let graph::ElementId::Edge(edge) = self.graph.bindings[id.0].owner
-                && self.each_ancestor(self.graph.edges[edge.0].source).is_some()
+                && self.enclosing(self.graph.edges[edge.0].source).is_some()
             {
                 continue;
             }
             bindings.push(execution::Binding {
                 name: format!("guard_{}", id.0),
+                label: None,
                 value: self.binding_value(id)?,
             });
         }
-        self.result.traces.push(execution::Trace {
+        let mut trace = execution::Trace {
             node: Self::id(self.root),
             name: self.name(self.root)?,
             fields,
             bindings,
             children,
-        });
+        };
+        for binding in &mut trace.bindings {
+            binding.label = self.label(&binding.name);
+        }
+        self.label_children(&mut trace.children);
+        self.result.traces.push(trace);
         let entrypoint = execution::RefId(self.result.refs.len() as u32);
         self.result.refs.push(execution::ResolvedRef {
             module: Some(Self::id(self.root)),
@@ -1386,6 +1241,87 @@ impl<'a> AgentLowering<'a> {
         Ok(())
     }
 
+    fn label_children(&self, children: &mut [execution::Child]) {
+        for child in children {
+            let (bindings, children) = match child {
+                execution::Child::Span(span) => (&mut span.bindings, Some(&mut span.children)),
+                execution::Child::Repeat(repeat) => (&mut repeat.bindings, Some(&mut repeat.children)),
+                execution::Child::Choice(choice) => (&mut choice.bindings, Some(&mut choice.children)),
+                execution::Child::Maybe(maybe) => (&mut maybe.bindings, Some(&mut maybe.children)),
+                execution::Child::Scorer(scorer) => (&mut scorer.bindings, None),
+            };
+            for binding in bindings {
+                binding.label = self.label(&binding.name);
+            }
+            if let Some(children) = children {
+                self.label_children(children);
+            }
+        }
+    }
+
+    // a readable name for a scoped value, taken from the graph element it belongs to
+    fn label(&self, name: &str) -> Option<String> {
+        let (role, index) = name.rsplit_once('_')?;
+        let index: usize = index.parse().ok()?;
+        let node = |id: graph::NodeId| {
+            let node = &self.graph.nodes[id.0];
+            node.name.clone().unwrap_or_else(|| node.kind.clone())
+        };
+        match role {
+            "binding" | "guard" | "edge_value" | "fork_input" => {
+                let binding = self.graph.bindings.get(index)?;
+                match (role, binding.owner) {
+                    // a supplied context value is known by its key
+                    ("binding", _) if binding.path.first().is_some_and(|key| key == CONTEXT_VALUE) => {
+                        Some(binding.path[1..].join("_"))
+                    }
+                    // a value a step keeps for itself is known by its own name
+                    ("binding", graph::ElementId::Node(owner)) => {
+                        let own: Vec<_> = (binding.path.iter()).filter(|key| *key != "local").cloned().collect();
+                        Some(if own.is_empty() {
+                            format!("{}_local", node(owner))
+                        } else {
+                            own.join("_")
+                        })
+                    }
+                    ("guard", graph::ElementId::Edge(edge)) => {
+                        let edge = &self.graph.edges[edge.0];
+                        Some(edge.name.clone().unwrap_or_else(|| format!("runs_{}", node(edge.target))))
+                    }
+                    ("edge_value", graph::ElementId::Edge(edge)) => {
+                        let edge = &self.graph.edges[edge.0];
+                        let into = (edge.props.iter()).find_map(|id| match self.graph.bindings[id.0].value {
+                            graph::Value::FieldRef(field) if self.graph.bindings[id.0].path == ["into"] => {
+                                Some(self.graph.bindings[field.0].path.join("_"))
+                            }
+                            _ => None,
+                        });
+                        Some(match (into, &edge.name) {
+                            // what a loop-back sends is the value for the round after this one
+                            (Some(into), _) if edge.cycle => format!("next_{}_{into}", node(edge.target)),
+                            (Some(into), _) => format!("{}_{into}", node(edge.target)),
+                            (None, Some(name)) => format!("{name}_value"),
+                            (None, None) => format!("{}_value", node(edge.target)),
+                        })
+                    }
+                    ("fork_input", graph::ElementId::Fork(fork)) => {
+                        let fork = &self.graph.forks[fork.0];
+                        let stem = fork.name.clone().unwrap_or_else(|| node(fork.source));
+                        Some(format!("{stem}_{}", binding.path[0]))
+                    }
+                    _ => None,
+                }
+            }
+            "fork_pick" => {
+                let fork = self.graph.forks.get(index)?;
+                Some(format!("{}_route", fork.name.clone().unwrap_or_else(|| node(fork.source))))
+            }
+            "emissions" => Some(format!("{}_arrivals", node(self.graph.junctions.get(index)?.target))),
+            "correlate" => Some(format!("{}_key", node(self.graph.junctions.get(index)?.target))),
+            _ => None,
+        }
+    }
+
     fn name(&self, node: graph::NodeId) -> Result<String, Error> {
         let n = &self.graph.nodes[node.0];
         for id in &n.props {
@@ -1400,8 +1336,8 @@ impl<'a> AgentLowering<'a> {
         Ok(n.name.clone().unwrap_or_else(|| format!("{}_{}", n.kind, node.0)))
     }
 
-    fn each(&self, node: graph::NodeId) -> Option<(usize, &graph::Fork)> {
-        self.round(node, &mut HashSet::new())
+    fn iterates(&self, fork: &graph::Fork) -> bool {
+        fork.primitive == graph::Primitive::Each || fork.primitive == graph::Primitive::Repeat
     }
 
     // the each or repeat fork whose round a step runs in
@@ -1409,12 +1345,9 @@ impl<'a> AgentLowering<'a> {
         if !seen.insert(node) {
             return None;
         }
-        let iterates =
-            |fork: &graph::Fork| inherits(self.graph, &fork.kind, "each") || inherits(self.graph, &fork.kind, "repeat");
-        let direct =
-            self.graph.forks.iter().enumerate().find(|(_, fork)| {
-                iterates(fork) && fork.branches.iter().flatten().any(|id| self.graph.edges[id.0].target == node)
-            });
+        let direct = self.graph.forks.iter().enumerate().find(|(_, fork)| {
+            self.iterates(fork) && fork.branches.iter().flatten().any(|id| self.graph.edges[id.0].target == node)
+        });
         if direct.is_some() {
             return direct;
         }
@@ -1423,7 +1356,7 @@ impl<'a> AgentLowering<'a> {
         for edge in &self.graph.edges {
             if edge.target == node
                 && !edge.cycle
-                && inherits(self.graph, &edge.kind, "next")
+                && edge.primitive == graph::Primitive::Next
                 && self.parents.get(&edge.source) == Some(level)
                 && let Some(found) = self.round(edge.source, seen)
             {
@@ -1434,7 +1367,7 @@ impl<'a> AgentLowering<'a> {
         for junction in self.graph.junctions.iter().filter(|junction| junction.target == node) {
             let Some(fork) = junction.fork else { continue };
             let fork = &self.graph.forks[fork.0];
-            if !iterates(fork)
+            if !self.iterates(fork)
                 && self.parents.get(&fork.source) == Some(level)
                 && let Some(found) = self.round(fork.source, seen)
             {
@@ -1444,17 +1377,167 @@ impl<'a> AgentLowering<'a> {
         None
     }
 
-    fn each_id(&self, index: usize) -> execution::NodeId {
-        execution::NodeId((self.graph.nodes.len() * 2 + index) as u32)
+    fn group_id(&self, group: Group) -> execution::NodeId {
+        let nodes = self.graph.nodes.len();
+        let forks = self.graph.forks.len();
+        execution::NodeId(match group {
+            Group::Round(index) => nodes * 2 + index,
+            Group::Loop(target) => nodes * 2 + forks + target.0,
+            Group::Emit(junction) => nodes * 3 + forks + junction,
+        } as u32)
+    }
+
+    fn junction_index(&self, node: graph::NodeId) -> Option<usize> {
+        self.graph.junctions.iter().position(|junction| junction.target == node)
+    }
+
+    fn junction_kind(&self, junction: &graph::Junction) -> execution::EmissionKind {
+        emission_kind(junction.primitive)
+    }
+
+    fn junction_prop(&self, junction: &graph::Junction, name: &str) -> Option<graph::BindingId> {
+        (junction.props.iter().copied()).find(|id| self.graph.bindings[id.0].path == [name])
+    }
+
+    // the rounds a junction gathers arrivals from, when its fork iterates
+    fn junction_round(&self, junction: &graph::Junction) -> Option<Group> {
+        let fork = junction.fork?;
+        self.iterates(&self.graph.forks[fork.0]).then_some(Group::Round(fork.0))
+    }
+
+    // whether a junction can fire more than once, so its target runs once for each emission
+    fn emits(&self, index: usize) -> bool {
+        use execution::EmissionKind as Kind;
+        let junction = &self.graph.junctions[index];
+        let kind = self.junction_kind(junction);
+        kind == Kind::Merge
+            || (self.junction_round(junction).is_some()
+                && (kind != Kind::Reduce || self.junction_prop(junction, "correlate").is_some()))
+    }
+
+    // the groups a step runs in on its own level, widest first
+    fn level_groups(&self, node: graph::NodeId) -> Vec<Group> {
+        let mut groups = Vec::new();
+        if let Some((index, _)) = self.round(node, &mut HashSet::new()) {
+            groups.push(Group::Round(index));
+        }
+        let Some(position) = self.order.iter().position(|member| *member == node) else {
+            return groups;
+        };
+        let level = self.parents.get(&node);
+        let holds = |target: graph::NodeId| {
+            self.parents.get(&target) == level
+                && (self.ranges.get(&target)).is_some_and(|(start, end)| (*start..*end).contains(&position))
+        };
+        let mut inner = Vec::new();
+        for (index, junction) in self.graph.junctions.iter().enumerate() {
+            if self.order.contains(&junction.target) && self.emits(index) && holds(junction.target) {
+                inner.push((self.ranges[&junction.target].0, 0, Group::Emit(index)));
+            }
+        }
+        for target in self.loops.keys() {
+            if holds(*target) {
+                inner.push((self.ranges[target].0, 1, Group::Loop(*target)));
+            }
+        }
+        inner.sort_by_key(|(start, kind, _)| (*start, *kind));
+        groups.extend(inner.into_iter().map(|(_, _, group)| group));
+        groups
+    }
+
+    // the innermost group a step runs in, with the step on the group's level that holds it
+    fn enclosing(&self, mut node: graph::NodeId) -> Option<(Group, graph::NodeId)> {
+        loop {
+            if let Some(group) = self.level_groups(node).pop() {
+                return Some((group, node));
+            }
+            node = *self.parents.get(&node)?;
+        }
+    }
+
+    fn within(&self, node: graph::NodeId, group: Group) -> bool {
+        self.order.contains(&node) && self.enclosing(node).is_some_and(|(found, _)| found == group)
+    }
+
+    // every group a step runs in, on its own level and above
+    fn all_groups(&self, mut node: graph::NodeId) -> Vec<Group> {
+        let mut groups = Vec::new();
+        loop {
+            groups.extend(self.level_groups(node));
+            match self.parents.get(&node) {
+                Some(parent) => node = *parent,
+                None => return groups,
+            }
+        }
+    }
+
+    // the groups the value being built is read in
+    fn reader(&self) -> Vec<Group> {
+        if let Some(groups) = self.readers.last() {
+            return groups.clone();
+        }
+        let Some(first) = self.building.first() else { return vec![] };
+        let node = match self.graph.bindings[first.0].owner {
+            graph::ElementId::Node(node) => node,
+            graph::ElementId::Edge(edge) => self.graph.edges[edge.0].source,
+            graph::ElementId::Fork(fork) => self.graph.forks[fork.0].source,
+            graph::ElementId::Junction(junction) => self.graph.junctions[junction.0].target,
+        };
+        self.all_groups(node)
     }
 
     fn each_ancestor(&self, mut node: graph::NodeId) -> Option<(usize, &graph::Fork)> {
         loop {
-            if let Some(fork) = self.each(node) {
+            if let Some(fork) = self.round(node, &mut HashSet::new()) {
                 return Some(fork);
             }
             node = *self.parents.get(&node)?;
         }
+    }
+
+    // the number of rounds of an each or repeat fork, read where the fork starts
+    fn round_count(&self, index: usize) -> Result<(execution::Value, graph::SrcRange), Error> {
+        let fork = &self.graph.forks[index];
+        let repeated = fork.primitive == graph::Primitive::Repeat;
+        let property = if repeated { "count" } else { "items" };
+        let input = *fork
+            .props
+            .iter()
+            .find(|id| self.graph.bindings[id.0].path == [property])
+            .ok_or("iteration fork needs its input")
+            .at(fork.range)?;
+        let range = self.graph.bindings[input.0].range;
+        let value = execution::Value::VarRef(format!("fork_input_{}", input.0));
+        let count = if repeated {
+            value
+        } else {
+            execution::Value::Func {
+                func: execution::Func::Len { target: Box::new(value) },
+                range,
+            }
+        };
+        Ok((count, range))
+    }
+
+    // the item, index or count of a round, read from a step inside it
+    fn round_value(&self, fork: usize, key: &str, innermost: bool, range: graph::SrcRange) -> Result<execution::Value, Error> {
+        use execution::Value as V;
+        let index = V::CtxRef(execution::CtxRef::RepeatIndexAt(self.group_id(Group::Round(fork))));
+        Ok(match key {
+            "index" => index,
+            "count" if innermost => V::CtxRef(execution::CtxRef::RepeatCount),
+            "count" => self.round_count(fork)?.0,
+            _ => {
+                let items = *(self.graph.forks[fork].props.iter())
+                    .find(|id| self.graph.bindings[id.0].path == ["items"])
+                    .ok_or("item requires an each fork")?;
+                V::Index {
+                    target: Box::new(V::VarRef(format!("fork_input_{}", items.0))),
+                    index: Box::new(index),
+                    range,
+                }
+            }
+        })
     }
 
     fn fork_bindings(&mut self, node: graph::NodeId) -> Result<Vec<execution::Binding>, Error> {
@@ -1466,28 +1549,34 @@ impl<'a> AgentLowering<'a> {
             .flat_map(|fork| fork.props.iter().copied())
             .filter(|id| matches!(self.graph.bindings[id.0].path[0].as_str(), "count" | "items"))
             .collect();
-        let mut bindings = self.weighted_bindings(node)?;
+        let mut bindings = self.weighted_bindings(Scope::Span(node))?;
         bindings.extend(
             ids.into_iter()
                 .map(|id| {
                     Ok(execution::Binding {
                         name: format!("fork_input_{}", id.0),
+                        label: None,
                         value: self.binding_value(id)?,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()?,
         );
+        bindings.extend(self.emission_bindings(Scope::Span(node))?);
         Ok(bindings)
     }
 
     fn weighted_branches(&self, node: graph::NodeId) -> Vec<(usize, usize)> {
         let mut result = Vec::new();
         for (index, fork) in self.graph.forks.iter().enumerate() {
-            if !inherits(self.graph, &fork.kind, "weighted") {
+            if fork.primitive != graph::Primitive::Weighted {
                 continue;
             }
             for (branch, edges) in fork.branches.iter().enumerate() {
-                let mut pending: Vec<_> = edges.iter().map(|id| self.graph.edges[id.0].target).collect();
+                // a loop-back branch starts a new round, it does not lead to its target
+                let mut pending: Vec<_> = (edges.iter().map(|id| &self.graph.edges[id.0]))
+                    .filter(|edge| !edge.cycle)
+                    .map(|edge| edge.target)
+                    .collect();
                 let mut seen = HashSet::new();
                 while let Some(current) = pending.pop() {
                     if !seen.insert(current) {
@@ -1501,7 +1590,7 @@ impl<'a> AgentLowering<'a> {
                         self.graph
                             .edges
                             .iter()
-                            .filter(|edge| edge.source == current && !edge.cycle && inherits(self.graph, &edge.kind, "next"))
+                            .filter(|edge| edge.source == current && !edge.cycle && edge.primitive == graph::Primitive::Next)
                             .map(|edge| edge.target),
                     );
                 }
@@ -1510,14 +1599,41 @@ impl<'a> AgentLowering<'a> {
         result
     }
 
+    // whether a step runs at all: every guard and weighted pick on the way to it
     fn node_condition(&self, node: graph::NodeId) -> execution::Value {
-        let mut condition = self.condition(&self.guards[&node]);
-        for (fork, branch) in self.weighted_branches(node) {
+        self.selected(&self.guards[&node], &self.weighted_branches(node), node)
+    }
+
+    // the guards and weighted picks that decide a step beyond those that decide its parent span
+    fn own_gates(&self, node: graph::NodeId) -> (Vec<graph::BindingId>, Vec<(usize, usize)>) {
+        let guards = &self.guards[&node];
+        let picks = self.weighted_branches(node);
+        let Some(parent) = (self.parents.get(&node)).filter(|parent| self.guards.contains_key(parent)) else {
+            return (guards.clone(), picks);
+        };
+        let inherited = &self.guards[parent];
+        let guards = match guards.strip_prefix(inherited.as_slice()) {
+            Some(own) => own.to_vec(),
+            None => guards.clone(),
+        };
+        let above = self.weighted_branches(*parent);
+        (guards, picks.into_iter().filter(|pick| !above.contains(pick)).collect())
+    }
+
+    // whether a step runs, given that its parent span does
+    fn gate_condition(&self, node: graph::NodeId) -> execution::Value {
+        let (guards, picks) = self.own_gates(node);
+        self.selected(&guards, &picks, node)
+    }
+
+    fn selected(&self, guards: &[graph::BindingId], picks: &[(usize, usize)], node: graph::NodeId) -> execution::Value {
+        let mut condition = self.condition(guards);
+        for (fork, branch) in picks {
             let selected = execution::Value::Binary {
                 op: execution::BinOp::Eq,
                 lhs: Box::new(execution::Value::VarRef(format!("fork_pick_{fork}"))),
-                rhs: Box::new(execution::Value::Num(execution::Number::Int(branch as i64))),
-                range: self.graph.forks[fork].range,
+                rhs: Box::new(execution::Value::Num(execution::Number::Int(*branch as i64))),
+                range: self.graph.forks[*fork].range,
             };
             condition = execution::Value::Binary {
                 op: execution::BinOp::And,
@@ -1535,30 +1651,44 @@ impl<'a> AgentLowering<'a> {
         };
         self.graph.edges[edge.0]
             .fork
-            .is_some_and(|fork| inherits(self.graph, &self.graph.forks[fork.0].kind, "weighted"))
+            .is_some_and(|fork| self.graph.forks[fork.0].primitive == graph::Primitive::Weighted)
     }
 
-    fn weighted_owner(&self, fork: &graph::Fork) -> graph::NodeId {
-        let mut owner = fork.source;
-        loop {
-            let encloses = fork.branches.iter().flatten().all(|id| {
-                let mut node = self.graph.edges[id.0].target;
+    // the innermost scope that holds a weighted fork and every step it may select
+    fn weighted_owner(&self, fork: &graph::Fork) -> Scope {
+        let targets: Vec<_> = (fork.branches.iter().flatten())
+            .map(|id| self.graph.edges[id.0].target)
+            .collect();
+        let under = |scope: Scope, node: graph::NodeId| match scope {
+            Scope::Group(group) => self.all_groups(node).contains(&group),
+            Scope::Span(span) => {
+                let mut cursor = node;
                 loop {
-                    if node == owner {
+                    if cursor == span {
                         return true;
                     }
-                    let Some(parent) = self.parents.get(&node) else { return false };
-                    node = *parent;
+                    let Some(parent) = self.parents.get(&cursor) else {
+                        return false;
+                    };
+                    cursor = *parent;
                 }
-            });
-            if encloses {
-                return owner;
             }
-            owner = self.parents[&owner];
+        };
+        let mut node = fork.source;
+        loop {
+            let mut scopes = vec![Scope::Span(node)];
+            scopes.extend(self.level_groups(node).into_iter().rev().map(Scope::Group));
+            if let Some(scope) = (scopes.into_iter()).find(|scope| targets.iter().all(|target| under(*scope, *target))) {
+                return scope;
+            }
+            match self.parents.get(&node) {
+                Some(parent) => node = *parent,
+                None => return Scope::Span(self.root),
+            }
         }
     }
 
-    fn weighted_bindings(&mut self, owner: graph::NodeId) -> Result<Vec<execution::Binding>, Error> {
+    fn weighted_bindings(&mut self, owner: Scope) -> Result<Vec<execution::Binding>, Error> {
         let forks: Vec<_> = self
             .graph
             .forks
@@ -1566,7 +1696,7 @@ impl<'a> AgentLowering<'a> {
             .enumerate()
             .filter(|(_, fork)| {
                 self.order.contains(&fork.source)
-                    && inherits(self.graph, &fork.kind, "weighted")
+                    && fork.primitive == graph::Primitive::Weighted
                     && self.weighted_owner(fork) == owner
             })
             .map(|(i, fork)| (i, fork.clone()))
@@ -1583,6 +1713,7 @@ impl<'a> AgentLowering<'a> {
             {
                 bindings.push(execution::Binding {
                     name: format!("guard_{}", id.0),
+                    label: None,
                     value: self.binding_value(id)?,
                 });
             }
@@ -1603,21 +1734,26 @@ impl<'a> AgentLowering<'a> {
                 }
                 let mut weights = Vec::new();
                 for edge in branch {
-                    let id = *self.graph.edges[edge.0]
-                        .props
-                        .iter()
+                    // a feeds edge beside a branch shares the weight of its next edge
+                    let Some(id) = (self.graph.edges[edge.0].props.iter().copied())
                         .find(|id| self.graph.bindings[id.0].path == ["weight"])
-                        .ok_or("weighted branch needs weight")?;
+                    else {
+                        continue;
+                    };
                     weights.push(execution::Value::Cond {
                         cond: Box::new(guard.clone()),
                         then: Box::new(self.binding_value(id)?),
                         otherwise: Box::new(execution::Value::Num(execution::Number::Int(0))),
                     });
                 }
+                if weights.is_empty() {
+                    return Err(located(fork.range, "weighted branch needs weight"));
+                }
                 branches.push(weights);
             }
             bindings.push(execution::Binding {
                 name: format!("fork_pick_{index}"),
+                label: None,
                 value: execution::Value::Func {
                     func: execution::Func::ForkPick(branches),
                     range: fork.range,
@@ -1627,44 +1763,114 @@ impl<'a> AgentLowering<'a> {
         Ok(bindings)
     }
 
-    fn iteration_bindings(&mut self, index: usize) -> Result<Vec<execution::Binding>, Error> {
+    // the values evaluated once for each iteration of a group
+    fn iteration_bindings(&mut self, group: Group) -> Result<Vec<execution::Binding>, Error> {
         let mut bindings = Vec::new();
-        for (id, binding) in self.graph.bindings.iter().enumerate() {
-            let name = match binding.owner {
+        for id in 0..self.graph.bindings.len() {
+            let binding = &self.graph.bindings[id];
+            let (name, reader) = match binding.owner {
                 graph::ElementId::Node(node)
-                    if self.each_ancestor(node).is_some_and(|(i, _)| i == index)
+                    if self.within(node, group)
                         && !binding.property
                         && !matches!(resolved(self.graph, &binding.value), graph::Value::GraphRef { .. })
-                        && (!inherits(self.graph, &self.graph.nodes[node.0].kind, "span")
+                        && (!self.graph.derives(&self.graph.nodes[node.0].kind, "span")
                             || Self::field(&binding.path[0]).is_none()) =>
                 {
-                    Some(format!("binding_{id}"))
+                    (format!("binding_{id}"), None)
                 }
-                graph::ElementId::Edge(edge)
-                    if self
-                        .each_ancestor(self.graph.edges[edge.0].source)
-                        .is_some_and(|(i, _)| i == index) =>
-                {
+                graph::ElementId::Edge(edge) => {
+                    let edge = &self.graph.edges[edge.0];
+                    let carried = edge.cycle && edge.primitive == graph::Primitive::Feeds;
                     match binding.path[0].as_str() {
-                        "when" if !self.weighted_guard(graph::BindingId(id)) => Some(format!("guard_{id}")),
-                        "value" => Some(format!("edge_value_{id}")),
-                        _ => None,
+                        "when" if !self.weighted_guard(graph::BindingId(id)) && self.within(edge.source, group) => {
+                            (format!("guard_{id}"), None)
+                        }
+                        // a value fed along a loop-back is kept by the round that sends it
+                        "value" if carried && group == Group::Loop(edge.target) && self.order.contains(&edge.source) => {
+                            (format!("edge_value_{id}"), Some(self.all_groups(edge.target)))
+                        }
+                        "value" if !carried && self.within(edge.source, group) => (format!("edge_value_{id}"), None),
+                        _ => continue,
                     }
                 }
-                _ => None,
+                _ => continue,
             };
-            if let Some(name) = name {
+            if let Some(reader) = reader {
+                self.readers.push(reader);
+                let value = self.binding_value(graph::BindingId(id));
+                self.readers.pop();
                 bindings.push(execution::Binding {
                     name,
+                    label: None,
+                    value: value?,
+                });
+            } else {
+                bindings.push(execution::Binding {
+                    name,
+                    label: None,
                     value: self.binding_value(graph::BindingId(id))?,
                 });
             }
         }
+        bindings.extend(self.weighted_bindings(Scope::Group(group))?);
+        if let Group::Round(fork) = group {
+            // a correlation key is read in the round whose arrivals it groups
+            for index in 0..self.graph.junctions.len() {
+                let junction = &self.graph.junctions[index];
+                if !self.order.contains(&junction.target) || junction.fork.map(|fork| fork.0) != Some(fork) {
+                    continue;
+                }
+                if let Some(id) = self.junction_prop(junction, "correlate") {
+                    let member = self.graph.forks[fork].branches.iter().flatten().next();
+                    let member = member.map(|edge| self.graph.edges[edge.0].target);
+                    self.readers
+                        .push(member.map(|member| self.all_groups(member)).unwrap_or_default());
+                    let value = self.binding_value(id);
+                    self.readers.pop();
+                    bindings.push(execution::Binding {
+                        name: format!("correlate_{index}"),
+                        label: None,
+                        value: value?,
+                    });
+                }
+            }
+        }
+        bindings.extend(self.emission_bindings(Scope::Group(group))?);
         Ok(bindings)
     }
 
-    fn junction(&self, node: graph::NodeId) -> Option<&graph::Junction> {
-        self.graph.junctions.iter().find(|junction| junction.target == node)
+    // the scope that holds the repeat a junction's emissions run in
+    fn emission_scope(&self, index: usize) -> Scope {
+        let target = self.graph.junctions[index].target;
+        let groups = self.level_groups(target);
+        match groups.iter().position(|group| *group == Group::Emit(index)) {
+            Some(position) if position > 0 => Scope::Group(groups[position - 1]),
+            _ => Scope::Span(self.parents[&target]),
+        }
+    }
+
+    fn emission_bindings(&mut self, scope: Scope) -> Result<Vec<execution::Binding>, Error> {
+        let mut bindings = Vec::new();
+        for index in 0..self.graph.junctions.len() {
+            let target = self.graph.junctions[index].target;
+            if !self.order.contains(&target) || !self.emits(index) || self.emission_scope(index) != scope {
+                continue;
+            }
+            // the emissions are gathered outside the repeat they drive
+            let mut reader = self.all_groups(self.parents[&target]);
+            let groups = self.level_groups(target);
+            let position = groups.iter().position(|group| *group == Group::Emit(index)).unwrap_or(0);
+            reader.extend(&groups[..position]);
+            self.readers.push(reader);
+            let value = self.emissions(index);
+            self.readers.pop();
+            bindings.push(execution::Binding {
+                name: format!("emissions_{index}"),
+                label: None,
+                value: value?,
+            });
+        }
+        Ok(bindings)
     }
 
     fn condition(&self, guards: &[graph::BindingId]) -> execution::Value {
@@ -1678,71 +1884,322 @@ impl<'a> AgentLowering<'a> {
             })
     }
 
-    fn arrivals(&mut self, node: graph::NodeId) -> Result<execution::Value, Error> {
-        let junction = self
-            .junction(node)
-            .ok_or("context.arrivals requires a junction target")?
-            .clone();
-        if inherits(self.graph, &junction.kind, "reduce") {
-            return Err("the arrivals of a reduce junction walk as a flow".into());
+    // appends a reference to the plan and returns the value that reads it
+    fn block(
+        &mut self,
+        steps: Vec<execution::Step>,
+        accessor: execution::Accessor,
+        path: Vec<execution::Selection>,
+        range: graph::SrcRange,
+    ) -> execution::Value {
+        let ref_id = execution::RefId(self.result.refs.len() as u32);
+        self.result.refs.push(execution::ResolvedRef {
+            module: Some(Self::id(self.root)),
+            up: 0,
+            steps,
+            accessor,
+            path,
+            range,
+        });
+        execution::Value::BlockRef { ref_id, range }
+    }
+
+    // the steps from the entry span to a member, its gate or the iteration of one of its groups
+    fn route(&mut self, node: graph::NodeId, end: End) -> Result<Vec<execution::Step>, Error> {
+        use execution::{Step, Value as V};
+        let mut nodes = vec![];
+        let mut cursor = node;
+        while cursor != self.root {
+            nodes.push(cursor);
+            cursor = *(self.parents.get(&cursor))
+                .ok_or("value references must stay within the selected agent")
+                .at(self.graph.nodes[node.0].range)?;
         }
-        let result = junction
-            .props
-            .iter()
-            .any(|id| matches!(&self.graph.bindings[id.0].value, graph::Value::Str(value) if value == "result"));
-        let first = inherits(self.graph, &junction.kind, "first");
-        let mut inputs = junction.inputs.clone();
-        if first && let Some(fork) = junction.fork {
-            // branches run in the order the fork lists them, so that is the order they arrive in
-            let order: Vec<_> = self.graph.forks[fork.0].branches.iter().flatten().copied().collect();
-            inputs.sort_by_key(|id| order.iter().position(|edge| edge == id));
-        }
-        let mut elem = Vec::new();
-        let mut conditions = Vec::new();
-        for id in inputs {
-            let edge = &self.graph.edges[id.0];
-            conditions.push(self.node_condition(edge.target));
-            let name = edge
-                .name
-                .clone()
-                .map(execution::Value::Str)
-                .unwrap_or(execution::Value::Num(execution::Number::Int(id.0 as i64)));
-            let value = if result {
-                match self.binding(edge.target, "output") {
-                    Some(binding) => self.reference(binding)?,
-                    None => execution::Value::Null,
-                }
-            } else {
-                match edge.props.iter().find(|id| self.graph.bindings[id.0].path == ["value"]) {
-                    Some(id) => execution::Value::VarRef(format!("edge_value_{}", id.0)),
-                    None => execution::Value::Null,
-                }
-            };
-            elem.push(execution::ArrayElem::Item(execution::Value::Object(execution::Object {
-                elem: vec![
-                    execution::ObjectField {
-                        key: "edge".into(),
-                        value: name,
+        nodes.reverse();
+        let reader = self.reader();
+        let range = self.graph.nodes[node.0].range;
+        let named = match &self.graph.nodes[node.0].name {
+            Some(name) => format!("`{name}`"),
+            None => "this step".to_owned(),
+        };
+        let child = |id: execution::NodeId| Step::Child {
+            candidates: vec![id],
+            position: None,
+        };
+        let mut steps = Vec::new();
+        for current in nodes {
+            for group in self.level_groups(current) {
+                let id = self.group_id(group);
+                steps.push(child(id));
+                let index = V::CtxRef(execution::CtxRef::RepeatIndexAt(id));
+                let across = (self.across.iter().rev())
+                    .find(|(found, _)| *found == group)
+                    .map(|(_, across)| *across);
+                steps.push(match across {
+                    Some(Across::All) => Step::Iterations { start: None, end: None },
+                    Some(Across::Before) => Step::Iterations {
+                        start: None,
+                        end: Some(index),
                     },
-                    execution::ObjectField {
-                        key: "value".into(),
-                        value,
-                    },
-                ],
-            })));
-        }
-        if first {
-            let mut value = execution::Value::Array(execution::Array { elem: vec![] });
-            for (item, cond) in elem.into_iter().zip(conditions).rev() {
-                value = execution::Value::Cond {
-                    cond: Box::new(cond),
-                    then: Box::new(execution::Value::Array(execution::Array { elem: vec![item] })),
-                    otherwise: Box::new(value),
-                };
+                    Some(Across::Previous) => Step::Iteration(V::Binary {
+                        op: execution::BinOp::Sub,
+                        lhs: Box::new(index),
+                        rhs: Box::new(V::Num(execution::Number::Int(1))),
+                        range,
+                    }),
+                    None if reader.contains(&group) => Step::Iteration(index),
+                    // a step after a loop reads the round the loop ended on
+                    None if matches!(group, Group::Loop(_)) => Step::Last,
+                    None if matches!(group, Group::Round(_)) => {
+                        return Err(located(
+                            range,
+                            format!(
+                                "{named} runs once for each round of its fork, read it from a step in the round or through a junction"
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(located(
+                            range,
+                            format!("{named} runs once for each arrival at its junction, read it from a step that runs with it"),
+                        ));
+                    }
+                });
+                if current == node && matches!(end, End::Iteration(found) if found == group) {
+                    return Ok(steps);
+                }
             }
-            return Ok(value);
+            if self.gated(current) {
+                steps.push(child(self.guard_id(current)));
+                if current == node && matches!(end, End::Guard) {
+                    return Ok(steps);
+                }
+            }
+            steps.push(child(Self::id(current)));
         }
-        Ok(execution::Value::Array(execution::Array { elem }))
+        Ok(steps)
+    }
+
+    // reads a value declared in the scope of a member, by name when the reader shares that scope
+    fn scoped(&mut self, name: String, member: graph::NodeId, range: graph::SrcRange) -> Result<execution::Value, Error> {
+        let Some((group, holder)) = self.enclosing(member) else {
+            return Ok(execution::Value::VarRef(name));
+        };
+        let crossed = self.across.iter().any(|(found, _)| *found == group);
+        if !crossed && self.reader().contains(&group) {
+            return Ok(execution::Value::VarRef(name));
+        }
+        let steps = self.route(holder, End::Iteration(group))?;
+        Ok(self.block(steps, execution::Accessor::Binding(name), vec![], range))
+    }
+
+    // the record a junction target reads for one arrival
+    fn arrival(name: execution::Value, value: execution::Value) -> execution::Value {
+        execution::Value::Object(execution::Object {
+            elem: vec![
+                execution::ObjectField {
+                    key: "edge".into(),
+                    value: name,
+                },
+                execution::ObjectField {
+                    key: "value".into(),
+                    value,
+                },
+            ],
+        })
+    }
+
+    fn edge_name(&self, id: graph::EdgeId) -> execution::Value {
+        (self.graph.edges[id.0].name.clone())
+            .map(execution::Value::Str)
+            .unwrap_or(execution::Value::Num(execution::Number::Int(id.0 as i64)))
+    }
+
+    // what a junction observes on one input: the result of the step it reaches or the value it carries
+    fn observed(&mut self, junction: &graph::Junction, id: graph::EdgeId) -> Result<Option<execution::Value>, Error> {
+        let edge = &self.graph.edges[id.0];
+        let result = (junction.props.iter())
+            .any(|id| matches!(&self.graph.bindings[id.0].value, graph::Value::Str(value) if value == "result"));
+        if result {
+            return (self.binding(edge.target, "output"))
+                .map(|binding| self.reference(binding))
+                .transpose();
+        }
+        let source = edge.source;
+        let range = edge.range;
+        match edge.props.iter().find(|id| self.graph.bindings[id.0].path == ["value"]) {
+            Some(id) => Ok(Some(self.scoped(format!("edge_value_{}", id.0), source, range)?)),
+            None => Ok(None),
+        }
+    }
+
+    // the inputs of a junction in the order their branches run
+    fn arrival_order(&self, junction: &graph::Junction) -> Vec<usize> {
+        let branches: Vec<_> = match junction.fork {
+            Some(fork) => self.graph.forks[fork.0].branches.iter().flatten().copied().collect(),
+            None => (0..self.graph.edges.len()).map(graph::EdgeId).collect(),
+        };
+        let mut order: Vec<usize> = (0..junction.inputs.len()).collect();
+        order.sort_by_key(|position| branches.iter().position(|edge| *edge == junction.inputs[*position]));
+        order
+    }
+
+    // every emission of a junction, each one the arrivals that fire together
+    fn emissions(&mut self, index: usize) -> Result<execution::Value, Error> {
+        let junction = self.graph.junctions[index].clone();
+        let round = self.junction_round(&junction);
+        let range = junction.range;
+        if let Some(group) = round {
+            self.across.push((group, Across::All));
+        }
+        let mut inputs = Vec::new();
+        let mut failure = None;
+        for id in &junction.inputs {
+            let target = self.graph.edges[id.0].target;
+            let arrived = if !self.gated(target) {
+                Ok(None)
+            } else if round.is_some() {
+                (self.route(target, End::Guard))
+                    .map(|steps| Some(self.block(steps, execution::Accessor::Included, vec![], range)))
+            } else {
+                Ok(Some(self.node_condition(target)))
+            };
+            let value = self.observed(&junction, *id);
+            match (arrived, value) {
+                (Ok(arrived), Ok(value)) => inputs.push(execution::EmissionInput {
+                    edge: self.edge_name(*id),
+                    arrived,
+                    shared: !matches!(value, Some(execution::Value::BlockRef { .. })),
+                    value,
+                }),
+                (Err(error), _) | (_, Err(error)) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let keys = match (round, self.junction_prop(&junction, "correlate")) {
+            (Some(group), Some(_)) if failure.is_none() => {
+                let Group::Round(fork) = group else { unreachable!() };
+                let member = (self.graph.forks[fork].branches.iter().flatten().next())
+                    .map(|edge| self.graph.edges[edge.0].target)
+                    .ok_or("a correlated junction needs a fork branch");
+                match member.at(range).and_then(|member| self.route(member, End::Iteration(group))) {
+                    Ok(steps) => Some(self.block(
+                        steps,
+                        execution::Accessor::Binding(format!("correlate_{index}")),
+                        vec![],
+                        range,
+                    )),
+                    Err(error) => {
+                        failure = Some(error);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if round.is_some() {
+            self.across.pop();
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let rounds = match round {
+            Some(Group::Round(fork)) => Some(self.round_count(fork)?.0),
+            _ => None,
+        };
+        let count = (self.junction_prop(&junction, "count"))
+            .map(|id| self.binding_value(id))
+            .transpose()?;
+        Ok(execution::Value::Func {
+            func: execution::Func::Emissions(Box::new(execution::Emissions {
+                kind: self.junction_kind(&junction),
+                order: self.arrival_order(&junction),
+                inputs,
+                rounds,
+                keys,
+                count,
+            })),
+            range,
+        })
+    }
+
+    fn arrivals(&mut self, node: graph::NodeId) -> Result<execution::Value, Error> {
+        use execution::{EmissionKind as Kind, Value as V};
+        let index = self
+            .junction_index(node)
+            .ok_or("context.arrivals requires a junction target")?;
+        let junction = self.graph.junctions[index].clone();
+        let range = junction.range;
+        if self.emits(index) {
+            // the target runs once for each emission and reads its own
+            return Ok(V::Index {
+                target: Box::new(V::VarRef(format!("emissions_{index}"))),
+                index: Box::new(V::CtxRef(execution::CtxRef::RepeatIndexAt(self.group_id(Group::Emit(index))))),
+                range,
+            });
+        }
+        let kind = self.junction_kind(&junction);
+        if kind == Kind::Quorum || (kind == Kind::Reduce && self.junction_round(&junction).is_some()) {
+            return Ok(V::Index {
+                target: Box::new(self.emissions(index)?),
+                index: Box::new(V::Num(execution::Number::Int(0))),
+                range,
+            });
+        }
+        // one activation: accumulate lists its inputs as declared, the others in the order they arrive
+        let positions = match kind {
+            Kind::Accumulate => (0..junction.inputs.len()).collect(),
+            _ => self.arrival_order(&junction),
+        };
+        let mut records = Vec::new();
+        for position in positions {
+            let id = junction.inputs[position];
+            let target = self.graph.edges[id.0].target;
+            let condition = self.gated(target).then(|| self.node_condition(target));
+            let value = self.observed(&junction, id)?.unwrap_or(V::Null);
+            records.push((condition, Self::arrival(self.edge_name(id), value)));
+        }
+        let single = |record: V| {
+            V::Array(execution::Array {
+                elem: vec![execution::ArrayElem::Item(record)],
+            })
+        };
+        let empty = || V::Array(execution::Array { elem: vec![] });
+        Ok(match kind {
+            Kind::First => {
+                let mut value = empty();
+                for (condition, record) in records.into_iter().rev() {
+                    value = match condition {
+                        Some(cond) => V::Cond {
+                            cond: Box::new(cond),
+                            then: Box::new(single(record)),
+                            otherwise: Box::new(value),
+                        },
+                        None => single(record),
+                    };
+                }
+                value
+            }
+            Kind::Reduce => V::Array(execution::Array {
+                elem: (records.into_iter())
+                    .map(|(condition, record)| match condition {
+                        Some(cond) => execution::ArrayElem::Spread(V::Cond {
+                            cond: Box::new(cond),
+                            then: Box::new(single(record)),
+                            otherwise: Box::new(empty()),
+                        }),
+                        None => execution::ArrayElem::Item(record),
+                    })
+                    .collect(),
+            }),
+            _ => V::Array(execution::Array {
+                elem: (records.into_iter())
+                    .map(|(_, record)| execution::ArrayElem::Item(record))
+                    .collect(),
+            }),
+        })
     }
 
     // the values upstream elements supply for a context key that reaches a node
@@ -1756,41 +2213,53 @@ impl<'a> AgentLowering<'a> {
         (!values.is_empty()).then_some(values)
     }
 
-    // a step that may not run sits under a gate, a reduce target always runs
+    // a step that may not run when its parent span does sits under a gate
     fn gated(&self, node: graph::NodeId) -> bool {
-        !self.guards[&node].is_empty()
-            || !self.weighted_branches(node).is_empty()
-            || (self.junction(node)).is_some_and(|junction| !inherits(self.graph, &junction.kind, "reduce"))
+        let (guards, picks) = self.own_gates(node);
+        let guarded = !guards.is_empty() || !picks.is_empty();
+        match self.junction_index(node) {
+            // the count of emissions decides how often this target runs
+            Some(index) if self.emits(index) => false,
+            // a reduce target always runs
+            Some(index) => guarded || self.junction_kind(&self.graph.junctions[index]) != execution::EmissionKind::Reduce,
+            None => guarded,
+        }
     }
 
     // the folded value a reduce junction hands its target
     fn accumulator(&mut self, node: graph::NodeId) -> Result<execution::Value, Error> {
-        let junction = self
-            .junction(node)
-            .filter(|junction| inherits(self.graph, &junction.kind, "reduce"))
-            .ok_or("context.accumulator requires a reduce junction target")?
-            .clone();
-        let prop = |name: &str| (junction.props.iter().copied()).find(|id| self.graph.bindings[id.0].path == [name]);
-        let initial = prop("initial").ok_or("reduce needs initial")?;
-        let combine = prop("combine").ok_or("reduce needs combine")?;
-        let observed = self.graph.edges[junction.inputs[0].0].target;
-        let output = self
-            .binding(observed, "output")
-            .ok_or("a reduce input needs an output to observe")?;
-        let execution::Value::BlockRef { ref_id, range } = self.reference(output)? else {
-            return Err("a reduce input needs an output to observe".into());
+        let index = self
+            .junction_index(node)
+            .filter(|index| self.graph.junctions[*index].primitive == graph::Primitive::Reduce)
+            .ok_or("context.accumulator requires a reduce junction target")?;
+        let junction = self.graph.junctions[index].clone();
+        let initial = self.junction_prop(&junction, "initial").ok_or("reduce needs initial")?;
+        let combine = self.junction_prop(&junction, "combine").ok_or("reduce needs combine")?;
+        let result = (junction.props.iter())
+            .any(|id| matches!(&self.graph.bindings[id.0].value, graph::Value::Str(value) if value == "result"));
+        let output = match junction.inputs.as_slice() {
+            [input] if result => self.binding(self.graph.edges[input.0].target, "output"),
+            _ => None,
         };
-        // every round of the observed step, in round order
-        let rounds = (self.result.refs[ref_id.0 as usize].steps.iter_mut())
-            .rev()
-            .find(|step| matches!(step, execution::Step::Iteration(_)))
-            .ok_or("a reduce input must run inside its fork's rounds")?;
-        *rounds = execution::Step::Iterations { start: None, end: None };
+        // one step observed across the rounds of its fork folds its results directly
+        let round = self.junction_round(&junction).filter(|_| !self.emits(index));
+        let (items, raw) = match (round, output) {
+            (Some(group), Some(output)) => {
+                self.across.push((group, Across::All));
+                let items = self.reference(output);
+                self.across.pop();
+                (items?, true)
+            }
+            _ => (self.arrivals(node)?, false),
+        };
+        let outer = std::mem::replace(&mut self.raw_fold, raw);
+        let combine = self.binding_value(combine);
+        self.raw_fold = outer;
         Ok(execution::Value::Func {
             func: execution::Func::Fold {
-                items: Box::new(execution::Value::BlockRef { ref_id, range }),
+                items: Box::new(items),
                 initial: Box::new(self.binding_value(initial)?),
-                combine: Box::new(self.binding_value(combine)?),
+                combine: Box::new(combine?),
             },
             range: junction.range,
         })
@@ -1800,169 +2269,290 @@ impl<'a> AgentLowering<'a> {
         execution::NodeId((self.graph.nodes.len() + node.0) as u32)
     }
 
-    fn children(&mut self, parent: graph::NodeId) -> Result<Vec<execution::Child>, Error> {
-        let children: Vec<_> = self
-            .order
-            .iter()
-            .copied()
-            .filter(|node| self.parents.get(node) == Some(&parent))
-            .collect();
-        let children: Vec<_> = children
-            .into_iter()
-            .map(|node| {
-                let kind = &self.graph.nodes[node.0].kind;
-                let range = self.graph.nodes[node.0].range;
-                let span = if kind == "node" || kind == "vars" {
-                    execution::Child::Maybe(execution::Maybe {
-                        node: Self::id(node),
-                        name: self.graph.nodes[node.0].name.clone(),
-                        chance: execution::Value::Num(execution::Number::Int(1)),
-                        chance_range: self.graph.nodes[node.0].range,
-                        bindings: self.fork_bindings(node)?,
-                        children: self.children(node)?,
-                    })
-                } else if inherits(self.graph, kind, "scorer") {
-                    if self.parents.values().any(|parent| *parent == node) {
-                        return Err(located(range, "scorer spans cannot contain child spans yet"));
-                    }
-                    let score = self.binding(node, "score").ok_or("scorer needs a score field").at(range)?;
-                    let reason = self
-                        .binding(node, "reason")
-                        .map(|id| self.binding_value(id).map(|value| (value, self.graph.bindings[id.0].range)))
-                        .transpose()?;
-                    execution::Child::Scorer(execution::ScorerSpan {
-                        node: Self::id(node),
-                        name: self.name(node)?,
-                        score: self.binding_value(score)?,
-                        score_range: self.graph.bindings[score.0].range,
-                        reason,
-                        bindings: self.fork_bindings(node)?,
-                    })
-                } else {
-                    let kind = if inherits(self.graph, kind, "tool") {
-                        execution::SpanKind::Tool
-                    } else if inherits(self.graph, kind, "llm") {
-                        execution::SpanKind::Llm
-                    } else if inherits(self.graph, kind, "function") {
-                        execution::SpanKind::Function
-                    } else if inherits(self.graph, kind, "task") || kind == "span" {
-                        execution::SpanKind::Task
-                    } else {
-                        return Err(located(
-                            range,
-                            format!("node kind {kind:?} is not supported by agent mocking yet"),
-                        ));
-                    };
-                    execution::Child::Span(execution::Span {
-                        node: Self::id(node),
-                        name: self.name(node)?,
-                        kind,
-                        fields: self.fields(node)?,
-                        bindings: self.fork_bindings(node)?,
-                        children: self.children(node)?,
-                    })
-                };
-                if !self.gated(node) {
-                    return Ok(span);
-                }
-                let condition = self.node_condition(node);
-                let active = if let Some(junction) = self.junction(node) {
-                    // accumulate needs every listed input and first needs any one of them
-                    let first = inherits(self.graph, &junction.kind, "first");
-                    let ready =
-                        junction
-                            .inputs
-                            .iter()
-                            .fold(execution::Value::Bool(!first), |ready, id| execution::Value::Binary {
-                                op: if first { execution::BinOp::Or } else { execution::BinOp::And },
-                                lhs: Box::new(ready),
-                                rhs: Box::new(self.node_condition(self.graph.edges[id.0].target)),
-                                range: junction.range,
-                            });
-                    if first {
-                        execution::Value::Cond {
-                            cond: Box::new(ready),
-                            then: Box::new(execution::Value::Num(execution::Number::Int(1))),
-                            otherwise: Box::new(execution::Value::Num(execution::Number::Int(0))),
-                        }
-                    } else {
-                        execution::Value::Func {
-                            func: execution::Func::Arrivals { ready: Box::new(ready) },
-                            range: junction.range,
-                        }
-                    }
-                } else {
-                    execution::Value::Num(execution::Number::Int(1))
-                };
-                Ok(execution::Child::Maybe(execution::Maybe {
-                    node: self.guard_id(node),
-                    name: None,
-                    chance: execution::Value::Cond {
-                        cond: Box::new(condition),
-                        then: Box::new(active),
-                        otherwise: Box::new(execution::Value::Num(execution::Number::Int(0))),
-                    },
-                    chance_range: self.graph.nodes[node.0].range,
-                    bindings: vec![],
-                    children: vec![span],
-                }))
-            })
-            .collect::<Result<_, Error>>()?;
-        let mut result = Vec::new();
-        let mut groups = HashMap::new();
-        for child in children {
-            let node = match &child {
-                execution::Child::Span(v) => graph::NodeId(v.node.0 as usize),
-                execution::Child::Scorer(v) => graph::NodeId(v.node.0 as usize),
-                execution::Child::Maybe(v) => graph::NodeId(v.node.0 as usize % self.graph.nodes.len()),
-                _ => unreachable!(),
+    // whether a loop runs another round, read in the round that just ran
+    fn again(&mut self, target: graph::NodeId) -> Result<execution::Value, Error> {
+        use execution::Value as V;
+        let (id, source) = (self.loops[&target].edge, self.loops[&target].source);
+        let edge = self.graph.edges[id.0].clone();
+        let both = |lhs: V, rhs: V| V::Binary {
+            op: execution::BinOp::And,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            range: edge.range,
+        };
+        // the loop-back is only reached in a round where its source ran
+        let level = self.parents[&target];
+        let mut chain = vec![source];
+        while self.parents[chain.last().unwrap()] != level {
+            chain.push(self.parents[chain.last().unwrap()]);
+        }
+        let mut condition = V::Bool(true);
+        if let Some(gate) = chain.into_iter().find(|node| self.gated(*node)) {
+            let steps = self.route(gate, End::Guard)?;
+            let included = self.block(steps, execution::Accessor::Included, vec![], edge.range);
+            condition = V::Binary {
+                op: execution::BinOp::Eq,
+                lhs: Box::new(included),
+                rhs: Box::new(V::Bool(true)),
+                range: edge.range,
             };
-            if let Some((index, fork)) = self.each(node) {
-                if fork.source != parent {
-                    return Err(located(
-                        self.graph.nodes[node.0].range,
-                        "each branch spans must be children of the fork source",
-                    ));
-                }
-                if let Some(position) = groups.get(&index) {
-                    let execution::Child::Repeat(repeat) = &mut result[*position] else {
-                        unreachable!()
-                    };
-                    repeat.children.push(child);
-                    continue;
-                }
-                groups.insert(index, result.len());
-                let repeated = inherits(self.graph, &fork.kind, "repeat");
-                let property = if repeated { "count" } else { "items" };
-                let input = *fork
-                    .props
-                    .iter()
-                    .find(|id| self.graph.bindings[id.0].path == [property])
-                    .ok_or("iteration fork needs its input")?;
-                let range = self.graph.bindings[input.0].range;
-                let name = fork.name.clone();
-                let value = execution::Value::VarRef(format!("fork_input_{}", input.0));
-                let count = if repeated {
-                    value
-                } else {
-                    execution::Value::Func {
-                        func: execution::Func::Len { target: Box::new(value) },
-                        range,
-                    }
-                };
-                result.push(execution::Child::Repeat(execution::Repeat {
-                    node: self.each_id(index),
-                    name,
-                    count,
-                    count_range: range,
-                    bindings: self.iteration_bindings(index)?,
-                    children: vec![child],
-                }));
-            } else {
-                result.push(child);
+        }
+        for id in &edge.props {
+            if self.graph.bindings[id.0].path == ["when"] && !self.weighted_guard(*id) {
+                condition = both(condition, self.scoped(format!("guard_{}", id.0), source, edge.range)?);
             }
         }
-        Ok(result)
+        if let Some(fork) = edge.fork
+            && self.graph.forks[fork.0].primitive == graph::Primitive::Weighted
+        {
+            let branch = (self.graph.forks[fork.0].branches.iter())
+                .position(|branch| branch.contains(&id))
+                .unwrap_or(0);
+            let picked = V::Binary {
+                op: execution::BinOp::Eq,
+                lhs: Box::new(V::VarRef(format!("fork_pick_{}", fork.0))),
+                rhs: Box::new(V::Num(execution::Number::Int(branch as i64))),
+                range: edge.range,
+            };
+            condition = both(condition, picked);
+        }
+        Ok(condition)
+    }
+
+    // the repeat that runs the steps of a group
+    fn repeat(&mut self, group: Group, children: Vec<execution::Child>) -> Result<execution::Child, Error> {
+        use execution::Value as V;
+        let node = self.group_id(group);
+        let bindings = self.iteration_bindings(group)?;
+        let named = |this: &Self, node: graph::NodeId, role: &str| {
+            let step = &this.graph.nodes[node.0];
+            Some(format!("{}_{role}", step.name.clone().unwrap_or_else(|| step.kind.clone())))
+        };
+        Ok(execution::Child::Repeat(match group {
+            Group::Round(index) => {
+                let (count, count_range) = self.round_count(index)?;
+                execution::Repeat {
+                    node,
+                    name: self.graph.forks[index].name.clone(),
+                    count,
+                    count_range,
+                    again: None,
+                    bindings,
+                    children,
+                }
+            }
+            Group::Loop(target) => {
+                let edge = self.graph.edges[self.loops[&target].edge.0].clone();
+                let inside = self.all_groups(target);
+                self.readers.push(inside.clone());
+                let condition = self.again(target);
+                self.readers.pop();
+                let limit = edge
+                    .props
+                    .iter()
+                    .copied()
+                    .find(|id| self.graph.bindings[id.0].path == ["max_traversals"]);
+                self.readers
+                    .push(inside.into_iter().filter(|found| *found != group).collect());
+                let limit = limit.map(|id| self.binding_value(id)).transpose();
+                self.readers.pop();
+                execution::Repeat {
+                    node,
+                    name: named(self, target, "round"),
+                    count: V::Num(execution::Number::Int(1)),
+                    count_range: edge.range,
+                    again: Some(execution::Again {
+                        condition: condition?,
+                        limit: limit?,
+                        range: edge.range,
+                    }),
+                    bindings,
+                    children,
+                }
+            }
+            Group::Emit(index) => {
+                let junction = &self.graph.junctions[index];
+                let target = junction.target;
+                let range = junction.range;
+                let mut count = V::Func {
+                    func: execution::Func::Len {
+                        target: Box::new(V::VarRef(format!("emissions_{index}"))),
+                    },
+                    range,
+                };
+                let (guards, picks) = self.own_gates(target);
+                if !guards.is_empty() || !picks.is_empty() {
+                    count = V::Cond {
+                        cond: Box::new(self.gate_condition(target)),
+                        then: Box::new(count),
+                        otherwise: Box::new(V::Num(execution::Number::Int(0))),
+                    };
+                }
+                execution::Repeat {
+                    node,
+                    name: named(self, target, "arrival"),
+                    count,
+                    count_range: range,
+                    again: None,
+                    bindings,
+                    children,
+                }
+            }
+        }))
+    }
+
+    // the span of a member, under a gate when it may not run
+    fn child(&mut self, node: graph::NodeId) -> Result<execution::Child, Error> {
+        use execution::{EmissionKind as Kind, Value as V};
+        let kind = &self.graph.nodes[node.0].kind;
+        let range = self.graph.nodes[node.0].range;
+        // the root node kind and a holder of values emit no span
+        let span = if kind == "node" || self.graph.nodes[node.0].primitive == graph::Primitive::Vars {
+            execution::Child::Maybe(execution::Maybe {
+                node: Self::id(node),
+                name: self.graph.nodes[node.0].name.clone(),
+                chance: V::Num(execution::Number::Int(1)),
+                chance_range: self.graph.nodes[node.0].range,
+                bindings: self.fork_bindings(node)?,
+                children: self.children(node)?,
+            })
+        } else if self.graph.derives(kind, "scorer") {
+            if self.parents.values().any(|parent| *parent == node) {
+                return Err(located(range, "scorer spans cannot contain child spans yet"));
+            }
+            let score = self.binding(node, "score").ok_or("scorer needs a score field").at(range)?;
+            let reason = self
+                .binding(node, "reason")
+                .map(|id| self.binding_value(id).map(|value| (value, self.graph.bindings[id.0].range)))
+                .transpose()?;
+            execution::Child::Scorer(execution::ScorerSpan {
+                node: Self::id(node),
+                name: self.name(node)?,
+                score: self.binding_value(score)?,
+                score_range: self.graph.bindings[score.0].range,
+                reason,
+                bindings: self.fork_bindings(node)?,
+            })
+        } else {
+            let kind = if self.graph.derives(kind, "tool") {
+                execution::SpanKind::Tool
+            } else if self.graph.derives(kind, "llm") {
+                execution::SpanKind::Llm
+            } else if self.graph.derives(kind, "function") {
+                execution::SpanKind::Function
+            } else {
+                // the capability check leaves task and span itself
+                execution::SpanKind::Task
+            };
+            execution::Child::Span(execution::Span {
+                node: Self::id(node),
+                name: self.name(node)?,
+                label: self.graph.nodes[node.0].name.clone(),
+                kind,
+                fields: self.fields(node)?,
+                bindings: self.fork_bindings(node)?,
+                children: self.children(node)?,
+            })
+        };
+        if !self.gated(node) {
+            return Ok(span);
+        }
+        let condition = self.gate_condition(node);
+        let one = || V::Num(execution::Number::Int(1));
+        let zero = || V::Num(execution::Number::Int(0));
+        let active = match self.junction_index(node) {
+            Some(index) => {
+                let junction = self.graph.junctions[index].clone();
+                let ready = |this: &Self, all: bool| {
+                    (junction.inputs.iter()).fold(V::Bool(all), |ready, id| V::Binary {
+                        op: if all { execution::BinOp::And } else { execution::BinOp::Or },
+                        lhs: Box::new(ready),
+                        rhs: Box::new(this.node_condition(this.graph.edges[id.0].target)),
+                        range: junction.range,
+                    })
+                };
+                match self.junction_kind(&junction) {
+                    // accumulate needs every listed input
+                    Kind::Accumulate => V::Func {
+                        func: execution::Func::Arrivals {
+                            ready: Box::new(ready(self, true)),
+                        },
+                        range: junction.range,
+                    },
+                    // first needs any one of them
+                    Kind::First => V::Cond {
+                        cond: Box::new(ready(self, false)),
+                        then: Box::new(one()),
+                        otherwise: Box::new(zero()),
+                    },
+                    // a quorum fires once or fails
+                    Kind::Quorum => V::Func {
+                        func: execution::Func::Len {
+                            target: Box::new(self.emissions(index)?),
+                        },
+                        range: junction.range,
+                    },
+                    _ => one(),
+                }
+            }
+            None => one(),
+        };
+        Ok(execution::Child::Maybe(execution::Maybe {
+            node: self.guard_id(node),
+            name: None,
+            chance: V::Cond {
+                cond: Box::new(condition),
+                then: Box::new(active),
+                otherwise: Box::new(zero()),
+            },
+            chance_range: self.graph.nodes[node.0].range,
+            bindings: vec![],
+            children: vec![span],
+        }))
+    }
+
+    fn children(&mut self, parent: graph::NodeId) -> Result<Vec<execution::Child>, Error> {
+        let nodes: Vec<_> = (self.order.iter().copied())
+            .filter(|node| self.parents.get(node) == Some(&parent))
+            .collect();
+        let mut members = Vec::new();
+        for node in nodes {
+            let groups = self.level_groups(node);
+            if let Some(Group::Round(index)) = groups.first()
+                && self.graph.forks[*index].source != parent
+            {
+                return Err(located(
+                    self.graph.nodes[node.0].range,
+                    "each branch spans must be children of the fork source",
+                ));
+            }
+            members.push((groups, self.child(node)?));
+        }
+        self.nest(members, 0)
+    }
+
+    // gathers the steps of each group into one repeat, placed where the group starts
+    fn nest(&mut self, members: Vec<Member>, depth: usize) -> Result<Vec<execution::Child>, Error> {
+        let mut result: Vec<Option<execution::Child>> = Vec::new();
+        let mut gathered: Vec<(Group, usize, Vec<Member>)> = Vec::new();
+        for (groups, child) in members {
+            let Some(group) = groups.get(depth).copied() else {
+                result.push(Some(child));
+                continue;
+            };
+            match gathered.iter_mut().find(|(found, _, _)| *found == group) {
+                Some((_, _, members)) => members.push((groups, child)),
+                None => {
+                    gathered.push((group, result.len(), vec![(groups, child)]));
+                    result.push(None);
+                }
+            }
+        }
+        for (group, position, members) in gathered {
+            let children = self.nest(members, depth + 1)?;
+            result[position] = Some(self.repeat(group, children)?);
+        }
+        Ok(result.into_iter().flatten().collect())
     }
 
     fn field(name: &str) -> Option<execution::Field> {
@@ -2032,25 +2622,10 @@ impl<'a> AgentLowering<'a> {
 
     fn reference(&mut self, id: graph::BindingId) -> Result<execution::Value, Error> {
         let binding = &self.graph.bindings[id.0];
-        if self.flow {
-            if let graph::ElementId::Node(node) = binding.owner {
-                if node != self.agent && !self.order.contains(&node) {
-                    return Err("graph occurrence references must belong to the current agent".into());
-                }
-                return Ok(execution::Value::Func {
-                    func: execution::Func::FlowRead {
-                        node: Self::id(if node == self.agent { self.root } else { node }),
-                        binding: id.0,
-                    },
-                    range: binding.range,
-                });
-            }
-            return self.flow_property(id);
-        }
         if self.callable && binding.owner == graph::ElementId::Node(self.root) {
             return self.binding_value(id);
         }
-        if self.callable && inherits(self.graph, &self.graph.nodes[self.root.0].kind, "scorer") {
+        if self.callable && self.graph.derives(&self.graph.nodes[self.root.0].kind, "scorer") {
             return Err("callable scorers read external values through context".into());
         }
         if let graph::ElementId::Node(node) = binding.owner
@@ -2060,7 +2635,7 @@ impl<'a> AgentLowering<'a> {
             let mut owners = Vec::new();
             for (index, candidate) in self.graph.nodes.iter().enumerate() {
                 let agent = graph::NodeId(index);
-                if inherits(self.graph, &candidate.kind, "agent") && structure(self.graph, agent)?.members.contains(&node) {
+                if self.graph.derives(&candidate.kind, "agent") && structure(self.graph, agent)?.members.contains(&node) {
                     owners.push(agent);
                 }
             }
@@ -2069,16 +2644,17 @@ impl<'a> AgentLowering<'a> {
             }
             return AgentLowering::new(self.graph, owners[0], self.result)?.reference(id);
         }
+        let range = binding.range;
         let graph::ElementId::Node(mut node) = binding.owner else {
             return match binding.owner {
                 graph::ElementId::Fork(_) if matches!(binding.path[0].as_str(), "items" | "count") => {
                     Ok(execution::Value::VarRef(format!("fork_input_{}", id.0)))
                 }
-                graph::ElementId::Edge(_) if binding.path == ["value"] => {
-                    Ok(execution::Value::VarRef(format!("edge_value_{}", id.0)))
+                graph::ElementId::Edge(edge) if binding.path == ["value"] => {
+                    self.scoped(format!("edge_value_{}", id.0), self.graph.edges[edge.0].source, range)
                 }
-                graph::ElementId::Edge(_) if binding.path == ["when"] => {
-                    Ok(execution::Value::VarRef(format!("guard_{}", id.0)))
+                graph::ElementId::Edge(edge) if binding.path == ["when"] => {
+                    self.scoped(format!("guard_{}", id.0), self.graph.edges[edge.0].source, range)
                 }
                 _ => self.binding_value(id),
             };
@@ -2095,77 +2671,18 @@ impl<'a> AgentLowering<'a> {
         if binding.property {
             return self.value(&binding.value.clone());
         }
-        if !inherits(self.graph, &self.graph.nodes[node.0].kind, "span") {
-            return Ok(execution::Value::VarRef(format!("binding_{}", id.0)));
+        // a step's own values live in the scope the step runs in
+        if !self.graph.derives(&self.graph.nodes[node.0].kind, "span") {
+            return self.scoped(format!("binding_{}", id.0), node, range);
         }
         let Some(field) = Self::field(&binding.path[0]) else {
-            return Ok(execution::Value::VarRef(format!("binding_{}", id.0)));
+            return self.scoped(format!("binding_{}", id.0), node, range);
         };
-        let mut nodes = vec![];
-        let mut cursor = node;
-        while cursor != self.root {
-            nodes.push(cursor);
-            cursor = self.parents[&cursor];
-        }
-        nodes.reverse();
-        let reference = execution::ResolvedRef {
-            module: Some(Self::id(self.root)),
-            up: 0,
-            steps: nodes
-                .into_iter()
-                .flat_map(|node| {
-                    let mut steps = Vec::new();
-                    if let Some((index, _)) = self.each(node) {
-                        steps.push(execution::Step::Child {
-                            candidates: vec![self.each_id(index)],
-                            position: None,
-                        });
-                        steps.push(execution::Step::Iteration(execution::Value::CtxRef(
-                            execution::CtxRef::RepeatIndexAt(self.each_id(index)),
-                        )));
-                    }
-                    if self.gated(node) {
-                        steps.push(execution::Step::Child {
-                            candidates: vec![self.guard_id(node)],
-                            position: None,
-                        });
-                    }
-                    steps.push(execution::Step::Child {
-                        candidates: vec![Self::id(node)],
-                        position: None,
-                    });
-                    steps
-                })
-                .collect(),
-            accessor: execution::Accessor::Field(field),
-            path: binding
-                .path
-                .iter()
-                .skip(1)
-                .map(|key| execution::Selection::Index(execution::Value::Str(key.clone())))
-                .collect(),
-            range: binding.range,
-        };
-        let ref_id = execution::RefId(self.result.refs.len() as u32);
-        self.result.refs.push(reference);
-        Ok(execution::Value::BlockRef {
-            ref_id,
-            range: binding.range,
-        })
-    }
-
-    fn flow_property(&mut self, id: graph::BindingId) -> Result<execution::Value, Error> {
-        let value = self.binding_value(id)?;
-        if matches!(self.graph.bindings[id.0].owner, graph::ElementId::Junction(_)) {
-            return Ok(value);
-        }
-        Ok(execution::Value::Func {
-            func: execution::Func::FlowProperty {
-                binding: id.0,
-                value: Box::new(value),
-            },
-            range: self.graph.bindings[id.0].range,
-        })
+        let path = (binding.path.iter().skip(1))
+            .map(|key| execution::Selection::Index(execution::Value::Str(key.clone())))
+            .collect();
+        let steps = self.route(node, End::Span)?;
+        Ok(self.block(steps, execution::Accessor::Field(field), path, range))
     }
 
     fn binding_value(&mut self, id: graph::BindingId) -> Result<execution::Value, Error> {
@@ -2182,13 +2699,6 @@ impl<'a> AgentLowering<'a> {
         use execution::Value as V;
         use graph::Value as G;
         Ok(match value {
-            G::Input { binding, ty } if self.flow => V::Func {
-                func: execution::Func::FlowInput {
-                    binding: binding.0,
-                    ty: *ty,
-                },
-                range: self.graph.bindings[binding.0].range,
-            },
             G::Context { path, .. } if path.first().is_some_and(|key| key == "parent") => {
                 return Err("`context.parent` is supplied to the provider and cannot be read by a field".into());
             }
@@ -2219,13 +2729,35 @@ impl<'a> AgentLowering<'a> {
                 }
                 value
             }
-            G::Context { path, .. } if self.flow => V::Func {
-                func: execution::Func::FlowContext(path.clone()),
-                range: self.graph.nodes[self.root.0].range,
-            },
             G::Input { binding, ty } => {
-                let source = *self.inputs.get(binding).ok_or("upstream field has no feeds edge")?;
-                let value = execution::Value::VarRef(format!("edge_value_{}", source.0));
+                let entry = self.inputs.get(binding).copied();
+                let range = self.graph.bindings[binding.0].range;
+                let value = match (entry, self.carried.get(binding).copied()) {
+                    (Some(entry), None) => V::VarRef(format!("edge_value_{}", entry.0)),
+                    (Some(entry), Some(carried)) => {
+                        // the first round takes the entry value, a later one what the round before it sent
+                        let graph::ElementId::Node(target) = self.graph.bindings[binding.0].owner else {
+                            return Err("a fed field belongs to a node".into());
+                        };
+                        let group = Group::Loop(target);
+                        self.across.push((group, Across::Previous));
+                        let steps = self.route(target, End::Iteration(group));
+                        self.across.pop();
+                        let name = format!("edge_value_{}", carried.0);
+                        let previous = self.block(steps?, execution::Accessor::Binding(name), vec![], range);
+                        V::Cond {
+                            cond: Box::new(V::Binary {
+                                op: execution::BinOp::Eq,
+                                lhs: Box::new(V::CtxRef(execution::CtxRef::RepeatIndexAt(self.group_id(group)))),
+                                rhs: Box::new(V::Num(execution::Number::Int(0))),
+                                range,
+                            }),
+                            then: Box::new(V::VarRef(format!("edge_value_{}", entry.0))),
+                            otherwise: Box::new(previous),
+                        }
+                    }
+                    (None, _) => return Err("upstream field has no feeds edge".into()),
+                };
                 if *ty == graph::FieldType::Any {
                     value
                 } else {
@@ -2234,7 +2766,7 @@ impl<'a> AgentLowering<'a> {
                             value: Box::new(value),
                             ty: *ty,
                         },
-                        range: self.graph.bindings[binding.0].range,
+                        range,
                     }
                 }
             }
@@ -2247,7 +2779,7 @@ impl<'a> AgentLowering<'a> {
                         && child.path.len() > parent.path.len()
                         && child.path.starts_with(&parent.path)
                 });
-                if internal && !self.flow {
+                if internal {
                     self.binding_value(*id)?
                 } else {
                     let mut value = self.reference(*id)?;
@@ -2358,32 +2890,24 @@ impl<'a> AgentLowering<'a> {
                     .position(|node| node.name.as_ref() == Some(name))
                     .map(graph::NodeId)
                     .ok_or("history node does not exist")?;
-                let (group, _) = self.each_ancestor(*node).ok_or("history requires a repetition group")?;
-                if self.each_ancestor(target).map(|(i, _)| i) != Some(group) {
+                // the earlier rounds of the innermost group the reader and the step share
+                let (group, _) = self.enclosing(target).ok_or("history requires a repetition group")?;
+                if !self.all_groups(*node).contains(&group) {
                     return Err("history must stay within the current repetition group".into());
                 }
                 // any payload field locates the step, a field of its own such as local does not
                 let binding = (self.graph.nodes[target.0].fields.iter().copied())
                     .find(|id| Self::field(&self.graph.bindings[id.0].path[0]).is_some())
                     .ok_or("history target needs a payload field")?;
-                let V::BlockRef { ref_id, range } = self.reference(binding)? else {
+                self.across.push((group, Across::Before));
+                let reference = self.reference(binding);
+                self.across.pop();
+                let V::BlockRef { ref_id, range } = reference? else {
                     return Err("history target needs a payload field".into());
                 };
                 let reference = &mut self.result.refs[ref_id.0 as usize];
                 reference.accessor = execution::Accessor::Record;
                 reference.path.clear();
-                let Some(step) = reference
-                    .steps
-                    .iter_mut()
-                    .rev()
-                    .find(|step| matches!(step, execution::Step::Iteration(_)))
-                else {
-                    return Err("history needs an occurrence reference".into());
-                };
-                *step = execution::Step::Iterations {
-                    start: None,
-                    end: Some(V::CtxRef(execution::CtxRef::RepeatIndex)),
-                };
                 let mut value = V::BlockRef { ref_id, range };
                 for key in path.iter().skip(2) {
                     value = V::Index {
@@ -2427,14 +2951,43 @@ impl<'a> AgentLowering<'a> {
                 path,
             } if path.first().is_some_and(|key| key == "accumulator" || key == "arrival") => {
                 let range = self.graph.junctions[junction.0].range;
-                let mut value = V::Func {
-                    func: if path[0] == "accumulator" {
-                        execution::Func::FoldAccumulator
-                    } else {
-                        execution::Func::FoldArrival
-                    },
-                    range,
+                let read = |func: execution::Func| V::Func { func, range };
+                let (mut value, skip) = if path[0] == "accumulator" {
+                    (read(execution::Func::FoldAccumulator), 1)
+                } else if !self.raw_fold {
+                    (read(execution::Func::FoldArrival), 1)
+                } else {
+                    // a fold over bare results reads the result where a record would hold it
+                    let edge = self.graph.junctions[junction.0].inputs[0];
+                    match path.get(1).map(String::as_str) {
+                        Some("value") => (read(execution::Func::FoldArrival), 2),
+                        Some("edge") => (self.edge_name(edge), 2),
+                        _ => (Self::arrival(self.edge_name(edge), read(execution::Func::FoldArrival)), 1),
+                    }
                 };
+                for key in path.iter().skip(skip) {
+                    value = V::Index {
+                        target: Box::new(value),
+                        index: Box::new(V::Str(key.clone())),
+                        range,
+                    };
+                }
+                value
+            }
+            G::Context {
+                owner: graph::ElementId::Junction(junction),
+                path,
+            } if path
+                .first()
+                .is_some_and(|key| key == "item" || key == "index" || key == "count") =>
+            {
+                // a junction reads the round of its own fork
+                let junction = &self.graph.junctions[junction.0];
+                let range = junction.range;
+                let Some(Group::Round(fork)) = self.junction_round(junction) else {
+                    return Err("item, index and count require a junction on an each or repeat fork".into());
+                };
+                let mut value = self.round_value(fork, &path[0], false, range)?;
                 for key in path.iter().skip(1) {
                     value = V::Index {
                         target: Box::new(value),
@@ -2458,24 +3011,9 @@ impl<'a> AgentLowering<'a> {
                         execution::CtxRef::RepeatCount
                     }));
                 }
-                let (_, fork) = self.each_ancestor(*node).ok_or("item and index require an each occurrence")?;
-                let mut value = V::CtxRef(if path[0] == "count" {
-                    execution::CtxRef::RepeatCount
-                } else {
-                    execution::CtxRef::RepeatIndex
-                });
-                if path[0] == "item" {
-                    let items = *fork
-                        .props
-                        .iter()
-                        .find(|id| self.graph.bindings[id.0].path == ["items"])
-                        .ok_or("item requires an each fork")?;
-                    value = V::Index {
-                        target: Box::new(V::VarRef(format!("fork_input_{}", items.0))),
-                        index: Box::new(value),
-                        range: self.graph.nodes[node.0].range,
-                    };
-                }
+                let (fork, _) = self.each_ancestor(*node).ok_or("item and index require an each occurrence")?;
+                let innermost = self.enclosing(*node).is_some_and(|(group, _)| group == Group::Round(fork));
+                let mut value = self.round_value(fork, &path[0], innermost, self.graph.nodes[node.0].range)?;
                 for key in path.iter().skip(1) {
                     value = V::Index {
                         target: Box::new(value),
@@ -2508,7 +3046,7 @@ impl<'a> AgentLowering<'a> {
                     let graph::ElementId::Node(node) = owner else {
                         return Err("scorer context requires a node".into());
                     };
-                    if !inherits(self.graph, &self.graph.nodes[node.0].kind, "scorer") {
+                    if !self.graph.derives(&self.graph.nodes[node.0].kind, "scorer") {
                         return Err("this context requires a scorer node".into());
                     }
                     let parent = *self.parents.get(node).ok_or("scorer span needs a parent")?;

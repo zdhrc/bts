@@ -2339,7 +2339,7 @@ fn agent_example_preserves_child_data_flow_in_both_languages() {
         let extension = if lang == "python" { "py" } else { "mts" };
         let generated =
             fs::read_to_string(root.join(lang).join(format!("src/agents/customer_support_agent.{extension}"))).unwrap();
-        assert!(!generated.contains("_flow_run"), "the example needs no flow interpreter");
+        assert!(!generated.contains("_flow_run"), "the example runs as nested code");
         let scorers = bts()
             .current_dir(&root)
             .args([
@@ -3393,10 +3393,7 @@ fn agent_native_values_preserve_results_names_and_lazy_failures() {
         assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
         let extension = if lang == "python" { "py" } else { "mts" };
         let source = fs::read_to_string(root.join(lang).join(format!("src/agents/native_agent.{extension}"))).unwrap();
-        assert!(
-            !source.contains("_flow_run"),
-            "a step's own values do not need the flow interpreter"
-        );
+        assert!(!source.contains("_flow_run"), "a step's own values run as nested code");
         let (program, script) = if lang == "python" {
             (
                 "python3",

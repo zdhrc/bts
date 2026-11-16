@@ -6,7 +6,7 @@ use crate::dsl::{
 };
 use code::{Dependency, Expr, Statement, Variable};
 use serde_json::{Value as Json, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) struct Agent {
     pub functions: Vec<code::Function>,
@@ -550,6 +550,12 @@ struct Context<'a> {
     local_names: Vec<(String, String)>,
     frames: Vec<(NodeId, String)>,
     direct: bool,
+    // values declared inside a step instead of beside it: the value, the step that holds it, the scope it left
+    moved: Vec<(String, NodeId, NodeId)>,
+    // moved values nothing outside their step reads, which the step does not hand back
+    unkept: Vec<String>,
+    // values that are another value under a second name, and the value they stand for
+    aliases: Vec<(String, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -610,6 +616,24 @@ fn child_node(child: &Child) -> NodeId {
     }
 }
 
+// the repeats of a plan that run as loops
+fn looping(children: &[Child], found: &mut Vec<NodeId>) {
+    for child in children {
+        match child {
+            Child::Span(span) => looping(&span.children, found),
+            Child::Choice(choice) => looping(&choice.children, found),
+            Child::Maybe(maybe) => looping(&maybe.children, found),
+            Child::Scorer(_) => {}
+            Child::Repeat(repeat) => {
+                if repeat.again.is_some() {
+                    found.push(repeat.node);
+                }
+                looping(&repeat.children, found);
+            }
+        }
+    }
+}
+
 fn random_name(lang: ScorerLang) -> &'static str {
     match lang {
         ScorerLang::Python => "random_source",
@@ -618,20 +642,51 @@ fn random_name(lang: ScorerLang) -> &'static str {
 }
 
 fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String>) -> Vec<(NodeId, Names)> {
-    fn visit(children: &[Child], lang: ScorerLang, used: &mut HashSet<String>, names: &mut Vec<(NodeId, Names)>) {
+    // how many steps print under each name
+    fn count(children: &[Child], shared: &mut HashMap<String, usize>) {
         for child in children {
             match child {
                 Child::Span(span) => {
+                    let stem = crate::mocking::code::planning::identifier_stem(&span.name).unwrap_or_default();
+                    *shared.entry(stem).or_default() += 1;
+                    count(&span.children, shared);
+                }
+                Child::Repeat(repeat) => count(&repeat.children, shared),
+                Child::Choice(choice) => count(&choice.children, shared),
+                Child::Maybe(maybe) => count(&maybe.children, shared),
+                Child::Scorer(_) => {}
+            }
+        }
+    }
+    // steps that share a name are told apart by the identifiers they were declared under
+    fn readable<'a>(span: &'a crate::dsl::Span, shared: &HashMap<String, usize>) -> &'a str {
+        let stem = crate::mocking::code::planning::identifier_stem(&span.name).unwrap_or_default();
+        match &span.label {
+            Some(label) if shared.get(&stem).copied().unwrap_or(0) > 1 => label,
+            _ => &span.name,
+        }
+    }
+    fn visit(
+        children: &[Child],
+        shared: &HashMap<String, usize>,
+        lang: ScorerLang,
+        used: &mut HashSet<String>,
+        names: &mut Vec<(NodeId, Names)>,
+    ) {
+        for child in children {
+            match child {
+                Child::Span(span) => {
+                    let name = readable(span, shared);
                     names.push((
                         span.node,
                         Names {
-                            function: allocate(&span.name, "", lang, used),
-                            state: allocate(&span.name, "span", lang, used),
+                            function: allocate(name, "", lang, used),
+                            state: allocate(name, "span", lang, used),
 
                             ..Names::default()
                         },
                     ));
-                    visit(&span.children, lang, used, names);
+                    visit(&span.children, shared, lang, used, names);
                 }
                 Child::Repeat(repeat) => {
                     let name = repeat.name.as_deref().unwrap_or("batch");
@@ -646,31 +701,21 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
                             item: allocate(name, "result", lang, used),
                         },
                     ));
-                    visit(&repeat.children, lang, used, names);
+                    visit(&repeat.children, shared, lang, used, names);
                 }
                 Child::Choice(choice) => {
-                    branch_names(
-                        choice.node,
-                        choice.name.as_deref().unwrap_or("choice"),
-                        &choice.children,
-                        true,
-                        lang,
-                        used,
-                        names,
-                    );
-                    visit(&choice.children, lang, used, names);
+                    branch_names(choice.node, choice.name.as_deref().unwrap_or("choice"), lang, used, names);
+                    visit(&choice.children, shared, lang, used, names);
                 }
                 Child::Maybe(maybe) => {
-                    branch_names(
-                        maybe.node,
-                        maybe.name.as_deref().unwrap_or("optional"),
-                        &maybe.children,
-                        false,
-                        lang,
-                        used,
-                        names,
-                    );
-                    visit(&maybe.children, lang, used, names);
+                    // a path that may not run is named for the step it guards
+                    let guarded = match maybe.children.as_slice() {
+                        [Child::Span(span)] => Some(format!("maybe_{}", readable(span, shared))),
+                        _ => None,
+                    };
+                    let name = maybe.name.clone().or(guarded).unwrap_or_else(|| "optional".into());
+                    branch_names(maybe.node, &name, lang, used, names);
+                    visit(&maybe.children, shared, lang, used, names);
                 }
                 Child::Scorer(v) => {
                     names.push((
@@ -685,15 +730,7 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
             }
         }
     }
-    fn branch_names(
-        node: NodeId,
-        name: &str,
-        _children: &[Child],
-        _choice: bool,
-        lang: ScorerLang,
-        used: &mut HashSet<String>,
-        names: &mut Vec<(NodeId, Names)>,
-    ) {
+    fn branch_names(node: NodeId, name: &str, lang: ScorerLang, used: &mut HashSet<String>, names: &mut Vec<(NodeId, Names)>) {
         names.push((
             node,
             Names {
@@ -704,24 +741,15 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
             },
         ));
     }
+    let mut shared = HashMap::new();
+    count(children, &mut shared);
     let mut names = Vec::new();
-    visit(children, lang, used, &mut names);
+    visit(children, &shared, lang, used, &mut names);
     names
 }
 
 pub(crate) fn agent(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang) -> Result<Agent, String> {
     execution::emit(model, trace, output, lang)
-}
-
-fn is_literal(value: &Value) -> bool {
-    match value {
-        Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null => true,
-        Value::Array(array) => array.elem.iter().all(|item| match item {
-            ArrayElem::Item(v) | ArrayElem::Spread(v) => is_literal(v),
-        }),
-        Value::Object(object) => object.elem.iter().all(|field| is_literal(&field.value)),
-        _ => false,
-    }
 }
 
 fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr, String> {
@@ -733,15 +761,34 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
         Value::Slice { target, start, end, .. } => {
             slice_expression(expr(target)?, start.as_deref(), end.as_deref(), ctx, lang)?
         }
-        Value::VarRef(name) => Expr::call(
-            ctx.local_names
-                .iter()
-                .find(|(n, _)| n == name)
-                .ok_or_else(|| format!("unknown agent variable {name:?}"))?
-                .1
-                .clone(),
-            vec![],
-        ),
+        Value::VarRef(name) => {
+            let mut name = name;
+            for _ in 0..ctx.aliases.len() {
+                match ctx.aliases.iter().find(|(alias, _)| alias == name) {
+                    Some((_, target)) => name = target,
+                    None => break,
+                }
+            }
+            // a value held by a step that is not running here is read from what that step kept
+            let held =
+                (ctx.moved.iter()).find(|(moved, holder, _)| moved == name && !ctx.frames.iter().any(|(id, _)| id == holder));
+            if let Some((_, holder, scope)) = held {
+                let step = Step::Child {
+                    candidates: vec![*holder],
+                    position: None,
+                };
+                return reference_expression(*scope, &[step], &Accessor::Binding(name.clone()), &[], None, ctx, lang);
+            }
+            Expr::call(
+                ctx.local_names
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .ok_or_else(|| format!("unknown agent variable {name:?}"))?
+                    .1
+                    .clone(),
+                vec![],
+            )
+        }
         Value::Template(template) => {
             let parts = template
                 .parts
@@ -786,7 +833,8 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
                     Ok(match item {
                         ArrayElem::Item(value) => {
                             let e = expr(value)?;
-                            if ctx.direct && is_literal(value) { e } else { e.lazy() }
+                            // statements in order evaluate every item where the array is built
+                            if ctx.direct { e } else { e.lazy() }
                         }
                         ArrayElem::Spread(value) => Expr::Spread(Box::new(Expr::call("_array", vec![expr(value)?]))),
                     })
@@ -838,7 +886,14 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
         }
         Value::BlockRef { ref_id, .. } => {
             let reference = &ctx.model.refs[ref_id.0 as usize];
-            if matches!(reference.accessor, Accessor::Record) {
+            let mut loops = Vec::new();
+            for trace in &ctx.model.traces {
+                looping(&trace.children, &mut loops);
+            }
+            let through_loop = reference.steps.windows(2).any(|steps| {
+                matches!((&steps[0], &steps[1]), (Step::Child { candidates, .. }, Step::Iterations { .. }) if loops.contains(&candidates[0]))
+            });
+            if matches!(reference.accessor, Accessor::Record) && !through_loop {
                 let group = reference
                     .steps
                     .windows(2)
@@ -974,13 +1029,14 @@ fn reference_expression(
         && candidates.len() == 1
         && ctx.frames.iter().any(|(id, _)| *id == candidates[0])
     {
-        let rest = if matches!(rest.first(), Some(Step::Iteration(Value::CtxRef(CtxRef::RepeatIndexAt(id)))) if *id == candidates[0])
-        {
-            &rest[1..]
-        } else {
-            rest
-        };
-        return reference_expression(candidates[0], rest, accessor, path, None, ctx, lang);
+        let own =
+            matches!(rest.first(), Some(Step::Iteration(Value::CtxRef(CtxRef::RepeatIndexAt(id)))) if *id == candidates[0]);
+        let other = matches!(rest.first(), Some(Step::Iteration(_) | Step::Iterations { .. } | Step::Last));
+        // the frame of a repeat is the iteration that is running, another one is read from the collection
+        if own || !other {
+            let rest = if own { &rest[1..] } else { rest };
+            return reference_expression(candidates[0], rest, accessor, path, None, ctx, lang);
+        }
     }
     let frame = record
         .or_else(|| {
@@ -1039,6 +1095,7 @@ fn reference_expression(
                 ctx,
                 lang,
             ),
+            Step::Last => reference_expression(node, rest, accessor, path, Some(Expr::call("_last", vec![frame])), ctx, lang),
             Step::Iterations { start, end } => {
                 let selected = slice_expression(frame.member("iterations"), start.as_ref(), end.as_ref(), ctx, lang)?;
                 let item = ctx.names(node).item.clone();
@@ -1056,6 +1113,15 @@ fn reference_expression(
         Accessor::Field(field) => read_field(frame, field_key(field), ctx.direct),
         Accessor::Chosen => read_field(frame, "chosen", ctx.direct),
         Accessor::Included => read_field(frame, "included", ctx.direct),
+        Accessor::Binding(name) => {
+            let local = &ctx
+                .local_names
+                .iter()
+                .find(|(found, _)| found == name)
+                .ok_or("unknown kept value")?
+                .1;
+            read_field(frame, local, false)
+        }
         Accessor::Index | Accessor::Count => {
             let (_, index, count) = ctx
                 .iterations
@@ -1082,6 +1148,11 @@ mod execution {
     use crate::mocking::code::planning::Operation;
 
     pub(crate) fn emit(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang) -> Result<Agent, String> {
+        emit_form(model, trace, output, lang, true)
+    }
+    // `ordered` prints statements in the order they run, and is tried before the deferred form
+    fn emit_form(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang, ordered: bool) -> Result<Agent, String> {
+        let try_ordered = ordered;
         let mut parents = Vec::new();
         let mut bindings = model.bindings.iter().chain(&trace.bindings).collect::<Vec<_>>();
         fn collect<'a>(
@@ -1109,11 +1180,38 @@ mod execution {
             Ok(())
         }
         collect(&trace.children, trace.node, &mut parents, &mut bindings)?;
-        let mut used = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval".split_whitespace().map(str::to_owned).collect();
+        let mut used: HashSet<String> = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval item_at trim_text format_value duration_seconds checked_number validate_input count_tokens as_list new_uuid sample_range step_history fold_items agent_result slice_items length_of as_count values_equal calculate require_arrivals group_arrivals select_option weighted_option as_number as_boolean as_integer itemAt trimText formatValue durationSeconds checkedNumber validateInput countTokens asList newUuid sampleRange stepHistory foldItems agentResult sliceItems lengthOf asCount valuesEqual requireArrivals groupArrivals selectOption weightedOption asNumber asBoolean asInteger remainder divide parse_input parseInput".split_whitespace().map(str::to_owned).collect();
+        let reserved = used.clone();
         let names = collect_names(&trace.children, lang, &mut used);
+        // values that took a number only because another scope already used their name
+        let mut numbered = Vec::new();
         let local_names = bindings
             .iter()
-            .map(|binding| (binding.name.clone(), allocate(&binding.name, "", lang, &mut used)))
+            .map(|binding| {
+                let readable = binding.label.as_deref().unwrap_or(&binding.name);
+                let name = allocate(readable, "", lang, &mut used);
+                let plain = allocate(readable, "", lang, &mut HashSet::new());
+                if plain != name && !reserved.contains(&plain) {
+                    numbered.push((name.clone(), plain));
+                }
+                (binding.name.clone(), name)
+            })
+            .collect::<Vec<(String, String)>>();
+        // A value that is only another value is printed as that value. One that another scope
+        // reads by name keeps its own declaration, since that read names it.
+        let aliases: Vec<(String, String)> = bindings
+            .iter()
+            .filter_map(|binding| match &binding.value {
+                Value::VarRef(target)
+                    if !model
+                        .refs
+                        .iter()
+                        .any(|reference| matches!(&reference.accessor, Accessor::Binding(name) if *name == binding.name)) =>
+                {
+                    Some((binding.name.clone(), target.clone()))
+                }
+                _ => None,
+            })
             .collect();
         let ctx = Context {
             model,
@@ -1124,23 +1222,30 @@ mod execution {
             local_names,
             frames: vec![(trace.node, "root".into())],
             direct: false,
+            moved: Vec::new(),
+            unkept: Vec::new(),
+            aliases,
         };
         let all_bindings = model.bindings.iter().chain(&trace.bindings).cloned().collect::<Vec<_>>();
         let mut direct_ctx = ctx.clone();
         direct_ctx.direct = true;
-        let flow = model.flows.iter().find(|flow| flow.root == trace.node);
-        let mut body = if let Some(flow) = flow {
-            vec![Statement::Return(flow_expression(flow, output, &ctx, lang)?)]
-        } else {
-            match scope(
-                Some(&trace.fields),
-                &all_bindings,
-                &trace.children,
-                "root",
-                &direct_ctx,
-                lang,
-                true,
-            ) {
+        let mut loops = Vec::new();
+        looping(&trace.children, &mut loops);
+        let mut body = {
+            let ordered = if try_ordered {
+                scope(
+                    Some(&trace.fields),
+                    &all_bindings,
+                    &trace.children,
+                    "root",
+                    &direct_ctx,
+                    lang,
+                    true,
+                )
+            } else {
+                Err("the plan has no ordered form".to_owned())
+            };
+            match ordered {
                 Ok(mut work) => {
                     work.push(Statement::Return(Expr::call(
                         "_agent_result",
@@ -1183,9 +1288,7 @@ mod execution {
             ],
         };
         let mut function = code::Function::new("_execute", parameters);
-        if flow.is_none() {
-            function.declare("root", scope_expr(&trace.name, "task", Expr::Null))?;
-        }
+        function.declare("root", scope_expr(&trace.name, "task", Expr::Null))?;
         function.body.append(&mut body);
         let parameters = function.parameters[..2].to_vec();
         let details_name = if lang == ScorerLang::Python {
@@ -1246,7 +1349,10 @@ mod execution {
         }
         let mut functions = vec![function, details, run, traced];
         let contracts = if direct_ctx.direct && matches!(functions[0].body.get(1), Some(Statement::TraceScope { .. })) {
-            native::functions(&mut functions, lang)
+            match native::functions(&mut functions, lang, &numbered) {
+                Some(contracts) => contracts,
+                None => return emit_form(model, trace, output, lang, false),
+            }
         } else {
             vec![]
         };
@@ -1255,131 +1361,6 @@ mod execution {
             functions,
             contracts,
         })
-    }
-
-    fn flow_expression(flow: &crate::dsl::Flow, output: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr, String> {
-        let callback = |value: &Value| -> Result<Expr, String> {
-            let parameters = ["_flow", "_occ"]
-                .into_iter()
-                .map(|name| {
-                    let parameter = code::Parameter::new(name);
-                    if lang == ScorerLang::Typescript {
-                        parameter.typed("any")
-                    } else {
-                        parameter
-                    }
-                })
-                .collect();
-            Ok(expression(value, ctx, lang)?.lambda(parameters))
-        };
-        let props = |values: &[(String, Value)]| -> Result<Expr, String> {
-            Ok(Expr::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| Ok((key.clone(), callback(value)?)))
-                    .collect::<Result<_, String>>()?,
-            ))
-        };
-        let nodes = flow
-            .nodes
-            .iter()
-            .map(|node| {
-                Ok(Expr::Object(vec![
-                    ("id".into(), Expr::number(node.id.0)),
-                    ("name".into(), Expr::string(&node.name)),
-                    ("key".into(), Expr::string(&node.key)),
-                    ("kind".into(), Expr::string(&node.kind)),
-                    ("parent".into(), node.parent.map(|n| Expr::number(n.0)).unwrap_or(Expr::Null)),
-                    (
-                        "bindings".into(),
-                        Expr::Object(
-                            node.bindings
-                                .iter()
-                                .map(|(id, value)| Ok((id.to_string(), callback(value)?)))
-                                .collect::<Result<_, String>>()?,
-                        ),
-                    ),
-                    (
-                        "fields".into(),
-                        Expr::Object(node.fields.iter().map(|(key, id)| (key.clone(), Expr::number(id))).collect()),
-                    ),
-                ]))
-            })
-            .collect::<Result<_, String>>()?;
-        let edges = flow
-            .edges
-            .iter()
-            .map(|edge| {
-                Ok(Expr::Object(vec![
-                    ("id".into(), Expr::number(edge.id)),
-                    ("bundle".into(), Expr::number(edge.bundle)),
-                    ("name".into(), expression(&edge.name, ctx, lang)?),
-                    ("source".into(), Expr::number(edge.source.0)),
-                    ("target".into(), Expr::number(edge.target.0)),
-                    ("kind".into(), Expr::string(&edge.kind)),
-                    ("cycle".into(), Expr::Bool(edge.cycle)),
-                    ("into".into(), edge.into.map(Expr::number).unwrap_or(Expr::Null)),
-                    ("fork".into(), edge.fork.map(Expr::number).unwrap_or(Expr::Null)),
-                    ("props".into(), props(&edge.props)?),
-                ]))
-            })
-            .collect::<Result<_, String>>()?;
-        let forks = flow
-            .forks
-            .iter()
-            .map(|fork| {
-                Ok(Expr::Object(vec![
-                    ("id".into(), Expr::number(fork.id)),
-                    ("source".into(), Expr::number(fork.source.0)),
-                    ("kind".into(), Expr::string(&fork.kind)),
-                    ("props".into(), props(&fork.props)?),
-                    (
-                        "branches".into(),
-                        Expr::Array(
-                            fork.branches
-                                .iter()
-                                .map(|branch| Expr::Array(branch.iter().map(Expr::number).collect()))
-                                .collect(),
-                        ),
-                    ),
-                ]))
-            })
-            .collect::<Result<_, String>>()?;
-        let junctions = flow
-            .junctions
-            .iter()
-            .map(|junction| {
-                Ok(Expr::Object(vec![
-                    ("target".into(), Expr::number(junction.target.0)),
-                    ("kind".into(), Expr::string(&junction.kind)),
-                    ("props".into(), props(&junction.props)?),
-                    ("fork".into(), junction.fork.map(Expr::number).unwrap_or(Expr::Null)),
-                    (
-                        "inputs".into(),
-                        Expr::Array(junction.inputs.iter().map(Expr::number).collect()),
-                    ),
-                ]))
-            })
-            .collect::<Result<_, String>>()?;
-        let plan = Expr::Object(vec![
-            ("root".into(), Expr::number(flow.root.0)),
-            ("input".into(), Expr::number(flow.input)),
-            ("nodes".into(), Expr::Array(nodes)),
-            ("edges".into(), Expr::Array(edges)),
-            ("forks".into(), Expr::Array(forks)),
-            ("junctions".into(), Expr::Array(junctions)),
-            ("output".into(), callback(output)?),
-        ]);
-        Ok(Expr::call(
-            "_flow_run",
-            vec![
-                plan,
-                "input".into(),
-                random_name(lang).into(),
-                "logger".into(),
-                "_MISSING".into(),
-            ],
-        ))
     }
 
     fn scope_expr(name: &str, kind: &str, parent: Expr) -> Expr {
@@ -1447,8 +1428,159 @@ mod execution {
         lang: ScorerLang,
         root: bool,
     ) -> Result<Vec<Statement>, String> {
+        scope_holding(fields_value, bindings, &[], children, frame, ctx, lang, root)
+    }
+    // `held` are values this scope declares for the scope above and keeps for it to read
+    #[allow(clippy::too_many_arguments)]
+    fn scope_holding(
+        fields_value: Option<&SpanFields>,
+        own: &[Binding],
+        held: &[Binding],
+        children: &[Child],
+        frame: &str,
+        ctx: &Context<'_>,
+        lang: ScorerLang,
+        root: bool,
+    ) -> Result<Vec<Statement>, String> {
+        let bindings: Vec<Binding> = own.iter().chain(held).cloned().collect();
+        let bindings = bindings.as_slice();
+        let first = operations(fields_value, bindings, held, children, frame, ctx, lang, root, &[])?;
+        if !ctx.direct {
+            return Ok(first.into_iter().flat_map(|op| op.code).collect());
+        }
+        let reads: Vec<_> = first.iter().map(|op| (op.key.clone(), op.reads.clone())).collect();
+        let unordered = match crate::mocking::code::planning::order(first, frame) {
+            Ok(ordered) => return Ok(ordered),
+            Err(unordered) => unordered,
+        };
+        // A value that reads one step, and that the step reads back, has no place beside the step.
+        // It is declared inside the step and read from what the step returns.
+        let local = |binding: &Binding| {
+            ctx.local_names
+                .iter()
+                .find(|(name, _)| *name == binding.name)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let read_by = |name: &str| {
+            reads
+                .iter()
+                .find(|(key, _)| *key == Dependency::Variable(name.to_owned()))
+                .map(|(_, reads)| reads)
+        };
+        let keys: Vec<_> = children
+            .iter()
+            .map(|child| ctx.names(child_node(child)).state.clone())
+            .collect();
+        let mut homes = vec![None::<usize>; bindings.len()];
+        loop {
+            let mut changed = false;
+            for (index, binding) in bindings.iter().enumerate() {
+                if homes[index].is_some() {
+                    continue;
+                }
+                let Some(reads) = read_by(&local(binding)) else { continue };
+                let mut found = HashSet::new();
+                for read in reads {
+                    match read {
+                        Dependency::Child(parent, key) if parent == frame => {
+                            found.extend(keys.iter().position(|found| found == key));
+                        }
+                        Dependency::Variable(name) => {
+                            let other = bindings.iter().position(|other| local(other) == *name);
+                            found.extend(other.and_then(|other| homes[other]));
+                        }
+                        _ => {}
+                    }
+                }
+                if found.len() == 1 {
+                    homes[index] = found.into_iter().next();
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if homes.iter().all(Option::is_none) {
+            return Err(unordered);
+        }
+        let mut moved_ctx = ctx.clone();
+        let mut moved = Vec::new();
+        let mut kept = Vec::new();
+        for (binding, home) in bindings.iter().zip(&homes) {
+            match home {
+                Some(home) => {
+                    let holder = child_node(&children[*home]);
+                    moved_ctx.moved.push((binding.name.clone(), holder, ctx.site));
+                    moved.push((holder, binding.clone()));
+                }
+                None => kept.push(binding.clone()),
+            }
+        }
+        let mut second = operations(fields_value, &kept, held, children, frame, &moved_ctx, lang, root, &moved)?;
+        // a step hands back only what something outside it reads, the entry scope keeps everything for the result
+        if !root {
+            let first_child = second.len() - children.len();
+            for (holder, binding) in &moved {
+                if held.iter().any(|held| held.name == binding.name) {
+                    continue;
+                }
+                let name = local(binding);
+                let own = children
+                    .iter()
+                    .position(|child| child_node(child) == *holder)
+                    .map(|index| first_child + index);
+                let mut read = false;
+                for (index, operation) in second.iter().enumerate() {
+                    if Some(index) == own {
+                        continue;
+                    }
+                    code::rewrite(&mut operation.code.clone(), &mut |found| {
+                        read |= matches!(found, Expr::Read { dependency: Dependency::Field(_, key), .. } if *key == name);
+                    });
+                }
+                if !read {
+                    moved_ctx.unkept.push(binding.name.clone());
+                }
+            }
+            if !moved_ctx.unkept.is_empty() {
+                second = operations(fields_value, &kept, held, children, frame, &moved_ctx, lang, root, &moved)?;
+            }
+        }
+        crate::mocking::code::planning::order(second, frame)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn operations(
+        fields_value: Option<&SpanFields>,
+        bindings: &[Binding],
+        held: &[Binding],
+        children: &[Child],
+        frame: &str,
+        ctx: &Context<'_>,
+        lang: ScorerLang,
+        root: bool,
+        moved: &[(NodeId, Binding)],
+    ) -> Result<Vec<Operation>, String> {
         let mut operations = Vec::new();
+        for binding in held {
+            if ctx.unkept.contains(&binding.name) {
+                continue;
+            }
+            // kept for the scope above, wherever below this scope the value is declared
+            let name = &ctx.local_names.iter().find(|(name, _)| *name == binding.name).unwrap().1;
+            let value = expression(&Value::VarRef(binding.name.clone()), ctx, lang)?;
+            operations.push(Operation {
+                key: Dependency::Field(frame.into(), name.clone()),
+                reads: value.references(),
+                code: vec![assign(Expr::from(frame).member("fields").index(Expr::string(name)), value)],
+            });
+        }
         for binding in bindings {
+            if ctx.aliases.iter().any(|(alias, _)| *alias == binding.name) {
+                continue;
+            }
             let name = &ctx.local_names.iter().find(|(name, _)| *name == binding.name).unwrap().1;
             let value = expression(&binding.value, ctx, lang)?;
             operations.push(Operation {
@@ -1456,9 +1588,74 @@ mod execution {
                 reads: value.references(),
                 code: vec![Statement::Variable(Variable::constant(name, value.lazy()))],
             });
+            // a value another scope reads is kept on the frame that declares it
+            let shared = !held.iter().any(|held| held.name == binding.name)
+                && (ctx.model.refs.iter())
+                    .any(|reference| matches!(&reference.accessor, Accessor::Binding(found) if *found == binding.name));
+            if shared {
+                operations.push(Operation {
+                    key: Dependency::Field(frame.into(), name.clone()),
+                    reads: HashSet::from([Dependency::Variable(name.clone())]),
+                    code: vec![assign(
+                        Expr::from(frame).member("fields").index(Expr::string(name)),
+                        if ctx.direct {
+                            Expr::call(name.as_str(), vec![])
+                        } else {
+                            Expr::Name(name.clone())
+                        },
+                    )],
+                });
+            }
         }
         if let Some(fields_value) = fields_value {
-            for (key, value) in fields(fields_value, ctx, lang, root)? {
+            for (key, mut value) in fields(fields_value, ctx, lang, root)? {
+                // an entry that another entry of the same object reads is computed first, under its own name
+                let own = Dependency::Field(frame.into(), key.clone());
+                if ctx.direct
+                    && value.references().contains(&own)
+                    && let Expr::Object(entries) = &mut value
+                {
+                    let mut wanted = Vec::new();
+                    for (_, entry) in entries.iter_mut() {
+                        code::rewrite_expr(entry, &mut |found| {
+                            if let Expr::Call { function, args, .. } = found
+                                && matches!(&**function, Expr::Name(name) if name == "_index")
+                                && let [Expr::Read { dependency, .. }, Expr::String(part)] = args.as_slice()
+                                && *dependency == own
+                            {
+                                let name = if lang == ScorerLang::Python {
+                                    format!("{key}_{part}")
+                                } else {
+                                    let mut name = key.clone();
+                                    for word in part.split('_').filter(|word| !word.is_empty()) {
+                                        name.push_str(&word[..1].to_uppercase());
+                                        name.push_str(&word[1..]);
+                                    }
+                                    name
+                                };
+                                // a name already in use leaves the read as it was, and the scope unordered
+                                if !ctx.local_names.iter().any(|(_, local)| *local == name) {
+                                    wanted.push((part.clone(), name.clone()));
+                                    *found = Expr::Name(name);
+                                }
+                            }
+                        });
+                    }
+                    for (part, name) in wanted {
+                        let Some((_, entry)) = entries.iter_mut().find(|(entry, _)| *entry == part) else {
+                            continue;
+                        };
+                        if matches!(entry, Expr::Name(found) if *found == name) {
+                            continue;
+                        }
+                        let computed = std::mem::replace(entry, Expr::Name(name.clone()));
+                        operations.push(Operation {
+                            key: Dependency::Variable(name.clone()),
+                            reads: computed.references(),
+                            code: vec![Statement::Variable(Variable::constant(&name, computed))],
+                        });
+                    }
+                }
                 let reads = value.references();
                 let statement = if ctx.direct {
                     let value = Expr::call("_value", vec![value]);
@@ -1479,7 +1676,12 @@ mod execution {
         }
         let mut previous = None;
         for child in children {
-            let mut operation = child_operation(child, frame, ctx, lang)?;
+            let node = child_node(child);
+            let held: Vec<_> = (moved.iter())
+                .filter(|(holder, _)| *holder == node)
+                .map(|(_, binding)| binding.clone())
+                .collect();
+            let mut operation = child_operation(child, &held, frame, ctx, lang)?;
             if ctx.model.ordered
                 && let Some(previous) = previous
             {
@@ -1488,13 +1690,15 @@ mod execution {
             previous = Some(operation.key.clone());
             operations.push(operation);
         }
-        if ctx.direct {
-            crate::mocking::code::planning::order(operations, frame)
-        } else {
-            Ok(operations.into_iter().flat_map(|op| op.code).collect())
-        }
+        Ok(operations)
     }
-    fn child_operation(child: &Child, parent: &str, ctx: &Context<'_>, lang: ScorerLang) -> Result<Operation, String> {
+    fn child_operation(
+        child: &Child,
+        held: &[Binding],
+        parent: &str,
+        ctx: &Context<'_>,
+        lang: ScorerLang,
+    ) -> Result<Operation, String> {
         let node = child_node(child);
         let names = ctx.names(node);
         let frame = &names.state;
@@ -1548,9 +1752,15 @@ mod execution {
             child_ctx.iterations.push((node, names.index.clone(), names.count.clone()));
         }
         let branching = matches!(child, Child::Choice(_) | Child::Maybe(_));
-        let mut work = scope(
+        if matches!(child, Child::Choice(_)) && !held.is_empty() {
+            return Err("a value cannot be held by a choice of paths".into());
+        }
+        // an optional path declares what it holds where the path runs
+        let outer_held = if branching { &[] } else { held };
+        let mut work = scope_holding(
             fields,
             bindings,
+            outer_held,
             if branching { &[] } else { children },
             frame,
             &child_ctx,
@@ -1588,6 +1798,19 @@ mod execution {
                     });
                 }
             }
+            Child::Repeat(v) => {
+                if let Some(again) = &v.again {
+                    let condition = expression(&again.condition, &child_ctx, lang)?;
+                    work.push(assign(
+                        Expr::from(frame.clone()).member("fields").index(Expr::string("again")),
+                        if ctx.direct {
+                            Expr::call("_boolean", vec![condition])
+                        } else {
+                            condition.lazy()
+                        },
+                    ));
+                }
+            }
             Child::Maybe(v) => {
                 work.push(assign(
                     Expr::from(frame.clone()).member("fields").index(Expr::string("included")),
@@ -1595,7 +1818,7 @@ mod execution {
                 ));
                 work.push(Statement::If {
                     condition: Expr::call("_boolean", vec![read_field(frame.clone().into(), "included", ctx.direct)]),
-                    then_body: scope(None, &[], children, frame, &child_ctx, lang, false)?,
+                    then_body: scope_holding(None, &[], held, children, frame, &child_ctx, lang, false)?,
                     else_body: vec![],
                 });
             }
@@ -1616,14 +1839,30 @@ mod execution {
             function.body.extend(work);
         }
         let call = if let Child::Repeat(v) = child {
-            Expr::call(
-                "_repeat",
-                vec![
-                    expression(&v.count, ctx, lang)?,
-                    names.function.clone().into(),
-                    Expr::string(name),
-                ],
-            )
+            match &v.again {
+                // a loop is known to its parent before its rounds run, so a round can read the one before it
+                Some(again) => Expr::call(
+                    "_loop",
+                    vec![
+                        parent.into(),
+                        Expr::string(frame),
+                        names.function.clone().into(),
+                        Expr::string(name),
+                        match &again.limit {
+                            Some(limit) => expression(limit, ctx, lang)?,
+                            None => Expr::Null,
+                        },
+                    ],
+                ),
+                None => Expr::call(
+                    "_repeat",
+                    vec![
+                        expression(&v.count, ctx, lang)?,
+                        names.function.clone().into(),
+                        Expr::string(name),
+                    ],
+                ),
+            }
         } else {
             Expr::call(names.function.clone(), vec![])
         };
@@ -1635,11 +1874,11 @@ mod execution {
         } else {
             code.push(assign(target, call.lazy()));
         }
-        Ok(Operation {
-            key: Dependency::Child(parent.into(), frame.clone()),
-            reads: code::references(&code),
-            code,
-        })
+        // a loop reads its own earlier rounds, which is not a dependency on itself
+        let key = Dependency::Child(parent.into(), frame.clone());
+        let mut reads = code::references(&code);
+        reads.remove(&key);
+        Ok(Operation { key, reads, code })
     }
 }
 // Prefer native values after dependency ordering has established execution order.

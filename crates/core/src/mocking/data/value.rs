@@ -311,23 +311,61 @@ pub mod expr {
         },
     }
 
+    /// How a junction combines the arrivals of its inputs.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub enum EmissionKind {
+        /// Every arrival fires on its own.
+        Merge,
+        /// The first arrival of a group fires and later ones are ignored.
+        First,
+        /// One arrival from every input fires together, in declared input order.
+        Accumulate,
+        /// The first arrivals from a number of distinct inputs fire together, in declared input order.
+        Quorum,
+        /// Every arrival of a group fires together when the group closes.
+        Reduce,
+    }
+
+    /// The arrivals of a junction and how they are grouped.
+    ///
+    /// Arrivals are taken round by round, and inside a round in branch order.
+    /// A group is the whole activation, or one correlation key when keys are given.
+    /// An accumulate group that closes with an input missing fails, and so does a
+    /// quorum group that closes short of its count.
+    #[derive(Debug, Clone)]
+    pub struct Emissions {
+        pub kind: EmissionKind,
+        /// The listed inputs in declared order.
+        pub inputs: Vec<EmissionInput>,
+        /// Positions into `inputs` in the order their branches run.
+        pub order: Vec<usize>,
+        /// The number of rounds. Without it there is one round and each input holds single values.
+        pub rounds: Option<Value>,
+        /// One correlation key for each round.
+        pub keys: Option<Value>,
+        /// The number of distinct inputs a quorum needs.
+        pub count: Option<Value>,
+    }
+
+    /// One listed input of a junction.
+    #[derive(Debug, Clone)]
+    pub struct EmissionInput {
+        /// The edge name or number reported in arrival records.
+        pub edge: Value,
+        /// Whether the input arrived, one value for each round. An absent expression always arrives.
+        pub arrived: Option<Value>,
+        /// The observed value, or null when the input observes nothing.
+        pub value: Option<Value>,
+        /// Whether `value` is one value shared by every round, not one value for each round.
+        pub shared: bool,
+    }
+
     /// A validated function call whose result is computed by a consumer.
     ///
     /// Argument structure is checked during compilation. Runtime values can still
     /// cause failures such as an invalid index or numeric overflow.
     #[derive(Debug, Clone)]
     pub enum Func {
-        /// Reads a binding from the selected graph occurrence.
-        FlowRead {
-            node: super::super::super::NodeId,
-            binding: usize,
-        },
-        /// Caches an edge or fork property for its source occurrence.
-        FlowProperty { binding: usize, value: Box<Value> },
-        /// Reads occurrence-local runtime context.
-        FlowContext(Vec<String>),
-        /// Requires a value supplied by an incoming edge.
-        FlowInput { binding: usize, ty: bts_lang::FieldType },
         /// Selects one eligible fork branch, or minus one when none qualify.
         ForkPick(Vec<Vec<Value>>),
         /// Requires every listed junction input before activating its target.
@@ -343,8 +381,13 @@ pub mod expr {
         },
         /// The running value of the innermost fold.
         FoldAccumulator,
-        /// The current item of the innermost fold, as a record with a `value` key.
+        /// The current item of the innermost fold.
         FoldArrival,
+        /// Groups the arrivals of a junction into the emissions that activate its target.
+        ///
+        /// The result is an array of emissions in the order they fire. Each emission is
+        /// an array of arrival records with `edge` and `value` keys.
+        Emissions(Box<Emissions>),
         /// Checks the value delivered to a schema-constrained field.
         Check { value: Box<Value>, ty: bts_lang::FieldType },
         /// An English language operation evaluated by the consumer.

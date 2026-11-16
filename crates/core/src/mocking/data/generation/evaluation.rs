@@ -2,10 +2,11 @@ use super::super::{Attachment, AttachmentFormat, EventKind, Value as JsonValue};
 use crate::dsl::EnglishOperation;
 use crate::dsl::{
     Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild,
-    Choice as ModelChoice, CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NOISE_SIZE_CAP, NodeId,
-    Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange,
-    RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
-    Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
+    Choice as ModelChoice, CtxRef as ModelCtxRef, EmissionKind, Emissions, Field, Func as ModelFunc, Maybe as ModelMaybe,
+    Model, NOISE_SIZE_CAP, NodeId, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField,
+    Part as ModelPart, Range as ModelRange, RefId, Repeat as ModelRepeat, ResolvedRef, Selection,
+    SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange, Step, Template as ModelTemplate, Trace as ModelTrace,
+    UnaryOp, Value as ModelValue,
 };
 use crate::english::{self, RealizeOptions, Sentence, VariationOptions};
 use crate::selection::filter::WriteFilter;
@@ -90,6 +91,10 @@ const COUNT_SALT: u64 = 0x01;
 const CHANCE_SALT: u64 = 0x02;
 const PICK_SALT: u64 = 0x03;
 const DURATION_SALT: u64 = 0x04;
+const AGAIN_SALT: u64 = 0x05;
+const LIMIT_SALT: u64 = 0x06;
+// a loop that names no limit stops here
+const LOOP_BUDGET: usize = 10_000;
 const FIELD_SALT: u64 = 0x10;
 const KEY_SALT: u64 = 0x20;
 const TAG_SALT: u64 = 0x30;
@@ -220,7 +225,6 @@ struct Ctx<'m> {
     last_ref: Option<SrcRange>,
     instances: Vec<Instance>,
     attachments: Vec<Attachment>,
-    flow: Option<FlowState>,
     // the running value and current item of each fold being evaluated, innermost last
     folds: Vec<(ModelValue, ModelValue)>,
 }
@@ -240,7 +244,6 @@ impl<'m> Ctx<'m> {
             last_ref: None,
             instances: Vec::new(),
             attachments: Vec::new(),
-            flow: None,
             folds: Vec::new(),
         }
     }
@@ -423,9 +426,9 @@ impl<'m> Ctx<'m> {
                 name,
                 count,
                 count_range,
+                again,
                 bindings,
                 children,
-                ..
             }) => {
                 let collection = self.add_instance(
                     *node,
@@ -435,6 +438,43 @@ impl<'m> Ctx<'m> {
                     &[],
                     FieldSlots::default(),
                 );
+                if let Some(again) = again {
+                    // a loop runs once, then again while its condition holds for the iteration that just ran
+                    let limit = match &again.limit {
+                        Some(limit) => {
+                            let rng = self.slot_rng(self.instances[collection].path, LIMIT_SALT);
+                            let limit = self.scoped(parent, rng, |ctx| eval_operand(limit.clone(), ctx))?;
+                            match limit {
+                                Scalar::Int(limit) if limit >= 0 => Some(limit as usize),
+                                _ => return Err(Error::new(ErrorKind::LoopLimit, again.range)),
+                            }
+                        }
+                        None => None,
+                    };
+                    for index in 0.. {
+                        let iteration = self.add_instance(
+                            *node,
+                            Some(collection),
+                            Shape::Iteration { index, count: index + 1 },
+                            index as u64 + 1,
+                            bindings,
+                            FieldSlots::default(),
+                        );
+                        self.add_children(iteration, children)?;
+                        let rng = self.slot_rng(self.instances[iteration].path, AGAIN_SALT);
+                        let condition = again.condition.clone();
+                        let repeat = self.scoped(iteration, rng, |ctx| eval_operand(condition, ctx)?.into_bool(ctx))?;
+                        if !repeat {
+                            break;
+                        }
+                        match limit {
+                            Some(limit) if index >= limit => return Err(Error::new(ErrorKind::LoopLimit, again.range)),
+                            None if index + 1 >= LOOP_BUDGET => return Err(Error::new(ErrorKind::LoopBudget, again.range)),
+                            _ => {}
+                        }
+                    }
+                    return Ok(());
+                }
                 // count is drawn in the parent scope, bindings re-evaluate per iteration
                 let rng = self.slot_rng(self.instances[collection].path, COUNT_SALT);
                 let count = self.scoped(parent, rng, |ctx| eval_count(count.clone(), *count_range, ctx))?;
@@ -686,6 +726,11 @@ impl<'m> Ctx<'m> {
                 self.apply_steps(iterations[index], rest, accessor, path, range)
             }
 
+            Step::Last => match self.instances[at].children.last().copied() {
+                Some(iteration) => self.apply_steps(iteration, rest, accessor, path, range),
+                None => Ok(JsonValue::Null),
+            },
+
             Step::Iterations { start, end } => {
                 let iterations = self.instances[at].children.clone();
                 let len = iterations.len();
@@ -770,6 +815,18 @@ impl<'m> Ctx<'m> {
                 Shape::Maybe { included, .. } => Ok(JsonValue::Bool(included)),
                 _ => unreachable!("modeler validated included against a maybe"),
             },
+            Accessor::Binding(name) => {
+                let position = self.instances[at].bindings.iter().position(|(known, _)| known == name);
+                let Some(position) = position else {
+                    return Err(Error::new(ErrorKind::RefShapeMismatch, range));
+                };
+                let value = self.force_binding_slot(at, position)?;
+                let mut json = lower_value(value, self)?;
+                for selection in path {
+                    json = json_select(json, selection.clone(), range, self)?;
+                }
+                Ok(json)
+            }
         }
     }
 
@@ -1801,44 +1858,6 @@ fn english_expression_shapes(source: &InputValue, english_options: Option<&Input
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
-        ModelFunc::FlowProperty { binding, value } => {
-            if let Some(value) = ctx
-                .flow
-                .as_ref()
-                .and_then(|flow| flow.occurrences[ctx.site].properties.get(&binding))
-                .cloned()
-            {
-                value
-            } else {
-                let value = eval_binding(*value, ctx)?;
-                ctx.flow
-                    .as_mut()
-                    .ok_or_else(|| flow_error("occurrence context is unavailable"))?
-                    .occurrences[ctx.site]
-                    .properties
-                    .insert(binding, value.clone());
-                value
-            }
-        }
-        ModelFunc::FlowRead { node, binding } => ctx.flow_read(node, binding)?,
-        ModelFunc::FlowContext(path) => ctx.flow_context(&path)?,
-        ModelFunc::FlowInput { binding, ty } => {
-            let value = ctx
-                .flow
-                .as_ref()
-                .and_then(|flow| flow.occurrences.get(ctx.site))
-                .and_then(|occ| occ.supplied.get(&binding))
-                .cloned()
-                .ok_or_else(|| flow_error("upstream value was not supplied"))?;
-            eval_func(
-                ModelFunc::Check {
-                    value: Box::new(value),
-                    ty,
-                },
-                range,
-                ctx,
-            )?
-        }
         ModelFunc::ForkPick(branches) => {
             let mut weights = Vec::new();
             for branch in branches {
@@ -1888,19 +1907,14 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
                 let ModelArrayElem::Item(value) = item else {
                     return Err(Error::new(ErrorKind::RefShapeMismatch, range));
                 };
-                let arrival = ModelValue::Object(ModelObject {
-                    elem: vec![ModelObjectField {
-                        key: "value".into(),
-                        value,
-                    }],
-                });
-                ctx.folds.push((accumulator, arrival));
+                ctx.folds.push((accumulator, value));
                 let combined = eval_binding((*combine).clone(), ctx);
                 ctx.folds.pop();
                 accumulator = json_to_value(lower_value(combined?, ctx)?);
             }
             accumulator
         }
+        ModelFunc::Emissions(join) => eval_emissions(*join, range, ctx)?,
         ModelFunc::FoldAccumulator => match ctx.folds.last() {
             Some((accumulator, _)) => accumulator.clone(),
             None => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
@@ -2240,6 +2254,136 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
     };
 
     Ok(value)
+}
+
+// fires the emissions of a junction from its arrivals, taken round by round in branch order
+fn eval_emissions(join: Emissions, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
+    let shape = || Error::new(ErrorKind::RefShapeMismatch, range);
+    let rounds = match &join.rounds {
+        Some(rounds) => Some(eval_count(rounds.clone(), range, ctx)?),
+        None => None,
+    };
+    // every per round expression yields one value for each round
+    let spread = |value: ModelValue, ctx: &mut Ctx| -> Result<Vec<InputValue>, Error> {
+        let value = lower_value(value, ctx)?.project(ctx.format).map_err(|_| shape())?;
+        match (rounds, value) {
+            (None, value) => Ok(vec![value]),
+            (Some(rounds), InputValue::Array(values)) if values.len() == rounds => Ok(values),
+            _ => Err(shape()),
+        }
+    };
+    let rounds = rounds.unwrap_or(1);
+    let mut inputs = Vec::new();
+    for input in join.inputs {
+        let arrived = match input.arrived {
+            Some(arrived) => spread(arrived, ctx)?
+                .iter()
+                .map(|value| value.as_bool() == Some(true))
+                .collect(),
+            None => vec![true; rounds],
+        };
+        let edge = lower_value(input.edge, ctx)?.project(ctx.format).map_err(|_| shape())?;
+        let values = match input.value {
+            None => vec![InputValue::Null; rounds],
+            Some(value) if input.shared => {
+                vec![lower_value(value, ctx)?.project(ctx.format).map_err(|_| shape())?; rounds]
+            }
+            Some(value) => spread(value, ctx)?,
+        };
+        inputs.push((edge, arrived, values));
+    }
+    let keys = match join.keys {
+        Some(keys) => Some(spread(keys, ctx)?),
+        None => None,
+    };
+    let count = match join.count {
+        Some(count) => eval_count(count, range, ctx)?,
+        None => 0,
+    };
+    struct Group {
+        key: InputValue,
+        queues: Vec<std::collections::VecDeque<InputValue>>,
+        seen: Vec<(usize, InputValue)>,
+        emitted: bool,
+    }
+    let group = |key: InputValue| Group {
+        key,
+        queues: vec![Default::default(); inputs.len()],
+        seen: vec![],
+        emitted: false,
+    };
+    // without keys the one group exists even when nothing arrives
+    let mut groups = if keys.is_none() {
+        vec![group(InputValue::Null)]
+    } else {
+        vec![]
+    };
+    let mut emissions: Vec<Vec<InputValue>> = Vec::new();
+    for round in 0..rounds {
+        for &position in &join.order {
+            let (edge, arrived, values) = &inputs[position];
+            if !arrived[round] {
+                continue;
+            }
+            let arrival = serde_json::json!({"edge": edge, "value": values[round]});
+            let key = keys.as_ref().map_or(InputValue::Null, |keys| keys[round].clone());
+            let index = match groups.iter().position(|group| group.key == key) {
+                Some(index) => index,
+                None => {
+                    groups.push(group(key));
+                    groups.len() - 1
+                }
+            };
+            let group = &mut groups[index];
+            match join.kind {
+                EmissionKind::Merge => emissions.push(vec![arrival]),
+                EmissionKind::First => {
+                    if !group.emitted {
+                        emissions.push(vec![arrival]);
+                    }
+                }
+                EmissionKind::Accumulate => {
+                    group.queues[position].push_back(arrival);
+                    if group.queues.iter().all(|queue| !queue.is_empty()) {
+                        emissions.push(group.queues.iter_mut().map(|queue| queue.pop_front().unwrap()).collect());
+                    } else {
+                        continue;
+                    }
+                }
+                EmissionKind::Quorum => {
+                    if group.emitted {
+                        continue;
+                    }
+                    if !group.seen.iter().any(|(seen, _)| *seen == position) {
+                        group.seen.push((position, arrival));
+                    }
+                    if group.seen.len() < count {
+                        continue;
+                    }
+                    let mut arrivals = std::mem::take(&mut group.seen);
+                    arrivals.sort_by_key(|(position, _)| *position);
+                    emissions.push(arrivals.into_iter().map(|(_, arrival)| arrival).collect());
+                }
+                EmissionKind::Reduce => {
+                    group.seen.push((position, arrival));
+                    continue;
+                }
+            }
+            group.emitted = true;
+        }
+    }
+    for group in groups {
+        match join.kind {
+            EmissionKind::Accumulate if !group.emitted || group.queues.iter().any(|queue| !queue.is_empty()) => {
+                return Err(Error::new(ErrorKind::MissingArrival, range));
+            }
+            EmissionKind::Quorum if !group.emitted => return Err(Error::new(ErrorKind::QuorumUnmet, range)),
+            EmissionKind::Reduce => emissions.push(group.seen.into_iter().map(|(_, arrival)| arrival).collect()),
+            _ => {}
+        }
+    }
+    let emissions = InputValue::Array(emissions.into_iter().map(InputValue::Array).collect());
+    Ok(json_to_value(emissions.into()))
 }
 
 fn finite_float(value: f64, range: SrcRange) -> Result<ModelValue, Error> {
@@ -2649,11 +2793,7 @@ pub(super) fn plan_experiment(
     let mut ctx = Ctx::new(&model.refs, seed, index, format);
     ctx.lazy_model = Some(model);
     ctx.row = Some((node, row));
-    if let Some(flow) = model.flows.iter().find(|flow| flow.root == trace.node) {
-        ctx.execute_flow(flow)?;
-    } else {
-        ctx.instantiate_trace(trace, &model.bindings)?;
-    }
+    ctx.instantiate_trace(trace, &model.bindings)?;
     let mut instance = 0;
     for step in &reference.steps {
         let Step::Child { candidates, .. } = step else {
@@ -2697,11 +2837,7 @@ pub(super) fn plan_with_filter(
         .collect();
     debug_assert!(!selected.is_empty());
 
-    let scorer_postlude = model.traces.iter().any(|trace| trace.children.iter().any(has_scorer))
-        || model
-            .flows
-            .iter()
-            .any(|flow| flow.nodes.iter().any(|node| node.kind == "scorer"));
+    let scorer_postlude = model.traces.iter().any(|trace| trace.children.iter().any(has_scorer));
 
     let capacity = (0..count).map(|index| trace_len(selected[index % selected.len()])).sum();
 
@@ -2716,11 +2852,7 @@ pub(super) fn plan_with_filter(
         // a trace's values depend on nothing planned before it
         let mut ctx = Ctx::new(&model.refs, seed, index, format);
         let chosen = selected[index % selected.len()];
-        if let Some(flow) = model.flows.iter().find(|flow| flow.root == chosen.node) {
-            ctx.execute_flow(flow)?;
-        } else {
-            ctx.instantiate_trace(chosen, &model.bindings)?;
-        }
+        ctx.instantiate_trace(chosen, &model.bindings)?;
         if model
             .refs
             .iter()
@@ -2811,9 +2943,11 @@ impl Error {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ErrorKind {
-    Flow,
     InvalidForkWeight,
     MissingArrival,
+    QuorumUnmet,
+    LoopLimit,
+    LoopBudget,
     SchemaTypeMismatch,
     UnsupportedAttachment,
     DivisionByZero,
@@ -2845,9 +2979,11 @@ pub enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Flow => "graph execution failed",
             Self::InvalidForkWeight => "weighted branch weights must agree and be finite nonnegative numbers",
             Self::MissingArrival => "accumulate group closed with a missing listed input",
+            Self::QuorumUnmet => "quorum group closed without enough distinct inputs",
+            Self::LoopLimit => "cycle max_traversals exceeded",
+            Self::LoopBudget => "graph execution budget exceeded (10000 traversals)",
             Self::SchemaTypeMismatch => "upstream value does not satisfy its field schema",
             Self::UnsupportedAttachment => "the selected format does not support attachments",
             Self::DivisionByZero => "expression divides by zero",
@@ -2896,955 +3032,6 @@ impl From<Error> for crate::dsl::Diag {
             what: error.to_string(),
             r#where: error.range,
         }
-    }
-}
-
-fn flow_error(message: impl Into<String>) -> Error {
-    Error {
-        kind: ErrorKind::Flow,
-        range: SrcRange::new(0, 0),
-        detail: Some(message.into()),
-    }
-}
-
-type FlowBundle = (Vec<usize>, usize, Option<(usize, usize, ModelValue, usize)>);
-
-type FlowScope = std::collections::HashMap<NodeId, Vec<usize>>;
-
-#[derive(Clone)]
-struct FlowOccurrence {
-    terminal: bool,
-    started: bool,
-    completed: bool,
-    prior: usize,
-    completion: usize,
-    properties: std::collections::HashMap<usize, ModelValue>,
-    history: usize,
-    scope: FlowScope,
-    group: usize,
-    supplied: std::collections::HashMap<usize, ModelValue>,
-    context: std::collections::HashMap<String, ModelValue>,
-}
-
-#[derive(Clone)]
-struct FlowArrival {
-    edge: usize,
-    occurrence: usize,
-    value: ModelValue,
-}
-
-struct FlowObservation {
-    edge: usize,
-    target: usize,
-    group: usize,
-    arrival: Option<ModelValue>,
-    result: bool,
-}
-
-struct FlowJoin {
-    junction: usize,
-    group: usize,
-    correlation: JsonValue,
-    queues: Vec<std::collections::VecDeque<FlowArrival>>,
-    arrivals: Vec<FlowArrival>,
-    emitted: bool,
-    closed: bool,
-    source: usize,
-}
-
-struct FlowState {
-    plan: crate::dsl::Flow,
-    occurrences: Vec<FlowOccurrence>,
-    joins: Vec<FlowJoin>,
-    counters: std::collections::HashMap<(usize, usize), usize>,
-    groups: usize,
-    steps: usize,
-    completed: usize,
-}
-
-fn merge_flow_scope(target: &mut FlowScope, source: &FlowScope) {
-    for (node, occurrences) in source {
-        let values = target.entry(*node).or_default();
-        for occurrence in occurrences {
-            if !values.contains(occurrence) {
-                values.push(*occurrence)
-            }
-        }
-    }
-}
-
-impl Ctx<'_> {
-    fn flow_read(&mut self, node: NodeId, binding: usize) -> Result<ModelValue, Error> {
-        let flow = self
-            .flow
-            .as_ref()
-            .ok_or_else(|| flow_error("occurrence context is unavailable"))?;
-        let current = &flow.occurrences[self.site];
-        let candidates = if self.instances[self.site].node == node {
-            vec![self.site]
-        } else if let Some(found) = current.scope.get(&node) {
-            found.clone()
-        } else {
-            flow.occurrences
-                .iter()
-                .enumerate()
-                .filter(|(i, occ)| occ.started && occ.group == current.group && self.instances[*i].node == node)
-                .map(|(i, _)| i)
-                .collect()
-        };
-        if candidates.len() != 1 {
-            return Err(flow_error(if candidates.is_empty() {
-                "referenced occurrence is not available"
-            } else {
-                "ambiguous occurrence reference, read context.arrivals instead"
-            }));
-        }
-        let occurrence = candidates[0];
-        if !flow.occurrences[occurrence].started {
-            return Err(flow_error("referenced occurrence is not available"));
-        }
-        let name = format!("flow_{binding}");
-        let position = self.instances[occurrence]
-            .bindings
-            .iter()
-            .position(|(key, _)| key == &name)
-            .ok_or_else(|| flow_error("occurrence binding is unavailable"))?;
-        self.force_binding_slot(occurrence, position)
-    }
-
-    fn flow_context(&mut self, path: &[String]) -> Result<ModelValue, Error> {
-        let Some(key) = path.first() else {
-            return Err(flow_error("context requires a field"));
-        };
-        let flow = self
-            .flow
-            .as_ref()
-            .ok_or_else(|| flow_error("occurrence context is unavailable"))?;
-        let occurrence = flow.occurrences[self.site].clone();
-        let (mut value, skip) = if key == "history" {
-            let name = path.get(1).ok_or_else(|| flow_error("history requires a node name"))?;
-            let node = flow
-                .plan
-                .nodes
-                .iter()
-                .find(|node| &node.key == name)
-                .ok_or_else(|| flow_error("unknown history node"))?
-                .id;
-            let indices: Vec<_> = flow
-                .occurrences
-                .iter()
-                .enumerate()
-                .filter(|(i, other)| {
-                    other.completed
-                        && other.completion < occurrence.prior
-                        && other.history == occurrence.history
-                        && self.instances[*i].node == node
-                })
-                .map(|(i, _)| i)
-                .collect();
-            let mut values = vec![];
-            for index in indices {
-                let value = self.read_accessor(index, &Accessor::Record, &[], SrcRange::new(0, 0))?;
-                values.push(ModelArrayElem::Item(json_to_value(value)));
-            }
-            (ModelValue::Array(ModelArray { elem: values }), 2)
-        } else if key == "trace_index" {
-            (ModelValue::Num(ModelNumber::Int(self.trace_index as i64)), 1)
-        } else if let Some(value) = occurrence.context.get(key) {
-            (value.clone(), 1)
-        } else if let Shape::Scorer(_) = self.instances[self.site].shape {
-            let parent = self.instances[self.site]
-                .parent
-                .ok_or_else(|| flow_error("scorer has no parent"))?;
-            let node = self.instances[parent].node;
-            let binding = flow
-                .plan
-                .nodes
-                .iter()
-                .find(|n| n.id == node)
-                .and_then(|n| n.fields.iter().find(|(field, _)| field == key))
-                .map(|(_, id)| *id);
-            (
-                match binding {
-                    Some(binding) => self.flow_eval(
-                        parent,
-                        ModelValue::Func {
-                            func: ModelFunc::FlowRead { node, binding },
-                            range: SrcRange::new(0, 0),
-                        },
-                    )?,
-                    None => ModelValue::Null,
-                },
-                1,
-            )
-        } else {
-            return Err(flow_error(format!("context.{key} is unavailable")));
-        };
-        for key in &path[skip..] {
-            value = eval_binding(
-                ModelValue::Index {
-                    target: Box::new(value),
-                    index: Box::new(ModelValue::Str(key.clone())),
-                    range: SrcRange::new(0, 0),
-                },
-                self,
-            )?;
-        }
-        Ok(value)
-    }
-
-    fn flow_eval(&mut self, site: usize, value: ModelValue) -> Result<ModelValue, Error> {
-        let rng = self.rng.clone();
-        let old = self.site;
-        self.site = site;
-        let result = eval_binding(value, self);
-        self.site = old;
-        if result.is_err() {
-            self.rng = rng
-        }
-        result
-    }
-
-    fn flow_property(
-        &mut self,
-        site: usize,
-        props: &[(String, ModelValue)],
-        key: &str,
-        default: ModelValue,
-    ) -> Result<ModelValue, Error> {
-        match props.iter().find(|(name, _)| name == key) {
-            Some((_, value)) => self.flow_eval(site, value.clone()),
-            None => Ok(default),
-        }
-    }
-
-    fn flow_guard(&mut self, site: usize, props: &[(String, ModelValue)]) -> Result<bool, Error> {
-        match self.flow_property(site, props, "when", ModelValue::Bool(true))? {
-            ModelValue::Bool(value) => Ok(value),
-            _ => Err(flow_error("edge guard must be a boolean")),
-        }
-    }
-
-    fn flow_add(&mut self, node: NodeId, mut occurrence: FlowOccurrence) -> Result<usize, Error> {
-        let flow = self.flow.as_mut().unwrap();
-        flow.steps += 1;
-        if flow.steps > 10_000 {
-            return Err(flow_error("graph execution budget exceeded (10000 occurrences)"));
-        }
-        let template = flow
-            .plan
-            .nodes
-            .iter()
-            .find(|n| n.id == node)
-            .ok_or_else(|| flow_error("unknown occurrence target"))?
-            .clone();
-        let parent = template
-            .parent
-            .map(|parent| {
-                let found = occurrence
-                    .scope
-                    .get(&parent)
-                    .ok_or_else(|| flow_error("span parent has not been entered"))?;
-                if found.len() != 1 {
-                    return Err(flow_error("span parent occurrence is ambiguous"));
-                }
-                Ok(found[0])
-            })
-            .transpose()?;
-        if parent.is_none() && !self.instances.is_empty() {
-            return Err(flow_error("a cycle cannot create another root span inside one trace"));
-        }
-        let shape = if parent.is_none() {
-            Shape::Trace {
-                name: template.name.clone(),
-            }
-        } else {
-            match template.kind.as_str() {
-                "node" | "vars" => Shape::Maybe {
-                    name: Some(template.name.clone()),
-                    included: true,
-                },
-                "scorer" => {
-                    let score = template
-                        .fields
-                        .iter()
-                        .find(|(key, _)| key == "score")
-                        .ok_or_else(|| flow_error("scorer needs score"))?
-                        .1;
-                    Shape::Scorer(Box::new(ScorerShape {
-                        name: template.name.clone(),
-                        score: ModelValue::Func {
-                            func: ModelFunc::FlowRead { node, binding: score },
-                            range: SrcRange::new(0, 0),
-                        },
-                        score_range: SrcRange::new(0, 0),
-                        reason: template.fields.iter().find(|(key, _)| key == "reason").map(|(_, id)| {
-                            (
-                                ModelValue::Func {
-                                    func: ModelFunc::FlowRead { node, binding: *id },
-                                    range: SrcRange::new(0, 0),
-                                },
-                                SrcRange::new(0, 0),
-                            )
-                        }),
-                    }))
-                }
-                kind => Shape::Span {
-                    name: template.name.clone(),
-                    kind: match kind {
-                        "tool" => EventKind::Tool,
-                        "llm" => EventKind::Llm,
-                        "function" => EventKind::Function,
-                        _ => EventKind::Task,
-                    },
-                },
-            }
-        };
-        let read = |binding| ModelValue::Func {
-            func: ModelFunc::FlowRead { node, binding },
-            range: SrcRange::new(0, 0),
-        };
-        let mut fields = FieldSlots::default();
-        for (key, id) in &template.fields {
-            let slot = Some(JsonSlot::Todo(read(*id)));
-            match key.as_str() {
-                "input" => fields.input = slot,
-                "output" => fields.output = slot,
-                "expected" => fields.expected = slot,
-                "error" => fields.error = slot,
-                "duration" => fields.duration = Some((read(*id), SrcRange::new(0, 0))),
-                _ => {}
-            }
-        }
-        let bindings: Vec<_> = template
-            .bindings
-            .iter()
-            .map(|(id, value)| ModelBinding {
-                name: format!("flow_{id}"),
-                value: value.clone(),
-            })
-            .collect();
-        let index = self.add_instance(node, parent, shape, self.instances.len() as u64, &bindings, fields);
-        occurrence.terminal = true;
-        occurrence.started = false;
-        occurrence.completed = false;
-        occurrence.prior = 0;
-        occurrence.completion = usize::MAX;
-        occurrence.properties.clear();
-        occurrence.scope.insert(node, vec![index]);
-        self.flow.as_mut().unwrap().occurrences.push(occurrence);
-        Ok(index)
-    }
-
-    fn flow_join(&mut self, junction: usize, group: usize, site: usize) -> Result<usize, Error> {
-        let props = self.flow.as_ref().unwrap().plan.junctions[junction].props.clone();
-        let correlation = self.flow_property(site, &props, "correlate", ModelValue::Null)?;
-        let correlation = lower_value(correlation, self)?;
-        if let Some(index) = self
-            .flow
-            .as_ref()
-            .unwrap()
-            .joins
-            .iter()
-            .position(|join| join.junction == junction && join.group == group && join.correlation == correlation)
-        {
-            return Ok(index);
-        }
-        let inputs = self.flow.as_ref().unwrap().plan.junctions[junction].inputs.len();
-        let index = self.flow.as_ref().unwrap().joins.len();
-        self.flow.as_mut().unwrap().joins.push(FlowJoin {
-            junction,
-            group,
-            correlation,
-            queues: (0..inputs).map(|_| Default::default()).collect(),
-            arrivals: vec![],
-            emitted: false,
-            closed: false,
-            source: site,
-        });
-        Ok(index)
-    }
-
-    fn flow_emit_join(
-        &mut self,
-        index: usize,
-        arrivals: Vec<FlowArrival>,
-        accumulator: Option<ModelValue>,
-        queue: &mut std::collections::VecDeque<usize>,
-    ) -> Result<(), Error> {
-        let state = self.flow.as_ref().unwrap();
-        let join = &state.joins[index];
-        let target = state.plan.junctions[join.junction].target;
-        let mut occurrence = state.occurrences[join.source].clone();
-        occurrence.group = join.group;
-        occurrence.supplied.clear();
-        if !arrivals.is_empty() {
-            occurrence.scope.clear();
-        }
-        let mut values = Vec::new();
-        for arrival in &arrivals {
-            merge_flow_scope(&mut occurrence.scope, &state.occurrences[arrival.occurrence].scope);
-            let edge = state.plan.edges.iter().find(|e| e.id == arrival.edge).unwrap();
-            values.push(ModelArrayElem::Item(ModelValue::Object(ModelObject {
-                elem: vec![
-                    ModelObjectField {
-                        key: "edge".into(),
-                        value: edge.name.clone(),
-                    },
-                    ModelObjectField {
-                        key: "value".into(),
-                        value: arrival.value.clone(),
-                    },
-                ],
-            })));
-        }
-        occurrence
-            .context
-            .insert("arrivals".into(), ModelValue::Array(ModelArray { elem: values }));
-        if let Some(value) = accumulator {
-            occurrence.context.insert("accumulator".into(), value);
-        }
-        for arrival in &arrivals {
-            self.flow.as_mut().unwrap().occurrences[arrival.occurrence].terminal = false;
-        }
-        self.flow.as_mut().unwrap().joins[index].emitted = true;
-        let target = self.flow_add(target, occurrence)?;
-        queue.push_back(target);
-        Ok(())
-    }
-
-    fn flow_arrive(
-        &mut self,
-        edge: usize,
-        site: usize,
-        group: usize,
-        value: ModelValue,
-        result: bool,
-        queue: &mut std::collections::VecDeque<usize>,
-    ) -> Result<(), Error> {
-        let junctions: Vec<_> = self
-            .flow
-            .as_ref()
-            .unwrap()
-            .plan
-            .junctions
-            .iter()
-            .enumerate()
-            .filter(|(_, j)| j.inputs.contains(&edge))
-            .map(|(i, _)| i)
-            .collect();
-        for junction in junctions {
-            let props = self.flow.as_ref().unwrap().plan.junctions[junction].props.clone();
-            let observe = self.flow_property(site, &props, "observe", ModelValue::Str("arrival".into()))?;
-            if matches!(observe, ModelValue::Str(mode) if mode == "result") != result {
-                continue;
-            }
-            let index = self.flow_join(junction, group, site)?;
-            let definition = self.flow.as_ref().unwrap().plan.junctions[junction].clone();
-            let arrival = FlowArrival {
-                edge,
-                occurrence: site,
-                value: value.clone(),
-            };
-            let join = &mut self.flow.as_mut().unwrap().joins[index];
-            if join.closed {
-                return Err(flow_error("arrival reached a closed junction group"));
-            }
-            match definition.kind.as_str() {
-                "merge" => self.flow_emit_join(index, vec![arrival], None, queue)?,
-                "first" => {
-                    if !join.emitted {
-                        self.flow_emit_join(index, vec![arrival], None, queue)?
-                    }
-                }
-                "reduce" => join.arrivals.push(arrival),
-                "accumulate" => {
-                    let position = definition.inputs.iter().position(|id| *id == edge).unwrap();
-                    join.queues[position].push_back(arrival);
-                    if join.queues.iter().all(|q| !q.is_empty()) {
-                        let arrivals = join.queues.iter_mut().map(|q| q.pop_front().unwrap()).collect();
-                        self.flow_emit_join(index, arrivals, None, queue)?;
-                    }
-                }
-                "quorum" => {
-                    if join.emitted {
-                        continue;
-                    }
-                    if !join.arrivals.iter().any(|a| a.edge == edge) {
-                        join.arrivals.push(arrival)
-                    }
-                    let count = self.flow_property(site, &definition.props, "count", ModelValue::Null)?;
-                    let ModelValue::Num(ModelNumber::Int(count)) = count else {
-                        return Err(flow_error("quorum count must be an integer"));
-                    };
-                    let join = &mut self.flow.as_mut().unwrap().joins[index];
-                    if join.arrivals.len() == count as usize {
-                        let mut arrivals = join.arrivals.clone();
-                        arrivals.sort_by_key(|arrival| definition.inputs.iter().position(|id| *id == arrival.edge));
-                        self.flow_emit_join(index, arrivals, None, queue)?;
-                    }
-                }
-                _ => return Err(flow_error("unknown junction strategy")),
-            }
-        }
-        Ok(())
-    }
-
-    fn execute_flow(&mut self, plan: &crate::dsl::Flow) -> Result<(), Error> {
-        self.flow = Some(FlowState {
-            plan: plan.clone(),
-            occurrences: vec![],
-            joins: vec![],
-            counters: Default::default(),
-            groups: 1,
-            steps: 0,
-            completed: 0,
-        });
-        let root = self.flow_add(
-            plan.root,
-            FlowOccurrence {
-                terminal: true,
-                started: false,
-                completed: false,
-                prior: 0,
-                completion: usize::MAX,
-                properties: Default::default(),
-                history: 0,
-                scope: Default::default(),
-                group: 0,
-                supplied: Default::default(),
-                context: Default::default(),
-            },
-        )?;
-        if let Some((node, row)) = self.row
-            && node == plan.root
-        {
-            let name = format!("flow_{}", plan.input);
-            if let Some((_, slot)) = self.instances[root].bindings.iter_mut().find(|(key, _)| key == &name) {
-                *slot = BindSlot::Done(json_to_value(row.get("input").cloned().unwrap_or(InputValue::Null).into()));
-            }
-        }
-        if let Some((node, row)) = self.row
-            && node == plan.root
-        {
-            let template = plan.nodes.iter().find(|node| node.id == plan.root).unwrap();
-            for (key, binding) in &template.fields {
-                let name = format!("flow_{binding}");
-                let Some((_, slot)) = self.instances[root].bindings.iter_mut().find(|(key, _)| key == &name) else {
-                    continue;
-                };
-                match (key.as_str(), slot) {
-                    ("expected", slot) => {
-                        *slot = BindSlot::Done(json_to_value(row.get("expected").cloned().unwrap_or(InputValue::Null).into()))
-                    }
-                    ("metadata", BindSlot::Todo(ModelValue::Object(object))) => {
-                        if let Some(values) = row.get("metadata").and_then(InputValue::as_object) {
-                            object.elem.retain(|field| !values.contains_key(&field.key));
-                            object.elem.extend(values.iter().map(|(key, value)| ModelObjectField {
-                                key: key.clone(),
-                                value: json_to_value(value.clone().into()),
-                            }));
-                        }
-                    }
-                    ("tags", BindSlot::Todo(ModelValue::Array(array))) => {
-                        if let Some(values) = row.get("tags").and_then(InputValue::as_array) {
-                            array.elem.extend(
-                                values
-                                    .iter()
-                                    .map(|value| ModelArrayElem::Item(json_to_value(value.clone().into()))),
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let mut queue = std::collections::VecDeque::from([root]);
-        let mut pending = Vec::new();
-        loop {
-            while let Some(site) = queue.pop_front() {
-                let state = self.flow.as_mut().unwrap();
-                state.occurrences[site].prior = state.completed;
-                state.occurrences[site].started = true;
-                let node = self.instances[site].node;
-                let group = self.flow.as_ref().unwrap().occurrences[site].group;
-                for edge in plan
-                    .edges
-                    .iter()
-                    .filter(|edge| edge.source == node && edge.kind == "requires")
-                {
-                    let ready = self.flow.as_ref().unwrap().occurrences[site]
-                        .scope
-                        .get(&edge.target)
-                        .is_some_and(|ids| ids.len() == 1 && self.flow.as_ref().unwrap().occurrences[ids[0]].completed);
-                    if !ready {
-                        return Err(flow_error("required prerequisite occurrence is not complete"));
-                    }
-                }
-                let mut bundles: Vec<FlowBundle> = vec![];
-                for (junction, definition) in plan.junctions.iter().enumerate() {
-                    let activates = if let Some(fork) = definition.fork {
-                        plan.forks.iter().any(|f| f.id == fork && f.source == node)
-                    } else {
-                        definition
-                            .inputs
-                            .iter()
-                            .any(|id| plan.edges.iter().any(|e| e.id == *id && e.source == node))
-                    };
-                    if activates && !definition.props.iter().any(|(key, _)| key == "correlate") {
-                        self.flow_join(junction, group, site)?;
-                    }
-                }
-                let mut independent: Vec<Vec<usize>> = vec![];
-                for edge in plan.edges.iter().filter(|e| e.source == node && e.fork.is_none()) {
-                    if let Some(bundle) = independent.iter_mut().find(|bundle| {
-                        let first = plan.edges.iter().find(|e| e.id == bundle[0]).unwrap();
-                        first.bundle == edge.bundle
-                    }) {
-                        bundle.push(edge.id)
-                    } else {
-                        independent.push(vec![edge.id])
-                    }
-                }
-                let supplies: Vec<_> = independent
-                    .iter()
-                    .filter(|bundle| {
-                        !bundle
-                            .iter()
-                            .any(|id| plan.edges.iter().any(|edge| edge.id == *id && edge.kind == "next"))
-                    })
-                    .flatten()
-                    .filter_map(|id| plan.edges.iter().find(|edge| edge.id == *id && edge.kind == "feeds"))
-                    .collect();
-                for mut bundle in independent {
-                    let first = plan.edges.iter().find(|edge| edge.id == bundle[0]).unwrap();
-                    if bundle
-                        .iter()
-                        .any(|id| plan.edges.iter().any(|edge| edge.id == *id && edge.kind == "next"))
-                    {
-                        bundle.extend(
-                            supplies
-                                .iter()
-                                .filter(|edge| edge.target == first.target && edge.cycle == first.cycle)
-                                .map(|edge| edge.id),
-                        );
-                    }
-                    bundles.push((bundle, group, None))
-                }
-                for fork in plan.forks.iter().filter(|fork| fork.source == node) {
-                    if fork.kind == "each" || fork.kind == "repeat" {
-                        if fork.kind == "each" {
-                            let concurrency =
-                                self.flow_property(site, &fork.props, "concurrency", ModelValue::Num(ModelNumber::Int(1)))?;
-                            if !matches!(concurrency, ModelValue::Num(ModelNumber::Int(value)) if value > 0) {
-                                return Err(flow_error("each concurrency must be a positive integer"));
-                            }
-                        }
-                        let items = if fork.kind == "each" {
-                            match self.flow_property(site, &fork.props, "items", ModelValue::Null)? {
-                                ModelValue::Array(a) => a
-                                    .elem
-                                    .into_iter()
-                                    .map(|e| match e {
-                                        ModelArrayElem::Item(v) => Ok(v),
-                                        _ => Err(flow_error("invalid each items")),
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?,
-                                _ => return Err(flow_error("each items must be an array")),
-                            }
-                        } else {
-                            let count = self.flow_property(site, &fork.props, "count", ModelValue::Null)?;
-                            let ModelValue::Num(ModelNumber::Int(count)) = count else {
-                                return Err(flow_error("repeat count must be an integer"));
-                            };
-                            if !(0..=10_000).contains(&count) {
-                                return Err(flow_error("repeat exceeds execution budget"));
-                            }
-                            vec![ModelValue::Null; count as usize]
-                        };
-                        let count = items.len();
-                        let history = self.flow.as_ref().unwrap().groups;
-                        self.flow.as_mut().unwrap().groups += 1;
-                        for (index, item) in items.into_iter().enumerate() {
-                            let group_id = self.flow.as_ref().unwrap().groups;
-                            self.flow.as_mut().unwrap().groups += 1;
-                            for branch in &fork.branches {
-                                bundles.push((branch.clone(), group_id, Some((index, count, item.clone(), history))))
-                            }
-                        }
-                    } else {
-                        let mut eligible = Vec::new();
-                        for (index, branch) in fork.branches.iter().enumerate() {
-                            let mut active = true;
-                            for id in branch {
-                                let edge = plan.edges.iter().find(|e| e.id == *id).unwrap();
-                                if !self.flow_guard(site, &edge.props)? {
-                                    active = false;
-                                    break;
-                                }
-                            }
-                            if active {
-                                eligible.push(index)
-                            }
-                        }
-                        if fork.kind == "exclusive" && eligible.len() > 1 {
-                            return Err(flow_error("exclusive fork selected multiple branches"));
-                        }
-                        if fork.kind == "weighted" {
-                            let mut weights = vec![vec![ModelValue::Num(ModelNumber::Int(0))]; fork.branches.len()];
-                            for index in &eligible {
-                                weights[*index] = fork.branches[*index]
-                                    .iter()
-                                    .map(|id| {
-                                        let edge = plan.edges.iter().find(|e| e.id == *id).unwrap();
-                                        self.flow_property(site, &edge.props, "weight", ModelValue::Null)
-                                    })
-                                    .collect::<Result<_, _>>()?;
-                            }
-                            let picked = eval_func(ModelFunc::ForkPick(weights), SrcRange::new(0, 0), self)?;
-                            let ModelValue::Num(ModelNumber::Int(picked)) = picked else {
-                                unreachable!()
-                            };
-                            eligible = if picked < 0 { vec![] } else { vec![picked as usize] };
-                        }
-                        for index in eligible {
-                            bundles.push((fork.branches[index].clone(), group, None))
-                        }
-                    }
-                }
-                for (bundle, target_group, iteration) in bundles {
-                    let edges: Vec<_> = bundle
-                        .iter()
-                        .map(|id| plan.edges.iter().find(|e| e.id == *id).unwrap())
-                        .collect();
-                    let mut active = Vec::new();
-                    for edge in edges {
-                        if edge.fork.is_some() || self.flow_guard(site, &edge.props)? {
-                            active.push(edge)
-                        }
-                    }
-                    if !active.iter().any(|e| e.kind == "next") {
-                        continue;
-                    }
-                    let target = active[0].target;
-                    let mut occurrence = self.flow.as_ref().unwrap().occurrences[site].clone();
-                    occurrence.group = target_group;
-                    occurrence.supplied.clear();
-                    if let Some((index, count, item, history)) = iteration {
-                        occurrence.history = history;
-                        occurrence
-                            .context
-                            .insert("index".into(), ModelValue::Num(ModelNumber::Int(index as i64)));
-                        occurrence
-                            .context
-                            .insert("count".into(), ModelValue::Num(ModelNumber::Int(count as i64)));
-                        occurrence.context.insert("item".into(), item);
-                    }
-                    let mut observations = Vec::new();
-                    for edge in active {
-                        if edge.cycle && edge.kind == "next" {
-                            let limit = self.flow_property(
-                                site,
-                                &edge.props,
-                                "max_traversals",
-                                ModelValue::Num(ModelNumber::Int(10_000)),
-                            )?;
-                            let ModelValue::Num(ModelNumber::Int(limit)) = limit else {
-                                return Err(flow_error("max_traversals must be a nonnegative integer"));
-                            };
-                            let count = self.flow.as_mut().unwrap().counters.entry((group, edge.id)).or_default();
-                            if limit < 0 || *count >= limit as usize {
-                                return Err(flow_error("cycle max_traversals exceeded"));
-                            }
-                            *count += 1;
-                        }
-                        let value = self.flow_property(site, &edge.props, "value", ModelValue::Null)?;
-                        if let Some(into) = edge.into
-                            && occurrence.supplied.insert(into, value.clone()).is_some()
-                        {
-                            return Err(flow_error("multiple values supplied to one field"));
-                        }
-                        observations.push((edge.id, value));
-                    }
-                    let target_site = self.flow_add(target, occurrence)?;
-                    self.flow.as_mut().unwrap().occurrences[site].terminal = false;
-                    queue.push_back(target_site);
-                    for (edge, value) in observations {
-                        let result = plan.junctions.iter().any(|j| {
-                            j.inputs.contains(&edge)
-                                && j.props
-                                    .iter()
-                                    .any(|(key, v)| key == "observe" && matches!(v,ModelValue::Str(s) if s=="result"))
-                        });
-                        pending.push(FlowObservation {
-                            edge,
-                            target: target_site,
-                            group,
-                            arrival: Some(value),
-                            result,
-                        });
-                    }
-                }
-                let mut remaining = Vec::new();
-                for mut observation in std::mem::take(&mut pending) {
-                    let FlowObservation {
-                        edge,
-                        target,
-                        group,
-                        result,
-                        ..
-                    } = observation;
-                    if !self.flow.as_ref().unwrap().occurrences[target].started {
-                        remaining.push(observation);
-                        continue;
-                    }
-                    if let Some(value) = observation.arrival.take() {
-                        self.flow_arrive(edge, target, group, value, false, &mut queue)?;
-                    }
-                    if result {
-                        let template = plan.nodes.iter().find(|node| node.id == self.instances[target].node).unwrap();
-                        let value = match template.fields.iter().find(|(key, _)| key == "output") {
-                            Some((_, binding)) => self.flow_eval(
-                                target,
-                                ModelValue::Func {
-                                    func: ModelFunc::FlowRead {
-                                        node: template.id,
-                                        binding: *binding,
-                                    },
-                                    range: SrcRange::new(0, 0),
-                                },
-                            ),
-                            None => Ok(ModelValue::Null),
-                        };
-                        match value {
-                            Ok(value) => self.flow_arrive(edge, target, group, value, true, &mut queue)?,
-                            Err(error)
-                                if error.kind == ErrorKind::Flow
-                                    && error.detail.as_deref() == Some("referenced occurrence is not available") =>
-                            {
-                                remaining.push(observation)
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
-                }
-                pending = remaining;
-                let state = self.flow.as_mut().unwrap();
-                state.occurrences[site].completed = true;
-                state.occurrences[site].completion = state.completed;
-                state.completed += 1;
-            }
-            let next = self
-                .flow
-                .as_ref()
-                .unwrap()
-                .joins
-                .iter()
-                .enumerate()
-                .filter(|(_, j)| {
-                    !j.closed
-                        && !pending.iter().any(|observation| {
-                            observation.group == j.group && plan.junctions[j.junction].inputs.contains(&observation.edge)
-                        })
-                })
-                .max_by_key(|(_, j)| (plan.junctions[j.junction].kind == "reduce", j.group))
-                .map(|(i, _)| i);
-            let Some(index) = next else {
-                if !pending.is_empty() {
-                    return Err(flow_error("referenced occurrence is not available at group closure"));
-                }
-                break;
-            };
-            let join = &self.flow.as_ref().unwrap().joins[index];
-            let definition = plan.junctions[join.junction].clone();
-            if definition.kind == "accumulate" && (!join.emitted || join.queues.iter().any(|q| !q.is_empty())) {
-                return Err(flow_error("accumulate group closed with a missing listed input"));
-            }
-            if definition.kind == "quorum" && !join.emitted {
-                return Err(flow_error("quorum group closed without enough distinct inputs"));
-            }
-            if definition.kind == "reduce" {
-                let source = join.source;
-                let mut arrivals = join.arrivals.clone();
-                if matches!(self.flow_property(source, &definition.props, "order", ModelValue::Str("source".into()))?, ModelValue::Str(order) if order == "source")
-                {
-                    arrivals.sort_by_key(|arrival| (arrival.occurrence, arrival.edge));
-                }
-                let mut accumulator = self.flow_property(source, &definition.props, "initial", ModelValue::Null)?;
-                let combine = definition
-                    .props
-                    .iter()
-                    .find(|(key, _)| key == "combine")
-                    .ok_or_else(|| flow_error("reduce requires combine"))?
-                    .1
-                    .clone();
-                for arrival in &arrivals {
-                    let old = self.flow.as_ref().unwrap().occurrences[source].context.clone();
-                    let context = &mut self.flow.as_mut().unwrap().occurrences[source].context;
-                    context.insert("accumulator".into(), accumulator);
-                    context.insert(
-                        "arrival".into(),
-                        ModelValue::Object(ModelObject {
-                            elem: vec![ModelObjectField {
-                                key: "value".into(),
-                                value: arrival.value.clone(),
-                            }],
-                        }),
-                    );
-                    accumulator = self.flow_eval(source, combine.clone())?;
-                    self.flow.as_mut().unwrap().occurrences[source].context = old;
-                }
-                self.flow_emit_join(index, arrivals, Some(accumulator), &mut queue)?;
-            }
-            self.flow.as_mut().unwrap().joins[index].closed = true;
-        }
-        let mut final_scope = FlowScope::new();
-        for occurrence in &self.flow.as_ref().unwrap().occurrences {
-            if occurrence.terminal {
-                merge_flow_scope(&mut final_scope, &occurrence.scope);
-            }
-        }
-        self.flow.as_mut().unwrap().occurrences[0].scope.extend(final_scope);
-        for site in 0..self.instances.len() {
-            let template = plan.nodes.iter().find(|node| node.id == self.instances[site].node).unwrap();
-            for (key, binding) in &template.fields {
-                if !matches!(key.as_str(), "metadata" | "metrics" | "tags") {
-                    continue;
-                }
-                let value = self.flow_eval(
-                    site,
-                    ModelValue::Func {
-                        func: ModelFunc::FlowRead {
-                            node: template.id,
-                            binding: *binding,
-                        },
-                        range: SrcRange::new(0, 0),
-                    },
-                )?;
-                let value = lower_value(value, self)?;
-                match (key.as_str(), value) {
-                    ("metadata", JsonValue::Object(values)) => {
-                        self.instances[site].fields.metadata =
-                            Some(values.into_iter().map(|(key, value)| (key, JsonSlot::Done(value))).collect())
-                    }
-                    ("metrics", JsonValue::Object(values)) => {
-                        self.instances[site].fields.metrics =
-                            Some(values.into_iter().map(|(key, value)| (key, JsonSlot::Done(value))).collect())
-                    }
-                    ("tags", JsonValue::Array(values)) => {
-                        self.instances[site].fields.tags = values
-                            .into_iter()
-                            .map(|value| match value {
-                                JsonValue::String(value) => Ok(TagSlot::Done(value)),
-                                _ => Err(flow_error("tags must be strings")),
-                            })
-                            .collect::<Result<_, _>>()?
-                    }
-                    _ => return Err(flow_error("invalid metadata, metrics or tags value")),
-                }
-            }
-        }
-        Ok(())
     }
 }
 
