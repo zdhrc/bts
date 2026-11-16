@@ -1707,3 +1707,86 @@ fn a_step_after_a_rounds_step_runs_in_every_round() {
         assert_eq!(code, expected);
     }
 }
+
+#[test]
+fn definitions_supply_context_values_to_data_and_code() {
+    // the agent supplies its tenant to every step, and each turn supplies its own ticket to its reply
+    let source = r#"
++(tenant_scoped:trait {tenant: {type: "string", required: true}})
+    -[:on]->(node)
+    -[:provides {tenant: {type: "string", value: self.props.tenant}}]->(context);
++(scoped_agent:node)
+    -[:extends]->(agent)
+    -[:has]->(tenant_scoped);
++(ticketed:trait)
+    -[:on]->(node)
+    -[:provides {ticket: {type: "object", value: {id: self.input, round: context.index}}}]->(context);
++(ticket_task:node)
+    -[:extends]->(task)
+    -[:has]->(ticketed);
+
+(support:scoped_agent {tenant: "acme"}) {input: "refund", output: request.output};
+(support)-[:next]->(request:task) {input: support.input, output: context.tenant};
+(request)
+    =[:repeat {count: 2}]=>[
+        -[:calls]->(turn:ticket_task) {input: "T-${context.index}", output: "handled"},
+    ]
+        ->(turn)-[:calls]->(reply:llm) {input: {tenant: context.tenant, ticket: context.ticket}, output: "ok"};
+"#;
+    let reply = |round: i64| json!({"tenant": "acme", "ticket": {"id": format!("T-{round}"), "round": round}});
+    let expected = [
+        ("request", json!("refund"), json!("acme")),
+        ("turn", json!("T-0"), json!("handled")),
+        ("reply", reply(0), json!("ok")),
+        ("turn", json!("T-1"), json!("handled")),
+        ("reply", reply(1), json!("ok")),
+    ]
+    .map(|(name, input, output)| (name.to_owned(), input, output));
+    let batch = flow_batch(source);
+    let data: Vec<_> = (batch.events.iter())
+        .map(|event| {
+            let project = |value: &Option<data::Value>| value.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
+            (event.name.clone(), project(&event.input), project(&event.output))
+        })
+        .collect();
+    assert_eq!(data, expected);
+    let model = lower(source).unwrap();
+    assert!(model.flows.is_empty());
+    for details in flow_code(&model, "support") {
+        let code: Vec<_> = (details["spans"].as_array().unwrap().iter())
+            .map(|span| {
+                (
+                    span["name"].as_str().unwrap().to_owned(),
+                    span["input"].clone(),
+                    span["output"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(code, expected);
+    }
+
+    // a key that no definition gives a value is still a located consumer error
+    let unsupplied = source.replace(", value: self.props.tenant", "");
+    assert_eq!(
+        lower(&unsupplied).unwrap_err(),
+        "unsupported mocking context field \"tenant\""
+    );
+    // two suppliers on two paths leave the reader without one value
+    let ambiguous = r#"
++(assigned:edge {direction: "directed"})
+    -[:extends]->(calls)
+    -[:provides {owner: {type: "string", value: target.input}}]->(context);
+(pair:agent) {input: "x", output: request.output};
+(pair)-[:next]->(request:task) {input: pair.input, output: "done"};
+(request)
+    =[:parallel]=>[
+        -[a:assigned]->(first_owner:task) {input: "ann", output: "l"},
+        -[b:assigned]->(second_owner:task) {input: "bo", output: "r"},
+    ]
+        >[:accumulate {observe: "result"} [a], [b]]>>(finish:task) {input: context.owner, output: "f"};
+"#;
+    assert_eq!(
+        lower(ambiguous).unwrap_err(),
+        "`context.owner` reaches this step from more than one supplier"
+    );
+}

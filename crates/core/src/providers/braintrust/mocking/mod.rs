@@ -1745,6 +1745,17 @@ impl<'a> AgentLowering<'a> {
         Ok(execution::Value::Array(execution::Array { elem }))
     }
 
+    // the values upstream elements supply for a context key that reaches a node
+    fn supplied(&self, node: graph::NodeId, path: &[String]) -> Option<Vec<graph::BindingId>> {
+        let key = path.first()?;
+        let supply = (self.graph.context.get(node.0)?.iter()).find(|supply| &supply.key == key)?;
+        let values: Vec<_> = (self.graph.context_values.iter())
+            .filter(|value| &value.key == key && supply.suppliers.contains(&value.owner))
+            .map(|value| value.binding)
+            .collect();
+        (!values.is_empty()).then_some(values)
+    }
+
     // a step that may not run sits under a gate, a reduce target always runs
     fn gated(&self, node: graph::NodeId) -> bool {
         !self.guards[&node].is_empty()
@@ -2180,6 +2191,33 @@ impl<'a> AgentLowering<'a> {
             },
             G::Context { path, .. } if path.first().is_some_and(|key| key == "parent") => {
                 return Err("`context.parent` is supplied to the provider and cannot be read by a field".into());
+            }
+            G::Context {
+                owner: graph::ElementId::Node(node),
+                path,
+            } if self.supplied(*node, path).is_some() => {
+                // the definition that provides this key supplies its value
+                let supplied = self.supplied(*node, path).unwrap();
+                let [binding] = supplied.as_slice() else {
+                    return Err(format!("`context.{}` reaches this step from more than one supplier", path[0]).into());
+                };
+                let member = matches!(
+                    self.graph.bindings[binding.0].owner,
+                    graph::ElementId::Node(owner) if self.order.contains(&owner)
+                );
+                let mut value = if member {
+                    self.reference(*binding)?
+                } else {
+                    self.binding_value(*binding)?
+                };
+                for key in path.iter().skip(1) {
+                    value = V::Index {
+                        target: Box::new(value),
+                        index: Box::new(V::Str(key.clone())),
+                        range: self.graph.nodes[node.0].range,
+                    };
+                }
+                value
             }
             G::Context { path, .. } if self.flow => V::Func {
                 func: execution::Func::FlowContext(path.clone()),
