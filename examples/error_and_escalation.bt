@@ -1,6 +1,14 @@
 # one sampled decision keeps the failed charge, escalation and retry consistent
+# the request carries its invoice, and every step it leads to reads it from context
++(invoiced:trait {account: {type: "string", required: true}, amount_usd: {type: "number", required: true}})
+    -[:on]->(node)
+    -[:provides {invoice: {type: "object", value: {account: self.props.account, amount_usd: self.props.amount_usd}}}]->(context);
++(invoice_request:node)
+    -[:extends]->(task)
+    -[:has]->(invoiced);
+
 (payments:agent) {input: "Charge the June invoice for acct_9W31.", output: request.output};
-(payments)-[:next]->(request:task {name: "payments-agent"}) {
+(payments)-[:next]->(request:invoice_request {name: "payments-agent", account: "acct_9W31", amount_usd: 1240}) {
     input: payments.input,
     output: charge.output,
     local: {failed: chance(0.07)},
@@ -18,7 +26,7 @@
 }
     =[:exclusive]=>[
         -[failed:next {when: request.local.failed}]->(declined:tool {name: "charge_customer"}) {
-            input: {account: "acct_9W31", amount_usd: 1240},
+            input: context.invoice,
             output: null,
             error: "card_declined: insufficient_funds",
         },
@@ -30,6 +38,10 @@
         }
         >[:first {observe: "result"} [failed], [healthy]]>>(charge);
 (charge:tool {name: "charge_customer"}) {
-    input: {account: "acct_9W31", amount_usd: 1240, card: request.local.failed ? "backup" : "primary"},
+    input: {
+        account: context.invoice.account,
+        amount_usd: context.invoice.amount_usd,
+        card: request.local.failed ? "backup" : "primary",
+    },
     output: {status: "succeeded", charge_id: format("ch_{}", alphanum(14))},
 };
