@@ -59,7 +59,7 @@ Neither command requires a project or API key. Start small, inspect the output, 
 
 ## Read a shape
 
-This graph models a support agent that looks up an article and uses it in a response. Braintrust kinds describe the agent and its steps, while `edges` define membership, progression, data flow, and span parenting. Save it as `support.bt`:
+This graph models a support agent that looks up an article and uses it in a response. Braintrust kinds describe the agent and its steps, while `edges` define progression, span nesting, and data flow. Save it as `support.bt`:
 
 ```bts
 (support:agent) {
@@ -67,13 +67,13 @@ This graph models a support agent that looks up an article and uses it in a resp
     output: reply.output,
 };
 
-(support)-[:contains, :next]->(request:task) {
+(support)-[:next]->(request:task) {
     input: support.input,
     output: reply.output,
     tags: [|"billing"|],
 };
 
-(request)-[:next]->(search:tool) {
+(request)-[:calls]->(search:tool) {
     input: {query: request.input.question},
     output: {article: "Download invoices from Billing > Invoices."},
 }
@@ -85,9 +85,6 @@ This graph models a support agent that looks up an article and uses it in a resp
         output: self.input.article,
         duration: range(0.4, 0.8),
     };
-
-(support)-[:contains]->(search)-[:child_of]->(request);
-(support)-[:contains]->(reply)-[:child_of]->(request);
 ```
 
 `(search:tool)` declares a named `node`. `(search)` refers to it. The body holds fields, which can contain literals, expressions, and references to other `nodes`. Arrays use `[|...|]`. Commas separate fields and array items, and semicolons end root statements.
@@ -96,12 +93,11 @@ This graph models a support agent that looks up an article and uses it in a resp
 
 | Relationship | Purpose in this shape |
 | --- | --- |
-| `contains` | Makes a `node` a member of the agent's behavior graph |
-| `next` | Selects the entry step or advances execution |
+| `next` | Enters the first step, or advances to a step on the same level |
+| `calls` | Advances like `next` and goes down a level, so the target is a child span of its source |
 | `feeds` | Supplies a value to a field marked `<-` |
-| `child_of` | Makes an emitted span a child of another span |
 
-The Braintrust provider interprets the `agent` `node` and its connected members as a behavior model. During trace generation, the agent does not emit a span itself. Its entry task becomes the trace root. Membership, execution order, and span parenting are expressed separately.
+The Braintrust provider interprets the `agent` `node` and every step its entry leads to as a behavior model. During trace generation, the agent does not emit a span itself. Its entry task becomes the trace root. Here `search` is a child of `request` because a `calls` edge reaches it, and `reply` follows `search` along `next`, so it is a child of `request` too.
 
 `tool`, `llm`, and `task` are Braintrust kinds built on the language's `node` primitive. In mock generation they describe data and spans, not real tool or model calls. The `reply` reads the lookup's actual article, keeping the response consistent with the evidence in the trace.
 
@@ -111,11 +107,11 @@ The Braintrust provider interprets the `agent` `node` and its connected members 
 
 ```bts
 (intake:agent) {input: "Find my patient record", output: finish.output};
-(intake)-[:contains, :next]->(intake_request:task) {
+(intake)-[:next]->(intake_request:task) {
     input: intake.input,
     output: finish.output,
 };
-(intake_request)-[:next]->(lookup:tool) {
+(intake_request)-[:calls]->(lookup:tool) {
     input: intake_request.input,
     output: {found: chance(0.8)},
 };
@@ -132,11 +128,6 @@ The Braintrust provider interprets the `agent` `node` and its connected members 
         >[:first {observe: "result"} [known], [unknown]]>>(finish:task) {
             output: context.arrivals[0].value,
         };
-
-(intake)-[:contains]->(lookup)-[:child_of]->(intake_request);
-(intake)-[:contains]->(schedule)-[:child_of]->(intake_request);
-(intake)-[:contains]->(register)-[:child_of]->(intake_request);
-(intake)-[:contains]->(finish)-[:child_of]->(intake_request);
 ```
 
 `exclusive` chooses a qualifying branch. `first` observes a selected branch's result and supplies it to `finish`. `Node` names identify definitions, while named `edges` such as `[known]` identify the `junct`'s inputs. Indentation attaches continuations to the correct `fork`.
@@ -280,7 +271,7 @@ await init();
 
 const source = `
 (support:agent) {input: "Help with billing", output: request.output};
-(support)-[:contains, :next]->(request:task) {
+(support)-[:next]->(request:task) {
     input: support.input,
     output: choice("resolved", "escalated"),
 };
