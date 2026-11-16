@@ -70,6 +70,9 @@ enum RawOrigin {
     Selector(ForkId, Anchor),
     Junction(JunctionId),
 }
+// the first path segment of the binding that holds a supplied context value, which no author can write
+const CONTEXT_VALUE: &str = "@context";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Slot {
     owner: ElementId,
@@ -105,6 +108,10 @@ struct Modeler {
     defined: HashSet<String>,
     // every context read with the element that owns it, the path after context and its location
     context_reads: Vec<(ElementId, Vec<String>, SrcRange)>,
+    // the value expression of each provided context key that has one, by the location of its descriptor
+    context_values: HashMap<(usize, usize, usize), ast::Expr>,
+    // the same expressions for each element that supplies them, by element and key
+    supplied: HashMap<(ElementId, String), ast::Expr>,
     errors: Diags,
 }
 
@@ -127,6 +134,8 @@ impl Modeler {
             unchecked: HashSet::new(),
             defined: HashSet::new(),
             context_reads: Vec::new(),
+            context_values: HashMap::new(),
+            supplied: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -153,6 +162,19 @@ impl Modeler {
             let (relationships, shape_errors) = relationships(&definition.steps);
             let broken = !shape_errors.is_empty();
             self.errors.extend(shape_errors);
+            for relationship in &relationships {
+                if !matches!(relationship.relation, Relation::Provides) {
+                    continue;
+                }
+                for descriptor in (relationship.keys.iter()).flat_map(|key| schema_entries(&key.value).unwrap_or_default()) {
+                    if descriptor.key == "value" {
+                        self.context_values.insert(
+                            (descriptor.range.source, descriptor.range.start, descriptor.range.end),
+                            descriptor.value,
+                        );
+                    }
+                }
+            }
             if builtin_construct(name).is_some() || reserved_name(name) || name == "trait" {
                 self.errors.extend(error(range, "definition name is reserved"));
             } else if resolver.names.contains_key(name) {
@@ -788,18 +810,25 @@ impl Modeler {
 
     fn raw_slot(&self, slot: &Slot, range: SrcRange) -> Result<ast::Expr> {
         let first = slot.path.first().ok_or_else(|| error(range, "expected field name"))?;
-        let field = self
-            .fields
-            .get(&(slot.owner, slot.property))
-            .and_then(|fields| fields.iter().find(|field| &field.key == first))
-            .ok_or_else(|| {
-                error(
-                    range,
-                    format!("unknown {} `{first}`", if slot.property { "property" } else { "field" }),
-                )
-            })?;
-        let mut expr = field.value.clone();
-        for key in slot.path.iter().skip(1) {
+        // a supplied context value is written once on the definition and lowered for each element
+        let (mut expr, rest) = if first == CONTEXT_VALUE {
+            let key = slot.path.get(1).ok_or_else(|| error(range, "expected context key"))?;
+            let value = self.supplied.get(&(slot.owner, key.clone())).cloned();
+            (value.ok_or_else(|| error(range, "context value is not available"))?, 2)
+        } else {
+            let field = self
+                .fields
+                .get(&(slot.owner, slot.property))
+                .and_then(|fields| fields.iter().find(|field| &field.key == first))
+                .ok_or_else(|| {
+                    error(
+                        range,
+                        format!("unknown {} `{first}`", if slot.property { "property" } else { "field" }),
+                    )
+                })?;
+            (field.value.clone(), 1)
+        };
+        for key in slot.path.iter().skip(rest) {
             let ast::ExprKind::Object(items) = &expr.kind else {
                 return Err(error(range, format!("field path cannot select `{key}`")));
             };
@@ -1335,6 +1364,33 @@ impl Modeler {
                     _ => {}
                 }
             }
+            // each element supplies the context values its kind provides, lowered as if written on it
+            let supplied: Vec<_> = (self.kind_schema(owner).into_iter())
+                .flat_map(|kind| &kind.provides)
+                .filter_map(|key| key.value.map(|at| (key.name.clone(), key.ty, at)))
+                .collect();
+            for (key, ty, at) in supplied {
+                let Some(value) = self.context_values.get(&(at.source, at.start, at.end)).cloned() else {
+                    continue;
+                };
+                self.supplied.insert((owner, key.clone()), value);
+                let slot = Slot {
+                    owner,
+                    property: false,
+                    path: vec![CONTEXT_VALUE.to_owned(), key.clone()],
+                };
+                let binding = self.binding(slot, at).and_then(|id| {
+                    expr::schema_type(self.reference_value(self.model.bindings[id.0].value.clone()), ty, at)?;
+                    Ok(id)
+                });
+                match binding {
+                    Ok(binding) => self.model.context_values.push(ContextValue { owner, key, binding }),
+                    Err(diags) => {
+                        self.errors.extend(diags);
+                        self.unchecked.insert(owner);
+                    }
+                }
+            }
         }
     }
 
@@ -1723,8 +1779,9 @@ fn schema_type(descriptor: &ast::Attr) -> Result<FieldType> {
     type_named(&schema_string(&descriptor.value)?).ok_or_else(|| error(descriptor.range, "unknown schema value type"))
 }
 
-// the keys listed on one provides or requires relationship, a key takes a type and nothing else
+// the keys listed on one provides or requires relationship
 fn context_keys(relationship: &Relationship, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    let provides = matches!(relationship.relation, Relation::Provides);
     let mut seen = HashSet::new();
     let mut errors = Vec::new();
     for attr in &relationship.keys {
@@ -1732,28 +1789,44 @@ fn context_keys(relationship: &Relationship, inherited: &mut Vec<FieldSchema>) -
             errors.extend(error(key_range(attr), "duplicate context key"));
         } else if attr.key == "history" {
             errors.extend(error(key_range(attr), "context.history is defined by the language"));
-        } else if let Err(diags) = context_key(attr, inherited) {
+        } else if let Err(diags) = context_key(attr, inherited, provides) {
             errors.extend(diags);
         }
     }
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
-fn context_key(attr: &ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+// a required key takes a type, a provided key takes a type and may take the value it supplies
+fn context_key(attr: &ast::Attr, inherited: &mut Vec<FieldSchema>, provides: bool) -> Result<()> {
     let position = inherited.iter().position(|entry| entry.name == attr.key);
     let previous = position.map(|position| inherited[position].ty);
     let mut ty = previous.unwrap_or(FieldType::Any);
+    let mut value = position.and_then(|position| inherited[position].value);
     for descriptor in schema_entries(&attr.value)? {
-        if descriptor.key != "type" {
-            return Err(error(
-                descriptor.range,
-                format!(
-                    "unknown context descriptor `{}`, a context key takes type only",
-                    descriptor.key
-                ),
-            ));
+        match descriptor.key.as_str() {
+            "type" => ty = schema_type(&descriptor)?,
+            "value" if provides => value = Some(descriptor.range),
+            "value" => {
+                return Err(error(
+                    descriptor.range,
+                    "a required context key is supplied from outside the graph and takes no value",
+                ));
+            }
+            _ => {
+                return Err(error(
+                    descriptor.range,
+                    format!(
+                        "unknown context descriptor `{}`, a {}",
+                        descriptor.key,
+                        if provides {
+                            "provided context key takes type and value"
+                        } else {
+                            "required context key takes type only"
+                        }
+                    ),
+                ));
+            }
         }
-        ty = schema_type(&descriptor)?;
     }
     if previous.is_some_and(|previous| previous != FieldType::Any && previous != ty) {
         return Err(error(attr.range, "a context key cannot change its inherited type"));
@@ -1764,6 +1837,7 @@ fn context_key(attr: &ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()>
         required: false,
         default: None,
         role: None,
+        value,
         range: attr.range,
     };
     match position {
@@ -1783,6 +1857,7 @@ fn primitive_context(construct: Construct, primitive: &str, range: SrcRange) -> 
                 required: false,
                 default: None,
                 role: None,
+                value: None,
                 range,
             })
             .collect()
@@ -1827,6 +1902,7 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
             required: false,
             default: None,
             role: None,
+            value: None,
             range: field.range,
         });
         schema.range = field.range;
@@ -1944,6 +2020,7 @@ fn primitive_properties(construct: Construct, primitive: &str, range: SrcRange) 
             required,
             default: None,
             role: None,
+            value: None,
             range,
         })
         .collect()

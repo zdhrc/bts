@@ -34,6 +34,19 @@ pub struct Model {
     pub names: BTreeMap<String, ElementId>,
     /// For each node, the context keys that reach it and their suppliers.
     pub context: Vec<Vec<ContextSupply>>,
+    /// The values elements supply for the context keys their kinds provide with a value.
+    pub context_values: Vec<ContextValue>,
+}
+
+/// The value one element supplies for a context key.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ContextValue {
+    /// The supplying element.
+    pub owner: ElementId,
+    /// Key name.
+    pub key: String,
+    /// The value expression, lowered as if written on the supplying element.
+    pub binding: BindingId,
 }
 
 /// One context key that reaches a node.
@@ -116,6 +129,8 @@ pub struct FieldSchema {
     pub default: Option<Value>,
     /// Optional role without an operation binding. Input roles retain runtime reads.
     pub role: Option<String>,
+    /// Where the definition gives a provided context key its value, when it does.
+    pub value: Option<SrcRange>,
     /// Schema field location.
     pub range: SrcRange,
 }

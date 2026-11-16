@@ -3069,8 +3069,18 @@ fn context_reads_name_declared_keys_that_reach_them() {
         ),
         (
             "+(a:node)-[:provides {tenant: {type: \"string\", required: true}}]->(context);",
-            "unknown context descriptor `required`, a context key takes type only",
+            "unknown context descriptor `required`, a provided context key takes type and value",
             "required: true",
+        ),
+        (
+            "+(a:node)-[:requires {tenant: {type: \"string\", required: true}}]->(context);",
+            "unknown context descriptor `required`, a required context key takes type only",
+            "required: true",
+        ),
+        (
+            "+(a:node)-[:requires {tenant: {type: \"string\", value: \"acme\"}}]->(context);",
+            "a required context key is supplied from outside the graph and takes no value",
+            "value: \"acme\"",
         ),
         (
             "+(a:node)-[:provides {tenant: {type: \"text\"}}]->(context);",
@@ -3207,5 +3217,73 @@ fn edge_kinds_provide_context_and_models_record_suppliers() {
         );
         let range = errors[0].r#where;
         assert!(source[range.start..range.end].starts_with(at), "{source}");
+    }
+}
+
+#[test]
+fn provided_context_keys_carry_values_lowered_for_each_element() {
+    let definitions = r#"
+        +(tenant_scoped:trait {tenant: {type: "string", required: true}})
+            -[:on]->(node)
+            -[:provides {tenant: {type: "string", value: self.props.tenant}}]->(context);
+        +(entry:node {open: true})-[:has]->(tenant_scoped);
+        +(stamped:edge {direction: "directed"})
+            -[:extends]->(next)
+            -[:provides {stamp: {type: "object", value: {from: source.label}}}]->(context);
+        +(narrowed:node {open: true})
+            -[:extends]->(entry)
+            -[:provides {tenant: {type: "string"}}]->(context);
+    "#;
+    let model = compiled(&format!(
+        r#"{definitions}
+        (a:entry {{tenant: "acme"}}) {{label: "first"}};
+        (a)-[e:stamped]->(b:node) {{tenant: context.tenant, stamp: context.stamp}};
+        (c:narrowed {{tenant: "globex"}})-[:next]->(d:node) {{tenant: context.tenant}};
+        "#
+    ));
+    let supplied = |owner: &str, key: &str| -> &bts_lang::Binding {
+        let owner = model.names[owner];
+        let value = (model.context_values.iter())
+            .find(|value| value.owner == owner && value.key == key)
+            .unwrap_or_else(|| panic!("{key}"));
+        &model.bindings[value.binding.0]
+    };
+    // one value for each element of a providing kind, and none for the kinds that only read
+    assert_eq!(model.context_values.len(), 3);
+    assert!(matches!(&supplied("a", "tenant").value, bts_lang::Value::Str(text) if text == "acme"));
+    // a derived kind keeps the value when it repeats the key without one
+    assert!(matches!(&supplied("c", "tenant").value, bts_lang::Value::Str(text) if text == "globex"));
+    // an edge supplies a value that reads its endpoints
+    assert_eq!(supplied("e", "stamp").owner, model.names["e"]);
+    // a supplied value is not one of its element's fields or properties
+    let bts_lang::ElementId::Node(a) = model.names["a"] else {
+        panic!()
+    };
+    assert_eq!(model.nodes[a.0].fields.len(), 1);
+    assert_eq!(model.nodes[a.0].props.len(), 1);
+
+    for (source, message, at) in [
+        (
+            // the value must match the declared type
+            r#"+(t:trait)-[:on]->(node)-[:provides {tenant: {type: "string", value: 7}}]->(context);
+            +(k:node)-[:has]->(t); (a:k);"#,
+            "",
+            "value: 7",
+        ),
+        (
+            // the value reads only what the supplying element has
+            r#"+(k:node)-[:provides {tenant: {type: "string", value: self.props.missing}}]->(context); (a:k);"#,
+            "unknown property `missing`",
+            "self.props.missing",
+        ),
+    ] {
+        let errors = compile(source).unwrap_err();
+        assert!(
+            errors.iter().any(|error| {
+                let text = &source[error.r#where.start..error.r#where.end];
+                error.what.contains(message) && (text.contains(at) || at.contains(text))
+            }),
+            "{source}\n{errors:#?}"
+        );
     }
 }

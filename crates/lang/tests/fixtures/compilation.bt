@@ -509,10 +509,11 @@
     ];
 
 # an edge kind provides context to its target, and the key continues along next edges
+# the definition supplies the value, read here from the source of each handoff edge
 +(handoff:edge {direction: "directed"})
     -[:extends]->(next)
-    -[:provides {assigned_by: {type: "string"}}]->(context);
-(triage:task)
+    -[:provides {assigned_by: {type: "string", value: source.input.nurse}}]->(context);
+(triage:task) {input: {nurse: "rn-17"}}
     -[:handoff]->(assess:task) {input: {assigned_by: context.assigned_by}}
         -[:next]->(discharge:task) {input: {assigned_by: context.assigned_by}};
 
