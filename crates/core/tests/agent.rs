@@ -1027,6 +1027,18 @@ fn cycles_create_fresh_occurrences_carry_inputs_and_preserve_history() {
             names
         );
     }
+    // the loop-back prints as an ordinary loop that stops when a round does not ask for another
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("retrying_agent."))
+            .unwrap();
+        assert!(agent.contents.contains("break"), "{}", agent.contents);
+        assert!(agent.contents.contains("cycle max_traversals exceeded"), "{}", agent.contents);
+        for helper in ["_loop(", "_lazy(", "_child(", "_iteration("] {
+            assert!(!agent.contents.contains(helper), "{helper} in {}", agent.contents);
+        }
+    }
     let limited = lower(&CYCLE_SOURCE.replace("max_traversals: 3", "max_traversals: 1")).unwrap();
     let error = data::generate(
         limited,
@@ -1789,4 +1801,213 @@ fn definitions_supply_context_values_to_data_and_code() {
         lower(ambiguous).unwrap_err(),
         "`context.owner` reaches this step from more than one supplier"
     );
+}
+
+// the name and output of every span, in the order the spans run
+fn outputs(batch: &data::EventBatch) -> Vec<Value> {
+    (batch.events.iter())
+        .map(|event| json!([event.name, event.output.as_ref().map(|output| output.project(&()).unwrap())]))
+        .collect()
+}
+
+#[test]
+fn loops_rounds_and_keyed_junctions_agree_in_data_and_code() {
+    // a loop holds a fork that repeats, and each round of the loop runs every round of the fork
+    let rounds_in_a_loop = r#"
+(looping:agent) {input: 0, output: last.output};
+(looping)-[:next]->(root:task) {input: looping.input};
+(root)-[:calls]->(turn:task) {output: len(context.history.turn)}
+    =[:repeat {count: 2}]=>[-[:calls]->(work:tool) {output: context.index + turn.output * 10}];
+(turn)~[:next {when: source.output < 2, max_traversals: 5}]~>(turn);
+(turn)-[:next {when: source.output >= 2}]->(last:task) {output: turn.output};
+"#;
+    // a correlated reduce closes one group for each key, in the order the keys first arrive
+    let keyed_reduce = r#"
+(looping:agent) {input: 0, output: "done"};
+(looping)-[:next]->(root:task) {input: looping.input};
+(root) =[:each {items: [|"x", "y", "x"|]}]=>[
+    -[a:calls]->(part:tool) {output: context.index + 1},
+]
+    >[:reduce {observe: "result", correlate: context.item, initial: 0, combine: context.accumulator + context.arrival.value} [a]]>>(finish:task) {
+        output: {total: context.accumulator, arrivals: context.arrivals},
+    };
+"#;
+    // a junction without a fork joins the edges that leave one step
+    let joined_edges = r#"
+(looping:agent) {input: 0, output: finish.output};
+(looping)-[:next]->(root:task) {input: looping.input};
+(root)-[x:calls]->(one:tool) {output: 1};
+(root)-[y:calls]->(two:tool) {output: 2};
+>[:accumulate {observe: "result"} [x], [y]]>>(finish:task) {output: context.arrivals};
+"#;
+    for (source, expected) in [
+        (
+            rounds_in_a_loop,
+            json!([
+                ["root", null],
+                ["turn", 0],
+                ["work", 0],
+                ["work", 1],
+                ["turn", 1],
+                ["work", 10],
+                ["work", 11],
+                ["turn", 2],
+                ["work", 20],
+                ["work", 21],
+                ["last", 2],
+            ]),
+        ),
+        (
+            keyed_reduce,
+            json!([
+                ["root", null],
+                ["part", 1], ["part", 2], ["part", 3],
+                ["finish", {"total": 4, "arrivals": [{"edge": "a", "value": 1}, {"edge": "a", "value": 3}]}],
+                ["finish", {"total": 2, "arrivals": [{"edge": "a", "value": 2}]}],
+            ]),
+        ),
+        (
+            joined_edges,
+            json!([
+                ["root", null],
+                ["one", 1],
+                ["two", 2],
+                ["finish", [{"edge": "x", "value": 1}, {"edge": "y", "value": 2}]],
+            ]),
+        ),
+    ] {
+        assert_eq!(json!(outputs(&one_trace(source))), expected, "{source}");
+        for generated in generated_runs(&lower(source).unwrap(), "looping") {
+            let spans: Vec<_> = (generated["spans"].as_array().unwrap().iter())
+                .map(|span| json!([span["name"], span.get("output").cloned().unwrap_or(Value::Null)]))
+                .collect();
+            assert_eq!(json!(spans), expected, "{source}");
+        }
+    }
+}
+
+// a shape the nested plan cannot hold is refused at the element that causes it
+#[test]
+fn shapes_without_a_nested_form_are_refused_with_a_location() {
+    let base = r#"
+(looping:agent) {input: 0, output: "done"};
+(looping)-[:next]->(root:task) {input: looping.input};
+(root)-[:calls]->(first:tool) {output: 1};
+(first)-[:next]->(second:tool) {output: 2};
+"#;
+    for (source, located, message) in [
+        (
+            format!("{base}(root)-[:calls]->(other:tool) {{output: 3}};\n(other)~[:next {{when: false}}]~>(first);"),
+            ":next {when: false}",
+            "a loop-back must return to a step that leads to its source",
+        ),
+        (
+            format!("{base}(second)~[:next {{when: false}}]~>(first);\n(second)~[retry:next {{when: false}}]~>(first);"),
+            "retry:next {when: false}",
+            "more than one loop-back to one step is not supported by mocking yet",
+        ),
+        (
+            format!("{base}(second)~[:next {{when: false}}]~>(root);"),
+            ":next {when: false}",
+            "cycle edges cannot target the trace entry span",
+        ),
+        (
+            base.replace(
+                "(first)-[:next]->(second:tool) {output: 2};",
+                "(root) =[:repeat {count: 2}]=>[-[:calls]->(second:tool) {output: 2}];\n(root)-[:calls]->(reader:tool) {output: second.output};",
+            ),
+            "(second:tool) {output: 2}",
+            "`second` runs once for each round of its fork, read it from a step in the round or through a junction",
+        ),
+    ] {
+        let errors = Bundle::compile_module(&source, false).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let range = errors[0].r#where;
+        assert_eq!(errors[0].what, message, "{source}");
+        assert_eq!(&source[range.start..range.end], located, "{errors:#?}");
+    }
+}
+
+#[test]
+fn every_example_agent_reads_as_written_by_hand() {
+    // no deferred values, no span bookkeeping, and no helper under a private name
+    for source in [
+        include_str!("../../../examples/agent_tool_loop.bt"),
+        include_str!("../../../examples/customer_support_agent.bt"),
+        include_str!("../../../examples/dataset_cases.bt"),
+        include_str!("../../../examples/error_and_escalation.bt"),
+        include_str!("../../../examples/experiments.bt"),
+        include_str!("../../../examples/fanout_parallel_workers.bt"),
+        include_str!("../../../examples/multi_turn_conversation.bt"),
+        include_str!("../../../examples/rag_pipeline.bt"),
+        include_str!("../../../examples/scoring_automations.bt"),
+        include_str!("../../../examples/supervisor_and_subagents.bt"),
+        include_str!("../../../examples/topics_automations.bt"),
+        include_str!("../../../examples/windowed_session.bt"),
+    ] {
+        let model = lower(source).unwrap();
+        for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+            let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+            let agents: Vec<_> = (assembly.files.iter())
+                .filter(|file| file.name.contains("_agent.") && !file.name.contains("runtime"))
+                .collect();
+            assert!(!agents.is_empty());
+            for file in agents {
+                // the agent's own code follows its imports
+                let body = file.contents.split_once("_MISSING = ").unwrap().1;
+                for told in [".fields[", ".children[", ".iterations"] {
+                    assert!(!body.contains(told), "{told} in {}", file.name);
+                }
+                let bytes = body.as_bytes();
+                for (at, _) in body.match_indices('_') {
+                    let starts = at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+                    let name: String = body[at..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    let called = body[at + name.len()..].starts_with('(');
+                    if starts && called {
+                        assert_eq!(name, "_execute", "private helper {name} in {}", file.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_loop_without_an_ordered_form_runs_in_the_deferred_form() {
+    // an entry that reads its sibling takes a name of its own, which a value here already uses,
+    // so the plan has no single order and the fallback prints it
+    let source = CYCLE_SOURCE
+        .replace(
+            "input: retrying.input, output: finish.output};",
+            "input: retrying.input, output: finish.output, local: {metrics_prompt_tokens: 1}};",
+        )
+        .replace(
+            "earlier: len(context.history.lookup)},\n};",
+            "earlier: len(context.history.lookup)},\n    metrics: {prompt_tokens: len(context.history.lookup) + 5, tokens: self.metrics.prompt_tokens + 1},\n};",
+        );
+    assert_ne!(source, CYCLE_SOURCE);
+    let model = lower(&source).unwrap();
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("retrying_agent."))
+            .unwrap();
+        assert!(agent.contents.contains("_loop("), "{}", agent.contents);
+    }
+    let names = ["root", "lookup", "check", "lookup", "check", "lookup", "check", "finish"];
+    for result in generated_runs(&model, "retrying") {
+        assert_eq!(result["output"], json!({"attempt":2,"earlier":2}));
+        assert_eq!(
+            result["spans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|span| span["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            names
+        );
+    }
 }

@@ -385,6 +385,10 @@ pub(in crate::mocking::code) fn statements(
                 expression(value, lang),
                 if lang == ScorerLang::Python { "" } else { ";" }
             )),
+            Statement::Break => source.push_str(&format!(
+                "{indent}break{}\n",
+                if lang == ScorerLang::Python { "" } else { ";" }
+            )),
             Statement::If {
                 condition,
                 then_body,
@@ -2075,6 +2079,7 @@ pub(in crate::mocking::code) fn agent(
             line.split_once(" = ").map(|(name, _)| name.to_string())
         })
         .collect();
+    // The helpers an agent calls by name read as ordinary library functions.
     let names = if lang == ScorerLang::Python {
         [
             ("_index", "item_at"),
@@ -2083,6 +2088,25 @@ pub(in crate::mocking::code) fn agent(
             ("_duration", "duration_seconds"),
             ("checked_number", "checked_number"),
             ("validate_input", "validate_input"),
+            ("_tokens", "count_tokens"),
+            ("_array", "as_list"),
+            ("_uuid", "new_uuid"),
+            ("_range", "sample_range"),
+            ("_history", "step_history"),
+            ("_fold", "fold_items"),
+            ("_agent_result", "agent_result"),
+            ("_slice", "slice_items"),
+            ("_len", "length_of"),
+            ("_count", "as_count"),
+            ("_equal", "values_equal"),
+            ("_arithmetic", "calculate"),
+            ("_require_arrivals", "require_arrivals"),
+            ("_emissions", "group_arrivals"),
+            ("_select", "select_option"),
+            ("_weighted", "weighted_option"),
+            ("_num", "as_number"),
+            ("_boolean", "as_boolean"),
+            ("_integer", "as_integer"),
         ]
     } else {
         [
@@ -2092,6 +2116,25 @@ pub(in crate::mocking::code) fn agent(
             ("_duration", "durationSeconds"),
             ("checked_number", "checkedNumber"),
             ("validate_input", "validateInput"),
+            ("_tokens", "countTokens"),
+            ("_array", "asList"),
+            ("_uuid", "newUuid"),
+            ("_range", "sampleRange"),
+            ("_history", "stepHistory"),
+            ("_fold", "foldItems"),
+            ("_agent_result", "agentResult"),
+            ("_slice", "sliceItems"),
+            ("_len", "lengthOf"),
+            ("_count", "asCount"),
+            ("_equal", "valuesEqual"),
+            ("_arithmetic", "calculate"),
+            ("_require_arrivals", "requireArrivals"),
+            ("_emissions", "groupArrivals"),
+            ("_select", "selectOption"),
+            ("_weighted", "weightedOption"),
+            ("_num", "asNumber"),
+            ("_boolean", "asBoolean"),
+            ("_integer", "asInteger"),
         ]
     };
     let mut functions = agent.functions.clone();

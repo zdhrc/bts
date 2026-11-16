@@ -336,6 +336,7 @@ pub(crate) mod code {
                     rewrite_expr(scope, rewrite);
                     self::rewrite(body, rewrite);
                 }
+                Statement::Break => {}
             }
         }
     }
@@ -397,6 +398,7 @@ pub(crate) mod code {
                     refs.extend(scope.references());
                     refs.extend(references(body));
                 }
+                Statement::Break => {}
             }
         }
         refs.retain(|d| !bound(d, &locals));
@@ -489,6 +491,7 @@ pub(crate) mod code {
             body: Vec<Statement>,
         },
         Raise(Expr),
+        Break,
         Function(Function),
     }
 
@@ -1939,6 +1942,8 @@ mod native {
         span: Type,
         fields: HashMap<String, Type>,
     }
+    // recorded among the types when a plan has no ordered form after all
+    const UNPRINTABLE: &str = "!unprintable";
     fn schema(value: &Expr, nullable: &HashSet<String>) -> Option<Json> {
         Some(match value {
             Expr::String(_) => json!({"type":"string"}),
@@ -2001,7 +2006,11 @@ mod native {
             Json::Object(fields) => Expr::Object(fields.iter().map(|(k, v)| (k.clone(), schema_expr(v))).collect()),
         }
     }
-    pub(crate) fn functions(functions: &mut Vec<code::Function>, lang: ScorerLang) -> Vec<(String, Json)> {
+    pub(crate) fn functions(
+        functions: &mut Vec<code::Function>,
+        lang: ScorerLang,
+        numbered: &[(String, String)],
+    ) -> Option<Vec<(String, Json)>> {
         let mut nullable = HashSet::new();
         let mut accessed = HashSet::new();
         for f in functions.iter_mut() {
@@ -2150,6 +2159,57 @@ mod native {
                 }
             }
         }
+        // a deferred value nothing reads is never computed, so it is not printed
+        fn unread(body: &mut Vec<Statement>, read: &HashSet<String>) {
+            body.retain(|statement| {
+                !matches!(statement, Statement::Variable(Variable::Declare { name, value: Expr::Call { function, .. }, .. })
+                    if matches!(&**function, Expr::Name(callee) if callee == "_lazy") && !read.contains(name))
+            });
+            for statement in body {
+                match statement {
+                    Statement::Function(function) => unread(&mut function.body, read),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => unread(body, read),
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        unread(then_body, read);
+                        unread(else_body, read);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        loop {
+            let mut read = HashSet::new();
+            let mut declared = 0;
+            for function in functions.iter_mut() {
+                code::rewrite(&mut function.body, &mut |value| {
+                    if let Expr::Name(name) = value {
+                        read.insert(name.clone());
+                    }
+                });
+            }
+            let count = |functions: &[code::Function]| {
+                let mut total = 0;
+                for function in functions {
+                    let mut body = function.body.clone();
+                    code::rewrite(&mut body, &mut |value| {
+                        if matches!(value, Expr::Call { function, .. } if matches!(&**function, Expr::Name(name) if name == "_lazy"))
+                        {
+                            total += 1;
+                        }
+                    });
+                }
+                total
+            };
+            declared += count(functions);
+            for function in functions.iter_mut() {
+                unread(&mut function.body, &read);
+            }
+            if count(functions) == declared {
+                break;
+            }
+        }
         for function in functions.iter_mut() {
             localize(&mut function.body);
         }
@@ -2236,7 +2296,12 @@ mod native {
                 types: types.clone(),
                 ..Environment::default()
             };
+            // what a caller passes in is plain data
+            env.names.insert("input".into(), Type::Value);
             function.body = block(std::mem::take(&mut function.body), &mut env, lang, None);
+        }
+        if types.borrow().contains_key(UNPRINTABLE) {
+            return None;
         }
         own_traces(functions);
         for function in functions.iter_mut() {
@@ -2260,12 +2325,129 @@ mod native {
         }
         annotate(functions, &types.borrow(), &mut contracts, lang);
         expand_results(functions, lang, &types.borrow());
-        local_names(functions, lang);
+        local_names(functions, lang, numbered);
         native_locals(functions, &types.borrow(), &contracts, lang);
         idioms(functions, lang);
         request_parameters(functions, lang);
         aliases(functions);
         arithmetic_steps(functions, lang);
+        // A step reached along more than one path is one function, however many places call it.
+        loop {
+            let same = |a: &code::Function, b: &code::Function| {
+                let shape = |function: &code::Function| format!("{:?}", (&function.parameters, &function.body));
+                !a.exported && !b.exported && !a.name.starts_with('_') && !b.name.starts_with('_') && shape(a) == shape(b)
+            };
+            let mut merged = None;
+            'search: for first in 0..functions.len() {
+                for second in first + 1..functions.len() {
+                    if same(&functions[first], &functions[second]) {
+                        merged = Some((functions[first].name.clone(), second));
+                        break 'search;
+                    }
+                }
+            }
+            let Some((kept, dropped)) = merged else { break };
+            let dropped = functions.remove(dropped).name;
+            for function in functions.iter_mut() {
+                code::rewrite(&mut function.body, &mut |value| {
+                    if matches!(value, Expr::Name(name) if *name == dropped) {
+                        *value = Expr::Name(kept.clone());
+                    }
+                });
+            }
+        }
+        // A parameter its function never reads is not passed.
+        fn inert(value: &Expr) -> bool {
+            match value {
+                Expr::Name(_) | Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
+                Expr::Index(target, index) => inert(target) && inert(index),
+                Expr::Member(target, _) => inert(target),
+                Expr::Binary { left, right, .. } => inert(left) && inert(right),
+                _ => false,
+            }
+        }
+        loop {
+            let mut unused = None;
+            'search: for function in functions.iter() {
+                if function.exported || function.name.starts_with('_') {
+                    continue;
+                }
+                let mut read = HashSet::new();
+                code::rewrite(&mut function.body.clone(), &mut |value| {
+                    if let Expr::Name(name) = value {
+                        read.insert(name.clone());
+                    }
+                });
+                for (index, parameter) in function.parameters.iter().enumerate() {
+                    if !parameter.members.is_empty() || parameter.keyword_only || read.contains(&parameter.name) {
+                        continue;
+                    }
+                    // every caller must pass something that costs nothing to leave out
+                    let mut removable = true;
+                    for caller in functions.iter() {
+                        code::rewrite(&mut caller.body.clone(), &mut |value| match value {
+                            Expr::Call {
+                                function: callee,
+                                args,
+                                keywords,
+                            } if matches!(&**callee, Expr::Name(name) if *name == function.name) => {
+                                removable &= keywords.is_empty() && args.get(index).is_some_and(inert);
+                            }
+                            _ => {}
+                        });
+                    }
+                    // a function handed on by name is called with arguments this pass cannot see
+                    let mut calls = 0;
+                    let mut mentions = 0;
+                    for caller in functions.iter() {
+                        code::rewrite(&mut caller.body.clone(), &mut |value| match value {
+                            Expr::Call { function: callee, .. } if matches!(&**callee, Expr::Name(name) if *name == function.name) =>
+                            {
+                                calls += 1;
+                            }
+                            Expr::Name(name) if *name == function.name => mentions += 1,
+                            _ => {}
+                        });
+                    }
+                    if removable && mentions == calls {
+                        unused = Some((function.name.clone(), index));
+                        break 'search;
+                    }
+                }
+            }
+            let Some((name, index)) = unused else { break };
+            for function in functions.iter_mut() {
+                if function.name == name {
+                    function.parameters.remove(index);
+                }
+                code::rewrite(&mut function.body, &mut |value| {
+                    if let Expr::Call {
+                        function: callee, args, ..
+                    } = value
+                        && matches!(&**callee, Expr::Name(callee) if *callee == name)
+                        && index < args.len()
+                    {
+                        args.remove(index);
+                    }
+                });
+            }
+        }
+        // a helper nothing calls any more is not printed
+        loop {
+            let called: HashSet<_> = functions
+                .iter()
+                .flat_map(|function| code::references(&function.body))
+                .collect();
+            let before = functions.len();
+            functions.retain(|function| {
+                function.exported
+                    || function.name.starts_with('_')
+                    || called.contains(&Dependency::Variable(function.name.clone()))
+            });
+            if functions.len() == before {
+                break;
+            }
+        }
         if let Some(schema) = input_schema {
             let name = if lang == ScorerLang::Python {
                 "parse_input"
@@ -2307,9 +2489,9 @@ mod native {
                 }
             }
             functions.insert(0, parse);
-            return contracts;
+            return Some(contracts);
         }
-        contracts
+        Some(contracts)
     }
     fn type_schema(kind: &Type) -> Json {
         match kind {
@@ -2602,7 +2784,6 @@ mod native {
                         && matches!(&**function,Expr::Name(n) if n=="_lazy")
                         && let [Expr::Lambda { parameters, value }] = args.as_slice()
                         && parameters.is_empty()
-                        && total(value, env, lang)
                     {
                         Some((name.clone(), (**value).clone()))
                     } else {
@@ -2615,7 +2796,62 @@ mod native {
                     !matches!(s, Statement::Variable(Variable::Declare {name:n,..}) if n == &name)
                         && code::references(std::slice::from_ref(s)).contains(&Dependency::Variable(name.clone()))
                 });
-                let Some(first) = first else { continue };
+                let Some(mut first) = first else { continue };
+                // A value that can fail is computed early only where its first reader always reads it.
+                if !total(&value, env, lang) {
+                    // a function that reads it does so when called, so the first statement that reads it decides
+                    let reader = body.iter().position(|s| {
+                        !matches!(s, Statement::Function(_))
+                            && !matches!(s, Statement::Variable(Variable::Declare {name:n,..}) if n == &name)
+                            && code::references(std::slice::from_ref(s)).contains(&Dependency::Variable(name.clone()))
+                    });
+                    let Some(reader) = reader else { continue };
+                    first = reader;
+                    let certain = match &body[first] {
+                        Statement::Variable(Variable::Declare { value, .. }) | Statement::Evaluate(value) => {
+                            let mut plain = true;
+                            code::rewrite_expr(&mut value.clone(), &mut |found| {
+                                plain &= !matches!(
+                                    found,
+                                    Expr::Conditional { .. }
+                                        | Expr::Lambda { .. }
+                                        | Expr::Map { .. }
+                                        | Expr::Binary {
+                                            op: BinOp::And | BinOp::Or,
+                                            ..
+                                        }
+                                );
+                            });
+                            plain
+                        }
+                        _ => false,
+                    };
+                    // a function defined earlier may read the value, which matters only if it is called earlier
+                    let mut readers = HashSet::from([name.clone()]);
+                    loop {
+                        let before = readers.len();
+                        for statement in &body[..first] {
+                            if let Statement::Function(function) = statement
+                                && (code::references(std::slice::from_ref(statement)).iter())
+                                    .any(|read| matches!(read, Dependency::Variable(read) if readers.contains(read)))
+                            {
+                                readers.insert(function.name.clone());
+                            }
+                        }
+                        if readers.len() == before {
+                            break;
+                        }
+                    }
+                    let earlier = body[..first].iter().any(|statement| {
+                        !matches!(statement, Statement::Function(_))
+                            && !matches!(statement, Statement::Variable(Variable::Declare { name: declared, .. }) if *declared == name)
+                            && (code::references(std::slice::from_ref(statement)).iter())
+                                .any(|read| matches!(read, Dependency::Variable(read) if readers.contains(read)))
+                    });
+                    if !certain || earlier {
+                        continue;
+                    }
+                }
                 let dependencies = code::references(&[Statement::Return(value.clone())]);
                 if body[first..].iter().any(|s| matches!(s,Statement::Variable(Variable::Declare {name,..}) if dependencies.contains(&Dependency::Variable(name.clone())))) {continue;}
                 // Leave computations inside their existing lexical execution scope.
@@ -2768,7 +3004,8 @@ mod native {
     }
 
     fn pure_functions(functions: &mut [code::Function]) {
-        fn convert(body: &mut [Statement]) {
+        // `known` are the helpers already found pure, which another pure helper may call
+        fn convert(body: &mut [Statement], known: &mut HashSet<String>) {
             for statement in body {
                 match statement {
                     Statement::Variable(Variable::Declare {
@@ -2781,7 +3018,7 @@ mod native {
                         {
                             let mut pure = true;
                             code::rewrite_expr(&mut (**value).clone(), &mut |e| match e {
-                                Expr::Call { function, .. } if !matches!(&**function, Expr::Name(n) if ["_num", "_integer", "_index", "_equal", "_boolean", "_len", "_text", "_trim", "_float", "_value", "checked_number", "remainder", "divide"].contains(&n.as_str())) => {
+                                Expr::Call { function, .. } if !matches!(&**function, Expr::Name(n) if known.contains(n) || ["_num", "_integer", "_index", "_equal", "_boolean", "_len", "_text", "_trim", "_float", "_value", "checked_number", "remainder", "divide"].contains(&n.as_str())) => {
                                     pure = false
                                 }
                                 Expr::Member(_, field)
@@ -2793,32 +3030,38 @@ mod native {
                                 _ => {}
                             });
                             if pure {
+                                known.insert(name.clone());
                                 let mut f = code::Function::new(name.clone(), vec![]);
                                 f.body.push(Statement::Return((**value).clone()));
                                 *statement = Statement::Function(f);
                             }
                         }
                     }
-                    Statement::Function(f) => convert(&mut f.body),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => convert(body),
+                    Statement::Function(f) => convert(&mut f.body, &mut known.clone()),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => convert(body, known),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        convert(then_body);
-                        convert(else_body);
+                        convert(then_body, &mut known.clone());
+                        convert(else_body, &mut known.clone());
                     }
                     _ => {}
                 }
             }
         }
         for function in functions {
-            convert(&mut function.body);
+            convert(&mut function.body, &mut HashSet::new());
         }
     }
 
     fn idioms(functions: &mut Vec<code::Function>, lang: ScorerLang) {
         fn literal(value: &Expr) -> bool {
-            matches!(value, Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null)
+            match value {
+                Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
+                Expr::Array(items) => items.iter().all(literal),
+                Expr::Object(fields) => fields.iter().all(|(_, value)| literal(value)),
+                _ => false,
+            }
         }
         // Structural functions that just forward one result are not application boundaries.
         let wrappers: HashMap<_, _> = functions
@@ -2952,6 +3195,15 @@ mod native {
                             );
                             return;
                         }
+                    }
+                    // a path that is either certain or impossible needs no draw
+                    if name == "_include"
+                        && let Some(Expr::Conditional { condition, yes, no }) = args.first()
+                        && matches!(&**yes, Expr::Number(n) if n == "1")
+                        && matches!(&**no, Expr::Number(n) if n == "0")
+                    {
+                        *value = (**condition).clone();
+                        return;
                     }
                     let method = match name.as_str() {
                         "_pick" => Some("pick"),
@@ -3160,7 +3412,7 @@ mod native {
         let history = functions
             .iter()
             .any(|function| code::references(&function.body).contains(&Dependency::Variable("_history".into())));
-        fn scopes(body: &mut Vec<Statement>, history: bool) {
+        fn scopes(body: &mut Vec<Statement>, history: bool, lang: ScorerLang) {
             let mut structural = HashSet::new();
             for statement in body.iter() {
                 if let Statement::Variable(Variable::Declare {
@@ -3184,6 +3436,11 @@ mod native {
                     needed.insert(name.clone());
                 }
             });
+            // a scope that stays still hands its values back as locals
+            let kept: HashSet<String> = (structural.iter())
+                .filter(|name| history || needed.contains(*name))
+                .cloned()
+                .collect();
             structural.retain(|name| !history && !needed.contains(name));
             let mut output = Vec::new();
             for mut statement in std::mem::take(body) {
@@ -3192,9 +3449,9 @@ mod native {
                     Statement::TraceScope {
                         scope: Expr::Name(name),
                         body,
-                    } if structural.contains(name) => {
+                    } if structural.contains(name) || kept.contains(name) => {
                         let frame = name.clone();
-                        fn fields(body: &mut [Statement], frame: &str) {
+                        fn fields(body: &mut [Statement], frame: &str, lang: ScorerLang) {
                             for statement in body {
                                 match statement {
                                     Statement::Variable(Variable::Assign {
@@ -3203,14 +3460,7 @@ mod native {
                                     }) if matches!(&**target, Expr::Member(target, member) if member == "fields" && matches!(&**target, Expr::Name(n) if n == frame)) => {
                                         if let Expr::String(field) = &**field {
                                             *statement = Statement::Variable(Variable::constant(
-                                                format!(
-                                                    "{}_{}",
-                                                    frame
-                                                        .strip_suffix("_span")
-                                                        .or_else(|| frame.strip_suffix("Span"))
-                                                        .unwrap_or(frame),
-                                                    field
-                                                ),
+                                                field_local(frame, field, lang),
                                                 value.clone(),
                                             ));
                                         }
@@ -3218,40 +3468,40 @@ mod native {
                                     Statement::If {
                                         then_body, else_body, ..
                                     } => {
-                                        fields(then_body, frame);
-                                        fields(else_body, frame);
+                                        fields(then_body, frame, lang);
+                                        fields(else_body, frame, lang);
                                     }
                                     _ => {}
                                 }
                             }
                         }
-                        fields(body, &frame);
+                        fields(body, &frame, lang);
                         code::rewrite(body, &mut |value| {
                             if let Expr::Member(target, field) = value
                                 && matches!(&**target, Expr::Name(n) if n == &frame)
-                                && ["chosen", "included"].contains(&field.as_str())
+                                && !["children", "iterations", "fields", "log"].contains(&field.as_str())
                             {
-                                *value = Expr::Name(format!(
-                                    "{}_{}",
-                                    frame
-                                        .strip_suffix("_span")
-                                        .or_else(|| frame.strip_suffix("Span"))
-                                        .unwrap_or(&frame),
-                                    field
-                                ));
+                                *value = Expr::Name(field_local(&frame, field, lang));
                             }
                         });
-                        scopes(body, history);
-                        output.append(body);
+                        scopes(body, history, lang);
+                        if kept.contains(&frame) {
+                            output.push(Statement::TraceScope {
+                                scope: Expr::Name(frame),
+                                body: std::mem::take(body),
+                            });
+                        } else {
+                            output.append(body);
+                        }
                         continue;
                     }
-                    Statement::Function(f) => scopes(&mut f.body, history),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => scopes(body, history),
+                    Statement::Function(f) => scopes(&mut f.body, history, lang),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => scopes(body, history, lang),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        scopes(then_body, history);
-                        scopes(else_body, history);
+                        scopes(then_body, history, lang);
+                        scopes(else_body, history, lang);
                     }
                     _ => {}
                 }
@@ -3288,7 +3538,7 @@ mod native {
                 }
                 _ => {}
             });
-            scopes(&mut function.body, history);
+            scopes(&mut function.body, history, lang);
             function.body.insert(
                 0,
                 Statement::Variable(Variable::constant(
@@ -3401,7 +3651,8 @@ mod native {
         }
     }
 
-    fn local_names(functions: &mut [code::Function], lang: ScorerLang) {
+    fn local_names(functions: &mut [code::Function], lang: ScorerLang, numbered: &[(String, String)]) {
+        let defined: HashSet<String> = functions.iter().map(|function| function.name.clone()).collect();
         fn declarations(body: &mut [Statement], names: &HashMap<String, String>) {
             for statement in body {
                 match statement {
@@ -3452,10 +3703,32 @@ mod native {
                 };
                 if used.contains(&old) && !used.contains(suffix) {
                     names.insert(old, suffix.to_string());
+                    continue;
+                }
+                // a function numbered apart from another has its number at the end of its span's name
+                let digits = function.name.len() - function.name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+                if digits == 0 {
+                    continue;
+                }
+                let (stem, number) = function.name.split_at(function.name.len() - digits);
+                let old = if lang == ScorerLang::Python {
+                    let stem = stem.trim_end_matches('_');
+                    if suffix == "span" {
+                        format!("{stem}_span_{number}")
+                    } else {
+                        format!("{stem}_span_{number}_{suffix}")
+                    }
+                } else if suffix == "span" {
+                    format!("{stem}Span{number}")
+                } else {
+                    format!("{stem}Span{number}{}{}", suffix[..1].to_uppercase(), &suffix[1..])
+                };
+                if used.contains(&old) && !used.contains(suffix) {
+                    names.insert(old, suffix.to_string());
                 }
             }
             for (field, local) in [("included", "included"), ("chosen", "selection")] {
-                let old = format!("{}_{field}", function.name);
+                let old = field_local(&function.name, field, lang);
                 if used.contains(&old) && !used.contains(local) {
                     names.insert(old, local.into());
                 }
@@ -3498,6 +3771,18 @@ mod native {
                         names.insert(old.clone(), new);
                     }
                     break;
+                }
+            }
+            // a name numbered to keep it apart from another function's local needs no number here
+            for (name, plain) in numbered {
+                if used.contains(name)
+                    && !names.contains_key(name)
+                    && !used.contains(plain)
+                    && !defined.contains(plain)
+                    && !names.values().any(|taken| taken == plain)
+                {
+                    used.insert(plain.clone());
+                    names.insert(name.clone(), plain.clone());
                 }
             }
             for parameter in &mut function.parameters {
@@ -3745,6 +4030,18 @@ mod native {
         *functions = extracted;
     }
 
+    // The local that holds a value a control-flow scope keeps for its caller.
+    fn field_local(frame: &str, field: &str, lang: ScorerLang) -> String {
+        let stem = frame
+            .strip_suffix("_span")
+            .or_else(|| frame.strip_suffix("Span"))
+            .unwrap_or(frame);
+        if lang == ScorerLang::Python {
+            format!("{stem}_{field}")
+        } else {
+            format!("{stem}{}{}", field[..1].to_uppercase(), &field[1..])
+        }
+    }
     fn export_name(field: &str) -> &str {
         match field {
             "input" => "request",
@@ -3778,7 +4075,24 @@ mod native {
     ) -> Vec<Statement> {
         let mut output = Vec::new();
         let mut lifted = HashMap::<String, Lifted>::new();
-        for statement in statements {
+        // the function that runs one round of a loop, by the frame its rounds are kept under
+        let rounds: HashMap<String, String> = statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Statement::Variable(Variable::Declare {
+                    name,
+                    value: Expr::Call { function, args, .. },
+                    ..
+                }) if matches!(&**function, Expr::Name(n) if n == "_loop") => match args.get(2) {
+                    Some(Expr::Name(callee)) => Some((callee.clone(), name.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let mut seeded = HashMap::<String, Branch>::new();
+        let mut pending = statements.into_iter().collect::<std::collections::VecDeque<_>>();
+        while let Some(statement) = pending.pop_front() {
             match statement {
                 Statement::Function(mut function) => {
                     for dependency in code::references(&function.body) {
@@ -3787,6 +4101,18 @@ mod native {
                         }
                     }
                     let mut child_env = env.clone();
+                    // a round reads the rounds before it, so its shape is found first and then used
+                    let original =
+                        (rounds.contains_key(&function.name) && !seeded.contains_key(&function.name)).then(|| function.clone());
+                    if let Some(frame) = rounds.get(&function.name)
+                        && let Some(shape) = seeded.get(&function.name)
+                    {
+                        let results = label(env, frame, "output", lang);
+                        child_env
+                            .names
+                            .insert(results.clone(), Type::List(Box::new(Type::Record(Box::new(shape.clone())))));
+                        child_env.collections.insert(frame.clone(), (results.into(), shape.clone()));
+                    }
                     let lift = match function.body.first() {
                         Some(Statement::Variable(Variable::Declare {
                             name,
@@ -3886,6 +4212,14 @@ mod native {
                             )
                         };
                         env.returns.insert(function.name.clone(), kind);
+                    }
+                    if let Some(original) = original
+                        && let Some(shape) = env.branches.get(&function.name)
+                        && shape.fields.contains_key("again")
+                    {
+                        seeded.insert(function.name.clone(), shape.clone());
+                        pending.push_front(Statement::Function(original));
+                        continue;
                     }
                     if let Some(kind) = env.returns.get(&function.name) {
                         env.types.borrow_mut().insert(format!("@{}", function.name), kind.clone());
@@ -4027,6 +4361,97 @@ mod native {
                         });
                         continue;
                     }
+                    // A loop-back is a native loop that stops when a round does not ask for another.
+                    if let Expr::Call { function, args, .. } = &value
+                        && matches!(&**function,Expr::Name(n) if n=="_loop")
+                        && args.len() == 5
+                    {
+                        let python = lang == ScorerLang::Python;
+                        let stem = name
+                            .strip_suffix("_span")
+                            .or_else(|| name.strip_suffix("Span"))
+                            .unwrap_or(&name);
+                        let index = if python {
+                            format!("{stem}_index")
+                        } else {
+                            format!("{stem}Index")
+                        };
+                        let latest = if python {
+                            format!("{stem}_latest")
+                        } else {
+                            format!("{stem}Latest")
+                        };
+                        let failure = |message: &str| {
+                            Statement::Raise(Expr::New {
+                                class: if python { "ValueError" } else { "Error" }.into(),
+                                args: vec![Expr::string(message)],
+                            })
+                        };
+                        let position = Expr::from(index.clone());
+                        let (bound, stop) = match &args[4] {
+                            Expr::Null => (
+                                Expr::number(10000),
+                                Statement::If {
+                                    condition: position.clone().binary(BinOp::Ge, Expr::number(9999)),
+                                    then_body: vec![failure("graph execution budget exceeded (10000 traversals)")],
+                                    else_body: vec![],
+                                },
+                            ),
+                            limit => {
+                                let limit = expression(Expr::call("_count", vec![limit.clone()]), env, lang).0;
+                                let bound = match &limit {
+                                    Expr::Number(n) => n.parse::<i128>().map(|n| Expr::number(n + 1)).ok(),
+                                    _ => None,
+                                }
+                                .unwrap_or_else(|| limit.clone().binary(BinOp::Add, Expr::number(1)));
+                                (
+                                    bound,
+                                    Statement::If {
+                                        condition: position.clone().binary(BinOp::Ge, limit),
+                                        then_body: vec![failure("cycle max_traversals exceeded")],
+                                        else_body: vec![],
+                                    },
+                                )
+                            }
+                        };
+                        let round = Expr::call(
+                            args[2].clone(),
+                            vec![position.clone(), position.clone().binary(BinOp::Add, Expr::number(1))],
+                        );
+                        let append = if python { "append" } else { "push" };
+                        if let Expr::Name(callee) = &args[2]
+                            && let Some(branch) = env.branches.get(callee).cloned()
+                            && branch.fields.contains_key("again")
+                        {
+                            let results = label(env, &name, "output", lang);
+                            output.push(Statement::Variable(Variable::constant(&results, Expr::Array(vec![]))));
+                            output.push(Statement::ForRange {
+                                index,
+                                count: bound,
+                                body: vec![
+                                    Statement::Variable(Variable::constant(&latest, round)),
+                                    Statement::Evaluate(Expr::call(
+                                        Expr::from(results.clone()).member(append),
+                                        vec![latest.clone().into()],
+                                    )),
+                                    Statement::If {
+                                        condition: Expr::from(latest).index(Expr::string("again")).not(),
+                                        then_body: vec![Statement::Break],
+                                        else_body: vec![],
+                                    },
+                                    stop,
+                                ],
+                            });
+                            env.names
+                                .insert(results.clone(), Type::List(Box::new(Type::Record(Box::new(branch.clone())))));
+                            env.collections.insert(name, (results.into(), branch));
+                            continue;
+                        }
+                        // A round that cannot hand back what later steps read has no ordered form.
+                        // The whole agent is printed in the deferred form instead.
+                        env.types.borrow_mut().insert(UNPRINTABLE.into(), Type::Null);
+                        continue;
+                    }
                     let was_lazy =
                         matches!(&value,Expr::Call{function,..} if matches!(&**function,Expr::Name(n) if n=="_lazy"));
                     let (mut value, mut kind) = expression(value, env, lang);
@@ -4134,12 +4559,23 @@ mod native {
                         && let Some(Type::Span(fields, children)) = env.names.get_mut(frame)
                     {
                         if member == "children" {
-                            children.insert(key.clone(), kind);
+                            children.insert(key.clone(), kind.clone());
                         } else if member == "fields" {
-                            fields.insert(key.clone(), kind);
+                            fields.insert(key.clone(), kind.clone());
                         }
                     }
                     if matches!(&value, Expr::Name(n) if env.records.contains_key(n) || env.collections.contains_key(n)) {
+                        continue;
+                    }
+                    // what a step keeps for its caller is part of what it returns, not a field of its span
+                    if let Expr::Index(target, key) = &name
+                        && let Expr::Member(frame, member) = &**target
+                        && member == "fields"
+                        && let Expr::Name(frame) = &**frame
+                        && Some(frame.as_str()) == return_frame
+                        && let Expr::String(key) = &**key
+                    {
+                        env.fields.insert((frame.clone(), key.clone()), (value, kind));
                         continue;
                     }
                     output.push(Statement::Variable(Variable::Assign {
@@ -4179,6 +4615,7 @@ mod native {
                 }
                 Statement::Evaluate(value) => output.push(Statement::Evaluate(expression(value, env, lang).0)),
                 Statement::Raise(value) => output.push(Statement::Raise(expression(value, env, lang).0)),
+                Statement::Break => output.push(Statement::Break),
                 Statement::If {
                     condition,
                     then_body,
@@ -4367,6 +4804,10 @@ mod native {
             // structural selections keep their established representation.
             let result = label(env, key, "output", lang);
             let kind = match &children[key] {
+                _ if env.records.contains_key(key) => Type::Record(Box::new(env.records[key].shape.clone())),
+                _ if env.collections.contains_key(key) => {
+                    Type::List(Box::new(Type::Record(Box::new(env.collections[key].1.clone()))))
+                }
                 Type::Span(fields, _) => fields.get("output").cloned().unwrap_or(Type::Null),
                 Type::Optional(child) => match &**child {
                     Type::Span(fields, _) => join(Type::Null, fields.get("output").cloned().unwrap_or(Type::Null)),
@@ -4571,6 +5012,40 @@ mod native {
                 right,
             } => infallible(left, env) && infallible(right, env),
             Expr::Unary { op: UnaryOp::Not, value } => infallible(value, env),
+            _ => sampled(value),
+        }
+    }
+    fn constant(value: &Expr) -> bool {
+        match value {
+            Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
+            Expr::Array(items) => items.iter().all(constant),
+            Expr::Object(fields) => fields.iter().all(|(_, value)| constant(value)),
+            Expr::Call { function, args, .. } => {
+                matches!(&**function, Expr::Name(name) if name == "_float") && args.iter().all(constant)
+            }
+            _ => false,
+        }
+    }
+    // A draw from constant parameters cannot fail, so nothing is lost by taking it where it is declared.
+    fn sampled(value: &Expr) -> bool {
+        let Expr::Call { function, args, .. } = value else {
+            return false;
+        };
+        let Expr::Name(name) = &**function else { return false };
+        let random = |value: &Expr| matches!(value, Expr::Name(name) if name == "random_source" || name == "randomSource");
+        let options = |value: &Expr| {
+            matches!(value, Expr::Array(items) if items.iter().all(|item| {
+                matches!(item, Expr::Call { function, args, .. }
+                    if matches!(&**function, Expr::Name(name) if name == "_lazy")
+                        && matches!(args.as_slice(), [Expr::Lambda { parameters, value }] if parameters.is_empty() && constant(value)))
+            }))
+        };
+        match (name.as_str(), args.as_slice()) {
+            ("_include" | "_range" | "_uuid" | "_sample" | "_random_text" | "_pick", args) => {
+                args.iter().all(|arg| constant(arg) || random(arg))
+            }
+            ("_weighted", [weights, choices, source]) => constant(weights) && options(choices) && random(source),
+            ("_select", [pick, choices]) => sampled(pick) && options(choices),
             _ => false,
         }
     }
@@ -4585,7 +5060,7 @@ mod native {
             Expr::Bool(v) => (Expr::Bool(v), Type::Bool),
             Expr::Null => (Expr::Null, Type::Null),
             Expr::Number(v) => {
-                let t = v.parse::<i128>().map(|v| Type::Integer(v, v)).unwrap_or(unknown);
+                let t = v.parse::<i128>().map(|v| Type::Integer(v, v)).unwrap_or(Type::Number);
                 (Expr::Number(v), t)
             }
             Expr::Read { dependency, value } => {
@@ -4593,6 +5068,11 @@ mod native {
                     && let Some((value, shape)) = env.collections.get(child)
                 {
                     return (value.clone(), Type::List(Box::new(Type::Record(Box::new(shape.clone())))));
+                }
+                if let Dependency::Child(_, child) = &dependency
+                    && let Some(record) = env.records.get(child)
+                {
+                    return (record.value.clone(), Type::Record(Box::new(record.shape.clone())));
                 }
                 if let Dependency::Field(frame, key) = &dependency {
                     if let Some(record) = env.records.get(frame)
@@ -4668,6 +5148,44 @@ mod native {
                         return (record.value.clone().index(Expr::string(field)), kind.clone());
                     }
                 }
+                // a step that already ran is read through the values it produced
+                if callee.as_deref() == Some("_at")
+                    && args.len() == 2
+                    && let Expr::Call {
+                        function,
+                        args: children,
+                        ..
+                    } = unwrapped(&args[0])
+                    && let Expr::Lambda { parameters, value } = &args[1]
+                    && matches!(&**function, Expr::Name(n) if n == "_child")
+                    && let Some(Expr::String(key)) = children.get(1)
+                    && let Some(parameter) = parameters.first()
+                    && !matches!(unwrapped(value), Expr::Member(..))
+                {
+                    let mut local = env.clone();
+                    let mut known = false;
+                    for ((frame, field), found) in &env.fields {
+                        if frame == key {
+                            local.fields.insert((parameter.name.clone(), field.clone()), found.clone());
+                            known = true;
+                        }
+                    }
+                    if let Some(found) = env.outputs.get(key) {
+                        local.outputs.insert(parameter.name.clone(), found.clone());
+                        known = true;
+                    }
+                    if known {
+                        let (result, kind) = expression((**value).clone(), &local, lang);
+                        let leaks = result.references().iter().any(|dependency| match dependency {
+                            Dependency::Variable(name) | Dependency::Field(name, _) | Dependency::Child(name, _) => {
+                                name == &parameter.name
+                            }
+                        });
+                        if !leaks {
+                            return (result, kind);
+                        }
+                    }
+                }
                 if callee.as_deref() == Some("_at")
                     && args.len() == 2
                     && let Expr::Call {
@@ -4716,7 +5234,33 @@ mod native {
                         }
                         ("_value", [value], [kind]) if materialized(kind) => return (value.clone(), kind.clone()),
                         ("_value", [value], _) => {
-                            let value = constants(value.clone(), env);
+                            // every item of a resolved literal is evaluated, so none needs deferring
+                            fn plain(value: Expr) -> Expr {
+                                match value {
+                                    Expr::Array(items) => Expr::Array(
+                                        items
+                                            .into_iter()
+                                            .map(|item| match item {
+                                                Expr::Call { function, mut args, .. }
+                                                    if matches!(&*function, Expr::Name(name) if name == "_lazy")
+                                                        && matches!(args.as_slice(), [Expr::Lambda { parameters, .. }] if parameters.is_empty()) =>
+                                                {
+                                                    match args.remove(0) {
+                                                        Expr::Lambda { value, .. } => plain(*value),
+                                                        other => other,
+                                                    }
+                                                }
+                                                other => plain(other),
+                                            })
+                                            .collect(),
+                                    ),
+                                    Expr::Object(fields) => {
+                                        Expr::Object(fields.into_iter().map(|(key, value)| (key, plain(value))).collect())
+                                    }
+                                    other => other,
+                                }
+                            }
+                            let value = constants(plain(value.clone()), env);
                             let (value, kind) = expression(value, env, lang);
                             if materialized(&kind) {
                                 return (value, kind);
@@ -4871,6 +5415,22 @@ mod native {
                             return (Expr::call("_index", vec![value.clone(), index.clone()]), (**kind).clone());
                         }
                         ("_index", _, [Type::List(kind), _]) => return (call, (**kind).clone()),
+                        ("_read", [value, Expr::String(key)], [Type::Record(branch), _]) => {
+                            if let Some(kind) = branch.fields.get(key) {
+                                return (value.clone().index(Expr::string(key)), kind.clone());
+                            }
+                        }
+                        ("_len", [Expr::Map { iterable, .. }], _) => {
+                            return expression(Expr::call("_len", vec![(**iterable).clone()]), env, lang);
+                        }
+                        ("_last", [value], [Type::List(kind)]) => {
+                            let position = if lang == ScorerLang::Python {
+                                Expr::number(-1)
+                            } else {
+                                value.clone().member("length").binary(BinOp::Sub, Expr::number(1))
+                            };
+                            return (value.clone().index(position), (**kind).clone());
+                        }
                         ("_slice", [value, start, end], [kind @ Type::List(_), _, _])
                             if matches!(start, Expr::Null) && matches!(end, Expr::Null) =>
                         {
@@ -4885,7 +5445,12 @@ mod native {
                                     } else {
                                         scope.clone().index(Expr::string(field))
                                     },
-                                    Type::Product(Box::new(kind.clone())),
+                                    // a nested scope keeps its own shape, a step is its result
+                                    if matches!(kind, Type::Record(_) | Type::List(_)) {
+                                        kind.clone()
+                                    } else {
+                                        Type::Product(Box::new(kind.clone()))
+                                    },
                                 );
                             }
                         }
@@ -4963,7 +5528,46 @@ mod native {
                         "_index" if kinds.first().is_some_and(materialized) => Type::Value,
                         "_at" => Type::Value,
                         "_duration" => Type::Value,
-                        "checked_number" | "remainder" | "divide" => Type::Number,
+                        "checked_number" | "remainder" | "divide" | "_sample" | "_arithmetic" | "_abs" | "_extreme" => {
+                            Type::Number
+                        }
+                        "_uuid" => Type::String,
+                        "_float" => Type::Number,
+                        "len" => Type::Integer(0, 9_007_199_254_740_991),
+                        // these return what they were given, or resolve it first
+                        "_slice" | "_array" if kinds.first().is_some_and(materialized) => Type::Value,
+                        "_history" | "_emissions" => Type::Value,
+                        "_tokens" => Type::Integer(0, 9_007_199_254_740_991),
+                        // a fold resolves what it returns
+                        "_fold" => Type::Value,
+                        "_range" => match args.as_slice() {
+                            [Expr::Number(low), Expr::Number(high), Expr::Number(whole), ..] if whole == "1" => {
+                                match (low.parse::<i128>(), high.parse::<i128>()) {
+                                    (Ok(low), Ok(high)) => Type::Integer(low, high),
+                                    _ => Type::Number,
+                                }
+                            }
+                            _ => Type::Number,
+                        },
+                        // a choice is whichever option it takes
+                        "_select" | "_weighted" => {
+                            let choices = args.get(1);
+                            let mut kinds = Vec::new();
+                            if let Some(Expr::Array(items)) = choices {
+                                for item in items {
+                                    if let Expr::Call { args, .. } = item
+                                        && let [Expr::Lambda { value, .. }] = args.as_slice()
+                                    {
+                                        kinds.push(expression((**value).clone(), env, lang).1);
+                                    }
+                                }
+                            }
+                            let all = kinds.len();
+                            match kinds.into_iter().reduce(join) {
+                                Some(kind) if all > 0 && materialized(&kind) => kind,
+                                _ => Type::Unknown,
+                            }
+                        }
                         _ => env.returns.get(&name).cloned().unwrap_or(Type::Unknown),
                     };
                     (call, kind)
@@ -4997,6 +5601,18 @@ mod native {
             Expr::Binary { left, op, right } => {
                 let (left, a) = expression(*left, env, lang);
                 let (right, b) = expression(*right, env, lang);
+                if op == BinOp::And && matches!(b, Type::Bool) && matches!(left, Expr::Bool(true)) {
+                    return (right, Type::Bool);
+                }
+                if op == BinOp::Or && matches!(b, Type::Bool) && matches!(left, Expr::Bool(false)) {
+                    return (right, Type::Bool);
+                }
+                if op == BinOp::Or && matches!(a, Type::Bool) && matches!(right, Expr::Bool(false)) {
+                    return (left, Type::Bool);
+                }
+                if op == BinOp::And && matches!(a, Type::Bool) && matches!(right, Expr::Bool(true)) {
+                    return (left, Type::Bool);
+                }
                 let t = match op {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or => {
                         Type::Bool
@@ -5024,6 +5640,12 @@ mod native {
             }
             Expr::Conditional { condition, yes, no } => {
                 let (condition, _) = expression(*condition, env, lang);
+                // a condition that is already decided leaves one side
+                match condition {
+                    Expr::Bool(true) => return expression(*yes, env, lang),
+                    Expr::Bool(false) => return expression(*no, env, lang),
+                    _ => {}
+                }
                 let (yes, a) = expression(*yes, env, lang);
                 let (no, b) = expression(*no, env, lang);
                 (
@@ -5052,6 +5674,8 @@ mod native {
                 }
                 let t = match t {
                     Type::Object(fields) | Type::Span(fields, _) => fields.get(&key).cloned().unwrap_or(unknown),
+                    // the length of a list or a string
+                    _ if key == "length" => Type::Integer(0, 9_007_199_254_740_991),
                     _ => unknown,
                 };
                 (value.member(key), t)
@@ -5115,7 +5739,12 @@ mod native {
                 Expr::Contains(Box::new(expression(*a, env, lang).0), Box::new(expression(*b, env, lang).0)),
                 Type::Bool,
             ),
-            Expr::Spread(value) => (Expr::Spread(Box::new(expression(*value, env, lang).0)), unknown),
+            Expr::Spread(value) => {
+                let (value, kind) = expression(*value, env, lang);
+                // spreading plain data gives plain items
+                let kind = if materialized(&kind) { Type::Value } else { unknown };
+                (Expr::Spread(Box::new(value)), kind)
+            }
             Expr::Template(items) => {
                 let items: Vec<_> = items.into_iter().map(|v| expression(v, env, lang).0).collect();
                 if items.iter().all(|v| matches!(v, Expr::String(_))) {
@@ -5243,30 +5872,6 @@ mod expressions {
             )
         };
         Ok(match func {
-            Func::FlowRead { node, binding } => Expr::call(
-                "_flow_read",
-                vec!["_flow".into(), "_occ".into(), Expr::number(node.0), Expr::number(binding)],
-            ),
-            Func::FlowProperty { binding, value } => Expr::call(
-                "_flow_property",
-                vec!["_occ".into(), Expr::number(binding), expr(value)?.lambda(vec![])],
-            ),
-            Func::FlowContext(path) => Expr::call(
-                "_flow_context",
-                vec![
-                    "_flow".into(),
-                    "_occ".into(),
-                    Expr::Array(path.iter().map(Expr::string).collect()),
-                ],
-            ),
-            Func::FlowInput { binding, ty } => Expr::call(
-                "_flow_input",
-                vec![
-                    "_occ".into(),
-                    Expr::number(binding),
-                    Expr::string(format!("{ty:?}").to_lowercase()),
-                ],
-            ),
             Func::ForkPick(branches) => Expr::call(
                 "_fork_pick",
                 vec![
@@ -5293,6 +5898,31 @@ mod expressions {
             ),
             Func::FoldAccumulator => "accumulator".into(),
             Func::FoldArrival => "arrival".into(),
+            Func::Emissions(join) => {
+                let optional =
+                    |value: &Option<Value>| Ok::<_, String>(value.as_ref().map(expr).transpose()?.unwrap_or(Expr::Null));
+                let inputs = (join.inputs.iter())
+                    .map(|input| {
+                        Ok(Expr::Object(vec![
+                            ("edge".into(), expr(&input.edge)?),
+                            ("arrived".into(), optional(&input.arrived)?),
+                            ("value".into(), optional(&input.value)?),
+                            ("shared".into(), Expr::Bool(input.shared)),
+                        ]))
+                    })
+                    .collect::<Result<_, String>>()?;
+                Expr::call(
+                    "_emissions",
+                    vec![
+                        Expr::string(format!("{:?}", join.kind).to_lowercase()),
+                        Expr::Array(inputs),
+                        Expr::Array(join.order.iter().map(Expr::number).collect()),
+                        optional(&join.rounds)?,
+                        optional(&join.keys)?,
+                        optional(&join.count)?,
+                    ],
+                )
+            }
             Func::Check { value, ty } => Expr::call(
                 "_check_type",
                 vec![expr(value)?, Expr::string(format!("{ty:?}").to_lowercase())],
@@ -5812,11 +6442,8 @@ pub(crate) mod scoring {
                 | Func::Fold { .. }
                 | Func::FoldAccumulator
                 | Func::FoldArrival
-                | Func::ForkPick(_)
-                | Func::FlowRead { .. }
-                | Func::FlowContext(_)
-                | Func::FlowProperty { .. }
-                | Func::FlowInput { .. } => {
+                | Func::Emissions(_)
+                | Func::ForkPick(_) => {
                     return Err(Error::Unsupported {
                         what: "runtime schema checks",
                     });

@@ -1291,7 +1291,8 @@ fn graph_fixture_runs_cycles_weighted_forks_and_juncts() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|file| file["contents"].as_str().unwrap().contains("_flow_run"))
+                .any(|file| !file["path"].as_str().unwrap().contains("runtime")
+                    && file["contents"].as_str().unwrap().contains("cycle max_traversals exceeded"))
         );
     }
     let failed = generate_result(&source.replace("max_traversals: 3", "max_traversals: 0"), &options);

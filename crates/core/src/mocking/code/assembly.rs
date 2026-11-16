@@ -378,7 +378,12 @@ mod agent_tests {
                 let extension = if lang == ScorerLang::Python { "py" } else { "mts" };
                 let runtime_name = format!("src/agents/{name}_agent_runtime.{extension}");
                 let runtime = built.files.iter().find(|file| file.name == runtime_name).unwrap();
-                assert_eq!(runtime.contents.contains("_tokens("), name == "count");
+                let counter = if lang == ScorerLang::Python {
+                    "count_tokens("
+                } else {
+                    "countTokens("
+                };
+                assert_eq!(runtime.contents.contains(counter), name == "count");
                 let source = built
                     .files
                     .iter()
