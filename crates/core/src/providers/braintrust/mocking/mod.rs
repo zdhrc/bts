@@ -96,10 +96,18 @@ fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
         }
         let agent = graph::NodeId(index);
         let Structure { members, parents } = structure(model, agent)?;
-        if model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
-            || model.junctions.iter().any(|junction| members.contains(&junction.target))
-        {
+        if model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source)) {
             lower_flow(model, agent, &members, parents, &mut result).at(node.range)?;
+            continue;
+        }
+        if model.junctions.iter().any(|junction| members.contains(&junction.target)) {
+            // the tree covers a junction on its own fork, any other junction walks as a flow
+            let saved = result.clone();
+            let tree = AgentLowering::new(model, agent, &mut result).and_then(|mut lowerer| lowerer.lower());
+            if tree.is_err() {
+                result = saved;
+                lower_flow(model, agent, &members, parents, &mut result).at(node.range)?;
+            }
             continue;
         }
         let mut lowerer = AgentLowering::new(model, agent, &mut result).at(node.range)?;
@@ -1111,8 +1119,12 @@ impl<'a> AgentLowering<'a> {
             if !members.contains(&junction.target) {
                 continue;
             }
-            if !inherits(graph, &junction.kind, "accumulate") {
-                return Err(located(junction.range, "mocking currently requires accumulate junctions"));
+            let reduce = inherits(graph, &junction.kind, "reduce");
+            if !reduce && !inherits(graph, &junction.kind, "accumulate") && !inherits(graph, &junction.kind, "first") {
+                return Err(located(
+                    junction.range,
+                    "mocking currently requires accumulate, first or reduce junctions",
+                ));
             }
             if !joined.insert(junction.target) {
                 return Err(located(
@@ -1128,8 +1140,31 @@ impl<'a> AgentLowering<'a> {
             if !members.contains(&source) {
                 return Err(located(junction.range, "junction group must belong to the same agent"));
             }
+            let rounds =
+                inherits(graph, &graph.forks[fork.0].kind, "each") || inherits(graph, &graph.forks[fork.0].kind, "repeat");
+            if reduce {
+                // the tree folds the result of one step across the rounds of its fork
+                let result = junction.props.iter().any(|id| {
+                    graph.bindings[id.0].path == ["observe"]
+                        && matches!(&graph.bindings[id.0].value, graph::Value::Str(mode) if mode == "result")
+                });
+                let source = junction.props.iter().all(|id| {
+                    graph.bindings[id.0].path != ["order"]
+                        || matches!(&graph.bindings[id.0].value, graph::Value::Str(order) if order == "source")
+                });
+                let branch = |id: &graph::EdgeId| graph.forks[fork.0].branches.iter().flatten().any(|edge| edge == id);
+                if !rounds || !result || !source || junction.inputs.len() != 1 || !branch(&junction.inputs[0]) {
+                    return Err(located(junction.range, "this reduce junction walks as a flow"));
+                }
+            } else if rounds {
+                // rounds feed a junction one arrival each, which only the flow walk queues
+                return Err(located(junction.range, "a junction on a repeating fork walks as a flow"));
+            }
             for id in &junction.props {
                 let binding = &graph.bindings[id.0];
+                if reduce && matches!(binding.path[0].as_str(), "initial" | "combine" | "order") {
+                    continue;
+                }
                 if binding.path != ["observe"]
                     || !matches!(&binding.value, graph::Value::Str(mode) if mode == "arrival" || mode == "result")
                 {
@@ -1656,13 +1691,25 @@ impl<'a> AgentLowering<'a> {
             .junction(node)
             .ok_or("context.arrivals requires a junction target")?
             .clone();
+        if inherits(self.graph, &junction.kind, "reduce") {
+            return Err("the arrivals of a reduce junction walk as a flow".into());
+        }
         let result = junction
             .props
             .iter()
             .any(|id| matches!(&self.graph.bindings[id.0].value, graph::Value::Str(value) if value == "result"));
+        let first = inherits(self.graph, &junction.kind, "first");
+        let mut inputs = junction.inputs.clone();
+        if first && let Some(fork) = junction.fork {
+            // branches run in the order the fork lists them, so that is the order they arrive in
+            let order: Vec<_> = self.graph.forks[fork.0].branches.iter().flatten().copied().collect();
+            inputs.sort_by_key(|id| order.iter().position(|edge| edge == id));
+        }
         let mut elem = Vec::new();
-        for id in junction.inputs {
+        let mut conditions = Vec::new();
+        for id in inputs {
             let edge = &self.graph.edges[id.0];
+            conditions.push(self.node_condition(edge.target));
             let name = edge
                 .name
                 .clone()
@@ -1692,7 +1739,58 @@ impl<'a> AgentLowering<'a> {
                 ],
             })));
         }
+        if first {
+            let mut value = execution::Value::Array(execution::Array { elem: vec![] });
+            for (item, cond) in elem.into_iter().zip(conditions).rev() {
+                value = execution::Value::Cond {
+                    cond: Box::new(cond),
+                    then: Box::new(execution::Value::Array(execution::Array { elem: vec![item] })),
+                    otherwise: Box::new(value),
+                };
+            }
+            return Ok(value);
+        }
         Ok(execution::Value::Array(execution::Array { elem }))
+    }
+
+    // a step that may not run sits under a gate, a reduce target always runs
+    fn gated(&self, node: graph::NodeId) -> bool {
+        !self.guards[&node].is_empty()
+            || !self.weighted_branches(node).is_empty()
+            || (self.junction(node)).is_some_and(|junction| !inherits(self.graph, &junction.kind, "reduce"))
+    }
+
+    // the folded value a reduce junction hands its target
+    fn accumulator(&mut self, node: graph::NodeId) -> Result<execution::Value, Error> {
+        let junction = self
+            .junction(node)
+            .filter(|junction| inherits(self.graph, &junction.kind, "reduce"))
+            .ok_or("context.accumulator requires a reduce junction target")?
+            .clone();
+        let prop = |name: &str| (junction.props.iter().copied()).find(|id| self.graph.bindings[id.0].path == [name]);
+        let initial = prop("initial").ok_or("reduce needs initial")?;
+        let combine = prop("combine").ok_or("reduce needs combine")?;
+        let observed = self.graph.edges[junction.inputs[0].0].target;
+        let output = self
+            .binding(observed, "output")
+            .ok_or("a reduce input needs an output to observe")?;
+        let execution::Value::BlockRef { ref_id, range } = self.reference(output)? else {
+            return Err("a reduce input needs an output to observe".into());
+        };
+        // every round of the observed step, in round order
+        let rounds = (self.result.refs[ref_id.0 as usize].steps.iter_mut())
+            .rev()
+            .find(|step| matches!(step, execution::Step::Iteration(_)))
+            .ok_or("a reduce input must run inside its fork's rounds")?;
+        *rounds = execution::Step::Iterations { start: None, end: None };
+        Ok(execution::Value::Func {
+            func: execution::Func::Fold {
+                items: Box::new(execution::Value::BlockRef { ref_id, range }),
+                initial: Box::new(self.binding_value(initial)?),
+                combine: Box::new(self.binding_value(combine)?),
+            },
+            range: junction.range,
+        })
     }
 
     fn guard_id(&self, node: graph::NodeId) -> execution::NodeId {
@@ -1761,25 +1859,34 @@ impl<'a> AgentLowering<'a> {
                         children: self.children(node)?,
                     })
                 };
-                let guards = &self.guards[&node];
-                if guards.is_empty() && self.junction(node).is_none() && self.weighted_branches(node).is_empty() {
+                if !self.gated(node) {
                     return Ok(span);
                 }
                 let condition = self.node_condition(node);
                 let active = if let Some(junction) = self.junction(node) {
+                    // accumulate needs every listed input and first needs any one of them
+                    let first = inherits(self.graph, &junction.kind, "first");
                     let ready =
                         junction
                             .inputs
                             .iter()
-                            .fold(execution::Value::Bool(true), |ready, id| execution::Value::Binary {
-                                op: execution::BinOp::And,
+                            .fold(execution::Value::Bool(!first), |ready, id| execution::Value::Binary {
+                                op: if first { execution::BinOp::Or } else { execution::BinOp::And },
                                 lhs: Box::new(ready),
                                 rhs: Box::new(self.node_condition(self.graph.edges[id.0].target)),
                                 range: junction.range,
                             });
-                    execution::Value::Func {
-                        func: execution::Func::Arrivals { ready: Box::new(ready) },
-                        range: junction.range,
+                    if first {
+                        execution::Value::Cond {
+                            cond: Box::new(ready),
+                            then: Box::new(execution::Value::Num(execution::Number::Int(1))),
+                            otherwise: Box::new(execution::Value::Num(execution::Number::Int(0))),
+                        }
+                    } else {
+                        execution::Value::Func {
+                            func: execution::Func::Arrivals { ready: Box::new(ready) },
+                            range: junction.range,
+                        }
                     }
                 } else {
                     execution::Value::Num(execution::Number::Int(1))
@@ -2014,10 +2121,7 @@ impl<'a> AgentLowering<'a> {
                             execution::CtxRef::RepeatIndexAt(self.each_id(index)),
                         )));
                     }
-                    if !self.guards[&node].is_empty()
-                        || self.junction(node).is_some()
-                        || !self.weighted_branches(node).is_empty()
-                    {
+                    if self.gated(node) {
                         steps.push(execution::Step::Child {
                             candidates: vec![self.guard_id(node)],
                             position: None,
@@ -2228,10 +2332,9 @@ impl<'a> AgentLowering<'a> {
                 if self.each_ancestor(target).map(|(i, _)| i) != Some(group) {
                     return Err("history must stay within the current repetition group".into());
                 }
-                let binding = self.graph.nodes[target.0]
-                    .fields
-                    .first()
-                    .copied()
+                // any payload field locates the step, a field of its own such as local does not
+                let binding = (self.graph.nodes[target.0].fields.iter().copied())
+                    .find(|id| Self::field(&self.graph.bindings[id.0].path[0]).is_some())
                     .ok_or("history target needs a payload field")?;
                 let V::BlockRef { ref_id, range } = self.reference(binding)? else {
                     return Err("history target needs a payload field".into());
@@ -2271,6 +2374,42 @@ impl<'a> AgentLowering<'a> {
                         target: Box::new(value),
                         index: Box::new(V::Str(key.clone())),
                         range: self.graph.nodes[node.0].range,
+                    };
+                }
+                value
+            }
+            G::Context {
+                owner: graph::ElementId::Node(node),
+                path,
+            } if path.first().is_some_and(|key| key == "accumulator") => {
+                let mut value = self.accumulator(*node)?;
+                for key in path.iter().skip(1) {
+                    value = V::Index {
+                        target: Box::new(value),
+                        index: Box::new(V::Str(key.clone())),
+                        range: self.graph.nodes[node.0].range,
+                    };
+                }
+                value
+            }
+            G::Context {
+                owner: graph::ElementId::Junction(junction),
+                path,
+            } if path.first().is_some_and(|key| key == "accumulator" || key == "arrival") => {
+                let range = self.graph.junctions[junction.0].range;
+                let mut value = V::Func {
+                    func: if path[0] == "accumulator" {
+                        execution::Func::FoldAccumulator
+                    } else {
+                        execution::Func::FoldArrival
+                    },
+                    range,
+                };
+                for key in path.iter().skip(1) {
+                    value = V::Index {
+                        target: Box::new(value),
+                        index: Box::new(V::Str(key.clone())),
+                        range,
                     };
                 }
                 value

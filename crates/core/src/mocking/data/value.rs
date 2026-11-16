@@ -332,6 +332,19 @@ pub mod expr {
         ForkPick(Vec<Vec<Value>>),
         /// Requires every listed junction input before activating its target.
         Arrivals { ready: Box<Value> },
+        /// Folds items into one value, starting from an initial value.
+        ///
+        /// The combine expression reads the running value through `FoldAccumulator`
+        /// and the current item through `FoldArrival`.
+        Fold {
+            items: Box<Value>,
+            initial: Box<Value>,
+            combine: Box<Value>,
+        },
+        /// The running value of the innermost fold.
+        FoldAccumulator,
+        /// The current item of the innermost fold, as a record with a `value` key.
+        FoldArrival,
         /// Checks the value delivered to a schema-constrained field.
         Check { value: Box<Value>, ty: bts_lang::FieldType },
         /// An English language operation evaluated by the consumer.

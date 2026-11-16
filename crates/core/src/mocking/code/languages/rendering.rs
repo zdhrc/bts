@@ -916,6 +916,13 @@ def _fork_pick(branches, random_source):
     return pick
 
 
+def _fold(items, initial, combine):
+    value = _value(initial)
+    for item in _value(items):
+        value = _value(combine(value, {"value": item}))
+    return value
+
+
 def _require_arrivals(ready):
     if ready is not True: raise ValueError("accumulate group closed with a missing listed input")
     return 1
@@ -1390,6 +1397,12 @@ function _fork_pick(branches: unknown[][], randomSource: () => number): number {
         }
     }
     return pick
+}
+
+function _fold(items: unknown, initial: unknown, combine: (accumulator: any, arrival: any) => unknown): unknown {
+    let value = _value(initial)
+    for (const item of _value(items) as unknown[]) value = _value(combine(value, {value: item}))
+    return value
 }
 
 function _require_arrivals(ready: unknown): number {

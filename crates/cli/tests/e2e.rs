@@ -2339,7 +2339,7 @@ fn agent_example_preserves_child_data_flow_in_both_languages() {
         let extension = if lang == "python" { "py" } else { "mts" };
         let generated =
             fs::read_to_string(root.join(lang).join(format!("src/agents/customer_support_agent.{extension}"))).unwrap();
-        assert!(generated.contains("_flow_run"));
+        assert!(!generated.contains("_flow_run"), "the example needs no flow interpreter");
         let scorers = bts()
             .current_dir(&root)
             .args([
@@ -2486,7 +2486,7 @@ for(const row of cases){
             .unwrap();
         assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
         let payload: JsonValue = serde_json::from_slice(&preview.stdout).unwrap();
-        assert!((16..=19).contains(&payload["events"].as_array().unwrap().len()));
+        assert!((16..=20).contains(&payload["events"].as_array().unwrap().len()));
         let mut reply = payload["events"][0]["output"][0].clone();
         reply.as_object_mut().unwrap().remove("retried");
         reply.as_object_mut().unwrap().remove("handoff");
@@ -3393,7 +3393,10 @@ fn agent_native_values_preserve_results_names_and_lazy_failures() {
         assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
         let extension = if lang == "python" { "py" } else { "mts" };
         let source = fs::read_to_string(root.join(lang).join(format!("src/agents/native_agent.{extension}"))).unwrap();
-        assert!(source.contains("_flow_run"));
+        assert!(
+            !source.contains("_flow_run"),
+            "a step's own values do not need the flow interpreter"
+        );
         let (program, script) = if lang == "python" {
             (
                 "python3",

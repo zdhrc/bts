@@ -221,6 +221,8 @@ struct Ctx<'m> {
     instances: Vec<Instance>,
     attachments: Vec<Attachment>,
     flow: Option<FlowState>,
+    // the running value and current item of each fold being evaluated, innermost last
+    folds: Vec<(ModelValue, ModelValue)>,
 }
 
 impl<'m> Ctx<'m> {
@@ -239,6 +241,7 @@ impl<'m> Ctx<'m> {
             instances: Vec::new(),
             attachments: Vec::new(),
             flow: None,
+            folds: Vec::new(),
         }
     }
 
@@ -1876,6 +1879,36 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             }
             ModelValue::Num(ModelNumber::Int(1))
         }
+        ModelFunc::Fold { items, initial, combine } => {
+            let ModelValue::Array(items) = json_to_value(lower_value(*items, ctx)?) else {
+                return Err(Error::new(ErrorKind::RefShapeMismatch, range));
+            };
+            let mut accumulator = eval_binding(*initial, ctx)?;
+            for item in items.elem {
+                let ModelArrayElem::Item(value) = item else {
+                    return Err(Error::new(ErrorKind::RefShapeMismatch, range));
+                };
+                let arrival = ModelValue::Object(ModelObject {
+                    elem: vec![ModelObjectField {
+                        key: "value".into(),
+                        value,
+                    }],
+                });
+                ctx.folds.push((accumulator, arrival));
+                let combined = eval_binding((*combine).clone(), ctx);
+                ctx.folds.pop();
+                accumulator = json_to_value(lower_value(combined?, ctx)?);
+            }
+            accumulator
+        }
+        ModelFunc::FoldAccumulator => match ctx.folds.last() {
+            Some((accumulator, _)) => accumulator.clone(),
+            None => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+        },
+        ModelFunc::FoldArrival => match ctx.folds.last() {
+            Some((_, arrival)) => arrival.clone(),
+            None => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+        },
         ModelFunc::Check { value, ty } => {
             use bts_lang::FieldType;
             let value = eval_binding(*value, ctx)?;
@@ -5361,10 +5394,10 @@ mod tests {
 (t)-[:next]->(t_root);"#,
         )
         .unwrap();
-        let plan = plan(model, 8, 17).unwrap();
+        let plan = plan(model, 32, 17).unwrap();
 
         let included = plan.events.iter().filter(|event| event.parent.is_some()).count();
-        assert!((1..8).contains(&included), "expected a mix of inclusions, got {included}");
+        assert!((1..32).contains(&included), "expected a mix of inclusions, got {included}");
     }
 
     #[test]

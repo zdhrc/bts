@@ -1154,7 +1154,7 @@ mod execution {
                         body: work,
                     }]
                 }
-                Err(error) if model.ordered => return Err(error),
+                // statements that cannot be put in one order are emitted lazily instead
                 Err(_) => {
                     let mut work = scope(Some(&trace.fields), &all_bindings, &trace.children, "root", &ctx, lang, true)?;
                     work.push(Statement::Return(Expr::call(
@@ -5041,6 +5041,19 @@ mod expressions {
                 ],
             ),
             Func::Arrivals { ready } => call("_require_arrivals", &[ready])?,
+            Func::Fold { items, initial, combine } => Expr::call(
+                "_fold",
+                vec![
+                    expr(items)?,
+                    expr(initial)?,
+                    Expr::Lambda {
+                        parameters: vec![code::Parameter::new("accumulator"), code::Parameter::new("arrival")],
+                        value: Box::new(expr(combine)?),
+                    },
+                ],
+            ),
+            Func::FoldAccumulator => "accumulator".into(),
+            Func::FoldArrival => "arrival".into(),
             Func::Check { value, ty } => Expr::call(
                 "_check_type",
                 vec![expr(value)?, Expr::string(format!("{ty:?}").to_lowercase())],
@@ -5557,6 +5570,9 @@ pub(crate) mod scoring {
             Ok(match func {
                 Func::Check { .. }
                 | Func::Arrivals { .. }
+                | Func::Fold { .. }
+                | Func::FoldAccumulator
+                | Func::FoldArrival
                 | Func::ForkPick(_)
                 | Func::FlowRead { .. }
                 | Func::FlowContext(_)

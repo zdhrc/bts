@@ -1521,7 +1521,7 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
         assert!(spans.contains(&("file".into(), json!(item), "request".into(), json!("hi"))));
         assert!(spans.contains(&("parse".into(), json!(item), "file".into(), json!(item))));
     }
-    // a flow plan: the junction makes this agent a flow, and each probe sits under its own round
+    // a reduce junction on the rounds: each probe sits under its own round and the fold follows the loop
     let flowing = r#"
 (chat:agent) {input: "hi", output: closing.output};
 (chat)-[:next]->(request:task) {input: chat.input, output: closing.output};
@@ -1536,7 +1536,7 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
         };
 "#;
     let model = lower(flowing).unwrap();
-    assert_eq!(model.flows.len(), 1);
+    assert!(model.flows.is_empty(), "a reduce over rounds needs no flow interpreter");
     let spans = span_parents(&flow_batch(flowing));
     assert_eq!(spans.len(), 8);
     for index in 0..3 {
@@ -1544,6 +1544,17 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
         assert!(spans.contains(&("probe".into(), json!(index), "inspect".into(), json!(index))));
     }
     assert!(spans.contains(&("closing".into(), json!([0, 1, 2]), "request".into(), json!("hi"))));
+    // data generation and generated code run the rounds in the same order
+    let order: Vec<_> = spans
+        .iter()
+        .map(|(name, input, _, _)| (name.clone(), input.clone()))
+        .collect();
+    for details in flow_code(&model, "chat") {
+        let code: Vec<_> = (details["spans"].as_array().unwrap().iter())
+            .map(|span| (span["name"].as_str().unwrap().to_owned(), span["input"].clone()))
+            .collect();
+        assert_eq!(code, order);
+    }
 }
 
 #[test]
