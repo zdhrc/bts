@@ -103,6 +103,8 @@ struct Modeler {
     unchecked: HashSet<ElementId>,
     // every name a definition statement introduced, including definitions that failed
     defined: HashSet<String>,
+    // every context read with the element that owns it, the path after context and its location
+    context_reads: Vec<(ElementId, Vec<String>, SrcRange)>,
     errors: Diags,
 }
 
@@ -124,6 +126,7 @@ impl Modeler {
             defaults: HashMap::new(),
             unchecked: HashSet::new(),
             defined: HashSet::new(),
+            context_reads: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -188,6 +191,8 @@ impl Modeler {
                         props: Vec::new(),
                         fields: Vec::new(),
                         open: false,
+                        provides: Vec::new(),
+                        requires: Vec::new(),
                         traits: Vec::new(),
                         range: entry.range,
                     }));
@@ -204,6 +209,8 @@ impl Modeler {
                         on: Vec::new(),
                         props: Vec::new(),
                         fields: Vec::new(),
+                        provides: Vec::new(),
+                        requires: Vec::new(),
                         range: entry.range,
                     }));
                 }
@@ -1064,10 +1071,11 @@ impl Modeler {
                         Some(ElementId::Node(node)) => Cursor::Element(ElementId::Node(node)),
                         _ => return Err(error(expr.range, "self requires a node-owned expression")),
                     },
-                    "context" => Cursor::Context(
-                        owner.ok_or_else(|| error(expr.range, "context requires an owning graph element"))?,
-                        Vec::new(),
-                    ),
+                    "context" => {
+                        let owner = owner.ok_or_else(|| error(expr.range, "context requires an owning graph element"))?;
+                        self.context_reads.push((owner, path[1..].to_vec(), expr.range));
+                        Cursor::Context(owner, Vec::new())
+                    }
                     "source" | "target" | "left" | "right" => {
                         let element = owner.ok_or_else(|| error(expr.range, "endpoint access requires an edge or fork"))?;
                         if !matches!(element, ElementId::Edge(_) | ElementId::Fork(_)) {
@@ -1365,6 +1373,124 @@ impl Modeler {
         ReferenceValue { value, bindings }
     }
 
+    // the context keys an element's kind provides (true) or requires (false)
+    fn declared_context(&self, owner: ElementId, provides: bool) -> Vec<String> {
+        let names = |keys: &[FieldSchema]| keys.iter().map(|key| key.name.clone()).collect();
+        if let Some(kind) = self.kind_schema(owner) {
+            return names(if provides { &kind.provides } else { &kind.requires });
+        }
+        let (name, construct) = self.element_kind(owner);
+        let (provided, required) = primitive_context(construct, name, SrcRange::new(0, 0));
+        names(if provides { &provided } else { &required })
+    }
+
+    // a read names a key its element's kind requires, or one a provider upstream supplies
+    fn check_context(&mut self) {
+        let model = &self.model;
+        // keys that reach each node from upstream
+        let mut reach: Vec<BTreeSet<String>> = vec![BTreeSet::new(); model.nodes.len()];
+        let leaving = |reach: &[BTreeSet<String>], node: NodeId| {
+            let mut keys = reach[node.0].clone();
+            keys.extend(self.declared_context(ElementId::Node(node), true));
+            keys
+        };
+        let branch = |edge: &Edge| -> Vec<String> {
+            edge.fork
+                .map(|fork| self.declared_context(ElementId::Fork(fork), true))
+                .unwrap_or_default()
+        };
+        // what an edge sees at its source, which is also what a junction receives from it
+        let carried = |reach: &[BTreeSet<String>], edge: &Edge| {
+            let mut keys = leaving(reach, edge.source);
+            keys.extend(branch(edge));
+            keys
+        };
+        loop {
+            let mut arriving: Vec<(NodeId, BTreeSet<String>)> = Vec::new();
+            for (index, edge) in model.edges.iter().enumerate() {
+                // a fork's keys reach each branch destination, other keys travel along next edges only
+                if let Some(fork) = edge.fork {
+                    let origin = model.forks[fork.0].source;
+                    let destination = if edge.source == origin { edge.target } else { edge.source };
+                    arriving.push((destination, branch(edge).into_iter().collect()));
+                }
+                if primitive(model, ElementId::Edge(EdgeId(index))) == "next" {
+                    arriving.push((edge.target, leaving(&reach, edge.source)));
+                }
+            }
+            for (index, junction) in model.junctions.iter().enumerate() {
+                let mut keys: BTreeSet<String> = self
+                    .declared_context(ElementId::Junction(JunctionId(index)), true)
+                    .into_iter()
+                    .collect();
+                for input in &junction.inputs {
+                    keys.extend(carried(&reach, &model.edges[input.0]));
+                }
+                arriving.push((junction.target, keys));
+            }
+            let mut changed = false;
+            for (node, keys) in arriving {
+                for key in keys {
+                    changed |= reach[node.0].insert(key);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut errors = Vec::new();
+        for (owner, path, range) in &self.context_reads {
+            let Some(key) = path.first() else { continue };
+            let mut available: BTreeSet<String> = self.declared_context(*owner, false).into_iter().collect();
+            match *owner {
+                ElementId::Node(node) => {
+                    available.extend(reach[node.0].iter().cloned());
+                    // history is defined by the language for every node and is keyed by node name
+                    available.insert("history".to_owned());
+                    if key == "history" {
+                        let nodes = || {
+                            (model.names.iter())
+                                .filter(|(_, element)| matches!(element, ElementId::Node(_)))
+                                .map(|(name, _)| name.as_str())
+                        };
+                        if let Some(name) = path.get(1)
+                            && !nodes().any(|node| node == name)
+                        {
+                            errors.extend(error(
+                                *range,
+                                format!("unknown history node `{name}`{}", suggestion(name, nodes())),
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                ElementId::Edge(edge) => available.extend(carried(&reach, &model.edges[edge.0])),
+                ElementId::Fork(fork) => available.extend(leaving(&reach, model.forks[fork.0].source)),
+                ElementId::Junction(junction) => {
+                    for input in &model.junctions[junction.0].inputs {
+                        available.extend(carried(&reach, &model.edges[input.0]));
+                    }
+                }
+            }
+            if available.contains(key) {
+                continue;
+            }
+            let listed = if available.is_empty() {
+                "none are available".to_owned()
+            } else {
+                format!("available: {}", available.iter().cloned().collect::<Vec<_>>().join(", "))
+            };
+            errors.extend(error(
+                *range,
+                format!(
+                    "context key `{key}` is not available here{} ({listed})",
+                    suggestion(key, available.iter().map(String::as_str))
+                ),
+            ));
+        }
+        self.errors.extend(errors);
+    }
+
     fn validate_primitives(&self) -> Result<()> {
         let mut errors = Vec::new();
         for (i, junction) in self.model.junctions.iter().enumerate() {
@@ -1547,6 +1673,92 @@ fn schema_string(expr: &ast::Expr) -> Result<String> {
     }
 }
 
+fn type_named(name: &str) -> Option<FieldType> {
+    Some(match name {
+        "any" => FieldType::Any,
+        "string" => FieldType::String,
+        "number" => FieldType::Number,
+        "boolean" => FieldType::Boolean,
+        "array" => FieldType::Array,
+        "object" => FieldType::Object,
+        _ => return None,
+    })
+}
+
+fn schema_type(descriptor: &ast::Attr) -> Result<FieldType> {
+    type_named(&schema_string(&descriptor.value)?).ok_or_else(|| error(descriptor.range, "unknown schema value type"))
+}
+
+// the keys listed on one provides or requires relationship, a key takes a type and nothing else
+fn context_keys(relationship: &Relationship, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+    for attr in &relationship.keys {
+        if !seen.insert(&attr.key) {
+            errors.extend(error(key_range(attr), "duplicate context key"));
+        } else if attr.key == "history" {
+            errors.extend(error(key_range(attr), "context.history is defined by the language"));
+        } else if let Err(diags) = context_key(attr, inherited) {
+            errors.extend(diags);
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+fn context_key(attr: &ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    let position = inherited.iter().position(|entry| entry.name == attr.key);
+    let previous = position.map(|position| inherited[position].ty);
+    let mut ty = previous.unwrap_or(FieldType::Any);
+    for descriptor in schema_entries(&attr.value)? {
+        if descriptor.key != "type" {
+            return Err(error(
+                descriptor.range,
+                format!(
+                    "unknown context descriptor `{}`, a context key takes type only",
+                    descriptor.key
+                ),
+            ));
+        }
+        ty = schema_type(&descriptor)?;
+    }
+    if previous.is_some_and(|previous| previous != FieldType::Any && previous != ty) {
+        return Err(error(attr.range, "a context key cannot change its inherited type"));
+    }
+    let schema = FieldSchema {
+        name: attr.key.clone(),
+        ty,
+        required: false,
+        default: None,
+        role: None,
+        range: attr.range,
+    };
+    match position {
+        Some(position) => inherited[position] = schema,
+        None => inherited.push(schema),
+    }
+    Ok(())
+}
+
+// the context a built-in kind declares in the language reference
+fn primitive_context(construct: Construct, primitive: &str, range: SrcRange) -> (Vec<FieldSchema>, Vec<FieldSchema>) {
+    let schemas = |keys: &[crate::spec::ContextDesc]| {
+        keys.iter()
+            .map(|key| FieldSchema {
+                name: key.name.to_owned(),
+                ty: type_named(key.ty).unwrap_or(FieldType::Any),
+                required: false,
+                default: None,
+                role: None,
+                range,
+            })
+            .collect()
+    };
+    match crate::spec::SPEC.primitive(construct.name(), primitive) {
+        Some(found) => (schemas(found.provides), schemas(found.requires)),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
 // descriptors written directly in a definition's header braces or body
 fn schema_attrs(attrs: &[ast::Attr], inherited: &mut Vec<FieldSchema>) -> Result<()> {
     let mut seen = HashSet::new();
@@ -1587,15 +1799,7 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
         for descriptor in schema_entries(&field.value)? {
             match descriptor.key.as_str() {
                 "type" => {
-                    schema.ty = match schema_string(&descriptor.value)?.as_str() {
-                        "any" => FieldType::Any,
-                        "string" => FieldType::String,
-                        "number" => FieldType::Number,
-                        "boolean" => FieldType::Boolean,
-                        "array" => FieldType::Array,
-                        "object" => FieldType::Object,
-                        _ => return Err(error(descriptor.range, "unknown schema value type")),
-                    };
+                    schema.ty = schema_type(&descriptor)?;
                 }
                 "required" => match descriptor.value.kind {
                     ast::ExprKind::Bool(value) => schema.required = value,
@@ -1762,12 +1966,25 @@ enum Relation {
     Extends,
     Has,
     On,
+    Provides,
+    Requires,
+}
+
+// which list of a kind a trait entry lands in
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Entry {
+    Property,
+    Field,
+    Provides,
+    Requires,
 }
 
 #[derive(Clone)]
 struct Relationship {
     relation: Relation,
     target: String,
+    // context keys, for provides and requires
+    keys: Vec<ast::Attr>,
     // the connector and its target
     range: SrcRange,
 }
@@ -1790,8 +2007,8 @@ struct Definitions<'a> {
     states: Vec<u8>,
     kinds: Vec<Option<Kind>>,
     traits: Vec<Option<Trait>>,
-    // the trait entry that supplied a property (true) or field (false) of a kind
-    origins: Vec<HashMap<(bool, String), usize>>,
+    // the trait entry that supplied a property, field or context key of a kind
+    origins: Vec<HashMap<(Entry, String), usize>>,
 }
 
 impl<'a> Definitions<'a> {
@@ -1850,17 +2067,19 @@ impl<'a> Definitions<'a> {
     fn resolve_trait_definition(&mut self, index: usize) -> Result<Trait> {
         let entry = &self.entries[index];
         let (name, head, range) = (entry.name, entry.head, entry.range);
+        let relationships = entry.relationships.clone();
         let mut errors = Vec::new();
         let mut base = None;
         let mut extended = false;
         let mut on: Vec<(Construct, SrcRange)> = Vec::new();
-        for relationship in &entry.relationships {
+        for relationship in &relationships {
             let target = relationship.target.as_str();
             match relationship.relation {
                 Relation::Has => errors.extend(error(
                     relationship.range,
                     "a trait cannot have traits, it may extend one trait",
                 )),
+                Relation::Provides | Relation::Requires => {}
                 Relation::On => match construct_named(target) {
                     Some(construct) => {
                         if !on.iter().any(|(listed, _)| *listed == construct) {
@@ -1917,6 +2136,8 @@ impl<'a> Definitions<'a> {
                 on: Vec::new(),
                 props: Vec::new(),
                 fields: Vec::new(),
+                provides: Vec::new(),
+                requires: Vec::new(),
                 range,
             },
         };
@@ -1933,6 +2154,16 @@ impl<'a> Definitions<'a> {
         }
         if let Err(diags) = schema_attrs(head.body.as_deref().unwrap_or(&[]), &mut resolved.fields) {
             errors.extend(diags);
+        }
+        for relationship in &relationships {
+            let keys = match relationship.relation {
+                Relation::Provides => &mut resolved.provides,
+                Relation::Requires => &mut resolved.requires,
+                _ => continue,
+            };
+            if let Err(diags) = context_keys(relationship, keys) {
+                errors.extend(diags);
+            }
         }
         if !resolved.fields.is_empty() && resolved.on.iter().any(|construct| *construct != Construct::Node) {
             errors.extend(error(
@@ -1964,10 +2195,12 @@ impl<'a> Definitions<'a> {
         let mut errors = Vec::new();
         let mut base = None;
         let mut has = Vec::new();
+        let mut context = Vec::new();
         for relationship in &relationships {
             match relationship.relation {
                 Relation::On => errors.extend(error(relationship.range, "`on` belongs to a trait definition")),
                 Relation::Has => has.push(relationship),
+                Relation::Provides | Relation::Requires => context.push(relationship),
                 Relation::Extends if base.is_some() => {
                     errors.extend(error(relationship.range, "a kind extends one base"));
                 }
@@ -1978,19 +2211,24 @@ impl<'a> Definitions<'a> {
             return Err(errors);
         }
         let crosses = |at: SrcRange| error(at, "kind extension crosses graph construct categories");
-        let root = |base: &str, at: SrcRange| Kind {
-            name: String::new(),
-            base: base.to_owned(),
-            base_kind: None,
-            construct,
-            primitive: base.to_owned(),
-            direction: (construct == Construct::Edge).then(|| primitive_direction(base)),
-            props: primitive_properties(construct, base, at),
-            fields: Vec::new(),
-            // the built-in node kinds take any content field
-            open: true,
-            traits: Vec::new(),
-            range: at,
+        let root = |base: &str, at: SrcRange| {
+            let (provides, requires) = primitive_context(construct, base, at);
+            Kind {
+                name: String::new(),
+                base: base.to_owned(),
+                base_kind: None,
+                construct,
+                primitive: base.to_owned(),
+                direction: (construct == Construct::Edge).then(|| primitive_direction(base)),
+                props: primitive_properties(construct, base, at),
+                fields: Vec::new(),
+                // the built-in node kinds take any content field
+                open: true,
+                provides,
+                requires,
+                traits: Vec::new(),
+                range: at,
+            }
         };
         let mut origins = HashMap::new();
         let mut kind = match base {
@@ -2072,11 +2310,20 @@ impl<'a> Definitions<'a> {
                 lineage.push(position);
                 next = self.traits[position].as_ref().and_then(|extended| extended.base);
             }
-            for (property, supplied) in [(true, &attached.props), (false, &attached.fields)] {
-                let entries = if property { &mut kind.props } else { &mut kind.fields };
-                let what = if property { "property" } else { "field" };
+            for (entry, supplied) in [
+                (Entry::Property, &attached.props),
+                (Entry::Field, &attached.fields),
+                (Entry::Provides, &attached.provides),
+                (Entry::Requires, &attached.requires),
+            ] {
+                let (entries, what) = match entry {
+                    Entry::Property => (&mut kind.props, "property"),
+                    Entry::Field => (&mut kind.fields, "field"),
+                    Entry::Provides => (&mut kind.provides, "provided context key"),
+                    Entry::Requires => (&mut kind.requires, "required context key"),
+                };
                 for field in supplied {
-                    let key = (property, field.name.clone());
+                    let key = (entry, field.name.clone());
                     let Some(position) = entries.iter().position(|entry| entry.name == field.name) else {
                         entries.push(field.clone());
                         origins.insert(key, found);
@@ -2170,6 +2417,15 @@ impl<'a> Definitions<'a> {
         if kind.fields.iter().any(|field| field.name == "props") {
             errors.extend(error(kind.range, "props is reserved for node properties"));
         }
+        for relationship in context {
+            let keys = match relationship.relation {
+                Relation::Provides => &mut kind.provides,
+                _ => &mut kind.requires,
+            };
+            if let Err(diags) = context_keys(relationship, keys) {
+                errors.extend(diags);
+            }
+        }
         if errors.is_empty() {
             self.origins[index] = origins;
             Ok(kind)
@@ -2222,15 +2478,25 @@ fn relationship(step: &ast::GraphEdgeStep) -> Result<Relationship> {
         "extends" => Relation::Extends,
         "has" => Relation::Has,
         "on" => Relation::On,
+        "provides" => Relation::Provides,
+        "requires" => Relation::Requires,
         other => {
             return Err(error(
                 header.range,
-                format!("unknown relationship `{other}`, expected extends, has or on"),
+                format!("unknown relationship `{other}`, expected extends, has, on, provides or requires"),
             ));
         }
     };
-    if header.name.is_some() || header.props.is_some() {
-        return Err(error(header.range, "a relationship edge has no name and no properties"));
+    let context = matches!(relation, Relation::Provides | Relation::Requires);
+    if header.name.is_some() || (!context && header.props.is_some()) {
+        return Err(error(
+            header.range,
+            if context {
+                "a relationship edge has no name"
+            } else {
+                "a relationship edge has no name and no properties"
+            },
+        ));
     }
     if step.cycle || step.direction != Direction::Directed {
         return Err(error(step.range, "a relationship edge is written -[:kind]->"));
@@ -2248,9 +2514,20 @@ fn relationship(step: &ast::GraphEdgeStep) -> Result<Relationship> {
     let Some(target) = target else {
         return Err(error(step.range, "a relationship target references a definition by name"));
     };
+    let keys = header.props.clone().unwrap_or_default();
+    if context && (target != "context" || keys.is_empty()) {
+        return Err(error(
+            step.range,
+            format!(
+                "`{}` lists context keys and targets context, written -[:{} {{key: {{type: \"any\"}}}}]->(context)",
+                header.kind, header.kind
+            ),
+        ));
+    }
     Ok(Relationship {
         relation,
         target,
+        keys,
         range: step.range,
     })
 }
@@ -2528,6 +2805,10 @@ pub(super) fn model(ast: ast::GraphDocument) -> Result<Model> {
         )
         .collect();
     debug_assert!(unresolved.is_empty() || !modeler.errors.is_empty());
+    // a read is judged against the whole graph, so one unresolved or unchecked element defers the check
+    if unresolved.is_empty() && modeler.unchecked.is_empty() {
+        modeler.check_context();
+    }
     if let Err(diags) = validate_graph(&mut modeler.model, &modeler.unchecked, &unresolved) {
         modeler.errors.extend(diags);
     }

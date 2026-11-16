@@ -21,7 +21,8 @@ pub const SOURCE: Source<'static> = Source {
     output: {type: "any", role: "output"},
     expected: {type: "any", role: "input"},
     metadata: {type: "object", role: "input"},
-};
+}
+    -[:requires {trace_index: {type: "number"}}]->(context);
 
 # provider schemas describe span data, they do not execute or emit spans
 # names are optional so anonymous graph nodes remain usable
@@ -38,7 +39,8 @@ pub const SOURCE: Source<'static> = Source {
     tags: {type: "array"},
     duration: {type: "number"},
     local: {type: "object"},
-};
+}
+    -[:requires {trace_index: {type: "number"}}]->(context);
 
 +(tool:node)-[:extends]->(span);
 +(task:node)-[:extends]->(span);
@@ -62,7 +64,15 @@ pub const SOURCE: Source<'static> = Source {
     judge: {type: "object"},
     reason: {type: "string"},
 }
-    -[:extends]->(span);
+    -[:extends]->(span)
+    -[:requires {
+        input: {type: "any"},
+        output: {type: "any"},
+        expected: {type: "any"},
+        metadata: {type: "object"},
+        index: {type: "number"},
+        count: {type: "number"},
+    }]->(context);
 
 # datasets and evaluations connect authored cases to modeled behavior
 +(dataset:node {name: {type: "string"}}) {description: {type: "string"}, cases: {type: "array", required: true}};

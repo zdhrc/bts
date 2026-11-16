@@ -1501,4 +1501,20 @@ fn consumer_rejections_point_at_the_offending_element() {
             .unwrap_or_else(|| panic!("{errors:#?}"));
         assert_eq!(&source[found.r#where.start..found.r#where.end], located);
     }
+    // a misspelled context key is a compile error at the read, with the keys available there
+    let source = r#"(probe:agent) {input: null, output: null};
+(probe)-[:next]->(a:task {name: "a"})
+    =[:parallel]=>[
+        -[one:next]->(b:task {name: "b"}),
+        -[two:next]->(c:task {name: "c"}),
+    ]
+        >[:accumulate [one], [two]]>>(joined:task {name: "joined"}) {input: context.arivals};"#;
+    let errors = Bundle::compile_module(source, false).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(
+        errors[0].what,
+        "context key `arivals` is not available here, did you mean `arrivals`? (available: arrivals, history, trace_index)"
+    );
+    let range = errors[0].r#where;
+    assert_eq!(&source[range.start..range.end], "context.arivals");
 }

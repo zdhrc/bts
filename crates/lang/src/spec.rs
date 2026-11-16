@@ -54,6 +54,22 @@ pub struct PrimitiveDesc {
     pub construct: &'static str,
     /// Structural and behavioral contract.
     pub summary: &'static str,
+    /// Context keys the primitive supplies to what it leads to.
+    pub provides: &'static [ContextDesc],
+    /// Context keys the primitive reads in its own properties.
+    pub requires: &'static [ContextDesc],
+}
+/// A context key declared by a built-in kind.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+pub struct ContextDesc {
+    /// Key read as context.name.
+    pub name: &'static str,
+    /// Value type, one of the schema descriptor types.
+    #[serde(rename = "type")]
+    pub ty: &'static str,
+}
+const fn key(name: &'static str, ty: &'static str) -> ContextDesc {
+    ContextDesc { name, ty }
 }
 /// A stable textual identifier for an entry in the language reference.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
@@ -893,7 +909,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.declarations"),
-        summary: "The + marker introduces a root definition, written as a graph statement. Its head is a node declaration whose name is the defined name and whose kind names the construct: node, edge, fork, junction or trait. Edges from the head relate it to other definitions: extends names its base, has attaches a trait and on lists the constructs a trait applies to. A kind without extends derives from its construct root. Bases resolve forward to declared kinds or built-in roots and primitives. Names must be unquoted identifiers in definitions, relationship targets and instances. Kinds and traits are unique in one namespace separate from instance names, cannot shadow built-ins or reserved names, and cannot form inheritance cycles. A kind extends at most one base, and bases and instances must use the same construct category. A definition-only module is valid. Derived kinds retain their base primitive validation and operation identity.",
+        summary: "The + marker introduces a root definition, written as a graph statement. Its head is a node declaration whose name is the defined name and whose kind names the construct: node, edge, fork, junction or trait. Edges from the head relate it to other definitions: extends names its base, has attaches a trait, on lists the constructs a trait applies to, and provides and requires declare context keys. A kind without extends derives from its construct root. Bases resolve forward to declared kinds or built-in roots and primitives. Names must be unquoted identifiers in definitions, relationship targets and instances. Kinds and traits are unique in one namespace separate from instance names, cannot shadow built-ins or reserved names, and cannot form inheritance cycles. A kind extends at most one base, and bases and instances must use the same construct category. A definition-only module is valid. Derived kinds retain their base primitive validation and operation identity.",
     },
     RuleDesc {
         tags: &[],
@@ -903,17 +919,17 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.inheritance"),
-        summary: "Extensions inherit properties, fields, requiredness, defaults, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict. Content fields are strict for a closed kind and free for an open one. Described content fields receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value.",
+        summary: "Extensions inherit properties, fields, requiredness, defaults, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict. Content fields are strict for a closed kind and free for an open one. Described content fields receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value. Extensions inherit context keys. A declaration may narrow an inherited key from any to a specific type and cannot change a concrete type. One kind may both provide and require a key. The key history cannot be declared.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.relationships"),
-        summary: "A relationship is one unnamed directed edge without properties from the definition head to a name: -[:extends]->(base), -[:has]->(trait) or -[:on]->(construct). Targets are references resolved in the kind namespace, never declarations. One relationship may follow the head on its line. Two or more are aligned continuation lines, so each starts at the head. A relationship that continues from another relationship's target, an edge list, a fork, a loop-back or an undirected edge is an error. Kinds accept extends and has. Traits accept extends and on.",
+        summary: "A relationship is one unnamed directed edge from the definition head to a name: -[:extends]->(base), -[:has]->(trait) or -[:on]->(construct). extends, has and on take no properties. Targets are references resolved in the kind namespace, never declarations. One relationship may follow the head on its line. Two or more are aligned continuation lines, so each starts at the head. A relationship that continues from another relationship's target, an edge list, a fork, a loop-back or an undirected edge is an error. Kinds accept extends and has. Traits accept extends and on. provides and requires each take a brace list of context keys and target the reserved name context: -[:provides {key: {type: \"string\"}}]->(context). Each key takes a descriptor that accepts type alone, any when omitted. Kinds and traits on every construct accept both.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.traits"),
-        summary: "A trait is a named schema of property and field descriptors that kinds attach with has. It carries no primitive behavior and cannot be instantiated. A trait lists the constructs it applies to with on, and a kind may only have traits that are on its construct. Only nodes have content fields, so a trait with fields is on node alone. A trait may extend one trait: it inherits that trait's entries under the kind inheritance rules and its on list, and may list on only to narrow it. A trait cannot use has. A kind's traits are those of its base, those it attaches and every trait they extend, and attaching one it already has changes nothing. Trait entries are merged after the base and before the kind's own descriptors, which may restrict them like inherited entries. An entry declared by two unrelated traits, or by a trait and the kind's base, is an error at the has relationship. Models retain each kind's traits.",
+        summary: "A trait is a named schema of property and field descriptors and context keys that kinds attach with has. It carries no primitive behavior and cannot be instantiated. A trait lists the constructs it applies to with on, and a kind may only have traits that are on its construct. Only nodes have content fields, so a trait with fields is on node alone. A trait may extend one trait: it inherits that trait's entries under the kind inheritance rules and its on list, and may list on only to narrow it. A trait cannot use has. A kind's traits are those of its base, those it attaches and every trait they extend, and attaching one it already has changes nothing. Trait entries are merged after the base and before the kind's own descriptors, which may restrict them like inherited entries. An entry or context key declared by two unrelated traits, or by a trait and the kind's base, is an error at the has relationship. Models retain each kind's traits.",
     },
     RuleDesc {
         tags: &[],
@@ -963,7 +979,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.each"),
-        summary: "each forks require an items array expression. Known non-array values are rejected and runtime values must be checked by consumers. Every array item creates a distinct occurrence of every branch destination, retaining definition identity and ancestry. Destination context.item and context.index identify its item and zero-based index. Every listed branch participates, so branch guards are prohibited. An optional concurrency property is a positive integer, with runtime-dependent values checked by the consumer. Omission leaves scheduling unconstrained. Empty arrays create no branch occurrences. Compilation preserves the array expression and graph definitions rather than instantiating occurrences.",
+        summary: "each forks require an items array expression. Known non-array values are rejected and runtime values must be checked by consumers. Every array item creates a distinct occurrence of every branch destination, retaining definition identity and ancestry. each provides item and index, the item and its zero-based index, to its branch destinations. Every listed branch participates, so branch guards are prohibited. An optional concurrency property is a positive integer, with runtime-dependent values checked by the consumer. Omission leaves scheduling unconstrained. Empty arrays create no branch occurrences. Compilation preserves the array expression and graph definitions rather than instantiating occurrences.",
     },
     RuleDesc {
         tags: &[],
@@ -978,7 +994,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.reduce"),
-        summary: "reduce requires initial and combine. Each observation updates context.accumulator using combine, with the observed payload in context.arrival.value. Emit one result on explicit group closure. An empty group emits initial. order is source by default or arrival. Source order follows the stable logical occurrence order assigned by the producer, including each item index and branch position, independent of scheduling. Arrival order uses actual observation order and may vary with scheduling. Consumers must provide that ordering or reject the configuration. Compiler validation does not execute combination or group scheduling.",
+        summary: "reduce requires initial and combine. reduce requires accumulator and arrival for its combine property and provides accumulator and arrivals to its target. Each observation updates context.accumulator using combine, with the observed payload in context.arrival.value. Emit one result on explicit group closure. An empty group emits initial. order is source by default or arrival. Source order follows the stable logical occurrence order assigned by the producer, including each item index and branch position, independent of scheduling. Arrival order uses actual observation order and may vary with scheduling. Consumers must provide that ordering or reject the configuration. Compiler validation does not execute combination or group scheduling.",
     },
     RuleDesc {
         tags: &[],
@@ -1004,7 +1020,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.fields"),
-        summary: "Every instance kind is a built-in or a declared kind. An unknown kind is an error at the kind name. Properties are strict for every kind except the root node kind. A built-in accepts its fixed configuration properties, edge kinds also accept when, weight and max_traversals, and a declared kind accepts those of its base plus its own. Content fields are strict for a closed node kind and free for an open one. The built-in node kinds are open. A declared node kind is closed unless it sets open. A closed kind still holds free-form content under a declared field of type any or object. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while context paths explicitly describe externally supplied values. An unknown name reports the nearest declared name when one is close.",
+        summary: "Every instance kind is a built-in or a declared kind. An unknown kind is an error at the kind name. Properties are strict for every kind except the root node kind. A built-in accepts its fixed configuration properties, edge kinds also accept when, weight and max_traversals, and a declared kind accepts those of its base plus its own. Content fields are strict for a closed node kind and free for an open one. The built-in node kinds are open. A declared node kind is closed unless it sets open. A closed kind still holds free-form content under a declared field of type any or object. Duplicate properties or body keys are errors. The body key props is reserved. A missing authored field is an error, while a context read names a declared key. An unknown name reports the nearest declared name when one is close.",
     },
     RuleDesc {
         tags: &[],
@@ -1034,7 +1050,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.cycles"),
-        summary: "Cycle punctuation explicitly marks directed loop-back behavior, independently of mathematical cycles. It always requires ~[headers]~> with an arrowhead. There is no undirected loop-back connector. Ordinary self-connections are allowed in either direction category. Compilation does not require a marked edge to close a topological cycle or require unmarked edges to form a DAG. Network acyclicity checks inspect all selected connections regardless of loop markers. Graph cycles do not permit circular field dependencies. Each traversed loop-back creates a fresh target occurrence and evaluates its outgoing paths again. source denotes the current occurrence and target the new occurrence. Explicit feeds supplies values before target evaluation, with no implicit copying of prior fields. max_traversals is an optional nonnegative integer bound on traversals of that edge within its execution group. A qualifying traversal beyond the limit fails rather than silently terminating. Mocking also enforces a 10000 occurrence execution budget per agent invocation. Cycle edges can be fork branches and do not implicitly suppress other outgoing edges. Exclusive forks express mutually exclusive retry and exit paths. context.history exposes completed earlier occurrences in the current execution or repetition batch and excludes in-flight occurrences. Its view is fixed when the reading occurrence starts, even when its fields are evaluated later.",
+        summary: "Cycle punctuation explicitly marks directed loop-back behavior, independently of mathematical cycles. It always requires ~[headers]~> with an arrowhead. There is no undirected loop-back connector. Ordinary self-connections are allowed in either direction category. Compilation does not require a marked edge to close a topological cycle or require unmarked edges to form a DAG. Network acyclicity checks inspect all selected connections regardless of loop markers. Graph cycles do not permit circular field dependencies. Each traversed loop-back creates a fresh target occurrence and evaluates its outgoing paths again. source denotes the current occurrence and target the new occurrence. Explicit feeds supplies values before target evaluation, with no implicit copying of prior fields. max_traversals is an optional nonnegative integer bound on traversals of that edge within its execution group. A qualifying traversal beyond the limit fails rather than silently terminating. Mocking also enforces a 10000 occurrence execution budget per agent invocation. Cycle edges can be fork branches and do not implicitly suppress other outgoing edges. Exclusive forks express mutually exclusive retry and exit paths. context.history exposes completed earlier occurrences in the current execution or repetition batch and excludes in-flight occurrences. It is readable on every node. Its view is fixed when the reading occurrence starts, even when its fields are evaluated later.",
     },
     RuleDesc {
         tags: &[],
@@ -1084,7 +1100,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.context"),
-        summary: "Context reads remain explicit residual values owned by their graph element. A consumer supplies their meaning for the selected behavior, so the same node definition can be interpreted by different consumers without introducing a separate kind. Lowering does not prescribe scope propagation or scheduling.",
+        summary: "A context read is context.key with any further path. It remains a residual value owned by its graph element, and a consumer supplies the value. Kinds and traits declare the keys. requires lists the keys an element reads itself. provides lists the keys an element supplies to what it leads to, and the element does not read them itself. An element may read a key that its kind requires or that reaches it. The keys a fork kind provides reach each branch edge and branch destination. The keys a junction kind provides reach its target. The keys a node kind provides reach the edges and forks that leave the node. Keys that reach a node continue along every edge whose primitive is next, including loop-backs, and through a junction to its target. Edges of other primitives carry no context. An edge or fork reads what its source carries, and a junction reads what its input edges carry. A node reached by several paths may read a key that any of them carries. Any other key is an error at the reference, with the nearest available key and the list of available keys. Only the key is checked. Deeper paths are not checked, and declared types are recorded without being enforced. context.history is defined by the language on every node. Its next segment names a node in the document, and an unknown name is an error. The check is static and does not prove that a value exists at run time. A residual .scope read on an edge is not checked.",
     },
     RuleDesc {
         tags: &[],
@@ -1222,101 +1238,141 @@ const PRIMITIVES: &[PrimitiveDesc] = &[
         name: "network",
         construct: "node",
         summary: "An explicit selection of nodes and edges with structural constraints. Definition checks run during compilation. Materialized checks are mandatory consumer obligations within each materialization group.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "relation",
         construct: "node",
         summary: "One multi-party relationship represented by incidence edges. Member incidences form an undirected relationship. Input and output incidences form a directed relationship with at least one of each. Membership does not imply execution.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "incidence",
         construct: "edge",
         summary: "Undirected membership between one relation node and one participant. The role property is member, input or output. Input and output roles describe the direction of the relationship, not execution along the incidence edge.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "weighted",
         construct: "fork",
         summary: "Select one eligible branch using explicit nonnegative relative weights and seeded randomness. All edges in a branch must agree on weight and all their guards must pass. No positive eligible weight means no selection. Each activation samples again.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "repeat",
         construct: "fork",
-        summary: "Instantiate every listed branch count times with distinct destination occurrences. Count is a nonnegative integer evaluated once when the fork activates. Zero creates no occurrences. Each occurrence exposes context.index and context.count, with nested forks supplying their own innermost context. context.history.<node_name> exposes payload records from completed earlier occurrences in the same repetition group. Consumers supply the payload fields and preserve group identity when evaluating history. The group closes after every contributing occurrence settles.",
+        summary: "Instantiate every listed branch count times with distinct destination occurrences. Count is a nonnegative integer evaluated once when the fork activates. Zero creates no occurrences. With nested forks the innermost one supplies index and count. context.history.<node_name> exposes payload records from completed earlier occurrences in the same repetition group. Consumers supply the payload fields and preserve group identity when evaluating history. The group closes after every contributing occurrence settles.",
+        provides: &[key("index", "number"), key("count", "number")],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "each",
         construct: "fork",
-        summary: "For each array item, instantiate every listed branch with a distinct destination occurrence. Item and index are available as context.item and context.index. Preserve definition identity separately from occurrence identity and group ancestry. The group closes after every contributing occurrence settles.",
+        summary: "For each array item, instantiate every listed branch with a distinct destination occurrence. Preserve definition identity separately from occurrence identity and group ancestry. The group closes after every contributing occurrence settles.",
+        provides: &[key("item", "any"), key("index", "number")],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "reduce",
         construct: "junction",
         summary: "Fold repeated observations within one group using initial and combine. The combine expression reads context.accumulator and context.arrival.value. Emit once at group closure, or initial for an empty group. The target reads the folded value through context.accumulator and all consumed arrivals through context.arrivals in processing order. Observation mode selects edge arrivals or destination occurrence results.",
+        provides: &[key("accumulator", "any"), key("arrivals", "array")],
+        requires: &[key("accumulator", "any"), key("arrival", "object")],
     },
     PrimitiveDesc {
         name: "accumulate",
         construct: "junction",
         summary: "Queue arrivals separately for each listed input within a correlation group. Repeatedly consume one arrival from each queue and create a fresh target occurrence. context.arrivals contains edge and value records in declared input order. Missing inputs or unmatched leftovers fail at group closure. Arrivals are consumed once per junction, independently of overlapping junctions.",
+        provides: &[key("arrivals", "array")],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "merge",
         construct: "junction",
         summary: "Forward each incoming arrival independently to a fresh target occurrence with its input identity and data preserved. context.arrivals contains that single arrival. Do not wait for other inputs or combine their scopes.",
+        provides: &[key("arrivals", "array")],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "first",
         construct: "junction",
         summary: "Emit the earliest arrival within a correlation group to the target, preserving its input identity and data. Emit at most once per group and ignore later arrivals. No arrivals means no emission. context.arrivals contains the winning arrival. This does not implicitly cancel upstream work.",
+        provides: &[key("arrivals", "array")],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "quorum",
         construct: "junction",
         summary: "Emit one grouped arrival after count distinct listed inputs have arrived within a correlation group. Preserve the contributing input identities and data. count is a required constant integer from one through the number of listed inputs. Repeated arrivals from one input count once. Select once per group and ignore later arrivals. An unmet quorum fails at closure. context.arrivals lists contributing inputs in declared input order.",
+        provides: &[key("arrivals", "array")],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "link",
         construct: "edge",
         summary: "Directed or undirected adjacency between nodes. Establishes a relationship without prescribing activation or data transfer.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "next",
         construct: "edge",
         summary: "Directed progression from source to target. An eligible traversal advances behavior to the target. It does not imply copying source fields into the target.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "requires",
         construct: "edge",
         summary: "The source depends on the target as a prerequisite. This direction expresses dependency rather than progression. The consumer defines how a prerequisite is satisfied.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "contains",
         construct: "edge",
         summary: "The source structurally contains the target. Membership alone does not activate the target, merge scopes, or impose single-parent tree constraints.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "feeds",
         construct: "edge",
         summary: "Directed data transfer from source to target. The value property specifies the payload when supplied. With into, the destination is a field reference to a direct content field on this edge's target that declares <-. A destination requires value, whose known type must match the destination schema. Data transfer does not itself imply progression or automatic copying of all source fields.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "parallel",
         construct: "fork",
         summary: "All branches participate. Edge guards are prohibited.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "conditional",
         construct: "fork",
         summary: "Matching branches participate. Conditions are boolean, overlap is permitted, and no default is required.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "exclusive",
         construct: "fork",
         summary: "At most one branch participates. Branch predicates must be provably disjoint, without requiring exhaustive coverage.",
+        provides: &[],
+        requires: &[],
     },
     PrimitiveDesc {
         name: "vars",
         construct: "node",
         summary: "A node of named expression bindings. The evaluate property accepts lazy or eager. Evaluation lifetime is a consumer concern.",
+        provides: &[],
+        requires: &[],
     },
 ];
 const EXPRESSIONS: &[ExprDesc] = &[
@@ -1422,6 +1478,40 @@ const EXAMPLES: &[Example] = &[
     },
     Example {
         tags: &[],
+        id: Id::new("example.context-read"),
+        summary: "A fork kind provides context to its branch destinations",
+        note: "each provides item and index, so the branch destination may read them.",
+        source: "(a:node) {records: [|1, 2|]} =[:each {items: source.records}]=>[-[:next]->(b:node) {value: context.item}];",
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.context-unavailable"),
+        summary: "A context key must reach its reader",
+        note: "Nothing upstream of b provides item, so the read is rejected at the reference.",
+        source: "(a:node)-[:next]->(b:node) {value: context.item};",
+        valid: false,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.context-provides"),
+        summary: "A trait provides context to what its kinds lead to",
+        note: "The key travels along the next edge from a to b. A consumer supplies its value.",
+        source: r#"+(tenant_scoped:trait)
+    -[:on]->(node)
+    -[:provides {tenant: {type: "string"}}]->(context); +(entry:node)-[:has]->(tenant_scoped); (a:entry)-[:next]->(b:node) {tenant: context.tenant};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.context-requires"),
+        summary: "A kind requires the context its instances read",
+        note: "The key is readable on every instance of the kind and is supplied from outside the graph.",
+        source: r#"+(caller_step:node {open: true})-[:requires {request_id: {type: "string"}}]->(context); (a:caller_step) {id: context.request_id};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
         id: Id::new("example.graph"),
         summary: "A graph with a forward reference",
         note: "The root node kind takes any property and field.",
@@ -1481,6 +1571,7 @@ pub static SPEC: Spec = Spec {
 definition = "+(", identifier, ":", construct, [fields], ")", [fields], {relationship}
 construct = "node" | "edge" | "fork" | "junction" | "trait"
 relationship = "-[:", ("extends" | "has" | "on"), "]->(", identifier, ")"
+    | "-[:", ("provides" | "requires"), fields, "]->(context)"
 root_path = (node | junction), steps
 attached_path = (selector | junction), steps
 steps = {edge | cycle}, [fork | arms]

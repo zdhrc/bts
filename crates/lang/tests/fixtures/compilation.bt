@@ -185,7 +185,15 @@
 # exact final-newline treatment for heredocs remains to be specified
 
 # scope properties illustrate configuration for a future consumer
-# context reads are explicit, propagation and occurrences remain consumer policies
+# a trait provides context keys to whatever its kinds lead to along next edges
+# a read names a key that reaches it, the consumer supplies the value
++(patient_scope:trait)
+    -[:on]->(node)
+    -[:provides {patient_id: {type: "string"}, purpose: {type: "string"}}]->(context);
++(scoped_agent:node)
+    -[:extends]->(agent)
+    -[:has]->(patient_scope);
+
 (patient_summary:task)
     -[:next]->(fetch_patient:tool {name: "fetch_patient"}) {
         input: {patient_id: context.patient_id},
@@ -198,24 +206,29 @@
             },
         };
 
-(intake_summary:agent {
+(intake_summary:scoped_agent {
     scope: {patient_id: "p-123", purpose: "prepare for an appointment"},
 })
     -[:next]->(patient_summary);
 
-(billing_summary:agent {
+(billing_summary:scoped_agent {
     scope: {patient_id: "p-123", purpose: "explain an invoice"},
 })
     -[:next]->(patient_summary);
 
 # independent incoming paths can combine through an explicit junction target
 # the example scope property remains illustrative, not a finalized schema
-(visit_intake:agent {
+# a kind can provide context without a trait, and a junction reads what its inputs carry
++(visit_agent:node)
+    -[:extends]->(agent)
+    -[:provides {visit_id: {type: "string"}}]->(context);
+
+(visit_intake:visit_agent {
     scope: {patient: {id: "p-123"}},
 })
     -[patient_details:next]->(capture_details:task);
 
-(scheduling:agent {
+(scheduling:visit_agent {
     scope: {appointment: {visit_id: "v-101"}},
 })
     -[appointment:next]->(confirm_appointment:task);
@@ -483,8 +496,10 @@
     ];
 
 # loop-back and exit are alternatives, with explicit data carried into the next visit
-(cycle_lookup:node) {input: <-, output: context.lookup_result};
-(cycle_check:node) {output: context.retry_decision};
+# a kind requires the context its own instances read, supplied by a consumer
++(cycle_step:node {open: true})-[:requires {lookup_result: {type: "any"}, retry_decision: {type: "object"}}]->(context);
+(cycle_lookup:cycle_step) {input: <-, output: context.lookup_result};
+(cycle_check:cycle_step) {output: context.retry_decision};
 (cycle_finish:node);
 (cycle_lookup)-[:next]->(cycle_check)
     =[:exclusive]=>[

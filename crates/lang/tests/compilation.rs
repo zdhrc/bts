@@ -159,7 +159,8 @@ const PROVIDER_SOURCE: &str = r#"
     description: {type: "string"},
     output: {type: "object", role: "output"},
     metadata: {type: "object", default: {}},
-};
+}
+    -[:requires {patient_id: {type: "string"}}]->(context);
 
 +(tool_span:node)-[:extends]->(span);
 
@@ -170,7 +171,8 @@ const PROVIDER_SOURCE: &str = r#"
 +(llm:node {open: true, model: {type: "string"}})-[:extends]->(step);
 +(function:node {open: true})-[:extends]->(step);
 +(agent:node {open: true, label: {type: "string"}, scope: {type: "any"}});
-+(scorer:node {open: true, lang: {type: "string"}});
++(scorer:node {open: true, lang: {type: "string"}})
+    -[:requires {output: {type: "any"}, expected: {type: "any"}}]->(context);
 +(dataset:node {open: true});
 +(case:node {open: true});
 +(experiment:node {open: true});
@@ -1002,6 +1004,14 @@ fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
     assert_eq!(traits("audited_data"), ["audited"]);
 }
 
+// a node kind for tests that need a value only a consumer can supply
+// it reads these keys itself and passes them to its edges, forks and junctions
+const SUPPLIED: &str = r#"
++(supplied:node {open: true})
+    -[:requires {member: {}, route: {}, flag: {}, decision: {}}]->(context)
+    -[:provides {request_id: {}, route: {}, count: {}, weight: {}, items: {}, limit: {}, records: {}}]->(context);
+"#;
+
 fn compiled(source: &str) -> bts_lang::Model {
     compile(source).unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"))
 }
@@ -1108,7 +1118,11 @@ fn preserves_dynamic_binding_identity_through_aliases() {
 #[test]
 fn resolves_edge_context_against_explicit_endpoints() {
     let model = compiled(
-        "+(summed:edge {sum: {type: \"number\"}})-[:extends]->(next); (:node) {value: 2} -[e:summed {sum: source.value + target.value}]->(:node) {value: 3}; (v:vars) {scope: [e].scope.member, external: context.member};",
+        &[
+            "+(summed:edge {sum: {type: \"number\"}})-[:extends]->(next); (:node) {value: 2} -[e:summed {sum: source.value + target.value}]->(:node) {value: 3}; (v:supplied) {scope: [e].scope.member, external: context.member};",
+            SUPPLIED,
+        ]
+        .concat(),
     );
     let property = &model.bindings[model.edges[0].props[0].0].value;
     assert!(matches!(property, Value::Num(bts_lang::Number::Int(5))));
@@ -1455,12 +1469,16 @@ fn resolves_edge_expressions_and_stored_fork_paths() {
 
 #[test]
 fn keeps_junction_properties_separate_from_destination_properties() {
-    let source = r#"(config:vars) {policy: "all"};
-        (a:node) =[f:parallel]=>[-[input_left:next]->(b:node), -[input_right:next]->(c:node)]
+    let source = &[
+        r#"(config:vars) {policy: "all"};
+        (a:supplied) =[f:parallel]=>[-[input_left:next]->(b:node), -[input_right:next]->(c:node)]
             >[:gathered {mode: config.policy, correlate: context.request_id} [input_left], [input_right]]>>(d:node {accumulate: "each"});
         >[:custom {custom: [input_right].target} [input_left]]>>(d);
         +(gathered:junction {mode: {type: "string"}})-[:extends]->(accumulate);
-        +(custom:junction {custom: {type: "any"}});"#;
+        +(custom:junction {custom: {type: "any"}});"#,
+        SUPPLIED,
+    ]
+    .concat();
     let ast = parse(source).unwrap();
     let GraphOrigin::Junction(junction) = &fork(&ast.paths[1].steps[0]).continuations[0].start else {
         panic!()
@@ -1559,8 +1577,9 @@ fn proves_common_exclusive_conditions_and_preserves_independent_draws() {
         ("context.route == \"billing\"", "context.route == \"appointments\"", false),
     ] {
         let source = format!(
-            r#"(a:node) {{flag: chance(0.5), alias: self.flag, route: context.route, n: range(0, 10), draw: range(1, 2), other_draw: range(1, 2)}}
-            =[:exclusive]=>[-[:next {{when: {left}}}]->(:node), -[:next {{when: {right}}}]->(:node)];"#
+            r#"(a:supplied) {{flag: chance(0.5), alias: self.flag, route: context.route, n: range(0, 10), draw: range(1, 2), other_draw: range(1, 2)}}
+            =[:exclusive]=>[-[:next {{when: {left}}}]->(:node), -[:next {{when: {right}}}]->(:node)];
+            {SUPPLIED}"#
         );
         assert_eq!(compile(&source).is_ok(), valid, "{source}\n{:?}", compile(&source));
     }
@@ -1638,11 +1657,12 @@ fn validates_builtin_junction_configuration() {
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     use bts_lang::{ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.definitions.len(), 14);
-    assert_eq!(ast.definitions[0].head.header.kind, "node");
-    assert_eq!(ast.definitions[1].head.header.kind, "edge");
-    assert_eq!(ast.definitions[2].head.header.kind, "fork");
-    assert_eq!(ast.definitions[3].head.header.kind, "junction");
+    assert_eq!(ast.definitions.len(), 18);
+    assert_eq!(ast.definitions[0].head.header.kind, "trait");
+    assert_eq!(ast.definitions[3].head.header.kind, "node");
+    assert_eq!(ast.definitions[4].head.header.kind, "edge");
+    assert_eq!(ast.definitions[5].head.header.kind, "fork");
+    assert_eq!(ast.definitions[6].head.header.kind, "junction");
     let marker = field(node_declaration(&edge(&ast.paths[37].steps[0]).target), "patient_id");
     assert!(matches!(marker.kind, ExprKind::Upstream));
     assert_eq!(&COMPILATION_SOURCE[marker.range.start..marker.range.end], "<-");
@@ -1845,7 +1865,7 @@ fn upstream_requirements_suppress_defaults_and_allow_alternative_suppliers() {
 
 #[test]
 fn preserves_schema_types_through_context_and_aliases() {
-    let schema = r#"+(record:node {open: true, label: {type: "string"}}) {id: {type: "string"}};"#;
+    let schema = r#"+(record:node {open: true, label: {type: "string"}}) {id: {type: "string"}}-[:requires {label: {}, id: {}, flag: {}}]->(context);"#;
     let model = compiled(&format!(
         r#"{schema} (a:record {{label: context.label}}) {{id: context.id, alias: self.id, text: "${{self.alias}} ${{self.props.label}}"}};"#
     ));
@@ -1874,7 +1894,7 @@ fn preserves_schema_types_through_context_and_aliases() {
 
 #[test]
 fn checks_every_possible_conditional_type() {
-    let schema = r#"+(record:node) {id: {type: "string"}};"#;
+    let schema = r#"+(record:node) {id: {type: "string"}}-[:requires {flag: {}, value: {}, other: {}, id: {}}]->(context);"#;
     for value in [
         "context.flag ? \"yes\" : 42",
         "context.flag ? 42 : \"yes\"",
@@ -1888,8 +1908,9 @@ fn checks_every_possible_conditional_type() {
         );
     }
     for guard in ["context.flag ? true : 1", "source.guard"] {
-        let source =
-            format!("(a:node) {{guard: context.flag ? true : 1}} =[:conditional]=>[-[:next {{when: {guard}}}]->(b:node)];");
+        let source = format!(
+            "(a:supplied) {{guard: context.flag ? true : 1}} =[:conditional]=>[-[:next {{when: {guard}}}]->(b:node)]; {SUPPLIED}"
+        );
         assert!(
             compile(&source)
                 .unwrap_err()
@@ -2120,23 +2141,29 @@ fn weighted_each_and_reduce_validate_configuration_without_executing() {
         ("", "context.weight", true),
     ] {
         let source = format!(
-            "(a:node) =[:weighted {{{props}}}]=>[-[:next {{weight: {weights}}}]->(b:node), -[:next {{weight: 1}}]->(c:node)];"
+            "(a:supplied) =[:weighted {{{props}}}]=>[-[:next {{weight: {weights}}}]->(b:node), -[:next {{weight: 1}}]->(c:node)]; {SUPPLIED}"
         );
         assert_eq!(compile(&source).is_ok(), valid, "{source}");
     }
     compiled("(a:node) =[:weighted]=>[-[:link {weight: 2}, :link {weight: 2}]-(b:node)];");
     compiled("(a:node) =[:weighted]=>[-[:next {weight: 0, when: false}]->(b:node)];");
-    compiled("(a:node) =[:each {items: context.items, concurrency: context.limit}]=>[-[:next]->(b:node)];");
+    compiled(&format!(
+        "(a:supplied) =[:each {{items: context.items, concurrency: context.limit}}]=>[-[:next]->(b:node)]; {SUPPLIED}"
+    ));
     assert!(compile("(a:node) =[:weighted]=>[-[:next]->(b:node)];").is_err());
     assert!(compile("(a:node) =[:weighted]=>[-[:link {weight: 1}, :link {weight: 2}]-(b:node)];").is_err());
     for props in ["", "{items: 1}", "{items: [||], concurrency: 0}"] {
         assert!(compile(&format!("(a:node) =[:each {props}]=>[-[:next]->(b:node)];")).is_err());
     }
-    let source = r#"
+    let source = &[
+        r#"
         +(batch:fork)-[:extends]->(each); +(sum:junction)-[:extends]->(reduce);
-        (a:node) =[work:batch {items: context.records}]=>[-[done:next]->(b:node) {item: context.item, index: context.index}]
+        (a:supplied) =[work:batch {items: context.records}]=>[-[done:next]->(b:node) {item: context.item, index: context.index}]
             >[:sum {observe: "result", initial: 0, combine: context.accumulator + context.arrival.value, on_failure: "skip"} [done]]>>(c:node);
-    "#;
+    "#,
+        SUPPLIED,
+    ]
+    .concat();
     let model = compiled(source);
     assert_eq!(model.nodes.len(), 3);
     assert_eq!(model.forks[0].kind, "batch");
@@ -2412,9 +2439,9 @@ fn input_roles_preserve_fallbacks_without_folding_caller_reads() {
 fn repeat_forks_require_nonnegative_integer_counts() {
     for source in [
         "(a:node)=[:repeat {count: 0}]=>[-[:next]->(b:node)];",
-        "(a:node)=[:repeat {count: context.count}]=>[-[:next]->(b:node)];",
+        "(a:supplied)=[:repeat {count: context.count}]=>[-[:next]->(b:node)];",
     ] {
-        compiled(source);
+        compiled(&[source, SUPPLIED].concat());
     }
     for source in [
         "(a:node)=[:repeat]=>[-[:next]->(b:node)];",
@@ -2430,7 +2457,7 @@ fn repeat_forks_require_nonnegative_integer_counts() {
 #[test]
 fn cycle_traversal_limits_belong_to_cycle_edges() {
     for limit in ["0", "3", "context.limit"] {
-        compiled(&format!("(a:node)~[:next {{max_traversals: {limit}}}]~>(a);"));
+        compiled(&format!("(a:supplied)~[:next {{max_traversals: {limit}}}]~>(a); {SUPPLIED}"));
     }
     for limit in ["-1", "1.5", "true", "\"three\""] {
         assert!(compile(&format!("(a:node)~[:next {{max_traversals: {limit}}}]~>(a);")).is_err());
@@ -2441,8 +2468,9 @@ fn cycle_traversal_limits_belong_to_cycle_edges() {
 #[test]
 fn fork_branches_preserve_cycle_identity_and_bundle_configuration() {
     let model = compiled(
-        r#"
-(a:node) {output: context.decision};
+        &[
+            r#"
+(a:supplied) {output: context.decision};
 (b:node) {input: <-};
 (a) =[:exclusive]=>[
     ~[retry:next {when: source.output.retry, max_traversals: 3},
@@ -2450,6 +2478,9 @@ fn fork_branches_preserve_cycle_identity_and_bundle_configuration() {
     -[done:next {when: !source.output.retry}]->(finish:node),
 ];
 "#,
+            SUPPLIED,
+        ]
+        .concat(),
     );
     let fork = &model.forks[0];
     assert_eq!(fork.branches[0].len(), 2);
@@ -2849,4 +2880,216 @@ fn closed_roots_unknown_kinds_and_strict_properties_are_located_errors() {
     // an instance of a definition that failed is not also reported as an unknown kind
     let errors = located("+(k:node)-[:has]->(missing); (a:k) {anything: 1};");
     assert_eq!(errors.len(), 1, "{errors:#?}");
+}
+
+#[test]
+fn context_reads_name_declared_keys_that_reach_them() {
+    use bts_lang::FieldType;
+    let keys = |keys: &[bts_lang::FieldSchema]| -> Vec<(String, FieldType)> {
+        keys.iter().map(|key| (key.name.clone(), key.ty)).collect()
+    };
+    let key = |name: &str, ty| (name.to_owned(), ty);
+    let model = compiled(
+        r#"
+        +(tenant_scoped:trait)
+            -[:on]->(node)
+            -[:provides {tenant: {type: "string"}}]->(context)
+            -[:requires {caller: {}}]->(context);
+        +(regional:trait)
+            -[:extends]->(tenant_scoped)
+            -[:provides {region: {type: "string"}}]->(context);
+        +(entry:node {name: {type: "any"}})
+            -[:has]->(regional)
+            -[:provides {request_id: {type: "string"}}]->(context);
+        +(batch:fork)-[:extends]->(each);
+        +(sum:junction)
+            -[:extends]->(reduce)
+            -[:provides {accumulator: {type: "number"}}]->(context);
+        +(handoff:edge)-[:extends]->(next);
+
+        # a kind reads what it requires, its edges, forks and junctions read what it provides
+        (a:entry {name: context.caller})
+            -[first:handoff {when: context.tenant == "acme"}]->(b:node) {tenant: context.tenant, region: context.region}
+                -[:next]->(c:node) {records: [|1, 2|], id: context.request_id, earlier: context.history.b};
+        # fork keys reach branch destinations and what follows them along next edges
+        (c)
+            =[work:batch {items: source.records, concurrency: len(context.request_id)}]=>[
+                -[done:next]->(d:node) {item: context.item, index: context.index},
+            ]
+                ->(d)-[:next]->(e:node) {item: context.item}
+                >[:sum {initial: 0, combine: context.accumulator + context.arrival.value + context.index} [done]]>>(f:node) {
+                    total: context.accumulator,
+                    seen: context.arrivals,
+                };
+        # a loop-back carries context, and a node reached by several paths reads what any of them carries
+        (g:node) {tenant: context.tenant};
+        (b)-[:next]->(g);
+        (g)~[:next]~>(g);
+        (plain:node)-[:next]->(g);
+        "#,
+    );
+    let kind = |name: &str| &model.kinds[model.kind_names[name].0];
+    let regional = &model.traits[model.trait_names["regional"].0];
+    assert_eq!(
+        keys(&regional.provides),
+        [key("tenant", FieldType::String), key("region", FieldType::String)]
+    );
+    assert_eq!(keys(&regional.requires), [key("caller", FieldType::Any)]);
+    assert_eq!(
+        keys(&kind("entry").provides),
+        [
+            key("tenant", FieldType::String),
+            key("region", FieldType::String),
+            key("request_id", FieldType::String)
+        ]
+    );
+    assert_eq!(keys(&kind("entry").requires), [key("caller", FieldType::Any)]);
+    // built-in kinds declare their context in the language reference and derived kinds inherit it
+    assert_eq!(
+        keys(&kind("batch").provides),
+        [key("item", FieldType::Any), key("index", FieldType::Number)]
+    );
+    assert_eq!(
+        keys(&kind("sum").provides),
+        [key("accumulator", FieldType::Number), key("arrivals", FieldType::Array)]
+    );
+    assert_eq!(
+        keys(&kind("sum").requires),
+        [key("accumulator", FieldType::Any), key("arrival", FieldType::Object)]
+    );
+    assert!(matches!(binding(&model, "f", "total").value, Value::Context { .. }));
+
+    let scoped = r#"+(scoped:node {open: true})-[:provides {tenant: {type: "string"}}]->(context);"#;
+    for (source, message, at) in [
+        (
+            "(a:node)=[:parallel]=>[-[one:next]->(b:node), -[two:next]->(c:node)] >[:accumulate [one], [two]]>>(d:node) {seen: context.arivals};".to_owned(),
+            "context key `arivals` is not available here, did you mean `arrivals`? (available: arrivals, history)",
+            "context.arivals",
+        ),
+        (
+            "(a:node)-[:next]->(b:node) {value: context.item};".to_owned(),
+            "context key `item` is not available here (available: history)",
+            "context.item",
+        ),
+        // a kind does not read the keys it provides
+        (
+            format!("{scoped} (a:scoped) {{tenant: context.tenant}};"),
+            "context key `tenant` is not available here (available: history)",
+            "context.tenant",
+        ),
+        // only next edges carry context
+        (
+            format!("{scoped} (a:scoped)-[:link]->(b:node) {{tenant: context.tenant}};"),
+            "context key `tenant` is not available here (available: history)",
+            "context.tenant",
+        ),
+        (
+            format!("{scoped} (a:scoped)-[:contains]->(b:node) {{tenant: context.tenant}};"),
+            "context key `tenant` is not available here (available: history)",
+            "context.tenant",
+        ),
+        // an edge reads what its source carries, not what its target receives
+        (
+            "(a:node)-[e:link]->(b:node); >[:merge [e]]>>(c:node)-[:next {when: context.arrivals == 1}]->(d:node); (x:node)-[:next {when: context.arrivals == 1}]->(c);".to_owned(),
+            "context key `arrivals` is not available here (none are available)",
+            "context.arrivals",
+        ),
+        // the reduce target does not read the single arrival its combine property requires
+        (
+            "(a:node)-[e:next]->(b:node); >[:reduce {initial: 0, combine: context.arrival.value} [e]]>>(c:node) {last: context.arrival};".to_owned(),
+            "context key `arrival` is not available here, did you mean `arrivals`? (available: accumulator, arrivals, history)",
+            "context.arrival",
+        ),
+        (
+            "(a:node)=[:repeat {count: context.count}]=>[-[:next]->(b:node)];".to_owned(),
+            "context key `count` is not available here (none are available)",
+            "context.count",
+        ),
+        (
+            "(lookup:node) {earlier: context.history.lokup};".to_owned(),
+            "unknown history node `lokup`, did you mean `lookup`?",
+            "context.history.lokup",
+        ),
+        (
+            "(a:node)-[e:next {when: len(context.history.a) > 1}]->(b:node);".to_owned(),
+            "context key `history` is not available here (none are available)",
+            "context.history.a",
+        ),
+    ] {
+        let errors = compile(&source).unwrap_err();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:#?}");
+        assert_eq!(errors[0].what, message, "{source}");
+        let range = errors[0].r#where;
+        assert_eq!(&source[range.start..range.end], at, "{source}");
+    }
+
+    for (source, message, at) in [
+        (
+            "+(a:node)-[:provides]->(context);",
+            "`provides` lists context keys and targets context, written -[:provides {key: {type: \"any\"}}]->(context)",
+            "-[:provides]->(context)",
+        ),
+        (
+            "+(a:node)-[:requires {tenant: {}}]->(node);",
+            "`requires` lists context keys and targets context, written -[:requires {key: {type: \"any\"}}]->(context)",
+            "-[:requires {tenant: {}}]->(node)",
+        ),
+        (
+            "+(a:node)-[keys:provides {tenant: {}}]->(context);",
+            "a relationship edge has no name",
+            "keys:provides {tenant: {}}",
+        ),
+        (
+            "+(a:node)-[:extends {tenant: {}}]->(vars);",
+            "a relationship edge has no name and no properties",
+            ":extends {tenant: {}}",
+        ),
+        (
+            "+(a:node)-[:supplies {tenant: {}}]->(context);",
+            "unknown relationship `supplies`, expected extends, has, on, provides or requires",
+            ":supplies {tenant: {}}",
+        ),
+        (
+            "+(a:node)-[:provides {tenant: {type: \"string\", required: true}}]->(context);",
+            "unknown context descriptor `required`, a context key takes type only",
+            "required: true",
+        ),
+        (
+            "+(a:node)-[:provides {tenant: {type: \"text\"}}]->(context);",
+            "unknown schema value type",
+            "type: \"text\"",
+        ),
+        (
+            "+(a:node)-[:provides {tenant: {}, tenant: {}}]->(context);",
+            "duplicate context key",
+            "tenant",
+        ),
+        (
+            "+(a:node)-[:requires {history: {}}]->(context);",
+            "context.history is defined by the language",
+            "history",
+        ),
+        (
+            "+(a:junction)\n    -[:extends]->(accumulate)\n    -[:provides {arrivals: {type: \"string\"}}]->(context);",
+            "a context key cannot change its inherited type",
+            "arrivals: {type: \"string\"}",
+        ),
+        (
+            "+(t:trait)\n    -[:on]->(node)\n    -[:provides {tenant: {}}]->(context);\n+(u:trait)\n    -[:on]->(node)\n    -[:provides {tenant: {}}]->(context);\n+(a:node)\n    -[:has]->(t)\n    -[:has]->(u);",
+            "provided context key `tenant` is declared by both trait `t` and trait `u`",
+            "-[:has]->(u)",
+        ),
+        (
+            "+(t:trait)\n    -[:on]->(junction)\n    -[:provides {arrivals: {}}]->(context);\n+(a:junction)\n    -[:extends]->(merge)\n    -[:has]->(t);",
+            "trait `t` declares provided context key `arrivals`, which `a` already has from its base",
+            "-[:has]->(t)",
+        ),
+    ] {
+        let errors = compile(source).unwrap_err();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:#?}");
+        assert_eq!(errors[0].what, message, "{source}");
+        let range = errors[0].r#where;
+        let found = &source[range.start..range.end];
+        assert!(found.starts_with(at), "{source}\n{found}");
+    }
 }

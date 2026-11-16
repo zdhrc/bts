@@ -112,6 +112,15 @@ pub fn reference(spec: &DslSpec) -> String {
     for primitive in spec.primitives {
         writeln!(output, "### {} ({})\n", inline_code(primitive.name), primitive.construct).unwrap();
         writeln!(output, "{}\n", primitive.summary).unwrap();
+        for (label, keys) in [("Provides", primitive.provides), ("Requires", primitive.requires)] {
+            if !keys.is_empty() {
+                let listed: Vec<_> = keys
+                    .iter()
+                    .map(|key| format!("{} ({})", inline_code(&format!("context.{}", key.name)), key.ty))
+                    .collect();
+                writeln!(output, "{label} context: {}\n", listed.join(", ")).unwrap();
+            }
+        }
     }
 
     writeln!(output, "## Global rules\n").unwrap();

@@ -229,6 +229,10 @@ pub struct Kind {
     pub fields: Vec<FieldSchema>,
     /// Whether a node of this kind accepts content fields the kind does not declare.
     pub open: bool,
+    /// Context keys an instance supplies to what it leads to, including inherited and trait entries.
+    pub provides: Vec<FieldSchema>,
+    /// Context keys an instance reads itself, including inherited and trait entries.
+    pub requires: Vec<FieldSchema>,
     /// Every trait this kind has, including those of its base and the traits they extend.
     pub traits: Vec<TraitId>,
     /// Declaration location.
@@ -248,6 +252,10 @@ pub struct Trait {
     pub props: Vec<FieldSchema>,
     /// Effective node content schema, including entries of extended traits.
     pub fields: Vec<FieldSchema>,
+    /// Context keys a kind with this trait supplies to what it leads to.
+    pub provides: Vec<FieldSchema>,
+    /// Context keys a kind with this trait reads itself.
+    pub requires: Vec<FieldSchema>,
     /// Definition location.
     pub range: SrcRange,
 }
