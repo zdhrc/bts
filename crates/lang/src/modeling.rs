@@ -1387,51 +1387,74 @@ impl Modeler {
     // a read names a key its element's kind requires, or one a provider upstream supplies
     fn check_context(&mut self) {
         let model = &self.model;
-        // keys that reach each node from upstream
-        let mut reach: Vec<BTreeSet<String>> = vec![BTreeSet::new(); model.nodes.len()];
-        let leaving = |reach: &[BTreeSet<String>], node: NodeId| {
+        type Keys = BTreeMap<String, BTreeSet<ElementId>>;
+        // a nearer provider replaces whatever the path carried for the same key
+        let provide = |keys: &mut Keys, element: ElementId| {
+            for key in self.declared_context(element, true) {
+                keys.insert(key, BTreeSet::from([element]));
+            }
+        };
+        // keys that reach each node from upstream, with the nearest supplier on every path
+        let mut reach: Vec<Keys> = vec![Keys::new(); model.nodes.len()];
+        let leaving = |reach: &[Keys], node: NodeId| {
             let mut keys = reach[node.0].clone();
-            keys.extend(self.declared_context(ElementId::Node(node), true));
+            provide(&mut keys, ElementId::Node(node));
             keys
         };
-        let branch = |edge: &Edge| -> Vec<String> {
-            edge.fork
-                .map(|fork| self.declared_context(ElementId::Fork(fork), true))
-                .unwrap_or_default()
-        };
-        // what an edge sees at its source, which is also what a junction receives from it
-        let carried = |reach: &[BTreeSet<String>], edge: &Edge| {
+        // what an edge sees at its source
+        let seen = |reach: &[Keys], edge: &Edge| {
             let mut keys = leaving(reach, edge.source);
-            keys.extend(branch(edge));
+            if let Some(fork) = edge.fork {
+                provide(&mut keys, ElementId::Fork(fork));
+            }
+            keys
+        };
+        // what an edge hands on, which is also what a junction receives from it
+        let carried = |reach: &[Keys], index: usize| {
+            let mut keys = seen(reach, &model.edges[index]);
+            provide(&mut keys, ElementId::Edge(EdgeId(index)));
             keys
         };
         loop {
-            let mut arriving: Vec<(NodeId, BTreeSet<String>)> = Vec::new();
+            let mut arriving: Vec<(NodeId, Keys)> = Vec::new();
             for (index, edge) in model.edges.iter().enumerate() {
-                // a fork's keys reach each branch destination, other keys travel along next edges only
+                // keys that reach a node travel along next edges only
+                let mut keys = if primitive(model, ElementId::Edge(EdgeId(index))) == "next" {
+                    leaving(&reach, edge.source)
+                } else {
+                    Keys::new()
+                };
+                // a fork's keys reach each branch destination
                 if let Some(fork) = edge.fork {
-                    let origin = model.forks[fork.0].source;
-                    let destination = if edge.source == origin { edge.target } else { edge.source };
-                    arriving.push((destination, branch(edge).into_iter().collect()));
+                    if edge.source == model.forks[fork.0].source {
+                        provide(&mut keys, ElementId::Fork(fork));
+                    } else {
+                        let mut branch = Keys::new();
+                        provide(&mut branch, ElementId::Fork(fork));
+                        arriving.push((edge.source, branch));
+                    }
                 }
-                if primitive(model, ElementId::Edge(EdgeId(index))) == "next" {
-                    arriving.push((edge.target, leaving(&reach, edge.source)));
-                }
+                // an edge kind's keys reach its target
+                provide(&mut keys, ElementId::Edge(EdgeId(index)));
+                arriving.push((edge.target, keys));
             }
             for (index, junction) in model.junctions.iter().enumerate() {
-                let mut keys: BTreeSet<String> = self
-                    .declared_context(ElementId::Junction(JunctionId(index)), true)
-                    .into_iter()
-                    .collect();
+                let mut keys = Keys::new();
                 for input in &junction.inputs {
-                    keys.extend(carried(&reach, &model.edges[input.0]));
+                    for (key, suppliers) in carried(&reach, input.0) {
+                        keys.entry(key).or_default().extend(suppliers);
+                    }
                 }
+                provide(&mut keys, ElementId::Junction(JunctionId(index)));
                 arriving.push((junction.target, keys));
             }
             let mut changed = false;
             for (node, keys) in arriving {
-                for key in keys {
-                    changed |= reach[node.0].insert(key);
+                for (key, suppliers) in keys {
+                    let known = reach[node.0].entry(key).or_default();
+                    for supplier in suppliers {
+                        changed |= known.insert(supplier);
+                    }
                 }
             }
             if !changed {
@@ -1444,7 +1467,7 @@ impl Modeler {
             let mut available: BTreeSet<String> = self.declared_context(*owner, false).into_iter().collect();
             match *owner {
                 ElementId::Node(node) => {
-                    available.extend(reach[node.0].iter().cloned());
+                    available.extend(reach[node.0].keys().cloned());
                     // history is defined by the language for every node and is keyed by node name
                     available.insert("history".to_owned());
                     if key == "history" {
@@ -1464,11 +1487,11 @@ impl Modeler {
                         continue;
                     }
                 }
-                ElementId::Edge(edge) => available.extend(carried(&reach, &model.edges[edge.0])),
-                ElementId::Fork(fork) => available.extend(leaving(&reach, model.forks[fork.0].source)),
+                ElementId::Edge(edge) => available.extend(seen(&reach, &model.edges[edge.0]).into_keys()),
+                ElementId::Fork(fork) => available.extend(leaving(&reach, model.forks[fork.0].source).into_keys()),
                 ElementId::Junction(junction) => {
                     for input in &model.junctions[junction.0].inputs {
-                        available.extend(carried(&reach, &model.edges[input.0]));
+                        available.extend(carried(&reach, input.0).into_keys());
                     }
                 }
             }
@@ -1489,6 +1512,17 @@ impl Modeler {
             ));
         }
         self.errors.extend(errors);
+        self.model.context = reach
+            .into_iter()
+            .map(|keys| {
+                keys.into_iter()
+                    .map(|(key, suppliers)| ContextSupply {
+                        key,
+                        suppliers: suppliers.into_iter().collect(),
+                    })
+                    .collect()
+            })
+            .collect();
     }
 
     fn validate_primitives(&self) -> Result<()> {

@@ -32,6 +32,17 @@ pub struct Model {
     pub refs: Vec<ResolvedRef>,
     /// The document-wide namespace shared by named graph elements.
     pub names: BTreeMap<String, ElementId>,
+    /// For each node, the context keys that reach it and their suppliers.
+    pub context: Vec<Vec<ContextSupply>>,
+}
+
+/// One context key that reaches a node.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ContextSupply {
+    /// Key name.
+    pub key: String,
+    /// The nearest providing element on every path that carries the key.
+    pub suppliers: Vec<ElementId>,
 }
 
 macro_rules! identity {

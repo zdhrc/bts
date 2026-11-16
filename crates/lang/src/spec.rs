@@ -1100,7 +1100,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.context"),
-        summary: "A context read is context.key with any further path. It remains a residual value owned by its graph element, and a consumer supplies the value. Kinds and traits declare the keys. requires lists the keys an element reads itself. provides lists the keys an element supplies to what it leads to, and the element does not read them itself. An element may read a key that its kind requires or that reaches it. The keys a fork kind provides reach each branch edge and branch destination. The keys a junction kind provides reach its target. The keys a node kind provides reach the edges and forks that leave the node. Keys that reach a node continue along every edge whose primitive is next, including loop-backs, and through a junction to its target. Edges of other primitives carry no context. An edge or fork reads what its source carries, and a junction reads what its input edges carry. A node reached by several paths may read a key that any of them carries. Any other key is an error at the reference, with the nearest available key and the list of available keys. Only the key is checked. Deeper paths are not checked, and declared types are recorded without being enforced. context.history is defined by the language on every node. Its next segment names a node in the document, and an unknown name is an error. The check is static and does not prove that a value exists at run time. A residual .scope read on an edge is not checked.",
+        summary: "A context read is context.key with any further path. It remains a residual value owned by its graph element, and a consumer supplies the value. Kinds and traits declare the keys. requires lists the keys an element reads itself. provides lists the keys an element supplies to what it leads to, and the element does not read them itself. An element may read a key that its kind requires or that reaches it. The keys a fork kind provides reach each branch edge and branch destination. The keys a junction kind provides reach its target. The keys a node kind provides reach the edges and forks that leave the node. The keys an edge kind provides reach the edge's target, whatever the edge's primitive, and the edge does not read them itself. Keys that reach a node continue along every edge whose primitive is next, including loop-backs, and through a junction to its target. Edges of other primitives carry no context. An edge or fork reads what its source carries. An edge carries what its source carries together with the keys its own kind and its fork provide, and a junction reads what its input edges carry. A node reached by several paths may read a key that any of them carries. When one path holds several providers of a key, the nearest provider supplies it. On a single step an edge kind is nearer than its fork, a fork is nearer than its source node, and a junction kind is nearer than its input edges. Models retain, for each node and each key that reaches it, the nearest supplier on every path. A consumer decides what several suppliers mean. Any other key is an error at the reference, with the nearest available key and the list of available keys. Only the key is checked. Deeper paths are not checked, and declared types are recorded without being enforced. context.history is defined by the language on every node. Its next segment names a node in the document, and an unknown name is an error. The check is static and does not prove that a value exists at run time. A residual .scope read on an edge is not checked.",
     },
     RuleDesc {
         tags: &[],
@@ -1509,6 +1509,26 @@ const EXAMPLES: &[Example] = &[
         note: "The key is readable on every instance of the kind and is supplied from outside the graph.",
         source: r#"+(caller_step:node {open: true})-[:requires {request_id: {type: "string"}}]->(context); (a:caller_step) {id: context.request_id};"#,
         valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.context-edge-provides"),
+        summary: "An edge kind provides context to its target",
+        note: "The key reaches b across the delegated edge and continues to c along next. A consumer supplies its value.",
+        source: r#"+(delegated:edge {direction: "directed"})
+    -[:extends]->(next)
+    -[:provides {owner: {type: "string"}}]->(context); (a:node)-[:delegated]->(b:node) {by: context.owner}; (b)-[:next]->(c:node) {by: context.owner};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.context-edge-source"),
+        summary: "An edge's keys do not reach its source",
+        note: "The delegated edge provides owner to b. Nothing provides it to a, so the read is rejected.",
+        source: r#"+(delegated:edge {direction: "directed"})
+    -[:extends]->(next)
+    -[:provides {owner: {type: "string"}}]->(context); (a:node) {by: context.owner}; (a)-[:delegated]->(b:node);"#,
+        valid: false,
     },
     Example {
         tags: &[],
