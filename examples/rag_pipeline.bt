@@ -10,13 +10,13 @@
     -[:has]->(retrieval);
 
 (docs_qa:agent) {input: "How do I rotate API keys?", output: answer.output.content};
-(docs_qa)-[:contains, :next]->(request:task) {
+(docs_qa)-[:next]->(request:task) {
     input: docs_qa.input,
     output: answer.output.content,
     metadata: {request_id: uuid()},
     tags: [|"rag"|],
 };
-(request)-[:next]->(search:doc_search {name: "search_docs"}) {
+(request)-[:calls]->(search:doc_search {name: "search_docs"}) {
     duration: lognormal(0.4, 0.3),
     considered: 8,
     input: {query: request.input, top_k: self.considered},
@@ -49,6 +49,3 @@
                 time_to_first_token: self.local.gen_time * range(0.1, 0.25),
             },
         };
-(docs_qa)-[:contains]->(search)-[:child_of]->(request);
-(docs_qa)-[:contains]->(rerank)-[:child_of]->(request);
-(docs_qa)-[:contains]->(answer)-[:child_of]->(request);

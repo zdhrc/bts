@@ -1,13 +1,13 @@
 # one sampled decision keeps the failed charge, escalation and retry consistent
 (payments:agent) {input: "Charge the June invoice for acct_9W31.", output: request.output};
-(payments)-[:contains, :next]->(request:task {name: "payments-agent"}) {
+(payments)-[:next]->(request:task {name: "payments-agent"}) {
     input: payments.input,
     output: charge.output,
     local: {failed: chance(0.07)},
     metadata: {run_id: uuid(), retried: self.local.failed},
     tags: [|"payments"|],
 };
-(request)-[:next]->(confirm:llm {name: "Chat Completion"}) {
+(request)-[:calls]->(confirm:llm {name: "Chat Completion"}) {
     input: [|
         {role: "system", content: "You are a payments agent. Confirm the invoice before charging."},
         {role: "user", content: request.input},
@@ -33,8 +33,3 @@
     input: {account: "acct_9W31", amount_usd: 1240, card: request.local.failed ? "backup" : "primary"},
     output: {status: "succeeded", charge_id: format("ch_{}", alphanum(14))},
 };
-(payments)-[:contains]->(confirm)-[:child_of]->(request);
-(payments)-[:contains]->(declined)-[:child_of]->(request);
-(payments)-[:contains]->(escalate)-[:child_of]->(request);
-(payments)-[:contains]->(charge)-[:child_of]->(request);
-(payments)-[:contains]->(ready)-[:child_of]->(request);

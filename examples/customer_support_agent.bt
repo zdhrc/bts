@@ -10,12 +10,9 @@
     output: replies.output,
     local: {case_batch_id: hex (8)}
 };
-("customer-support-agent")-[:contains]->("late-arrival");
 ("late-arrival")
-    =[:repeat {count: 3}]=>[-[requests:next]->("handle-late-arrival")]
+    =[:repeat {count: 3}]=>[-[requests:calls]->("handle-late-arrival")]
         >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [requests]]>>(replies:task) {output: context.accumulator};
-("customer-support-agent")-[:contains]->(replies);
-(replies)-[:child_of]->("late-arrival");
 ("handle-late-arrival":task) {
     input: ("late-arrival").input[: context.count][context.index],
     output: ("draft-reply").output,
@@ -25,15 +22,11 @@
         handoff: range(0, 1),
     }
 };
-("customer-support-agent")-[:contains]->("handle-late-arrival");
-("handle-late-arrival")-[:child_of]->("late-arrival");
 ("lookup-reservation") =[:conditional]=>[-[:next {when: ("handle-late-arrival").local.retried}]->("retry-reservation")];
 ("retry-reservation":tool) {
     input: ("lookup-reservation").input,
     output: ("lookup-reservation").output
 };
-("customer-support-agent")-[:contains]->("retry-reservation");
-("retry-reservation")-[:child_of]->("handle-late-arrival");
 ("lookup-reservation")-[:next]->("check-arrival-policy");
 ("check-arrival-policy":function) {
     duration: 0.02,
@@ -46,9 +39,7 @@
         can_check_in: self.input.reservation.found && self.input.reservation.booking.status == "confirmed" && ${("handle-late-arrival").local.planned_hour < 24 || self.input.reservation.booking.overnight_check_in},
     }
 };
-("customer-support-agent")-[:contains]->("check-arrival-policy");
-("check-arrival-policy")-[:child_of]->("handle-late-arrival");
-("handle-late-arrival")-[:next]->("lookup-reservation");
+("handle-late-arrival")-[:calls]->("lookup-reservation");
 ("lookup-reservation":tool) {
     input: {reservation_id: ("handle-late-arrival").input.reservation_id == null ? null : upper (trim (("handle-late-arrival").input.reservation_id))},
     error: self.output.found ? null : "reservation-not-found",
@@ -56,21 +47,15 @@
     duration: 0.05,
     output: self.input.reservation_id == "HTL-4821" ? {found: true, booking: {status: "confirmed", overnight_check_in: true}} : self.input.reservation_id == "HTL-7390" ? {found: true, booking: {status: "confirmed", overnight_check_in: false}} : self.input.reservation_id == "HTL-9102" ? {found: true, booking: {status: "cancelled", overnight_check_in: true}} : {found: false, booking: null}
 };
-("customer-support-agent")-[:contains]->("lookup-reservation");
-("lookup-reservation")-[:child_of]->("handle-late-arrival");
 ("check-arrival-policy") =[:exclusive]=>[-[:next {when: ("handle-late-arrival").local.handoff == 0}]->("front-desk-message"), -[:next {when: ("handle-late-arrival").local.handoff == 1}]->("callback-request")];
 ("front-desk-message":task) {
     input: ("check-arrival-policy").output,
     output: {channel: "front-desk-message", status: self.input.needs_staff ? "queued" : "not-required"}
 };
-("customer-support-agent")-[:contains]->("front-desk-message");
-("front-desk-message")-[:child_of]->("handle-late-arrival");
 ("callback-request":task) {
     input: ("check-arrival-policy").output,
     output: {channel: "callback", status: self.input.needs_staff ? "queued" : "not-required"}
 };
-("customer-support-agent")-[:contains]->("callback-request");
-("callback-request")-[:child_of]->("handle-late-arrival");
 ("check-arrival-policy")-[:next]->("draft-reply");
 ("draft-reply":llm) {
     duration: range (0.4, 0.9),
@@ -83,8 +68,6 @@
         reply_action: self.input.policy.action,
     }
 };
-("customer-support-agent")-[:contains]->("draft-reply");
-("draft-reply")-[:child_of]->("handle-late-arrival");
 ("customer-support-cases":dataset) {
     cases: [|("standard-arrivals"), ("reservation-recovery"), ("arrival-window")|]
 };

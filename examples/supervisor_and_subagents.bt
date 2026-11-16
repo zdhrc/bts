@@ -1,13 +1,13 @@
 # delegated tasks have their own span trees and reconcile before synthesis
 (supervisor:agent) {input: "Compare checkout latency to the last two releases.", output: synthesis.output.content};
-(supervisor)-[:contains, :next]->(request:task {name: "research-supervisor"}) {
+(supervisor)-[:next]->(request:task {name: "research-supervisor"}) {
     input: supervisor.input,
     output: synthesis.output.content,
     local: {profiled: chance(0.4)},
     metadata: {run_id: uuid(), profiled: self.local.profiled},
     tags: [|"multi-agent"|],
 };
-(request)-[:next]->(delegate:llm {name: "Chat Completion"}) {
+(request)-[:calls]->(delegate:llm {name: "Chat Completion"}) {
     input: request.input,
     output: "Pull latency metrics and compare checkout-path changes.",
     metadata: {model: "gpt-4o", provider: "openai"},
@@ -22,12 +22,12 @@
             output: diff_reply.output,
         },
     ]
-        ->(metrics_agent)-[:next]->(metrics_reply:llm {name: "Chat Completion"}) {
+        ->(metrics_agent)-[:calls]->(metrics_reply:llm {name: "Chat Completion"}) {
             input: metrics_agent.input,
             output: "v40 p95 412ms, v41 p95 418ms, v42 p95 493ms.",
             metadata: {model: "gpt-4o", provider: "openai"},
         }
-        ->(diff_agent)-[:next]->(diff_reply:llm {name: "Chat Completion"}) {
+        ->(diff_agent)-[:calls]->(diff_reply:llm {name: "Chat Completion"}) {
             input: diff_agent.input,
             output: "A synchronous fraud check was added to the checkout path in v42.",
             metadata: {model: "gpt-4o", provider: "openai"},
@@ -46,17 +46,8 @@
             output: profile_reply.output,
         },
     ]
-        ->(profiler)-[:next]->(profile_reply:llm {name: "Chat Completion"}) {
+        ->(profiler)-[:calls]->(profile_reply:llm {name: "Chat Completion"}) {
             input: profiler.input,
             output: "The fraud check adds 70-90ms per call at p95.",
             metadata: {model: "gpt-4o", provider: "openai"},
         };
-(supervisor)
-    -[:contains]->(delegate)-[:child_of]->(request)
-    -[:contains]->(metrics_agent)-[:child_of]->(request)
-    -[:contains]->(metrics_reply)-[:child_of]->(metrics_agent)
-    -[:contains]->(diff_agent)-[:child_of]->(request)
-    -[:contains]->(diff_reply)-[:child_of]->(diff_agent)
-    -[:contains]->(synthesis)-[:child_of]->(request)
-    -[:contains]->(profiler)-[:child_of]->(request)
-    -[:contains]->(profile_reply)-[:child_of]->(profiler);

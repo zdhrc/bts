@@ -1,6 +1,6 @@
 # a selected window carries its own question, answer and prior context
 (copilot:agent) {input: null, output: request.output};
-(copilot)-[:contains, :next]->(request:task {name: "copilot-window"}) {
+(copilot)-[:next]->(request:task {name: "copilot-window"}) {
     input: copilot.input,
     local: {position: range(0, 1)},
     output: self.local.position == 0 ? opening.output : later.output,
@@ -9,18 +9,18 @@
 };
 (request)
     =[:exclusive]=>[
-        -[:next {when: request.local.position == 0}]->(opening:task {name: "turn"}) {
+        -[:calls {when: request.local.position == 0}]->(opening:task {name: "turn"}) {
             input: "Why does my worker pool deadlock on shutdown?",
             output: "Your workers block on the results channel. Drain results before joining them.",
             metadata: {window: 0},
         },
-        -[:next {when: request.local.position == 1}]->(later:task {name: "turn"}) {
+        -[:calls {when: request.local.position == 1}]->(later:task {name: "turn"}) {
             input: "Now the shutdown races with the metrics flush.",
             output: "Flush from the shutdown coordinator after the workers have joined.",
             metadata: {window: 3},
         },
     ]
-        ->(opening)-[:next]->(opening_reply:llm {name: "Chat Completion"}) {
+        ->(opening)-[:calls]->(opening_reply:llm {name: "Chat Completion"}) {
             input: [|
                 {role: "system", content: "You are a coding copilot. Prior context arrives as a summary message."},
                 {role: "user", content: opening.input},
@@ -29,7 +29,7 @@
             metadata: {model: "gpt-4o-mini", provider: "openai"},
             metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         }
-        ->(later)-[:next]->(later_reply:llm {name: "Chat Completion"}) {
+        ->(later)-[:calls]->(later_reply:llm {name: "Chat Completion"}) {
             input: [|
                 {role: "system", content: "You are a coding copilot. Prior context arrives as a summary message."},
                 {role: "system", content: "Summary of windows 0-2: the worker-pool deadlock was fixed by draining results before joining. A race in shutdown remains."},
@@ -39,7 +39,3 @@
             metadata: {model: "gpt-4o-mini", provider: "openai"},
             metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         };
-(copilot)-[:contains]->(opening)-[:child_of]->(request);
-(copilot)-[:contains]->(later)-[:child_of]->(request);
-(copilot)-[:contains]->(opening_reply)-[:child_of]->(opening);
-(copilot)-[:contains]->(later_reply)-[:child_of]->(later);

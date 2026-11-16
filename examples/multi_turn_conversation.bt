@@ -16,7 +16,7 @@
     ),
     output: request.output,
 };
-(billing)-[:contains, :next]->(request:task {name: "billing-support"}) {
+(billing)-[:next]->(request:task {name: "billing-support"}) {
     input: billing.input,
     local: {turns: billing.input},
     output: self.local.turns[len(self.local.turns) - 1],
@@ -25,12 +25,12 @@
 };
 (request)
     =[:repeat {count: len(request.local.turns) / 2}]=>[
-        -[:next]->(turn:task) {
+        -[:calls]->(turn:task) {
             input: request.local.turns[context.index * 2],
             output: request.local.turns[context.index * 2 + 1],
         },
     ]
-        ->(turn)-[:next]->(reply:llm {name: "Chat Completion"}) {
+        ->(turn)-[:calls]->(reply:llm {name: "Chat Completion"}) {
             input: [|
                 {role: "system", content: "You are a support assistant for a billing product. Be concise and cite the relevant policy when you refuse."},
                 ...request.local.turns[:context.index * 2 + 1],
@@ -40,5 +40,3 @@
             duration: range(0.3, 0.8),
             metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         };
-(billing)-[:contains]->(turn)-[:child_of]->(request);
-(billing)-[:contains]->(reply)-[:child_of]->(turn);

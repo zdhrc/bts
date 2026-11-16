@@ -7,31 +7,24 @@
     output: ("answer-request").output
 };
 
-("support-lookup_agent")-[:contains]->("support-lookup");
-("support-lookup")-[:next]->("answer-request");
+("support-lookup")-[:calls]->("answer-request");
 ("answer-request":task) {
     input: ("support-lookup").input,
     output: ("draft-answer").output.content
 };
 
-("support-lookup_agent")-[:contains]->("answer-request");
-("answer-request")-[:child_of]->("support-lookup");
-("answer-request")-[:next]->("search-kb");
+("answer-request")-[:calls]->("search-kb");
 ("search-kb":tool) {
     input: {query: ("support-lookup").input.question},
     output: {article: "Billing > Invoices", url: "/billing/invoices"}
 };
 
-("support-lookup_agent")-[:contains]->("search-kb");
-("search-kb")-[:child_of]->("answer-request");
 ("search-kb")-[:next]->("draft-answer");
 ("draft-answer":llm) {
     input: {question: ("support-lookup").input.question, article: ("search-kb").output.article},
     output: {role: "assistant", content: "Download invoices from Billing > Invoices."}
 };
 
-("support-lookup_agent")-[:contains]->("draft-answer");
-("draft-answer")-[:child_of]->("answer-request");
 ("support-regressions":dataset) {
     description: "Billing support examples from authored inputs and trace spans",
     cases: [|(inline), ("whole-trace"), ("field-values"), (search), (answer)|]

@@ -13,8 +13,7 @@
     metadata: {version: "basic", channel: "chat"}
 };
 
-(basic_agent)-[:contains]->("basic-flow");
-("basic-flow")-[:next]->("lookup-account");
+("basic-flow")-[:calls]->("lookup-account");
 ("lookup-account":tool) {
     duration: range (0.05, 0.15),
     input: {request: ("basic-flow").input.message},
@@ -25,8 +24,6 @@
     }
 };
 
-(basic_agent)-[:contains]->("lookup-account");
-("lookup-account")-[:child_of]->("basic-flow");
 ("lookup-account")-[:next]->("draft-reply");
 ("draft-reply":llm) {
     duration: range (0.4, 0.8),
@@ -38,8 +35,6 @@
     metadata: {model: "gpt-4o-mini", provider: "openai"}
 };
 
-(basic_agent)-[:contains]->("draft-reply");
-("draft-reply")-[:child_of]->("basic-flow");
 ("recovery-flow":task) {
     input: recovery_agent.input,
     output: {
@@ -49,8 +44,7 @@
     metadata: {version: "improved", channel: "chat"}
 };
 
-(recovery_agent)-[:contains]->("recovery-flow");
-("recovery-flow")-[:next]->("recovery-flow_lookup-account");
+("recovery-flow")-[:calls]->("recovery-flow_lookup-account");
 ("recovery-flow_lookup-account":tool {name: "lookup-account"}) {
     duration: range (0.05, 0.15),
     input: {request: ("recovery-flow").input.message},
@@ -61,8 +55,6 @@
     }
 };
 
-(recovery_agent)-[:contains]->("recovery-flow_lookup-account");
-("recovery-flow_lookup-account")-[:child_of]->("recovery-flow");
 ("recovery-flow_lookup-account")-[:next]->("recovery-flow_draft-reply");
 ("recovery-flow_draft-reply":llm {name: "draft-reply"}) {
     duration: range (0.4, 0.8),
@@ -74,8 +66,6 @@
     metadata: {model: "gpt-4o-mini", provider: "openai"}
 };
 
-(recovery_agent)-[:contains]->("recovery-flow_draft-reply");
-("recovery-flow_draft-reply")-[:child_of]->("recovery-flow");
 ("account-recovery-regressions":dataset) {
     description: "Ordinary resets, unverified email, locked accounts, and lost MFA devices",
     cases: [|
