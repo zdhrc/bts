@@ -1658,3 +1658,41 @@ fn agents_share_a_step_under_their_own_parents() {
             .all(|(name, parent)| name != "lookup" || parent.ends_with("_request"))
     );
 }
+
+#[test]
+fn a_step_after_a_rounds_step_runs_in_every_round() {
+    // act follows think on its level, so each round runs both and act can read the round
+    let source = r#"(loop:agent) {input: "x", output: request.output};
+(loop)-[:next]->(request:task) {input: loop.input, output: "done"};
+(request)
+    =[:repeat {count: 2}]=>[
+        -[:calls]->(think:llm) {input: context.index, output: "thought"},
+    ]
+        ->(think)-[:next]->(act:tool) {input: {round: context.index, thought: think.input}, output: "acted"};
+"#;
+    let expected = [
+        ("request", json!("x")),
+        ("think", json!(0)),
+        ("act", json!({"round": 0, "thought": 0})),
+        ("think", json!(1)),
+        ("act", json!({"round": 1, "thought": 1})),
+    ]
+    .map(|(name, input)| (name.to_owned(), input));
+    let batch = flow_batch(source);
+    let spans = span_parents(&batch);
+    let data: Vec<_> = spans
+        .iter()
+        .map(|(name, input, _, _)| (name.clone(), input.clone()))
+        .collect();
+    assert_eq!(data, expected);
+    assert!(
+        spans.iter().skip(1).all(|(_, _, parent, _)| parent == "request"),
+        "every step is a child of the request"
+    );
+    for details in flow_code(&lower(source).unwrap(), "loop") {
+        let code: Vec<_> = (details["spans"].as_array().unwrap().iter())
+            .map(|span| (span["name"].as_str().unwrap().to_owned(), span["input"].clone()))
+            .collect();
+        assert_eq!(code, expected);
+    }
+}

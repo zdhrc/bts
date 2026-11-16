@@ -96,69 +96,7 @@ fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
         }
         let agent = graph::NodeId(index);
         let Structure { members, parents } = structure(model, agent)?;
-        let entry = model
-            .edges
-            .iter()
-            .find(|edge| edge.source == agent && inherits(model, &edge.kind, "next"))
-            .map(|edge| edge.target);
-        // child-owned computed fields need an occurrence-local binding cache
-        let computed_children = members.iter().any(|id| {
-            Some(*id) != entry
-                && inherits(model, &model.nodes[id.0].kind, "span")
-                && model.nodes[id.0].fields.iter().any(|field| {
-                    let binding = &model.bindings[field.0];
-                    binding.path.len() == 1
-                        && !matches!(
-                            binding.value,
-                            graph::Value::Input { .. }
-                                | graph::Value::Str(_)
-                                | graph::Value::Num(_)
-                                | graph::Value::Bool(_)
-                                | graph::Value::Null
-                                | graph::Value::Func {
-                                    func: graph::Func::Range(_)
-                                        | graph::Func::Normal { .. }
-                                        | graph::Func::Lognormal { .. }
-                                        | graph::Func::Exponential { .. }
-                                        | graph::Func::Pareto { .. }
-                                        | graph::Func::Beta { .. }
-                                        | graph::Func::Poisson { .. }
-                                        | graph::Func::Chance { .. }
-                                        | graph::Func::Uuid
-                                        | graph::Func::Hex { .. }
-                                        | graph::Func::Alphanum { .. },
-                                    ..
-                                }
-                        )
-                        && !matches!(
-                            binding.path[0].as_str(),
-                            "input"
-                                | "output"
-                                | "expected"
-                                | "error"
-                                | "metadata"
-                                | "metrics"
-                                | "tags"
-                                | "scores"
-                                | "duration"
-                                | "score"
-                                | "reason"
-                        )
-                })
-        });
-        let nested_dependencies = model.bindings.iter().any(|binding| {
-            let graph::Value::BindingRef(target, _) = binding.value else {
-                return false;
-            };
-            let target = &model.bindings[target.0];
-            matches!(binding.owner, graph::ElementId::Node(node) if members.contains(&node))
-                && target.owner != binding.owner
-                && target.path.len() > 1
-                && matches!(target.path[0].as_str(), "metadata" | "metrics")
-        });
-        if computed_children
-            || nested_dependencies
-            || model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
+        if model.edges.iter().any(|edge| edge.cycle && members.contains(&edge.source))
             || model.junctions.iter().any(|junction| members.contains(&junction.target))
         {
             lower_flow(model, agent, &members, parents, &mut result).at(node.range)?;
@@ -1436,10 +1374,47 @@ impl<'a> AgentLowering<'a> {
     }
 
     fn each(&self, node: graph::NodeId) -> Option<(usize, &graph::Fork)> {
-        self.graph.forks.iter().enumerate().find(|(_, fork)| {
-            (inherits(self.graph, &fork.kind, "each") || inherits(self.graph, &fork.kind, "repeat"))
-                && fork.branches.iter().flatten().any(|id| self.graph.edges[id.0].target == node)
-        })
+        self.round(node, &mut HashSet::new())
+    }
+
+    // the each or repeat fork whose round a step runs in
+    fn round(&self, node: graph::NodeId, seen: &mut HashSet<graph::NodeId>) -> Option<(usize, &graph::Fork)> {
+        if !seen.insert(node) {
+            return None;
+        }
+        let iterates =
+            |fork: &graph::Fork| inherits(self.graph, &fork.kind, "each") || inherits(self.graph, &fork.kind, "repeat");
+        let direct =
+            self.graph.forks.iter().enumerate().find(|(_, fork)| {
+                iterates(fork) && fork.branches.iter().flatten().any(|id| self.graph.edges[id.0].target == node)
+            });
+        if direct.is_some() {
+            return direct;
+        }
+        // a step that follows a round's step on the same level belongs to that round
+        let level = self.parents.get(&node)?;
+        for edge in &self.graph.edges {
+            if edge.target == node
+                && !edge.cycle
+                && inherits(self.graph, &edge.kind, "next")
+                && self.parents.get(&edge.source) == Some(level)
+                && let Some(found) = self.round(edge.source, seen)
+            {
+                return Some(found);
+            }
+        }
+        // so does the target of a junction on a fork inside the round
+        for junction in self.graph.junctions.iter().filter(|junction| junction.target == node) {
+            let Some(fork) = junction.fork else { continue };
+            let fork = &self.graph.forks[fork.0];
+            if !iterates(fork)
+                && self.parents.get(&fork.source) == Some(level)
+                && let Some(found) = self.round(fork.source, seen)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     fn each_id(&self, index: usize) -> execution::NodeId {
