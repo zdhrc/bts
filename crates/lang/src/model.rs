@@ -1,4 +1,4 @@
-use crate::diag::SrcRange;
+use crate::diag::{Diag, DiagPhase, Diags, SrcRange};
 use std::collections::BTreeMap;
 
 /// A compiled graph with stable model-local identities and resolved references.
@@ -36,6 +36,8 @@ pub struct Model {
     pub context: Vec<Vec<ContextSupply>>,
     /// The values elements supply for the context keys their kinds provide with a value.
     pub context_values: Vec<ContextValue>,
+    /// Every context read with the element that owns it, in source order.
+    pub context_reads: Vec<ContextRead>,
 }
 
 /// The value one element supplies for a context key.
@@ -47,6 +49,32 @@ pub struct ContextValue {
     pub key: String,
     /// The value expression, lowered as if written on the supplying element.
     pub binding: BindingId,
+}
+
+/// One read of a context key.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ContextRead {
+    /// The element whose context is read.
+    pub owner: ElementId,
+    /// The key and any further path.
+    pub path: Vec<String>,
+    /// Source location of the read.
+    pub range: SrcRange,
+}
+
+impl Model {
+    /// Whether a kind is `base` or derives from it.
+    pub fn derives(&self, kind: &str, base: &str) -> bool {
+        let mut name = kind;
+        for _ in 0..=self.kinds.len() {
+            if name == base {
+                return true;
+            }
+            let Some(id) = self.kind_names.get(name) else { return false };
+            name = &self.kinds[id.0].base;
+        }
+        false
+    }
 }
 
 /// One context key that reaches a node.
@@ -943,4 +971,89 @@ pub struct ObjectField {
     pub key: String,
     /// The value expression to inspect or evaluate.
     pub value: Value,
+}
+
+/// The kinds and context keys one consumer gives meaning to.
+///
+/// A kind is supported when it is listed or derives from a listed kind. Listing a
+/// construct root, such as `node`, supports that kind alone, since a kind derived
+/// from a root is a new kind the consumer knows nothing about. A context key is
+/// supported when it is listed, or when a definition that provides the key supplies
+/// its value, which needs no consumer.
+#[derive(Debug, Clone, Copy)]
+pub struct Capabilities<'a> {
+    /// The consumer's name in diagnostics.
+    pub consumer: &'a str,
+    /// Supported node kinds.
+    pub nodes: &'a [&'a str],
+    /// Supported edge kinds.
+    pub edges: &'a [&'a str],
+    /// Supported fork kinds.
+    pub forks: &'a [&'a str],
+    /// Supported junction kinds.
+    pub junctions: &'a [&'a str],
+    /// Context keys the consumer supplies.
+    pub context: &'a [&'a str],
+}
+
+impl Model {
+    /// Reports every listed element whose kind a consumer does not support, and
+    /// every context read of those elements that nothing supplies.
+    ///
+    /// The elements are the ones the consumer would walk. Other elements of the
+    /// model may belong to another consumer and are left alone.
+    pub fn unsupported(&self, capabilities: &Capabilities, elements: &[ElementId]) -> Diags {
+        let model = self;
+        let mut diags = Vec::new();
+        for element in elements {
+            let (construct, kind, range, supported) = match *element {
+                ElementId::Node(id) => ("node", &model.nodes[id.0].kind, model.nodes[id.0].range, capabilities.nodes),
+                ElementId::Edge(id) => ("edge", &model.edges[id.0].kind, model.edges[id.0].range, capabilities.edges),
+                ElementId::Fork(id) => ("fork", &model.forks[id.0].kind, model.forks[id.0].range, capabilities.forks),
+                ElementId::Junction(id) => (
+                    "junction",
+                    &model.junctions[id.0].kind,
+                    model.junctions[id.0].range,
+                    capabilities.junctions,
+                ),
+            };
+            let supports = |base: &&str| {
+                if *base == construct {
+                    kind == base
+                } else {
+                    model.derives(kind, base)
+                }
+            };
+            if !supported.iter().any(supports) {
+                diags.push(Diag {
+                    when: DiagPhase::Validation,
+                    what: format!("{construct} kind `{kind}` is not supported by {}", capabilities.consumer),
+                    r#where: range,
+                });
+            }
+        }
+        for read in &model.context_reads {
+            let Some(key) = read.path.first() else { continue };
+            if !elements.contains(&read.owner) || capabilities.context.contains(&key.as_str()) {
+                continue;
+            }
+            // a definition that provides the key with a value supplies it without a consumer
+            let supplied = match read.owner {
+                ElementId::Node(node) => (model.context.get(node.0).into_iter().flatten())
+                    .filter(|supply| &supply.key == key)
+                    .flat_map(|supply| &supply.suppliers)
+                    .any(|supplier| (model.context_values.iter()).any(|value| &value.key == key && value.owner == *supplier)),
+                _ => false,
+            };
+            if !supplied {
+                diags.push(Diag {
+                    when: DiagPhase::Validation,
+                    what: format!("context key `{key}` is not supplied by {}", capabilities.consumer),
+                    r#where: read.range,
+                });
+            }
+        }
+        diags.sort_by_key(|diag| (diag.r#where.source, diag.r#where.start));
+        diags
+    }
 }

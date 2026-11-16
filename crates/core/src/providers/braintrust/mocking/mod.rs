@@ -29,7 +29,75 @@ pub fn compile(source: &str) -> Result<execution::Model, String> {
 ///
 /// A failure is one validation diagnostic at the graph element it concerns, or at
 /// the start of the source when no single element is responsible.
+/// The kinds and context keys the mocking consumers give meaning to.
+pub const CAPABILITIES: graph::Capabilities<'static> = graph::Capabilities {
+    consumer: "Braintrust mocking",
+    // a span and the kinds derived from it emit spans, node and vars carry values without one
+    nodes: &["span", "node", "vars"],
+    // calls derives from next
+    edges: &["next", "feeds"],
+    forks: &["parallel", "conditional", "exclusive", "weighted", "each", "repeat"],
+    junctions: &["accumulate", "merge", "first", "quorum", "reduce"],
+    context: &[
+        "trace_index",
+        "history",
+        "item",
+        "index",
+        "count",
+        "arrivals",
+        "accumulator",
+        "arrival",
+        "parent",
+        "input",
+        "output",
+        "expected",
+        "metadata",
+    ],
+};
+
+/// Reports every element the mocking consumers would walk and give no meaning to.
+///
+/// The elements are the steps of each agent with their edges, forks and junctions,
+/// and every scorer. Other elements of the model are left to other consumers.
+pub fn unsupported(model: &graph::Model) -> graph::Diags {
+    let mut elements = BTreeSet::new();
+    for (index, node) in model.nodes.iter().enumerate() {
+        let id = graph::NodeId(index);
+        if model.derives(&node.kind, "scorer") {
+            elements.insert(graph::ElementId::Node(id));
+        }
+        if !model.derives(&node.kind, "agent") {
+            continue;
+        }
+        // a broken structure is reported by the lowering itself
+        let Ok(Structure { members, .. }) = structure(model, id) else {
+            continue;
+        };
+        let walked = |node: &graph::NodeId| *node == id || members.contains(node);
+        elements.extend(members.iter().map(|member| graph::ElementId::Node(*member)));
+        elements.extend(
+            (model.edges.iter().enumerate())
+                .filter(|(_, edge)| walked(&edge.source))
+                .map(|(edge, _)| graph::ElementId::Edge(graph::EdgeId(edge))),
+        );
+        elements.extend(
+            (model.forks.iter().enumerate())
+                .filter(|(_, fork)| walked(&fork.source))
+                .map(|(fork, _)| graph::ElementId::Fork(graph::ForkId(fork))),
+        );
+        elements.extend(
+            (model.junctions.iter().enumerate())
+                .filter(|(_, junction)| members.contains(&junction.target))
+                .map(|(junction, _)| graph::ElementId::Junction(graph::JunctionId(junction))),
+        );
+    }
+    model.unsupported(&CAPABILITIES, &elements.into_iter().collect::<Vec<_>>())
+}
+
 pub fn lower(model: &graph::Model) -> Result<execution::Model, graph::Diag> {
+    if let Some(diag) = unsupported(model).into_iter().next() {
+        return Err(diag);
+    }
     lower_model(model).map_err(|error| graph::Diag {
         when: graph::DiagPhase::Validation,
         what: error.what,

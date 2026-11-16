@@ -1568,6 +1568,13 @@ impl Modeler {
             ));
         }
         self.errors.extend(errors);
+        self.model.context_reads = (self.context_reads.iter())
+            .map(|(owner, path, range)| ContextRead {
+                owner: *owner,
+                path: path.clone(),
+                range: *range,
+            })
+            .collect();
         self.model.context = reach
             .into_iter()
             .map(|keys| {

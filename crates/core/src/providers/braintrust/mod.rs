@@ -38,8 +38,16 @@ impl Bundle {
             &[Self::DEFINITIONS],
             allow_empty,
         )?;
+        // everything this provider's consumers do not support is reported together
+        let unsupported = mocking::unsupported(&graph);
+        if !unsupported.is_empty() {
+            return Err(unsupported);
+        }
         Self::lower(&graph).map_err(|diag| vec![diag])
     }
+
+    /// The kinds and context keys the mocking consumers give meaning to.
+    pub const CAPABILITIES: bts_lang::Capabilities<'static> = mocking::CAPABILITIES;
 
     /// Lowers an agent graph for the shared mock data and mock code consumers.
     ///
