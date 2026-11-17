@@ -2,6 +2,7 @@ use crate::config::Settings;
 use crate::diag::SourceDiags;
 use crate::selection;
 use bts_core::providers::DataProvider;
+use bts_core::providers::Provider as _;
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, clap::Args)]
@@ -19,9 +20,10 @@ pub struct Args {
 impl Args {
     pub fn run(self) -> Result<(), Error> {
         let source = fs::read_to_string(&self.from).map_err(Error::Read)?;
-        let model = bts_core::providers::braintrust::Bundle::compile_module(&source, true)
+        let model = crate::providers::SELECTED
+            .compile_module(&source, true)
             .map_err(|diags| Error::Invalid(SourceDiags::new(&self.from.display().to_string(), &source, diags)))?;
-        let client = bts_core::providers::braintrust::Bundle
+        let client = crate::providers::SELECTED
             .client(&crate::providers::braintrust::config(&Settings::load()?)?)
             .map_err(Error::Client)?;
         bts_core::providers::braintrust::features::datasets::sync(

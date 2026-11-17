@@ -1,4 +1,5 @@
 use crate::dsl::Diags;
+use bts_core::providers::Provider as _;
 use std::fmt;
 
 // keep the original source and locations until the cli renders the failure
@@ -25,11 +26,10 @@ impl fmt::Display for SourceDiags {
             if index > 0 {
                 formatter.write_str("\n")?;
             }
-            let definition = bts_core::providers::braintrust::Bundle::DEFINITIONS;
-            let (name, source) = if diag.r#where.source == 1 {
-                (definition.name, definition.text)
-            } else {
-                (self.source_name.as_str(), self.source.as_str())
+            // a source index past zero is one of the provider's definition sources
+            let (name, source) = match crate::providers::SELECTED.schema().definition(diag.r#where.source) {
+                Some(definition) => (definition.name, definition.text),
+                None => (self.source_name.as_str(), self.source.as_str()),
             };
             formatter.write_str(&diag.render(name, source))?;
         }
@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn provider_definition_conflicts_point_to_the_user_declaration() {
         let source = "+(span:node);";
-        let errors = bts_core::providers::braintrust::Bundle::compile_module(source, false).unwrap_err();
+        let errors = crate::providers::SELECTED.compile_module(source, false).unwrap_err();
         let report = SourceDiags::new("shape.bt", source, errors).to_string();
         assert!(report.contains("shape.bt:"));
         assert!(!report.contains("braintrust.bt:"));

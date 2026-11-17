@@ -2,6 +2,7 @@ use bts_core::mocking::data::{
     self, Attachment, AttachmentFormat, Distribution, EventBatch, Format, PrepareError, Request, RunError, Sink,
     UnsupportedAttachment, Value, WriteError,
 };
+use bts_core::providers::Provider;
 use bts_core::providers::braintrust::Bundle;
 use bts_core::selection::filter::WriteFilter;
 use bts_lang::semantics::{Source, compile_with_definitions};
@@ -148,17 +149,18 @@ impl std::error::Error for ArchiveUnavailable {}
 
 fn request<'a>(source: &str, filter: &'a WriteFilter) -> Request<'a> {
     Request {
-        model: Bundle::lower(
-            &compile_with_definitions(
-                Source {
-                    name: "archive.bt",
-                    text: source,
-                },
-                &[Bundle::DEFINITIONS],
+        model: Bundle
+            .lower(
+                &compile_with_definitions(
+                    Source {
+                        name: "archive.bt",
+                        text: source,
+                    },
+                    Bundle.schema().definitions,
+                )
+                .unwrap(),
             )
             .unwrap(),
-        )
-        .unwrap(),
         count: 1,
         over: Duration::from_secs(60),
         distribution: Distribution::Linear,

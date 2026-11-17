@@ -4014,7 +4014,7 @@ fn all_examples_compile_and_trace_examples_generate() {
             String::from_utf8_lossy(&checked.stderr)
         );
         let source = fs::read_to_string(&path).unwrap();
-        let model = bts_core::providers::braintrust::Bundle::compile(&source).unwrap();
+        let model = bts_core::providers::Provider::compile(&bts_core::providers::braintrust::Bundle, &source).unwrap();
         if model.agents.is_empty() {
             assert!(!model.scorers.is_empty(), "{} has no executable example", path.display());
             continue;

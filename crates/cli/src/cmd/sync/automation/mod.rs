@@ -2,6 +2,7 @@ mod scorers;
 mod topics;
 
 use crate::{diag::SourceDiags, selection};
+use bts_core::providers::Provider as _;
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, clap::Args)]
@@ -47,9 +48,11 @@ impl Options {
             path: self.from.clone(),
             source,
         })?;
-        bts_core::providers::braintrust::Bundle::compile_module(&source, true).map_err(|diags| Error::InvalidShape {
-            details: SourceDiags::new(&self.from.display().to_string(), &source, diags),
-        })
+        crate::providers::SELECTED
+            .compile_module(&source, true)
+            .map_err(|diags| Error::InvalidShape {
+                details: SourceDiags::new(&self.from.display().to_string(), &source, diags),
+            })
     }
 }
 

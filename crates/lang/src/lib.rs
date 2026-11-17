@@ -4,6 +4,11 @@
 //! Use [`semantics::compile`] to resolve references and check the language's semantic rules.
 //! Compilation produces a [`Model`] for consumers to evaluate, generate from, or
 //! inspect. This crate does not execute the model or contact external services.
+//!
+//! A provider extends the language with its own kinds and says which kinds and
+//! context keys it gives meaning to. It declares both in a [`ProviderSchema`].
+//! [`semantics::compile_module_with_provider`] compiles source against one, and
+//! [`Model::unsupported`] reports what the provider gives no meaning to.
 #![warn(missing_docs)]
 
 mod ast;
@@ -76,6 +81,20 @@ pub mod semantics {
     /// source text and can use these indexes to render diagnostics with [`Diag::render`].
     pub fn compile_with_definitions(source: Source<'_>, definitions: &[Source<'_>]) -> Result<Model, Diags> {
         compile_module_with_definitions(source, definitions, false)
+    }
+
+    /// Compiles user source together with the definitions a provider declares.
+    ///
+    /// Source indexes follow [`compile_with_definitions`], and
+    /// [`ProviderSchema::definition`](crate::ProviderSchema::definition) returns the
+    /// definition source an index refers to. This does not check what the provider
+    /// supports. Use [`Model::unsupported`] with the elements the provider walks.
+    pub fn compile_module_with_provider(
+        source: Source<'_>,
+        provider: &crate::ProviderSchema<'_>,
+        allow_empty: bool,
+    ) -> Result<Model, Diags> {
+        compile_module_with_definitions(source, provider.definitions, allow_empty)
     }
 
     /// Compiles with supplied definitions and an explicit empty user module policy.

@@ -118,7 +118,7 @@ fn build_matches_shared_core_planning_for_both_languages() {
         let result = build_result(source, &options);
         assert_eq!(result["ok"], true, "{result}");
 
-        let model = bts_core::providers::braintrust::Bundle::compile(source).unwrap();
+        let model = bts_core::providers::Provider::compile(&bts_core::providers::braintrust::Bundle, source).unwrap();
         let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new("Browser Project");
         let assembly = bts_core::mocking::code::assemble(
             &model.scorers,
@@ -180,7 +180,7 @@ fn builds_callable_agents_without_a_project_in_both_languages() {
                 .iter()
                 .any(|file| file["path"] == format!("src/agents/hello_agent_runtime.{extension}"))
         );
-        let model = bts_core::providers::braintrust::Bundle::compile(source).unwrap();
+        let model = bts_core::providers::Provider::compile(&bts_core::providers::braintrust::Bundle, source).unwrap();
         let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new("");
         let assembly = code::assemble_agents(&model, language, &target).unwrap();
         let assembly = target.agent_assembly(&model, language, assembly).unwrap();
@@ -604,7 +604,10 @@ fn exposes_shared_reference_and_browser_authoring_guidance() {
     let reference: Value = serde_wasm_bindgen::from_value(bts_wasm::spec().unwrap()).unwrap();
     assert_eq!(reference, serde_json::to_value(bts_lang::spec::SPEC).unwrap());
     let skill = bts_wasm::skill();
-    assert!(skill.starts_with(&bts_core::skill::render(&bts_lang::spec::SPEC)));
+    assert!(skill.starts_with(&bts_core::skill::render(
+        &bts_lang::spec::SPEC,
+        &bts_core::providers::braintrust::Bundle
+    )));
     assert!(skill.contains("validate(source)"));
     assert!(skill.contains("generate(source, options)"));
     assert!(skill.contains("build(source, options)"));
@@ -668,7 +671,7 @@ fn generation_matches_shared_core_with_filtering_tokens_and_maximum_seed() {
     assert_eq!(value["attachments"], serde_json::json!([]));
 
     let mut batch = data::generate_filtered(
-        bts_core::providers::braintrust::Bundle::compile(source).unwrap(),
+        bts_core::providers::Provider::compile(&bts_core::providers::braintrust::Bundle, source).unwrap(),
         3,
         Duration::from_secs(60),
         data::Distribution::Sine,

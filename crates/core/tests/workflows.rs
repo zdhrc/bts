@@ -87,7 +87,7 @@ fn prepares_preview_attachments_without_reading_or_uploading_files() {
 #[test]
 fn renders_a_language_skill_without_an_interface_spec() {
     let spec = &bts_lang::spec::SPEC;
-    let skill = bts_core::skill::render(spec);
+    let skill = bts_core::skill::render(spec, &bts_core::providers::braintrust::Bundle);
     assert!(skill.starts_with("---\nname: bts\n"));
     assert!(skill.contains(spec.surface.grammar.trim()));
     assert!(skill.contains(&bts_core::skill::reference(spec)));

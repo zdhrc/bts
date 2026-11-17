@@ -4,6 +4,7 @@ use crate::logging;
 use crate::providers::{AgentAdapter, CodeAdapter, braintrust};
 use crate::{code, selection};
 use bts_core::providers::CodeProvider;
+use bts_core::providers::Provider as _;
 use code::AgentTarget as _;
 use std::{env, fmt, fs, path::PathBuf};
 
@@ -143,7 +144,7 @@ impl Args {
         })?;
         let source_name = self.from.display().to_string();
         tracing::info_span!("compile")
-            .in_scope(|| bts_core::providers::braintrust::Bundle::compile_module(&source, false))
+            .in_scope(|| crate::providers::SELECTED.compile_module(&source, false))
             .map_err(|diags| BuildError::InvalidShape {
                 details: SourceDiags::new(&source_name, &source, diags),
             })
@@ -331,10 +332,10 @@ mod tests {
     fn agent_selection_precedes_adapter_configuration_and_passes_the_seed() {
         struct SelectedAgent;
         impl CodeAdapter for SelectedAgent {
-            type Provider = bts_core::providers::braintrust::Bundle;
+            type Provider = crate::providers::Selected;
             type Error = std::io::Error;
             fn provider(&self) -> Self::Provider {
-                bts_core::providers::braintrust::Bundle
+                crate::providers::SELECTED
             }
             fn config(&self) -> Result<String, Self::Error> {
                 unreachable!()
@@ -426,10 +427,10 @@ mod tests {
     fn scorer_execution_accepts_an_adapter_without_agent_support() {
         struct ScorerOnly;
         impl CodeAdapter for ScorerOnly {
-            type Provider = bts_core::providers::braintrust::Bundle;
+            type Provider = crate::providers::Selected;
             type Error = std::io::Error;
             fn provider(&self) -> Self::Provider {
-                bts_core::providers::braintrust::Bundle
+                crate::providers::SELECTED
             }
             fn config(&self) -> Result<String, Self::Error> {
                 Err(std::io::Error::other("scorer settings"))

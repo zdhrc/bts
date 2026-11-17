@@ -6,11 +6,11 @@ use std::{fmt, path::Path};
 pub struct Adapter;
 
 impl DataAdapter for Adapter {
-    type Provider = braintrust::Bundle;
+    type Provider = super::Selected;
     type Error = Error;
 
     fn provider(&self) -> Self::Provider {
-        braintrust::Bundle
+        super::SELECTED
     }
 
     fn config(&self, settings: &Settings) -> Result<braintrust::config::Config, Error> {
@@ -64,11 +64,11 @@ impl DataAdapter for Adapter {
 }
 
 impl CodeAdapter for Adapter {
-    type Provider = braintrust::Bundle;
+    type Provider = super::Selected;
     type Error = Error;
 
     fn provider(&self) -> Self::Provider {
-        braintrust::Bundle
+        super::SELECTED
     }
 
     fn config(&self) -> Result<String, Error> {

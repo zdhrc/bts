@@ -1,15 +1,103 @@
-//! Provider capabilities for data delivery and code integration.
+//! What a provider is, and the workflows a provider can support.
 //!
-//! Providers implement only the workflows they support. Applications supply
-//! configuration and choose a provider without changing the generic pipelines.
+//! [`Provider`] is the contract. A provider declares its kinds and what it gives
+//! meaning to in a [`bts_lang::ProviderSchema`], says which elements of a model it
+//! walks, lowers a model for its consumers, and supplies authoring guidance.
+//! [`conformance::check`] verifies that an implementer is consistent.
+//!
+//! [`DataProvider`] and [`CodeProvider`] are the delivery side. Providers implement
+//! only the workflows they support. Applications supply configuration and choose a
+//! provider in one place, and reach it through these traits everywhere else.
 
 pub mod braintrust;
+pub mod conformance;
 
 use crate::mocking::{code, data};
+use bts_lang::semantics::Source;
+use bts_lang::{Diag, Diags, ElementId, Model, ProviderSchema};
 
 /// Identifies a provider whose supported workflows are declared through capability traits.
 pub trait Bundle {
     const ID: &'static str;
+}
+
+/// Authoring guidance a provider contributes to a generated skill.
+///
+/// Each section is Markdown that starts at a second-level heading. A section a
+/// provider has nothing to say in is empty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Guidance {
+    /// How to author source for this provider, from the request to a finished shape.
+    pub workflow: &'static str,
+    /// How the provider presents what a shape produces.
+    pub presentation: &'static str,
+    /// Notes on the provider's kinds, shown above its definitions.
+    pub definitions: &'static str,
+}
+
+impl Guidance {
+    /// The sections in the order a skill shows them.
+    pub fn sections(&self) -> [&'static str; 3] {
+        [self.workflow, self.presentation, self.definitions]
+    }
+}
+
+/// Gives the language's kinds a meaning: the one contract every provider implements.
+///
+/// The schema is the declarative half and lives in the language crate. This trait
+/// is the half that runs. A host compiles source through [`Provider::compile_module`]
+/// and hands the lowered model to the provider's consumers.
+pub trait Provider: Bundle {
+    /// What the provider's consumers run.
+    type Lowered;
+
+    /// The provider's identity, definitions and supported kinds and context keys.
+    ///
+    /// Its `id` equals [`Bundle::ID`].
+    fn schema(&self) -> ProviderSchema<'static>;
+
+    /// The elements of a model the provider walks.
+    ///
+    /// Only these are checked against the schema. Other elements may belong to
+    /// another provider and are left alone.
+    fn elements(&self, model: &Model) -> Vec<ElementId>;
+
+    /// Lowers a compiled model for the provider's consumers.
+    ///
+    /// A failure is located at the graph element it concerns when one is responsible.
+    fn lower(&self, model: &Model) -> Result<Self::Lowered, Diag>;
+
+    /// Authoring guidance for the skill.
+    fn guidance(&self) -> Guidance;
+
+    /// Reports every walked element the provider gives no meaning to.
+    fn unsupported(&self, model: &Model) -> Diags {
+        model.unsupported(&self.schema(), &self.elements(model))
+    }
+
+    /// Compiles source with the provider's definitions and lowers it.
+    fn compile(&self, source: &str) -> Result<Self::Lowered, String> {
+        self.compile_module(source, false).map_err(|errors| format!("{errors:?}"))
+    }
+
+    /// Compiles source while preserving diagnostics and the empty module policy.
+    ///
+    /// Everything the provider does not support is reported together.
+    fn compile_module(&self, source: &str, allow_empty: bool) -> Result<Self::Lowered, Diags> {
+        let model = bts_lang::semantics::compile_module_with_provider(
+            Source {
+                name: "input.bt",
+                text: source,
+            },
+            &self.schema(),
+            allow_empty,
+        )?;
+        let unsupported = self.unsupported(&model);
+        if !unsupported.is_empty() {
+            return Err(unsupported);
+        }
+        self.lower(&model).map_err(|diag| vec![diag])
+    }
 }
 
 /// Supplies compatible formatting and delivery components for generated data.

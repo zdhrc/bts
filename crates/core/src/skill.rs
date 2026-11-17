@@ -1,48 +1,53 @@
+use crate::providers::Provider;
 use bts_lang::spec::{RuleDesc, Spec as DslSpec};
 use std::fmt::Write as _;
 const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
 Steal the structure, replace the content, and expand along the axis each one names.";
 
-/// A selectable section of the generated Braintrust skill.
+/// A selectable section of a generated skill.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Part {
-    BraintrustWorkflow,
-    BraintrustPresentation,
+    /// The provider's authoring workflow.
+    Workflow,
+    /// How the provider presents what a shape produces.
+    Presentation,
+    /// The language reference, followed by the provider's kinds.
     Language,
 }
 
-pub const FULL_BRAINTRUST: &[Part] = &[Part::BraintrustWorkflow, Part::BraintrustPresentation, Part::Language];
+pub const FULL: &[Part] = &[Part::Workflow, Part::Presentation, Part::Language];
 
-/// Generates a standalone Braintrust skill without interface commands or file access.
-pub fn render(spec: &DslSpec) -> String {
+/// Generates a standalone skill for one provider without interface commands or file access.
+pub fn render<P: Provider>(spec: &DslSpec, provider: &P) -> String {
     format!(
         "---\nname: bts\ndescription: Write, review, explain, and debug bts language source.\n---\n\n{}",
-        assemble_braintrust(spec, FULL_BRAINTRUST, None, None)
+        assemble(spec, provider, FULL, None, None)
     )
 }
 
-/// Assembles Braintrust guidance, the language reference, and optional interface instructions.
-pub fn assemble_braintrust(
+/// Assembles a provider's guidance, the language reference, and optional interface instructions.
+pub fn assemble<P: Provider>(
     spec: &DslSpec,
+    provider: &P,
     parts: &[Part],
     interface_preamble: Option<&str>,
     interface_reference: Option<&str>,
 ) -> String {
+    let guidance = provider.guidance();
     let mut output = String::new();
     if let Some(interface_preamble) = interface_preamble {
         output.push_str(interface_preamble);
     }
     for part in parts {
         match part {
-            Part::BraintrustWorkflow => output.push_str(crate::providers::braintrust::skill::WORKFLOW),
-            Part::BraintrustPresentation => output.push_str(crate::providers::braintrust::skill::PRESENTATION),
+            Part::Workflow => output.push_str(guidance.workflow),
+            Part::Presentation => output.push_str(guidance.presentation),
             Part::Language => {
                 output.push_str(&reference(spec));
-                output.push_str(crate::providers::braintrust::skill::GRAPH);
-                output.push_str(&fenced_code(
-                    "bts",
-                    crate::providers::braintrust::Bundle::DEFINITIONS.text.trim(),
-                ));
+                output.push_str(guidance.definitions);
+                for definition in provider.schema().definitions {
+                    output.push_str(&fenced_code("bts", definition.text.trim()));
+                }
             }
         }
     }
@@ -184,10 +189,11 @@ fn fenced_code(language: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::braintrust::Bundle as Braintrust;
     use bts_lang::spec::SPEC as DSL_SPEC;
     #[test]
     fn renders_the_language_spec_without_interface_dependencies() {
-        let skill = render(&DSL_SPEC);
+        let skill = render(&DSL_SPEC, &Braintrust);
 
         assert!(skill.starts_with("---\nname: bts\ndescription:"));
         assert!(skill.contains(DSL_SPEC.summary));
@@ -226,16 +232,16 @@ mod tests {
 
     #[test]
     fn skill_parts_can_be_selected_independently() {
-        let workflow = assemble_braintrust(&DSL_SPEC, &[Part::BraintrustWorkflow], None, None);
+        let workflow = assemble(&DSL_SPEC, &Braintrust, &[Part::Workflow], None, None);
         assert!(workflow.contains("### 1. Choose the viewer's question"));
         assert!(!workflow.contains("## Braintrust trace presentation"));
         assert!(!workflow.contains("## Surface grammar"));
 
-        let presentation = assemble_braintrust(&DSL_SPEC, &[Part::BraintrustPresentation], None, None);
+        let presentation = assemble(&DSL_SPEC, &Braintrust, &[Part::Presentation], None, None);
         assert!(presentation.contains("## Braintrust trace presentation"));
         assert!(!presentation.contains("## Authoring realistic Braintrust data"));
 
-        let language = assemble_braintrust(&DSL_SPEC, &[Part::Language], None, None);
+        let language = assemble(&DSL_SPEC, &Braintrust, &[Part::Language], None, None);
         assert!(language.contains("## Surface grammar"));
         assert!(!language.contains("## Authoring realistic Braintrust data"));
         assert!(!language.contains("## Braintrust trace presentation"));

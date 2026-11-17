@@ -1127,17 +1127,28 @@ pub struct ObjectField {
     pub value: Value,
 }
 
-/// The kinds and context keys one consumer gives meaning to.
+/// What a provider declares: its identity, its kinds, and what it gives meaning to.
+///
+/// A provider fills in one value of this type. It holds no behavior, so a host can
+/// compile and check source against a provider without running anything. The parts
+/// of a provider that execute are defined by its consumers, outside this crate.
 ///
 /// A kind is supported when it is listed or derives from a listed kind. Listing a
 /// construct root, such as `node`, supports that kind alone, since a kind derived
-/// from a root is a new kind the consumer knows nothing about. A context key is
+/// from a root is a new kind the provider knows nothing about. A context key is
 /// supported when it is listed, or when a definition that provides the key supplies
-/// its value, which needs no consumer.
+/// its value, which needs no provider.
 #[derive(Debug, Clone, Copy)]
-pub struct Capabilities<'a> {
-    /// The consumer's name in diagnostics.
-    pub consumer: &'a str,
+pub struct ProviderSchema<'a> {
+    /// A stable identifier, unique among providers.
+    pub id: &'a str,
+    /// The provider's name in diagnostics.
+    pub name: &'a str,
+    /// The provider's kinds, traits and context keys, written in the language.
+    ///
+    /// Compilation supplies these in order, so a source range with source index
+    /// `n + 1` lies in `definitions[n]`.
+    pub definitions: &'a [crate::semantics::Source<'a>],
     /// Supported node kinds.
     pub nodes: &'a [&'a str],
     /// Supported edge kinds.
@@ -1146,29 +1157,38 @@ pub struct Capabilities<'a> {
     pub forks: &'a [&'a str],
     /// Supported junction kinds.
     pub junctions: &'a [&'a str],
-    /// Context keys the consumer supplies.
+    /// Context keys the provider supplies.
     pub context: &'a [&'a str],
 }
 
+impl<'a> ProviderSchema<'a> {
+    /// Returns the definition source a source range index refers to.
+    ///
+    /// Index zero is the user's source, which the caller holds, so it returns `None`.
+    pub fn definition(&self, source: usize) -> Option<crate::semantics::Source<'a>> {
+        self.definitions.get(source.checked_sub(1)?).copied()
+    }
+}
+
 impl Model {
-    /// Reports every listed element whose kind a consumer does not support, and
+    /// Reports every listed element whose kind a provider does not support, and
     /// every context read of those elements that nothing supplies.
     ///
-    /// The elements are the ones the consumer would walk. Other elements of the
-    /// model may belong to another consumer and are left alone.
-    pub fn unsupported(&self, capabilities: &Capabilities, elements: &[ElementId]) -> Diags {
+    /// The elements are the ones the provider would walk. Other elements of the
+    /// model may belong to another provider and are left alone.
+    pub fn unsupported(&self, provider: &ProviderSchema, elements: &[ElementId]) -> Diags {
         let model = self;
         let mut diags = Vec::new();
         for element in elements {
             let (construct, kind, range, supported) = match *element {
-                ElementId::Node(id) => ("node", &model.nodes[id.0].kind, model.nodes[id.0].range, capabilities.nodes),
-                ElementId::Edge(id) => ("edge", &model.edges[id.0].kind, model.edges[id.0].range, capabilities.edges),
-                ElementId::Fork(id) => ("fork", &model.forks[id.0].kind, model.forks[id.0].range, capabilities.forks),
+                ElementId::Node(id) => ("node", &model.nodes[id.0].kind, model.nodes[id.0].range, provider.nodes),
+                ElementId::Edge(id) => ("edge", &model.edges[id.0].kind, model.edges[id.0].range, provider.edges),
+                ElementId::Fork(id) => ("fork", &model.forks[id.0].kind, model.forks[id.0].range, provider.forks),
                 ElementId::Junction(id) => (
                     "junction",
                     &model.junctions[id.0].kind,
                     model.junctions[id.0].range,
-                    capabilities.junctions,
+                    provider.junctions,
                 ),
             };
             let supports = |base: &&str| {
@@ -1181,17 +1201,17 @@ impl Model {
             if !supported.iter().any(supports) {
                 diags.push(Diag {
                     when: DiagPhase::Validation,
-                    what: format!("{construct} kind `{kind}` is not supported by {}", capabilities.consumer),
+                    what: format!("{construct} kind `{kind}` is not supported by {}", provider.name),
                     r#where: range,
                 });
             }
         }
         for read in &model.context_reads {
             let Some(key) = read.path.first() else { continue };
-            if !elements.contains(&read.owner) || capabilities.context.contains(&key.as_str()) {
+            if !elements.contains(&read.owner) || provider.context.contains(&key.as_str()) {
                 continue;
             }
-            // a definition that provides the key with a value supplies it without a consumer
+            // a definition that provides the key with a value supplies it without a provider
             let supplied = match read.owner {
                 ElementId::Node(node) => (model.context.get(node.0).into_iter().flatten())
                     .filter(|supply| &supply.key == key)
@@ -1202,7 +1222,7 @@ impl Model {
             if !supplied {
                 diags.push(Diag {
                     when: DiagPhase::Validation,
-                    what: format!("context key `{key}` is not supplied by {}", capabilities.consumer),
+                    what: format!("context key `{key}` is not supplied by {}", provider.name),
                     r#where: read.range,
                 });
             }

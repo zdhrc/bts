@@ -1,7 +1,7 @@
 use bts_core::providers::braintrust::mocking::compile;
 use bts_core::{
     mocking::{code, data},
-    providers::{Bundle, CodeProvider, DataProvider, braintrust},
+    providers::{Bundle, CodeProvider, DataProvider, Guidance, Provider, braintrust, conformance},
     selection::filter::WriteFilter,
 };
 use std::{
@@ -284,4 +284,112 @@ fn one_code_workflow_accepts_braintrust_and_a_code_only_bundle() {
     let braintrust = assemble(&braintrust::Bundle, &"test-project".to_owned());
     assert!(braintrust.files[1].contents.contains("test-project"));
     assert!(braintrust.files[1].contents.contains("handler=scorer_quality,"));
+}
+
+#[test]
+fn braintrust_conforms_to_the_provider_contract() {
+    assert_eq!(conformance::check(&braintrust::Bundle), Vec::<String>::new());
+}
+
+// lists kinds it never defines, files one under the wrong construct, and says nothing about its own kind
+struct Inconsistent;
+
+impl Bundle for Inconsistent {
+    const ID: &'static str = "inconsistent";
+}
+
+impl Provider for Inconsistent {
+    type Lowered = ();
+
+    fn schema(&self) -> bts_lang::ProviderSchema<'static> {
+        bts_lang::ProviderSchema {
+            id: "other",
+            name: "Inconsistent",
+            definitions: &[bts_lang::semantics::Source {
+                name: "inconsistent.bt",
+                text: "+(widget:node);",
+            }],
+            nodes: &["widget", "gadget", "next"],
+            edges: &["next"],
+            forks: &[],
+            junctions: &[],
+            context: &[],
+        }
+    }
+
+    fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
+        Vec::new()
+    }
+
+    fn lower(&self, _: &bts_lang::Model) -> Result<(), bts_lang::Diag> {
+        Ok(())
+    }
+
+    fn guidance(&self) -> Guidance {
+        Guidance {
+            workflow: "## Workflow\n\nNothing about the kinds.\n",
+            presentation: "",
+            definitions: "",
+        }
+    }
+}
+
+#[test]
+fn the_conformance_check_reports_each_inconsistency() {
+    assert_eq!(
+        conformance::check(&Inconsistent),
+        [
+            "schema id `other` is not the bundle id `inconsistent`",
+            "node kind `gadget` is neither a primitive nor defined by the provider",
+            "`next` is listed under node kinds and belongs to edge kinds",
+            "the guidance does not mention the kind `widget`",
+        ]
+    );
+}
+
+#[test]
+fn the_conformance_check_locates_definitions_that_do_not_compile() {
+    struct Broken;
+    impl Bundle for Broken {
+        const ID: &'static str = "broken";
+    }
+    impl Provider for Broken {
+        type Lowered = ();
+        fn schema(&self) -> bts_lang::ProviderSchema<'static> {
+            bts_lang::ProviderSchema {
+                id: "broken",
+                name: "Broken",
+                definitions: &[bts_lang::semantics::Source {
+                    name: "broken.bt",
+                    text: "+(widget:missing);",
+                }],
+                nodes: &[],
+                edges: &[],
+                forks: &[],
+                junctions: &[],
+                context: &[],
+            }
+        }
+        fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
+            Vec::new()
+        }
+        fn lower(&self, _: &bts_lang::Model) -> Result<(), bts_lang::Diag> {
+            Ok(())
+        }
+        fn guidance(&self) -> Guidance {
+            Inconsistent.guidance()
+        }
+    }
+    let problems = conformance::check(&Broken);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("broken.bt:"), "{problems:?}");
+}
+
+#[test]
+fn a_provider_compiles_source_against_its_own_definitions() {
+    let errors = Inconsistent.compile_module("(a:span);", false).unwrap_err();
+    assert!(errors[0].what.contains("span"), "{errors:?}");
+    assert!(Inconsistent.compile_module("(a:widget);", false).is_ok());
+    assert_eq!(braintrust::Bundle.schema().definition(1).unwrap().name, "braintrust.bt");
+    assert!(braintrust::Bundle.schema().definition(0).is_none());
 }

@@ -13,7 +13,7 @@ impl Args {
     pub fn run(self) -> Result<(), Error> {
         let root = crate::config::project_root().map_err(Error::Directory)?;
         let model = self.sync.compile()?;
-        let client = bts_core::providers::braintrust::Bundle
+        let client = crate::providers::SELECTED
             .client(&crate::providers::braintrust::config(&Settings::load()?)?)
             .map_err(Error::Client)?;
         scorers::run(

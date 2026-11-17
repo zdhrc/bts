@@ -2,14 +2,16 @@
 //!
 //! [`mocking::data`] separates generation, encoding, and delivery.
 //! [`mocking::code`] separates source assembly, codebase planning, and file writes.
-//! [`providers`] supplies compatible capabilities and provider-specific features.
+//! [`providers`] defines what a provider is and holds the providers themselves.
 //! Applications own argument parsing, configuration choices, and presentation.
 //! The default `native` feature enables local configuration, filesystem writes,
 //! and provider clients. Disable it to use generation, encoding, and codebase
 //! planning in browser applications.
 //!
-//! Compile graph sources with provider definitions, then lower them through
-//! [`providers::braintrust::Bundle::lower`] before invoking mocking consumers.
+//! A host names its provider in one place and reaches it through
+//! [`providers::Provider`]. [`providers::Provider::compile_module`] compiles source
+//! with the provider's definitions, rejects what the provider does not support and
+//! lowers the result for the mocking consumers.
 //! Model transformations must preserve resolved references and scope invariants.
 
 #[cfg(feature = "native")]

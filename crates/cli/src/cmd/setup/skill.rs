@@ -207,9 +207,10 @@ fn render_skill(spec: &DslSpec, cli_spec: &CliSpec) -> String {
     )
     .unwrap();
     render_cli_spec(&mut cli_reference, cli_spec);
-    output.push_str(&bts_core::skill::assemble_braintrust(
+    output.push_str(&bts_core::skill::assemble(
         spec,
-        bts_core::skill::FULL_BRAINTRUST,
+        &crate::providers::SELECTED,
+        bts_core::skill::FULL,
         Some(crate::spec::PREAMBLE),
         Some(&cli_reference),
     ));

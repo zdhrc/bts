@@ -1,4 +1,5 @@
 use bts_core::mocking::{ScorerLang, code, data};
+use bts_core::providers::Provider;
 use bts_core::providers::braintrust::{Bundle, mocking::code::CodeTarget};
 use bts_lang::semantics::{Source, compile_with_definitions};
 use serde_json::{Value, json};
@@ -34,10 +35,10 @@ fn lower(source: &str) -> Result<bts_core::mocking::Model, String> {
             name: "agent.bt",
             text: source,
         },
-        &[Bundle::DEFINITIONS],
+        Bundle.schema().definitions,
     )
     .unwrap_or_else(|errors| panic!("{errors:#?}"));
-    Bundle::lower(&graph).map_err(|diag| diag.what)
+    Bundle.lower(&graph).map_err(|diag| diag.what)
 }
 
 #[test]
@@ -1411,7 +1412,7 @@ fn consumer_rejections_point_at_the_offending_element() {
             "fork kind `fork` is not supported by Braintrust mocking",
         ),
     ] {
-        let errors = Bundle::compile_module(&source, false).unwrap_err();
+        let errors = Bundle.compile_module(&source, false).unwrap_err();
         assert_eq!(errors.len(), 1, "{errors:#?}");
         let range = errors[0].r#where;
         assert_eq!(errors[0].what, message);
@@ -1446,7 +1447,7 @@ fn consumer_rejections_point_at_the_offending_element() {
             "unknown node kind `tsak`, did you mean `task`?",
         ),
     ] {
-        let errors = Bundle::compile_module(&source, false).unwrap_err();
+        let errors = Bundle.compile_module(&source, false).unwrap_err();
         let found = errors
             .iter()
             .find(|error| error.what == message)
@@ -1461,7 +1462,7 @@ fn consumer_rejections_point_at_the_offending_element() {
         -[two:next]->(c:task {name: "c"}),
     ]
         >[:accumulate [one], [two]]>>(joined:task {name: "joined"}) {input: context.arivals};"#;
-    let errors = Bundle::compile_module(source, false).unwrap_err();
+    let errors = Bundle.compile_module(source, false).unwrap_err();
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert_eq!(
         errors[0].what,
@@ -1636,7 +1637,7 @@ fn a_junction_target_takes_the_parent_its_inputs_carry() {
     );
     // inputs that disagree are rejected at the junction
     let disagreeing = source.replace("-[a:next]->", "-[a:calls]->");
-    let errors = Bundle::compile_module(&disagreeing, false).unwrap_err();
+    let errors = Bundle.compile_module(&disagreeing, false).unwrap_err();
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert_eq!(
         errors[0].what,
@@ -1920,7 +1921,7 @@ fn shapes_without_a_nested_form_are_refused_with_a_location() {
             "`second` runs once for each round of its fork, read it from a step in the round or through a junction",
         ),
     ] {
-        let errors = Bundle::compile_module(&source, false).unwrap_err();
+        let errors = Bundle.compile_module(&source, false).unwrap_err();
         assert_eq!(errors.len(), 1, "{errors:#?}");
         let range = errors[0].r#where;
         assert_eq!(errors[0].what, message, "{source}");

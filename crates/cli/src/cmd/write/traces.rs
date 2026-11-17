@@ -6,6 +6,7 @@ use crate::logging;
 use crate::providers::{DataAdapter, TraceRun, braintrust};
 use bts_core::mocking::data::Format as _;
 use bts_core::providers::DataProvider;
+use bts_core::providers::Provider as _;
 use std::{
     env, fmt, fs,
     num::NonZeroUsize,
@@ -130,7 +131,7 @@ impl Args {
         })?;
         let source_name = self.from.display().to_string();
         let model = tracing::info_span!("compile")
-            .in_scope(|| bts_core::providers::braintrust::Bundle::compile_module(&source, false))
+            .in_scope(|| crate::providers::SELECTED.compile_module(&source, false))
             .map_err(|diags| TraceError::InvalidShape {
                 details: SourceDiags::new(&source_name, &source, diags),
             })?;

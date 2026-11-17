@@ -15,50 +15,37 @@ use mocking::code;
 #[cfg(feature = "native")]
 use mocking::data;
 
-/// Supplies Braintrust implementations for core mocking workflows.
+/// The Braintrust provider: its schema, its lowering for the mocking consumers, and its delivery and code workflows.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Bundle;
 
-impl Bundle {
-    /// Supplies agent and span schemas for hosts to include explicitly during compilation.
-    pub const DEFINITIONS: bts_lang::semantics::Source<'static> = defs::SOURCE;
-
-    /// Compiles source with this provider's definitions and lowers its mocking behavior.
-    pub fn compile(source: &str) -> Result<crate::mocking::Model, String> {
-        Self::compile_module(source, false).map_err(|errors| format!("{errors:?}"))
-    }
-
-    /// Compiles provider source while preserving diagnostics and the empty module policy.
-    pub fn compile_module(source: &str, allow_empty: bool) -> Result<crate::mocking::Model, bts_lang::Diags> {
-        let graph = bts_lang::semantics::compile_module_with_definitions(
-            bts_lang::semantics::Source {
-                name: "input.bt",
-                text: source,
-            },
-            &[Self::DEFINITIONS],
-            allow_empty,
-        )?;
-        // everything this provider's consumers do not support is reported together
-        let unsupported = mocking::unsupported(&graph);
-        if !unsupported.is_empty() {
-            return Err(unsupported);
-        }
-        Self::lower(&graph).map_err(|diag| vec![diag])
-    }
-
-    /// The kinds and context keys the mocking consumers give meaning to.
-    pub const CAPABILITIES: bts_lang::Capabilities<'static> = mocking::CAPABILITIES;
-
-    /// Lowers an agent graph for the shared mock data and mock code consumers.
-    ///
-    /// A failure is located at the graph element it concerns when one is responsible.
-    pub fn lower(model: &bts_lang::Model) -> Result<crate::mocking::Model, bts_lang::Diag> {
-        mocking::lower(model)
-    }
-}
-
 impl super::Bundle for Bundle {
     const ID: &'static str = "braintrust";
+}
+
+impl super::Provider for Bundle {
+    type Lowered = crate::mocking::Model;
+
+    fn schema(&self) -> bts_lang::ProviderSchema<'static> {
+        mocking::SCHEMA
+    }
+
+    fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
+        mocking::elements(model)
+    }
+
+    /// Lowers an agent graph for the shared mock data and mock code consumers.
+    fn lower(&self, model: &bts_lang::Model) -> Result<crate::mocking::Model, bts_lang::Diag> {
+        mocking::lower(model)
+    }
+
+    fn guidance(&self) -> super::Guidance {
+        super::Guidance {
+            workflow: skill::WORKFLOW,
+            presentation: skill::PRESENTATION,
+            definitions: skill::GRAPH,
+        }
+    }
 }
 
 #[cfg(feature = "native")]

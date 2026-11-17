@@ -1,4 +1,5 @@
 use bts_core::mocking::data::{self, Distribution, Value};
+use bts_core::providers::Provider;
 use bts_core::providers::braintrust::Bundle;
 use bts_lang::semantics::{Source, compile_with_definitions};
 
@@ -8,10 +9,10 @@ fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
             name: "generation.bt",
             text: source,
         },
-        &[Bundle::DEFINITIONS],
+        Bundle.schema().definitions,
     )
     .map_err(|errors| format!("{errors:#?}"))?;
-    Bundle::lower(&graph).map_err(|diag| diag.what)
+    Bundle.lower(&graph).map_err(|diag| diag.what)
 }
 use std::collections::HashSet;
 use std::time::{Duration, UNIX_EPOCH};

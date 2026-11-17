@@ -1,5 +1,9 @@
+use bts_core::providers::{CodeProvider as _, Provider as _};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use wasm_bindgen::prelude::*;
+
+// the one place this crate names its provider, operations reach it through the provider traits
+const PROVIDER: bts_core::providers::braintrust::Bundle = bts_core::providers::braintrust::Bundle;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &str = r#"
@@ -136,7 +140,7 @@ fn options<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, Operatio
 }
 
 fn compile_source(source: &str) -> Result<bts_core::mocking::Model, OperationError> {
-    bts_core::providers::braintrust::Bundle::compile_module(source, false).map_err(|diagnostics| OperationError {
+    PROVIDER.compile_module(source, false).map_err(|diagnostics| OperationError {
         stage: "compile",
         message: "source is invalid".to_owned(),
         diagnostics,
@@ -153,7 +157,7 @@ pub fn spec() -> Result<JsValue, JsValue> {
 /// Returns shared authoring guidance with instructions for this browser interface.
 #[wasm_bindgen]
 pub fn skill() -> String {
-    let mut text = bts_core::skill::render(&bts_lang::spec::SPEC);
+    let mut text = bts_core::skill::render(&bts_lang::spec::SPEC, &PROVIDER);
     text.push_str("\n## Browser workflow\n\n\
 The host application provides the agent and maps these JavaScript functions to its tools. \
 Use the tool names supplied by that application. Source is a string, and files are supplied by the host.\n\n\
@@ -296,7 +300,7 @@ fn generate_batch(source: &str, options: GenerateOptions) -> Result<Generated, O
         .encode(&batch)
         .map_err(|error| OperationError::new("format", error))?;
     Ok(Generated {
-        provider: "braintrust",
+        provider: PROVIDER.schema().id,
         seed: seed.to_string(),
         trace_count: batch.trace_count,
         event_count: batch.events.len(),
@@ -327,11 +331,13 @@ struct WebDiagnostic<'a>(&'a bts_lang::Diag);
 
 impl Serialize for WebDiagnostic<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut diagnostic = serializer.serialize_struct("Diagnostic", if self.0.r#where.source == 1 { 4 } else { 3 })?;
+        // a source index past zero is one of the provider's definition sources
+        let definition = PROVIDER.schema().definition(self.0.r#where.source);
+        let mut diagnostic = serializer.serialize_struct("Diagnostic", if definition.is_some() { 4 } else { 3 })?;
         diagnostic.serialize_field("phase", &self.0.when.to_string())?;
         diagnostic.serialize_field("message", &self.0.what)?;
-        if self.0.r#where.source == 1 {
-            diagnostic.serialize_field("source", bts_core::providers::braintrust::Bundle::DEFINITIONS.name)?;
+        if let Some(definition) = definition {
+            diagnostic.serialize_field("source", definition.name)?;
         }
         diagnostic.serialize_field("range", &WebRange(&self.0.r#where))?;
         diagnostic.end()
@@ -355,9 +361,7 @@ impl Serialize for WebRange<'_> {
 /// Diagnostic ranges use UTF-8 byte offsets into the original source.
 #[wasm_bindgen(unchecked_return_type = "ValidationResult")]
 pub fn validate(source: &str) -> Result<JsValue, JsValue> {
-    let diagnostics = bts_core::providers::braintrust::Bundle::compile_module(source, false)
-        .err()
-        .unwrap_or_default();
+    let diagnostics = PROVIDER.compile_module(source, false).err().unwrap_or_default();
     serde_wasm_bindgen::to_value(&ValidationResult {
         valid: diagnostics.is_empty(),
         diagnostics: diagnostics.iter().map(WebDiagnostic).collect(),
@@ -521,10 +525,9 @@ pub fn build(
             BuildLanguage::Python => bts_core::mocking::ScorerLang::Python,
             BuildLanguage::Typescript => bts_core::mocking::ScorerLang::Typescript,
         });
-        let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new(
-            build_options.project.as_deref().unwrap_or_default(),
-        )
-        .with_seed(seed);
+        let target = PROVIDER
+            .code(&build_options.project.clone().unwrap_or_default())
+            .with_seed(seed);
         let existing = BuildExistingFiles(build_options.files);
         let context = bts_core::mocking::code::CodebaseContext {
             root: std::path::Path::new(&build_options.root),
@@ -535,7 +538,7 @@ pub fn build(
                 if model.scorers.is_empty() {
                     return Err(OperationError::new("build", "the graph declares no scorer nodes"));
                 }
-                let assembly = code::assemble(&model.scorers, language, &code::languages::Languages, &target)
+                let assembly = code::assemble(&model.scorers, language, &PROVIDER.emitter(), &target)
                     .map_err(|error| OperationError::new("build", error))?;
                 code::plan_codebase(&assembly, &target, &context).map_err(|error| OperationError::new("build", error))?
             }

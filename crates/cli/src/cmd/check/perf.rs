@@ -4,6 +4,7 @@ use crate::data;
 use crate::diag::SourceDiags;
 use bts_core::mocking::data::Format as _;
 use bts_core::providers::DataProvider;
+use bts_core::providers::Provider as _;
 use bts_core::providers::braintrust::mocking::data as braintrust_data;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -74,7 +75,7 @@ impl Args {
             for _ in 0..self.iterations.get() {
                 let started = Instant::now();
                 let model = tracing::info_span!("compile")
-                    .in_scope(|| bts_core::providers::braintrust::Bundle::compile_module(&source, false))
+                    .in_scope(|| crate::providers::SELECTED.compile_module(&source, false))
                     .map_err(|diags| Error::Invalid {
                         details: SourceDiags::new(&source_name, &source, diags),
                     })?;
@@ -85,7 +86,7 @@ impl Args {
                     self.dist.into(),
                     SystemTime::now(),
                     seed,
-                    &bts_core::providers::braintrust::Bundle.format(),
+                    &crate::providers::SELECTED.format(),
                 )
                 .map_err(|error| match error {
                     // show expression errors with their line and column
@@ -94,10 +95,7 @@ impl Args {
                     },
                     other => Error::Generate(other),
                 })?;
-                let encoded = bts_core::providers::braintrust::Bundle
-                    .format()
-                    .encode(&events)
-                    .map_err(Error::Format)?;
+                let encoded = crate::providers::SELECTED.format().encode(&events).map_err(Error::Format)?;
                 let stats = crate::client::writer::pack_stats(&encoded).map_err(Error::Pack)?;
                 recorder.record("total", started.elapsed());
                 summary = Some(Summary {

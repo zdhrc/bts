@@ -13,25 +13,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Compiles source with the Braintrust definitions for the mocking consumers.
 pub fn compile(source: &str) -> Result<execution::Model, String> {
-    super::Bundle::compile(source)
+    crate::providers::Provider::compile(&super::Bundle, source)
 }
 
-/// Lowers provider behavior graphs into shared mocking execution plans.
-///
-/// Membership is every step the entry leads to, and a calls edge makes its target a child span.
-/// An agent lowers to one nested plan. A fork that iterates becomes a repeat of its rounds,
-/// a loop-back becomes a repeat that runs again while its guard holds, and a junction target
-/// runs once for each emission of its junction.
-/// Both consumers enforce traversal limits, and a loop-back without one stops at 10000 traversals.
-/// One trace has one entry span, so loop-back targets must be its descendants.
-/// Authored error payloads are trace data, not failed runtime operations.
-/// Expression errors abort generation. Mocking does not dispatch cancellable operations.
-///
-/// A failure is one validation diagnostic at the graph element it concerns, or at
-/// the start of the source when no single element is responsible.
-/// The kinds and context keys the mocking consumers give meaning to.
-pub const CAPABILITIES: graph::Capabilities<'static> = graph::Capabilities {
-    consumer: "Braintrust mocking",
+/// What Braintrust declares: its kinds, and the kinds and context keys mocking gives meaning to.
+pub const SCHEMA: graph::ProviderSchema<'static> = graph::ProviderSchema {
+    id: "braintrust",
+    name: "Braintrust mocking",
+    definitions: &[super::defs::SOURCE],
     // a span and the kinds derived from it emit spans, node and vars carry values without one
     nodes: &["span", "node", "vars"],
     // calls derives from next
@@ -55,11 +44,11 @@ pub const CAPABILITIES: graph::Capabilities<'static> = graph::Capabilities {
     ],
 };
 
-/// Reports every element the mocking consumers would walk and give no meaning to.
+/// The elements the mocking consumers walk.
 ///
-/// The elements are the steps of each agent with their edges, forks and junctions,
-/// and every scorer. Other elements of the model are left to other consumers.
-pub fn unsupported(model: &graph::Model) -> graph::Diags {
+/// They are the steps of each agent with their edges, forks and junctions, and
+/// every scorer. Other elements of the model are left to other consumers.
+pub fn elements(model: &graph::Model) -> Vec<graph::ElementId> {
     let mut elements = BTreeSet::new();
     for (index, node) in model.nodes.iter().enumerate() {
         let id = graph::NodeId(index);
@@ -91,9 +80,27 @@ pub fn unsupported(model: &graph::Model) -> graph::Diags {
                 .map(|(junction, _)| graph::ElementId::Junction(graph::JunctionId(junction))),
         );
     }
-    model.unsupported(&CAPABILITIES, &elements.into_iter().collect::<Vec<_>>())
+    elements.into_iter().collect()
 }
 
+/// Reports every element the mocking consumers would walk and give no meaning to.
+pub fn unsupported(model: &graph::Model) -> graph::Diags {
+    model.unsupported(&SCHEMA, &elements(model))
+}
+
+/// Lowers provider behavior graphs into shared mocking execution plans.
+///
+/// Membership is every step the entry leads to, and a calls edge makes its target a child span.
+/// An agent lowers to one nested plan. A fork that iterates becomes a repeat of its rounds,
+/// a loop-back becomes a repeat that runs again while its guard holds, and a junction target
+/// runs once for each emission of its junction.
+/// Both consumers enforce traversal limits, and a loop-back without one stops at 10000 traversals.
+/// One trace has one entry span, so loop-back targets must be its descendants.
+/// Authored error payloads are trace data, not failed runtime operations.
+/// Expression errors abort generation. Mocking does not dispatch cancellable operations.
+///
+/// A failure is one validation diagnostic at the graph element it concerns, or at
+/// the start of the source when no single element is responsible.
 pub fn lower(model: &graph::Model) -> Result<execution::Model, graph::Diag> {
     if let Some(diag) = unsupported(model).into_iter().next() {
         return Err(diag);

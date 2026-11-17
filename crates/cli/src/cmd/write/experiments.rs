@@ -3,6 +3,7 @@ use crate::diag::SourceDiags;
 use crate::logging;
 use crate::selection::ResourceSelector;
 use bts_core::providers::DataProvider;
+use bts_core::providers::Provider as _;
 
 use serde_json::json;
 use std::{fmt, fs, path::PathBuf, time::SystemTime};
@@ -44,7 +45,8 @@ impl Args {
 
     fn execute(self, settings: &Settings) -> Result<(), Error> {
         let source = fs::read_to_string(&self.from).map_err(Error::Read)?;
-        let model = bts_core::providers::braintrust::Bundle::compile_module(&source, false)
+        let model = crate::providers::SELECTED
+            .compile_module(&source, false)
             .map_err(|errors| Error::Invalid(SourceDiags::new(&self.from.display().to_string(), &source, errors)))?;
         bts_core::providers::braintrust::features::experiments::validate_selection(&model, &self.select)?;
         let seed = self.seed.unwrap_or_else(rand::random);
@@ -56,7 +58,7 @@ impl Args {
             println!("{}", serde_json::to_string_pretty(&preview).map_err(Error::Encode)?);
             return Ok(());
         }
-        let client = bts_core::providers::braintrust::Bundle
+        let client = crate::providers::SELECTED
             .client(&crate::providers::braintrust::config(settings)?)
             .map_err(Error::Client)?;
         let result = bts_core::providers::braintrust::features::experiments::run(
