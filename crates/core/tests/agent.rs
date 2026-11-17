@@ -2054,55 +2054,131 @@ fn shapes_without_a_nested_form_are_refused_with_a_location() {
 
 #[test]
 fn the_world_example_agrees_in_data_and_code() {
-    // statements and the intent emit no spans, and what the statements say is the same everywhere
+    // the policies and the traveler's request are built beside the agent, and none of it emits a span
     let source = include_str!("../../../examples/flight_change.bt");
     let policies = "Follow the change policies. A same-day change costs 75 USD. The change window closes two hours before departure. The fare difference must be paid before the new ticket is issued.";
     let reply = "I found a later flight, and a same-day change costs 75 USD. It leaves on November 20, 2026 at 5:30 PM. The fare difference must be paid before the new ticket is issued.";
     let model = lower(source).unwrap();
-    // the traveler's wording is sampled, so collect what data generation says across many traces
-    let batch = data::generate(
-        model.clone(),
-        64,
-        Duration::from_secs(3600),
-        data::Distribution::Linear,
-        UNIX_EPOCH + Duration::from_secs(7200),
-        42,
-        &(),
-    )
-    .unwrap();
+    // the last seed is past what a TypeScript number holds exactly
+    let seeds: Vec<u64> = (1..=12).chain([u64::MAX]).collect();
     let project = |value: &Option<data::Value>| value.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
-    let mut wordings = std::collections::BTreeSet::new();
-    for trace in batch.events.chunks(3) {
-        let names: Vec<_> = trace.iter().map(|event| event.name.as_str()).collect();
-        assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
-        let input = project(&trace[2].input);
-        assert_eq!(input[0]["content"], policies);
-        wordings.insert(input[1]["content"].as_str().unwrap().to_owned());
-        assert_eq!(project(&trace[2].output)["content"], reply);
-        assert_eq!(project(&trace[0].output), reply);
-        assert_eq!(project(&trace[1].output)["departs"], "17:30");
+    // what the traveler says in the first trace of each seed
+    let mut said = Vec::new();
+    for seed in &seeds {
+        let batch = data::generate(
+            model.clone(),
+            2,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            *seed,
+            &(),
+        )
+        .unwrap();
+        for trace in batch.events.chunks(3) {
+            let names: Vec<_> = trace.iter().map(|event| event.name.as_str()).collect();
+            assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
+            let input = project(&trace[2].input);
+            assert_eq!(input[0]["content"], policies);
+            assert_eq!(project(&trace[2].output)["content"], reply);
+            assert_eq!(project(&trace[0].output), reply);
+            assert_eq!(project(&trace[1].output)["departs"], "17:30");
+        }
+        said.push(project(&batch.events[2].input)[1]["content"].clone());
     }
+    let wordings: std::collections::BTreeSet<_> = said.iter().map(|text| text.as_str().unwrap()).collect();
     assert!(wordings.len() > 3, "{wordings:?}");
-    for details in generated_runs(&model, "flight_change") {
-        assert_eq!(details["output"], reply);
-        let spans = details["spans"].as_array().unwrap();
-        let names: Vec<_> = spans.iter().map(|span| span["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
-        assert_eq!(spans[0]["output"], reply);
-        assert_eq!(spans[1]["output"]["departs"], "17:30");
-        assert_eq!(spans[2]["input"][0]["content"], policies);
-        let said = spans[2]["input"][1]["content"].as_str().unwrap();
-        assert!(wordings.contains(said), "{said} is not among {wordings:?}");
-        assert_eq!(spans[2]["output"]["content"], reply);
+    // a generated agent given a seed builds the world of that seed's first trace
+    let runs = [
+        execute_generated(
+            &model,
+            ScorerLang::Python,
+            "python3",
+            "check.py",
+            &format!(
+                "from flight_change_agent import run_details\nimport json\nprint(json.dumps([run_details(seed=seed) for seed in {seeds:?}]))"
+            ),
+        ),
+        execute_generated(
+            &model,
+            ScorerLang::Typescript,
+            "node",
+            "check.mts",
+            &format!(
+                "import {{runDetails}} from './flight_change_agent.mts'; console.log(JSON.stringify([{}].map(seed => runDetails(undefined, Math.random, seed))));",
+                (seeds.iter().map(|seed| format!("{seed}n")).collect::<Vec<_>>()).join(", ")
+            ),
+        ),
+    ];
+    for run in &runs {
+        for (details, said) in run.as_array().unwrap().iter().zip(&said) {
+            assert_eq!(details["output"], reply);
+            let spans = details["spans"].as_array().unwrap();
+            let names: Vec<_> = spans.iter().map(|span| span["name"].as_str().unwrap()).collect();
+            assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
+            assert_eq!(spans[0]["output"], reply);
+            assert_eq!(spans[1]["output"]["departs"], "17:30");
+            assert_eq!(spans[2]["input"][0]["content"], policies);
+            assert_eq!(&spans[2]["input"][1]["content"], said);
+            assert_eq!(spans[2]["output"]["content"], reply);
+        }
     }
-    // a step that only holds values leaves no function, call or result type behind
+    assert_eq!(runs[0], runs[1]);
+    // without a seed the agent still builds one of the worlds the graph allows
+    for details in generated_runs(&model, "flight_change") {
+        let asked = details["spans"][2]["input"][1]["content"].as_str().unwrap().to_owned();
+        assert!(
+            asked.ends_with("my flight?") || asked.ends_with("flight.") || asked.ends_with("flight?"),
+            "{asked}"
+        );
+    }
+    // the reply declares what it reads from the world in the order the shape declares it
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("flight_change_agent.") && !file.name.contains("runtime"))
+            .unwrap();
+        let locals = match lang {
+            ScorerLang::Python => [
+                "fee_text = ",
+                "window_text = ",
+                "payment_text = ",
+                "policies_text = ",
+                "ask_text = ",
+            ],
+            ScorerLang::Typescript => [
+                "feeText = ",
+                "windowText = ",
+                "paymentText = ",
+                "policiesText = ",
+                "askText = ",
+            ],
+        };
+        let places: Vec<_> = locals.iter().map(|local| agent.contents.find(local).unwrap()).collect();
+        assert!(places.is_sorted(), "{places:?}");
+    }
+    // the world leaves no function, deferred value or graph behind, and the agent takes a seed
     for lang in [ScorerLang::Python, ScorerLang::Typescript] {
         let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
         for file in assembly.files.iter().filter(|file| !file.name.contains("runtime")) {
-            for told in ["chance(", "included", "fee(", "FeeResult"] {
+            for told in ["chance(", "included", "fee(", "FeeResult", "_lazy", "policies(", "ask("] {
                 assert!(!file.contents.contains(told), "{told} in {}", file.name);
             }
         }
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("flight_change_agent.") && !file.name.contains("runtime"))
+            .unwrap();
+        let seeded = match lang {
+            ScorerLang::Python => "ExecutionContext(logger, seeded(random_source, seed))",
+            ScorerLang::Typescript => "new ExecutionContext(logger, seeded(randomSource, seed))",
+        };
+        assert!(agent.contents.contains(seeded), "{}", agent.contents);
+    }
+    // an agent that walks nothing takes no seed
+    let plain = lower(include_str!("../../../examples/computed_fields.bt")).unwrap();
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&plain, lang, &CodeTarget::new("local-test")).unwrap();
+        assert!(assembly.files.iter().all(|file| !file.contents.contains("seed")));
     }
 }
 

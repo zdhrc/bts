@@ -8,6 +8,7 @@ pub mod code;
 pub mod data;
 
 use crate::mocking as execution;
+use crate::providers::Supplied;
 use bts_lang as graph;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -105,11 +106,19 @@ pub fn unsupported(model: &graph::Model) -> graph::Diags {
 ///
 /// The functions are the implementations calls in the model refer to: Braintrust's
 /// own, and those of any contributor it is joined with.
-pub fn lower(model: &graph::Model, functions: &'static [crate::mocking::Function]) -> Result<execution::Model, graph::Diag> {
+///
+/// A step may read a field of a node a contributor walks. The contributor supplies
+/// what that node's context holds, and each field read this way is computed once
+/// for a trace.
+pub fn lower(
+    model: &graph::Model,
+    functions: &'static [crate::mocking::Function],
+    supplied: &Supplied,
+) -> Result<execution::Model, graph::Diag> {
     if let Some(diag) = unsupported(model).into_iter().next() {
         return Err(diag);
     }
-    lower_model(model, functions).map_err(|error| graph::Diag {
+    lower_model(model, functions, supplied).map_err(|error| graph::Diag {
         when: graph::DiagPhase::Validation,
         what: error.what,
         r#where: error.range.unwrap_or(graph::SrcRange::new(0, 0)),
@@ -156,7 +165,11 @@ impl<T, E: Into<Error>> At<T> for Result<T, E> {
     }
 }
 
-fn lower_model(model: &graph::Model, functions: &'static [crate::mocking::Function]) -> Result<execution::Model, Error> {
+fn lower_model(
+    model: &graph::Model,
+    functions: &'static [crate::mocking::Function],
+    supplied: &Supplied,
+) -> Result<execution::Model, Error> {
     let mut result = execution::Model {
         ordered: true,
         functions,
@@ -167,7 +180,7 @@ fn lower_model(model: &graph::Model, functions: &'static [crate::mocking::Functi
             continue;
         }
         let agent = graph::NodeId(index);
-        let mut lowerer = AgentLowering::new(model, agent, &mut result).at(node.range)?;
+        let mut lowerer = AgentLowering::new(model, agent, supplied, &mut result).at(node.range)?;
         lowerer.lower().at(node.range)?;
     }
     for (index, node) in model.nodes.iter().enumerate() {
@@ -175,7 +188,7 @@ fn lower_model(model: &graph::Model, functions: &'static [crate::mocking::Functi
             continue;
         }
         let id = graph::NodeId(index);
-        let mut lowerer = AgentLowering::callable(model, id, &mut result);
+        let mut lowerer = AgentLowering::callable(model, id, supplied, &mut result);
         let kind = if let Some(judge) = lowerer.binding(id, "judge") {
             if lowerer.binding(id, "score").is_some() || lowerer.binding(id, "steps").is_some() {
                 return Err(located(node.range, "a scorer must select expressions or a judge"));
@@ -390,7 +403,13 @@ fn resource_value(
     value: &graph::Value,
     result: &mut execution::Model,
 ) -> Result<execution::Value, Error> {
-    AgentLowering::callable(graph, node, result)
+    // a resource reads nothing a contributor built
+    const NOTHING: Supplied = Supplied {
+        elements: Vec::new(),
+        context: Vec::new(),
+        hidden: Vec::new(),
+    };
+    AgentLowering::callable(graph, node, &NOTHING, result)
         .value(value)
         .at(graph.nodes[node.0].range)
 }
@@ -812,6 +831,9 @@ struct AgentLowering<'a> {
     // whether a fold hands its combine expression bare values, not arrival records
     raw_fold: bool,
     callable: bool,
+    // what contributors built beside the agent, and the fields of it the agent reads
+    beside: &'a Supplied,
+    read_beside: BTreeSet<graph::BindingId>,
     result: &'a mut execution::Model,
 }
 
@@ -831,7 +853,7 @@ fn emission_kind(primitive: graph::Primitive) -> execution::EmissionKind {
 
 impl<'a> AgentLowering<'a> {
     // lowers the values of one node that is not walked as an agent
-    fn callable(graph: &'a graph::Model, node: graph::NodeId, result: &'a mut execution::Model) -> Self {
+    fn callable(graph: &'a graph::Model, node: graph::NodeId, beside: &'a Supplied, result: &'a mut execution::Model) -> Self {
         Self {
             graph,
             agent: node,
@@ -848,11 +870,18 @@ impl<'a> AgentLowering<'a> {
             readers: vec![],
             raw_fold: false,
             callable: true,
+            beside,
+            read_beside: BTreeSet::new(),
             result,
         }
     }
 
-    fn new(graph: &'a graph::Model, agent: graph::NodeId, result: &'a mut execution::Model) -> Result<Self, Error> {
+    fn new(
+        graph: &'a graph::Model,
+        agent: graph::NodeId,
+        beside: &'a Supplied,
+        result: &'a mut execution::Model,
+    ) -> Result<Self, Error> {
         let Structure { members, parents } = structure(graph, agent)?;
         if members.is_empty() {
             return Err("agent needs one next entry edge".into());
@@ -1178,6 +1207,8 @@ impl<'a> AgentLowering<'a> {
             readers: vec![],
             raw_fold: false,
             callable: false,
+            beside,
+            read_beside: BTreeSet::new(),
             result,
         })
     }
@@ -1289,11 +1320,41 @@ impl<'a> AgentLowering<'a> {
                 value: self.binding_value(id)?,
             });
         }
+        // a field read from beside the agent may read others, so keep going until none is new
+        let mut beside: Vec<(graph::BindingId, execution::Value, BTreeSet<graph::BindingId>)> = Vec::new();
+        let mut pending: Vec<_> = self.read_beside.iter().copied().collect();
+        while let Some(id) = pending.pop() {
+            if beside.iter().any(|(known, ..)| *known == id) {
+                continue;
+            }
+            let others = std::mem::take(&mut self.read_beside);
+            let value = self.binding_value(id)?;
+            let reads = std::mem::replace(&mut self.read_beside, others);
+            pending.extend(reads.iter().copied());
+            beside.push((id, value, reads));
+        }
+        // each is declared after what it reads, and otherwise in the order the shape declares them
+        beside.sort_by_key(|(id, ..)| *id);
+        let mut declared = BTreeSet::new();
+        while !beside.is_empty() {
+            let ready = (beside.iter())
+                .position(|(_, _, reads)| reads.iter().all(|read| declared.contains(read)))
+                .ok_or("values beside the agent read each other in a circle")?;
+            let (id, value, _) = beside.remove(ready);
+            declared.insert(id);
+            bindings.push(execution::Binding {
+                name: format!("binding_{}", id.0),
+                label: None,
+                value,
+            });
+        }
+        let beside = declared.iter().map(|id| format!("binding_{}", id.0)).collect();
         let mut trace = execution::Trace {
             node: Self::id(self.root),
             name: self.name(self.root)?,
             fields,
             bindings,
+            beside,
             children,
         };
         for binding in &mut trace.bindings {
@@ -1354,6 +1415,10 @@ impl<'a> AgentLowering<'a> {
                     // a supplied context value is known by its key
                     ("binding", _) if binding.path.first().is_some_and(|key| key == CONTEXT_VALUE) => {
                         Some(binding.path[1..].join("_"))
+                    }
+                    // a value from beside the agent is known by what it belongs to
+                    ("binding", graph::ElementId::Node(owner)) if self.beside.walks(owner) => {
+                        Some(format!("{}_{}", node(owner), binding.path.join("_")))
                     }
                     // a value a step keeps for itself is known by its own name
                     ("binding", graph::ElementId::Node(owner)) => {
@@ -2709,6 +2774,23 @@ impl<'a> AgentLowering<'a> {
             return Err("callable scorers read external values through context".into());
         }
         if let graph::ElementId::Node(node) = binding.owner
+            && self.beside.walks(node)
+        {
+            // what a contributor built reads its own parts freely, a step of the agent reads what is always there
+            let within = self.building.last().is_some_and(|parent| {
+                matches!(self.graph.bindings[parent.0].owner, graph::ElementId::Node(owner) if self.beside.walks(owner))
+            });
+            if !within && let Some(why) = self.beside.hidden(node) {
+                return Err(why.into());
+            }
+            if binding.property {
+                return self.value(&binding.value.clone());
+            }
+            // one value for the whole trace, whoever reads it
+            self.read_beside.insert(id);
+            return Ok(execution::Value::VarRef(format!("binding_{}", id.0)));
+        }
+        if let graph::ElementId::Node(node) = binding.owner
             && !self.order.contains(&node)
             && node != self.agent
         {
@@ -2722,7 +2804,11 @@ impl<'a> AgentLowering<'a> {
             if owners.len() != 1 {
                 return Err("external value references need one owning agent".into());
             }
-            return AgentLowering::new(self.graph, owners[0], self.result)?.reference(id);
+            let mut owner = AgentLowering::new(self.graph, owners[0], self.beside, self.result)?;
+            let value = owner.reference(id)?;
+            let read = std::mem::take(&mut owner.read_beside);
+            self.read_beside.extend(read);
+            return Ok(value);
         }
         let range = binding.range;
         let graph::ElementId::Node(mut node) = binding.owner else {
@@ -2781,6 +2867,22 @@ impl<'a> AgentLowering<'a> {
         Ok(match value {
             G::Context { path, .. } if path.first().is_some_and(|key| key == "parent") => {
                 return Err("`context.parent` is supplied to the provider and cannot be read by a field".into());
+            }
+            G::Context {
+                owner: graph::ElementId::Node(node),
+                path,
+            } if path.first().is_some_and(|key| self.beside.value(*node, key).is_some()) => {
+                // the contributor that walks this node says what the key holds
+                let supplied = self.beside.value(*node, &path[0]).unwrap().clone();
+                let mut value = self.value(&supplied)?;
+                for key in path.iter().skip(1) {
+                    value = V::Index {
+                        target: Box::new(value),
+                        index: Box::new(V::Str(key.clone())),
+                        range: self.graph.nodes[node.0].range,
+                    };
+                }
+                value
             }
             G::Context {
                 owner: graph::ElementId::Node(node),

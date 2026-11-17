@@ -40,14 +40,14 @@ impl super::Contributor for Bundle {
             definitions: skill::GRAPH,
         }
     }
-}
-
-impl super::Provider for Bundle {
-    type Lowered = crate::mocking::Model;
 
     fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
         mocking::elements(model)
     }
+}
+
+impl super::Provider for Bundle {
+    type Lowered = crate::mocking::Model;
 
     /// Lowers an agent graph for the shared mock data and mock code consumers.
     fn lower(
@@ -55,7 +55,17 @@ impl super::Provider for Bundle {
         model: &bts_lang::Model,
         functions: &'static [crate::mocking::Function],
     ) -> Result<crate::mocking::Model, bts_lang::Diag> {
-        mocking::lower(model, functions)
+        mocking::lower(model, functions, &super::Supplied::default())
+    }
+
+    /// Lowers an agent graph whose steps read what a contributor built beside it.
+    fn lower_with(
+        &self,
+        model: &bts_lang::Model,
+        functions: &'static [crate::mocking::Function],
+        supplied: &super::Supplied,
+    ) -> Result<crate::mocking::Model, bts_lang::Diag> {
+        mocking::lower(model, functions, supplied)
     }
 }
 

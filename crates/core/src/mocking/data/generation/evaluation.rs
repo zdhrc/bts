@@ -206,6 +206,8 @@ struct Ctx<'m> {
     lazy_model: Option<&'m Model>,
     row: Option<(NodeId, &'m InputValue)>,
     trace_index: usize,
+    // the seed of the run, for values addressed by seed and trace index alone
+    seed: u64,
     // the address every instance path derives from: seed and trace index
     base: u64,
     // the rng of the slot evaluating right now, swapped as slots force
@@ -229,6 +231,7 @@ impl<'m> Ctx<'m> {
             lazy_model: None,
             row: None,
             trace_index,
+            seed,
             base,
             rng: Xoshiro256PlusPlus::seed_from_u64(base),
             site: 0,
@@ -1703,6 +1706,8 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             let mut evaluation = Evaluation {
                 rng: &mut ctx.rng,
                 format: ctx.format,
+                seed: ctx.seed,
+                trace_index: ctx.trace_index,
             };
             match evaluate(&args, &mut evaluation) {
                 Ok(value) => json_to_value(value),
@@ -2606,6 +2611,7 @@ pub(super) fn plan_case_data(
             ..Default::default()
         },
         bindings: Vec::new(),
+        beside: Vec::new(),
         children: Vec::new(),
     };
     ctx.instantiate_trace(&case, &model.bindings)?;

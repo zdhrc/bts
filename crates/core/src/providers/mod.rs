@@ -5,8 +5,9 @@
 //! each function, and supplies authoring guidance. [`Provider`] is a contributor that
 //! also says which elements of a model it walks and lowers a model for its consumers.
 //! [`With`] puts a provider and a contributor together, so a shape can use the kinds
-//! and functions of both. [`conformance::check`] verifies that an implementer is
-//! consistent.
+//! and functions of both. A contributor may walk elements of its own, and what it
+//! makes of them reaches the provider as [`Supplied`] values. [`conformance::check`]
+//! verifies that an implementer is consistent.
 //!
 //! [`DataProvider`] and [`CodeProvider`] are the delivery side. Providers implement
 //! only the workflows they support. Applications supply configuration and choose
@@ -18,7 +19,7 @@ pub mod world;
 
 use crate::mocking::{Function, code, data};
 use bts_lang::semantics::Source;
-use bts_lang::{Diag, DiagPhase, Diags, ElementId, Model, ProviderSchema};
+use bts_lang::{Diag, DiagPhase, Diags, ElementId, Model, NodeId, ProviderSchema, Value};
 use std::any::TypeId;
 use std::sync::Mutex;
 
@@ -57,6 +58,58 @@ pub struct Part {
     pub guidance: Guidance,
 }
 
+/// What a contributor makes of the elements it walks, for the provider that lowers the model.
+///
+/// The values are written in the language's own model, so the provider lowers them
+/// the way it lowers anything an author wrote.
+#[derive(Clone, Debug, Default)]
+pub struct Supplied {
+    /// The elements the contributor walks. The provider reads their fields and leaves the rest alone.
+    pub elements: Vec<ElementId>,
+    /// The value of a context key on a node the contributor walks.
+    pub context: Vec<Supply>,
+    /// Nodes the contributor walks whose fields nothing outside may read, each with the reason.
+    pub hidden: Vec<(NodeId, String)>,
+}
+
+/// The value a contributor gives one context key on one node.
+#[derive(Clone, Debug)]
+pub struct Supply {
+    /// The node that reads the key.
+    pub node: NodeId,
+    /// The key, read as `context.key`.
+    pub key: &'static str,
+    /// What the key holds.
+    pub value: Value,
+}
+
+impl Supplied {
+    /// Whether a contributor walks a node.
+    pub fn walks(&self, node: NodeId) -> bool {
+        self.elements.contains(&ElementId::Node(node))
+    }
+
+    /// The value supplied for a context key on a node.
+    pub fn value(&self, node: NodeId, key: &str) -> Option<&Value> {
+        (self.context.iter())
+            .find(|supply| supply.node == node && supply.key == key)
+            .map(|supply| &supply.value)
+    }
+
+    /// Why nothing outside may read a node's fields, when that is so.
+    pub fn hidden(&self, node: NodeId) -> Option<&str> {
+        (self.hidden.iter())
+            .find(|(hidden, _)| *hidden == node)
+            .map(|(_, why)| why.as_str())
+    }
+
+    fn extend(&mut self, other: Supplied) {
+        self.elements.extend(other.elements);
+        self.context.extend(other.context);
+        self.hidden.extend(other.hidden);
+    }
+}
+
 /// Adds kinds, traits, context keys and functions to the language.
 ///
 /// The schema is the declarative half and lives in the language crate. This trait
@@ -74,8 +127,37 @@ pub trait Contributor: Bundle {
         &[]
     }
 
+    /// The names of implementations the schema does not declare.
+    ///
+    /// Authors cannot call these. They appear only in values the contributor
+    /// supplies, so each still runs everywhere a declared function would.
+    fn internal(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Authoring guidance for the skill.
     fn guidance(&self) -> Guidance;
+
+    /// The elements of a model the contributor walks.
+    ///
+    /// Only these are checked against its schema. Other elements may belong to
+    /// another contributor and are left alone. A contributor that only adds
+    /// definitions and functions walks nothing.
+    fn elements(&self, _model: &Model) -> Vec<ElementId> {
+        Vec::new()
+    }
+
+    /// What the contributor makes of the elements it walks.
+    ///
+    /// A failure is located at the graph element it concerns.
+    fn supply(&self, _model: &Model) -> Result<Supplied, Diag> {
+        Ok(Supplied::default())
+    }
+
+    /// Reports every walked element the contributor gives no meaning to.
+    fn walked(&self, model: &Model) -> Diags {
+        model.unsupported(&self.schema(), &self.elements(model))
+    }
 
     /// The contributors this one is made of, in the order their definitions compile.
     fn parts(&self) -> Vec<Part> {
@@ -94,12 +176,6 @@ pub trait Provider: Contributor {
     /// What the provider's consumers run.
     type Lowered;
 
-    /// The elements of a model the provider walks.
-    ///
-    /// Only these are checked against the schema. Other elements may belong to
-    /// another provider and are left alone.
-    fn elements(&self, model: &Model) -> Vec<ElementId>;
-
     /// Lowers a compiled model for the provider's consumers.
     ///
     /// The functions are every implementation in use, the provider's own and those
@@ -107,6 +183,14 @@ pub trait Provider: Contributor {
     /// it. A failure is located at the graph element it concerns when one is
     /// responsible.
     fn lower(&self, model: &Model, functions: &'static [Function]) -> Result<Self::Lowered, Diag>;
+
+    /// Lowers a compiled model that reads what contributors supply.
+    ///
+    /// A provider that reads nothing from a contributor keeps this as it is. Such a
+    /// provider rejects a read of an element it does not walk.
+    fn lower_with(&self, model: &Model, functions: &'static [Function], _supplied: &Supplied) -> Result<Self::Lowered, Diag> {
+        self.lower(model, functions)
+    }
 
     /// Reports every walked element the provider gives no meaning to, and every
     /// function call the provider cannot accept, each at its own location.
@@ -116,7 +200,7 @@ pub trait Provider: Contributor {
     /// consumer's check, since only it knows what it generates. It asks
     /// [`Function::runs`] and reports the call at the same location.
     fn unsupported(&self, model: &Model) -> Diags {
-        let mut diags = model.unsupported(&self.schema(), &self.elements(model));
+        let mut diags = self.walked(model);
         let report = |range, what| Diag {
             when: DiagPhase::Validation,
             what,
@@ -163,8 +247,9 @@ pub trait Provider: Contributor {
 /// A provider joined by a contributor.
 ///
 /// The provider lowers the model and delivers what it produces. The contributor adds
-/// its definitions, functions and guidance. Definitions compile in order, the
-/// provider's first. A function name has one definition among the two, which
+/// its definitions, functions and guidance, and supplies values for the elements it
+/// walks. Each checks its own elements against its own schema, and no element
+/// belongs to both. Definitions compile in order, the provider's first. A function name has one definition among the two, which
 /// [`conformance::check`] verifies. Joining another contributor to the result adds a
 /// third, and so on.
 #[derive(Clone, Copy, Debug, Default)]
@@ -174,6 +259,7 @@ pub struct With<P, C>(pub P, pub C);
 struct Joined {
     schema: ProviderSchema<'static>,
     functions: &'static [Function],
+    internal: &'static [&'static str],
 }
 
 impl<P: Provider + 'static, C: Contributor + 'static> With<P, C> {
@@ -200,6 +286,7 @@ impl<P: Provider + 'static, C: Contributor + 'static> With<P, C> {
                 ..base
             },
             functions: both(self.0.functions(), self.1.functions()),
+            internal: both(self.0.internal(), self.1.internal()),
         }));
         joined.push((id, built));
         built
@@ -220,6 +307,10 @@ impl<P: Provider + 'static, C: Contributor + 'static> Contributor for With<P, C>
         self.joined().functions
     }
 
+    fn internal(&self) -> &'static [&'static str] {
+        self.joined().internal
+    }
+
     fn guidance(&self) -> Guidance {
         self.0.guidance()
     }
@@ -229,17 +320,60 @@ impl<P: Provider + 'static, C: Contributor + 'static> Contributor for With<P, C>
         parts.extend(self.1.parts());
         parts
     }
+
+    fn elements(&self, model: &Model) -> Vec<ElementId> {
+        let mut elements = self.0.elements(model);
+        elements.extend(self.1.elements(model));
+        elements
+    }
+
+    fn supply(&self, model: &Model) -> Result<Supplied, Diag> {
+        let mut supplied = self.0.supply(model)?;
+        supplied.extend(self.1.supply(model)?);
+        Ok(supplied)
+    }
+
+    /// Each side answers for its own elements, and an element both walk is reported once.
+    fn walked(&self, model: &Model) -> Diags {
+        let mut diags = self.0.walked(model);
+        diags.extend(self.1.walked(model));
+        let added = self.1.elements(model);
+        for element in self.0.elements(model) {
+            if !added.contains(&element) {
+                continue;
+            }
+            let range = match element {
+                ElementId::Node(id) => model.nodes[id.0].range,
+                ElementId::Edge(id) => model.edges[id.0].range,
+                ElementId::Fork(id) => model.forks[id.0].range,
+                ElementId::Junction(id) => model.junctions[id.0].range,
+            };
+            diags.push(Diag {
+                when: DiagPhase::Validation,
+                what: format!(
+                    "this belongs to {} and to {}, and an element belongs to one of them",
+                    self.0.schema().name,
+                    self.1.schema().name
+                ),
+                r#where: range,
+            });
+        }
+        diags.sort_by_key(|diag| (diag.r#where.source, diag.r#where.start));
+        diags
+    }
 }
 
 impl<P: Provider + 'static, C: Contributor + 'static> Provider for With<P, C> {
     type Lowered = P::Lowered;
 
-    fn elements(&self, model: &Model) -> Vec<ElementId> {
-        self.0.elements(model)
+    fn lower(&self, model: &Model, functions: &'static [Function]) -> Result<Self::Lowered, Diag> {
+        self.lower_with(model, functions, &Supplied::default())
     }
 
-    fn lower(&self, model: &Model, functions: &'static [Function]) -> Result<Self::Lowered, Diag> {
-        self.0.lower(model, functions)
+    fn lower_with(&self, model: &Model, functions: &'static [Function], supplied: &Supplied) -> Result<Self::Lowered, Diag> {
+        let mut supplied = supplied.clone();
+        supplied.extend(self.1.supply(model)?);
+        self.0.lower_with(model, functions, &supplied)
     }
 }
 

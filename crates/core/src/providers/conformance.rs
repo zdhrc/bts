@@ -18,7 +18,10 @@ use bts_lang::{Construct, spec::SPEC};
 /// - Its guidance mentions every kind it defines, as a whole word.
 /// - Every function its schema declares is named once, is not a built-in function,
 ///   accepts some type for each parameter and has exactly one implementation.
-/// - Every implementation belongs to a declared function, runs somewhere, and each
+/// - Every implementation belongs to a declared function or is named as internal, and
+///   not both. An internal one runs in data generation and in both agent languages.
+///   An internal name has an implementation. A provider with no model walks nothing.
+/// - Every implementation runs somewhere, and each
 ///   helper's text or runtime defines the function the helper names. A helper that
 ///   scorers call has a runtime, and the runtime defines that name on its own.
 pub fn check<P: Contributor>(provider: &P) -> Vec<String> {
@@ -110,8 +113,19 @@ pub fn check<P: Contributor>(provider: &P) -> Vec<String> {
     }
     for function in functions {
         let name = function.name;
-        if !schema.functions.iter().any(|declared| declared.doc.name == name) {
+        let declared = schema.functions.iter().any(|declared| declared.doc.name == name);
+        let internal = provider.internal().contains(&name);
+        if !declared && !internal {
             problems.push(format!("the implementation `{name}` belongs to no declared function"));
+        }
+        if declared && internal {
+            problems.push(format!("function `{name}` is declared and is internal"));
+        }
+        // nothing reports an internal function a consumer cannot run, so it runs everywhere agents do
+        if internal && !(function.data.is_some() && function.python.is_some() && function.typescript.is_some()) {
+            problems.push(format!(
+                "the internal function `{name}` does not run in data and in both agent languages"
+            ));
         }
         if function.data.is_none() && function.python.is_none() && function.typescript.is_none() {
             problems.push(format!("function `{name}` runs nowhere"));
@@ -137,6 +151,18 @@ pub fn check<P: Contributor>(provider: &P) -> Vec<String> {
                 }
             }
         }
+    }
+
+    for name in provider.internal() {
+        if !functions.iter().any(|function| function.name == *name) {
+            problems.push(format!("the internal function `{name}` has no implementation"));
+        }
+    }
+    if !provider.elements(&model).is_empty() {
+        problems.push("the provider walks elements of a model that has none".to_owned());
+    }
+    if let Err(diag) = provider.supply(&model) {
+        problems.push(format!("supplying an empty model fails: {}", diag.what));
     }
 
     // each contributor speaks for its own kinds

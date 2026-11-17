@@ -216,6 +216,10 @@ pub struct Trace {
     pub fields: SpanFields,
     /// Scoped expressions to evaluate for each instance.
     pub bindings: Vec<Binding>,
+    /// The names of the bindings that hold what was built beside the agent.
+    ///
+    /// Each reads the ones before it, and all of them belong to the trace as a whole.
+    pub beside: Vec<String>,
     /// Nested definitions in source order.
     pub children: Vec<Child>,
 }

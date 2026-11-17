@@ -294,16 +294,24 @@ fn braintrust_conforms_to_the_provider_contract() {
 #[test]
 fn world_conforms_to_the_provider_contract() {
     assert_eq!(conformance::check(&world::Bundle), Vec::<String>::new());
-    // it lowers nothing and lists no kinds, so its kinds ride on what the provider it joins walks
+    // it walks its own graphs, so it lists the kinds a walk is made of and the key a walk reads
     let schema = world::Bundle.schema();
-    assert!(schema.nodes.is_empty() && schema.edges.is_empty());
-    assert_eq!(schema.functions.len(), 12);
-    // every function runs in data generation, in agents and in scorers
+    assert_eq!(schema.nodes, ["walk", "part", "vars"]);
+    assert_eq!(schema.edges, ["next"]);
+    assert_eq!(schema.forks, ["weighted", "exclusive"]);
+    assert!(schema.junctions.is_empty());
+    assert_eq!(schema.context, ["steps"]);
+    // the twelve English functions and merge are declared, and what a fork lowers to is internal
+    assert_eq!(schema.functions.len(), 13);
+    assert_eq!(world::Bundle.functions().len(), 14);
+    assert_eq!(world::Bundle.internal(), ["world.pick"]);
     for function in world::Bundle.functions() {
         assert!(function.runs(Consumer::Data), "{}", function.name);
         assert!(function.runs(Consumer::Agent(ScorerLang::Python)), "{}", function.name);
         assert!(function.runs(Consumer::Agent(ScorerLang::Typescript)), "{}", function.name);
-        assert!(function.runs(Consumer::Scorer), "{}", function.name);
+        // the English functions run in scorers too, and what serves a walk does not
+        let walks = ["merge", "world.pick"].contains(&function.name);
+        assert_eq!(function.runs(Consumer::Scorer), !walks, "{}", function.name);
     }
 }
 
@@ -316,8 +324,9 @@ fn a_provider_joined_by_a_contributor_has_the_kinds_and_functions_of_both() {
     assert_eq!((schema.id, schema.name), ("braintrust", "Braintrust mocking"));
     let sources: Vec<_> = schema.definitions.iter().map(|source| source.name).collect();
     assert_eq!(sources, ["braintrust.bt", "world.bt"]);
-    assert_eq!(schema.functions.len(), 15);
-    assert_eq!(joined.functions().len(), 15);
+    assert_eq!(schema.functions.len(), 16);
+    assert_eq!(joined.functions().len(), 17);
+    assert_eq!(joined.internal(), ["world.pick"]);
     let parts: Vec<_> = joined.parts().iter().map(|part| part.schema.id).collect();
     assert_eq!(parts, ["braintrust", "world"]);
 
@@ -454,6 +463,7 @@ static INCONSISTENT_FUNCTIONS: &[Function] = &[
             name: "_measure",
             reads_as: None,
             random: false,
+            seeded: false,
             counts: false,
             texts: false,
             text: "\ndef _weigh(value):\n    return 0\n",
@@ -519,10 +529,6 @@ impl Contributor for Inconsistent {
 
 impl Provider for Inconsistent {
     type Lowered = ();
-
-    fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
-        Vec::new()
-    }
 
     fn lower(&self, _: &bts_lang::Model, _: &'static [Function]) -> Result<(), bts_lang::Diag> {
         Ok(())

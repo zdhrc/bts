@@ -470,6 +470,37 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
         returns: FieldType::String,
         shape: None,
     },
+    FunctionDesc {
+        doc: FuncDesc {
+            tags: &[],
+            id: Id::new("func.merge"),
+            name: "merge",
+            syntax: "merge(base, objects)",
+            summary: "Makes one object from many. It starts from base and applies each object in order. A later key replaces an earlier one, and a null value or a null item changes nothing, so an object sets only what it states. Keys are merged one level deep. A walk uses it to add up what its steps give: merge(defaults, context.steps). Performs no random draws.",
+            examples: &[r#"merge({ tense: "present", modal: null }, [|{ modal: "can" }, { tense: null }|])"#],
+            rules: CALL_RULES,
+        },
+        params: &[
+            ParamDesc {
+                name: "base",
+                accepts: &[FieldType::Object],
+                nullable: false,
+                optional: false,
+                constant: false,
+                bounds: None,
+            },
+            ParamDesc {
+                name: "objects",
+                accepts: &[FieldType::Array],
+                nullable: false,
+                optional: false,
+                constant: false,
+                bounds: None,
+            },
+        ],
+        returns: FieldType::Object,
+        shape: None,
+    },
 ];
 
 // every function runs in data generation, in agents and in scorers, through one entry point
@@ -479,6 +510,7 @@ const fn function(name: &'static str, data: Evaluate, texts: bool) -> Function {
         // generated agents read it as an ordinary library function
         reads_as: Some("english"),
         random: true,
+        seeded: false,
         counts: false,
         texts,
         text: "",
@@ -514,7 +546,39 @@ pub static FUNCTIONS: &[Function] = &[
     function("format_number", format_number, true),
     function("format_date", format_date, true),
     function("format_time", format_time, true),
+    Function {
+        name: "merge",
+        check: None,
+        data: Some(super::walk::merge),
+        python: Some(walked("_world_merge", "merge_objects", false, super::walk::PY_MERGE)),
+        typescript: Some(walked("_world_merge", "mergeObjects", false, super::walk::TS_MERGE)),
+    },
+    // what a weighted fork in a walk lowers to, which no author calls
+    Function {
+        name: super::walk::PICK,
+        check: None,
+        data: Some(super::walk::pick),
+        python: Some(walked("_world_pick", "take_branch", true, super::walk::PY_PICK)),
+        typescript: Some(walked("_world_pick", "takeBranch", true, super::walk::TS_PICK)),
+    },
 ];
+
+// a helper a walk uses, defined by its own text
+const fn walked(name: &'static str, reads_as: &'static str, random: bool, text: &'static str) -> Helper {
+    Helper {
+        name,
+        reads_as: Some(reads_as),
+        random,
+        // the one helper that draws is the one that needs the seed
+        seeded: random,
+        counts: false,
+        texts: false,
+        text,
+        operation: None,
+        runtime: None,
+        scorer: None,
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Operation {

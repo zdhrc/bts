@@ -89,6 +89,8 @@ pub type Evaluate = fn(&[Value], &mut Evaluation<'_>) -> Result<Value, EvaluateE
 pub struct Evaluation<'a> {
     pub(crate) rng: &'a mut Xoshiro256PlusPlus,
     pub(crate) format: &'a dyn AttachmentFormat,
+    pub(crate) seed: u64,
+    pub(crate) trace_index: usize,
 }
 
 impl Evaluation<'_> {
@@ -115,6 +117,14 @@ impl Evaluation<'_> {
     /// The random stream of the expression being evaluated.
     pub fn random(&mut self) -> &mut impl Rng {
         &mut *self.rng
+    }
+
+    /// The seed of the run and the index of the trace being generated.
+    ///
+    /// A value drawn from these alone is the same wherever and however often it is
+    /// evaluated in one trace, and a generated agent given the seed can draw it too.
+    pub fn address(&self) -> (u64, usize) {
+        (self.seed, self.trace_index)
     }
 }
 
@@ -146,6 +156,12 @@ pub struct Helper {
     ///
     /// Such a helper is defined with the runtime's own samplers.
     pub random: bool,
+    /// Whether a call needs the seed of the run.
+    ///
+    /// The random source such a helper is passed carries the seed as `seed`. An
+    /// agent that calls one takes an optional seed and wraps its random source with
+    /// `seeded`, which the helper's text defines.
+    pub seeded: bool,
     /// Whether the result is a count, which typed code can rely on.
     pub counts: bool,
     /// Whether the result is text, which typed code can rely on.

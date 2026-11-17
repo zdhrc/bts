@@ -1333,7 +1333,16 @@ mod execution {
                 helpers.push(*helper);
             }
         }
-        let parameters = match lang {
+        // a helper that needs the run's seed gets it from the random source, and the agent takes one
+        let seeded = helpers.iter().any(|helper| helper.seeded);
+        let seed = seeded.then(|| match lang {
+            ScorerLang::Python => code::Parameter::new("seed").with_default(Expr::Null).keyword(),
+            ScorerLang::Typescript => code::Parameter::new("seed")
+                // a seed past what a number holds exactly is given as a bigint
+                .typed("number | bigint | undefined")
+                .with_default(Expr::from("undefined")),
+        });
+        let mut parameters = match lang {
             ScorerLang::Python => vec![
                 code::Parameter::new("input").with_default("_MISSING"),
                 code::Parameter::new("random_source")
@@ -1349,10 +1358,12 @@ mod execution {
                 code::Parameter::new("logger").typed("any").with_default(Expr::Null),
             ],
         };
+        parameters.extend(seed.clone());
         let mut function = code::Function::new("_execute", parameters);
         function.declare("root", scope_expr(&trace.name, "task", Expr::Null))?;
         function.body.append(&mut body);
-        let parameters = function.parameters[..2].to_vec();
+        let mut parameters = function.parameters[..2].to_vec();
+        parameters.extend(seed);
         let details_name = if lang == ScorerLang::Python {
             "run_details"
         } else {
@@ -1361,24 +1372,33 @@ mod execution {
         let invoke = |name: &str, traced: bool| {
             let random = Expr::Name(random_name(lang).into());
             if lang == ScorerLang::Python {
+                let mut keywords = if traced {
+                    vec![("random_source".into(), random), ("logger".into(), "logger".into())]
+                } else {
+                    vec![("random_source".into(), random)]
+                };
+                if seeded {
+                    keywords.push(("seed".into(), "seed".into()));
+                }
                 Expr::Call {
                     function: Box::new(name.into()),
                     args: vec!["input".into()],
-                    keywords: if traced {
-                        vec![("random_source".into(), random), ("logger".into(), "logger".into())]
-                    } else {
-                        vec![("random_source".into(), random)]
-                    },
+                    keywords,
                 }
             } else {
-                Expr::call(
-                    name,
-                    if traced {
-                        vec!["input".into(), random, "logger".into()]
-                    } else {
-                        vec!["input".into(), random]
-                    },
-                )
+                let mut args = if traced {
+                    vec!["input".into(), random, "logger".into()]
+                } else {
+                    vec!["input".into(), random]
+                };
+                if seeded {
+                    // the seed follows the logger where there is one
+                    if !traced && name == "_execute" {
+                        args.push(Expr::Null);
+                    }
+                    args.push("seed".into());
+                }
+                Expr::call(name, args)
             }
         };
         let details_call = invoke("_execute", false);
@@ -1411,13 +1431,44 @@ mod execution {
         }
         let mut functions = vec![function, details, run, traced];
         let contracts = if direct_ctx.direct && matches!(functions[0].body.get(1), Some(Statement::TraceScope { .. })) {
-            match native::functions(&mut functions, lang, &numbered, &helpers) {
+            // values built beside the agent read one another, so each follows its reader into place
+            match native::functions(&mut functions, lang, &numbered, &helpers, !trace.beside.is_empty()) {
                 Some(contracts) => contracts,
                 None => return emit_form(model, trace, output, lang, false, unsupported),
             }
         } else {
             vec![]
         };
+        if seeded {
+            let seeded = |source: Expr| Expr::call("seeded", vec![source, "seed".into()]);
+            let mut given = false;
+            let execute = (functions.iter_mut())
+                .find(|function| function.name == "_execute")
+                .ok_or("the agent has no entry function")?;
+            for statement in &mut execute.body {
+                if let Statement::Variable(Variable::Declare {
+                    value: Expr::New { class, args },
+                    ..
+                }) = statement
+                    && class == "ExecutionContext"
+                    && let Some(source) = args.get_mut(1)
+                {
+                    *source = seeded(source.clone());
+                    given = true;
+                }
+            }
+            // without a context the steps read the random source by name
+            if !given {
+                let source = Expr::Name(random_name(lang).into());
+                execute.body.insert(
+                    0,
+                    Statement::Variable(Variable::Assign {
+                        name: source.clone(),
+                        value: seeded(source),
+                    }),
+                );
+            }
+        }
         Ok(Agent {
             helpers,
             functions,
@@ -2079,6 +2130,7 @@ mod native {
         lang: ScorerLang,
         numbered: &[(String, String)],
         helpers: &[crate::mocking::Helper],
+        chained: bool,
     ) -> Option<Vec<(String, Json)>> {
         let counts: Counts = std::rc::Rc::new(Results {
             counts: (helpers.iter())
@@ -2168,7 +2220,27 @@ mod native {
         }
         // Bind a deferred value in its sole consumer when that consumer is invoked
         // exactly once. Evaluation remains deferred until the original first read.
-        fn localize(body: &mut Vec<Statement>) {
+        // In a chain of values, one read only by a value that moved follows it, until nothing moves.
+        fn localize(body: &mut Vec<Statement>, chained: bool) {
+            while localize_once(body, chained) && chained {}
+            for statement in body {
+                match statement {
+                    Statement::Function(f) => localize(&mut f.body, chained),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => localize(body, chained),
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        localize(then_body, chained);
+                        localize(else_body, chained);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn localize_once(body: &mut Vec<Statement>, chained: bool) -> bool {
+            let mut moved = false;
+            // values in a chain keep the order they were declared in, and those moved later are read by those moved before
+            let mut placed: HashMap<String, usize> = HashMap::new();
             let candidates: Vec<_> = body
                 .iter()
                 .filter_map(|s| match s {
@@ -2217,26 +2289,17 @@ mod native {
                     .find(|s| matches!(s, Statement::Variable(Variable::Declare { name: n, .. }) if n == &name))
                     .unwrap()
                     .clone();
+                let place = placed.entry(consumer.clone()).or_default();
                 if let Statement::Function(f) = &mut body[index]
                     && let Statement::TraceScope { body, .. } = &mut f.body[1]
                 {
-                    body.insert(0, declaration);
+                    body.insert(if chained { *place } else { 0 }, declaration);
+                    *place += 1;
                 }
                 body.retain(|s| !matches!(s, Statement::Variable(Variable::Declare { name: n, .. }) if n == &name));
+                moved = true;
             }
-            for statement in body {
-                match statement {
-                    Statement::Function(f) => localize(&mut f.body),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => localize(body),
-                    Statement::If {
-                        then_body, else_body, ..
-                    } => {
-                        localize(then_body);
-                        localize(else_body);
-                    }
-                    _ => {}
-                }
-            }
+            moved
         }
         // a deferred value nothing reads is never computed, so it is not printed
         fn unread(body: &mut Vec<Statement>, read: &HashSet<String>) {
@@ -2290,7 +2353,7 @@ mod native {
             }
         }
         for function in functions.iter_mut() {
-            localize(&mut function.body);
+            localize(&mut function.body, chained);
         }
         fn exported_fields(body: &[Statement], ancestors: &[String], exports: &mut HashMap<String, Vec<String>>) {
             for statement in body {
@@ -2396,7 +2459,7 @@ mod native {
             });
         }
         observe(functions, lang);
-        eager_values(functions, &types.borrow(), &counts, lang);
+        eager_values(functions, &types.borrow(), &counts, lang, chained);
         pure_functions(functions);
         hoist(functions, lang);
         let mut contracts = Vec::new();
@@ -2898,7 +2961,13 @@ mod native {
         }
     }
 
-    fn eager_values(functions: &mut [code::Function], types: &HashMap<String, Type>, counts: &Counts, lang: ScorerLang) {
+    fn eager_values(
+        functions: &mut [code::Function],
+        types: &HashMap<String, Type>,
+        counts: &Counts,
+        lang: ScorerLang,
+        chained: bool,
+    ) {
         fn total(value: &Expr, env: &Environment, lang: ScorerLang) -> bool {
             match value {
                 Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
@@ -2926,7 +2995,25 @@ mod native {
                 _ => false,
             }
         }
-        fn visit(body: &mut Vec<Statement>, env: &Environment, lang: ScorerLang) {
+        fn visit(body: &mut Vec<Statement>, env: &Environment, lang: ScorerLang, chained: bool) {
+            // in a chain of values, one whose first reader was itself deferred can be computed once that reader is
+            while visit_once(body, env, lang) && chained {}
+            for statement in body {
+                match statement {
+                    Statement::Function(f) => visit(&mut f.body, env, lang, chained),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => visit(body, env, lang, chained),
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        visit(then_body, env, lang, chained);
+                        visit(else_body, env, lang, chained);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn visit_once(body: &mut Vec<Statement>, env: &Environment, lang: ScorerLang) -> bool {
+            let mut changed = false;
             let candidates: Vec<_> = body
                 .iter()
                 .filter_map(|s| {
@@ -3020,20 +3107,9 @@ mod native {
                         *e = Expr::Name(name.clone());
                     }
                 });
+                changed = true;
             }
-            for statement in body {
-                match statement {
-                    Statement::Function(f) => visit(&mut f.body, env, lang),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => visit(body, env, lang),
-                    Statement::If {
-                        then_body, else_body, ..
-                    } => {
-                        visit(then_body, env, lang);
-                        visit(else_body, env, lang);
-                    }
-                    _ => {}
-                }
-            }
+            changed
         }
         let env = Environment {
             names: types.clone(),
@@ -3041,7 +3117,7 @@ mod native {
             ..Environment::default()
         };
         for function in functions {
-            visit(&mut function.body, &env, lang);
+            visit(&mut function.body, &env, lang, chained);
         }
     }
 
