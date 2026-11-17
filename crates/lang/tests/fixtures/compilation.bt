@@ -574,3 +574,13 @@
             kept_for: self.props.retention_days,
             checked_by: self.props.auditor,
         };
+
+# a kind computes a field for the instances that omit it, from the instance's own fields
+# an instance that writes the field replaces the kind's value
++(prescription:node) {
+    dose_mg: {type: "number", required: true},
+    doses_per_day: {type: "number", default: 1},
+    daily_mg: {type: "number", value: self.dose_mg * self.doses_per_day},
+};
+(standard_course:prescription) {dose_mg: 250, doses_per_day: 3};
+(tapered_course:prescription) {dose_mg: 250, doses_per_day: 3, daily_mg: 500};

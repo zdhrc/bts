@@ -16,13 +16,16 @@ mod braintrust_defs;
 const BRAINTRUST_FIXTURE: &str = include_str!("../../core/tests/fixtures/braintrust.bt");
 
 fn compile_braintrust(source: &str) -> Result<bts_lang::Model, bts_lang::Diags> {
-    compile_with_definitions(
-        Source {
-            name: "user.bt",
-            text: source,
-        },
-        &[braintrust_defs::SOURCE],
-    )
+    // the provider's kinds call its functions, so they compile with a provider that declares them
+    let provider = ProviderSchema {
+        definitions: &[braintrust_defs::SOURCE],
+        ..PROVIDER
+    };
+    let source = Source {
+        name: "user.bt",
+        text: source,
+    };
+    compile_module_with_provider(source, &provider, false)
 }
 
 #[test]
@@ -193,6 +196,7 @@ const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
         params: &[ParamDesc {
             name: "value",
             accepts: &[FieldType::String, FieldType::Array, FieldType::Object],
+            nullable: true,
             constant: false,
             bounds: None,
         }],
@@ -203,6 +207,7 @@ const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
         params: &[ParamDesc {
             name: "size",
             accepts: &[FieldType::Number],
+            nullable: false,
             constant: false,
             bounds: Some((0, 16)),
         }],
@@ -214,12 +219,14 @@ const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
             ParamDesc {
                 name: "path",
                 accepts: &[FieldType::String],
+                nullable: false,
                 constant: true,
                 bounds: None,
             },
             ParamDesc {
                 name: "content_type",
                 accepts: &[FieldType::String],
+                nullable: false,
                 constant: true,
                 bounds: None,
             },
@@ -317,7 +324,7 @@ fn provider_functions_are_checked_from_their_descriptors_and_never_folded() {
         ),
         (
             "tokens(1)",
-            "function `tokens` expects a string, array, or object argument, but found number",
+            "function `tokens` expects a string, array, object, or null argument, but found number",
         ),
         ("noise(\"x\")", "function `noise` expects a number argument, but found string"),
         ("noise(-1)", "function `noise` size must be an integer between 0 and 16"),
@@ -354,6 +361,10 @@ fn unknown_and_ambiguous_function_names_are_located_at_the_call() {
     assert!(errors[0].what.starts_with("unknown function `uper`, did you mean `upper`?"));
     let errors = compile("(values:vars) {value: unrelated_name(1)};").unwrap_err();
     assert!(errors[0].what.starts_with("unknown function `unrelated_name`;"));
+    // a parameter that takes null says so, and the others still reject it
+    assert!(provided("tokens(null)").is_ok());
+    assert!(provided("tokens(1)").unwrap_err().contains("string, array, object, or null"));
+    assert!(provided("noise(null)").is_err());
     // without the provider its functions are unknown
     assert!(compile("(values:vars) {value: tokens(\"a\")};").is_err());
 
@@ -1021,7 +1032,7 @@ fn preserves_fork_contracts_without_enforcing_runtime_policies() {
 #[test]
 fn parses_compilation_fixture() {
     let graph = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(graph.paths.len(), 63);
+    assert_eq!(graph.paths.len(), 65);
     let intake = &graph.paths[2];
     assert_eq!(intake.steps.len(), 3);
     let outer = fork(&intake.steps[2]);
@@ -1191,7 +1202,7 @@ fn handles_truncated_pattern_references_without_panicking() {
 #[test]
 fn lowers_the_compilation_fixture_to_a_domain_neutral_graph() {
     let model = compile_fixture();
-    assert_eq!(model.paths.len(), 63);
+    assert_eq!(model.paths.len(), 65);
     // the fixture's handoff edge supplies its key to both steps downstream
     let supplied = |node: &str| {
         let bts_lang::ElementId::Node(id) = model.names[node] else {
@@ -1871,7 +1882,7 @@ fn validates_builtin_junction_configuration() {
 fn fixture_lowers_kind_schemas_upstream_inputs_and_destinations() {
     use bts_lang::{ElementId, FieldType};
     let ast = parse(COMPILATION_SOURCE).unwrap();
-    assert_eq!(ast.definitions.len(), 19);
+    assert_eq!(ast.definitions.len(), 20);
     assert_eq!(ast.definitions[0].head.header.kind, "trait");
     assert_eq!(ast.definitions[3].head.header.kind, "node");
     assert_eq!(ast.definitions[4].head.header.kind, "edge");
@@ -3437,6 +3448,270 @@ fn edge_kinds_provide_context_and_models_record_suppliers() {
         let range = errors[0].r#where;
         assert!(source[range.start..range.end].starts_with(at), "{source}");
     }
+}
+
+#[test]
+fn computed_fields_are_lowered_for_each_instance_that_omits_them() {
+    use bts_lang::Number::Int;
+    // the fixture's kind computes one instance and is replaced on the other
+    let model = compile_fixture();
+    assert!(matches!(
+        binding(&model, "standard_course", "daily_mg").value,
+        Value::Num(Int(750))
+    ));
+    assert!(matches!(
+        binding(&model, "tapered_course", "daily_mg").value,
+        Value::Num(Int(500))
+    ));
+    let kind = &model.kinds[model.kind_names["prescription"].0];
+    assert!(
+        kind.fields
+            .iter()
+            .any(|field| field.name == "daily_mg" && field.value.is_some())
+    );
+
+    let definitions = r#"
+        +(order:node) {
+            price: {type: "number", required: true},
+            quantity: {type: "number", default: 1},
+            total: {type: "number", required: true, value: self.price * self.quantity},
+        };
+        # an extension keeps the value, restates it, or puts a default in its place
+        +(kept:node)-[:extends]->(order);
+        +(doubled:node) {total: {value: self.price * self.quantity * 2}}
+            -[:extends]->(order);
+        +(flat:node) {total: {default: 9}}
+            -[:extends]->(order);
+        +(counted:node) {quantity: {value: self.price + 1}}
+            -[:extends]->(order);
+        # a trait computes a field for every kind that has it
+        +(labelled:trait) {label: {type: "string", value: "order ${self.props.code}"}}
+            -[:on]->(node);
+        +(coded:node {code: {type: "string", required: true}})
+            -[:extends]->(order)
+            -[:has]->(labelled);
+        # a value reads the context that reaches the instance, samples and calls functions
+        +(tenant_scoped:trait {tenant: {type: "string", required: true}})
+            -[:on]->(node)
+            -[:provides {tenant: {type: "string", value: self.props.tenant}}]->(context);
+        +(entry:node)-[:has]->(tenant_scoped);
+        +(billed:node) {
+            account: {type: "string", value: context.tenant},
+            jitter: {type: "number", value: range(0, 1)},
+            shout: {type: "string", value: upper(self.account)},
+            parts: {type: "object", value: {first: self.jitter, second: self.parts.first}},
+        };
+    "#;
+    let model = compiled(&format!(
+        r#"{definitions}
+        (a:order) {{price: 4, quantity: 3}};
+        (b:order) {{price: 4}};
+        (c:order) {{price: 4, total: 10}};
+        (d:order) {{price: 4, total: <-}};
+        (e:kept) {{price: 2, quantity: 5}};
+        (f:doubled) {{price: 2, quantity: 5}};
+        (g:flat) {{price: 2, quantity: 5}};
+        (h:counted) {{price: 2}};
+        (i:coded {{code: "A1"}}) {{price: 1}};
+        (start:entry {{tenant: "acme"}})-[:next]->(j:billed);
+        (other:entry {{tenant: "globex"}})-[:next]->(k:billed);
+        "#
+    ));
+    let total = |node: &str| binding(&model, node, "total").value.clone();
+    assert!(matches!(total("a"), Value::Num(Int(12))));
+    // a value reads the default of a sibling the instance omitted, and satisfies required
+    assert!(matches!(total("b"), Value::Num(Int(4))));
+    // what the instance writes replaces the value, and so does a declared input
+    assert!(matches!(total("c"), Value::Num(Int(10))));
+    assert!(matches!(total("d"), Value::Input { .. }));
+    assert!(matches!(total("e"), Value::Num(Int(10))));
+    assert!(matches!(total("f"), Value::Num(Int(20))));
+    assert!(matches!(total("g"), Value::Num(Int(9))));
+    // a value put in place of an inherited default feeds the inherited value
+    assert!(matches!(total("h"), Value::Num(Int(6))));
+    assert!(matches!(&binding(&model, "i", "label").value, Value::Str(text) if text == "order A1"));
+    // each instance reads its own context, and the read is recorded for it
+    for node in ["j", "k"] {
+        let owner = model.names[node];
+        assert!(
+            matches!(&binding(&model, node, "account").value, Value::Context { owner: read, path } if *read == owner && path == &["tenant"])
+        );
+        assert!(
+            model
+                .context_reads
+                .iter()
+                .any(|read| read.owner == owner && read.path == ["tenant"])
+        );
+        // a sampled value is left for a consumer, once for each instance
+        assert!(matches!(binding(&model, node, "jitter").value, Value::Func { .. }));
+        // a computed field is one of its instance's fields, in the kind's order after what was written
+        let bts_lang::ElementId::Node(id) = owner else { panic!() };
+        let fields: Vec<_> = (model.nodes[id.0].fields.iter())
+            .map(|binding| model.bindings[binding.0].path.join("."))
+            .collect();
+        assert_eq!(fields, ["account", "jitter", "shout", "parts"]);
+    }
+
+    // an object written over a computed object is merged with it, one level deep
+    let model = compiled(
+        r#"
+        +(sized:node) {
+            scale: {type: "number", default: 2},
+            size: {type: "object", value: {width: self.scale, height: self.size.width * 3, area: {unit: "m"}}},
+            label: {type: "any", value: {text: "kind"}},
+        };
+        (other:node) {depth: 7};
+        (a:sized) {size: {depth: other.depth, width: 5, area: {scale: 1}}};
+        (b:sized) {size: {...{depth: 1}}, label: "written"};
+        (c:sized) {size: {}};
+        "#,
+    );
+    let keys = |node: &str| -> Vec<String> {
+        let Value::Object(object) = &binding(&model, node, "size").value else {
+            panic!("{node}")
+        };
+        object.elem.iter().map(|entry| entry.key.clone()).collect()
+    };
+    let entry = |node: &str, key: &str| -> Value {
+        let owner = model.names[node];
+        (model.bindings.iter())
+            .find(|binding| binding.owner == owner && binding.path == ["size", key])
+            .unwrap_or_else(|| panic!("{node}.{key}"))
+            .value
+            .clone()
+    };
+    // the kind's keys keep their order, the instance's own keys follow
+    assert_eq!(keys("a"), ["width", "height", "area", "depth"]);
+    // a key the instance writes replaces the kind's, and the kind's other keys read it
+    assert!(matches!(entry("a", "width"), Value::Num(Int(5))));
+    assert!(matches!(entry("a", "height"), Value::Num(Int(15))));
+    // what the instance writes may name other nodes, and a nested object is replaced, not merged
+    assert!(matches!(entry("a", "depth"), Value::Num(Int(7))));
+    let Value::Object(area) = entry("a", "area") else { panic!() };
+    assert_eq!(area.elem.len(), 1);
+    assert_eq!(area.elem[0].key, "scale");
+    // an object with a spread and a value that is no object replace the kind's whole
+    assert_eq!(keys("b"), ["depth"]);
+    assert!(matches!(&binding(&model, "b", "label").value, Value::Str(text) if text == "written"));
+    // an empty object keeps everything the kind computes
+    assert_eq!(keys("c"), ["width", "height", "area"]);
+    assert!(matches!(entry("c", "height"), Value::Num(Int(6))));
+
+    // a kind that comes from a provider's definitions computes the same way, with the provider's functions
+    let provider = ProviderSchema {
+        definitions: &[Source {
+            name: "provider.bt",
+            text: r#"+(counted_text:node) {text: {type: "string"}, size: {type: "number", value: tokens(self.text)}};"#,
+        }],
+        ..PROVIDER
+    };
+    let source = Source {
+        name: "user.bt",
+        text: r#"(a:counted_text) {text: "hello"}; (b:counted_text) {text: "hello", size: 1};"#,
+    };
+    let model = compile_module_with_provider(source, &provider, false).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let Value::Func {
+        func: bts_lang::Func::Call { function, .. },
+        range,
+    } = &binding(&model, "a", "size").value
+    else {
+        panic!()
+    };
+    // the call keeps its place in the provider's source
+    assert_eq!((function.as_str(), range.source), ("tokens", 1));
+    assert!(matches!(binding(&model, "b", "size").value, Value::Num(Int(1))));
+}
+
+#[test]
+fn computed_fields_are_restricted_and_report_at_the_instance() {
+    // what a descriptor may not say is reported at the descriptor
+    for (source, message, at) in [
+        (
+            r#"+(k:node {code: {type: "string", value: "a"}});"#,
+            "a property descriptor takes no value, only a content field is computed",
+            r#"value: "a""#,
+        ),
+        (
+            r#"+(k:node) {total: {default: 1, value: 2}};"#,
+            "a field takes a default or a value, not both",
+            "value: 2",
+        ),
+        (
+            r#"+(k:edge {direction: "directed", weight: {value: 1}});"#,
+            "a property descriptor takes no value, only a content field is computed",
+            "value: 1",
+        ),
+    ] {
+        let errors = compile(source).unwrap_err();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:#?}");
+        assert_eq!(errors[0].what, message, "{source}");
+        assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], at, "{source}");
+    }
+    // what goes wrong while computing is reported at the instance, naming the kind and the field
+    for (source, message, at) in [
+        (
+            r#"+(copy:node) {held: {value: a.held}}; (a:node) {held: 1}; (b:copy);"#,
+            "computed field `held` of kind `copy`: a computed field reads self and context, `a` is not available to a kind",
+            "(b:copy)",
+        ),
+        (
+            r#"+(copy:node) {held: {value: {inner: a.held}}}; (a:node) {held: 1}; (b:copy);"#,
+            "computed field `held` of kind `copy`: a computed field reads self and context, `a` is not available to a kind",
+            "(b:copy)",
+        ),
+        (
+            r#"+(copy:node) {held: {value: ?<(@:node)>.held}}; (a:node) {held: 1}; (b:copy);"#,
+            "computed field `held` of kind `copy`: a computed field reads self and context, a graph pattern is not available to a kind",
+            "(b:copy)",
+        ),
+        (
+            r#"+(base:node) {held: {type: "number", value: self.text}, text: {type: "any"}}; +(copy:node)-[:extends]->(base); (b:copy) {text: "a"};"#,
+            "computed field `held` of kind `copy`: operator `schema` expects number operands, but found string",
+            r#"(b:copy) {text: "a"}"#,
+        ),
+        (
+            r#"+(copy:node) {held: {value: self.missing}}; (b:copy);"#,
+            "computed field `held` of kind `copy`: ",
+            "(b:copy)",
+        ),
+        (
+            r#"+(copy:node) {held: {value: context.absent}}; (b:copy);"#,
+            "context key `absent` is not available here",
+            "context.absent",
+        ),
+    ] {
+        let errors = compile(source).unwrap_err();
+        assert_eq!(errors.len(), 1, "{source}\n{errors:#?}");
+        assert!(errors[0].what.starts_with(message), "{source}\n{}", errors[0].what);
+        assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], at, "{source}");
+    }
+    // in a merged object the kind's keys are still the kind's, reported at the instance
+    let source = r#"+(copy:node) {held: {value: {mine: a.held}}}; (a:node) {held: 1}; (b:copy) {held: {yours: a.held}};"#;
+    let errors = compile(source).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0]
+            .what
+            .starts_with("computed field `held` of kind `copy`: a computed field reads self and context")
+    );
+    assert_eq!(
+        &source[errors[0].r#where.start..errors[0].r#where.end],
+        "(b:copy) {held: {yours: a.held}}"
+    );
+    // the name is rejected for the value alone, the fields it reads may name other nodes
+    let model = compiled(
+        r#"+(copy:node) {from: {type: "any"}, held: {value: self.from}}; (a:node) {held: 1}; (b:copy) {from: a.held};"#,
+    );
+    assert!(matches!(
+        binding(&model, "b", "held").value,
+        Value::Num(bts_lang::Number::Int(1))
+    ));
+    // two computed fields that read each other are circular for the instance
+    let errors = compile(r#"+(k:node) {a: {value: self.b}, b: {value: self.a}}; (n:k);"#).unwrap_err();
+    assert!(
+        errors.iter().all(|error| error.what.contains("circular field dependency")),
+        "{errors:#?}"
+    );
 }
 
 #[test]

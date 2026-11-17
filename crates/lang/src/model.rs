@@ -303,7 +303,7 @@ pub struct FieldSchema {
     pub default: Option<Value>,
     /// Optional role without an operation binding. Input roles retain runtime reads.
     pub role: Option<String>,
-    /// Where the definition gives a provided context key its value, when it does.
+    /// Where the definition states the value of a computed field or a provided context key, when it does.
     pub value: Option<SrcRange>,
     /// Schema field location.
     pub range: SrcRange,
@@ -1168,6 +1168,8 @@ pub struct ParamDesc {
     pub name: &'static str,
     /// The accepted types. An argument fed by context is checked on evaluation.
     pub accepts: &'static [FieldType],
+    /// Whether null is accepted beside those types.
+    pub nullable: bool,
     /// Whether the argument must be a constant.
     pub constant: bool,
     /// Inclusive bounds a constant argument must be an integer within.

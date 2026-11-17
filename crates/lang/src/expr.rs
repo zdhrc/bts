@@ -1824,16 +1824,17 @@ impl<'a> ExpressionModeler<'a> {
                 _ => true,
             };
             let found = self.static_type(&arg);
-            let typed = param.accepts.iter().any(|ty| match schema_static_type(*ty) {
-                Some(accepted) => found == Some(accepted),
-                None => true,
-            });
+            let typed = (param.nullable && found == Some(StaticType::Null))
+                || param.accepts.iter().any(|ty| match schema_static_type(*ty) {
+                    Some(accepted) => found == Some(accepted),
+                    None => true,
+                });
             if param.constant && !is_constant(&arg) {
                 self.errors.push(Error::new(
                     ErrorKind::CallParam {
                         func,
                         param: param.name,
-                        expected: format!("a constant {}", accepted_types(param.accepts)),
+                        expected: format!("a constant {}", accepted_types(param)),
                         rule,
                     },
                     arg.range,
@@ -1843,7 +1844,7 @@ impl<'a> ExpressionModeler<'a> {
                 self.errors.push(Error::new(
                     ErrorKind::CallArgType {
                         func,
-                        expected: accepted_types(param.accepts),
+                        expected: accepted_types(param),
                         found: self.found_type(&arg),
                     },
                     arg.range,
@@ -2599,10 +2600,10 @@ fn type_name(required: StaticType) -> &'static str {
 }
 
 // the types a provider parameter accepts, as a diagnostic reads them
-fn accepted_types(accepts: &[FieldType]) -> String {
-    let names: Vec<&str> = accepts
-        .iter()
+fn accepted_types(param: &crate::ParamDesc) -> String {
+    let names: Vec<&str> = (param.accepts.iter())
         .map(|ty| schema_static_type(*ty).map_or("value", type_name))
+        .chain(param.nullable.then_some("null"))
         .collect();
     match names.as_slice() {
         [] => "value".to_owned(),

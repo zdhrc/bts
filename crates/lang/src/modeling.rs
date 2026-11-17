@@ -45,6 +45,17 @@ enum Anchor {
     Node(NodeId),
     Reference(ast::Expr, Option<ElementId>),
 }
+// a field an element takes from its kind's value
+#[derive(Clone)]
+struct Computed {
+    // the kind of the element
+    kind: String,
+    // the descriptor that states the value
+    range: SrcRange,
+    // the keys the kind supplies when the instance wrote an object over the value, none when it wrote nothing
+    keys: Option<HashSet<String>>,
+}
+
 #[derive(Clone)]
 struct RawEdge {
     source: Anchor,
@@ -109,8 +120,13 @@ struct Modeler {
     defined: HashSet<String>,
     // every context read with the element that owns it, the path after context and its location
     context_reads: Vec<(ElementId, Vec<String>, SrcRange)>,
-    // the value expression of each provided context key that has one, by the location of its descriptor
-    context_values: HashMap<(usize, usize, usize), ast::Expr>,
+    // the value expression of each provided context key and computed field, by the location of its descriptor
+    values: HashMap<(usize, usize, usize), ast::Expr>,
+    // the fields an element takes from its kind's value, with the kind that states it and where
+    // a field merged with what the instance wrote also lists the keys the kind supplies
+    computed: HashMap<(ElementId, String), Computed>,
+    // the computed field being lowered, whose expression reads self and context only
+    computing: Option<String>,
     // the same expressions for each element that supplies them, by element and key
     supplied: HashMap<(ElementId, String), ast::Expr>,
     // the functions a provider contributes to expressions
@@ -138,7 +154,9 @@ impl Modeler {
             unchecked: HashSet::new(),
             defined: HashSet::new(),
             context_reads: Vec::new(),
-            context_values: HashMap::new(),
+            values: HashMap::new(),
+            computed: HashMap::new(),
+            computing: None,
             supplied: HashMap::new(),
             errors: Vec::new(),
         }
@@ -166,17 +184,17 @@ impl Modeler {
             let (relationships, shape_errors) = relationships(&definition.steps);
             let broken = !shape_errors.is_empty();
             self.errors.extend(shape_errors);
-            for relationship in &relationships {
-                if !matches!(relationship.relation, Relation::Provides) {
-                    continue;
-                }
-                for descriptor in (relationship.keys.iter()).flat_map(|key| schema_entries(&key.value).unwrap_or_default()) {
-                    if descriptor.key == "value" {
-                        self.context_values.insert(
-                            (descriptor.range.source, descriptor.range.start, descriptor.range.end),
-                            descriptor.value,
-                        );
-                    }
+            let provided = (relationships.iter())
+                .filter(|relationship| matches!(relationship.relation, Relation::Provides))
+                .flat_map(|relationship| &relationship.keys);
+            for descriptor in (provided.chain(definition.head.body.iter().flatten()))
+                .flat_map(|key| schema_entries(&key.value).unwrap_or_default())
+            {
+                if descriptor.key == "value" {
+                    self.values.insert(
+                        (descriptor.range.source, descriptor.range.start, descriptor.range.end),
+                        descriptor.value,
+                    );
                 }
             }
             if builtin_construct(name).is_some() || reserved_name(name) || name == "trait" {
@@ -397,8 +415,28 @@ impl Modeler {
                 }
             }
             for entry in entries {
-                if !fields.iter().any(|field| field.key == entry.name) {
-                    if let Some(value) = entry.default {
+                let computed = (entry.value).and_then(|at| self.values.get(&(at.source, at.start, at.end)).cloned());
+                let stated = |keys| Computed {
+                    kind: kind.name.clone(),
+                    range: entry.range,
+                    keys,
+                };
+                if let Some(written) = fields.iter_mut().find(|field| field.key == entry.name) {
+                    // an object the instance writes is merged over the object its kind computes, key by key
+                    if let Some((merged, keys)) = computed.and_then(|value| merged(&value, &written.value)) {
+                        written.value.kind = ast::ExprKind::Object(merged);
+                        self.computed.insert((owner, entry.name.clone()), stated(Some(keys)));
+                    }
+                } else {
+                    if let Some(value) = computed {
+                        // a computed field is lowered for each instance as if the instance had written it
+                        self.computed.insert((owner, entry.name.clone()), stated(None));
+                        fields.push(ast::Attr {
+                            key: entry.name,
+                            value,
+                            range: entry.range,
+                        });
+                    } else if let Some(value) = entry.default {
                         self.defaults.insert(
                             Slot {
                                 owner,
@@ -884,23 +922,42 @@ impl Modeler {
         });
         self.slots.insert(slot.clone(), id);
         self.visiting.insert(slot.clone());
+        let computed = (!slot.property)
+            .then(|| self.computed.get(&(slot.owner, slot.path[0].clone())).cloned())
+            .flatten();
+        // in a merged object only the keys the kind supplies are the kind's expressions
+        let supplied = computed.as_ref().is_some_and(|computed| match &computed.keys {
+            Some(keys) => slot.path.get(1).is_some_and(|key| keys.contains(key)),
+            None => true,
+        });
+        let outer = std::mem::replace(&mut self.computing, supplied.then(|| slot.path[0].clone()));
         let result = self.lower_binding_expr(expr, &slot);
+        self.computing = outer;
         self.visiting.remove(&slot);
-        match result {
+        let result = match result {
             Ok(value) => {
-                self.model.bindings[id.0].value = value;
-                expr::schema_type(
-                    self.reference_value(self.model.bindings[id.0].value.clone()),
-                    self.field_type(&slot),
-                    range,
-                )?;
-                Ok(id)
+                self.model.bindings[id.0].value = value.clone();
+                expr::schema_type(self.reference_value(value), self.field_type(&slot), range).map(|()| id)
             }
             Err(errors) => {
                 self.slots.remove(&slot);
                 Err(errors)
             }
-        }
+        };
+        // what goes wrong inside a kind's value is reported at the instance it was computed for
+        result.map_err(|mut errors| {
+            if let Some(Computed { kind, range: at, .. }) = computed.filter(|_| slot.path.len() == 1) {
+                let instance = self.element_range(slot.owner);
+                for diag in &mut errors {
+                    let place = diag.r#where;
+                    if place.source == at.source && place.start >= at.start && place.end <= at.end {
+                        diag.what = format!("computed field `{}` of kind `{kind}`: {}", slot.path[0], diag.what);
+                        diag.r#where = instance;
+                    }
+                }
+            }
+            errors
+        })
     }
 
     fn lower_binding_expr(&mut self, mut expr: ast::Expr, slot: &Slot) -> Result<Value> {
@@ -1130,6 +1187,12 @@ impl Modeler {
                         }
                         self.member(Cursor::Element(element), name, expr.range)?
                     }
+                    _ if self.computing.is_some() => {
+                        return Err(error(
+                            expr.range,
+                            format!("a computed field reads self and context, `{name}` is not available to a kind"),
+                        ));
+                    }
                     _ => Cursor::Element(
                         *self
                             .model
@@ -1168,6 +1231,10 @@ impl Modeler {
                 }
                 Ok(Cursor::Element(ElementId::Edge(edge)))
             }
+            ast::ExprKind::PatternRef(_) if self.computing.is_some() => Err(error(
+                expr.range,
+                "a computed field reads self and context, a graph pattern is not available to a kind",
+            )),
             ast::ExprKind::PatternRef(pattern) => Ok(Cursor::Element(self.pattern(pattern, owner)?)),
             ast::ExprKind::Index { target, index } => {
                 let cursor = self.cursor(target, owner)?;
@@ -1402,7 +1469,7 @@ impl Modeler {
                 .filter_map(|key| key.value.map(|at| (key.name.clone(), key.ty, at)))
                 .collect();
             for (key, ty, at) in supplied {
-                let Some(value) = self.context_values.get(&(at.source, at.start, at.end)).cloned() else {
+                let Some(value) = self.values.get(&(at.source, at.start, at.end)).cloned() else {
                     continue;
                 };
                 self.supplied.insert((owner, key.clone()), value);
@@ -1904,14 +1971,48 @@ fn primitive_context(primitive: Primitive, range: SrcRange) -> (Vec<FieldSchema>
     }
 }
 
+// the keys of an object literal, when it has no spread
+fn literal_keys(expr: &ast::Expr) -> Option<Vec<&ast::Attr>> {
+    let ast::ExprKind::Object(items) = &expr.kind else {
+        return None;
+    };
+    (items.iter())
+        .map(|item| match item {
+            ast::ObjectItem::Attr(attr) => Some(attr),
+            ast::ObjectItem::Spread(_) => None,
+        })
+        .collect()
+}
+
+// what an instance wrote over what its kind computes: the kind's keys in their order, each replaced by the
+// instance's when it writes one, then the keys only the instance has. Also the keys left to the kind
+fn merged(computed: &ast::Expr, written: &ast::Expr) -> Option<(Vec<ast::ObjectItem>, HashSet<String>)> {
+    let (computed, written) = (literal_keys(computed)?, literal_keys(written)?);
+    let mut kept = HashSet::new();
+    let mut items = Vec::new();
+    for attr in &computed {
+        let replaced = written.iter().find(|field| field.key == attr.key);
+        if replaced.is_none() {
+            kept.insert(attr.key.clone());
+        }
+        items.push(ast::ObjectItem::Attr((*replaced.unwrap_or(attr)).clone()));
+    }
+    for attr in written {
+        if !computed.iter().any(|field| field.key == attr.key) {
+            items.push(ast::ObjectItem::Attr(attr.clone()));
+        }
+    }
+    Some((items, kept))
+}
+
 // descriptors written directly in a definition's header braces or body
-fn schema_attrs(attrs: &[ast::Attr], inherited: &mut Vec<FieldSchema>) -> Result<()> {
+fn schema_attrs(attrs: &[ast::Attr], inherited: &mut Vec<FieldSchema>, content: bool) -> Result<()> {
     let mut seen = HashSet::new();
     let mut errors = Vec::new();
     for attr in attrs {
         if !seen.insert(&attr.key) {
             errors.extend(error(attr.range, "duplicate schema key"));
-        } else if let Err(diags) = schema_field(attr.clone(), inherited) {
+        } else if let Err(diags) = schema_field(attr.clone(), inherited, content) {
             errors.extend(diags);
         }
     }
@@ -1929,7 +2030,7 @@ fn narrows(previous: &FieldSchema, schema: &FieldSchema, range: SrcRange) -> Res
     Ok(())
 }
 
-fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>, content: bool) -> Result<()> {
     {
         let previous = inherited.iter().find(|entry| entry.name == field.key).cloned();
         let mut schema = previous.clone().unwrap_or(FieldSchema {
@@ -1942,6 +2043,8 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
             range: field.range,
         });
         schema.range = field.range;
+        // where this descriptor states a default and a value
+        let mut stated = (None, None);
         for descriptor in schema_entries(&field.value)? {
             match descriptor.key.as_str() {
                 "type" => {
@@ -1960,6 +2063,18 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
                         return Err(error(descriptor.range, "schema defaults must be constant"));
                     }
                     schema.default = Some(value);
+                    stated.0 = Some(descriptor.range);
+                }
+                // the expression is kept by its location and lowered for each instance
+                "value" if content => {
+                    schema.value = Some(descriptor.range);
+                    stated.1 = Some(descriptor.range);
+                }
+                "value" => {
+                    return Err(error(
+                        descriptor.range,
+                        "a property descriptor takes no value, only a content field is computed",
+                    ));
                 }
                 _ => {
                     return Err(error(
@@ -1968,6 +2083,13 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
                     ));
                 }
             }
+        }
+        // a field has a default or a value, and stating one replaces an inherited other
+        match stated {
+            (Some(_), Some(at)) => return Err(error(at, "a field takes a default or a value, not both")),
+            (Some(_), None) => schema.value = None,
+            (None, Some(_)) => schema.default = None,
+            (None, None) => {}
         }
         if let Some(previous) = &previous {
             narrows(previous, &schema, field.range)?;
@@ -2302,10 +2424,10 @@ impl<'a> Definitions<'a> {
         if resolved.on.is_empty() {
             errors.extend(error(range, "a trait needs at least one `on` relationship"));
         }
-        if let Err(diags) = schema_attrs(head.header.props.as_deref().unwrap_or(&[]), &mut resolved.props) {
+        if let Err(diags) = schema_attrs(head.header.props.as_deref().unwrap_or(&[]), &mut resolved.props, false) {
             errors.extend(diags);
         }
-        if let Err(diags) = schema_attrs(head.body.as_deref().unwrap_or(&[]), &mut resolved.fields) {
+        if let Err(diags) = schema_attrs(head.body.as_deref().unwrap_or(&[]), &mut resolved.fields, true) {
             errors.extend(diags);
         }
         for relationship in &relationships {
@@ -2559,13 +2681,13 @@ impl<'a> Definitions<'a> {
                 false
             });
         }
-        if let Err(diags) = schema_attrs(&props, &mut kind.props) {
+        if let Err(diags) = schema_attrs(&props, &mut kind.props, false) {
             errors.extend(diags);
         }
         let body = head.body.as_deref().unwrap_or(&[]);
         if construct != Construct::Node && !body.is_empty() {
             errors.extend(error(body[0].range, "only node kinds have content fields"));
-        } else if let Err(diags) = schema_attrs(body, &mut kind.fields) {
+        } else if let Err(diags) = schema_attrs(body, &mut kind.fields, true) {
             errors.extend(diags);
         }
         if kind.fields.iter().any(|field| field.name == "props") {

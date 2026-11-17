@@ -870,12 +870,12 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.schemas"),
-        summary: "The braces in a definition head hold property descriptors and its body holds field descriptors, mirroring an instance's properties and content. Only node kinds and traits on node have a body. On an edge kind the header key direction is reserved: it takes directed, undirected or either instead of a descriptor. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. On a node kind the header key open is reserved: it takes a literal boolean instead of a descriptor. A node kind is closed unless open is true, and a kind whose base is closed cannot set it. Each descriptor accepts type, required, default and role. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. role does not install an operation. The input role preserves references to the field and its nested values as runtime reads, even when its authored fallback is constant. Consumers may supply a value at that boundary. Constant folding and branch proofs cannot assume the fallback is the supplied value. Output roles preserve field reference identity without installing evaluation behavior. Other roles remain descriptive metadata. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
+        summary: "The braces in a definition head hold property descriptors and its body holds field descriptors, mirroring an instance's properties and content. Only node kinds and traits on node have a body. On an edge kind the header key direction is reserved: it takes directed, undirected or either instead of a descriptor. Omitting direction inherits the base allowance. Extensions may narrow either but cannot widen or contradict an inherited allowance. On a node kind the header key open is reserved: it takes a literal boolean instead of a descriptor. A node kind is closed unless open is true, and a kind whose base is closed cannot set it. Each descriptor accepts type, required, default and role, and a field descriptor also accepts value. Types are any, string, number, boolean, array and object. Omitted type is any for a new field and inherited for an override. required is a literal boolean. Defaults are constant expressions without instance references or function evaluation. A value is an expression that computes the field for each instance that omits it. It is lowered once for each such instance as if that instance had written it, so self is the instance. It reads self and context only, and a graph name or a pattern in it is an error. It may sample and call functions. An object literal an instance writes over a value that is an object literal is merged with it, one level deep: the value's keys keep their order, a key the instance writes replaces the value's, and the instance's other keys follow. The keys left to the value stay the kind's expressions and the rest are the instance's. Any other written field, including <- and an object with a spread, replaces the value whole. A descriptor takes a default or a value, not both, and a property descriptor takes no value. An error inside a value is reported at the instance, with the kind and the field named. A computed field affects nothing but itself. role does not install an operation. The input role preserves references to the field and its nested values as runtime reads, even when its authored fallback is constant. Consumers may supply a value at that boundary. Constant folding and branch proofs cannot assume the fallback is the supplied value. Output roles preserve field reference identity without installing evaluation behavior. Other roles remain descriptive metadata. Duplicate keys and unknown descriptors are errors. Nested object schemas and collection element schemas are not yet supported.",
     },
     RuleDesc {
         tags: &[],
         id: Id::new("kind.inheritance"),
-        summary: "Extensions inherit properties, fields, requiredness, defaults, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type. Declared properties are strict. Content fields are strict for a closed kind and free for an open one. Described content fields receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive defaults when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value. Extensions inherit context keys. A declaration may narrow an inherited key from any to a specific type and cannot change a concrete type. One kind may both provide and require a key. The key history cannot be declared.",
+        summary: "Extensions inherit properties, fields, requiredness, defaults, values, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults and values. Stating a default replaces an inherited value, and stating a value replaces an inherited default. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type, and a computed value must satisfy it for each instance. Declared properties are strict. Content fields are strict for a closed kind and free for an open one. Described content fields receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive their value or default when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value. Extensions inherit context keys. A declaration may narrow an inherited key from any to a specific type and cannot change a concrete type. One kind may both provide and require a key. The key history cannot be declared.",
     },
     RuleDesc {
         tags: &[],
@@ -890,7 +890,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.inputs"),
-        summary: "A direct node content field with value <- requires upstream data for each occurrence. Lowering preserves an Input with binding identity and the schema type, or any for an undescribed field. Authored expressions may read that input through ordinary references. Runtime data availability is not proven by compilation. Declared inputs suppress schema defaults for that field. Defaults are fallback values for omitted fields, not for undelivered required inputs.",
+        summary: "A direct node content field with value <- requires upstream data for each occurrence. Lowering preserves an Input with binding identity and the schema type, or any for an undescribed field. Authored expressions may read that input through ordinary references. Runtime data availability is not proven by compilation. Declared inputs suppress schema defaults and values for that field. Defaults and values are for omitted fields, not for undelivered required inputs.",
     },
     RuleDesc {
         tags: &[],
@@ -1475,6 +1475,30 @@ const EXAMPLES: &[Example] = &[
     -[:on]->(node)
     -[:provides {tenant: {type: "string", value: self.props.tenant}}]->(context); +(entry:node)-[:has]->(tenant_scoped); (a:entry {tenant: "acme"})-[:next]->(b:node) {tenant: context.tenant};"#,
         valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.computed-field"),
+        summary: "A kind computes a field for its instances",
+        note: "a omits total, so it is computed from a's own fields. b writes total, which replaces the kind's value.",
+        source: r#"+(order:node) {price: {type: "number"}, quantity: {type: "number"}, total: {type: "number", value: self.price * self.quantity}}; (a:order) {price: 4, quantity: 3}; (b:order) {price: 4, quantity: 3, total: 10};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.computed-field-merge"),
+        summary: "An object an instance writes is merged over a computed object",
+        note: "a's size is {width: 9, height: 3, depth: 1}. The kind's keys keep their place, a replaces width and adds depth.",
+        source: r#"+(box:node) {size: {type: "object", value: {width: 2, height: 3}}}; (a:box) {size: {depth: 1, width: 9}};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.computed-field-reads"),
+        summary: "A computed field reads self and context only",
+        note: "A kind does not know the graph it is used in, so the name a is rejected at b, the instance the value is computed for.",
+        source: r#"+(copy:node) {held: {type: "number", value: a.held}}; (a:node) {held: 1}; (b:copy);"#,
+        valid: false,
     },
     Example {
         tags: &[],
