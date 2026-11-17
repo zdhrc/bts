@@ -2083,6 +2083,11 @@ pub(in crate::mocking::code) fn agent(
             ("_num", "as_number"),
             ("_boolean", "as_boolean"),
             ("_integer", "as_integer"),
+            ("_floor", "round_down"),
+            ("_ceil", "round_up"),
+            ("_round", "round_number"),
+            ("_abs", "absolute"),
+            ("_clamp", "clamp"),
         ]
     } else {
         [
@@ -2111,6 +2116,11 @@ pub(in crate::mocking::code) fn agent(
             ("_num", "asNumber"),
             ("_boolean", "asBoolean"),
             ("_integer", "asInteger"),
+            ("_floor", "roundDown"),
+            ("_ceil", "roundUp"),
+            ("_round", "roundNumber"),
+            ("_abs", "absolute"),
+            ("_clamp", "clamp"),
         ]
     };
     // a provider's helpers read by the names the provider gives them

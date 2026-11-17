@@ -1348,13 +1348,11 @@ impl<'a> AgentLowering<'a> {
                 value,
             });
         }
-        let beside = declared.iter().map(|id| format!("binding_{}", id.0)).collect();
         let mut trace = execution::Trace {
             node: Self::id(self.root),
             name: self.name(self.root)?,
             fields,
             bindings,
-            beside,
             children,
         };
         for binding in &mut trace.bindings {

@@ -2611,7 +2611,6 @@ pub(super) fn plan_case_data(
             ..Default::default()
         },
         bindings: Vec::new(),
-        beside: Vec::new(),
         children: Vec::new(),
     };
     ctx.instantiate_trace(&case, &model.bindings)?;

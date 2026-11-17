@@ -1232,7 +1232,7 @@ mod execution {
             Ok(())
         }
         collect(&trace.children, trace.node, &mut parents, &mut bindings)?;
-        let mut used: HashSet<String> = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval item_at trim_text format_value duration_seconds checked_number validate_input count_tokens as_list new_uuid sample_range step_history fold_items agent_result slice_items length_of as_count values_equal calculate require_arrivals group_arrivals select_option weighted_option as_number as_boolean as_integer itemAt trimText formatValue durationSeconds checkedNumber validateInput countTokens asList newUuid sampleRange stepHistory foldItems agentResult sliceItems lengthOf asCount valuesEqual requireArrivals groupArrivals selectOption weightedOption asNumber asBoolean asInteger remainder divide parse_input parseInput".split_whitespace().map(str::to_owned).collect();
+        let mut used: HashSet<String> = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval item_at trim_text format_value duration_seconds checked_number validate_input count_tokens as_list new_uuid sample_range step_history fold_items agent_result slice_items length_of as_count values_equal calculate require_arrivals group_arrivals select_option weighted_option as_number as_boolean as_integer itemAt trimText formatValue durationSeconds checkedNumber validateInput countTokens asList newUuid sampleRange stepHistory foldItems agentResult sliceItems lengthOf asCount valuesEqual requireArrivals groupArrivals selectOption weightedOption asNumber asBoolean asInteger remainder divide parse_input parseInput round_down round_up round_number absolute clamp roundDown roundUp roundNumber seed seeded".split_whitespace().map(str::to_owned).collect();
         let reserved = used.clone();
         let names = collect_names(&trace.children, lang, &mut used);
         // values that took a number only because another scope already used their name
@@ -1431,8 +1431,7 @@ mod execution {
         }
         let mut functions = vec![function, details, run, traced];
         let contracts = if direct_ctx.direct && matches!(functions[0].body.get(1), Some(Statement::TraceScope { .. })) {
-            // values built beside the agent read one another, so each follows its reader into place
-            match native::functions(&mut functions, lang, &numbered, &helpers, !trace.beside.is_empty()) {
+            match native::functions(&mut functions, lang, &numbered, &helpers) {
                 Some(contracts) => contracts,
                 None => return emit_form(model, trace, output, lang, false, unsupported),
             }
@@ -2130,7 +2129,6 @@ mod native {
         lang: ScorerLang,
         numbered: &[(String, String)],
         helpers: &[crate::mocking::Helper],
-        chained: bool,
     ) -> Option<Vec<(String, Json)>> {
         let counts: Counts = std::rc::Rc::new(Results {
             counts: (helpers.iter())
@@ -2220,26 +2218,26 @@ mod native {
         }
         // Bind a deferred value in its sole consumer when that consumer is invoked
         // exactly once. Evaluation remains deferred until the original first read.
-        // In a chain of values, one read only by a value that moved follows it, until nothing moves.
-        fn localize(body: &mut Vec<Statement>, chained: bool) {
-            while localize_once(body, chained) && chained {}
+        // A value read only by one that moved follows it, so this runs until nothing moves.
+        fn localize(body: &mut Vec<Statement>) {
+            while localize_once(body) {}
             for statement in body {
                 match statement {
-                    Statement::Function(f) => localize(&mut f.body, chained),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => localize(body, chained),
+                    Statement::Function(f) => localize(&mut f.body),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => localize(body),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        localize(then_body, chained);
-                        localize(else_body, chained);
+                        localize(then_body);
+                        localize(else_body);
                     }
                     _ => {}
                 }
             }
         }
-        fn localize_once(body: &mut Vec<Statement>, chained: bool) -> bool {
+        fn localize_once(body: &mut Vec<Statement>) -> bool {
             let mut moved = false;
-            // values in a chain keep the order they were declared in, and those moved later are read by those moved before
+            // moved values keep the order they were declared in, and those moved later are read by those moved before
             let mut placed: HashMap<String, usize> = HashMap::new();
             let candidates: Vec<_> = body
                 .iter()
@@ -2293,7 +2291,7 @@ mod native {
                 if let Statement::Function(f) = &mut body[index]
                     && let Statement::TraceScope { body, .. } = &mut f.body[1]
                 {
-                    body.insert(if chained { *place } else { 0 }, declaration);
+                    body.insert(*place, declaration);
                     *place += 1;
                 }
                 body.retain(|s| !matches!(s, Statement::Variable(Variable::Declare { name: n, .. }) if n == &name));
@@ -2353,7 +2351,7 @@ mod native {
             }
         }
         for function in functions.iter_mut() {
-            localize(&mut function.body, chained);
+            localize(&mut function.body);
         }
         fn exported_fields(body: &[Statement], ancestors: &[String], exports: &mut HashMap<String, Vec<String>>) {
             for statement in body {
@@ -2459,7 +2457,7 @@ mod native {
             });
         }
         observe(functions, lang);
-        eager_values(functions, &types.borrow(), &counts, lang, chained);
+        eager_values(functions, &types.borrow(), &counts, lang);
         pure_functions(functions);
         hoist(functions, lang);
         let mut contracts = Vec::new();
@@ -2961,13 +2959,7 @@ mod native {
         }
     }
 
-    fn eager_values(
-        functions: &mut [code::Function],
-        types: &HashMap<String, Type>,
-        counts: &Counts,
-        lang: ScorerLang,
-        chained: bool,
-    ) {
+    fn eager_values(functions: &mut [code::Function], types: &HashMap<String, Type>, counts: &Counts, lang: ScorerLang) {
         fn total(value: &Expr, env: &Environment, lang: ScorerLang) -> bool {
             match value {
                 Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
@@ -2995,18 +2987,18 @@ mod native {
                 _ => false,
             }
         }
-        fn visit(body: &mut Vec<Statement>, env: &Environment, lang: ScorerLang, chained: bool) {
-            // in a chain of values, one whose first reader was itself deferred can be computed once that reader is
-            while visit_once(body, env, lang) && chained {}
+        fn visit(body: &mut Vec<Statement>, env: &Environment, lang: ScorerLang) {
+            // a value whose first reader was itself deferred can be computed once that reader is
+            while visit_once(body, env, lang) {}
             for statement in body {
                 match statement {
-                    Statement::Function(f) => visit(&mut f.body, env, lang, chained),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => visit(body, env, lang, chained),
+                    Statement::Function(f) => visit(&mut f.body, env, lang),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => visit(body, env, lang),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        visit(then_body, env, lang, chained);
-                        visit(else_body, env, lang, chained);
+                        visit(then_body, env, lang);
+                        visit(else_body, env, lang);
                     }
                     _ => {}
                 }
@@ -3117,7 +3109,7 @@ mod native {
             ..Environment::default()
         };
         for function in functions {
-            visit(&mut function.body, &env, lang, chained);
+            visit(&mut function.body, &env, lang);
         }
     }
 
