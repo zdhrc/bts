@@ -75,11 +75,11 @@ fn the_world_provider_walks_its_own_elements_and_conforms() {
     let agent = braintrust::Bundle.elements(&model);
     assert!(walked.iter().all(|element| !agent.contains(element)));
     assert_eq!(SELECTED.elements(&model).len(), walked.len() + agent.len());
-    // it supplies the steps of the walk, and hides the steps a walk may not visit
+    // it supplies the steps of the walk
     let supplied = world::Bundle.supply(&model).unwrap();
-    assert_eq!(supplied.context.len(), 1);
-    assert_eq!(supplied.context[0].key, "steps");
-    assert_eq!(supplied.hidden.len(), 5);
+    let keys: Vec<_> = supplied.context.iter().map(|supply| supply.key).collect();
+    // with its steps a walk is told that no speaker leads to it and that no relation joins it
+    assert_eq!(keys, ["steps", "speaker", "spoken", "related", "styled"]);
 }
 
 #[test]
@@ -336,6 +336,200 @@ fn a_walk_says_what_it_is_drawn_for() {
 }
 
 #[test]
+fn a_walk_is_a_step_of_another_walk() {
+    // one policy of the list varies, and it is read by name and through the list alike
+    let world = r#"(policies:list)
+    -[:next]->(fee:sentence)
+        -[:next]->(:part {subject: "a same-day change", verb: "cost"})
+        =[:weighted]=>[
+            -[:next {weight: 1}]->(:part {complement: "75 USD"}),
+            -[:next {weight: 1}]->(:part {complement: "50 USD"}),
+        ]
+    -[:next]->(window:policy {subject: "the change window", verb: "close", complement: "at noon"});"#;
+    let said = outputs(
+        &shape(
+            world,
+            "{fee: fee.text, clause: fee.sentence, all: policies.text, items: policies.items}",
+        ),
+        0..24,
+    );
+    let fees: BTreeSet<_> = said.iter().map(|trace| trace["fee"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(
+        fees.into_iter().collect::<Vec<_>>(),
+        ["A same-day change costs 50 USD.", "A same-day change costs 75 USD."]
+    );
+    for trace in &said {
+        let fee = trace["fee"].as_str().unwrap();
+        assert_eq!(trace["all"], format!("{fee} The change window closes at noon."));
+        assert_eq!(trace["items"], json!([fee, "The change window closes at noon."]));
+        assert!(fee.contains(trace["clause"]["clause"]["predicate"]["complement"].as_str().unwrap()));
+    }
+}
+
+#[test]
+fn a_fact_has_a_value_and_an_entity_has_attributes() {
+    let world = r#"(fare:fact)
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:given {is: 1240.5}),
+        -[:next {weight: 1}]->(:given {is: 980}),
+    ];
+(flight:entity)
+    -[:next]->(:given {is: {date: "2026-11-20"}})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:given {is: {departs: "17:30"}}),
+        -[:next {weight: 1}]->(:given {is: {departs: "19:05"}}),
+    ];
+(traveler:entity)
+    -[:next]->(:given {is: {name: a.input}});
+(holds:relation);
+(holds)-[:incidence]-(traveler);
+(holds)-[:incidence]-(flight);"#;
+    let read = "{fare: fare.value, flight: flight.attributes, departs: flight.attributes.departs, holds: traveler.related.holds, held_by: flight.related.holds, who: traveler.attributes}";
+    let said = outputs(&shape(world, read), 0..24);
+    let distinct = |key: &str| said.iter().map(|trace| trace[key].to_string()).collect::<BTreeSet<_>>();
+    assert_eq!(distinct("fare"), BTreeSet::from(["1240.5".to_owned(), "980".to_owned()]));
+    assert_eq!(distinct("departs").len(), 2);
+    for trace in &said {
+        // what never changes is there with what was drawn, and everyone who reads the flight reads the same one
+        assert_eq!(trace["flight"]["date"], "2026-11-20");
+        assert_eq!(trace["flight"]["departs"], trace["departs"]);
+        assert_eq!(trace["holds"], json!([trace["flight"]]));
+        // a world reads the agent's input, and a relation is read from both of its ends
+        assert_eq!(trace["who"], json!({"name": "hi"}));
+        assert_eq!(trace["held_by"], json!([{"name": "hi"}]));
+    }
+    // an entity that is part of no relation is related to nothing
+    assert_eq!(
+        outputs(
+            &shape("(alone:entity)-[:next]->(:given {is: {a: 1}});", "alone.related"),
+            1..2
+        ),
+        [json!({})]
+    );
+    // the world a caller meets depends on the input
+    let world = r#"(perk:fact)
+    =[:exclusive]=>[
+        -[:next {when: a.input == "gold"}]->(:given {is: "lounge access"}),
+        -[:next {when: a.input != "gold"}]->(:given {is: "a seat"}),
+    ];"#;
+    assert_eq!(outputs(&shape(world, "perk.value"), 1..2), [json!("a seat")]);
+    assert_eq!(
+        outputs(&shape(world, "perk.value").replace("input: \"hi\"", "input: \"gold\""), 1..2),
+        [json!("lounge access")]
+    );
+}
+
+#[test]
+fn relations_have_a_direction_and_a_setting_gathers_walks() {
+    let world = r#"(traveler:entity)-[:next]->(:given {is: {name: "Maya"}});
+(booking:entity)-[:next]->(:given {is: {code: "AB42"}});
+(spare:entity)-[:next]->(:given {is: {code: "ZZ99"}});
+(friend:entity)-[:next]->(:given {is: {name: "Sam"}});
+(holds:relation);
+(holds)-[:incidence {role: "input"}]-(traveler);
+(holds)-[:incidence {role: "output"}]-(booking);
+(holds)-[:incidence {role: "output"}]-(spare);
+(knows:relation);
+(knows)-[:incidence]-(traveler);
+(knows)-[:incidence]-(friend);
+(trip:setting {nodes: [|(traveler), (booking)|], edges: [||]});"#;
+    let read = "{has: traveler.related, held: booking.related.holds, spare: spare.related.holds, friend: friend.related, trip: trip.members}";
+    let output = outputs(&shape(world, read), 1..2).remove(0);
+    // an input reads the outputs and an output reads the inputs, never its own side
+    assert_eq!(output["has"]["holds"], json!([{"code": "AB42"}, {"code": "ZZ99"}]));
+    assert_eq!(output["held"], json!([{"name": "Maya"}]));
+    assert_eq!(output["spare"], json!([{"name": "Maya"}]));
+    // members of a relation with no direction read each other
+    assert_eq!(output["has"]["knows"], json!([{"name": "Sam"}]));
+    assert_eq!(output["friend"], json!({"knows": [{"name": "Maya"}]}));
+    // a setting holds what each walk it gathers gives, by name
+    assert_eq!(
+        output["trip"],
+        json!({"traveler": {"name": "Maya"}, "booking": {"code": "AB42"}})
+    );
+}
+
+#[test]
+fn a_world_reads_what_the_agent_was_given_and_what_its_steps_return() {
+    let source = r#"(receipt:entity)
+    -[:next]->(:given {is: {charged: charge.output.amount, to: desk.input.name}});
+(note:sentence)
+    -[:next]->(:part {subject: "the charge", verb: "be", complement: charge.output.status});
+(desk:agent) {input: {name: "Maya"}, output: done.output};
+(desk)-[:next]->(t:task {name: "t"}) {input: desk.input, output: done.output};
+(t)-[:calls]->(charge:tool {name: "charge"}) {input: t.input, output: {amount: range(10, 20), status: choice("settled", "pending")}}
+    -[:next]->(done:task {name: "done"}) {input: charge.output, output: {receipt: receipt.attributes, note: note.text, amount: charge.output.amount, status: charge.output.status}};
+"#;
+    for output in outputs(source, 0..12) {
+        // the world quotes the one charge the step made, whatever it drew
+        assert_eq!(output["receipt"], json!({"charged": output["amount"], "to": "Maya"}));
+        assert_eq!(
+            output["note"],
+            format!("The charge is {}.", output["status"].as_str().unwrap())
+        );
+    }
+    // a step's own fields are read by name whether or not the walk visits the step
+    let world = r#"(w:list)
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(p:policy {subject: "a", verb: "be"}),
+        -[:next {weight: 1}]->(q:policy {subject: "b", verb: "be"}),
+    ];"#;
+    for output in outputs(&shape(world, "{p: p.text, q: q.text, built: w.items}"), 0..8) {
+        assert_eq!(output["p"], "A is.");
+        assert_eq!(output["q"], "b is.");
+        assert!(
+            output["built"] == json!(["A is."]) || output["built"] == json!(["b is."]),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn a_repeat_fork_walks_its_branches_once_for_each_round() {
+    let world = r#"(reasons:list)
+    -[:next]->(:policy {subject: "the desk", verb: "open"})
+    =[:repeat {count: 3}]=>[
+        -[:next]->(reason:choice),
+    ];
+(reason)
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "leave", complement: "late"}),
+        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "close", complement: "early"}),
+        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "change"}),
+    ];"#;
+    let said = outputs(&shape(world, "reasons.items"), 0..24);
+    let mut mixed = false;
+    for items in &said {
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0], "The desk opens.");
+        mixed |= items[1] != items[2] || items[2] != items[3];
+    }
+    // each round draws for itself, so the three are not always the same
+    assert!(mixed);
+    assert_eq!(said, outputs(&shape(world, "reasons.items"), 0..24));
+    // no rounds give nothing
+    let none = world.replace("count: 3", "count: 0");
+    assert_eq!(outputs(&shape(&none, "reasons.items"), 1..2), [json!(["The desk opens."])]);
+}
+
+#[test]
+fn a_persona_says_its_sentences_its_own_way() {
+    let world = r#"(maya:persona {style: "text_message"})
+    -[:next]->(ask:sentence)
+        -[:next]->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});
+(plain:sentence)
+    -[:next]->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});"#;
+    let output = outputs(&shape(world, "{ask: ask.text, said: maya.said, plain: plain.text}"), 1..2).remove(0);
+    assert_eq!(output["plain"], "Can I change my flight?");
+    assert_eq!(output["ask"], "can i change my flight?");
+    assert_eq!(output["said"], json!(["can i change my flight?"]));
+    // the sentence as its grammar reads is still there
+    let output = outputs(&shape(world, "[|ask.plain, ask.text|]"), 1..2).remove(0);
+    assert_eq!(output, json!(["Can I change my flight?", "can i change my flight?"]));
+}
+
+#[test]
 fn a_conversation_is_several_traces_that_belong_together() {
     // three traces in a row are one conversation, and the traveler keeps one mood through it
     let world = r#"(chat:conversation {turns: 3});
@@ -511,9 +705,23 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
             "a walk follows `next` edges, not `calls`",
         ),
         (
-            "(w:list)-[:next]->(s:sentence)-[:next]->(:part {subject: \"a\", verb: \"be\"});".to_owned(),
+            "(w:list)-[:next]->(s:list)-[:next]->(w);".to_owned(),
             "w.text",
-            "a walk cannot be a step of another walk yet",
+            "this walk is a step of a walk that is a step of it, and a walk cannot build itself",
+        ),
+        (
+            format!(
+                "(w:list)\n    =[:repeat {{count: other.value}}]=>[\n        -[:next]->{policy},\n    ];\n(other:fact)-[:next]->(:given {{is: 2}});"
+            ),
+            "w.text",
+            "a repeat fork in a walk is written with a whole count from 0 to 64",
+        ),
+        (
+            format!(
+                "(w:entity)-[:next]->(:given {{is: {{a: 1}}}});\n(r:relation);\n(r)-[:incidence]-(w);\n(r)-[:incidence]-{policy};"
+            ),
+            "w.related",
+            "a relation in a world joins walks, and this is not one",
         ),
         (
             "(w:list)-[:next]->(p:vars) {x: 1};".to_owned(),
@@ -535,13 +743,16 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
             "w.text",
             "a weighted fork in a walk chooses by weight alone",
         ),
-        // a step behind a fork may not be visited, so nothing outside reads what it computes
+        // one walk is built once, so it cannot be what a repeat repeats
         (
-            format!(
-                "(w:list)\n    =[:weighted]=>[\n        -[:next {{weight: 1}}]->{policy},\n        -[:next {{weight: 1}}]->(q:policy {{subject: \"b\", verb: \"be\"}}),\n    ];"
-            ),
-            "p.text",
-            "`p` is behind a fork, so a walk may not visit it. Read `w`, the walk it belongs to",
+            "(w:list)\n    =[:repeat {count: 2}]=>[\n        -[:next]->(s:sentence),\n    ];\n(s)-[:next]->(:part {subject: \"a\", verb: \"be\"});".to_owned(),
+            "w.text",
+            "a walk inside a repeat is built once, so every round would give the same. Repeat a `choice` with a fork under it",
+        ),
+        (
+            "(w:entity)-[:next]->(:given {is: {a: 1}});\n(all:setting {nodes: [|(w), (p)|], edges: [||]});\n(p:vars) {x: 1};".to_owned(),
+            "all.members",
+            "a network in a world gathers named walks, and this is not one",
         ),
         // the steps of a walk are not a key an agent's step can read
         (

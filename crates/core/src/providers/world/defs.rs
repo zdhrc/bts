@@ -50,8 +50,58 @@ pub const SOURCE: Source<'static> = Source {
 # the provider visits what leaves each node in the order written, and takes one branch at each fork
 # steps is what each visited step gives, in order
 # per says what the walk is drawn for: traces that give the same value see the same walk, and left out it is the trace
+# speaker is who says the walk and spoken says whether a speaker leads to it, and related is what relations join it to
+# a walk that is a step of another gives that walk what its own gives says
 +(walk:node {per: {type: "any", default: null}})
-    -[:requires {steps: {type: "array"}, trace_index: {type: "number"}}]->(context);
+    -[:requires {
+        steps: {type: "array"},
+        trace_index: {type: "number"},
+        speaker: {type: "any"},
+        spoken: {type: "boolean"},
+        styled: {type: "any"},
+        related: {type: "object"},
+    }]->(context);
+
+# a given is a value written down, for a walk to take as it is
++(given:node {is: {type: "any", required: true}}) {
+    gives: {type: "any", value: self.props.is},
+};
+
+# a choice gives nothing itself, so it is a place to hang a fork, such as inside a repeat
++(choice:node) {
+    gives: {type: "any", value: null},
+};
+
+# a fact is one value in the world, the first its walk gives, so a fork under it makes it vary
++(fact:node) {
+    value: {type: "any", value: context.steps[0]},
+    gives: {type: "any", value: self.value},
+}
+    -[:extends]->(walk);
+
+# an entity is something in the world with attributes, which its steps add up to
+# related holds, for each relation the entity is part of, the attributes of the others in it
++(entity:node) {
+    attributes: {type: "object", value: merge({}, context.steps)},
+    related: {type: "object", value: context.related},
+    gives: {type: "object", value: self.attributes},
+}
+    -[:extends]->(walk);
+
+# a setting gathers walks under one name, listed in nodes, and members holds what each of them gives
++(setting:node) {
+    members: {type: "object", value: context.members},
+}
+    -[:extends]->(network)
+    -[:requires {members: {type: "object"}}]->(context);
+
+# a persona is someone in the world, and the sentences under it are said their way
++(persona:node) {
+    said: {type: "array", value: context.steps},
+    gives: {type: "array", value: self.said},
+}
+    -[:extends]->(walk)
+    -[:has]->(speaker);
 
 # a conversation is several traces in a row that belong together, and it stands beside an agent
 # turns is how many traces one conversation has, and with up_to each conversation runs for turns to up_to of them
@@ -113,7 +163,10 @@ pub const SOURCE: Source<'static> = Source {
         tense: self.grammar.tense,
         form: self.grammar.form,
     }}},
-    text: {type: "string", value: realize(self.sentence)},
+    # plain is the sentence as its grammar reads, and text is that or the way of the speaker that leads to it
+    plain: {type: "string", value: realize(self.sentence)},
+    text: {type: "string", value: context.spoken ? context.styled : self.plain},
+    gives: {type: "string", value: self.text},
 }
     -[:extends]->(walk);
 
@@ -121,6 +174,7 @@ pub const SOURCE: Source<'static> = Source {
 +(list:node) {
     items: {type: "array", value: context.steps},
     text: {type: "string", value: compose(context.steps)},
+    gives: {type: "string", value: self.text},
 }
     -[:extends]->(walk);
 "#,

@@ -168,6 +168,8 @@ pub struct Helper {
     pub counts: bool,
     /// Whether the result is text, which typed code can rely on.
     pub texts: bool,
+    /// Whether the result is plain data, which typed code can use as it is.
+    pub plain: bool,
     /// The definition of the function, starting on a new line.
     ///
     /// It is empty when the definition is part of a runtime the helper names.

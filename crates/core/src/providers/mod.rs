@@ -68,8 +68,6 @@ pub struct Supplied {
     pub elements: Vec<ElementId>,
     /// The value of a context key on a node the contributor walks.
     pub context: Vec<Supply>,
-    /// Nodes the contributor walks whose fields nothing outside may read, each with the reason.
-    pub hidden: Vec<(NodeId, String)>,
 }
 
 /// The value a contributor gives one context key on one node.
@@ -96,17 +94,9 @@ impl Supplied {
             .map(|supply| &supply.value)
     }
 
-    /// Why nothing outside may read a node's fields, when that is so.
-    pub fn hidden(&self, node: NodeId) -> Option<&str> {
-        (self.hidden.iter())
-            .find(|(hidden, _)| *hidden == node)
-            .map(|(_, why)| why.as_str())
-    }
-
     fn extend(&mut self, other: Supplied) {
         self.elements.extend(other.elements);
         self.context.extend(other.context);
-        self.hidden.extend(other.hidden);
     }
 }
 

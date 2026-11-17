@@ -1,10 +1,13 @@
+# a session is two traces in a row that carry one identifier: the window that opens it, then a later one
+(session:conversation {turns: 2});
+
 # a selected window carries its own question, answer and prior context
 (copilot:agent) {input: null, output: request.output};
 (copilot)-[:next]->(request:task {name: "copilot-window"}) {
     input: copilot.input,
-    local: {position: range(0, 1)},
+    local: {position: session.turn},
     output: self.local.position == 0 ? opening.output : later.output,
-    metadata: {session_id: format("sess_{}", hex(10)), window: self.local.position == 0 ? 0 : 3},
+    metadata: {session_id: format("sess_{}", session.id), window: self.local.position == 0 ? 0 : 3},
     tags: [|"copilot"|],
 };
 (request)

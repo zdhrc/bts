@@ -36,6 +36,20 @@ pub const STEPS: &str = "steps";
 pub const GIVES: &str = "gives";
 /// The property that says what a walk is drawn for, in place of the trace.
 pub const PER: &str = "per";
+/// The context key a walk reads who says it through.
+pub const SPEAKER: &str = "speaker";
+/// The context key that says whether a speaker leads to a walk.
+pub const SPOKEN: &str = "spoken";
+/// The context key a sentence reads its styled text through, when a speaker leads to it.
+pub const STYLED: &str = "styled";
+/// The internal function that says a sentence a speaker's way.
+pub const SAY: &str = "world.say";
+/// The internal function that gives the draws a styled sentence is said by.
+pub const DRAWS: &str = "world.draws";
+/// The context key a network reads what its walks give through.
+pub const MEMBERS: &str = "members";
+/// The context key a walk reads what it is related to through.
+pub const RELATED: &str = "related";
 /// The internal function a weighted fork lowers to. No author can write the name.
 pub const PICK: &str = "world.pick";
 /// The kind of several traces in a row that belong together.
@@ -103,7 +117,9 @@ pub fn checked(model: &Model) -> Vec<ElementId> {
         .filter(|element| match element {
             ElementId::Node(node) => {
                 let kind = &model.nodes[node.0].kind;
-                model.derives(kind, WALK) || model.derives(kind, CONVERSATION)
+                model.derives(kind, WALK)
+                    || model.derives(kind, CONVERSATION)
+                    || matches!(model.nodes[node.0].primitive, Primitive::Relation | Primitive::Network)
             }
             _ => true,
         })
@@ -136,6 +152,15 @@ pub fn elements(model: &Model) -> Vec<ElementId> {
             }
         }
     }
+    for network in &model.networks {
+        if (network.nodes.iter()).any(|member| model.derives(&model.nodes[member.0].kind, WALK)) {
+            elements.insert(ElementId::Node(network.node));
+        }
+    }
+    for (relation, joined) in relations(model) {
+        elements.insert(ElementId::Node(relation));
+        elements.extend(joined.into_iter().map(|(edge, _)| ElementId::Edge(edge)));
+    }
     for (index, junction) in model.junctions.iter().enumerate() {
         let joins = nodes.contains(&junction.target)
             || (junction.inputs.iter()).any(|input| nodes.contains(&model.edges[input.0].source));
@@ -156,6 +181,7 @@ fn fail(range: SrcRange, what: impl Into<String>) -> Diag {
 
 struct Walker<'a> {
     model: &'a Model,
+    root: NodeId,
     name: String,
     // what the walk is drawn for, when it says
     per: Option<Graph>,
@@ -163,10 +189,10 @@ struct Walker<'a> {
     path: Vec<NodeId>,
     // each fork's place in the walk, so a fork reached along two paths draws once
     forks: Vec<ForkId>,
-    // how many forks enclose the step being visited
-    depth: usize,
-    visited: BTreeSet<NodeId>,
-    always: BTreeSet<NodeId>,
+    // the round of each repeat fork being walked, outermost first
+    rounds: Vec<usize>,
+    // the walks that are steps of this one
+    inner: Vec<NodeId>,
 }
 
 impl Walker<'_> {
@@ -185,12 +211,6 @@ impl Walker<'_> {
     // what a step gives, without the keys it was not written with
     fn gives(&self, step: NodeId) -> Result<Graph, Diag> {
         let node = &self.model.nodes[step.0];
-        if self.model.derives(&node.kind, WALK) {
-            return Err(fail(
-                node.range,
-                "a walk cannot be a step of another walk yet, give it steps of its own beside this one",
-            ));
-        }
         let binding = (node.fields.iter())
             .map(|id| &self.model.bindings[id.0])
             .find(|binding| binding.path == [GIVES])
@@ -220,7 +240,7 @@ impl Walker<'_> {
         if edge.direction != Direction::Directed {
             return Err(fail(edge.range, "a walk follows directed edges"));
         }
-        if edge.cycle || self.path.contains(&edge.target) {
+        if edge.cycle || self.path.contains(&edge.target) || self.root == edge.target {
             return Err(fail(edge.range, "a walk cannot return to a step it has visited yet"));
         }
         if edge.fork.is_none()
@@ -232,12 +252,24 @@ impl Walker<'_> {
             ));
         }
         let target = edge.target;
-        let mut steps = vec![ArrayElem::Item(self.gives(target)?)];
-        self.visited.insert(target);
-        if self.depth == 0 {
-            self.always.insert(target);
+        // a step that gives null adds nothing, which is how a step holds a fork and no value
+        let mut steps = match self.gives(target)? {
+            Graph::Null => vec![],
+            gives => vec![ArrayElem::Item(gives)],
+        };
+        // a walk that is a step gives what it built, and what it leads to builds it, not this walk
+        if self.model.derives(&self.model.nodes[target.0].kind, WALK) {
+            // one walk is built once, so inside a repeat every round would give the same thing
+            if !self.rounds.is_empty() {
+                return Err(fail(
+                    self.model.nodes[target.0].range,
+                    "a walk inside a repeat is built once, so every round would give the same. Repeat a `choice` with a fork under it",
+                ));
+            }
+            self.inner.push(target);
+        } else {
+            steps.extend(self.leads(target)?);
         }
-        steps.extend(self.leads(target)?);
         Ok(steps)
     }
 
@@ -261,9 +293,48 @@ impl Walker<'_> {
         Ok(steps)
     }
 
+    // the rounds a fork sits in, so each round draws for itself
+    fn round(&self) -> String {
+        self.rounds.iter().map(|round| format!("#{round}")).collect()
+    }
+
+    // every branch of a repeat fork, walked once for each round
+    fn repeat(&mut self, id: ForkId) -> Result<Graph, Diag> {
+        let fork = &self.model.forks[id.0];
+        let mut count = None;
+        for prop in &fork.props {
+            let binding = &self.model.bindings[prop.0];
+            match (binding.path[0].as_str(), self.resolved(&binding.value)) {
+                ("count", Graph::Num(bts_lang::Number::Int(rounds))) if (0..=64).contains(rounds) => {
+                    count = Some(*rounds as usize);
+                }
+                ("count", _) => {
+                    return Err(fail(
+                        binding.range,
+                        "a repeat fork in a walk is written with a whole count from 0 to 64",
+                    ));
+                }
+                _ => return Err(fail(binding.range, "a repeat fork in a walk takes a count and nothing else")),
+            }
+        }
+        let count = count.ok_or_else(|| fail(fork.range, "a repeat fork needs a count"))?;
+        let mut steps = Vec::new();
+        for round in 0..count {
+            self.rounds.push(round);
+            for edge in fork.branches.iter().flatten() {
+                steps.extend(self.step(*edge)?);
+            }
+            self.rounds.pop();
+        }
+        Ok(Graph::Array(Array { elem: steps }))
+    }
+
     // the steps of whichever branch the fork takes
     fn fork(&mut self, id: ForkId) -> Result<Graph, Diag> {
         let fork = &self.model.forks[id.0];
+        if fork.primitive == Primitive::Repeat {
+            return self.repeat(id);
+        }
         if let Some(prop) = fork.props.first() {
             return Err(fail(
                 self.model.bindings[prop.0].range,
@@ -277,7 +348,6 @@ impl Walker<'_> {
                 self.forks.len() - 1
             }
         };
-        self.depth += 1;
         let mut branches = Vec::new();
         for branch in &fork.branches {
             let mut steps = Vec::new();
@@ -287,7 +357,6 @@ impl Walker<'_> {
             let first = *branch.first().ok_or_else(|| fail(fork.range, "a branch needs a step"))?;
             branches.push((first, Graph::Array(Array { elem: steps })));
         }
-        self.depth -= 1;
         let value = |binding: BindingId| self.model.bindings[binding.0].value.clone();
         match fork.primitive {
             Primitive::Weighted => {
@@ -306,7 +375,7 @@ impl Walker<'_> {
                 }
                 let options = branches.into_iter().map(|(_, steps)| ArrayElem::Item(steps)).collect();
                 let mut args = vec![
-                    Graph::Str(format!("{}.{}", self.name, place + 1)),
+                    Graph::Str(format!("{}.{}{}", self.name, place + 1, self.round())),
                     Graph::Array(Array { elem: weights }),
                     Graph::Array(Array { elem: options }),
                 ];
@@ -347,10 +416,94 @@ impl Walker<'_> {
     }
 }
 
+// the relation nodes that join walks, each with the walks it joins
+// the role an incidence edge gives its participant: member, input or output
+fn role(model: &Model, edge: EdgeId) -> &str {
+    (model.edges[edge.0].props.iter())
+        .map(|id| &model.bindings[id.0])
+        .find(|binding| binding.path == ["role"])
+        .and_then(|binding| match &binding.value {
+            Graph::Str(role) => Some(role.as_str()),
+            _ => None,
+        })
+        .unwrap_or("member")
+}
+
+fn relations(model: &Model) -> Vec<(NodeId, Vec<(EdgeId, NodeId)>)> {
+    let mut found = Vec::new();
+    for (index, node) in model.nodes.iter().enumerate() {
+        if node.primitive != Primitive::Relation {
+            continue;
+        }
+        let relation = NodeId(index);
+        let joined: Vec<_> = (model.edges.iter().enumerate())
+            .filter(|(_, edge)| edge.primitive == Primitive::Incidence)
+            .filter_map(|(edge, joins)| match (joins.source == relation, joins.target == relation) {
+                (true, false) => Some((EdgeId(edge), joins.target)),
+                (false, true) => Some((EdgeId(edge), joins.source)),
+                _ => None,
+            })
+            .collect();
+        if joined
+            .iter()
+            .any(|(_, other)| model.derives(&model.nodes[other.0].kind, WALK))
+        {
+            found.push((relation, joined));
+        }
+    }
+    found
+}
+
+// what a walk is related to: for each relation it is part of, what the other walks in it give
+fn related(model: &Model, walk: NodeId) -> Result<Graph, Diag> {
+    let mut elem = Vec::new();
+    for (relation, joined) in relations(model) {
+        if !joined.iter().any(|(_, other)| *other == walk) {
+            continue;
+        }
+        let node = &model.nodes[relation.0];
+        let mut others = Vec::new();
+        // in a relation with a direction an input reads the outputs and an output reads the inputs
+        let own: Vec<_> = (joined.iter())
+            .filter(|(_, other)| *other == walk)
+            .map(|(edge, _)| role(model, *edge))
+            .collect();
+        let read = |edge: EdgeId| match role(model, edge) {
+            "input" => own.contains(&"output"),
+            "output" => own.contains(&"input"),
+            _ => own.contains(&"member"),
+        };
+        for (edge, other) in joined.iter().filter(|(edge, other)| *other != walk && read(*edge)) {
+            let gives = (model.bindings.iter())
+                .position(|binding| binding.owner == ElementId::Node(*other) && !binding.property && binding.path == [GIVES])
+                .filter(|_| model.derives(&model.nodes[other.0].kind, WALK))
+                .ok_or_else(|| {
+                    fail(
+                        model.edges[edge.0].range,
+                        "a relation in a world joins walks, and this is not one",
+                    )
+                })?;
+            others.push(ArrayElem::Item(Graph::BindingRef(BindingId(gives), node.range)));
+        }
+        let key = node.name.clone().unwrap_or_else(|| node.kind.clone());
+        if elem.iter().any(|field: &bts_lang::ObjectField| field.key == key) {
+            return Err(fail(
+                node.range,
+                format!("two relations of one walk are both known as `{key}`, name them apart"),
+            ));
+        }
+        elem.push(bts_lang::ObjectField {
+            key,
+            value: Graph::Array(Array { elem: others }),
+        });
+    }
+    Ok(Graph::Object(Object { elem }))
+}
+
 /// Turns every walk in a model into the value of its `steps`.
 ///
-/// A step that some walk always visits can be read by name from outside. A step
-/// that sits behind a fork in every walk that reaches it is hidden, with the reason.
+/// A step's own fields do not depend on the walk, so they are read by name whether or
+/// not a walk visits the step. What was built is read from the walk.
 pub fn supply(model: &Model) -> Result<Supplied, Diag> {
     let mut supplied = Supplied {
         elements: elements(model),
@@ -420,8 +573,7 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
             },
         });
     }
-    let mut always = BTreeSet::new();
-    let mut behind: BTreeMap<NodeId, String> = BTreeMap::new();
+    let mut within: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
     for root in roots(model) {
         let node = &model.nodes[root.0];
         let name = node.name.clone().unwrap_or_else(|| format!("walk{}", root.0));
@@ -432,13 +584,13 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
             .filter(|value| !matches!(value, Graph::Null));
         let mut walker = Walker {
             model,
+            root,
             name: name.clone(),
             per,
             path: Vec::new(),
             forks: Vec::new(),
-            depth: 0,
-            visited: BTreeSet::new(),
-            always: BTreeSet::new(),
+            rounds: Vec::new(),
+            inner: Vec::new(),
         };
         let steps = walker.leads(root)?;
         supplied.context.push(Supply {
@@ -446,25 +598,106 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
             key: STEPS,
             value: Graph::Array(Array { elem: steps }),
         });
-        for step in &walker.visited {
-            if !walker.always.contains(step) {
-                behind.entry(*step).or_insert_with(|| name.clone());
+        // a walk no speaker leads to is said plainly
+        let spoken = (model.context.get(root.0).into_iter().flatten())
+            .filter(|supply| supply.key == SPEAKER)
+            .flat_map(|supply| &supply.suppliers)
+            .any(|supplier| (model.context_values.iter()).any(|value| value.key == SPEAKER && value.owner == *supplier));
+        if !spoken {
+            supplied.context.push(Supply {
+                node: root,
+                key: SPEAKER,
+                value: Graph::Null,
+            });
+        }
+        supplied.context.push(Supply {
+            node: root,
+            key: SPOKEN,
+            value: Graph::Bool(spoken),
+        });
+        supplied.context.push(Supply {
+            node: root,
+            key: RELATED,
+            value: related(model, root)?,
+        });
+        // a sentence a speaker leads to is said that speaker's way, by draws addressed like a fork's
+        let plain = (model.bindings.iter())
+            .position(|binding| binding.owner == ElementId::Node(root) && !binding.property && binding.path == ["plain"]);
+        let styled = match plain {
+            Some(plain) if spoken => {
+                let mut address = vec![Graph::Str(name.clone())];
+                address.extend(walker.per.clone());
+                let call = |function: &str, args, returns| Graph::Func {
+                    func: Func::Call {
+                        function: function.to_owned(),
+                        args,
+                        returns,
+                        shape: None,
+                    },
+                    range: node.range,
+                };
+                call(
+                    SAY,
+                    vec![
+                        Graph::BindingRef(BindingId(plain), node.range),
+                        Graph::Context {
+                            owner: ElementId::Node(root),
+                            path: vec![SPEAKER.to_owned(), "wording".to_owned()],
+                        },
+                        call(DRAWS, address, FieldType::Array),
+                    ],
+                    FieldType::String,
+                )
+            }
+            _ => Graph::Null,
+        };
+        supplied.context.push(Supply {
+            node: root,
+            key: STYLED,
+            value: styled,
+        });
+        within.insert(root, walker.inner);
+    }
+    // a walk is built before the walk it is a step of, so none is a step of itself
+    for root in roots(model) {
+        let mut pending = within[&root].clone();
+        let mut seen = BTreeSet::new();
+        while let Some(inner) = pending.pop() {
+            if inner == root {
+                return Err(fail(
+                    model.nodes[root.0].range,
+                    "this walk is a step of a walk that is a step of it, and a walk cannot build itself",
+                ));
+            }
+            if seen.insert(inner) {
+                pending.extend(within.get(&inner).into_iter().flatten().copied());
             }
         }
-        always.extend(walker.always);
     }
-    for (step, walk) in behind {
-        if always.contains(&step) {
-            continue;
+    // a network gathers walks under one name, and reads what each of them gives
+    for network in &model.networks {
+        let mut elem = Vec::new();
+        for member in &network.nodes {
+            let node = &model.nodes[member.0];
+            let gives = (model.bindings.iter())
+                .position(|binding| binding.owner == ElementId::Node(*member) && !binding.property && binding.path == [GIVES])
+                .filter(|_| model.derives(&node.kind, WALK));
+            let (Some(gives), Some(name)) = (gives, &node.name) else {
+                return Err(fail(
+                    node.range,
+                    "a network in a world gathers named walks, and this is not one",
+                ));
+            };
+            elem.push(bts_lang::ObjectField {
+                key: name.clone(),
+                value: Graph::BindingRef(BindingId(gives), model.nodes[network.node.0].range),
+            });
         }
-        let named = match &model.nodes[step.0].name {
-            Some(name) => format!("`{name}`"),
-            None => "this step".to_owned(),
-        };
-        supplied.hidden.push((
-            step,
-            format!("{named} is behind a fork, so a walk may not visit it. Read `{walk}`, the walk it belongs to"),
-        ));
+        supplied.context.push(Supply {
+            node: network.node,
+            key: MEMBERS,
+            value: Graph::Object(Object { elem }),
+        });
     }
     Ok(supplied)
 }
@@ -668,6 +901,35 @@ pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Va
     ])))
 }
 
+/// How many draws a styled sentence is given. Styling takes far fewer.
+pub const DRAWN: usize = 32;
+
+/// The numbers a sentence is styled by: [`DRAWN`] draws of 53 bits each, addressed like a fork's.
+pub fn draws(seed: u64, per: &str, label: &str) -> Vec<f64> {
+    (0..DRAWN)
+        .map(|at| {
+            let half = |part: &str| u64::from(hash(&address(seed, per, &format!("{label}~{at}{part}"))));
+            ((half("a") << 21) | (half("b") >> 11)) as f64 / 9_007_199_254_740_992.0
+        })
+        .collect()
+}
+
+/// Evaluates the draws a styled sentence is said by.
+pub(super) fn drawn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    let (seed, trace_index) = evaluation.address();
+    let (label, per) = match args {
+        [Value::String(label)] => (label, trace_index.to_string()),
+        [Value::String(label), per] => (label, drawn_for(per)?),
+        _ => return Err(EvaluateError::Shape),
+    };
+    let numbers = draws(seed, &per, label).into_iter().map(|draw| {
+        serde_json::Number::from_f64(draw)
+            .map(Value::Number)
+            .ok_or(EvaluateError::Shape)
+    });
+    Ok(Value::Array(numbers.collect::<Result<_, _>>()?))
+}
+
 /// Evaluates `merge`: one object from many, where later keys win and null changes nothing.
 pub(super) fn merge(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
     let [Value::Object(base), Value::Array(objects)] = args else {
@@ -787,6 +1049,12 @@ def _world_turn(label, index, turns, up_to, weights, random_source):
         count += 1
 
 
+def _world_draws(label, *rest):
+    *per, random_source = rest
+    address = f"{random_source.seed}/{_world_per(per[0]) if per else random_source.trace}/{label}~"
+    return [(_world_hash(f"{address}{at}a") * 2097152 + (_world_hash(f"{address}{at}b") >> 11)) / 9007199254740992 for at in range(32)]
+
+
 def _world_id(label, per, random_source):
     address = f"{random_source.seed}/{_world_per(per)}/{label}#"
     return f"{_world_hash(address + 'a'):08x}{_world_hash(address + 'b'):08x}"
@@ -873,6 +1141,12 @@ function _world_turn(label: string, index: unknown, turnsValue: unknown, upToVal
         if (start + length > offset) return { number: block * 256 + count, turn: offset - start, length: Math.min(length, 256 - start) };
         start += length;
     }
+}
+function _world_draws(label: string, ...rest: unknown[]): number[] {
+    const randomSource = rest[rest.length - 1] as () => number;
+    const seed = (randomSource as { seed?: number | bigint }).seed;
+    const address = `${seed}/${rest.length > 1 ? _world_per(rest[0]) : traceOf(randomSource)}/${label}~`;
+    return Array.from({ length: 32 }, (_, at) => (_world_hash(`${address}${at}a`) * 2097152 + (_world_hash(`${address}${at}b`) >>> 11)) / 9007199254740992);
 }
 function _world_id(label: string, per: unknown, randomSource: () => number): string {
     const seed = (randomSource as { seed?: number | bigint }).seed;

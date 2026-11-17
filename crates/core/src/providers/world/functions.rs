@@ -513,6 +513,7 @@ const fn function(name: &'static str, data: Evaluate, texts: bool) -> Function {
         seeded: false,
         counts: false,
         texts,
+        plain: false,
         text: "",
         operation: Some(name),
         runtime: Some(Runtime {
@@ -569,6 +570,22 @@ pub static FUNCTIONS: &[Function] = &[
         python: Some(seeded("_world_turn", "conversation_turn")),
         typescript: Some(seeded("_world_turn", "conversationTurn")),
     },
+    // what the draws of a styled sentence lower to
+    Function {
+        name: super::walk::DRAWS,
+        check: None,
+        data: Some(super::walk::drawn),
+        python: Some(seeded("_world_draws", "draws_for")),
+        typescript: Some(seeded("_world_draws", "drawsFor")),
+    },
+    // what a sentence said a speaker's way lowers to: styled by the draws it is handed
+    Function {
+        name: super::walk::SAY,
+        check: None,
+        data: Some(say),
+        python: Some(said()),
+        typescript: Some(said()),
+    },
     // what the identifier of a conversation lowers to
     Function {
         name: super::walk::ID,
@@ -579,6 +596,62 @@ pub static FUNCTIONS: &[Function] = &[
     },
 ];
 
+// styling goes through the English entry point, as an operation no author calls
+const fn said() -> Helper {
+    let Some(mut helper) = function("say", say, true).python else {
+        panic!("the English entry point has a helper");
+    };
+    helper.scorer = None;
+    helper
+}
+
+// the draws a sentence is styled by, played back as a random source
+struct Replay<'a> {
+    draws: &'a [f64],
+    at: usize,
+}
+
+impl rand::RngCore for Replay<'_> {
+    fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    // the 53 bits of the draw, where a float is read from
+    fn next_u64(&mut self) -> u64 {
+        let draw = self.draws.get(self.at).copied().unwrap_or(0.5);
+        self.at += 1;
+        ((draw * 9_007_199_254_740_992.0) as u64) << 11
+    }
+
+    fn fill_bytes(&mut self, bytes: &mut [u8]) {
+        for chunk in bytes.chunks_mut(8) {
+            let next = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&next[..chunk.len()]);
+        }
+    }
+}
+
+// a sentence said a speaker's way, with the draws it was handed
+fn say(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    let [text, wording, Value::Array(draws)] = args else {
+        return Err(EvaluateError::Shape);
+    };
+    let draws = (draws.iter())
+        .map(|draw| match draw {
+            Value::Number(number) => number.as_f64().filter(|draw| (0.0..1.0).contains(draw)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(EvaluateError::Shape)?;
+    let plain = |value: &Value| {
+        (evaluation.plain(value)).map_err(|_| EvaluateError::Invalid("English functions do not accept attachments".into()))
+    };
+    let args = [plain(text)?, plain(wording)?];
+    run_english(Operation::Vary, &args, &mut Replay { draws: &draws, at: 0 })
+        .map(Value::from)
+        .map_err(|error| EvaluateError::Invalid(format!("say: {error}").into()))
+}
+
 // a helper that draws by the seed of the run, defined in the text those helpers share
 const fn seeded(name: &'static str, reads_as: &'static str) -> Helper {
     Helper {
@@ -588,6 +661,7 @@ const fn seeded(name: &'static str, reads_as: &'static str) -> Helper {
         seeded: true,
         counts: false,
         texts: false,
+        plain: true,
         text: "",
         operation: None,
         runtime: Some(Runtime {
@@ -607,6 +681,7 @@ const fn walked(name: &'static str, reads_as: &'static str, text: &'static str) 
         seeded: false,
         counts: false,
         texts: false,
+        plain: true,
         text,
         operation: None,
         runtime: None,

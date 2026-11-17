@@ -407,7 +407,6 @@ fn resource_value(
     const NOTHING: Supplied = Supplied {
         elements: Vec::new(),
         context: Vec::new(),
-        hidden: Vec::new(),
     };
     AgentLowering::callable(graph, node, &NOTHING, result)
         .value(value)
@@ -2774,13 +2773,6 @@ impl<'a> AgentLowering<'a> {
         if let graph::ElementId::Node(node) = binding.owner
             && self.beside.walks(node)
         {
-            // what a contributor built reads its own parts freely, a step of the agent reads what is always there
-            let within = self.building.last().is_some_and(|parent| {
-                matches!(self.graph.bindings[parent.0].owner, graph::ElementId::Node(owner) if self.beside.walks(owner))
-            });
-            if !within && let Some(why) = self.beside.hidden(node) {
-                return Err(why.into());
-            }
             if binding.property {
                 return self.value(&binding.value.clone());
             }
@@ -2824,7 +2816,8 @@ impl<'a> AgentLowering<'a> {
             };
         };
         if node == self.agent {
-            if binding.path != ["input"] {
+            // the input or a key of it, which the entry span holds
+            if binding.path.first().is_none_or(|key| key != "input") {
                 return Err("only agent input can be read by its steps".into());
             }
             node = self.root;

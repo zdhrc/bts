@@ -1,3 +1,12 @@
+# the hotel's reservations stand beside the agent as entities of a world, each defined once
+# the lookup tool finds a reservation by its number, so every step that reads a booking reads the same one
+(overnight_stay:entity)
+    -[:next]->(:given {is: {id: "HTL-4821", booking: {status: "confirmed", overnight_check_in: true}}});
+(evening_stay:entity)
+    -[:next]->(:given {is: {id: "HTL-7390", booking: {status: "confirmed", overnight_check_in: false}}});
+(cancelled_stay:entity)
+    -[:next]->(:given {is: {id: "HTL-9102", booking: {status: "cancelled", overnight_check_in: true}}});
+
 ("customer-support-agent":agent) {input: [|{name: "Maya", reservation_id: "HTL-4821", arrival_hour: 25, message: "My flight is delayed. Can I still check in when I arrive?"}, {name: "Riley", reservation_id: "HTL-7390", arrival_hour: 26, message: "Will the front desk still be open?"}, {name: "Avery", reservation_id: "HTL-9102", arrival_hour: 25, message: "Can you check that my booking is active?"}|], output: ("late-arrival").output};
 ("customer-support-agent")-[:next]->("late-arrival");
 ("late-arrival":task) {
@@ -45,7 +54,7 @@
     error: self.output.found ? null : "reservation-not-found",
     metadata: {lookup: "reservation-number"},
     duration: 0.05,
-    output: self.input.reservation_id == "HTL-4821" ? {found: true, booking: {status: "confirmed", overnight_check_in: true}} : self.input.reservation_id == "HTL-7390" ? {found: true, booking: {status: "confirmed", overnight_check_in: false}} : self.input.reservation_id == "HTL-9102" ? {found: true, booking: {status: "cancelled", overnight_check_in: true}} : {found: false, booking: null}
+    output: self.input.reservation_id == overnight_stay.attributes.id ? {found: true, booking: overnight_stay.attributes.booking} : self.input.reservation_id == evening_stay.attributes.id ? {found: true, booking: evening_stay.attributes.booking} : self.input.reservation_id == cancelled_stay.attributes.id ? {found: true, booking: cancelled_stay.attributes.booking} : {found: false, booking: null}
 };
 ("check-arrival-policy") =[:exclusive]=>[-[:next {when: ("handle-late-arrival").local.handoff == 0}]->("front-desk-message"), -[:next {when: ("handle-late-arrival").local.handoff == 1}]->("callback-request")];
 ("front-desk-message":task) {

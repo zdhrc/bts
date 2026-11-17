@@ -2054,20 +2054,18 @@ fn shapes_without_a_nested_form_are_refused_with_a_location() {
 
 #[test]
 fn the_world_example_agrees_in_data_and_code() {
-    // the policies and the traveler's request are built beside the agent, and none of it emits a span
+    // the policies, the flight and what the traveler asks are built beside the agent, and none of it emits a span
     let source = include_str!("../../../examples/flight_change.bt");
-    let policies = "Follow the change policies. A same-day change costs 75 USD. The change window closes two hours before departure. The fare difference must be paid before the new ticket is issued.";
-    let reply = "I found a later flight, and a same-day change costs 75 USD. It leaves on November 20, 2026 at 5:30 PM. The fare difference must be paid before the new ticket is issued.";
     let model = lower(source).unwrap();
     // the last seed is past what a TypeScript number holds exactly
     let seeds: Vec<u64> = (1..=12).chain([u64::MAX]).collect();
     let project = |value: &Option<data::Value>| value.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
-    // what the traveler says in the first trace of each seed
-    let mut said = Vec::new();
+    // the spans of the first trace of each seed, as an agent reports them
+    let mut traces = Vec::new();
     for seed in &seeds {
         let batch = data::generate(
             model.clone(),
-            2,
+            1,
             Duration::from_secs(3600),
             data::Distribution::Linear,
             UNIX_EPOCH + Duration::from_secs(7200),
@@ -2075,19 +2073,44 @@ fn the_world_example_agrees_in_data_and_code() {
             &(),
         )
         .unwrap();
-        for trace in batch.events.chunks(3) {
-            let names: Vec<_> = trace.iter().map(|event| event.name.as_str()).collect();
-            assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
-            let input = project(&trace[2].input);
-            assert_eq!(input[0]["content"], policies);
-            assert_eq!(project(&trace[2].output)["content"], reply);
-            assert_eq!(project(&trace[0].output), reply);
-            assert_eq!(project(&trace[1].output)["departs"], "17:30");
-        }
-        said.push(project(&batch.events[2].input)[1]["content"].clone());
+        let names: Vec<_> = batch.events.iter().map(|event| event.name.as_str()).collect();
+        assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
+        let spans: Vec<_> = (batch.events.iter())
+            .map(|event| (project(&event.input), project(&event.output)))
+            .collect();
+        // the fee the policies state is the fee the reply quotes, and the flight the tool returns is the one it describes
+        let policies = spans[2].0[0]["content"].as_str().unwrap();
+        let reply = spans[2].1["content"].as_str().unwrap();
+        let fee = if policies.contains("costs 75 USD") {
+            "75 USD"
+        } else {
+            "50 USD"
+        };
+        assert!(policies.starts_with(&format!(
+            "Follow the change policies. A same-day change costs {fee}. The change window"
+        )));
+        assert!(reply.starts_with(&format!(
+            "I found a later flight, and a same-day change costs {fee}. It leaves on November 20, 2026 at "
+        )));
+        let departs = if spans[1].1["departs"] == "17:30" {
+            "5:30 PM"
+        } else {
+            "7:05 PM"
+        };
+        assert!(
+            reply.contains(&format!(" at {departs}. The fare difference must be paid")),
+            "{reply}"
+        );
+        assert_eq!(spans[0].1, reply);
+        // the traveler writes in lower case
+        let asked = spans[2].0[1]["content"].as_str().unwrap();
+        assert_eq!(asked, asked.to_lowercase());
+        traces.push(spans);
     }
-    let wordings: std::collections::BTreeSet<_> = said.iter().map(|text| text.as_str().unwrap()).collect();
-    assert!(wordings.len() > 3, "{wordings:?}");
+    let asked: std::collections::BTreeSet<_> = traces.iter().map(|spans| spans[2].0[1]["content"].to_string()).collect();
+    let departures: std::collections::BTreeSet<_> = traces.iter().map(|spans| spans[1].1["departs"].to_string()).collect();
+    assert!(asked.len() > 3, "{asked:?}");
+    assert_eq!(departures.len(), 2);
     // a generated agent given a seed builds the world of that seed's first trace
     let runs = [
         execute_generated(
@@ -2111,21 +2134,20 @@ fn the_world_example_agrees_in_data_and_code() {
         ),
     ];
     for run in &runs {
-        for (details, said) in run.as_array().unwrap().iter().zip(&said) {
-            assert_eq!(details["output"], reply);
+        for (details, trace) in run.as_array().unwrap().iter().zip(&traces) {
             let spans = details["spans"].as_array().unwrap();
             let names: Vec<_> = spans.iter().map(|span| span["name"].as_str().unwrap()).collect();
             assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
-            assert_eq!(spans[0]["output"], reply);
-            assert_eq!(spans[1]["output"]["departs"], "17:30");
-            assert_eq!(spans[2]["input"][0]["content"], policies);
-            assert_eq!(&spans[2]["input"][1]["content"], said);
-            assert_eq!(spans[2]["output"]["content"], reply);
+            for (span, (input, output)) in spans.iter().zip(trace) {
+                assert_eq!(&span["input"], input);
+                assert_eq!(&span["output"], output);
+            }
+            assert_eq!(details["output"], trace[2].1["content"]);
         }
     }
     assert_eq!(runs[0], runs[1]);
     // an agent given a trace as well builds the world of that trace
-    let third = data::generate(
+    let later = data::generate(
         model.clone(),
         4,
         Duration::from_secs(3600),
@@ -2135,7 +2157,7 @@ fn the_world_example_agrees_in_data_and_code() {
         &(),
     )
     .unwrap();
-    let asked = project(&third.events[3 * 3 + 2].input)[1]["content"].clone();
+    let fourth = project(&later.events[3 * 3 + 2].output)["content"].clone();
     let python = execute_generated(
         &model,
         ScorerLang::Python,
@@ -2150,42 +2172,17 @@ fn the_world_example_agrees_in_data_and_code() {
         "check.mts",
         "import {runDetails} from './flight_change_agent.mts'; console.log(JSON.stringify(runDetails(undefined, Math.random, 7, 3)));",
     );
-    assert_eq!(python["spans"][2]["input"][1]["content"], asked);
-    assert_eq!(typescript["spans"][2]["input"][1]["content"], asked);
+    assert_eq!(python["output"], fourth);
+    assert_eq!(typescript["output"], fourth);
     // without a seed the agent still builds one of the worlds the graph allows
     for details in generated_runs(&model, "flight_change") {
-        let asked = details["spans"][2]["input"][1]["content"].as_str().unwrap().to_owned();
+        let reply = details["output"].as_str().unwrap();
         assert!(
-            asked.ends_with("my flight?") || asked.ends_with("flight.") || asked.ends_with("flight?"),
-            "{asked}"
+            reply.starts_with("I found a later flight, and a same-day change costs "),
+            "{reply}"
         );
     }
-    // the reply declares what it reads from the world in the order the shape declares it
-    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
-        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
-        let agent = (assembly.files.iter())
-            .find(|file| file.name.contains("flight_change_agent.") && !file.name.contains("runtime"))
-            .unwrap();
-        let locals = match lang {
-            ScorerLang::Python => [
-                "fee_text = ",
-                "window_text = ",
-                "payment_text = ",
-                "policies_text = ",
-                "ask_text = ",
-            ],
-            ScorerLang::Typescript => [
-                "feeText = ",
-                "windowText = ",
-                "paymentText = ",
-                "policiesText = ",
-                "askText = ",
-            ],
-        };
-        let places: Vec<_> = locals.iter().map(|local| agent.contents.find(local).unwrap()).collect();
-        assert!(places.is_sorted(), "{places:?}");
-    }
-    // the world leaves no function, deferred value or graph behind, and the agent takes a seed
+    // the world leaves no function, deferred value or graph behind, and the agent takes a seed and a trace
     for lang in [ScorerLang::Python, ScorerLang::Typescript] {
         let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
         for file in assembly.files.iter().filter(|file| !file.name.contains("runtime")) {
@@ -2268,6 +2265,135 @@ fn a_walk_drawn_for_more_than_a_trace_agrees_in_data_and_code() {
         assert_eq!(python["output"], said[0]);
         assert_eq!(typescript["output"], said[0]);
     }
+}
+
+#[test]
+fn every_piece_of_a_world_agrees_in_data_and_code() {
+    // a walk inside a walk, a fact, entities and a relation, a persona, a repeat and a read of the agent's input
+    let model = lower(include_str!("fixtures/world.bt")).unwrap();
+    let seeds = [1u64, 2, 3, 4, 5, 6];
+    let outputs: Vec<Value> = (seeds.iter())
+        .map(|seed| {
+            let batch = data::generate(
+                model.clone(),
+                1,
+                Duration::from_secs(3600),
+                data::Distribution::Linear,
+                UNIX_EPOCH + Duration::from_secs(7200),
+                *seed,
+                &(),
+            )
+            .unwrap();
+            batch.events[0].output.as_ref().unwrap().project(&()).unwrap()
+        })
+        .collect();
+    for output in &outputs {
+        // each part of the world is read the same way wherever it is read
+        assert!(
+            output["policies"]
+                .as_str()
+                .unwrap()
+                .starts_with(output["fee"].as_str().unwrap())
+        );
+        assert_eq!(output["holds"], json!([output["flight"]]));
+        assert_eq!(output["who"], "Maya");
+        assert_eq!(output["said"], json!([output["ask"]]));
+        assert_eq!(output["ask"], "can i change my flight?");
+        assert_eq!(output["reasons"].as_array().unwrap().len(), 3);
+    }
+    let distinct = |key: &str| {
+        outputs
+            .iter()
+            .map(|output| output[key].to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    };
+    assert!(distinct("fee") > 1 && distinct("fare") > 1 && distinct("flight") > 1 && distinct("reasons") > 1);
+    let python = execute_generated(
+        &model,
+        ScorerLang::Python,
+        "python3",
+        "check.py",
+        &format!("from desk_agent import run\nimport json\nprint(json.dumps([run(seed=seed) for seed in {seeds:?}]))"),
+    );
+    let typescript = execute_generated(
+        &model,
+        ScorerLang::Typescript,
+        "node",
+        "check.mts",
+        &format!(
+            "import {{run}} from './desk_agent.mts'; console.log(JSON.stringify({seeds:?}.map(seed => run(undefined, Math.random, seed))));"
+        ),
+    );
+    assert_eq!(python, Value::Array(outputs.clone()));
+    assert_eq!(typescript, Value::Array(outputs));
+    // nothing of the world is deferred, and its helpers print under readable names
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("desk_agent.") && !file.name.contains("runtime"))
+            .unwrap();
+        for told in ["_lazy", "_world"] {
+            assert!(!agent.contents.contains(told), "{told} in {}", agent.contents);
+        }
+    }
+}
+
+#[test]
+fn a_way_of_talking_that_samples_agrees_in_data_and_code() {
+    // typos and a wording that may or may not apply are drawn by the seed, like a fork
+    let source = r#"+(sloppy:trait)
+    -[:on]->(node)
+    -[:provides {speaker: {type: "object", value: {wording: {style: "text_message", probability: 0.6, typos: {probability: 0.7, max_errors: 2}}}}}]->(context);
++(texter:node) {said: {type: "array", value: context.steps}, gives: {type: "array", value: self.said}}
+    -[:extends]->(walk)
+    -[:has]->(sloppy);
+(maya:texter)
+    -[:next]->(one:sentence)
+        -[:next]->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight because the meeting moved"})
+    -[:next]->(two:sentence)
+        -[:next]->(:part {subject: "the people", number: "plural", verb: "think", complement: "that the ticket was really expensive"});
+(texts:agent) {input: "hi", output: t.output};
+(texts)-[:next]->(t:task {name: "t"}) {input: texts.input, output: maya.said};
+"#;
+    let model = lower(source).unwrap();
+    let seeds: Vec<u64> = (1..=16).collect();
+    let said: Vec<Value> = (seeds.iter())
+        .map(|seed| {
+            let batch = data::generate(
+                model.clone(),
+                1,
+                Duration::from_secs(3600),
+                data::Distribution::Linear,
+                UNIX_EPOCH + Duration::from_secs(7200),
+                *seed,
+                &(),
+            )
+            .unwrap();
+            batch.events[0].output.as_ref().unwrap().project(&()).unwrap()
+        })
+        .collect();
+    // the sampling shows: not every seed says it the same way
+    let ways: std::collections::BTreeSet<_> = said.iter().map(Value::to_string).collect();
+    assert!(ways.len() > 4, "{ways:?}");
+    let python = execute_generated(
+        &model,
+        ScorerLang::Python,
+        "python3",
+        "check.py",
+        &format!("from texts_agent import run\nimport json\nprint(json.dumps([run(seed=seed) for seed in {seeds:?}]))"),
+    );
+    let typescript = execute_generated(
+        &model,
+        ScorerLang::Typescript,
+        "node",
+        "check.mts",
+        &format!(
+            "import {{run}} from './texts_agent.mts'; console.log(JSON.stringify({seeds:?}.map(seed => run(undefined, Math.random, seed))));"
+        ),
+    );
+    assert_eq!(python, Value::Array(said.clone()));
+    assert_eq!(typescript, Value::Array(said));
 }
 
 #[test]

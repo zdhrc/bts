@@ -2062,6 +2062,8 @@ mod native {
     struct Results {
         counts: HashSet<&'static str>,
         texts: HashSet<(&'static str, &'static str)>,
+        // the provider helpers that return plain data
+        plain: HashSet<&'static str>,
     }
     #[derive(Clone, Debug)]
     struct Branch {
@@ -2160,6 +2162,10 @@ mod native {
             texts: (helpers.iter())
                 .filter(|helper| helper.texts)
                 .filter_map(|helper| Some((helper.name, helper.operation?)))
+                .collect(),
+            plain: (helpers.iter())
+                .filter(|helper| helper.plain)
+                .map(|helper| helper.name)
                 .collect(),
         });
         let mut nullable = HashSet::new();
@@ -5260,6 +5266,17 @@ mod native {
                 right,
             } => infallible(left, env) && infallible(right, env),
             Expr::Unary { op: UnaryOp::Not, value } => infallible(value, env),
+            // a provider helper that returns plain data from constants is taken where it is declared
+            Expr::Call {
+                function,
+                args,
+                keywords,
+            } if keywords.is_empty()
+                && matches!(&**function, Expr::Name(name) if env.counts.plain.contains(name.as_str()))
+                && args.iter().all(constant) =>
+            {
+                true
+            }
             _ => sampled(value),
         }
     }
@@ -5816,6 +5833,7 @@ mod native {
                             }
                         }
                         name if env.counts.counts.contains(name) => Type::Integer(0, 9_007_199_254_740_991),
+                        name if env.counts.plain.contains(name) => Type::Value,
                         name if matches!(args.first(), Some(Expr::String(operation))
                             if env.counts.texts.iter().any(|(helper, known)| *helper == name && *known == operation.as_str())) =>
                         {
