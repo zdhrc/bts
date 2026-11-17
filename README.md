@@ -157,6 +157,8 @@ The expression reads `self` and `context` only, so the kind works in any shape. 
 
 The provider's `llm` kind uses this to count tokens. Every `llm` step gets `prompt_tokens`, `completion_tokens` and `tokens` in its `metrics` without writing them, and `metrics: {time_to_first_token: 0.2}` adds to those counts. See [computed fields](examples/computed_fields.bt).
 
+The world provider writes what people say as graph. A `statement` is one sentence written as its grammar, and an `intent` is something a speaker wants, worded differently in each trace. Both hold values and emit no spans, so they sit on the agent's path before the steps that read them. See [flight change](examples/flight_change.bt).
+
 ## Use the model
 
 The following workflows consume the support graph through the Braintrust provider. Generate data from its possible behaviors, build a mock implementation, or add definitions for evaluation and resource management.
