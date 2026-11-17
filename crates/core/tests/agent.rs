@@ -1,6 +1,6 @@
 use bts_core::mocking::{ScorerLang, code, data};
-use bts_core::providers::Provider;
 use bts_core::providers::braintrust::{Bundle, mocking::code::CodeTarget};
+use bts_core::providers::{Contributor, Provider, With, world};
 use bts_lang::semantics::{Source, compile_module_with_provider};
 use serde_json::{Value, json};
 use std::{
@@ -29,17 +29,20 @@ const SOURCE: &str = r#"# shared mock data and mock code case
 };
 "#;
 
+// the providers a host selects: braintrust lowers, world adds its kinds and functions
+const SELECTED: With<Bundle, world::Bundle> = With(Bundle, world::Bundle);
+
 fn lower(source: &str) -> Result<bts_core::mocking::Model, String> {
     let graph = compile_module_with_provider(
         Source {
             name: "agent.bt",
             text: source,
         },
-        &Bundle.schema(),
+        &SELECTED.schema(),
         false,
     )
     .unwrap_or_else(|errors| panic!("{errors:#?}"));
-    Bundle.lower(&graph).map_err(|diag| diag.what)
+    SELECTED.lower(&graph, SELECTED.functions()).map_err(|diag| diag.what)
 }
 
 #[test]
@@ -2050,6 +2053,60 @@ fn shapes_without_a_nested_form_are_refused_with_a_location() {
 }
 
 #[test]
+fn the_world_example_agrees_in_data_and_code() {
+    // statements and the intent emit no spans, and what the statements say is the same everywhere
+    let source = include_str!("../../../examples/flight_change.bt");
+    let policies = "Follow the change policies. A same-day change costs 75 USD. The change window closes two hours before departure. The fare difference must be paid before the new ticket is issued.";
+    let reply = "I found a later flight, and a same-day change costs 75 USD. It leaves on November 20, 2026 at 5:30 PM. The fare difference must be paid before the new ticket is issued.";
+    let model = lower(source).unwrap();
+    // the traveler's wording is sampled, so collect what data generation says across many traces
+    let batch = data::generate(
+        model.clone(),
+        64,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        42,
+        &(),
+    )
+    .unwrap();
+    let project = |value: &Option<data::Value>| value.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
+    let mut wordings = std::collections::BTreeSet::new();
+    for trace in batch.events.chunks(3) {
+        let names: Vec<_> = trace.iter().map(|event| event.name.as_str()).collect();
+        assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
+        let input = project(&trace[2].input);
+        assert_eq!(input[0]["content"], policies);
+        wordings.insert(input[1]["content"].as_str().unwrap().to_owned());
+        assert_eq!(project(&trace[2].output)["content"], reply);
+        assert_eq!(project(&trace[0].output), reply);
+        assert_eq!(project(&trace[1].output)["departs"], "17:30");
+    }
+    assert!(wordings.len() > 3, "{wordings:?}");
+    for details in generated_runs(&model, "flight_change") {
+        assert_eq!(details["output"], reply);
+        let spans = details["spans"].as_array().unwrap();
+        let names: Vec<_> = spans.iter().map(|span| span["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["flight-change", "search_flights", "Chat Completion"]);
+        assert_eq!(spans[0]["output"], reply);
+        assert_eq!(spans[1]["output"]["departs"], "17:30");
+        assert_eq!(spans[2]["input"][0]["content"], policies);
+        let said = spans[2]["input"][1]["content"].as_str().unwrap();
+        assert!(wordings.contains(said), "{said} is not among {wordings:?}");
+        assert_eq!(spans[2]["output"]["content"], reply);
+    }
+    // a step that only holds values leaves no function, call or result type behind
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        for file in assembly.files.iter().filter(|file| !file.name.contains("runtime")) {
+            for told in ["chance(", "included", "fee(", "FeeResult"] {
+                assert!(!file.contents.contains(told), "{told} in {}", file.name);
+            }
+        }
+    }
+}
+
+#[test]
 fn every_example_agent_reads_as_written_by_hand() {
     // no deferred values, no span bookkeeping, and no helper under a private name
     for source in [
@@ -2060,6 +2117,7 @@ fn every_example_agent_reads_as_written_by_hand() {
         include_str!("../../../examples/error_and_escalation.bt"),
         include_str!("../../../examples/experiments.bt"),
         include_str!("../../../examples/fanout_parallel_workers.bt"),
+        include_str!("../../../examples/flight_change.bt"),
         include_str!("../../../examples/multi_turn_conversation.bt"),
         include_str!("../../../examples/rag_pipeline.bt"),
         include_str!("../../../examples/scoring_automations.bt"),

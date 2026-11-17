@@ -46,10 +46,12 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
             name: "value",
             accepts: &[FieldType::String, FieldType::Array, FieldType::Object],
             nullable: true,
+            optional: false,
             constant: false,
             bounds: None,
         }],
         returns: FieldType::Number,
+        shape: None,
     },
     FunctionDesc {
         doc: FuncDesc {
@@ -69,6 +71,7 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
                 name: "path",
                 accepts: &[FieldType::String],
                 nullable: false,
+                optional: false,
                 constant: true,
                 bounds: None,
             },
@@ -76,11 +79,13 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
                 name: "content_type",
                 accepts: &[FieldType::String],
                 nullable: false,
+                optional: false,
                 constant: true,
                 bounds: None,
             },
         ],
         returns: FieldType::Object,
+        shape: None,
     },
     FunctionDesc {
         doc: FuncDesc {
@@ -96,10 +101,12 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
             name: "size",
             accepts: &[FieldType::Number],
             nullable: false,
+            optional: false,
             constant: false,
             bounds: Some((0, NOISE_SIZE_CAP)),
         }],
         returns: FieldType::String,
+        shape: None,
     },
 ];
 
@@ -114,14 +121,22 @@ pub static FUNCTIONS: &[Function] = &[
             reads_as: Some("count_tokens"),
             random: false,
             counts: true,
+            texts: false,
             text: PY_TOKENS,
+            operation: None,
+            runtime: None,
+            scorer: None,
         }),
         typescript: Some(Helper {
             name: "_tokens",
             reads_as: Some("countTokens"),
             random: false,
             counts: true,
+            texts: false,
             text: TS_TOKENS,
+            operation: None,
+            runtime: None,
+            scorer: None,
         }),
     },
     // an agent has no way to package a local file, so only data generation attaches one
@@ -141,14 +156,22 @@ pub static FUNCTIONS: &[Function] = &[
             reads_as: None,
             random: true,
             counts: false,
+            texts: false,
             text: PY_NOISE,
+            operation: None,
+            runtime: None,
+            scorer: None,
         }),
         typescript: Some(Helper {
             name: "_noise",
             reads_as: None,
             random: true,
             counts: false,
+            texts: false,
             text: TS_NOISE,
+            operation: None,
+            runtime: None,
+            scorer: None,
         }),
     },
 ];
@@ -195,7 +218,7 @@ fn attachment(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, 
     };
     let filename = Path::new(path)
         .file_name()
-        .ok_or(EvaluateError::Invalid("attachment path does not name a file"))?
+        .ok_or(EvaluateError::Invalid("attachment path does not name a file".into()))?
         .to_string_lossy()
         .into_owned();
     let mut key_bytes = [0; 16];
@@ -219,7 +242,9 @@ fn noise(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, Evalu
         Some(size) if (0..=NOISE_SIZE_CAP).contains(&size) => {
             Ok(Value::String(evaluation.random_text(NOISE_CHARSET, size as usize)))
         }
-        _ => Err(EvaluateError::Invalid("noise size is not an integer between 0 and 8388608")),
+        _ => Err(EvaluateError::Invalid(
+            "noise size is not an integer between 0 and 8388608".into(),
+        )),
     }
 }
 

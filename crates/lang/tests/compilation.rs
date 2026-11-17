@@ -6,7 +6,7 @@ use bts_lang::syntax::{
     parse,
 };
 use bts_lang::{DiagPhase, Primitive, Value, semantics::compile, syntax::parse_traversal};
-use bts_lang::{FieldType, FunctionDesc, ParamDesc, ProviderSchema};
+use bts_lang::{FieldType, FunctionDesc, ParamDesc, ProviderSchema, ResultShape};
 
 const COMPILATION_SOURCE: &str = include_str!("fixtures/compilation.bt");
 
@@ -197,10 +197,12 @@ const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
             name: "value",
             accepts: &[FieldType::String, FieldType::Array, FieldType::Object],
             nullable: true,
+            optional: false,
             constant: false,
             bounds: None,
         }],
         returns: FieldType::Number,
+        shape: None,
     },
     FunctionDesc {
         doc: function_doc("noise", "noise(size)"),
@@ -208,10 +210,12 @@ const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
             name: "size",
             accepts: &[FieldType::Number],
             nullable: false,
+            optional: false,
             constant: false,
             bounds: Some((0, 16)),
         }],
         returns: FieldType::String,
+        shape: None,
     },
     FunctionDesc {
         doc: function_doc("attachment", "attachment(path, content_type)"),
@@ -220,6 +224,7 @@ const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
                 name: "path",
                 accepts: &[FieldType::String],
                 nullable: false,
+                optional: false,
                 constant: true,
                 bounds: None,
             },
@@ -227,16 +232,64 @@ const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
                 name: "content_type",
                 accepts: &[FieldType::String],
                 nullable: false,
+                optional: false,
                 constant: true,
                 bounds: None,
             },
         ],
         returns: FieldType::Object,
+        shape: None,
     },
     FunctionDesc {
         doc: function_doc("stamp", "stamp()"),
         params: &[],
         returns: FieldType::Any,
+        shape: None,
+    },
+    // a trailing parameter a call may leave out
+    FunctionDesc {
+        doc: function_doc("label", "label(value[, options])"),
+        params: &[
+            ParamDesc {
+                name: "value",
+                accepts: &[FieldType::String, FieldType::Object],
+                nullable: false,
+                optional: false,
+                constant: false,
+                bounds: None,
+            },
+            ParamDesc {
+                name: "options",
+                accepts: &[FieldType::Object],
+                nullable: false,
+                optional: true,
+                constant: false,
+                bounds: None,
+            },
+        ],
+        returns: FieldType::String,
+        shape: None,
+    },
+    // a result whose fields are known before evaluation
+    FunctionDesc {
+        doc: function_doc("survey", "survey(value)"),
+        params: &[ParamDesc {
+            name: "value",
+            accepts: &[FieldType::Any],
+            nullable: false,
+            optional: false,
+            constant: false,
+            bounds: None,
+        }],
+        returns: FieldType::Object,
+        shape: Some(ResultShape::Object(&[
+            ("title", ResultShape::Scalar(FieldType::String)),
+            ("size", ResultShape::Scalar(FieldType::Number)),
+            (
+                "parts",
+                ResultShape::Array(&ResultShape::Object(&[("name", ResultShape::Scalar(FieldType::String))])),
+            ),
+        ])),
     },
 ];
 
@@ -289,7 +342,9 @@ fn provided(expression: &str) -> Result<Value, String> {
 fn provider_functions_are_checked_from_their_descriptors_and_never_folded() {
     // constant arguments stay in the call, the language has no meaning to fold with
     let Value::Func {
-        func: bts_lang::Func::Call { function, args, returns },
+        func: bts_lang::Func::Call {
+            function, args, returns, ..
+        },
         ..
     } = provided(r#"tokens("hello")"#).unwrap()
     else {
@@ -343,6 +398,59 @@ fn provider_functions_are_checked_from_their_descriptors_and_never_folded() {
             "function `upper` expects a string argument, but found number",
         ),
         ("tokens(\"a\") + noise(1)", "number"),
+    ] {
+        let error = provided(invalid).expect_err(invalid);
+        assert!(error.contains(message), "{invalid}: {error}");
+    }
+}
+
+#[test]
+fn provider_functions_take_optional_arguments_and_describe_their_results() {
+    for valid in [
+        r#"label("a")"#,
+        r#"label("a", {style: "short"})"#,
+        "label({a: 1}, {})",
+        // every alternative has an accepted type
+        r#"label(choice("a", {a: 1}))"#,
+        r#"label(self.flag ? "a" : {a: 1})"#,
+        // a read into a described result has the type of its field
+        r#"upper(survey(1).title)"#,
+        "survey(1).size + 1",
+        r#"upper(survey(1).parts[0].name)"#,
+        "len(survey(1).parts)",
+        r#"upper(survey(1)["title"])"#,
+    ] {
+        let source = format!("(values:vars) {{flag: context.history, value: {valid}}};");
+        compile_provided(&source).unwrap_or_else(|errors| panic!("{valid}: {errors:?}"));
+    }
+    for (invalid, message) in [
+        ("label()", "function `label` expects one or two arguments (value, options)"),
+        (
+            r#"label("a", {}, {})"#,
+            "function `label` expects one or two arguments (value, options)",
+        ),
+        (
+            "label(1)",
+            "function `label` expects a string or object argument, but found number",
+        ),
+        (
+            r#"label("a", "b")"#,
+            "function `label` expects a object argument, but found string",
+        ),
+        (
+            r#"label(choice("a", 1))"#,
+            "function `label` expects a string or object argument",
+        ),
+        (
+            "upper(survey(1).size)",
+            "function `upper` expects a string argument, but found number",
+        ),
+        ("survey(1).title + 1", "number"),
+        (
+            "upper(survey(1).parts)",
+            "function `upper` expects a string argument, but found array",
+        ),
+        ("survey(1).parts[0].name + 1", "number"),
     ] {
         let error = provided(invalid).expect_err(invalid);
         assert!(error.contains(message), "{invalid}: {error}");
@@ -1544,13 +1652,15 @@ fn checks_known_dynamic_collection_indices_without_inlining_draws() {
 
 #[test]
 fn preserves_function_result_types_and_argument_checks() {
-    compiled(
+    // a described result keeps its field types through bindings and aliases
+    compile_provided(
         r#"(v:vars) {
-        result: expression({}), alias: self.result,
-        text: upper(self.alias.text), count: len(self.alias.used_facts),
-        selected: self.alias.selection.intent,
+        result: survey({}), alias: self.result,
+        text: upper(self.alias.title), count: len(self.alias.parts),
+        selected: upper(self.alias.parts[0].name),
     };"#,
-    );
+    )
+    .unwrap_or_else(|errors| panic!("{errors:#?}"));
     for function in bts_lang::spec::SPEC.functions {
         if function.name != "uuid" {
             assert!(

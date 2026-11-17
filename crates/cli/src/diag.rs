@@ -1,5 +1,5 @@
 use crate::dsl::Diags;
-use bts_core::providers::Provider as _;
+use bts_core::providers::Contributor as _;
 use std::fmt;
 
 // keep the original source and locations until the cli renders the failure
@@ -61,6 +61,7 @@ pub fn build_error(error: &crate::code::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bts_core::providers::Provider as _;
 
     #[test]
     fn preserves_language_diagnostics_until_rendering() {

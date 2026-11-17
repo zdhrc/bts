@@ -19,7 +19,6 @@
 
 #[cfg(feature = "native")]
 pub mod config;
-pub mod english;
 pub mod mocking;
 pub mod providers;
 pub mod selection;

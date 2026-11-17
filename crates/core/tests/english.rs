@@ -1,6 +1,12 @@
-use bts_core::english::*;
+use bts_core::providers::world::english::*;
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
+
+// the functions belong to the world provider, which joins the provider that lowers a model
+fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
+    use bts_core::providers::{Provider, With, braintrust, world};
+    With(braintrust::Bundle, world::Bundle).compile(source)
+}
 
 fn subject(text: &str, person: Person, number: Number) -> Subject {
     Subject {
@@ -535,7 +541,7 @@ fn toolkit_materializes_through_the_dsl_with_explicit_conversation_scope() {
     let source = include_str!("fixtures/english.bt");
     let outputs = |seed| {
         let batch = data::generate(
-            bts_core::providers::braintrust::mocking::compile(source).unwrap(),
+            compile(source).unwrap(),
             16,
             Duration::from_secs(600),
             Distribution::Linear,
@@ -613,12 +619,12 @@ fn toolkit_materializes_through_the_dsl_with_explicit_conversation_scope() {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod parity {
+    use super::compile;
     use bts_core::mocking::{ScorerKind, ScorerLang};
     use bts_core::mocking::{
         code::{Emitter, Item, languages::Languages},
         data::{self, Distribution},
     };
-    use bts_core::providers::braintrust::mocking::compile;
     use serde_json::{Value, json};
     use std::{collections::BTreeSet, fs, io::Write, process::Stdio, time::Duration};
 
@@ -1270,8 +1276,8 @@ mod parity {
             c.forms[0].id = form.into();
             plan.bindings.insert(role.into(), id.into());
         }
-        let escaped_options = bts_core::english::ExpressionOptions::default();
-        let escaped_result = bts_core::english::expression(
+        let escaped_options = bts_core::providers::world::english::ExpressionOptions::default();
+        let escaped_result = bts_core::providers::world::english::expression(
             &escaped,
             &escaped_options,
             &mut <rand_xoshiro::Xoshiro256PlusPlus as rand::SeedableRng>::seed_from_u64(1),
@@ -1435,7 +1441,7 @@ mod parity {
     }
 
     fn style_replays() -> (Vec<Value>, Vec<Value>) {
-        use bts_core::english::{Sentence, StyleOptions, vary_sentence_styled, vary_styled};
+        use bts_core::providers::world::english::{Sentence, StyleOptions, vary_sentence_styled, vary_styled};
         use rand::{Rng, SeedableRng};
         use rand_xoshiro::Xoshiro256PlusPlus;
         let mut inputs = Vec::new();
@@ -1490,7 +1496,7 @@ mod parity {
     }
 
     fn expression_replays() -> (Vec<Value>, Vec<Value>) {
-        use bts_core::english::*;
+        use bts_core::providers::world::english::*;
         use rand::{Rng, SeedableRng};
         use rand_xoshiro::Xoshiro256PlusPlus;
         let source = super::flight_expression_source();

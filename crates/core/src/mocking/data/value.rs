@@ -204,7 +204,7 @@ mod tests {
 
 /// Expressions evaluated by mock data and emitted by mock code.
 pub mod expr {
-    use crate::dsl::{BinOp, CtxRef, EnglishOperation, Number, RefId, ScorerArg, SrcRange, UnaryOp};
+    use crate::dsl::{BinOp, CtxRef, Number, RefId, ScorerArg, SrcRange, UnaryOp};
 
     /// A compiled value or an expression left for a consumer to evaluate.
     ///
@@ -388,13 +388,6 @@ pub mod expr {
         Emissions(Box<Emissions>),
         /// Checks the value delivered to a schema-constrained field.
         Check { value: Box<Value>, ty: bts_lang::FieldType },
-        /// An English language operation evaluated by the consumer.
-        English {
-            /// The English operation to perform.
-            operation: EnglishOperation,
-            /// Arguments in authored order, including optional arguments when supplied.
-            args: Vec<Value>,
-        },
         /// A call to a function the provider supplies.
         Provider {
             /// The provider's implementations of the function.

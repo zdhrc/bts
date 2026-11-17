@@ -1326,8 +1326,10 @@ mod execution {
         let references = code::references(&body);
         let mut helpers: Vec<crate::mocking::Helper> = Vec::new();
         for helper in model.functions.iter().filter_map(|function| function.helper(lang)) {
+            // one helper may serve several functions, and each says what its own call returns
             let called = references.contains(&Dependency::Variable(helper.name.into()));
-            if called && !helpers.iter().any(|known| known.name == helper.name) {
+            let known = |known: &crate::mocking::Helper| known.name == helper.name && known.operation == helper.operation;
+            if called && !helpers.iter().any(known) {
                 helpers.push(*helper);
             }
         }
@@ -1979,10 +1981,16 @@ mod native {
         collections: HashMap<String, (Expr, Branch)>,
         input: Option<Type>,
         types: std::rc::Rc<std::cell::RefCell<HashMap<String, Type>>>,
-        // the provider helpers that return a count
+        // what the provider helpers return
         counts: Counts,
     }
-    type Counts = std::rc::Rc<HashSet<&'static str>>;
+    type Counts = std::rc::Rc<Results>;
+    // the provider helpers that return a count, and the operations of a helper that return text
+    #[derive(Default)]
+    struct Results {
+        counts: HashSet<&'static str>,
+        texts: HashSet<(&'static str, &'static str)>,
+    }
     #[derive(Clone, Debug)]
     struct Branch {
         span: Type,
@@ -2072,12 +2080,16 @@ mod native {
         numbered: &[(String, String)],
         helpers: &[crate::mocking::Helper],
     ) -> Option<Vec<(String, Json)>> {
-        let counts: Counts = std::rc::Rc::new(
-            (helpers.iter())
+        let counts: Counts = std::rc::Rc::new(Results {
+            counts: (helpers.iter())
                 .filter(|helper| helper.counts)
                 .map(|helper| helper.name)
                 .collect(),
-        );
+            texts: (helpers.iter())
+                .filter(|helper| helper.texts)
+                .filter_map(|helper| Some((helper.name, helper.operation?)))
+                .collect(),
+        });
         let mut nullable = HashSet::new();
         let mut accessed = HashSet::new();
         for f in functions.iter_mut() {
@@ -2422,6 +2434,80 @@ mod native {
                         *value = Expr::Name(kept.clone());
                     }
                 });
+            }
+        }
+        // A step that only holds values does nothing when it runs, since its values are computed
+        // where they are read. Its function and the calls nobody reads the result of are dropped.
+        fn holds_values(function: &code::Function) -> bool {
+            matches!(
+                function.body.as_slice(),
+                [
+                    Statement::Variable(Variable::Declare { name, value: Expr::Call { function: callee, args, keywords }, .. }),
+                    Statement::If { condition: Expr::Name(tested), then_body, else_body },
+                    Statement::Return(Expr::Object(fields)),
+                ] if matches!(&**callee, Expr::Member(_, member) if member == "chance")
+                    && matches!(args.as_slice(), [Expr::Number(always)] if always == "1")
+                    && keywords.is_empty()
+                    && tested == name
+                    && then_body.is_empty()
+                    && else_body.is_empty()
+                    && matches!(fields.as_slice(), [(_, Expr::Name(returned))] if returned == name)
+            )
+        }
+        fn drop_calls(body: &mut Vec<Statement>, holder: &str, read: &HashSet<String>) {
+            body.retain(|statement| {
+                !matches!(
+                    statement,
+                    Statement::Variable(Variable::Declare { name, value: Expr::Call { function, .. }, .. })
+                        if matches!(&**function, Expr::Name(called) if called == holder) && !read.contains(name)
+                )
+            });
+            for statement in body.iter_mut() {
+                match statement {
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        drop_calls(then_body, holder, read);
+                        drop_calls(else_body, holder, read);
+                    }
+                    Statement::ForRange { body, .. } | Statement::TraceScope { body, .. } => drop_calls(body, holder, read),
+                    _ => {}
+                }
+            }
+        }
+        let holders: Vec<String> = (functions.iter())
+            .filter(|function| !function.exported && !function.name.starts_with('_') && holds_values(function))
+            .map(|function| function.name.clone())
+            .collect();
+        for holder in holders {
+            for function in functions.iter_mut() {
+                // a result is read when its name appears anywhere but where it is declared
+                let mut read = HashSet::new();
+                code::rewrite(&mut function.body.clone(), &mut |value| {
+                    if let Expr::Name(name) = value {
+                        read.insert(name.clone());
+                    }
+                });
+                drop_calls(&mut function.body, &holder, &read);
+            }
+            let called = functions.iter().any(|function| {
+                function.name != holder && code::references(&function.body).contains(&Dependency::Variable(holder.clone()))
+            });
+            if !called {
+                // the result type goes with the function, unless something else still names it
+                let result = (functions.iter())
+                    .find(|function| function.name == holder)
+                    .and_then(|function| function.returns.clone());
+                functions.retain(|function| function.name != holder);
+                if let Some(result) = result {
+                    let named = functions.iter().any(|function| {
+                        function.returns.as_deref() == Some(result.as_str())
+                            || format!("{:?}", (&function.parameters, &function.body)).contains(&format!("\"{result}\""))
+                    });
+                    if !named {
+                        contracts.retain(|(name, _)| *name != result);
+                    }
+                }
             }
         }
         // A parameter its function never reads is not passed.
@@ -5639,7 +5725,12 @@ mod native {
                                 _ => Type::Unknown,
                             }
                         }
-                        name if env.counts.contains(name) => Type::Integer(0, 9_007_199_254_740_991),
+                        name if env.counts.counts.contains(name) => Type::Integer(0, 9_007_199_254_740_991),
+                        name if matches!(args.first(), Some(Expr::String(operation))
+                            if env.counts.texts.iter().any(|(helper, known)| *helper == name && *known == operation.as_str())) =>
+                        {
+                            Type::String
+                        }
                         _ => env.returns.get(&name).cloned().unwrap_or(Type::Unknown),
                     };
                     (call, kind)
@@ -6009,14 +6100,6 @@ mod expressions {
             Func::Render { template, values } => call("_render", &[template, values])?,
             Func::Compose { array, separator } => call("_compose", &[array, separator])?,
             Func::Sample { array, count } => Expr::call("_sample_items", vec![expr(array)?, expr(count)?, random()]),
-            Func::English { operation, args } => Expr::call(
-                "_english",
-                vec![
-                    Expr::string(operation.as_str()),
-                    Expr::Array(args.iter().map(expr).collect::<Result<_, _>>()?),
-                    random(),
-                ],
-            ),
             Func::Contains { target, needle } => call("_contains", &[target, needle])?,
             Func::StartsWith { text, prefix } => call("_starts_with", &[text, prefix])?,
             Func::EndsWith { text, suffix } => call("_ends_with", &[text, suffix])?,
@@ -6092,6 +6175,10 @@ mod expressions {
                     .helper(lang)
                     .ok_or_else(|| format!("function `{}` is not supported by agent generation", function.name))?;
                 let mut args = args.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
+                // a helper that serves several functions takes the operation and the arguments as one list
+                if let Some(operation) = helper.operation {
+                    args = vec![Expr::string(operation), Expr::Array(args)];
+                }
                 if helper.random {
                     args.push(random());
                 }
@@ -6709,23 +6796,6 @@ pub(crate) mod scoring {
                         vec![self.lower(array)?, self.language_value(count)?, random],
                     )
                 }
-                Func::English { operation, args } => {
-                    self.helpers.insert(Helper::English);
-                    let random = if python {
-                        self.imports.insert("random");
-                        Expr::from("random").member("random")
-                    } else {
-                        Expr::from("Math").member("random")
-                    };
-                    Expr::call(
-                        "_language_english",
-                        vec![
-                            Expr::string(operation.as_str()),
-                            Expr::Array(args.iter().map(|arg| self.lower(arg)).collect::<Result<_, _>>()?),
-                            random,
-                        ],
-                    )
-                }
                 Func::Contains { target, needle } => {
                     Expr::Contains(Box::new(self.lower(needle)?), Box::new(self.lower(target)?))
                 }
@@ -6833,11 +6903,31 @@ pub(crate) mod scoring {
                         Expr::call(if hex { "randomHex" } else { "randomAlphanum" }, vec![Expr::number(length)])
                     }
                 }
-                // the capability check reports the call first, with its location
-                Func::Provider { .. } => {
-                    return Err(Error::Unsupported {
-                        what: "a provider function",
-                    });
+                // the capability check reports a call a scorer cannot make first, with its location
+                Func::Provider { function, args } => {
+                    let lang = if python { ScorerLang::Python } else { ScorerLang::Typescript };
+                    let (Some(helper), Some(name)) = (function.helper(lang), function.scorer(lang)) else {
+                        return Err(Error::Unsupported {
+                            what: "a provider function",
+                        });
+                    };
+                    // a scorer file has no runtime module, so the text that defines the call comes along
+                    if let Some(runtime) = helper.runtime {
+                        self.helpers.insert(Helper::Runtime(runtime));
+                    }
+                    let mut args = args.iter().map(|arg| self.lower(arg)).collect::<Result<Vec<_>, _>>()?;
+                    if let Some(operation) = helper.operation {
+                        args = vec![Expr::string(operation), Expr::Array(args)];
+                    }
+                    if helper.random {
+                        args.push(if python {
+                            self.imports.insert("random");
+                            Expr::from("random").member("random")
+                        } else {
+                            Expr::from("Math").member("random")
+                        });
+                    }
+                    Expr::call(name, args)
                 }
             })
         }
@@ -6849,7 +6939,8 @@ pub(crate) mod scoring {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
     pub(in crate::mocking::code) enum Helper {
         Language,
-        English,
+        // the text a provider's functions are defined in
+        Runtime(crate::mocking::Runtime),
         Normal,
         Gamma,
         Lognormal,

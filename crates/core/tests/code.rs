@@ -3,8 +3,13 @@ use bts_core::mocking::code::{
     SourceFile, Target,
 };
 use bts_core::mocking::{Number, ScorerLang, Value};
-use bts_core::providers::braintrust::mocking::compile;
 use std::{collections::BTreeMap, error::Error as _, fmt, fs, path::Path};
+
+// one fixture calls the world provider's functions, so every source compiles with both providers
+fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
+    use bts_core::providers::{Provider, With, braintrust, world};
+    With(braintrust::Bundle, world::Bundle).compile(source)
+}
 
 #[derive(Debug, PartialEq)]
 enum TargetError {

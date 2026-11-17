@@ -1004,7 +1004,9 @@ fn render_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::english::{Aspect, Clause, Condition, Number, Person, Polarity, Predicate, Subject, Tense, Verb};
+    use crate::providers::world::english::{
+        Aspect, Clause, Condition, Number, Person, Polarity, Predicate, Subject, Tense, Verb,
+    };
 
     fn sentence(subject: &str, verb: &str) -> Sentence {
         Sentence {

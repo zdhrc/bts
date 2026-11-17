@@ -102,11 +102,14 @@ pub fn unsupported(model: &graph::Model) -> graph::Diags {
 ///
 /// A failure is one validation diagnostic at the graph element it concerns, or at
 /// the start of the source when no single element is responsible.
-pub fn lower(model: &graph::Model) -> Result<execution::Model, graph::Diag> {
+///
+/// The functions are the implementations calls in the model refer to: Braintrust's
+/// own, and those of any contributor it is joined with.
+pub fn lower(model: &graph::Model, functions: &'static [crate::mocking::Function]) -> Result<execution::Model, graph::Diag> {
     if let Some(diag) = unsupported(model).into_iter().next() {
         return Err(diag);
     }
-    lower_model(model).map_err(|error| graph::Diag {
+    lower_model(model, functions).map_err(|error| graph::Diag {
         when: graph::DiagPhase::Validation,
         what: error.what,
         r#where: error.range.unwrap_or(graph::SrcRange::new(0, 0)),
@@ -153,10 +156,10 @@ impl<T, E: Into<Error>> At<T> for Result<T, E> {
     }
 }
 
-fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
+fn lower_model(model: &graph::Model, functions: &'static [crate::mocking::Function]) -> Result<execution::Model, Error> {
     let mut result = execution::Model {
         ordered: true,
-        functions: super::functions::FUNCTIONS,
+        functions,
         ..Default::default()
     };
     for (index, node) in model.nodes.iter().enumerate() {
@@ -3138,12 +3141,8 @@ impl<'a> AgentLowering<'a> {
 
     fn function(&mut self, func: &graph::Func) -> Result<execution::Func, Error> {
         Ok(match func {
-            graph::Func::English { operation, args } => execution::Func::English {
-                operation: *operation,
-                args: args.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?,
-            },
             graph::Func::Call { function, args, .. } => {
-                let implementation = (super::functions::FUNCTIONS.iter())
+                let implementation = (self.result.functions.iter())
                     .find(|known| known.name == function)
                     .ok_or_else(|| format!("function `{function}` has no implementation"))?;
                 execution::Func::Provider {

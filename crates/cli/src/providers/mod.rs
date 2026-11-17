@@ -4,9 +4,11 @@ use crate::{code, config::Settings, data};
 use bts_core::providers::{CodeProvider, DataProvider};
 use std::{error::Error, path::Path, time::Duration};
 
-// the one place the cli names its provider, commands reach it through the provider traits
-pub type Selected = bts_core::providers::braintrust::Bundle;
-pub const SELECTED: Selected = bts_core::providers::braintrust::Bundle;
+// the one place the cli names its providers, commands reach them through the provider traits
+// braintrust lowers and delivers, world adds its kinds and functions
+pub type Selected = bts_core::providers::With<bts_core::providers::braintrust::Bundle, bts_core::providers::world::Bundle>;
+pub const SELECTED: Selected =
+    bts_core::providers::With(bts_core::providers::braintrust::Bundle, bts_core::providers::world::Bundle);
 
 pub type Encoded<P> = <<P as DataProvider>::Format as data::Format>::Output;
 

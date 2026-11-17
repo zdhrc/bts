@@ -1315,7 +1315,7 @@ impl<'a> ExpressionModeler<'a> {
                 Func::StartsWith { text, prefix } => self.value_reaches_context(text) || self.value_reaches_context(prefix),
                 Func::EndsWith { text, suffix } => self.value_reaches_context(text) || self.value_reaches_context(suffix),
                 Func::Len { target } => self.value_reaches_context(target),
-                Func::Format { args, .. } | Func::English { args, .. } | Func::Call { args, .. } => any(args),
+                Func::Format { args, .. } | Func::Call { args, .. } => any(args),
                 Func::Clamp { value, min, max } => {
                     self.value_reaches_context(value) || self.value_reaches_context(min) || self.value_reaches_context(max)
                 }
@@ -1599,18 +1599,6 @@ impl<'a> ExpressionModeler<'a> {
                     separator: Box::new(separator?),
                 })
             }
-            "express"
-            | "expression"
-            | "expression_candidates"
-            | "realize"
-            | "vary"
-            | "combine"
-            | "refer"
-            | "remember"
-            | "unmentioned"
-            | "format_number"
-            | "format_date"
-            | "format_time" => self.model_english_func(func, args, range),
             "render" => {
                 let [template, values] = self.func_args(func, args, "exactly two arguments (template, values)", range)?;
                 let template = self.model_typed_arg(template, func, StaticType::String);
@@ -1793,13 +1781,23 @@ impl<'a> ExpressionModeler<'a> {
     // a provider function: the descriptor says what to check, and the call is never folded
     fn model_call(&mut self, desc: FunctionDesc, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
         let func = desc.doc.name;
-        if args.len() != desc.params.len() {
-            let count = match desc.params.len() {
-                0 => "no arguments".to_owned(),
-                1 => "exactly one argument".to_owned(),
-                2 => "exactly two arguments".to_owned(),
-                3 => "exactly three arguments".to_owned(),
-                count => format!("exactly {count} arguments"),
+        // optional parameters come last, so a call supplies a prefix of the list
+        let required = desc.params.iter().filter(|param| !param.optional).count();
+        let most = desc.params.len();
+        if !(required..=most).contains(&args.len()) {
+            let word = |count: usize| match count {
+                0 => "no".to_owned(),
+                1 => "one".to_owned(),
+                2 => "two".to_owned(),
+                3 => "three".to_owned(),
+                count => count.to_string(),
+            };
+            let count = match (required, most) {
+                (0, 0) => "no arguments".to_owned(),
+                (1, 1) => "exactly one argument".to_owned(),
+                (required, most) if required == most => format!("exactly {} arguments", word(most)),
+                (required, most) if required + 1 == most => format!("{} or {} arguments", word(required), word(most)),
+                (required, most) => format!("between {} and {} arguments", word(required), word(most)),
             };
             let names: Vec<&str> = desc.params.iter().map(|param| param.name).collect();
             let expected = match names.as_slice() {
@@ -1823,12 +1821,12 @@ impl<'a> ExpressionModeler<'a> {
                 }
                 _ => true,
             };
-            let found = self.static_type(&arg);
-            let typed = (param.nullable && found == Some(StaticType::Null))
-                || param.accepts.iter().any(|ty| match schema_static_type(*ty) {
-                    Some(accepted) => found == Some(accepted),
-                    None => true,
-                });
+            // an argument with alternatives is accepted when each of them is
+            let mut allowed: Vec<StaticType> = param.accepts.iter().filter_map(|ty| schema_static_type(*ty)).collect();
+            if param.nullable {
+                allowed.push(StaticType::Null);
+            }
+            let typed = param.accepts.contains(&FieldType::Any) || self.matches_static_types(&arg, &allowed);
             if param.constant && !is_constant(&arg) {
                 self.errors.push(Error::new(
                     ErrorKind::CallParam {
@@ -1869,6 +1867,7 @@ impl<'a> ExpressionModeler<'a> {
             function: func.to_owned(),
             args: values,
             returns: desc.returns,
+            shape: desc.shape,
         })
     }
 
@@ -1984,62 +1983,6 @@ impl<'a> ExpressionModeler<'a> {
         }
 
         valid.then_some(Func::Format { pieces, args: values })
-    }
-
-    fn model_english_func(&mut self, func: &'static str, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
-        use EnglishOperation::*;
-        let operation = match func {
-            "express" => Express,
-            "expression" => Expression,
-            "expression_candidates" => ExpressionCandidates,
-            "realize" => Realize,
-            "vary" => Vary,
-            "combine" => Combine,
-            "refer" => Refer,
-            "remember" => Remember,
-            "unmentioned" => Unmentioned,
-            "format_number" => FormatNumber,
-            "format_date" => FormatDate,
-            "format_time" => FormatTime,
-            _ => unreachable!("known English function"),
-        };
-        let (min, max, expected) = match operation {
-            Express | Expression | ExpressionCandidates | Realize | Vary | FormatNumber | FormatDate | FormatTime => {
-                (1, 2, "one or two arguments (value, options)")
-            }
-            Combine => (2, 3, "two or three arguments (sentences, relation, options)"),
-            Refer => (2, 3, "two or three arguments (entity, context, options)"),
-            Remember => (2, 3, "two or three arguments (context, entities, facts)"),
-            Unmentioned => (2, 2, "exactly two arguments (details, context)"),
-        };
-        if !(min..=max).contains(&args.len()) {
-            self.errors.push(Error::new(
-                ErrorKind::FuncArity {
-                    rule: spec::ids::FUNC_ARITY,
-                    func,
-                    expected,
-                },
-                range,
-            ));
-            return None;
-        }
-        let mut values = Vec::with_capacity(args.len());
-        let mut valid = true;
-        for (index, arg) in args.into_iter().enumerate() {
-            let (allowed, expected): (&[StaticType], &'static str) = match (operation, index) {
-                (Vary, 0) => (&[StaticType::String, StaticType::Object], "string or object"),
-                (FormatNumber, 0) => (&[StaticType::String, StaticType::Number], "string or number"),
-                (FormatDate | FormatTime, 0) | (Combine, 1) => (&[StaticType::String], "string"),
-                (Combine | Unmentioned, 0) | (Remember, 1 | 2) => (&[StaticType::Array], "array"),
-                _ => (&[StaticType::Object], "object"),
-            };
-            if !self.matches_static_types(&arg, allowed) && !self.defers_to_evaluation(&arg) {
-                self.push_func_arg_type(&arg, func, expected);
-                valid = false;
-            }
-            values.push(arg.into_value());
-        }
-        valid.then_some(Func::English { operation, args: values })
     }
 
     fn matches_static_types(&self, folded: &Folded, allowed: &[StaticType]) -> bool {
@@ -2265,8 +2208,8 @@ impl<'a> ExpressionModeler<'a> {
     }
 
     fn value_type(&self, value: &Value) -> Option<StaticType> {
-        if let Some(shape) = self.result_shape(value) {
-            return Some(shape.value_type());
+        if let Some(kind) = self.result_shape(value).and_then(shape_type) {
+            return Some(kind);
         }
         match value {
             Value::Str(_) | Value::Template(_) => Some(StaticType::String),
@@ -2344,10 +2287,11 @@ impl<'a> ExpressionModeler<'a> {
                 FoldedKind::Value(value) => self.result_shape(value),
                 _ => None,
             },
+            // a provider says what its function returns
             Value::Func {
-                func: Func::English { operation, .. },
+                func: Func::Call { shape, .. },
                 ..
-            } => english_result_shape(*operation),
+            } => *shape,
             Value::Index { target, index, .. } => match self.result_shape(target)? {
                 ResultShape::Object(fields) => {
                     let Value::Str(key) = &**index else { return None };
@@ -2413,11 +2357,6 @@ impl<'a> ExpressionModeler<'a> {
             | Func::Hex { .. }
             | Func::Alphanum { .. } => Some(StaticType::String),
             Func::Split { .. } | Func::Sample { .. } => Some(StaticType::Array),
-            Func::English { operation, .. } => Some(match operation {
-                EnglishOperation::Remember | EnglishOperation::Expression => StaticType::Object,
-                EnglishOperation::Unmentioned | EnglishOperation::ExpressionCandidates => StaticType::Array,
-                _ => StaticType::String,
-            }),
             Func::Call { returns, .. } => schema_static_type(*returns),
         }
     }
@@ -2455,72 +2394,12 @@ enum StaticType {
     Object,
 }
 
-// result schemas describe existing runtime values without evaluating a function
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ResultShape {
-    Scalar(StaticType),
-    Object(&'static [(&'static str, ResultShape)]),
-    Array(&'static ResultShape),
-}
-
-impl ResultShape {
-    fn value_type(self) -> StaticType {
-        match self {
-            Self::Scalar(kind) => kind,
-            Self::Object(_) => StaticType::Object,
-            Self::Array(_) => StaticType::Array,
-        }
-    }
-}
-
-fn english_result_shape(operation: EnglishOperation) -> Option<ResultShape> {
-    use ResultShape::{Array, Object, Scalar};
-    const TEXT: ResultShape = Scalar(StaticType::String);
-    const NUMBER: ResultShape = Scalar(StaticType::Number);
-    const STRINGS: ResultShape = Array(&TEXT);
-    const MESSAGE: ResultShape = Object(&[
-        ("layout", TEXT),
-        ("recipe", TEXT),
-        ("forms", STRINGS),
-        ("organization", TEXT),
-        ("elaboration", TEXT),
-        ("sentence_shape", TEXT),
-        ("reference_style", TEXT),
-    ]);
-    const SELECTION: ResultShape = Object(&[("intent", TEXT), ("family", TEXT), ("pattern", TEXT), ("message", MESSAGE)]);
-    const CONTEXT: ResultShape = Object(&[
-        ("established", STRINGS),
-        ("recent", Array(&SELECTION)),
-        ("topic", TEXT),
-        ("requested", STRINGS),
-        ("known", STRINGS),
-        ("offered", STRINGS),
-        ("allowed_acts", STRINGS),
-    ]);
-    const EDIT: ResultShape = Object(&[
-        ("rule", TEXT),
-        ("replacement", TEXT),
-        ("stage", NUMBER),
-        ("range", Object(&[("start", NUMBER), ("end", NUMBER)])),
-    ]);
-    const CANDIDATE: ResultShape = Object(&[
-        ("selection", SELECTION),
-        ("text", TEXT),
-        ("used_facts", STRINGS),
-        ("establishes", STRINGS),
-        ("probability", NUMBER),
-    ]);
-    match operation {
-        EnglishOperation::Expression => Some(Object(&[
-            ("text", TEXT),
-            ("base_text", TEXT),
-            ("selection", SELECTION),
-            ("used_facts", STRINGS),
-            ("context", CONTEXT),
-            ("edits", Array(&EDIT)),
-        ])),
-        EnglishOperation::ExpressionCandidates => Some(Array(&CANDIDATE)),
-        _ => None,
+// the type of a value with a known shape, none when the shape leaves it to evaluation
+fn shape_type(shape: ResultShape) -> Option<StaticType> {
+    match shape {
+        ResultShape::Scalar(ty) => schema_static_type(ty),
+        ResultShape::Object(_) => Some(StaticType::Object),
+        ResultShape::Array(_) => Some(StaticType::Array),
     }
 }
 
@@ -3415,7 +3294,7 @@ fn collect_func_refs(func: &Func, found: &mut Vec<BindingId>) {
             collect_refs(suffix, found);
         }
         Func::Len { target } => collect_refs(target, found),
-        Func::Format { args, .. } | Func::English { args, .. } | Func::Call { args, .. } => all(args),
+        Func::Format { args, .. } | Func::Call { args, .. } => all(args),
         Func::Clamp { value, min, max } => {
             collect_refs(value, found);
             collect_refs(min, found);

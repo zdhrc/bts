@@ -767,13 +767,6 @@ pub enum Value {
 /// cause failures such as an invalid index or numeric overflow.
 #[derive(Debug, Clone)]
 pub enum Func {
-    /// An English language operation evaluated by the consumer.
-    English {
-        /// The English operation to perform.
-        operation: EnglishOperation,
-        /// Arguments in authored order, including optional arguments when supplied.
-        args: Vec<Value>,
-    },
     /// A call to a function a provider contributes.
     ///
     /// The language checks the arguments against the provider's descriptor and
@@ -781,10 +774,12 @@ pub enum Func {
     Call {
         /// The function name, as the provider declares it.
         function: String,
-        /// Arguments in authored order.
+        /// Arguments in authored order, including optional arguments when supplied.
         args: Vec<Value>,
         /// The result type the provider declares.
         returns: FieldType,
+        /// The fields of the result the provider declares, when it declares any.
+        shape: Option<ResultShape>,
     },
     /// One selected alternative.
     Choice(Vec<Value>),
@@ -974,54 +969,6 @@ pub enum Func {
     },
 }
 
-/// English language operations evaluated by consumers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnglishOperation {
-    /// Generate a procedural English utterance.
-    Express,
-    /// Generate an utterance with explicit selection and conversation context.
-    Expression,
-    /// Inspect eligible expression choices without sampling.
-    ExpressionCandidates,
-    /// Render explicit grammatical features as English text.
-    Realize,
-    /// Select a supported wording variation.
-    Vary,
-    /// Combine explicitly related propositions.
-    Combine,
-    /// Refer to an entity using explicit discourse context.
-    Refer,
-    /// Return an updated discourse context.
-    Remember,
-    /// Select details not established in a discourse context.
-    Unmentioned,
-    /// Format a decimal using an English regional convention.
-    FormatNumber,
-    /// Format an explicit date using an English regional convention.
-    FormatDate,
-    /// Format an explicit time using an English regional convention.
-    FormatTime,
-}
-
-impl EnglishOperation {
-    /// The corresponding built-in function name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Express => "express",
-            Self::Expression => "expression",
-            Self::ExpressionCandidates => "expression_candidates",
-            Self::Realize => "realize",
-            Self::Vary => "vary",
-            Self::Combine => "combine",
-            Self::Refer => "refer",
-            Self::Remember => "remember",
-            Self::Unmentioned => "unmentioned",
-            Self::FormatNumber => "format_number",
-            Self::FormatDate => "format_date",
-            Self::FormatTime => "format_time",
-        }
-    }
-}
 /// One candidate value and its relative sampling weight.
 #[derive(Debug, Clone)]
 pub struct WeightedOption {
@@ -1155,10 +1102,27 @@ pub struct ProviderSchema<'a> {
 pub struct FunctionDesc {
     /// The name, syntax, summary, examples and rules, as for a built-in function.
     pub doc: crate::spec::FuncDesc,
-    /// Parameters in order. Their count is the number of arguments a call takes.
+    /// Parameters in order. A call supplies every parameter that is not optional,
+    /// and optional parameters come last.
     pub params: &'static [ParamDesc],
     /// The type of the result, or any when it is known only on evaluation.
     pub returns: FieldType,
+    /// The fields of the result, when reads into it can be typed before evaluation.
+    pub shape: Option<ResultShape>,
+}
+
+/// What the result of a provider function contains.
+///
+/// A read into the result is typed from this, so a field of the wrong type is
+/// reported at compilation. A field the shape does not list is typed on evaluation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ResultShape {
+    /// A value of one type.
+    Scalar(FieldType),
+    /// An object with the listed fields.
+    Object(&'static [(&'static str, ResultShape)]),
+    /// An array whose elements share a shape.
+    Array(&'static ResultShape),
 }
 
 /// One parameter of a provider function.
@@ -1170,6 +1134,8 @@ pub struct ParamDesc {
     pub accepts: &'static [FieldType],
     /// Whether null is accepted beside those types.
     pub nullable: bool,
+    /// Whether a call may leave the argument out.
+    pub optional: bool,
     /// Whether the argument must be a constant.
     pub constant: bool,
     /// Inclusive bounds a constant argument must be an integer within.
@@ -1259,7 +1225,7 @@ impl Model {
                         each(args, owner, found);
                     }
                     Func::Choice(values) | Func::Min(values) | Func::Max(values) => each(values, owner, found),
-                    Func::Format { args, .. } | Func::English { args, .. } => each(args, owner, found),
+                    Func::Format { args, .. } => each(args, owner, found),
                     Func::Weighted(options) => options.iter().for_each(|option| walk(&option.value, owner, found)),
                     Func::Range(_)
                     | Func::Normal { .. }

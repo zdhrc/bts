@@ -1,4 +1,4 @@
-use crate::providers::Provider;
+use crate::providers::Contributor;
 use bts_lang::spec::{FuncDesc, RuleDesc, Spec as DslSpec};
 use std::fmt::Write as _;
 const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
@@ -18,7 +18,7 @@ pub enum Part {
 pub const FULL: &[Part] = &[Part::Workflow, Part::Presentation, Part::Language];
 
 /// Generates a standalone skill for one provider without interface commands or file access.
-pub fn render<P: Provider>(spec: &DslSpec, provider: &P) -> String {
+pub fn render<P: Contributor>(spec: &DslSpec, provider: &P) -> String {
     format!(
         "---\nname: bts\ndescription: Write, review, explain, and debug bts language source.\n---\n\n{}",
         assemble(spec, provider, FULL, None, None)
@@ -26,38 +26,45 @@ pub fn render<P: Provider>(spec: &DslSpec, provider: &P) -> String {
 }
 
 /// Assembles a provider's guidance, the language reference, and optional interface instructions.
-pub fn assemble<P: Provider>(
+pub fn assemble<P: Contributor>(
     spec: &DslSpec,
     provider: &P,
     parts: &[Part],
     interface_preamble: Option<&str>,
     interface_reference: Option<&str>,
 ) -> String {
-    let guidance = provider.guidance();
+    // a provider joined by contributors has a section for each, in the order their definitions compile
+    let contributors = provider.parts();
     let mut output = String::new();
     if let Some(interface_preamble) = interface_preamble {
         output.push_str(interface_preamble);
     }
     for part in parts {
         match part {
-            Part::Workflow => output.push_str(guidance.workflow),
-            Part::Presentation => output.push_str(guidance.presentation),
+            Part::Workflow => contributors
+                .iter()
+                .for_each(|contributor| output.push_str(contributor.guidance.workflow)),
+            Part::Presentation => contributors
+                .iter()
+                .for_each(|contributor| output.push_str(contributor.guidance.presentation)),
             Part::Language => {
                 output.push_str(&reference(spec));
-                output.push_str(guidance.definitions);
-                let schema = provider.schema();
-                for definition in schema.definitions {
-                    output.push_str(&fenced_code("bts", definition.text.trim()));
-                }
-                if !schema.functions.is_empty() {
-                    writeln!(output, "\n## {} functions\n", schema.name).unwrap();
-                    writeln!(
-                        output,
-                        "The provider contributes these functions. Call them like the functions of the language.\n"
-                    )
-                    .unwrap();
-                    for function in schema.functions {
-                        render_function(&mut output, &function.doc);
+                for contributor in &contributors {
+                    let schema = contributor.schema;
+                    output.push_str(contributor.guidance.definitions);
+                    for definition in schema.definitions {
+                        output.push_str(&fenced_code("bts", definition.text.trim()));
+                    }
+                    if !schema.functions.is_empty() {
+                        writeln!(output, "\n## {} functions\n", schema.name).unwrap();
+                        writeln!(
+                            output,
+                            "The provider contributes these functions. Call them like the functions of the language.\n"
+                        )
+                        .unwrap();
+                        for function in schema.functions {
+                            render_function(&mut output, &function.doc);
+                        }
                     }
                 }
             }

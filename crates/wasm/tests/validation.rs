@@ -604,10 +604,12 @@ fn exposes_shared_reference_and_browser_authoring_guidance() {
     let reference: Value = serde_wasm_bindgen::from_value(bts_wasm::spec().unwrap()).unwrap();
     assert_eq!(reference, serde_json::to_value(bts_lang::spec::SPEC).unwrap());
     let skill = bts_wasm::skill();
+    // the providers the browser interface selects
     assert!(skill.starts_with(&bts_core::skill::render(
         &bts_lang::spec::SPEC,
-        &bts_core::providers::braintrust::Bundle
+        &bts_core::providers::With(bts_core::providers::braintrust::Bundle, bts_core::providers::world::Bundle)
     )));
+    assert!(skill.contains("## World functions"));
     assert!(skill.contains("validate(source)"));
     assert!(skill.contains("generate(source, options)"));
     assert!(skill.contains("build(source, options)"));

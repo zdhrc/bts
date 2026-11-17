@@ -355,7 +355,7 @@ pub(crate) fn expression_action(predicate: &Predicate, gerund: bool) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::english::model::Verb;
+    use crate::providers::world::english::model::Verb;
 
     fn guest() -> Subject {
         Subject {

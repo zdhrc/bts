@@ -1,8 +1,11 @@
 //! Checks that a provider is consistent with the contract.
 //!
-//! Every provider's tests call [`check`]. It needs no credentials and runs nothing.
+//! Every provider's tests call [`check`], and so do the tests of each pairing a host
+//! selects, since a function name has one definition among the providers in use. It
+//! needs no credentials and runs nothing.
 
-use super::Provider;
+use super::Contributor;
+use crate::mocking::ScorerLang;
 use bts_lang::semantics::Source;
 use bts_lang::{Construct, spec::SPEC};
 
@@ -16,8 +19,9 @@ use bts_lang::{Construct, spec::SPEC};
 /// - Every function its schema declares is named once, is not a built-in function,
 ///   accepts some type for each parameter and has exactly one implementation.
 /// - Every implementation belongs to a declared function, runs somewhere, and each
-///   helper's text defines the function the helper names.
-pub fn check<P: Provider>(provider: &P) -> Vec<String> {
+///   helper's text or runtime defines the function the helper names. A helper that
+///   scorers call has a runtime, and the runtime defines that name on its own.
+pub fn check<P: Contributor>(provider: &P) -> Vec<String> {
     let schema = provider.schema();
     let mut problems = Vec::new();
     if schema.id != P::ID {
@@ -112,17 +116,33 @@ pub fn check<P: Provider>(provider: &P) -> Vec<String> {
         if function.data.is_none() && function.python.is_none() && function.typescript.is_none() {
             problems.push(format!("function `{name}` runs nowhere"));
         }
-        let helpers = [("def", &function.python), ("function", &function.typescript)];
-        for (keyword, helper) in helpers {
-            if let Some(helper) = helper
-                && !helper.text.contains(&format!("\n{keyword} {}(", helper.name))
-            {
+        let helpers = [
+            ("def", ScorerLang::Python, &function.python),
+            ("function", ScorerLang::Typescript, &function.typescript),
+        ];
+        for (keyword, lang, helper) in helpers {
+            let Some(helper) = helper else { continue };
+            let defines = |text: &str, called: &str| text.contains(&format!("\n{keyword} {called}("));
+            let defined = match helper.runtime {
+                Some(runtime) => defines(&(runtime.source)(lang, true), helper.name),
+                None => defines(helper.text, helper.name),
+            };
+            if !defined {
                 problems.push(format!("the helper text of `{name}` does not define `{}`", helper.name));
+            }
+            if let Some(scorer) = helper.scorer {
+                let standalone = helper.runtime.map(|runtime| (runtime.source)(lang, false));
+                if !standalone.is_some_and(|text| defines(&format!("\n{text}"), scorer)) {
+                    problems.push(format!("no runtime of `{name}` defines `{scorer}` for scorers"));
+                }
             }
         }
     }
 
-    let guidance = provider.guidance().sections().concat().to_lowercase();
+    // each contributor speaks for its own kinds
+    let guidance: String = (provider.parts().iter())
+        .map(|part| part.guidance.sections().concat().to_lowercase())
+        .collect();
     let words: Vec<&str> = guidance
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .collect();

@@ -2,8 +2,8 @@ use bts_core::mocking::data::{
     self, Attachment, AttachmentFormat, Distribution, EventBatch, Format, PrepareError, Request, RunError, Sink,
     UnsupportedAttachment, Value, WriteError,
 };
-use bts_core::providers::Provider;
 use bts_core::providers::braintrust::Bundle;
+use bts_core::providers::{Contributor, Provider};
 use bts_core::selection::filter::WriteFilter;
 use bts_lang::semantics::{Source, compile_module_with_provider};
 use serde_json::{Value as JsonValue, json};
@@ -160,6 +160,7 @@ fn request<'a>(source: &str, filter: &'a WriteFilter) -> Request<'a> {
                     false,
                 )
                 .unwrap(),
+                Bundle.functions(),
             )
             .unwrap(),
         count: 1,

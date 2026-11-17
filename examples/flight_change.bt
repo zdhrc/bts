@@ -1,0 +1,43 @@
+# the world provider writes what people say as graph, and a Braintrust agent works with it
+# a statement is one sentence, an intent is something a speaker wants, and neither emits a span
+# a conversation is a task with someone on the other end, who gives the intents beneath it a way of talking
++(conversation:node)
+    -[:extends]->(task)
+    -[:has]->(speaker);
+
+(flight_change:agent) {input: {booking: "AB42"}, output: reply.output.content};
+(flight_change)-[:next]->(request:conversation {name: "flight-change", style: "text_message"}) {
+    input: flight_change.input,
+    output: reply.output.content,
+    tags: [|"flight-change"|],
+};
+# the policies the agent works under
+(request)-[:calls]->(fee:statement {subject: "a same-day change", verb: "cost", complement: "75 USD"})
+    -[:next]->(window:statement {subject: "the change window", verb: "close", complement: "two hours before departure"})
+    -[:next]->(payment:statement {subject: "the fare difference", verb: "be", modal: "must", complement: "paid before the new ticket is issued"})
+    # what the traveler wants, worded differently in each trace
+    -[:next]->(ask:intent {name: "change_flight"}) {
+        constructions: [|
+            {id: "change", predicate: {verb: "change", complement: "my flight"}},
+            {id: "switch", predicate: {verb: "switch", complement: "to a later flight"}},
+        |],
+        families: [|{id: "request", kind: "request"}, {id: "desire", kind: "desire"}, {id: "procedure", kind: "procedure"}|],
+    }
+    -[:next]->(search:tool {name: "search_flights"}) {
+        input: {booking: request.input.booking},
+        output: {date: "2026-11-20", departs: "17:30", fare_difference: 1240.5},
+    }
+    -[:next]->(found:statement {subject: "I", person: "first", verb: "find", complement: "a later flight", tense: "past"})
+    # the reply relates two statements and formats what the search returned
+    -[:next]->(reply:llm {name: "Chat Completion"}) {
+        input: [|
+            {role: "system", content: compose([|"Follow the change policies.", fee.text, window.text, payment.text|])},
+            {role: "user", content: ask.text},
+        |],
+        output: {role: "assistant", content: format("{} It leaves on {} at {}. {}",
+            combine([|found.sentence, fee.sentence|], "and"),
+            format_date(search.output.date, {style: "long"}),
+            format_time(search.output.departs),
+            payment.text)},
+        metadata: {model: "gpt-4o-mini", provider: "openai"},
+    };

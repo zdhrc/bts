@@ -1,9 +1,10 @@
-use bts_core::providers::{CodeProvider as _, Provider as _};
+use bts_core::providers::{CodeProvider as _, Contributor as _, Provider as _, With, braintrust, world};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use wasm_bindgen::prelude::*;
 
-// the one place this crate names its provider, operations reach it through the provider traits
-const PROVIDER: bts_core::providers::braintrust::Bundle = bts_core::providers::braintrust::Bundle;
+// the one place this crate names its providers, operations reach them through the provider traits
+// braintrust lowers and delivers, world adds its kinds and functions
+const PROVIDER: With<braintrust::Bundle, world::Bundle> = With(braintrust::Bundle, world::Bundle);
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &str = r#"

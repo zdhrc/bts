@@ -58,8 +58,8 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
 }
 
 fn helper_snippet(helper: Helper) -> String {
-    if helper == Helper::English {
-        return super::rendering::english_source(ScorerLang::Typescript, false);
+    if let Helper::Runtime(runtime) = helper {
+        return (runtime.source)(ScorerLang::Typescript, false);
     }
     match helper {
         Helper::Language => super::rendering::TS_LANGUAGE,
@@ -102,7 +102,7 @@ fn helper_snippet(helper: Helper) -> String {
         Helper::Round => {
             "function roundAwayFromZero(value: number): number {\n  return (value < 0 ? -1 : 1) * Math.floor(Math.abs(value) + 0.5);\n}\n"
         }
-        Helper::English => unreachable!("handled above"),
+        Helper::Runtime(_) => unreachable!("handled above"),
     }.to_owned()
 }
 #[cfg(test)]

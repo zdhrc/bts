@@ -1250,7 +1250,7 @@ mod tests {
     use rand_xoshiro::Xoshiro256PlusPlus;
 
     use super::*;
-    use crate::english::{Aspect, Clause, Condition, Modal, Number, Person, Predicate, Subject, Tense, Verb};
+    use crate::providers::world::english::{Aspect, Clause, Condition, Modal, Number, Person, Predicate, Subject, Tense, Verb};
 
     fn sentence() -> Sentence {
         let subject = Subject {

@@ -1,7 +1,7 @@
 use bts_core::providers::braintrust::mocking::compile;
 use bts_core::{
     mocking::{Consumer, Function, Helper, ScorerLang, code, data},
-    providers::{Bundle, CodeProvider, DataProvider, Guidance, Provider, braintrust, conformance},
+    providers::{Bundle, CodeProvider, Contributor, DataProvider, Guidance, Provider, With, braintrust, conformance, world},
     selection::filter::WriteFilter,
 };
 use std::{
@@ -291,6 +291,124 @@ fn braintrust_conforms_to_the_provider_contract() {
     assert_eq!(conformance::check(&braintrust::Bundle), Vec::<String>::new());
 }
 
+#[test]
+fn world_conforms_to_the_provider_contract() {
+    assert_eq!(conformance::check(&world::Bundle), Vec::<String>::new());
+    // it lowers nothing and lists no kinds, so its kinds ride on what the provider it joins walks
+    let schema = world::Bundle.schema();
+    assert!(schema.nodes.is_empty() && schema.edges.is_empty());
+    assert_eq!(schema.functions.len(), 12);
+    // every function runs in data generation, in agents and in scorers
+    for function in world::Bundle.functions() {
+        assert!(function.runs(Consumer::Data), "{}", function.name);
+        assert!(function.runs(Consumer::Agent(ScorerLang::Python)), "{}", function.name);
+        assert!(function.runs(Consumer::Agent(ScorerLang::Typescript)), "{}", function.name);
+        assert!(function.runs(Consumer::Scorer), "{}", function.name);
+    }
+}
+
+#[test]
+fn a_provider_joined_by_a_contributor_has_the_kinds_and_functions_of_both() {
+    let joined = With(braintrust::Bundle, world::Bundle);
+    assert_eq!(conformance::check(&joined), Vec::<String>::new());
+    // the provider keeps its identity, and its definitions compile first
+    let schema = joined.schema();
+    assert_eq!((schema.id, schema.name), ("braintrust", "Braintrust mocking"));
+    let sources: Vec<_> = schema.definitions.iter().map(|source| source.name).collect();
+    assert_eq!(sources, ["braintrust.bt", "world.bt"]);
+    assert_eq!(schema.functions.len(), 15);
+    assert_eq!(joined.functions().len(), 15);
+    let parts: Vec<_> = joined.parts().iter().map(|part| part.schema.id).collect();
+    assert_eq!(parts, ["braintrust", "world"]);
+
+    // a shape uses the kinds of both, and a call finds what runs it whichever declared it
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task) {input: a.input, output: {said: s.text, counted: tokens(s.text)}};
+(t)-[:calls]->(s:statement {subject: "the desk", verb: "open"});"#;
+    let model = joined.compile(source).unwrap();
+    let batch = data::generate(
+        model,
+        1,
+        Duration::from_secs(1),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(10),
+        1,
+        &(),
+    )
+    .unwrap();
+    let output = batch.events[0].output.as_ref().unwrap().project(&()).unwrap();
+    assert_eq!(output["said"], "The desk opens.");
+    assert!(output["counted"].as_i64().unwrap() > 0);
+
+    // alone, the provider knows neither the kind nor the function
+    let errors = braintrust::Bundle.compile_module(source, false).unwrap_err();
+    assert!(errors.iter().any(|error| error.what.contains("statement")), "{errors:?}");
+    let errors = (braintrust::Bundle)
+        .compile_module(r#"(v:vars) {value: realize({})};"#, false)
+        .unwrap_err();
+    assert!(errors[0].what.starts_with("unknown function `realize`"), "{errors:?}");
+}
+
+#[test]
+fn a_function_two_providers_declare_fails_the_conformance_check() {
+    // a second contributor that declares a function the provider already has
+    struct Clashing;
+    impl Bundle for Clashing {
+        const ID: &'static str = "clashing";
+    }
+    impl Contributor for Clashing {
+        fn schema(&self) -> bts_lang::ProviderSchema<'static> {
+            const DECLARED: &[bts_lang::FunctionDesc] = &[described("tokens", &[])];
+            bts_lang::ProviderSchema {
+                id: "clashing",
+                name: "Clashing",
+                definitions: &[],
+                nodes: &[],
+                edges: &[],
+                forks: &[],
+                junctions: &[],
+                context: &[],
+                functions: DECLARED,
+            }
+        }
+        fn functions(&self) -> &'static [Function] {
+            static FUNCTIONS: &[Function] = &[Function {
+                name: "tokens",
+                check: None,
+                data: Some(|_, _| Ok(data::Value::Null)),
+                python: None,
+                typescript: None,
+            }];
+            FUNCTIONS
+        }
+        fn guidance(&self) -> Guidance {
+            Guidance {
+                workflow: "",
+                presentation: "",
+                definitions: "",
+            }
+        }
+    }
+    assert_eq!(conformance::check(&Clashing), Vec::<String>::new());
+    let problems = conformance::check(&With(braintrust::Bundle, Clashing));
+    assert_eq!(
+        problems,
+        [
+            "function `tokens` has more than one implementation",
+            "function `tokens` is declared twice",
+            "function `tokens` has more than one implementation",
+        ]
+    );
+    // and a call to it is ambiguous, whatever the order
+    let errors = With(braintrust::Bundle, Clashing)
+        .compile_module(r#"(v:vars) {value: tokens("a")};"#, false)
+        .unwrap_err();
+    assert!(
+        errors[0].what.starts_with("function `tokens` is defined more than once"),
+        "{errors:?}"
+    );
+}
+
 const fn described(name: &'static str, params: &'static [bts_lang::ParamDesc]) -> bts_lang::FunctionDesc {
     bts_lang::FunctionDesc {
         doc: bts_lang::spec::FuncDesc {
@@ -304,6 +422,7 @@ const fn described(name: &'static str, params: &'static [bts_lang::ParamDesc]) -
         },
         params,
         returns: bts_lang::FieldType::Any,
+        shape: None,
     }
 }
 
@@ -318,6 +437,7 @@ const INCONSISTENT_DESCRIPTORS: &[bts_lang::FunctionDesc] = &[
             name: "value",
             accepts: &[],
             nullable: false,
+            optional: false,
             constant: false,
             bounds: None,
         }],
@@ -335,7 +455,11 @@ static INCONSISTENT_FUNCTIONS: &[Function] = &[
             reads_as: None,
             random: false,
             counts: false,
+            texts: false,
             text: "\ndef _weigh(value):\n    return 0\n",
+            operation: None,
+            runtime: None,
+            scorer: None,
         }),
         typescript: None,
     },
@@ -362,9 +486,7 @@ impl Bundle for Inconsistent {
     const ID: &'static str = "inconsistent";
 }
 
-impl Provider for Inconsistent {
-    type Lowered = ();
-
+impl Contributor for Inconsistent {
     fn schema(&self) -> bts_lang::ProviderSchema<'static> {
         bts_lang::ProviderSchema {
             id: "other",
@@ -386,20 +508,24 @@ impl Provider for Inconsistent {
         INCONSISTENT_FUNCTIONS
     }
 
-    fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
-        Vec::new()
-    }
-
-    fn lower(&self, _: &bts_lang::Model) -> Result<(), bts_lang::Diag> {
-        Ok(())
-    }
-
     fn guidance(&self) -> Guidance {
         Guidance {
             workflow: "## Workflow\n\nNothing about the kinds.\n",
             presentation: "",
             definitions: "",
         }
+    }
+}
+
+impl Provider for Inconsistent {
+    type Lowered = ();
+
+    fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
+        Vec::new()
+    }
+
+    fn lower(&self, _: &bts_lang::Model, _: &'static [Function]) -> Result<(), bts_lang::Diag> {
+        Ok(())
     }
 }
 
@@ -430,8 +556,7 @@ fn the_conformance_check_locates_definitions_that_do_not_compile() {
     impl Bundle for Broken {
         const ID: &'static str = "broken";
     }
-    impl Provider for Broken {
-        type Lowered = ();
+    impl Contributor for Broken {
         fn schema(&self) -> bts_lang::ProviderSchema<'static> {
             bts_lang::ProviderSchema {
                 id: "broken",
@@ -447,12 +572,6 @@ fn the_conformance_check_locates_definitions_that_do_not_compile() {
                 context: &[],
                 functions: &[],
             }
-        }
-        fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
-            Vec::new()
-        }
-        fn lower(&self, _: &bts_lang::Model) -> Result<(), bts_lang::Diag> {
-            Ok(())
         }
         fn guidance(&self) -> Guidance {
             Inconsistent.guidance()

@@ -24,9 +24,7 @@ impl super::Bundle for Bundle {
     const ID: &'static str = "braintrust";
 }
 
-impl super::Provider for Bundle {
-    type Lowered = crate::mocking::Model;
-
+impl super::Contributor for Bundle {
     fn schema(&self) -> bts_lang::ProviderSchema<'static> {
         mocking::SCHEMA
     }
@@ -35,21 +33,29 @@ impl super::Provider for Bundle {
         functions::FUNCTIONS
     }
 
-    fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
-        mocking::elements(model)
-    }
-
-    /// Lowers an agent graph for the shared mock data and mock code consumers.
-    fn lower(&self, model: &bts_lang::Model) -> Result<crate::mocking::Model, bts_lang::Diag> {
-        mocking::lower(model)
-    }
-
     fn guidance(&self) -> super::Guidance {
         super::Guidance {
             workflow: skill::WORKFLOW,
             presentation: skill::PRESENTATION,
             definitions: skill::GRAPH,
         }
+    }
+}
+
+impl super::Provider for Bundle {
+    type Lowered = crate::mocking::Model;
+
+    fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
+        mocking::elements(model)
+    }
+
+    /// Lowers an agent graph for the shared mock data and mock code consumers.
+    fn lower(
+        &self,
+        model: &bts_lang::Model,
+        functions: &'static [crate::mocking::Function],
+    ) -> Result<crate::mocking::Model, bts_lang::Diag> {
+        mocking::lower(model, functions)
     }
 }
 

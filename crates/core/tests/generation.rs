@@ -1,6 +1,6 @@
 use bts_core::mocking::data::{self, Distribution, Value};
-use bts_core::providers::Provider;
 use bts_core::providers::braintrust::Bundle;
+use bts_core::providers::{Contributor, Provider};
 use bts_lang::semantics::{Source, compile_module_with_provider};
 
 fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
@@ -13,7 +13,7 @@ fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
         false,
     )
     .map_err(|errors| format!("{errors:#?}"))?;
-    Bundle.lower(&graph).map_err(|diag| diag.what)
+    Bundle.lower(&graph, Bundle.functions()).map_err(|diag| diag.what)
 }
 use std::collections::HashSet;
 use std::time::{Duration, UNIX_EPOCH};

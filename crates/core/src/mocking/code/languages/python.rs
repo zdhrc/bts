@@ -62,8 +62,8 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
 }
 
 fn helper_snippet(helper: Helper) -> String {
-    if helper == Helper::English {
-        return super::rendering::english_source(ScorerLang::Python, false);
+    if let Helper::Runtime(runtime) = helper {
+        return (runtime.source)(ScorerLang::Python, false);
     }
     match helper {
         Helper::Language => super::rendering::PY_LANGUAGE,

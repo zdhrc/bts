@@ -1,5 +1,4 @@
 use super::super::{Attachment, AttachmentFormat, EventKind, Value as JsonValue};
-use crate::dsl::EnglishOperation;
 use crate::dsl::{
     Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild,
     Choice as ModelChoice, CtxRef as ModelCtxRef, EmissionKind, Emissions, Field, Func as ModelFunc, Maybe as ModelMaybe,
@@ -7,13 +6,11 @@ use crate::dsl::{
     Range as ModelRange, RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields,
     SpanKind as ModelSpanKind, SrcRange, Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
 };
-use crate::english::{self, RealizeOptions, Sentence, VariationOptions};
 use crate::mocking::{EvaluateError, Evaluation};
 use crate::selection::filter::WriteFilter;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Number as JsonNumber, Value as InputValue};
 use std::collections::BTreeMap as JsonMap;
 use std::fmt;
@@ -1606,249 +1603,6 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx, at: SrcRange) -> Result<Mode
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnglishVaryOptions {
-    #[serde(default = "english_enabled")]
-    negation: bool,
-    #[serde(default = "english_enabled")]
-    condition_order: bool,
-    #[serde(default)]
-    rendering: RealizeOptions,
-}
-
-fn english_enabled() -> bool {
-    true
-}
-
-impl Default for EnglishVaryOptions {
-    fn default() -> Self {
-        Self {
-            negation: true,
-            condition_order: true,
-            rendering: RealizeOptions::default(),
-        }
-    }
-}
-
-fn eval_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue], rng: &mut R) -> Result<InputValue, String> {
-    run_english(operation, args, rng).map_err(|error| format!("{}: {error}", operation.as_str()))
-}
-
-fn run_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue], rng: &mut R) -> Result<InputValue, String> {
-    use EnglishOperation::*;
-    let (min, max) = match operation {
-        Express | Expression | ExpressionCandidates | Realize | Vary | FormatNumber | FormatDate | FormatTime => (1, 2),
-        Combine | Refer | Remember => (2, 3),
-        Unmentioned => (2, 2),
-    };
-    if !(min..=max).contains(&args.len()) {
-        return Err(format!("expected {min} to {max} arguments"));
-    }
-    match operation {
-        Express | Expression | ExpressionCandidates => {
-            english_expression_shapes(&args[0], args.get(1))?;
-            let source = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            match operation {
-                Express => english::express(&source, &english_options, rng)
-                    .map(InputValue::String)
-                    .map_err(english_error_message),
-                Expression => {
-                    serde_json::to_value(english::expression(&source, &english_options, rng).map_err(english_error_message)?)
-                        .map_err(english_error_message)
-                }
-                _ => serde_json::to_value(
-                    english::expression_candidates(&source, &english_options).map_err(english_error_message)?,
-                )
-                .map_err(english_error_message),
-            }
-        }
-        Realize => {
-            let sentence: Sentence = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            english::realize(&sentence, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        Vary => {
-            if args.get(1).and_then(InputValue::as_object).is_some_and(|english_options| {
-                english_options
-                    .keys()
-                    .any(|key| !["negation", "condition_order", "rendering"].contains(&key.as_str()))
-            }) {
-                let english_options: english::StyleOptions = english_options(args.get(1))?;
-                let result = if let Some(text) = args[0].as_str() {
-                    english::vary_styled(text, &english_options, rng)
-                } else {
-                    english::vary_sentence_styled(&decode_english(&args[0])?, &english_options, rng)
-                };
-                return result
-                    .map(|result| InputValue::String(result.text))
-                    .map_err(english_error_message);
-            }
-            let english_options: EnglishVaryOptions = english_options(args.get(1))?;
-            let variation = VariationOptions {
-                negation: english_options.negation,
-                condition_order: english_options.condition_order,
-            };
-            let output = if let Some(text) = args[0].as_str() {
-                english::vary(text, &variation, rng)
-            } else {
-                let sentence: Sentence = decode_english(&args[0])?;
-                english::vary_sentence(&sentence, &english_options.rendering, &variation, rng)
-            };
-            output.map(InputValue::String).map_err(english_error_message)
-        }
-        Combine => {
-            let sentences: Vec<Sentence> = decode_english(&args[0])?;
-            let relation = decode_english(&args[1])?;
-            let english_options = english_options(args.get(2))?;
-            english::composition::combine(&sentences, relation, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        Refer => {
-            let entity = decode_english(&args[0])?;
-            let context = decode_english(&args[1])?;
-            let english_options = english_options(args.get(2))?;
-            english::discourse::refer(&entity, &context, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        Remember => {
-            let context = decode_english(&args[0])?;
-            let entities: Vec<english::discourse::Entity> = decode_english(&args[1])?;
-            let facts: Vec<String> = english_options(args.get(2))?;
-            let context = english::discourse::remember(&context, &entities, &facts).map_err(english_error_message)?;
-            serde_json::to_value(context).map_err(english_error_message)
-        }
-        Unmentioned => {
-            let details: Vec<english::discourse::Detail> = decode_english(&args[0])?;
-            let context = decode_english(&args[1])?;
-            let selected = english::discourse::unmentioned(&details, &context).map_err(english_error_message)?;
-            serde_json::to_value(selected).map_err(english_error_message)
-        }
-        FormatNumber => {
-            let number = match &args[0] {
-                InputValue::String(value) => value.clone(),
-                InputValue::Number(number) => number.to_string(),
-                _ => return Err("expected a number or decimal string".into()),
-            };
-            let english_options = english_options(args.get(1))?;
-            english::formatting::format_number(&number, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        FormatDate => {
-            let date: String = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            english::formatting::format_date(&date, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        FormatTime => {
-            let time: String = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            english::formatting::format_time(&time, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-    }
-}
-
-fn decode_english<T: DeserializeOwned>(value: &InputValue) -> Result<T, String> {
-    serde_json::from_value(value.clone()).map_err(english_error_message)
-}
-
-fn english_options<T: DeserializeOwned + Default>(value: Option<&InputValue>) -> Result<T, String> {
-    value.map(decode_english).unwrap_or_else(|| Ok(T::default()))
-}
-
-fn english_error_message(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-
-// Serde also accepts struct sequences. The DSL contract requires named objects.
-fn english_expression_shapes(source: &InputValue, english_options: Option<&InputValue>) -> Result<(), String> {
-    fn object(value: &InputValue) -> Result<(), String> {
-        if value.is_object() {
-            Ok(())
-        } else {
-            Err("expected an expression object".into())
-        }
-    }
-    fn objects(value: Option<&InputValue>) -> Result<(), String> {
-        if let Some(InputValue::Array(values)) = value {
-            for value in values {
-                object(value)?;
-            }
-        }
-        Ok(())
-    }
-    object(source)?;
-    for key in ["families", "facts", "constructions", "components"] {
-        objects(source.get(key))?;
-    }
-    if let Some(InputValue::Array(values)) = source.get("components") {
-        for value in values {
-            objects(value.get("forms"))?;
-        }
-    }
-    if let Some(InputValue::Array(values)) = source.get("families") {
-        for value in values {
-            if let Some(message) = value.get("message").filter(|v| !v.is_null()) {
-                object(message)?;
-                if let Some(bindings) = message.get("bindings") {
-                    object(bindings)?;
-                }
-            }
-        }
-    }
-    if let Some(InputValue::Array(values)) = source.get("constructions") {
-        for value in values {
-            if let Some(predicate) = value.get("predicate") {
-                object(predicate)?;
-                if let Some(verb) = predicate.get("verb")
-                    && !verb.is_string()
-                {
-                    object(verb)?;
-                }
-            }
-        }
-    }
-    if let Some(english_options) = english_options {
-        object(english_options)?;
-        if let Some(context) = english_options.get("context") {
-            object(context)?;
-            objects(context.get("recent"))?;
-            if let Some(InputValue::Array(recent)) = context.get("recent") {
-                for selection in recent {
-                    if let Some(message) = selection.get("message").filter(|v| !v.is_null()) {
-                        object(message)?;
-                    }
-                }
-            }
-        }
-        if let Some(speaker) = english_options.get("speaker") {
-            object(speaker)?;
-            for key in ["greetings", "closings"] {
-                objects(speaker.get(key))?;
-            }
-            if let Some(wording) = speaker.get("wording") {
-                object(wording)?;
-                for key in ["typos", "rendering"] {
-                    if let Some(value) = wording.get(key) {
-                        object(value)?;
-                    }
-                }
-                objects(wording.get("alternatives"))?;
-            }
-        }
-    }
-    Ok(())
-}
-
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
@@ -1938,18 +1692,6 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             }
             value
         }
-        ModelFunc::English { operation, args } => {
-            let args = args
-                .into_iter()
-                .map(|arg| {
-                    lower_value(arg, ctx)?
-                        .project(&())
-                        .map_err(|_| Error::english("English functions do not accept attachments".into(), range))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let output = eval_english(operation, &args, &mut ctx.rng).map_err(|detail| Error::english(detail, range))?;
-            json_to_value(output.into())
-        }
         ModelFunc::Provider { function, args } => {
             let args = args
                 .into_iter()
@@ -1966,7 +1708,7 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
                 Ok(value) => json_to_value(value),
                 Err(EvaluateError::Shape) => return Err(shape_error(ctx)),
                 Err(EvaluateError::UnsupportedAttachment) => return Err(Error::new(ErrorKind::UnsupportedAttachment, range)),
-                Err(EvaluateError::Invalid(detail)) => return Err(Error::call(detail.to_owned(), range)),
+                Err(EvaluateError::Invalid(detail)) => return Err(Error::call(detail.into_owned(), range)),
             }
         }
         ModelFunc::Choice(options) => {
@@ -2909,14 +2651,6 @@ impl Error {
             detail: Some(detail),
         }
     }
-
-    fn english(detail: String, range: SrcRange) -> Self {
-        Self {
-            kind: ErrorKind::InvalidEnglish,
-            range,
-            detail: Some(detail),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2948,7 +2682,6 @@ pub enum ErrorKind {
     InvalidRender,
     InvalidCompose,
     InvalidSample,
-    InvalidEnglish,
     CircularReference,
     AbsentRefField,
     RefShapeMismatch,
@@ -2983,7 +2716,6 @@ impl fmt::Display for ErrorKind {
             Self::InvalidRender => "render requires balanced braces and named string, number, or boolean values",
             Self::InvalidCompose => "compose parts must be strings or null",
             Self::InvalidSample => "sample count must be an integer between zero and the array length",
-            Self::InvalidEnglish => "invalid English language function argument",
             Self::JoinElementNotScalar => "join element is not a string, number, or boolean",
             Self::CircularReference => "references form a cycle",
             Self::AbsentRefField => "referenced block does not set the field",
@@ -3018,6 +2750,12 @@ mod tests {
     use super::*;
     use crate::providers::braintrust::functions::count_tokens;
     use crate::providers::braintrust::mocking::compile;
+
+    // the English functions belong to the world provider
+    fn compile_with_world(source: &str) -> Result<Model, String> {
+        use crate::providers::{Provider, With, braintrust, world};
+        With(braintrust::Bundle, world::Bundle).compile(source)
+    }
 
     macro_rules! value {
         ($($tokens:tt)*) => { JsonValue::from(serde_json::json!($($tokens)*)) };
@@ -3664,7 +3402,7 @@ mod tests {
         let source = r#"(t_root:task {name: "t"}) {output: {sentence: realize(t_root.local.arrival), combined: combine([|t_root.local.arrival, t_root.local.checkin|], "and"), first: refer(t_root.local.guest, {}), later: refer(t_root.local.guest, t_root.local.context), reset: refer(t_root.local.guest, {}), context: t_root.local.context, details: unmentioned([|{id: "arrival", text: "The arrival is recorded."}, {id: "key", text: "Your key is at reception."}|], t_root.local.context), amount: format_number("1234567.125", {locale: "en-IN", fraction_digits: 2}), date: format_date("2026-11-10", {locale: "en-GB"}), time: format_time("17:30", {locale: "en-US"}), composed: compose([|render("Hello {name}.", {name: t_root.local.guest.label}), realize(t_root.local.checkin)|])}, local: {guest: {id: "guest_1", label: "Maya", pronouns: {subject: "she", object: "her", possessive_determiner: "her", possessive: "hers"}}, arrival: {clause: {subject: {text: "the guest"}, predicate: {verb: "arrive"}, tense: "future"}}, checkin: {clause: {subject: {text: "the guest"}, predicate: {verb: "check", complement: "in"}, modal: "can"}}, context: remember({}, [|t_root.local.guest|], [|"arrival"|])}, input: t.input};
 (t:agent) {input: null, output: t_root.output};
 (t)-[:next]->(t_root);"#;
-        let generated = plan(compile(source).unwrap(), 2, 42).unwrap();
+        let generated = plan(compile_with_world(source).unwrap(), 2, 42).unwrap();
         for event in generated.events.iter() {
             let output = event.fields.output.as_ref().unwrap();
             assert_eq!(output["sentence"], JsonValue::from("The guest will arrive."));
@@ -3691,8 +3429,8 @@ mod tests {
         let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.reply, local: {reply: vary("The guest cannot check in.")}};
 (t:agent) {input: t_root.local.reply, output: t_root.output};
 (t)-[:next]->(t_root);"#;
-        let first = plan(compile(source).unwrap(), 32, 7).unwrap();
-        assert_eq!(first, plan(compile(source).unwrap(), 32, 7).unwrap());
+        let first = plan(compile_with_world(source).unwrap(), 32, 7).unwrap();
+        assert_eq!(first, plan(compile_with_world(source).unwrap(), 32, 7).unwrap());
         let outputs = first
             .events
             .iter()
@@ -3707,7 +3445,7 @@ mod tests {
             "output = turn.reply",
             "output = turn.reply metadata = { other = choice(1, 2) }",
         );
-        let changed = plan(compile(&with_unrelated).unwrap(), 32, 7).unwrap();
+        let changed = plan(compile_with_world(&with_unrelated).unwrap(), 32, 7).unwrap();
         for (before, after) in first.events.iter().zip(changed.events.iter()) {
             assert_eq!(before.fields.output, after.fields.output);
         }
@@ -3727,8 +3465,8 @@ mod tests {
             let source = format!(
                 "(t_root:task {{name: \"t\"}}) {{output: {expression}, input: t.input}};\n(t:agent) {{input: null, output: t_root.output}};\n(t)-[:next]->(t_root);"
             );
-            let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidEnglish);
+            let error = plan(compile_with_world(&source).unwrap(), 1, 0).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidCall);
             assert_eq!(&source[error.range.start..error.range.end], expression);
             assert!(error.to_string().contains(detail), "{error}");
             let diagnostic: crate::dsl::Diag = error.into();
