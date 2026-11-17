@@ -13,6 +13,10 @@ use bts_lang::{Construct, spec::SPEC};
 /// - Every kind its schema lists is a language primitive, a construct root or a kind
 ///   it defines, and belongs to the construct it is listed under.
 /// - Its guidance mentions every kind it defines, as a whole word.
+/// - Every function its schema declares is named once, is not a built-in function,
+///   accepts some type for each parameter and has exactly one implementation.
+/// - Every implementation belongs to a declared function, runs somewhere, and each
+///   helper's text defines the function the helper names.
 pub fn check<P: Provider>(provider: &P) -> Vec<String> {
     let schema = provider.schema();
     let mut problems = Vec::new();
@@ -76,6 +80,44 @@ pub fn check<P: Provider>(provider: &P) -> Vec<String> {
                     ));
                 }
                 Some(_) => {}
+            }
+        }
+    }
+
+    let functions = provider.functions();
+    for (index, function) in schema.functions.iter().enumerate() {
+        let name = function.doc.name;
+        if schema.functions[..index].iter().any(|earlier| earlier.doc.name == name) {
+            problems.push(format!("function `{name}` is declared twice"));
+        }
+        if SPEC.function(name).is_some() {
+            problems.push(format!("function `{name}` is a built-in function"));
+        }
+        for param in function.params {
+            if param.accepts.is_empty() {
+                problems.push(format!("function `{name}` accepts no type for `{}`", param.name));
+            }
+        }
+        match functions.iter().filter(|known| known.name == name).count() {
+            1 => {}
+            0 => problems.push(format!("function `{name}` has no implementation")),
+            _ => problems.push(format!("function `{name}` has more than one implementation")),
+        }
+    }
+    for function in functions {
+        let name = function.name;
+        if !schema.functions.iter().any(|declared| declared.doc.name == name) {
+            problems.push(format!("the implementation `{name}` belongs to no declared function"));
+        }
+        if function.data.is_none() && function.python.is_none() && function.typescript.is_none() {
+            problems.push(format!("function `{name}` runs nowhere"));
+        }
+        let helpers = [("def", &function.python), ("function", &function.typescript)];
+        for (keyword, helper) in helpers {
+            if let Some(helper) = helper
+                && !helper.text.contains(&format!("\n{keyword} {}(", helper.name))
+            {
+                problems.push(format!("the helper text of `{name}` does not define `{}`", helper.name));
             }
         }
     }

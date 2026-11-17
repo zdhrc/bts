@@ -5,6 +5,7 @@ pub mod config;
 pub mod defs;
 #[cfg(feature = "native")]
 pub mod features;
+pub mod functions;
 pub mod mocking;
 pub(crate) mod naming;
 pub mod skill;
@@ -28,6 +29,10 @@ impl super::Provider for Bundle {
 
     fn schema(&self) -> bts_lang::ProviderSchema<'static> {
         mocking::SCHEMA
+    }
+
+    fn functions(&self) -> &'static [crate::mocking::Function] {
+        functions::FUNCTIONS
     }
 
     fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {

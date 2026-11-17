@@ -1,7 +1,7 @@
 use bts_core::mocking::{ScorerLang, code, data};
 use bts_core::providers::Provider;
 use bts_core::providers::braintrust::{Bundle, mocking::code::CodeTarget};
-use bts_lang::semantics::{Source, compile_with_definitions};
+use bts_lang::semantics::{Source, compile_module_with_provider};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -30,12 +30,13 @@ const SOURCE: &str = r#"# shared mock data and mock code case
 "#;
 
 fn lower(source: &str) -> Result<bts_core::mocking::Model, String> {
-    let graph = compile_with_definitions(
+    let graph = compile_module_with_provider(
         Source {
             name: "agent.bt",
             text: source,
         },
-        Bundle.schema().definitions,
+        &Bundle.schema(),
+        false,
     )
     .unwrap_or_else(|errors| panic!("{errors:#?}"));
     Bundle.lower(&graph).map_err(|diag| diag.what)

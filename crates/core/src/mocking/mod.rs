@@ -1,6 +1,7 @@
 //! Shared execution contracts for data generation and code emission.
 pub mod code;
 pub mod data;
+pub mod functions;
 
 pub use crate::providers::braintrust::{Automation, AutomationKind, Dataset, DatasetCase, DatasetSource, Experiment, Facet};
 pub use bts_lang::{BinOp, Diag, DiagPhase, Diags, EnglishOperation, Number, SrcRange, UnaryOp, syntax};
@@ -10,3 +11,4 @@ pub use data::contracts::{
     ScorerSpan, Selection, Span, SpanFields, SpanKind, Step, Trace,
 };
 pub use data::value::expr::*;
+pub use functions::{Check, Consumer, Evaluate, EvaluateError, Evaluation, Function, Helper};

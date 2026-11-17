@@ -32,6 +32,12 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
 
         let body = emitter.steps(item.steps, item.name)?;
         let fallback = emitter.lower(item.score)?;
+        // the assembly reports these calls with their locations before any module is emitted
+        if !emitter.unsupported.is_empty() {
+            return Err(Error::Unsupported {
+                what: "a provider function",
+            });
+        }
         let function = crate::mocking::code::lowering::scoring::function(item, body, fallback, crate::dsl::ScorerLang::Python);
         functions.push(format!(
             "# scorer \"{name}\"\n{}",

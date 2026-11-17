@@ -15,7 +15,7 @@ pub(crate) mod planning;
 #[cfg(feature = "native")]
 pub mod writing;
 
-pub use assembly::{AssemblyError, Error, assemble, assemble_agents, resolve_slugs};
+pub use assembly::{AgentError, AssemblyError, Error, assemble, assemble_agents, resolve_slugs};
 pub use codebase::{CodebaseContext, CodebaseFile, CodebasePlan, CodebaseRemoval, ExistingFiles, plan_codebase};
 pub use contracts::{AgentTarget, Assembly, CodeGroup, Emitter, Item, Judge, Module, SourceFile, Target, arg_name};
 pub use languages::Error as EmitError;

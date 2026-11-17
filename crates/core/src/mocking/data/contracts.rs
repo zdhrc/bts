@@ -69,6 +69,8 @@ pub struct Model {
     pub datasets: Vec<Dataset>,
     /// Experiment definitions in declaration order.
     pub experiments: Vec<Experiment>,
+    /// The functions the provider supplies, which calls in the model refer to.
+    pub functions: &'static [crate::mocking::Function],
 }
 
 /// Identifies a block within one compiled model.

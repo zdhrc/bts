@@ -1,6 +1,6 @@
 use bts_core::providers::braintrust::mocking::compile;
 use bts_core::{
-    mocking::{code, data},
+    mocking::{Consumer, Function, Helper, ScorerLang, code, data},
     providers::{Bundle, CodeProvider, DataProvider, Guidance, Provider, braintrust, conformance},
     selection::filter::WriteFilter,
 };
@@ -291,6 +291,69 @@ fn braintrust_conforms_to_the_provider_contract() {
     assert_eq!(conformance::check(&braintrust::Bundle), Vec::<String>::new());
 }
 
+const fn described(name: &'static str, params: &'static [bts_lang::ParamDesc]) -> bts_lang::FunctionDesc {
+    bts_lang::FunctionDesc {
+        doc: bts_lang::spec::FuncDesc {
+            tags: &[],
+            id: bts_lang::spec::Id::new("func.test"),
+            name,
+            syntax: name,
+            summary: "A function declared for the conformance check.",
+            examples: &[],
+            rules: &[],
+        },
+        params,
+        returns: bts_lang::FieldType::Any,
+    }
+}
+
+// declares a function twice, redefines a built-in, leaves a parameter without a type and one function without an implementation
+const INCONSISTENT_DESCRIPTORS: &[bts_lang::FunctionDesc] = &[
+    described("measure", &[]),
+    described("measure", &[]),
+    described("upper", &[]),
+    described(
+        "weigh",
+        &[bts_lang::ParamDesc {
+            name: "value",
+            accepts: &[],
+            constant: false,
+            bounds: None,
+        }],
+    ),
+];
+
+// implements a function nobody declared, one that runs nowhere, and a helper whose text defines another name
+static INCONSISTENT_FUNCTIONS: &[Function] = &[
+    Function {
+        name: "measure",
+        check: None,
+        data: None,
+        python: Some(Helper {
+            name: "_measure",
+            reads_as: None,
+            random: false,
+            counts: false,
+            text: "\ndef _weigh(value):\n    return 0\n",
+        }),
+        typescript: None,
+    },
+    Function {
+        name: "upper",
+        check: None,
+        data: None,
+        python: None,
+        typescript: None,
+    },
+    Function {
+        name: "orphan",
+        check: Some(|_| Ok(())),
+        data: None,
+        python: None,
+        typescript: None,
+    },
+];
+
 // lists kinds it never defines, files one under the wrong construct, and says nothing about its own kind
 struct Inconsistent;
 
@@ -314,7 +377,12 @@ impl Provider for Inconsistent {
             forks: &[],
             junctions: &[],
             context: &[],
+            functions: INCONSISTENT_DESCRIPTORS,
         }
+    }
+
+    fn functions(&self) -> &'static [Function] {
+        INCONSISTENT_FUNCTIONS
     }
 
     fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
@@ -342,6 +410,14 @@ fn the_conformance_check_reports_each_inconsistency() {
             "schema id `other` is not the bundle id `inconsistent`",
             "node kind `gadget` is neither a primitive nor defined by the provider",
             "`next` is listed under node kinds and belongs to edge kinds",
+            "function `measure` is declared twice",
+            "function `upper` is a built-in function",
+            "function `weigh` accepts no type for `value`",
+            "function `weigh` has no implementation",
+            "the helper text of `measure` does not define `_measure`",
+            "function `upper` runs nowhere",
+            "the implementation `orphan` belongs to no declared function",
+            "function `orphan` runs nowhere",
             "the guidance does not mention the kind `widget`",
         ]
     );
@@ -368,6 +444,7 @@ fn the_conformance_check_locates_definitions_that_do_not_compile() {
                 forks: &[],
                 junctions: &[],
                 context: &[],
+                functions: &[],
             }
         }
         fn elements(&self, _: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
@@ -392,4 +469,176 @@ fn a_provider_compiles_source_against_its_own_definitions() {
     assert!(Inconsistent.compile_module("(a:widget);", false).is_ok());
     assert_eq!(braintrust::Bundle.schema().definition(1).unwrap().name, "braintrust.bt");
     assert!(braintrust::Bundle.schema().definition(0).is_none());
+}
+
+const TWO_AGENTS: &str = r#"(files:agent) {input: null, output: work.output};
+(files)-[:next]->(work);
+(work:task {name: "work"}) {
+    input: files.input,
+    output: {report: attachment("report.pdf", "application/pdf"), size: tokens("four words of text")},
+};
+(other:agent) {input: null, output: plain.output};
+(other)-[:next]->(plain);
+(plain:task {name: "plain"}) {input: other.input, output: noise(8)};
+("length":scorer {lang: "python"}) {score: clamp(tokens(context.output) / 400, 0.1, 0.9)};
+("fixed":scorer {lang: "python"}) {score: 0.5};
+"#;
+
+fn located<'a>(source: &'a str, diag: &bts_lang::Diag) -> &'a str {
+    &source[diag.r#where.start..diag.r#where.end]
+}
+
+#[test]
+fn braintrust_declares_and_implements_the_functions_that_left_the_language() {
+    let declared: Vec<&str> = (braintrust::Bundle.schema().functions.iter())
+        .map(|function| function.doc.name)
+        .collect();
+    assert_eq!(declared, ["tokens", "attachment", "noise"]);
+    for name in &declared {
+        assert!(bts_lang::spec::SPEC.function(name).is_none(), "{name}");
+        assert!(bts_lang::semantics::compile(&format!("(v:vars) {{value: {name}()}};")).is_err());
+    }
+    let runs = |name: &str, consumer| {
+        let functions = braintrust::Bundle.functions();
+        functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap()
+            .runs(consumer)
+    };
+    let agents = [Consumer::Agent(ScorerLang::Python), Consumer::Agent(ScorerLang::Typescript)];
+    for name in ["tokens", "noise"] {
+        assert!(
+            runs(name, Consumer::Data) && agents.iter().all(|agent| runs(name, *agent)),
+            "{name}"
+        );
+    }
+    assert!(runs("attachment", Consumer::Data) && !agents.iter().any(|agent| runs("attachment", *agent)));
+    assert!(!declared.iter().any(|name| runs(name, Consumer::Scorer)));
+
+    // data generation runs all three
+    let model = compile(TWO_AGENTS).unwrap();
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let events = data::generate(
+        model,
+        2,
+        Duration::from_secs(60),
+        data::Distribution::Linear,
+        now,
+        7,
+        &braintrust::Bundle.format(),
+    )
+    .unwrap();
+    let outputs: Vec<_> = events.events.iter().filter_map(|event| event.output.as_ref()).collect();
+    assert!(
+        outputs
+            .iter()
+            .any(|output| matches!(output["report"], data::Value::Attachment(_)))
+    );
+    assert!(outputs.iter().any(|output| output["size"].as_i64() == Some(4)));
+    assert!(
+        outputs
+            .iter()
+            .any(|output| output.as_str().is_some_and(|noise| noise.len() == 8))
+    );
+}
+
+#[test]
+fn a_function_a_consumer_cannot_run_is_reported_where_it_is_called() {
+    let model = compile(TWO_AGENTS).unwrap();
+    let target = braintrust::mocking::code::CodeTarget::new("local-test");
+
+    // an agent build reports the call in the agent it generates
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let Err(code::AgentError::Unsupported(diags)) = code::assemble_agents(&model, lang, &target) else {
+            panic!("expected located diagnostics")
+        };
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(
+            located(TWO_AGENTS, &diags[0]),
+            r#"attachment("report.pdf", "application/pdf")"#
+        );
+        let language = if lang == ScorerLang::Python { "Python" } else { "TypeScript" };
+        assert_eq!(
+            diags[0].what,
+            format!("function `attachment` is not supported by {language} agent generation")
+        );
+        // an agent that is not generated does not stop the one that is
+        let selected = bts_core::selection::agents(&model, &["agent.other".parse().unwrap()]).unwrap();
+        assert!(code::assemble_agents(&selected, lang, &target).is_ok());
+    }
+
+    // a scorer build reports the call in the scorer it generates
+    let emitter = braintrust::Bundle.emitter();
+    let target = braintrust::Bundle.code(&"local-test".to_owned());
+    let Err(code::AssemblyError::Unsupported(diags)) = code::assemble(&model.scorers, None, &emitter, &target) else {
+        panic!("expected located diagnostics")
+    };
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(located(TWO_AGENTS, &diags[0]), "tokens(context.output)");
+    assert_eq!(diags[0].what, "function `tokens` is not supported by scorer generation");
+    assert!(code::assemble(&model.scorers[1..], None, &emitter, &target).is_ok());
+}
+
+#[test]
+fn a_provider_checks_the_arguments_its_descriptor_cannot_declare() {
+    for (call, message) in [
+        (
+            r#"attachment("", "text/plain")"#,
+            "function `attachment` path must be a constant file path",
+        ),
+        (
+            r#"attachment("..", "text/plain")"#,
+            "function `attachment` path must be a constant file path",
+        ),
+        (
+            r#"attachment("a.txt", "")"#,
+            "function `attachment` content_type must be a non-empty constant MIME type",
+        ),
+    ] {
+        let source = format!("(v:vars) {{value: {call}}};");
+        let errors = braintrust::Bundle.compile_module(&source, false).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!((errors[0].what.as_str(), located(&source, &errors[0])), (message, call));
+    }
+    // what the descriptor declares is checked by the language, at the argument
+    let source = "(v:vars) {value: noise(8388609)};";
+    let errors = braintrust::Bundle.compile_module(source, false).unwrap_err();
+    assert!(
+        errors[0]
+            .what
+            .starts_with("function `noise` size must be an integer between 0 and 8388608")
+    );
+    assert_eq!(located(source, &errors[0]), "8388609");
+}
+
+#[test]
+fn the_skill_lists_the_functions_a_provider_contributes() {
+    let skill = bts_core::skill::render(&bts_lang::spec::SPEC, &braintrust::Bundle);
+    let heading = skill.find("## Braintrust mocking functions").unwrap();
+    assert!(heading > skill.find("## Global rules").unwrap());
+    for function in braintrust::Bundle.schema().functions {
+        let entry = skill[heading..].find(&format!("### `{}`", function.doc.name)).unwrap();
+        assert!(skill[heading + entry..].contains(function.doc.summary));
+        assert!(skill[heading + entry..].contains(function.doc.syntax));
+    }
+}
+
+#[test]
+fn the_examples_of_a_provider_function_compile_against_the_provider() {
+    let settings = r#"(settings:vars) {prompt: "hello"};"#;
+    for function in braintrust::Bundle.schema().functions {
+        assert!(!function.doc.examples.is_empty(), "{}", function.doc.name);
+        for example in function.doc.examples {
+            let text = format!("{settings} (example:vars) {{value: {example}}};");
+            let source = bts_lang::semantics::Source {
+                name: "example.bt",
+                text: &text,
+            };
+            let schema = braintrust::Bundle.schema();
+            let model = bts_lang::semantics::compile_module_with_provider(source, &schema, false);
+            let model = model.unwrap_or_else(|errors| panic!("{example}: {errors:?}"));
+            assert_eq!(braintrust::Bundle.unsupported(&model), [], "{example}");
+        }
+    }
 }

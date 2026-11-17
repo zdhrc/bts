@@ -4,7 +4,7 @@ use crate::{
     model::*,
     spec,
 };
-use std::{collections::HashMap, fmt, path::Path};
+use std::{collections::HashMap, fmt};
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum ExprType {
     String,
@@ -30,7 +30,7 @@ impl ExprType {
                 Value::Bool(_) => Self::Boolean,
                 Value::Null => Self::Null,
                 Value::Array(_) => Self::Array,
-                Value::Object(_) | Value::Attachment { .. } => Self::Object,
+                Value::Object(_) => Self::Object,
                 Value::Func { .. } => Self::Func,
                 // constant exprs fold to values, only dynamic ones get here
                 Value::Input { .. }
@@ -146,6 +146,8 @@ struct ExpressionModeler<'a> {
     types: HashMap<BindingId, FieldType>,
     errors: Errors,
     reference_errors: Diags,
+    // the functions the provider contributes, checked from their descriptors
+    functions: &'a [FunctionDesc],
     resolve: &'a mut Resolver<'a>,
 }
 impl<'a> ExpressionModeler<'a> {
@@ -1259,7 +1261,7 @@ impl<'a> ExpressionModeler<'a> {
             Value::GraphRef { .. } | Value::FieldRef(_) => false,
             Value::Input { .. } => true,
             Value::Context { .. } => true,
-            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::Attachment { .. } => false,
+            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null => false,
             Value::Template(template) => template.parts.iter().any(|part| match part {
                 Part::Dynamic(value) => self.value_reaches_context(value),
                 Part::Lit(_) | Part::BindingRef(_) => false,
@@ -1294,8 +1296,7 @@ impl<'a> ExpressionModeler<'a> {
                 | Func::Chance { .. }
                 | Func::Uuid
                 | Func::Hex { .. }
-                | Func::Alphanum { .. }
-                | Func::Attachment { .. } => false,
+                | Func::Alphanum { .. } => false,
                 Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => self.value_reaches_context(text),
                 Func::Replace { text, from, to } => {
                     self.value_reaches_context(text) || self.value_reaches_context(from) || self.value_reaches_context(to)
@@ -1314,15 +1315,13 @@ impl<'a> ExpressionModeler<'a> {
                 Func::StartsWith { text, prefix } => self.value_reaches_context(text) || self.value_reaches_context(prefix),
                 Func::EndsWith { text, suffix } => self.value_reaches_context(text) || self.value_reaches_context(suffix),
                 Func::Len { target } => self.value_reaches_context(target),
-                Func::Tokens { value } => self.value_reaches_context(value),
-                Func::Format { args, .. } | Func::English { args, .. } => any(args),
+                Func::Format { args, .. } | Func::English { args, .. } | Func::Call { args, .. } => any(args),
                 Func::Clamp { value, min, max } => {
                     self.value_reaches_context(value) || self.value_reaches_context(min) || self.value_reaches_context(max)
                 }
                 Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
                     self.value_reaches_context(value)
                 }
-                Func::Noise { size } => self.value_reaches_context(size),
             },
         }
     }
@@ -1425,9 +1424,20 @@ impl<'a> ExpressionModeler<'a> {
 
     // none = unknown, out of scope, or an invalid definition, all diagnosed
     fn model_func(&mut self, name: String, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
+        // a name defined twice has no single meaning, whoever defines it
+        let provided = self.functions.iter().filter(|desc| desc.doc.name == name).count();
+        if provided + usize::from(spec::SPEC.function(&name).is_some()) > 1 {
+            self.errors.push(Error::new(ErrorKind::AmbiguousFunction { name }, range));
+            return None;
+        }
         // the descriptor's name doubles as the &'static str for diagnostics
         let Some(func) = spec::SPEC.function(&name).map(|desc| desc.name) else {
-            let nearest = crate::modeling::suggestion(&name, spec::SPEC.functions.iter().map(|desc| desc.name));
+            if let Some(desc) = self.functions.iter().find(|desc| desc.doc.name == name) {
+                return self.model_call(*desc, args, range);
+            }
+            let known =
+                (spec::SPEC.functions.iter().map(|desc| desc.name)).chain(self.functions.iter().map(|desc| desc.doc.name));
+            let nearest = crate::modeling::suggestion(&name, known);
             self.errors.push(Error::new(
                 ErrorKind::UnknownFunction {
                     rule: spec::ids::KNOWN_FUNCTIONS,
@@ -1694,20 +1704,6 @@ impl<'a> ExpressionModeler<'a> {
                     target: Box::new(target.into_value()),
                 })
             }
-            "tokens" => {
-                let [value] = self.func_args(func, args, "exactly one argument", range)?;
-                let known = matches!(
-                    self.static_type(&value),
-                    Some(StaticType::String | StaticType::Array | StaticType::Object)
-                );
-                if !known && !self.defers_to_evaluation(&value) {
-                    self.push_func_arg_type(&value, func, "string, array, or object");
-                    return None;
-                }
-                Some(Func::Tokens {
-                    value: Box::new(value.into_value()),
-                })
-            }
             "format" => self.model_format(args, range),
 
             "clamp" => {
@@ -1789,61 +1785,90 @@ impl<'a> ExpressionModeler<'a> {
                     Func::Alphanum { length }
                 })
             }
-            "noise" => {
-                let [size] = self.func_args(func, args, "exactly one argument (size)", range)?;
-                // a constant size settles its bounds during validation
-                if let FoldedKind::Value(Value::Num(number)) = &size.kind {
-                    let valid = matches!(number, Number::Int(value) if (0..=NOISE_SIZE_CAP).contains(value));
-                    if !valid {
-                        self.errors.push(Error::new(
-                            ErrorKind::ParamOutOfRange {
-                                rule: spec::ids::NOISE_SIZE,
-                                func,
-                                param: "size",
-                                expected: "an integer between 0 and 8388608",
-                            },
-                            size.range,
-                        ));
-                        return None;
-                    }
-                }
-                let size = self.model_typed_arg(size, func, StaticType::Number)?;
-                Some(Func::Noise { size: Box::new(size) })
-            }
-            "attachment" => {
-                let [path, content_type] = self.func_args(func, args, "exactly two arguments (path, content_type)", range)?;
-                let Some(path_text) = const_string(&path).filter(|path| Path::new(path).file_name().is_some()) else {
-                    self.errors.push(Error::new(
-                        ErrorKind::ParamOutOfRange {
-                            rule: spec::ids::FUNC_ARG_TYPES,
-                            func,
-                            param: "path",
-                            expected: "a constant file path",
-                        },
-                        path.range,
-                    ));
-                    return None;
-                };
-                let Some(content_type_text) = const_string(&content_type).filter(|value| !value.is_empty()) else {
-                    self.errors.push(Error::new(
-                        ErrorKind::ParamOutOfRange {
-                            rule: spec::ids::FUNC_ARG_TYPES,
-                            func,
-                            param: "content_type",
-                            expected: "a non-empty constant MIME type",
-                        },
-                        content_type.range,
-                    ));
-                    return None;
-                };
-                Some(Func::Attachment {
-                    path: path_text,
-                    content_type: content_type_text,
-                })
-            }
 
             _ => unreachable!("function {name} does not have a model lowering"),
         }
+    }
+
+    // a provider function: the descriptor says what to check, and the call is never folded
+    fn model_call(&mut self, desc: FunctionDesc, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
+        let func = desc.doc.name;
+        if args.len() != desc.params.len() {
+            let count = match desc.params.len() {
+                0 => "no arguments".to_owned(),
+                1 => "exactly one argument".to_owned(),
+                2 => "exactly two arguments".to_owned(),
+                3 => "exactly three arguments".to_owned(),
+                count => format!("exactly {count} arguments"),
+            };
+            let names: Vec<&str> = desc.params.iter().map(|param| param.name).collect();
+            let expected = match names.as_slice() {
+                [] => count,
+                names => format!("{count} ({})", names.join(", ")),
+            };
+            self.errors.push(Error::new(ErrorKind::CallArity { func, expected }, range));
+            return None;
+        }
+        // a rule beyond the two every function shares is the provider's own account of its parameters
+        let shared = [spec::ids::FUNC_ARITY, spec::ids::FUNC_ARG_TYPES];
+        let rule = (desc.doc.rules.iter())
+            .find(|rule| !shared.contains(&rule.id))
+            .map(|rule| rule.summary);
+        let mut valid = true;
+        let mut values = Vec::with_capacity(args.len());
+        for (arg, param) in args.into_iter().zip(desc.params) {
+            let bounded = match (&arg.kind, param.bounds) {
+                (FoldedKind::Value(Value::Num(number)), Some((low, high))) => {
+                    matches!(number, Number::Int(value) if (low..=high).contains(value))
+                }
+                _ => true,
+            };
+            let found = self.static_type(&arg);
+            let typed = param.accepts.iter().any(|ty| match schema_static_type(*ty) {
+                Some(accepted) => found == Some(accepted),
+                None => true,
+            });
+            if param.constant && !is_constant(&arg) {
+                self.errors.push(Error::new(
+                    ErrorKind::CallParam {
+                        func,
+                        param: param.name,
+                        expected: format!("a constant {}", accepted_types(param.accepts)),
+                        rule,
+                    },
+                    arg.range,
+                ));
+                valid = false;
+            } else if !typed && !self.defers_to_evaluation(&arg) {
+                self.errors.push(Error::new(
+                    ErrorKind::CallArgType {
+                        func,
+                        expected: accepted_types(param.accepts),
+                        found: self.found_type(&arg),
+                    },
+                    arg.range,
+                ));
+                valid = false;
+            } else if !bounded {
+                let (low, high) = param.bounds.unwrap_or_default();
+                self.errors.push(Error::new(
+                    ErrorKind::CallParam {
+                        func,
+                        param: param.name,
+                        expected: format!("an integer between {low} and {high}"),
+                        rule,
+                    },
+                    arg.range,
+                ));
+                valid = false;
+            }
+            values.push(arg.into_value());
+        }
+        valid.then(|| Func::Call {
+            function: func.to_owned(),
+            args: values,
+            returns: desc.returns,
+        })
     }
 
     fn model_weighted(&mut self, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
@@ -2248,7 +2273,7 @@ impl<'a> ExpressionModeler<'a> {
             Value::Bool(_) => Some(StaticType::Boolean),
             Value::Null => Some(StaticType::Null),
             Value::Array(_) => Some(StaticType::Array),
-            Value::Object(_) | Value::Attachment { .. } => Some(StaticType::Object),
+            Value::Object(_) => Some(StaticType::Object),
             // a binding is typed by its definition
             Value::BindingRef(name, _) => self
                 .types
@@ -2365,7 +2390,6 @@ impl<'a> ExpressionModeler<'a> {
             | Func::Beta { .. }
             | Func::Poisson { .. }
             | Func::Len { .. }
-            | Func::Tokens { .. }
             | Func::Clamp { .. }
             | Func::Round { .. }
             | Func::Floor { .. }
@@ -2386,15 +2410,14 @@ impl<'a> ExpressionModeler<'a> {
             | Func::Format { .. }
             | Func::Uuid
             | Func::Hex { .. }
-            | Func::Alphanum { .. }
-            | Func::Noise { .. } => Some(StaticType::String),
+            | Func::Alphanum { .. } => Some(StaticType::String),
             Func::Split { .. } | Func::Sample { .. } => Some(StaticType::Array),
             Func::English { operation, .. } => Some(match operation {
                 EnglishOperation::Remember | EnglishOperation::Expression => StaticType::Object,
                 EnglishOperation::Unmentioned | EnglishOperation::ExpressionCandidates => StaticType::Array,
                 _ => StaticType::String,
             }),
-            Func::Attachment { .. } => Some(StaticType::Object),
+            Func::Call { returns, .. } => schema_static_type(*returns),
         }
     }
 
@@ -2575,6 +2598,20 @@ fn type_name(required: StaticType) -> &'static str {
     }
 }
 
+// the types a provider parameter accepts, as a diagnostic reads them
+fn accepted_types(accepts: &[FieldType]) -> String {
+    let names: Vec<&str> = accepts
+        .iter()
+        .map(|ty| schema_static_type(*ty).map_or("value", type_name))
+        .collect();
+    match names.as_slice() {
+        [] => "value".to_owned(),
+        [only] => (*only).to_owned(),
+        [first, second] => format!("{first} or {second}"),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+    }
+}
+
 fn is_constant(folded: &Folded) -> bool {
     match &folded.kind {
         FoldedKind::Value(value) => value_is_constant(value),
@@ -2598,8 +2635,7 @@ fn value_is_constant(value: &Value) -> bool {
         | Value::GraphRef { .. }
         | Value::Input { .. }
         | Value::FieldRef(_)
-        | Value::Context { .. }
-        | Value::Attachment { .. } => false,
+        | Value::Context { .. } => false,
         Value::Unary { .. } | Value::Binary { .. } | Value::Cond { .. } | Value::Index { .. } | Value::Slice { .. } => false,
     }
 }
@@ -2704,6 +2740,25 @@ enum ErrorKind {
         rule: spec::Id,
         name: String,
         nearest: String,
+    },
+    AmbiguousFunction {
+        name: String,
+    },
+    CallArity {
+        func: &'static str,
+        expected: String,
+    },
+    CallArgType {
+        func: &'static str,
+        expected: String,
+        found: ExprType,
+    },
+    CallParam {
+        func: &'static str,
+        param: &'static str,
+        expected: String,
+        // the rule the provider documents for the function, when it has one of its own
+        rule: Option<&'static str>,
     },
     EmptyChoice {
         rule: spec::Id,
@@ -2849,6 +2904,34 @@ impl fmt::Display for ErrorKind {
             Self::UnknownFunction { rule, name, nearest } => {
                 let rule = rule_desc(*rule);
                 write!(formatter, "unknown function `{name}`{nearest}; {}", rule.summary)
+            }
+            Self::AmbiguousFunction { name } => {
+                let rule = rule_desc(spec::ids::PROVIDER_FUNCTIONS);
+                write!(formatter, "function `{name}` is defined more than once; {}", rule.summary)
+            }
+            Self::CallArity { func, expected } => {
+                let rule = rule_desc(spec::ids::FUNC_ARITY);
+                write!(formatter, "function `{func}` expects {expected}; {}", rule.summary)
+            }
+            Self::CallArgType { func, expected, found } => {
+                let rule = rule_desc(spec::ids::FUNC_ARG_TYPES);
+                write!(
+                    formatter,
+                    "function `{func}` expects a {expected} argument, but found {found}; {}",
+                    rule.summary
+                )
+            }
+            Self::CallParam {
+                func,
+                param,
+                expected,
+                rule,
+            } => {
+                write!(formatter, "function `{func}` {param} must be {expected}")?;
+                match rule {
+                    Some(rule) => write!(formatter, "; {rule}"),
+                    None => Ok(()),
+                }
             }
             Self::EmptyChoice { rule } => {
                 let rule = rule_desc(*rule);
@@ -3074,13 +3157,14 @@ fn folded_value(value: Value, range: SrcRange) -> Folded {
         value => Folded::value(value, range),
     }
 }
-pub(crate) fn lower(expr: ast::Expr, resolve: &mut Resolver<'_>) -> Result<Value, Diags> {
+pub(crate) fn lower(expr: ast::Expr, functions: &[FunctionDesc], resolve: &mut Resolver<'_>) -> Result<Value, Diags> {
     let mut modeler = ExpressionModeler {
         scopes: Vec::new(),
         vars: HashMap::new(),
         types: HashMap::new(),
         errors: Vec::new(),
         reference_errors: Vec::new(),
+        functions,
         resolve,
     };
     let value = modeler.fold_expr(expr);
@@ -3138,6 +3222,7 @@ fn with_value(
         types: HashMap::new(),
         errors: Vec::new(),
         reference_errors: Vec::new(),
+        functions: &[],
         resolve: &mut resolve,
     };
     let bindings = value.bindings.clone();
@@ -3231,8 +3316,7 @@ fn collect_refs(value: &Value, found: &mut Vec<BindingId>) {
         | Value::GraphRef { .. }
         | Value::Input { .. }
         | Value::FieldRef(_)
-        | Value::Context { .. }
-        | Value::Attachment { .. } => {}
+        | Value::Context { .. } => {}
         Value::Template(template) => collect_template_refs(template, found),
         Value::Array(array) => {
             for elem in &array.elem {
@@ -3296,8 +3380,7 @@ fn collect_func_refs(func: &Func, found: &mut Vec<BindingId>) {
         | Func::Chance { .. }
         | Func::Uuid
         | Func::Hex { .. }
-        | Func::Alphanum { .. }
-        | Func::Attachment { .. } => {}
+        | Func::Alphanum { .. } => {}
         Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => collect_refs(text, found),
         Func::Replace { text, from, to } => {
             collect_refs(text, found);
@@ -3331,8 +3414,7 @@ fn collect_func_refs(func: &Func, found: &mut Vec<BindingId>) {
             collect_refs(suffix, found);
         }
         Func::Len { target } => collect_refs(target, found),
-        Func::Tokens { value } => collect_refs(value, found),
-        Func::Format { args, .. } | Func::English { args, .. } => all(args),
+        Func::Format { args, .. } | Func::English { args, .. } | Func::Call { args, .. } => all(args),
         Func::Clamp { value, min, max } => {
             collect_refs(value, found);
             collect_refs(min, found);
@@ -3341,7 +3423,6 @@ fn collect_func_refs(func: &Func, found: &mut Vec<BindingId>) {
         Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
             collect_refs(value, found)
         }
-        Func::Noise { size } => collect_refs(size, found),
     }
 }
 

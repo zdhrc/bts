@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 pub(crate) struct Agent {
     pub functions: Vec<code::Function>,
-    pub tokens: bool,
+    // the provider helpers the agent calls
+    pub helpers: Vec<crate::mocking::Helper>,
     pub contracts: Vec<(String, Json)>,
 }
 
@@ -559,6 +560,23 @@ struct Context<'a> {
     unkept: Vec<String>,
     // values that are another value under a second name, and the value they stand for
     aliases: Vec<(String, String)>,
+    // calls to provider functions an agent in this language cannot run
+    unsupported: &'a Unsupported,
+}
+
+/// Provider function calls a consumer met and cannot run, each at its location.
+pub(crate) type Unsupported = std::cell::RefCell<bts_lang::Diags>;
+
+fn unsupported_call(
+    function: &crate::mocking::Function,
+    consumer: crate::mocking::Consumer,
+    range: bts_lang::SrcRange,
+) -> bts_lang::Diag {
+    bts_lang::Diag {
+        when: bts_lang::DiagPhase::Validation,
+        what: format!("function `{}` is not supported by {}", function.name, consumer.name()),
+        r#where: range,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -751,14 +769,32 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
     names
 }
 
-pub(crate) fn agent(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang) -> Result<Agent, String> {
-    execution::emit(model, trace, output, lang)
+pub(crate) fn agent(
+    model: &Model,
+    trace: &Trace,
+    output: &Value,
+    lang: ScorerLang,
+    unsupported: &Unsupported,
+) -> Result<Agent, String> {
+    execution::emit(model, trace, output, lang, unsupported)
 }
 
 fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr, String> {
     let expr = |v: &Value| expression(v, ctx, lang);
     Ok(match value {
         Value::CtxRef(reference) => context_ref(*reference, ctx)?,
+        // the call is reported with its location and the rest of the agent is still checked
+        Value::Func {
+            func: Func::Provider { function, .. },
+            range,
+        } if function.helper(lang).is_none() => {
+            let diag = unsupported_call(function, crate::mocking::Consumer::Agent(lang), *range);
+            let mut unsupported = ctx.unsupported.borrow_mut();
+            if !unsupported.contains(&diag) {
+                unsupported.push(diag);
+            }
+            Expr::Null
+        }
         Value::Func { func, .. } => expressions::emit(func, ctx, lang)?,
         Value::Index { target, index, .. } => Expr::call("_index", vec![expr(target)?, expr(index)?]),
         Value::Slice { target, start, end, .. } => {
@@ -1150,11 +1186,24 @@ mod execution {
     use crate::dsl::{Binding, SpanKind};
     use crate::mocking::code::planning::Operation;
 
-    pub(crate) fn emit(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang) -> Result<Agent, String> {
-        emit_form(model, trace, output, lang, true)
+    pub(crate) fn emit(
+        model: &Model,
+        trace: &Trace,
+        output: &Value,
+        lang: ScorerLang,
+        unsupported: &Unsupported,
+    ) -> Result<Agent, String> {
+        emit_form(model, trace, output, lang, true, unsupported)
     }
     // `ordered` prints statements in the order they run, and is tried before the deferred form
-    fn emit_form(model: &Model, trace: &Trace, output: &Value, lang: ScorerLang, ordered: bool) -> Result<Agent, String> {
+    fn emit_form(
+        model: &Model,
+        trace: &Trace,
+        output: &Value,
+        lang: ScorerLang,
+        ordered: bool,
+        unsupported: &Unsupported,
+    ) -> Result<Agent, String> {
         let try_ordered = ordered;
         let mut parents = Vec::new();
         let mut bindings = model.bindings.iter().chain(&trace.bindings).collect::<Vec<_>>();
@@ -1228,6 +1277,7 @@ mod execution {
             moved: Vec::new(),
             unkept: Vec::new(),
             aliases,
+            unsupported,
         };
         let all_bindings = model.bindings.iter().chain(&trace.bindings).cloned().collect::<Vec<_>>();
         let mut direct_ctx = ctx.clone();
@@ -1273,7 +1323,14 @@ mod execution {
                 }
             }
         };
-        let tokens = code::references(&body).contains(&Dependency::Variable("_tokens".into()));
+        let references = code::references(&body);
+        let mut helpers: Vec<crate::mocking::Helper> = Vec::new();
+        for helper in model.functions.iter().filter_map(|function| function.helper(lang)) {
+            let called = references.contains(&Dependency::Variable(helper.name.into()));
+            if called && !helpers.iter().any(|known| known.name == helper.name) {
+                helpers.push(*helper);
+            }
+        }
         let parameters = match lang {
             ScorerLang::Python => vec![
                 code::Parameter::new("input").with_default("_MISSING"),
@@ -1352,15 +1409,15 @@ mod execution {
         }
         let mut functions = vec![function, details, run, traced];
         let contracts = if direct_ctx.direct && matches!(functions[0].body.get(1), Some(Statement::TraceScope { .. })) {
-            match native::functions(&mut functions, lang, &numbered) {
+            match native::functions(&mut functions, lang, &numbered, &helpers) {
                 Some(contracts) => contracts,
-                None => return emit_form(model, trace, output, lang, false),
+                None => return emit_form(model, trace, output, lang, false, unsupported),
             }
         } else {
             vec![]
         };
         Ok(Agent {
-            tokens,
+            helpers,
             functions,
             contracts,
         })
@@ -1922,7 +1979,10 @@ mod native {
         collections: HashMap<String, (Expr, Branch)>,
         input: Option<Type>,
         types: std::rc::Rc<std::cell::RefCell<HashMap<String, Type>>>,
+        // the provider helpers that return a count
+        counts: Counts,
     }
+    type Counts = std::rc::Rc<HashSet<&'static str>>;
     #[derive(Clone, Debug)]
     struct Branch {
         span: Type,
@@ -2010,7 +2070,14 @@ mod native {
         functions: &mut Vec<code::Function>,
         lang: ScorerLang,
         numbered: &[(String, String)],
+        helpers: &[crate::mocking::Helper],
     ) -> Option<Vec<(String, Json)>> {
+        let counts: Counts = std::rc::Rc::new(
+            (helpers.iter())
+                .filter(|helper| helper.counts)
+                .map(|helper| helper.name)
+                .collect(),
+        );
         let mut nullable = HashSet::new();
         let mut accessed = HashSet::new();
         for f in functions.iter_mut() {
@@ -2294,6 +2361,7 @@ mod native {
                 exports: exports.clone(),
                 input: input_type.clone(),
                 types: types.clone(),
+                counts: counts.clone(),
                 ..Environment::default()
             };
             // what a caller passes in is plain data
@@ -2316,7 +2384,7 @@ mod native {
             });
         }
         observe(functions, lang);
-        eager_values(functions, &types.borrow(), lang);
+        eager_values(functions, &types.borrow(), &counts, lang);
         pure_functions(functions);
         hoist(functions, lang);
         let mut contracts = Vec::new();
@@ -2324,9 +2392,9 @@ mod native {
             contracts.push(("AgentInput".into(), schema.clone()));
         }
         annotate(functions, &types.borrow(), &mut contracts, lang);
-        expand_results(functions, lang, &types.borrow());
+        expand_results(functions, lang, &types.borrow(), &counts);
         local_names(functions, lang, numbered);
-        native_locals(functions, &types.borrow(), &contracts, lang);
+        native_locals(functions, &types.borrow(), &contracts, &counts, lang);
         idioms(functions, lang);
         request_parameters(functions, lang);
         aliases(functions);
@@ -2744,7 +2812,7 @@ mod native {
         }
     }
 
-    fn eager_values(functions: &mut [code::Function], types: &HashMap<String, Type>, lang: ScorerLang) {
+    fn eager_values(functions: &mut [code::Function], types: &HashMap<String, Type>, counts: &Counts, lang: ScorerLang) {
         fn total(value: &Expr, env: &Environment, lang: ScorerLang) -> bool {
             match value {
                 Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
@@ -2883,6 +2951,7 @@ mod native {
         }
         let env = Environment {
             names: types.clone(),
+            counts: counts.clone(),
             ..Environment::default()
         };
         for function in functions {
@@ -3271,6 +3340,7 @@ mod native {
         functions: &mut [code::Function],
         types: &HashMap<String, Type>,
         contracts: &[(String, Json)],
+        counts: &Counts,
         lang: ScorerLang,
     ) {
         fn infer(body: &[Statement], env: &mut Environment, lang: ScorerLang) {
@@ -3374,6 +3444,7 @@ mod native {
         for function in functions {
             let mut env = Environment {
                 names: types.clone(),
+                counts: counts.clone(),
                 ..Environment::default()
             };
             env.returns = types
@@ -3552,7 +3623,7 @@ mod native {
         }
     }
 
-    fn expand_results(functions: &mut [code::Function], lang: ScorerLang, types: &HashMap<String, Type>) {
+    fn expand_results(functions: &mut [code::Function], lang: ScorerLang, types: &HashMap<String, Type>, counts: &Counts) {
         fn collect(body: &[Statement], used: &mut HashSet<String>) {
             for statement in body {
                 match statement {
@@ -3645,6 +3716,7 @@ mod native {
                 lang,
                 &Environment {
                     names: types.clone(),
+                    counts: counts.clone(),
                     ..Environment::default()
                 },
             );
@@ -5537,7 +5609,6 @@ mod native {
                         // these return what they were given, or resolve it first
                         "_slice" | "_array" if kinds.first().is_some_and(materialized) => Type::Value,
                         "_history" | "_emissions" => Type::Value,
-                        "_tokens" => Type::Integer(0, 9_007_199_254_740_991),
                         // a fold resolves what it returns
                         "_fold" => Type::Value,
                         "_range" => match args.as_slice() {
@@ -5568,6 +5639,7 @@ mod native {
                                 _ => Type::Unknown,
                             }
                         }
+                        name if env.counts.contains(name) => Type::Integer(0, 9_007_199_254_740_991),
                         _ => env.returns.get(&name).cloned().unwrap_or(Type::Unknown),
                     };
                     (call, kind)
@@ -6015,9 +6087,16 @@ mod expressions {
                     random(),
                 ],
             ),
-            Func::Noise { size } => Expr::call("_noise", vec![expr(size)?, random()]),
-            Func::Tokens { value } => call("_tokens", &[value])?,
-            Func::Attachment { .. } => return Err("attachment packaging is not supported by agent generation".into()),
+            Func::Provider { function, args } => {
+                let helper = function
+                    .helper(lang)
+                    .ok_or_else(|| format!("function `{}` is not supported by agent generation", function.name))?;
+                let mut args = args.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
+                if helper.random {
+                    args.push(random());
+                }
+                Expr::call(helper.name, args)
+            }
         })
     }
 }
@@ -6069,6 +6148,8 @@ pub(crate) mod scoring {
         pub imports: BTreeSet<&'static str>,
         pub helpers: BTreeSet<Helper>,
         pub next_loop: usize,
+        // calls to provider functions, none of which scorer code can run
+        pub unsupported: bts_lang::Diags,
         loops: Vec<(String, String)>,
     }
     impl Compiler {
@@ -6078,6 +6159,7 @@ pub(crate) mod scoring {
                 imports: BTreeSet::new(),
                 helpers: BTreeSet::new(),
                 next_loop: 0,
+                unsupported: vec![],
                 loops: vec![],
             }
         }
@@ -6203,6 +6285,15 @@ pub(crate) mod scoring {
                         CtxRef::RepeatCount => pair.1.clone(),
                         _ => return Err(Error::Unsupported { what: "trace.index" }),
                     })
+                }
+                // the call is reported with its location and the rest of the scorer is still checked
+                Value::Func {
+                    func: Func::Provider { function, .. },
+                    range,
+                } if !function.runs(crate::mocking::Consumer::Scorer) => {
+                    let diag = super::unsupported_call(function, crate::mocking::Consumer::Scorer, *range);
+                    self.unsupported.push(diag);
+                    Expr::Null
                 }
                 Value::Func { func, .. } => self.func(func)?,
                 Value::Unary { op, operand, .. } => Expr::Unary {
@@ -6742,9 +6833,12 @@ pub(crate) mod scoring {
                         Expr::call(if hex { "randomHex" } else { "randomAlphanum" }, vec![Expr::number(length)])
                     }
                 }
-                Func::Attachment { .. } => return Err(Error::Unsupported { what: "`attachment`" }),
-                Func::Tokens { .. } => return Err(Error::Unsupported { what: "`tokens`" }),
-                Func::Noise { .. } => return Err(Error::Unsupported { what: "`noise`" }),
+                // the capability check reports the call first, with its location
+                Func::Provider { .. } => {
+                    return Err(Error::Unsupported {
+                        what: "a provider function",
+                    });
+                }
             })
         }
     }
@@ -6777,6 +6871,15 @@ pub(crate) mod scoring {
         pub(crate) slug: &'m str,
         pub(crate) score: &'m Value,
         pub(crate) steps: &'m [ScorerStep],
+    }
+
+    // Every provider function call the scorers would emit, which scorer code cannot run.
+    pub(crate) fn unsupported(name: &str, steps: &[ScorerStep], score: &Value) -> bts_lang::Diags {
+        let mut compiler = Compiler::new(ScorerLang::Python);
+        // a failure for another reason is reported when the module is emitted
+        let _ = compiler.steps(steps, name);
+        let _ = compiler.lower(score);
+        compiler.unsupported
     }
 
     // Render named scorer functions with their shared imports and helpers.

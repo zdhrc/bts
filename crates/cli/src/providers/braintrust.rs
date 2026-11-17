@@ -164,10 +164,10 @@ impl AgentAdapter for Adapter {
         model: &bts_core::mocking::Model,
         lang: bts_core::mocking::ScorerLang,
         target: &braintrust::mocking::code::CodeTarget,
-    ) -> Result<code::Assembly, String> {
+    ) -> Result<code::Assembly, code::AgentError> {
         let assembly = code::assemble_agents(model, lang, target)?;
         target
             .agent_assembly(model, lang, assembly)
-            .map_err(|error| error.to_string())
+            .map_err(|error| code::AgentError::Generation(error.to_string()))
     }
 }

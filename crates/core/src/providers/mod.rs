@@ -1,9 +1,10 @@
 //! What a provider is, and the workflows a provider can support.
 //!
-//! [`Provider`] is the contract. A provider declares its kinds and what it gives
-//! meaning to in a [`bts_lang::ProviderSchema`], says which elements of a model it
-//! walks, lowers a model for its consumers, and supplies authoring guidance.
-//! [`conformance::check`] verifies that an implementer is consistent.
+//! [`Provider`] is the contract. A provider declares its kinds, its functions and
+//! what it gives meaning to in a [`bts_lang::ProviderSchema`], says which elements
+//! of a model it walks, supplies what runs each function, lowers a model for its
+//! consumers, and supplies authoring guidance. [`conformance::check`] verifies that
+//! an implementer is consistent.
 //!
 //! [`DataProvider`] and [`CodeProvider`] are the delivery side. Providers implement
 //! only the workflows they support. Applications supply configuration and choose a
@@ -12,9 +13,9 @@
 pub mod braintrust;
 pub mod conformance;
 
-use crate::mocking::{code, data};
+use crate::mocking::{Function, code, data};
 use bts_lang::semantics::Source;
-use bts_lang::{Diag, Diags, ElementId, Model, ProviderSchema};
+use bts_lang::{Diag, DiagPhase, Diags, ElementId, Model, ProviderSchema};
 
 /// Identifies a provider whose supported workflows are declared through capability traits.
 pub trait Bundle {
@@ -51,10 +52,15 @@ pub trait Provider: Bundle {
     /// What the provider's consumers run.
     type Lowered;
 
-    /// The provider's identity, definitions and supported kinds and context keys.
+    /// The provider's identity, definitions, functions and supported kinds and context keys.
     ///
     /// Its `id` equals [`Bundle::ID`].
     fn schema(&self) -> ProviderSchema<'static>;
+
+    /// What runs each function the schema declares, one entry for each by name.
+    fn functions(&self) -> &'static [Function] {
+        &[]
+    }
 
     /// The elements of a model the provider walks.
     ///
@@ -70,9 +76,31 @@ pub trait Provider: Bundle {
     /// Authoring guidance for the skill.
     fn guidance(&self) -> Guidance;
 
-    /// Reports every walked element the provider gives no meaning to.
+    /// Reports every walked element the provider gives no meaning to, and every
+    /// function call the provider cannot accept, each at its own location.
+    ///
+    /// A call needs an implementation, and its arguments must pass the check the
+    /// implementation supplies. Whether a consumer can run the function is that
+    /// consumer's check, since only it knows what it generates. It asks
+    /// [`Function::runs`] and reports the call at the same location.
     fn unsupported(&self, model: &Model) -> Diags {
-        model.unsupported(&self.schema(), &self.elements(model))
+        let mut diags = model.unsupported(&self.schema(), &self.elements(model));
+        let report = |range, what| Diag {
+            when: DiagPhase::Validation,
+            what,
+            r#where: range,
+        };
+        for call in model.calls() {
+            let name = call.function;
+            let Some(function) = self.functions().iter().find(|function| function.name == name) else {
+                diags.push(report(call.range, format!("function `{name}` has no implementation")));
+                continue;
+            };
+            if let Some(Err(what)) = function.check.map(|check| check(call.args)) {
+                diags.push(report(call.range, format!("function `{name}` {what}")));
+            }
+        }
+        diags
     }
 
     /// Compiles source with the provider's definitions and lowers it.

@@ -237,8 +237,6 @@ pub mod ids {
     /// Stable language rule or function identifier.
     pub const FUNC_LEN: Id = Id::new("func.len");
     /// Stable language rule or function identifier.
-    pub const FUNC_TOKENS: Id = Id::new("func.tokens");
-    /// Stable language rule or function identifier.
     pub const FUNC_FORMAT: Id = Id::new("func.format");
     /// Stable language rule or function identifier.
     pub const FUNC_CLAMP: Id = Id::new("func.clamp");
@@ -260,10 +258,6 @@ pub mod ids {
     pub const FUNC_HEX: Id = Id::new("func.hex");
     /// Stable language rule or function identifier.
     pub const FUNC_ALPHANUM: Id = Id::new("func.alphanum");
-    /// Stable language rule or function identifier.
-    pub const FUNC_NOISE: Id = Id::new("func.noise");
-    /// Stable language rule or function identifier.
-    pub const FUNC_ATTACHMENT: Id = Id::new("func.attachment");
     /// Stable language rule or function identifier.
     pub const SCALAR_INTERPOLATION: Id = Id::new("rule.scalar-interpolation");
     /// Stable language rule or function identifier.
@@ -297,7 +291,7 @@ pub mod ids {
     /// Stable language rule or function identifier.
     pub const RANDOM_LENGTH: Id = Id::new("rule.random-string-length");
     /// Stable language rule or function identifier.
-    pub const NOISE_SIZE: Id = Id::new("rule.noise-size");
+    pub const PROVIDER_FUNCTIONS: Id = Id::new("rule.provider-functions");
     /// Stable language rule or function identifier.
     pub const OPERAND_TYPES: Id = Id::new("rule.operand-types");
     /// Stable language rule or function identifier.
@@ -339,13 +333,15 @@ const RANGE_RULES: &[RuleDesc] = &[RuleDesc {
     summary: "`range` takes exactly two finite numbers with min <= max.",
 }];
 
-const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
+/// The arity rule every function follows, for providers that document a function.
+pub const FUNC_ARITY_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::FUNC_ARITY,
     summary: "A function takes the arguments its syntax documents; `choice`, `weighted`, `min`, `max`, and `format` accept a variable number. `compose` accepts an optional separator.",
 };
 
-const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
+/// The argument type rule every function follows, for providers that document a function.
+pub const FUNC_ARG_TYPES_RULE: RuleDesc = RuleDesc {
     tags: &[],
     id: ids::FUNC_ARG_TYPES,
     summary: "A function argument must have the documented type, known before evaluation; an argument whose type is only known during evaluation (e.g. a `choice` with mixed alternatives) is rejected.",
@@ -432,16 +428,6 @@ const RANDOM_STRING_RULES: &[RuleDesc] = &[
 ];
 
 const UUID_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE];
-
-const NOISE_RULES: &[RuleDesc] = &[
-    FUNC_ARITY_RULE,
-    FUNC_ARG_TYPES_RULE,
-    RuleDesc {
-        tags: &[],
-        id: ids::NOISE_SIZE,
-        summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during evaluation.",
-    },
-];
 
 const FUNCS: &[FuncDesc] = &[
     FuncDesc {
@@ -773,15 +759,6 @@ const FUNCS: &[FuncDesc] = &[
     },
     FuncDesc {
         tags: &[],
-        id: ids::FUNC_TOKENS,
-        name: "tokens",
-        syntax: "tokens(value)",
-        summary: "The exact number of tokens in a string, or in the JSON serialization of an array or object, as an integer, on evaluation. Counts with the o200k_base encoding used by current OpenAI models.",
-        examples: &["tokens(\"What is the weather in Tokyo?\")", "tokens(settings.prompt)"],
-        rules: TEXT_FUNC_RULES,
-    },
-    FuncDesc {
-        tags: &[],
         id: ids::FUNC_FORMAT,
         name: "format",
         syntax: "format(template, value, ...)",
@@ -881,27 +858,6 @@ const FUNCS: &[FuncDesc] = &[
         summary: "A random alphanumeric string (0-9, A-Z, a-z) of the given constant length, on evaluation.",
         examples: &["alphanum(12)"],
         rules: RANDOM_STRING_RULES,
-    },
-    FuncDesc {
-        tags: &[],
-        id: ids::FUNC_ATTACHMENT,
-        name: "attachment",
-        syntax: "attachment(path, content_type)",
-        summary: "References a local file as an attachment in a logged value. The path may be absolute or relative to the shape file's directory.",
-        examples: &[
-            "attachment(\"report.pdf\", \"application/pdf\")",
-            "attachment(\"/tmp/report.pdf\", \"application/pdf\")",
-        ],
-        rules: TEXT_FUNC_RULES,
-    },
-    FuncDesc {
-        tags: &[],
-        id: ids::FUNC_NOISE,
-        name: "noise",
-        syntax: "noise(size)",
-        summary: "An opaque random base64-style string of the given size in bytes, for adding payload weight where storage size matters; the size may be dynamic, so payloads can vary per evaluation.",
-        examples: &["noise(250000)", "noise(round(lognormal(80000, 0.9)))"],
-        rules: NOISE_RULES,
     },
 ];
 
@@ -1120,7 +1076,12 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: ids::KNOWN_FUNCTIONS,
-        summary: "A function call may only use the documented functions listed in this spec. An unknown name is an error at the call, with the nearest known name when one is close.",
+        summary: "A function call may only use the functions listed in this spec and the functions the provider in use contributes. An unknown name is an error at the call, with the nearest known name when one is close.",
+    },
+    RuleDesc {
+        tags: &[],
+        id: ids::PROVIDER_FUNCTIONS,
+        summary: "A provider may contribute functions. Each has a name, ordered parameters and a result type, and is called like a built-in function. The language checks the number of arguments, that each argument has an accepted type known before evaluation, that an argument is a constant where the parameter requires one, and that a constant integer lies within the bounds a parameter declares. An argument fed by context is checked on evaluation. A provider function is never folded, so its call always remains for the consumer, and its meaning belongs to the provider. A function name has one definition among the language and the providers in use, and a name defined more than once is an error at the call.",
     },
     RuleDesc {
         tags: &[],
@@ -1186,11 +1147,6 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
         tags: &[],
         id: ids::RANDOM_LENGTH,
         summary: "`hex` and `alphanum` take a constant non-negative integer length.",
-    },
-    RuleDesc {
-        tags: &[],
-        id: ids::NOISE_SIZE,
-        summary: "`noise` takes an integer size between 0 and 8388608 (8 MiB); a constant violation is rejected during validation, and a dynamic one fails the run during evaluation.",
     },
     RuleDesc {
         tags: &[],
@@ -1454,6 +1410,14 @@ const EXAMPLES: &[Example] = &[
     },
     Example {
         tags: &[],
+        id: Id::new("example.unknown-function"),
+        summary: "A call names a function the language or the provider defines",
+        note: "The misspelled name is rejected at the call, with the nearest known function.",
+        source: r#"(a:node) {value: uper("hello")};"#,
+        valid: false,
+    },
+    Example {
+        tags: &[],
         id: Id::new("example.closed-kind"),
         summary: "A declared kind takes only its declared fields",
         note: "The misspelled field is rejected at its key, with the nearest declared name.",
@@ -1563,14 +1527,6 @@ const EXAMPLES: &[Example] = &[
         note: "Each line continues from the last node of the line it sits under, so the edges run a to b, b to c and c to d.",
         source: "(a:node)\n    -[:next]->(b:node)\n        -[:next]->(c:node)\n            -[:next]->(d:node);",
         valid: true,
-    },
-    Example {
-        tags: &[],
-        id: Id::new("example.unknown-function"),
-        summary: "A call names a function the language or the provider defines",
-        note: "The misspelled name is rejected at the call, with the nearest known function.",
-        source: r#"(a:node) {value: uper("hello")};"#,
-        valid: false,
     },
     Example {
         tags: &[],

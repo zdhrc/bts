@@ -5,8 +5,8 @@
 //! Compilation produces a [`Model`] for consumers to evaluate, generate from, or
 //! inspect. This crate does not execute the model or contact external services.
 //!
-//! A provider extends the language with its own kinds and says which kinds and
-//! context keys it gives meaning to. It declares both in a [`ProviderSchema`].
+//! A provider extends the language with its own kinds and functions and says which
+//! kinds and context keys it gives meaning to. It declares them in a [`ProviderSchema`].
 //! [`semantics::compile_module_with_provider`] compiles source against one, and
 //! [`Model::unsupported`] reports what the provider gives no meaning to.
 #![warn(missing_docs)]
@@ -87,14 +87,16 @@ pub mod semantics {
     ///
     /// Source indexes follow [`compile_with_definitions`], and
     /// [`ProviderSchema::definition`](crate::ProviderSchema::definition) returns the
-    /// definition source an index refers to. This does not check what the provider
+    /// definition source an index refers to. Calls to the provider's functions are
+    /// checked against their descriptors and stay in the model as
+    /// [`Func::Call`](crate::Func::Call). This does not check what the provider
     /// supports. Use [`Model::unsupported`] with the elements the provider walks.
     pub fn compile_module_with_provider(
         source: Source<'_>,
         provider: &crate::ProviderSchema<'_>,
         allow_empty: bool,
     ) -> Result<Model, Diags> {
-        compile_module_with_definitions(source, provider.definitions, allow_empty)
+        compile_sources(source, provider.definitions, provider.functions, allow_empty)
     }
 
     /// Compiles with supplied definitions and an explicit empty user module policy.
@@ -104,6 +106,15 @@ pub mod semantics {
     pub fn compile_module_with_definitions(
         source: Source<'_>,
         definitions: &[Source<'_>],
+        allow_empty: bool,
+    ) -> Result<Model, Diags> {
+        compile_sources(source, definitions, &[], allow_empty)
+    }
+
+    fn compile_sources(
+        source: Source<'_>,
+        definitions: &[Source<'_>],
+        functions: &[crate::FunctionDesc],
         allow_empty: bool,
     ) -> Result<Model, Diags> {
         fn document(source: Source<'_>, index: usize) -> Result<crate::ast::GraphDocument, Diags> {
@@ -147,7 +158,7 @@ pub mod semantics {
         let mut compiled = if ast.paths.is_empty() && ast.definitions.is_empty() {
             Model::default()
         } else {
-            tracing::info_span!("model").in_scope(|| model(ast))?
+            tracing::info_span!("model").in_scope(|| model(ast, functions))?
         };
         compiled.sources = std::iter::once(source)
             .chain(definitions.iter().copied())

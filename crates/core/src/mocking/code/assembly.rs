@@ -77,6 +77,12 @@ pub fn assemble<E: Emitter + ?Sized, T: Target + ?Sized>(
                 }
             })
             .collect();
+        let unsupported: bts_lang::Diags = (items.iter())
+            .flat_map(|item| lowering::scoring::unsupported(item.name, item.steps, item.score))
+            .collect();
+        if !unsupported.is_empty() {
+            return Err(AssemblyError::Unsupported(unsupported));
+        }
         let module = emitter.emit(file_lang, &items).map_err(AssemblyError::Emit)?;
         if module.functions.len() != items.len() {
             return Err(AssemblyError::Plan(Error::ExportCount {
@@ -137,14 +143,48 @@ pub fn assemble<E: Emitter + ?Sized, T: Target + ?Sized>(
 #[derive(Debug)]
 pub enum AssemblyError<E, T> {
     Plan(Error),
+    /// Calls to provider functions that scorer code cannot run, each at its location.
+    Unsupported(bts_lang::Diags),
     Emit(E),
     Target(T),
+}
+
+/// Why agents could not be generated.
+#[derive(Debug)]
+pub enum AgentError {
+    /// Calls to provider functions that an agent in the requested language cannot run, each at its location.
+    Unsupported(bts_lang::Diags),
+    /// Any other failure, described.
+    Generation(String),
+}
+
+impl fmt::Display for AgentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(diags) => write_diags(formatter, diags),
+            Self::Generation(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for AgentError {}
+
+impl From<String> for AgentError {
+    fn from(reason: String) -> Self {
+        Self::Generation(reason)
+    }
+}
+
+fn write_diags(formatter: &mut fmt::Formatter<'_>, diags: &[bts_lang::Diag]) -> fmt::Result {
+    let reasons: Vec<&str> = diags.iter().map(|diag| diag.what.as_str()).collect();
+    formatter.write_str(&reasons.join(", "))
 }
 
 impl<E: fmt::Display, T: fmt::Display> fmt::Display for AssemblyError<E, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Plan(source) => source.fmt(formatter),
+            Self::Unsupported(diags) => write_diags(formatter, diags),
             Self::Emit(source) => source.fmt(formatter),
             Self::Target(source) => source.fmt(formatter),
         }
@@ -155,6 +195,7 @@ impl<E: std::error::Error + 'static, T: std::error::Error + 'static> std::error:
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Plan(source) => Some(source),
+            Self::Unsupported(_) => None,
             Self::Emit(source) => Some(source),
             Self::Target(source) => Some(source),
         }
@@ -205,13 +246,24 @@ pub fn assemble_agents(
     model: &crate::dsl::Model,
     lang: ScorerLang,
     target: &(impl super::AgentTarget + ?Sized),
-) -> Result<Assembly, String> {
+) -> Result<Assembly, AgentError> {
     let mut sources = Vec::new();
     let mut types = Vec::new();
+    // every agent is lowered before a call it cannot run stops the build, so all of them are reported
+    let unsupported = lowering::Unsupported::default();
+    let mut lowered = Vec::new();
     for agent in planning::agents(model, lang)? {
-        let function =
-            lowering::agent(model, agent.trace, agent.output, lang).map_err(|e| format!("agent {:?}: {e}", agent.name))?;
-        let path = std::path::Path::new(&agent.file);
+        let function = lowering::agent(model, agent.trace, agent.output, lang, &unsupported);
+        lowered.push((function.map_err(|e| format!("agent {:?}: {e}", agent.name)), agent.file));
+    }
+    let mut unsupported = unsupported.into_inner();
+    if !unsupported.is_empty() {
+        unsupported.sort_by_key(|diag| (diag.r#where.source, diag.r#where.start));
+        return Err(AgentError::Unsupported(unsupported));
+    }
+    for (function, file) in lowered {
+        let function = function?;
+        let path = std::path::Path::new(&file);
         let module = format!("{}_types", path.file_stem().unwrap().to_string_lossy());
         let (contents, definitions) = super::languages::rendering::agent(&function, lang, &module, target.tracing(lang));
         if let Some(contents) = definitions {
@@ -226,7 +278,7 @@ pub fn assemble_agents(
         sources.push(super::SourceFile {
             slugs: Vec::new(),
             lang,
-            name: agent.file,
+            name: file,
             contents,
         });
     }
@@ -427,6 +479,7 @@ mod agent_tests {
             assemble_agents(&model, ScorerLang::Typescript, &target)
                 .err()
                 .unwrap()
+                .to_string()
                 .contains("safe integer")
         );
     }

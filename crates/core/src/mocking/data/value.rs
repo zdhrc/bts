@@ -206,8 +206,6 @@ mod tests {
 pub mod expr {
     use crate::dsl::{BinOp, CtxRef, EnglishOperation, Number, RefId, ScorerArg, SrcRange, UnaryOp};
 
-    pub use bts_lang::NOISE_SIZE_CAP;
-
     /// A compiled value or an expression left for a consumer to evaluate.
     ///
     /// Compilation folds expressions whose values are known. References, random
@@ -397,12 +395,12 @@ pub mod expr {
             /// Arguments in authored order, including optional arguments when supplied.
             args: Vec<Value>,
         },
-        /// An attachment reference to be materialized by a consumer.
-        Attachment {
-            /// The attachment path written in source.
-            path: String,
-            /// The attachment media type.
-            content_type: String,
+        /// A call to a function the provider supplies.
+        Provider {
+            /// The provider's implementations of the function.
+            function: &'static crate::mocking::Function,
+            /// Arguments in authored order.
+            args: Vec<Value>,
         },
         /// One selected alternative.
         Choice(Vec<Value>),
@@ -538,11 +536,6 @@ pub mod expr {
             /// The value to index, slice, or inspect.
             target: Box<Value>,
         },
-        /// Counts tokens using the consumer’s tokenizer.
-        Tokens {
-            /// The value expression to inspect or evaluate.
-            value: Box<Value>,
-        },
         /// Interleaves literal pieces with evaluated arguments.
         Format {
             /// Literal text around each format argument. There is one more piece than argument.
@@ -594,11 +587,6 @@ pub mod expr {
         Alphanum {
             /// The requested output length.
             length: usize,
-        },
-        /// Produces a requested amount of generated noise.
-        Noise {
-            /// The requested noise size.
-            size: Box<Value>,
         },
     }
 

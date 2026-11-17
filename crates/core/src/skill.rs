@@ -1,5 +1,5 @@
 use crate::providers::Provider;
-use bts_lang::spec::{RuleDesc, Spec as DslSpec};
+use bts_lang::spec::{FuncDesc, RuleDesc, Spec as DslSpec};
 use std::fmt::Write as _;
 const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
 Steal the structure, replace the content, and expand along the axis each one names.";
@@ -45,8 +45,20 @@ pub fn assemble<P: Provider>(
             Part::Language => {
                 output.push_str(&reference(spec));
                 output.push_str(guidance.definitions);
-                for definition in provider.schema().definitions {
+                let schema = provider.schema();
+                for definition in schema.definitions {
                     output.push_str(&fenced_code("bts", definition.text.trim()));
+                }
+                if !schema.functions.is_empty() {
+                    writeln!(output, "\n## {} functions\n", schema.name).unwrap();
+                    writeln!(
+                        output,
+                        "The provider contributes these functions. Call them like the functions of the language.\n"
+                    )
+                    .unwrap();
+                    for function in schema.functions {
+                        render_function(&mut output, &function.doc);
+                    }
                 }
             }
         }
@@ -99,17 +111,7 @@ pub fn reference(spec: &DslSpec) -> String {
     if !spec.functions.is_empty() {
         writeln!(output, "## Functions\n").unwrap();
         for function in spec.functions {
-            writeln!(output, "### {}\n", inline_code(function.name)).unwrap();
-            writeln!(output, "{}\n", function.summary).unwrap();
-            writeln!(output, "Syntax: {}\n", inline_code(function.syntax)).unwrap();
-            if !function.examples.is_empty() {
-                writeln!(output, "Examples:").unwrap();
-                for example in function.examples {
-                    writeln!(output, "- {}", inline_code(example)).unwrap();
-                }
-                writeln!(output).unwrap();
-            }
-            render_rules(&mut output, function.rules);
+            render_function(&mut output, function);
         }
     }
 
@@ -149,6 +151,20 @@ pub fn reference(spec: &DslSpec) -> String {
     }
 
     output
+}
+
+fn render_function(output: &mut String, function: &FuncDesc) {
+    writeln!(output, "### {}\n", inline_code(function.name)).unwrap();
+    writeln!(output, "{}\n", function.summary).unwrap();
+    writeln!(output, "Syntax: {}\n", inline_code(function.syntax)).unwrap();
+    if !function.examples.is_empty() {
+        writeln!(output, "Examples:").unwrap();
+        for example in function.examples {
+            writeln!(output, "- {}", inline_code(example)).unwrap();
+        }
+        writeln!(output).unwrap();
+    }
+    render_rules(output, function.rules);
 }
 
 fn render_rules(output: &mut String, rules: &[RuleDesc]) {

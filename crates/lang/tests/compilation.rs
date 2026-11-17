@@ -1,10 +1,12 @@
 use bts_lang::SrcRange;
-use bts_lang::semantics::{Source, compile_module_with_definitions, compile_with_definitions};
+use bts_lang::semantics::{Source, compile_module_with_definitions, compile_module_with_provider, compile_with_definitions};
+use bts_lang::spec::{FuncDesc, Id};
 use bts_lang::syntax::{
     BinOp, Expr, ExprKind, GraphNode, GraphNodeDecl, GraphOrigin, GraphReferenceKind, GraphStep, ObjectItem, TemplatePart,
     parse,
 };
 use bts_lang::{DiagPhase, Primitive, Value, semantics::compile, syntax::parse_traversal};
+use bts_lang::{FieldType, FunctionDesc, ParamDesc, ProviderSchema};
 
 const COMPILATION_SOURCE: &str = include_str!("fixtures/compilation.bt");
 
@@ -184,18 +186,213 @@ const PROVIDER_SOURCE: &str = r#"
 +(experiment:node {open: true});
 "#;
 
-fn compile_fixture() -> bts_lang::Model {
-    compile_with_definitions(
-        Source {
-            name: "compilation.bt",
-            text: COMPILATION_SOURCE,
-        },
-        &[Source {
-            name: "braintrust.bt",
-            text: PROVIDER_SOURCE,
+// the functions a provider contributes, with every check a descriptor can ask for
+const PROVIDER_FUNCTIONS: &[FunctionDesc] = &[
+    FunctionDesc {
+        doc: function_doc("tokens", "tokens(value)"),
+        params: &[ParamDesc {
+            name: "value",
+            accepts: &[FieldType::String, FieldType::Array, FieldType::Object],
+            constant: false,
+            bounds: None,
         }],
+        returns: FieldType::Number,
+    },
+    FunctionDesc {
+        doc: function_doc("noise", "noise(size)"),
+        params: &[ParamDesc {
+            name: "size",
+            accepts: &[FieldType::Number],
+            constant: false,
+            bounds: Some((0, 16)),
+        }],
+        returns: FieldType::String,
+    },
+    FunctionDesc {
+        doc: function_doc("attachment", "attachment(path, content_type)"),
+        params: &[
+            ParamDesc {
+                name: "path",
+                accepts: &[FieldType::String],
+                constant: true,
+                bounds: None,
+            },
+            ParamDesc {
+                name: "content_type",
+                accepts: &[FieldType::String],
+                constant: true,
+                bounds: None,
+            },
+        ],
+        returns: FieldType::Object,
+    },
+    FunctionDesc {
+        doc: function_doc("stamp", "stamp()"),
+        params: &[],
+        returns: FieldType::Any,
+    },
+];
+
+const fn function_doc(name: &'static str, syntax: &'static str) -> FuncDesc {
+    FuncDesc {
+        tags: &[],
+        id: Id::new("func.provided"),
+        name,
+        syntax,
+        summary: "A function the test provider contributes.",
+        examples: &[],
+        rules: &[],
+    }
+}
+
+const PROVIDER: ProviderSchema<'static> = ProviderSchema {
+    id: "test",
+    name: "Test provider",
+    definitions: &[Source {
+        name: "braintrust.bt",
+        text: PROVIDER_SOURCE,
+    }],
+    nodes: &[],
+    edges: &[],
+    forks: &[],
+    junctions: &[],
+    context: &[],
+    functions: PROVIDER_FUNCTIONS,
+};
+
+fn compile_provided(source: &str) -> Result<bts_lang::Model, bts_lang::Diags> {
+    let source = Source {
+        name: "compilation.bt",
+        text: source,
+    };
+    compile_module_with_provider(source, &PROVIDER, false)
+}
+
+fn compile_fixture() -> bts_lang::Model {
+    compile_provided(COMPILATION_SOURCE).unwrap_or_else(|errors| panic!("{errors:#?}"))
+}
+
+fn provided(expression: &str) -> Result<Value, String> {
+    let model = compile_provided(&format!("(values:vars) {{settings: context.history, value: {expression}}};"))
+        .map_err(|errors| errors.into_iter().map(|error| error.what).collect::<Vec<_>>().join("\n"))?;
+    Ok(binding(&model, "values", "value").value.clone())
+}
+
+#[test]
+fn provider_functions_are_checked_from_their_descriptors_and_never_folded() {
+    // constant arguments stay in the call, the language has no meaning to fold with
+    let Value::Func {
+        func: bts_lang::Func::Call { function, args, returns },
+        ..
+    } = provided(r#"tokens("hello")"#).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!((function.as_str(), returns), ("tokens", FieldType::Number));
+    assert!(matches!(args.as_slice(), [Value::Str(text)] if text == "hello"));
+    for valid in [
+        "tokens([|1, 2|])",
+        "tokens({a: 1})",
+        // an argument fed by context settles its type on evaluation
+        "tokens(self.settings)",
+        "noise(0)",
+        "noise(16)",
+        "noise(round(range(1, 9)))",
+        r#"attachment("report.pdf", "application/pdf")"#,
+        "stamp()",
+        // the declared result type takes part in the surrounding checks
+        "tokens(\"a\") + 1",
+        "upper(noise(4))",
+        "len(noise(4))",
+    ] {
+        provided(valid).unwrap_or_else(|error| panic!("{valid}: {error}"));
+    }
+    for (invalid, message) in [
+        ("tokens()", "function `tokens` expects exactly one argument (value)"),
+        ("tokens(1, 2)", "function `tokens` expects exactly one argument (value)"),
+        ("stamp(1)", "function `stamp` expects no arguments"),
+        (
+            "attachment(\"a\")",
+            "function `attachment` expects exactly two arguments (path, content_type)",
+        ),
+        (
+            "tokens(1)",
+            "function `tokens` expects a string, array, or object argument, but found number",
+        ),
+        ("noise(\"x\")", "function `noise` expects a number argument, but found string"),
+        ("noise(-1)", "function `noise` size must be an integer between 0 and 16"),
+        ("noise(17)", "function `noise` size must be an integer between 0 and 16"),
+        ("noise(1.5)", "function `noise` size must be an integer between 0 and 16"),
+        (
+            "attachment(upper(\"a\"), \"text/plain\")",
+            "function `attachment` path must be a constant string",
+        ),
+        (
+            "attachment(\"a\", self.settings)",
+            "function `attachment` content_type must be a constant string",
+        ),
+        (
+            "upper(tokens(\"a\"))",
+            "function `upper` expects a string argument, but found number",
+        ),
+        ("tokens(\"a\") + noise(1)", "number"),
+    ] {
+        let error = provided(invalid).expect_err(invalid);
+        assert!(error.contains(message), "{invalid}: {error}");
+    }
+}
+
+#[test]
+fn unknown_and_ambiguous_function_names_are_located_at_the_call() {
+    let source = "(values:vars) {value: tokns(\"a\")};";
+    let errors = compile_provided(source).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].what.starts_with("unknown function `tokns`, did you mean `tokens`?"));
+    assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], "tokns(\"a\")");
+    // a built-in is suggested the same way, and a distant name gets no suggestion
+    let errors = compile("(values:vars) {value: uper(\"a\")};").unwrap_err();
+    assert!(errors[0].what.starts_with("unknown function `uper`, did you mean `upper`?"));
+    let errors = compile("(values:vars) {value: unrelated_name(1)};").unwrap_err();
+    assert!(errors[0].what.starts_with("unknown function `unrelated_name`;"));
+    // without the provider its functions are unknown
+    assert!(compile("(values:vars) {value: tokens(\"a\")};").is_err());
+
+    // a provider cannot redefine a built-in or define one name twice
+    let clashing = [
+        PROVIDER_FUNCTIONS[0],
+        PROVIDER_FUNCTIONS[0],
+        FunctionDesc {
+            doc: function_doc("upper", "upper(text)"),
+            ..PROVIDER_FUNCTIONS[0]
+        },
+    ];
+    let provider = ProviderSchema {
+        functions: &clashing,
+        ..PROVIDER
+    };
+    for call in ["tokens(\"a\")", "upper(\"a\")"] {
+        let source = format!("(values:vars) {{value: {call}}};");
+        let source = Source {
+            name: "user.bt",
+            text: &source,
+        };
+        let errors = compile_module_with_provider(source, &provider, false).unwrap_err();
+        assert!(errors[0].what.contains("is defined more than once"), "{call}");
+        assert_eq!(&source.text[errors[0].r#where.start..errors[0].r#where.end], call);
+    }
+}
+
+#[test]
+fn a_model_lists_its_provider_calls_with_their_owners() {
+    let model = compile_provided(
+        r#"(a:vars) {size: tokens("a"), nested: {inner: [|noise(tokens("b"))|]}};
+        (b:vars) {text: "${noise(1)}", plain: upper("x")};"#,
     )
-    .unwrap_or_else(|errors| panic!("{errors:#?}"))
+    .unwrap();
+    let calls: Vec<(bts_lang::ElementId, &str)> = model.calls().iter().map(|call| (call.owner, call.function)).collect();
+    let (a, b) = (model.names["a"], model.names["b"]);
+    assert_eq!(calls, [(a, "tokens"), (a, "noise"), (a, "tokens"), (b, "noise")]);
+    assert!(compiled("(a:vars) {plain: upper(\"x\")};").calls().is_empty());
 }
 
 fn named_fixture_node<'a>(ast: &'a bts_lang::syntax::Ast, name: &str) -> &'a GraphNodeDecl {
@@ -1279,7 +1476,6 @@ fn retains_expression_validation_and_checked_arithmetic() {
         "hex(-1)",
         "split(\"x\", \"\")",
         "clamp(3, 5, 1)",
-        "noise(-1)",
         "1 + true",
         "\"${[|1|]}\"",
     ] {
@@ -3330,15 +3526,4 @@ fn primitives_match_the_language_reference() {
             assert!(described.is_some(), "{} is not in the reference", primitive.name());
         }
     }
-}
-
-#[test]
-fn unknown_function_names_suggest_the_nearest_builtin() {
-    let source = "(values:vars) {value: uper(\"a\")};";
-    let errors = compile(source).unwrap_err();
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].what.starts_with("unknown function `uper`, did you mean `upper`?"));
-    assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], "uper(\"a\")");
-    let errors = compile("(values:vars) {value: unrelated_name(1)};").unwrap_err();
-    assert!(errors[0].what.starts_with("unknown function `unrelated_name`;"));
 }

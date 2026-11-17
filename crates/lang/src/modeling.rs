@@ -4,6 +4,7 @@ use crate::{
     model::*,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, Diags>;
 
@@ -112,12 +113,15 @@ struct Modeler {
     context_values: HashMap<(usize, usize, usize), ast::Expr>,
     // the same expressions for each element that supplies them, by element and key
     supplied: HashMap<(ElementId, String), ast::Expr>,
+    // the functions a provider contributes to expressions
+    functions: Rc<[FunctionDesc]>,
     errors: Diags,
 }
 
 impl Modeler {
-    fn new() -> Self {
+    fn new(functions: &[FunctionDesc]) -> Self {
         Self {
+            functions: functions.into(),
             model: Model::default(),
             declarations: HashMap::new(),
             fields: HashMap::new(),
@@ -945,7 +949,7 @@ impl Modeler {
                     path: vec![field.key.clone()],
                 };
             }
-            return expr::lower(expr, &mut |expr| {
+            return expr::lower(expr, &self.functions.clone(), &mut |expr| {
                 let ast::ExprKind::Ref { path } = expr.kind else {
                     unreachable!()
                 };
@@ -962,7 +966,9 @@ impl Modeler {
                 self.finish(Cursor::Slot(child), expr.range)
             });
         }
-        expr::lower(expr, &mut |expr| self.resolve_value(expr, Some(slot.owner)))
+        expr::lower(expr, &self.functions.clone(), &mut |expr| {
+            self.resolve_value(expr, Some(slot.owner))
+        })
     }
 
     fn finish(&mut self, cursor: Cursor, range: SrcRange) -> Result<ReferenceValue> {
@@ -1165,7 +1171,9 @@ impl Modeler {
             ast::ExprKind::PatternRef(pattern) => Ok(Cursor::Element(self.pattern(pattern, owner)?)),
             ast::ExprKind::Index { target, index } => {
                 let cursor = self.cursor(target, owner)?;
-                let index = expr::lower((**index).clone(), &mut |expr| self.resolve_value(expr, owner))?;
+                let index = expr::lower((**index).clone(), &self.functions.clone(), &mut |expr| {
+                    self.resolve_value(expr, owner)
+                })?;
                 if let Value::Str(name) = &index {
                     return self.member(cursor, name, expr.range);
                 }
@@ -1178,11 +1186,19 @@ impl Modeler {
                 let value = self.finish(cursor, expr.range)?;
                 let start = start
                     .as_ref()
-                    .map(|expr| expr::lower((**expr).clone(), &mut |expr| self.resolve_value(expr, owner)))
+                    .map(|expr| {
+                        expr::lower((**expr).clone(), &self.functions.clone(), &mut |expr| {
+                            self.resolve_value(expr, owner)
+                        })
+                    })
                     .transpose()?;
                 let end = end
                     .as_ref()
-                    .map(|expr| expr::lower((**expr).clone(), &mut |expr| self.resolve_value(expr, owner)))
+                    .map(|expr| {
+                        expr::lower((**expr).clone(), &self.functions.clone(), &mut |expr| {
+                            self.resolve_value(expr, owner)
+                        })
+                    })
                     .transpose()?;
                 let mut value = value;
                 for bound in start.iter().chain(end.iter()) {
@@ -1191,7 +1207,9 @@ impl Modeler {
                 Ok(Cursor::Value(expr::slice(value, start, end, expr.range)?))
             }
             _ => {
-                let value = expr::lower(expr.clone(), &mut |expr| self.resolve_value(expr, owner))?;
+                let value = expr::lower(expr.clone(), &self.functions.clone(), &mut |expr| {
+                    self.resolve_value(expr, owner)
+                })?;
                 Ok(Cursor::Value(self.reference_value(value)))
             }
         }
@@ -1227,7 +1245,9 @@ impl Modeler {
             }
             let id = self.binding(slot, prop.range)?;
             let actual = self.model.bindings[id.0].value.clone();
-            let expected = expr::lower(prop.value.clone(), &mut |expr| self.resolve_value(expr, owner))?;
+            let expected = expr::lower(prop.value.clone(), &self.functions.clone(), &mut |expr| {
+                self.resolve_value(expr, owner)
+            })?;
             if !expr::constant(&actual) || !expr::constant(&expected) {
                 return Err(error(
                     prop.range,
@@ -1933,7 +1953,7 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>) -> Result<()
                 },
                 "role" => schema.role = Some(schema_string(&descriptor.value)?),
                 "default" => {
-                    let value = expr::lower(descriptor.value, &mut |expr| {
+                    let value = expr::lower(descriptor.value, &[], &mut |expr| {
                         Err(error(expr.range, "schema defaults cannot reference instances"))
                     })?;
                     if !expr::constant(&value) {
@@ -2909,8 +2929,8 @@ fn disjoint(a: &Value, b: &Value, bindings: &[Binding]) -> bool {
     })
 }
 
-pub(super) fn model(ast: ast::GraphDocument) -> Result<Model> {
-    let mut modeler = Modeler::new();
+pub(super) fn model(ast: ast::GraphDocument, functions: &[FunctionDesc]) -> Result<Model> {
+    let mut modeler = Modeler::new(functions);
     // no phase stops the next one: a failed element is marked, and later checks that
     // depend on it are skipped, so each independent mistake is reported once
     modeler.definitions(&ast.definitions);

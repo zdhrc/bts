@@ -61,7 +61,7 @@ where
         model: &bts_core::mocking::Model,
         lang: bts_core::mocking::ScorerLang,
         target: &<Self::Provider as CodeProvider>::Target,
-    ) -> Result<code::Assembly, String> {
+    ) -> Result<code::Assembly, code::AgentError> {
         code::assemble_agents(model, lang, target)
     }
 }

@@ -5,7 +5,7 @@ use bts_core::mocking::data::{
 use bts_core::providers::Provider;
 use bts_core::providers::braintrust::Bundle;
 use bts_core::selection::filter::WriteFilter;
-use bts_lang::semantics::{Source, compile_with_definitions};
+use bts_lang::semantics::{Source, compile_module_with_provider};
 use serde_json::{Value as JsonValue, json};
 use std::cell::{Cell, RefCell};
 use std::error::Error as _;
@@ -151,12 +151,13 @@ fn request<'a>(source: &str, filter: &'a WriteFilter) -> Request<'a> {
     Request {
         model: Bundle
             .lower(
-                &compile_with_definitions(
+                &compile_module_with_provider(
                     Source {
                         name: "archive.bt",
                         text: source,
                     },
-                    Bundle.schema().definitions,
+                    &Bundle.schema(),
+                    false,
                 )
                 .unwrap(),
             )

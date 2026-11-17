@@ -695,17 +695,6 @@ pub enum Value {
     Array(Array),
     /// A collection of named entries.
     Object(Object),
-    /// An attachment reference to be materialized by a consumer.
-    Attachment {
-        /// The attachment path written in source.
-        path: String,
-        /// The name to use when presenting the attachment.
-        filename: String,
-        /// The attachment media type.
-        content_type: String,
-        /// The attachment key used to connect payloads with uploads.
-        key: String,
-    },
     /// A resolved field or variable binding and the location of this read.
     BindingRef(BindingId, SrcRange),
     /// A graph reference resolved through the owning model.
@@ -785,12 +774,17 @@ pub enum Func {
         /// Arguments in authored order, including optional arguments when supplied.
         args: Vec<Value>,
     },
-    /// An attachment reference to be materialized by a consumer.
-    Attachment {
-        /// The attachment path written in source.
-        path: String,
-        /// The attachment media type.
-        content_type: String,
+    /// A call to a function a provider contributes.
+    ///
+    /// The language checks the arguments against the provider's descriptor and
+    /// never folds the call. Its meaning belongs to the provider.
+    Call {
+        /// The function name, as the provider declares it.
+        function: String,
+        /// Arguments in authored order.
+        args: Vec<Value>,
+        /// The result type the provider declares.
+        returns: FieldType,
     },
     /// One selected alternative.
     Choice(Vec<Value>),
@@ -926,11 +920,6 @@ pub enum Func {
         /// The value to index, slice, or inspect.
         target: Box<Value>,
     },
-    /// Counts tokens using the consumer’s tokenizer.
-    Tokens {
-        /// The value expression to inspect or evaluate.
-        value: Box<Value>,
-    },
     /// Interleaves literal pieces with evaluated arguments.
     Format {
         /// Literal text around each format argument. There is one more piece than argument.
@@ -983,11 +972,6 @@ pub enum Func {
         /// The requested output length.
         length: usize,
     },
-    /// Produces a requested amount of generated noise.
-    Noise {
-        /// The requested noise size.
-        size: Box<Value>,
-    },
 }
 
 /// English language operations evaluated by consumers.
@@ -1038,9 +1022,6 @@ impl EnglishOperation {
         }
     }
 }
-/// Maximum permitted noise size, limiting accidental allocations during evaluation.
-pub const NOISE_SIZE_CAP: i64 = 8 << 20;
-
 /// One candidate value and its relative sampling weight.
 #[derive(Debug, Clone)]
 pub struct WeightedOption {
@@ -1127,11 +1108,12 @@ pub struct ObjectField {
     pub value: Value,
 }
 
-/// What a provider declares: its identity, its kinds, and what it gives meaning to.
+/// What a provider declares: its identity, its kinds, its functions, and what it gives meaning to.
 ///
 /// A provider fills in one value of this type. It holds no behavior, so a host can
 /// compile and check source against a provider without running anything. The parts
-/// of a provider that execute are defined by its consumers, outside this crate.
+/// of a provider that execute are defined by its consumers, outside this crate. That
+/// includes what a function computes: a [`FunctionDesc`] says only how it is called.
 ///
 /// A kind is supported when it is listed or derives from a listed kind. Listing a
 /// construct root, such as `node`, supports that kind alone, since a kind derived
@@ -1159,6 +1141,50 @@ pub struct ProviderSchema<'a> {
     pub junctions: &'a [&'a str],
     /// Context keys the provider supplies.
     pub context: &'a [&'a str],
+    /// Functions the provider contributes to expressions.
+    ///
+    /// A name is unique among them and is not the name of a built-in function.
+    pub functions: &'a [FunctionDesc],
+}
+
+/// A function a provider contributes, as the language sees it.
+///
+/// The language checks a call against this and leaves the call in the model as
+/// [`Func::Call`]. It never evaluates or folds one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct FunctionDesc {
+    /// The name, syntax, summary, examples and rules, as for a built-in function.
+    pub doc: crate::spec::FuncDesc,
+    /// Parameters in order. Their count is the number of arguments a call takes.
+    pub params: &'static [ParamDesc],
+    /// The type of the result, or any when it is known only on evaluation.
+    pub returns: FieldType,
+}
+
+/// One parameter of a provider function.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ParamDesc {
+    /// The parameter name in diagnostics.
+    pub name: &'static str,
+    /// The accepted types. An argument fed by context is checked on evaluation.
+    pub accepts: &'static [FieldType],
+    /// Whether the argument must be a constant.
+    pub constant: bool,
+    /// Inclusive bounds a constant argument must be an integer within.
+    pub bounds: Option<(i64, i64)>,
+}
+
+/// One call to a provider function, with the element whose value contains it.
+#[derive(Debug, Clone, Copy)]
+pub struct CallSite<'m> {
+    /// The element that owns the field or property the call is written in.
+    pub owner: ElementId,
+    /// The function name.
+    pub function: &'m str,
+    /// Arguments in authored order.
+    pub args: &'m [Value],
+    /// Source location of the call.
+    pub range: SrcRange,
 }
 
 impl<'a> ProviderSchema<'a> {
@@ -1171,6 +1197,140 @@ impl<'a> ProviderSchema<'a> {
 }
 
 impl Model {
+    /// Returns every call to a provider function, in binding order.
+    pub fn calls(&self) -> Vec<CallSite<'_>> {
+        fn each<'m>(values: &'m [Value], owner: ElementId, found: &mut Vec<CallSite<'m>>) {
+            values.iter().for_each(|value| walk(value, owner, found));
+        }
+        fn walk<'m>(value: &'m Value, owner: ElementId, found: &mut Vec<CallSite<'m>>) {
+            match value {
+                Value::Input { .. }
+                | Value::FieldRef(_)
+                | Value::Str(_)
+                | Value::Num(_)
+                | Value::Bool(_)
+                | Value::Null
+                | Value::Context { .. }
+                | Value::BindingRef(..)
+                | Value::GraphRef { .. } => {}
+                Value::Template(template) => {
+                    for part in &template.parts {
+                        if let Part::Dynamic(value) = part {
+                            walk(value, owner, found);
+                        }
+                    }
+                }
+                Value::Array(array) => {
+                    for ArrayElem::Item(value) | ArrayElem::Spread(value) in &array.elem {
+                        walk(value, owner, found);
+                    }
+                }
+                Value::Object(object) => object.elem.iter().for_each(|field| walk(&field.value, owner, found)),
+                Value::Unary { operand, .. } => walk(operand, owner, found),
+                Value::Binary { lhs, rhs, .. } => {
+                    walk(lhs, owner, found);
+                    walk(rhs, owner, found);
+                }
+                Value::Cond { cond, then, otherwise } => {
+                    walk(cond, owner, found);
+                    walk(then, owner, found);
+                    walk(otherwise, owner, found);
+                }
+                Value::Index { target, index, .. } => {
+                    walk(target, owner, found);
+                    walk(index, owner, found);
+                }
+                Value::Slice { target, start, end, .. } => {
+                    walk(target, owner, found);
+                    for bound in start.iter().chain(end) {
+                        walk(bound, owner, found);
+                    }
+                }
+                Value::Func { func, range } => match func {
+                    Func::Call { function, args, .. } => {
+                        found.push(CallSite {
+                            owner,
+                            function,
+                            args,
+                            range: *range,
+                        });
+                        each(args, owner, found);
+                    }
+                    Func::Choice(values) | Func::Min(values) | Func::Max(values) => each(values, owner, found),
+                    Func::Format { args, .. } | Func::English { args, .. } => each(args, owner, found),
+                    Func::Weighted(options) => options.iter().for_each(|option| walk(&option.value, owner, found)),
+                    Func::Range(_)
+                    | Func::Normal { .. }
+                    | Func::Lognormal { .. }
+                    | Func::Exponential { .. }
+                    | Func::Pareto { .. }
+                    | Func::Beta { .. }
+                    | Func::Poisson { .. }
+                    | Func::Chance { .. }
+                    | Func::Uuid
+                    | Func::Hex { .. }
+                    | Func::Alphanum { .. } => {}
+                    Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => walk(text, owner, found),
+                    Func::Len { target: value }
+                    | Func::Round { value }
+                    | Func::Floor { value }
+                    | Func::Ceil { value }
+                    | Func::Abs { value } => walk(value, owner, found),
+                    Func::Replace { text, from, to } => {
+                        walk(text, owner, found);
+                        walk(from, owner, found);
+                        walk(to, owner, found);
+                    }
+                    Func::Clamp { value, min, max } => {
+                        walk(value, owner, found);
+                        walk(min, owner, found);
+                        walk(max, owner, found);
+                    }
+                    Func::Split {
+                        text: first,
+                        separator: second,
+                    }
+                    | Func::Join {
+                        array: first,
+                        separator: second,
+                    }
+                    | Func::Compose {
+                        array: first,
+                        separator: second,
+                    }
+                    | Func::Render {
+                        template: first,
+                        values: second,
+                    }
+                    | Func::Sample {
+                        array: first,
+                        count: second,
+                    }
+                    | Func::Contains {
+                        target: first,
+                        needle: second,
+                    }
+                    | Func::StartsWith {
+                        text: first,
+                        prefix: second,
+                    }
+                    | Func::EndsWith {
+                        text: first,
+                        suffix: second,
+                    } => {
+                        walk(first, owner, found);
+                        walk(second, owner, found);
+                    }
+                },
+            }
+        }
+        let mut found = Vec::new();
+        for binding in &self.bindings {
+            walk(&binding.value, binding.owner, &mut found);
+        }
+        found
+    }
+
     /// Reports every listed element whose kind a provider does not support, and
     /// every context read of those elements that nothing supplies.
     ///

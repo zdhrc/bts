@@ -42,6 +42,7 @@ pub const SCHEMA: graph::ProviderSchema<'static> = graph::ProviderSchema {
         "expected",
         "metadata",
     ],
+    functions: super::functions::DESCRIPTORS,
 };
 
 /// The elements the mocking consumers walk.
@@ -155,6 +156,7 @@ impl<T, E: Into<Error>> At<T> for Result<T, E> {
 fn lower_model(model: &graph::Model) -> Result<execution::Model, Error> {
     let mut result = execution::Model {
         ordered: true,
+        functions: super::functions::FUNCTIONS,
         ..Default::default()
     };
     for (index, node) in model.nodes.iter().enumerate() {
@@ -2906,17 +2908,6 @@ impl<'a> AgentLowering<'a> {
                     })
                     .collect::<Result<_, Error>>()?,
             }),
-            G::Attachment {
-                path,
-                filename,
-                content_type,
-                key,
-            } => V::Attachment {
-                path: path.clone(),
-                filename: filename.clone(),
-                content_type: content_type.clone(),
-                key: key.clone(),
-            },
             G::Unary { op, operand, range } => V::Unary {
                 op: *op,
                 operand: Box::new(self.value(operand)?),
@@ -3151,10 +3142,15 @@ impl<'a> AgentLowering<'a> {
                 operation: *operation,
                 args: args.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?,
             },
-            graph::Func::Attachment { path, content_type } => execution::Func::Attachment {
-                path: path.clone(),
-                content_type: content_type.clone(),
-            },
+            graph::Func::Call { function, args, .. } => {
+                let implementation = (super::functions::FUNCTIONS.iter())
+                    .find(|known| known.name == function)
+                    .ok_or_else(|| format!("function `{function}` has no implementation"))?;
+                execution::Func::Provider {
+                    function: implementation,
+                    args: args.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?,
+                }
+            }
             graph::Func::Choice(values) => {
                 execution::Func::Choice(values.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?)
             }
@@ -3243,9 +3239,6 @@ impl<'a> AgentLowering<'a> {
             graph::Func::Len { target } => execution::Func::Len {
                 target: Box::new(self.value(target)?),
             },
-            graph::Func::Tokens { value } => execution::Func::Tokens {
-                value: Box::new(self.value(value)?),
-            },
             graph::Func::Format { pieces, args } => execution::Func::Format {
                 pieces: pieces.clone(),
                 args: args.iter().map(|v| self.value(v)).collect::<Result<_, Error>>()?,
@@ -3276,9 +3269,6 @@ impl<'a> AgentLowering<'a> {
             graph::Func::Uuid => execution::Func::Uuid,
             graph::Func::Hex { length } => execution::Func::Hex { length: *length },
             graph::Func::Alphanum { length } => execution::Func::Alphanum { length: *length },
-            graph::Func::Noise { size } => execution::Func::Noise {
-                size: Box::new(self.value(size)?),
-            },
         })
     }
 }

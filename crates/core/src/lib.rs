@@ -11,7 +11,10 @@
 //! A host names its provider in one place and reaches it through
 //! [`providers::Provider`]. [`providers::Provider::compile_module`] compiles source
 //! with the provider's definitions, rejects what the provider does not support and
-//! lowers the result for the mocking consumers.
+//! lowers the result for the mocking consumers. A provider also contributes
+//! functions: the schema declares each one and a [`mocking::Function`] runs it, for
+//! data generation and for agents generated in each language. A consumer that cannot
+//! run a function reports the call where it is written.
 //! Model transformations must preserve resolved references and scope invariants.
 
 #[cfg(feature = "native")]

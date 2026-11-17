@@ -1,6 +1,7 @@
 //! Render functions, expressions, and runtime support into target-language source.
 
 use crate::dsl::ScorerLang;
+use crate::mocking::Helper;
 
 use crate::mocking::code::lowering::code::{Expr, Function, Statement, Variable};
 
@@ -1544,10 +1545,7 @@ def _sample(kind, args, random_source):
 
 def _random_text(alphabet, length, random_source):
     return "".join(alphabet[_pick(len(alphabet), random_source)] for _ in range(_count(length)))
-def _noise(size, random_source):
-    size = _count(size)
-    if size > 8388608: raise ValueError("noise exceeds 8388608 characters")
-    return _random_text("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", size, random_source)
+{samplers}
 def _uuid(random_source):
     data = [_pick(256, random_source) for _ in range(16)]
     data[6], data[8] = (data[6] & 15) | 64, (data[8] & 63) | 128
@@ -1716,34 +1714,12 @@ function _sample(kind: string, args: number[], randomSource: () => number): numb
 function _random_text(alphabet: string, length: number, randomSource: () => number): string {
     return Array.from({length: _count(length)}, () => alphabet[_pick(alphabet.length, randomSource)]).join("");
 }
-function _noise(size: unknown, randomSource: () => number): string {
-    const length = _count(size);
-    if (length > 8388608) throw new RangeError("noise exceeds 8388608 characters");
-    return _random_text("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", length, randomSource);
-}
+{samplers}
 function _uuid(randomSource: () => number): string {
     const data = Array.from({length: 16}, () => _pick(256, randomSource));
     data[6] = (data[6] & 15) | 64; data[8] = (data[8] & 63) | 128;
     const text = data.map(byte => byte.toString(16).padStart(2, "0")).join("");
     return text.slice(0,8)+"-"+text.slice(8,12)+"-"+text.slice(12,16)+"-"+text.slice(16,20)+"-"+text.slice(20);
-}
-"#;
-
-    pub(in crate::mocking::code) const PY_TOKENS: &str = r#"
-def _tokens(value):
-    import tiktoken
-    value = _value(value)
-    text = value if isinstance(value, str) else _json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return len(tiktoken.get_encoding("o200k_base").encode_ordinary(text))
-"#;
-
-    pub(in crate::mocking::code) const TS_TOKENS: &str = r#"
-import { getEncoding as _getEncoding } from "js-tiktoken";
-const _encoding = _getEncoding("o200k_base");
-function _tokens(value: unknown): number {
-    value = _serialize(value);
-    const sorted = (item: any): any => Array.isArray(item) ? item.map(sorted) : item !== null && typeof item === "object" ? Object.fromEntries(Object.keys(item).sort().map(key => [key, sorted(item[key])])) : item;
-    return _encoding.encode(typeof value === "string" ? value : JSON.stringify(sorted(value)), [], []).length;
 }
 "#;
 }
@@ -2088,7 +2064,6 @@ pub(in crate::mocking::code) fn agent(
             ("_duration", "duration_seconds"),
             ("checked_number", "checked_number"),
             ("validate_input", "validate_input"),
-            ("_tokens", "count_tokens"),
             ("_array", "as_list"),
             ("_uuid", "new_uuid"),
             ("_range", "sample_range"),
@@ -2116,7 +2091,6 @@ pub(in crate::mocking::code) fn agent(
             ("_duration", "durationSeconds"),
             ("checked_number", "checkedNumber"),
             ("validate_input", "validateInput"),
-            ("_tokens", "countTokens"),
             ("_array", "asList"),
             ("_uuid", "newUuid"),
             ("_range", "sampleRange"),
@@ -2137,6 +2111,14 @@ pub(in crate::mocking::code) fn agent(
             ("_integer", "asInteger"),
         ]
     };
+    // a provider's helpers read by the names the provider gives them
+    let mut names = names.to_vec();
+    names.extend(
+        agent
+            .helpers
+            .iter()
+            .filter_map(|helper| Some((helper.name, helper.reads_as?))),
+    );
     let mut functions = agent.functions.clone();
     for function in &mut functions {
         crate::mocking::code::lowering::code::rewrite(&mut function.body, &mut |value| {
@@ -2176,7 +2158,7 @@ pub(in crate::mocking::code) fn agent(
     };
     let extra = runtime_helpers(
         lang,
-        agent.tokens,
+        &agent.helpers,
         crate::mocking::code::planning::mentions(&functions, "_english"),
     );
     let rename = |source: &str| {
@@ -2211,19 +2193,33 @@ pub(in crate::mocking::code) fn agent(
     };
     (source, types)
 }
-fn runtime_helpers(lang: ScorerLang, tokens: bool, english: bool) -> String {
-    let (base, tokenizer) = match lang {
-        ScorerLang::Python => (PYTHON, PY_TOKENS),
-        ScorerLang::Typescript => (TYPESCRIPT, TS_TOKENS),
+fn runtime_helpers(lang: ScorerLang, helpers: &[Helper], english: bool) -> String {
+    let base = match lang {
+        ScorerLang::Python => PYTHON,
+        ScorerLang::Typescript => TYPESCRIPT,
     };
     let language = if lang == ScorerLang::Python {
         PY_LANGUAGE
     } else {
         TS_LANGUAGE
     };
+    // a helper that draws from the random source sits with the samplers, the rest follow the runtime
+    let text = |random: bool| -> String {
+        (helpers.iter())
+            .filter(|helper| helper.random == random)
+            .map(|helper| {
+                if random {
+                    helper.text.trim_start_matches('\n')
+                } else {
+                    helper.text
+                }
+            })
+            .collect()
+    };
     format!(
-        "{base}\n{language}\n{}\n{}",
-        if tokens { tokenizer } else { "" },
+        "{}\n{language}\n{}\n{}",
+        base.replace("{samplers}\n", &text(true)),
+        text(false),
         if english { english_source(lang, true) } else { String::new() }
     )
 }

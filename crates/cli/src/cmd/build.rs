@@ -90,7 +90,7 @@ impl Args {
         if !self.select.is_empty() || self.seed.is_some() {
             return Err(BuildError::AgentOptions);
         }
-        let model = self.compile::<A>()?;
+        let (model, source) = self.compile::<A>()?;
         if model.scorers.is_empty() {
             return Err(BuildError::NoScorers);
         }
@@ -101,7 +101,11 @@ impl Args {
         let emitter = provider.emitter();
         let assembly = tracing::info_span!("assemble")
             .in_scope(|| code::assemble(&model.scorers, lang, &emitter, &target))
-            .map_err(BuildError::Plan)?;
+            .map_err(|error| match error {
+                // a function scorer code cannot run is a mistake in the shape, shown where it is called
+                code::AssemblyError::Unsupported(diags) => self.invalid(&source, diags),
+                error => BuildError::Plan(error),
+            })?;
         let files = code::writing::Directory::new(&self.out);
         let context = code::CodebaseContext {
             root: &self.out,
@@ -115,7 +119,8 @@ impl Args {
     where
         <A::Provider as CodeProvider>::Target: code::AgentTarget,
     {
-        let model = selection::agents(&self.compile::<A>()?, &self.select).map_err(BuildError::Selection)?;
+        let (model, source) = self.compile::<A>()?;
+        let model = selection::agents(&model, &self.select).map_err(BuildError::Selection)?;
         let lang = self
             .lang
             .map(Lang::into_model)
@@ -125,7 +130,11 @@ impl Args {
             .map_err(BuildError::Adapter)?;
         let assembly = tracing::info_span!("assemble")
             .in_scope(|| adapter.assemble_agents(&model, lang, &target))
-            .map_err(BuildError::Agent)?;
+            .map_err(|error| match error {
+                // a function the agent cannot run is a mistake in the shape, shown where it is called
+                code::AgentError::Unsupported(diags) => self.invalid(&source, diags),
+                code::AgentError::Generation(reason) => BuildError::Agent(reason),
+            })?;
         let files = code::writing::Directory::new(&self.out);
         let context = code::CodebaseContext {
             root: &self.out,
@@ -137,17 +146,22 @@ impl Args {
         self.write(plan, adapter, model.scorers.len())
     }
 
-    fn compile<A: CodeAdapter>(&self) -> Result<bts_core::mocking::Model, ExecutionError<A>> {
+    // the source is returned with the model so a later stage can show a mistake where it was written
+    fn compile<A: CodeAdapter>(&self) -> Result<(bts_core::mocking::Model, String), ExecutionError<A>> {
         let source = fs::read_to_string(&self.from).map_err(|source| BuildError::ReadShape {
             path: self.from.clone(),
             source,
         })?;
-        let source_name = self.from.display().to_string();
-        tracing::info_span!("compile")
+        let model = tracing::info_span!("compile")
             .in_scope(|| crate::providers::SELECTED.compile_module(&source, false))
-            .map_err(|diags| BuildError::InvalidShape {
-                details: SourceDiags::new(&source_name, &source, diags),
-            })
+            .map_err(|diags| self.invalid(&source, diags))?;
+        Ok((model, source))
+    }
+
+    fn invalid<A, E, T>(&self, source: &str, diags: crate::dsl::Diags) -> BuildError<A, E, T> {
+        BuildError::InvalidShape {
+            details: SourceDiags::new(&self.from.display().to_string(), source, diags),
+        }
     }
 
     fn write<A: CodeAdapter>(

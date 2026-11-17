@@ -139,13 +139,18 @@ fn options<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, Operatio
     serde_wasm_bindgen::from_value(value).map_err(|error| OperationError::new("options", error))
 }
 
-fn compile_source(source: &str) -> Result<bts_core::mocking::Model, OperationError> {
-    PROVIDER.compile_module(source, false).map_err(|diagnostics| OperationError {
+// invalid source, reported with the location of each mistake
+fn invalid(diagnostics: bts_lang::Diags) -> OperationError {
+    OperationError {
         stage: "compile",
         message: "source is invalid".to_owned(),
         diagnostics,
         details: None,
-    })
+    }
+}
+
+fn compile_source(source: &str) -> Result<bts_core::mocking::Model, OperationError> {
+    PROVIDER.compile_module(source, false).map_err(invalid)
 }
 
 /// Returns the shared language reference, including rules, examples, and versions.
@@ -538,8 +543,12 @@ pub fn build(
                 if model.scorers.is_empty() {
                     return Err(OperationError::new("build", "the graph declares no scorer nodes"));
                 }
-                let assembly = code::assemble(&model.scorers, language, &PROVIDER.emitter(), &target)
-                    .map_err(|error| OperationError::new("build", error))?;
+                let assembly =
+                    code::assemble(&model.scorers, language, &PROVIDER.emitter(), &target).map_err(|error| match error {
+                        // a function scorer code cannot run is a mistake in the source
+                        code::AssemblyError::Unsupported(diagnostics) => invalid(diagnostics),
+                        error => OperationError::new("build", error),
+                    })?;
                 code::plan_codebase(&assembly, &target, &context).map_err(|error| OperationError::new("build", error))?
             }
             BuildTarget::Agent => {
@@ -555,8 +564,11 @@ pub fn build(
                     return Err(OperationError::new("options", "project is required for agent evals"));
                 }
                 let language = language.unwrap_or(bts_core::mocking::ScorerLang::Python);
-                let assembly =
-                    code::assemble_agents(&model, language, &target).map_err(|error| OperationError::new("build", error))?;
+                let assembly = code::assemble_agents(&model, language, &target).map_err(|error| match error {
+                    // a function the agent cannot run is a mistake in the source
+                    code::AgentError::Unsupported(diagnostics) => invalid(diagnostics),
+                    error => OperationError::new("build", error),
+                })?;
                 let assembly = target
                     .agent_assembly(&model, language, assembly)
                     .map_err(|error| OperationError::new("build", error))?;

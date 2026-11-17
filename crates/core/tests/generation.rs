@@ -1,15 +1,16 @@
 use bts_core::mocking::data::{self, Distribution, Value};
 use bts_core::providers::Provider;
 use bts_core::providers::braintrust::Bundle;
-use bts_lang::semantics::{Source, compile_with_definitions};
+use bts_lang::semantics::{Source, compile_module_with_provider};
 
 fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
-    let graph = compile_with_definitions(
+    let graph = compile_module_with_provider(
         Source {
             name: "generation.bt",
             text: source,
         },
-        Bundle.schema().definitions,
+        &Bundle.schema(),
+        false,
     )
     .map_err(|errors| format!("{errors:#?}"))?;
     Bundle.lower(&graph).map_err(|diag| diag.what)

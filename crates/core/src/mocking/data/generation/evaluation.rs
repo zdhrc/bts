@@ -3,12 +3,12 @@ use crate::dsl::EnglishOperation;
 use crate::dsl::{
     Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild,
     Choice as ModelChoice, CtxRef as ModelCtxRef, EmissionKind, Emissions, Field, Func as ModelFunc, Maybe as ModelMaybe,
-    Model, NOISE_SIZE_CAP, NodeId, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField,
-    Part as ModelPart, Range as ModelRange, RefId, Repeat as ModelRepeat, ResolvedRef, Selection,
-    SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange, Step, Template as ModelTemplate, Trace as ModelTrace,
-    UnaryOp, Value as ModelValue,
+    Model, NodeId, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart,
+    Range as ModelRange, RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields,
+    SpanKind as ModelSpanKind, SrcRange, Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
 };
 use crate::english::{self, RealizeOptions, Sentence, VariationOptions};
+use crate::mocking::{EvaluateError, Evaluation};
 use crate::selection::filter::WriteFilter;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
@@ -18,12 +18,6 @@ use serde_json::{Number as JsonNumber, Value as InputValue};
 use std::collections::BTreeMap as JsonMap;
 use std::fmt;
 use std::ops::Range;
-use std::sync::LazyLock;
-use tiktoken_rs::CoreBPE;
-use uuid::Uuid;
-
-// building the encoder parses the embedded vocab, do it once
-static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expect("the embedded vocab parses"));
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct Plan {
@@ -1956,21 +1950,23 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             let output = eval_english(operation, &args, &mut ctx.rng).map_err(|detail| Error::english(detail, range))?;
             json_to_value(output.into())
         }
-        ModelFunc::Attachment { path, content_type } => {
-            let filename = std::path::Path::new(&path)
-                .file_name()
-                .expect("modeler validates attachment path")
-                .to_string_lossy()
-                .into_owned();
-            let mut key_bytes = [0; 16];
-            ctx.rng.fill(&mut key_bytes);
-            key_bytes[6] = (key_bytes[6] & 0x0f) | 0x40;
-            key_bytes[8] = (key_bytes[8] & 0x3f) | 0x80;
-            ModelValue::Attachment {
-                path,
-                filename,
-                content_type,
-                key: Uuid::from_bytes(key_bytes).to_string(),
+        ModelFunc::Provider { function, args } => {
+            let args = args
+                .into_iter()
+                .map(|arg| lower_value(arg, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let evaluate = function
+                .data
+                .ok_or_else(|| Error::call(format!("function `{}` does not run in data generation", function.name), range))?;
+            let mut evaluation = Evaluation {
+                rng: &mut ctx.rng,
+                format: ctx.format,
+            };
+            match evaluate(&args, &mut evaluation) {
+                Ok(value) => json_to_value(value),
+                Err(EvaluateError::Shape) => return Err(shape_error(ctx)),
+                Err(EvaluateError::UnsupportedAttachment) => return Err(Error::new(ErrorKind::UnsupportedAttachment, range)),
+                Err(EvaluateError::Invalid(detail)) => return Err(Error::call(detail.to_owned(), range)),
             }
         }
         ModelFunc::Choice(options) => {
@@ -2173,17 +2169,6 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             };
             ModelValue::Num(ModelNumber::Int(length as i64))
         }
-        ModelFunc::Tokens { value } => {
-            // containers count their compact json serialization
-            let text = match lower_value(*value, ctx)? {
-                JsonValue::String(text) => text,
-                value => value
-                    .project(ctx.format)
-                    .map_err(|_| Error::new(ErrorKind::UnsupportedAttachment, range))?
-                    .to_string(),
-            };
-            ModelValue::Num(ModelNumber::Int(BPE.encode_ordinary(&text).len() as i64))
-        }
         ModelFunc::Format { pieces, args } => {
             // the modeler guarantees one more piece than args
             let mut pieces = pieces.into_iter();
@@ -2238,19 +2223,6 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             length,
             ctx,
         )),
-        ModelFunc::Noise { size } => {
-            let size = match eval_operand(*size, ctx)? {
-                Scalar::Int(value) if (0..=NOISE_SIZE_CAP).contains(&value) => value as usize,
-                Scalar::Int(_) | Scalar::Float(_) => return Err(Error::new(ErrorKind::NoiseSizeOutOfRange, range)),
-                // reference-fed arguments settle their types here
-                _ => return Err(shape_error(ctx)),
-            };
-            ModelValue::Str(random_text(
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-                size,
-                ctx,
-            ))
-        }
     };
 
     Ok(value)
@@ -2448,9 +2420,7 @@ fn eval_extreme(values: Vec<ModelValue>, minimize: bool, ctx: &mut Ctx) -> Resul
 }
 
 fn random_text(charset: &[u8], length: usize, ctx: &mut Ctx) -> String {
-    (0..length)
-        .map(|_| charset[ctx.rng.random_range(0..charset.len())] as char)
-        .collect()
+    crate::mocking::functions::random_text(charset, length, &mut ctx.rng)
 }
 
 fn json_text(value: &JsonValue) -> Option<String> {
@@ -2932,6 +2902,14 @@ impl Error {
         }
     }
 
+    fn call(detail: String, range: SrcRange) -> Self {
+        Self {
+            kind: ErrorKind::InvalidCall,
+            range,
+            detail: Some(detail),
+        }
+    }
+
     fn english(detail: String, range: SrcRange) -> Self {
         Self {
             kind: ErrorKind::InvalidEnglish,
@@ -2963,7 +2941,7 @@ pub enum ErrorKind {
     ScoreOutOfRange,
     ScorerReasonNotString,
     DurationOutOfRange,
-    NoiseSizeOutOfRange,
+    InvalidCall,
     ClampBoundsOutOfOrder,
     EmptySplitSeparator,
     JoinElementNotScalar,
@@ -2999,7 +2977,7 @@ impl fmt::Display for ErrorKind {
             Self::ScoreOutOfRange => "synthetic scorer score is not a number between 0 and 1",
             Self::ScorerReasonNotString => "synthetic scorer reason is not a string",
             Self::DurationOutOfRange => "duration is not a positive number of seconds",
-            Self::NoiseSizeOutOfRange => "noise size is not an integer between 0 and 8388608",
+            Self::InvalidCall => "invalid provider function call",
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
             Self::EmptySplitSeparator => "split separator is empty",
             Self::InvalidRender => "render requires balanced braces and named string, number, or boolean values",
@@ -3038,6 +3016,7 @@ impl From<Error> for crate::dsl::Diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::braintrust::functions::count_tokens;
     use crate::providers::braintrust::mocking::compile;
 
     macro_rules! value {
@@ -3101,7 +3080,7 @@ mod tests {
         let rendered = InputValue::Array(vec![AttachmentView.attachment(&plan.attachments[0]).unwrap()]).to_string();
         assert_eq!(
             plan.events[0].fields.metrics.as_ref().unwrap()["count"].as_u64(),
-            Some(BPE.encode_ordinary(&rendered).len() as u64)
+            Some(count_tokens(&rendered) as u64)
         );
         assert!(matches!(plan.events[0].fields.input, Some(JsonValue::Attachment(_))));
     }
@@ -3297,7 +3276,7 @@ mod tests {
             );
             assert_eq!(
                 fields.metrics.as_ref().unwrap()["count"].as_u64(),
-                Some(BPE.encode_ordinary(&projection.to_string()).len() as u64),
+                Some(count_tokens(&projection.to_string()) as u64),
             );
         }
     }
@@ -3631,7 +3610,7 @@ mod tests {
         assert_eq!(metrics["empty"], JsonValue::from(0));
         // containers count their compact json serialization
         let serialized = r#"[{"content":"hi","role":"user"}]"#;
-        assert_eq!(metrics["messages"], JsonValue::from(BPE.encode_ordinary(serialized).len()));
+        assert_eq!(metrics["messages"], JsonValue::from(count_tokens(serialized)));
     }
 
     #[test]
