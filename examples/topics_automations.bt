@@ -106,12 +106,7 @@
     input: ("subscription-support").local.turns[: context.index * 2 + 1],
     output: turn.output,
     metadata: {model: "glm-5.2"},
-    duration: lognormal (0.8, 0.35),
-    metrics: {
-        prompt_tokens: tokens (self.input),
-        completion_tokens: tokens (self.output),
-        tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens,
-    }
+    duration: lognormal (0.8, 0.35)
 };
 
 ("Retention signals":facet) {

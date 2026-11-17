@@ -146,6 +146,17 @@ A definition starts with `+` and is written like a `node`: its header holds prop
 
 Then change `(search:tool)` to `(search:billing_lookup {service: "billing"})`. Properties inside the `node` header configure that instance and are checked against the inherited schema. The body remains its data and expressions. This extension adds a contract, not a service implementation.
 
+A field descriptor can also carry `value`, an expression that computes the field for every instance that omits it:
+
+```bts
++(clean_query:node) {output: {type: "string", value: lower(trim(self.input))}}
+    -[:extends]->(tool);
+```
+
+The expression reads `self` and `context` only, so the kind works in any shape. An instance that writes the field replaces the computed value. When both are objects they are merged by key, and the instance's keys win.
+
+The provider's `llm` kind uses this to count tokens. Every `llm` step gets `prompt_tokens`, `completion_tokens` and `tokens` in its `metrics` without writing them, and `metrics: {time_to_first_token: 0.2}` adds to those counts. See [computed fields](examples/computed_fields.bt).
+
 ## Use the model
 
 The following workflows consume the support graph through the Braintrust provider. Generate data from its possible behaviors, build a mock implementation, or add definitions for evaluation and resource management.

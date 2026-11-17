@@ -317,6 +317,7 @@ const INCONSISTENT_DESCRIPTORS: &[bts_lang::FunctionDesc] = &[
         &[bts_lang::ParamDesc {
             name: "value",
             accepts: &[],
+            nullable: false,
             constant: false,
             bounds: None,
         }],
@@ -578,6 +579,84 @@ fn a_function_a_consumer_cannot_run_is_reported_where_it_is_called() {
     assert_eq!(located(TWO_AGENTS, &diags[0]), "tokens(context.output)");
     assert_eq!(diags[0].what, "function `tokens` is not supported by scorer generation");
     assert!(code::assemble(&model.scorers[1..], None, &emitter, &target).is_ok());
+}
+
+#[test]
+fn a_computed_field_a_consumer_cannot_run_is_reported_at_its_call() {
+    // the kind states the call once, so the report points into the kind for the agent that uses it
+    let source = r#"+(reporting:node) {output: {value: {report: attachment("report.pdf", "application/pdf")}}}
+    -[:extends]->(task);
+(files:agent) {input: null, output: work.output};
+(files)-[:next]->(work:reporting {name: "work"}) {input: files.input};
+(other:agent) {input: null, output: plain.output};
+(other)-[:next]->(plain:task {name: "plain"}) {input: other.input, output: "plain"};
+"#;
+    let model = compile(source).unwrap();
+    let target = braintrust::mocking::code::CodeTarget::new("local-test");
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let Err(code::AgentError::Unsupported(diags)) = code::assemble_agents(&model, lang, &target) else {
+            panic!("expected located diagnostics")
+        };
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(located(source, &diags[0]), r#"attachment("report.pdf", "application/pdf")"#);
+        assert_eq!(diags[0].r#where.source, 0);
+        // an agent that does not use the kind is still generated
+        let selected = bts_core::selection::agents(&model, &["agent.other".parse().unwrap()]).unwrap();
+        assert!(code::assemble_agents(&selected, lang, &target).is_ok());
+    }
+}
+
+#[test]
+fn an_llm_span_counts_its_own_tokens() {
+    use braintrust::functions::count_tokens;
+    // no step writes a token count: the llm kind computes them, and an object in metrics is merged over them
+    let source = r#"(chat:agent) {input: "How do I rotate API keys?", output: full.output};
+(chat)-[:next]->(request:task {name: "request"}) {input: chat.input, output: full.output};
+(request)-[:calls]->(bare:llm {name: "bare"})
+    -[:next]->(full:llm {name: "full"}) {input: request.input, output: "Under Settings."}
+        -[:next]->(timed:llm {name: "timed"}) {input: request.input, output: "Under Settings.", metrics: {time_to_first_token: 0.25}}
+            -[:next]->(cached:llm {name: "cached"}) {input: request.input, output: "Under Settings.", metrics: {prompt_tokens: 0}};
+"#;
+    let model = compile(source).unwrap();
+    let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let batch = data::generate(
+        model,
+        1,
+        Duration::from_secs(60),
+        data::Distribution::Linear,
+        now,
+        7,
+        &braintrust::Bundle.format(),
+    )
+    .unwrap();
+    let metric = |span: &str, key: &str| -> Option<data::Value> {
+        let event = batch.events.iter().find(|event| event.name == span).unwrap();
+        event.metrics.get(key).cloned()
+    };
+    let (prompt, completion) = (
+        count_tokens("How do I rotate API keys?") as i64,
+        count_tokens("Under Settings.") as i64,
+    );
+    for span in ["full", "timed"] {
+        assert_eq!(metric(span, "prompt_tokens"), Some(data::Value::from(prompt)), "{span}");
+        assert_eq!(
+            metric(span, "completion_tokens"),
+            Some(data::Value::from(completion)),
+            "{span}"
+        );
+        assert_eq!(metric(span, "tokens"), Some(data::Value::from(prompt + completion)), "{span}");
+    }
+    // what a step adds sits beside the counts, and what it replaces feeds the total
+    assert_eq!(metric("timed", "time_to_first_token"), Some(data::Value::from(0.25)));
+    assert_eq!(metric("full", "time_to_first_token"), None);
+    assert_eq!(metric("cached", "prompt_tokens"), Some(data::Value::from(0)));
+    assert_eq!(metric("cached", "tokens"), Some(data::Value::from(completion)));
+    // a step with no input or output has nothing to count
+    for key in ["prompt_tokens", "completion_tokens", "tokens"] {
+        assert_eq!(metric("bare", key), Some(data::Value::from(0)), "{key}");
+    }
+    // a task counts nothing unless it asks
+    assert_eq!(metric("request", "tokens"), None);
 }
 
 #[test]

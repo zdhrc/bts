@@ -43,7 +43,18 @@ pub const SOURCE: Source<'static> = Source {
 
 +(tool:node)-[:extends]->(span);
 +(task:node)-[:extends]->(span);
-+(llm:node)-[:extends]->(span);
+# an llm span counts its own tokens, and an object written in metrics is merged over these keys
+# a step without input or output counts none for it
++(llm:node) {
+    input: {default: null},
+    output: {default: null},
+    metrics: {value: {
+        prompt_tokens: tokens(self.input),
+        completion_tokens: tokens(self.output),
+        tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens,
+    }},
+}
+    -[:extends]->(span);
 +(function:node)-[:extends]->(span);
 
 # calls schedules its target like next and goes down a level

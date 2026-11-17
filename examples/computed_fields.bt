@@ -1,0 +1,30 @@
+# a kind states once how a field is computed, and every instance that omits the field gets it
+# the query cleaner derives its output from its input, so its instance writes an input alone
++(clean_query:node) {output: {type: "string", value: lower(trim(self.input))}}
+    -[:extends]->(tool);
+
+(help_desk:agent) {input: "  How do I ROTATE my API keys?  ", output: answer.output.content};
+(help_desk)-[:next]->(request:task {name: "help-desk"}) {
+    input: help_desk.input,
+    output: answer.output.content,
+    tags: [|"help-desk"|],
+};
+# an llm step counts its own tokens, which is a computed field of the provider's llm kind
+(request)-[:calls]->(clean:clean_query {name: "clean_query"}) {input: request.input}
+    -[:next]->(route:llm {name: "Chat Completion"}) {
+        input: {system: "Name the help article that answers the question.", question: clean.output},
+        output: {role: "assistant", content: "api-keys/rotation"},
+        metadata: {model: "gpt-4o-mini", provider: "openai"},
+    }
+        # an object written over a computed object is merged with it, key by key
+        # a cache hit bills no prompt, and the time to the first token is this step's own metric
+        -[:next]->(answer:llm {name: "Chat Completion"}) {
+            input: {
+                system: "Answer from the article. Keep it to two sentences.",
+                question: clean.output,
+                article: route.output.content,
+            },
+            output: {role: "assistant", content: "Rotate keys under Settings > API. The old key stays valid for 24 hours."},
+            metadata: {model: "gpt-4o-mini", provider: "openai", cache: "hit"},
+            metrics: {prompt_tokens: 0, time_to_first_token: 0.2},
+        };

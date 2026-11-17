@@ -27,7 +27,6 @@
             |],
             output: {role: "assistant", content: opening.output},
             metadata: {model: "gpt-4o-mini", provider: "openai"},
-            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         }
         ->(later)-[:calls]->(later_reply:llm {name: "Chat Completion"}) {
             input: [|
@@ -37,5 +36,4 @@
             |],
             output: {role: "assistant", content: later.output},
             metadata: {model: "gpt-4o-mini", provider: "openai"},
-            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         };

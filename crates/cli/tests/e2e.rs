@@ -2178,7 +2178,21 @@ fn write_eval_sdk_stub(root: &std::path::Path, lang: &str) {
             "definitions = []\ndef Eval(project, **definition):\n    definitions.append((project, definition))\n",
         )
         .unwrap();
+        // an llm step counts its tokens, and the tokenizer is not installed where the tests run
+        for directory in ["src", "src/agents"] {
+            if root.join(directory).is_dir() {
+                fs::write(root.join(directory).join("tiktoken.py"), "def get_encoding(name):\n    class Words:\n        def encode_ordinary(self, text): return text.split()\n    return Words()\n").unwrap();
+            }
+        }
     } else {
+        let tokenizer = root.join("node_modules/js-tiktoken");
+        fs::create_dir_all(&tokenizer).unwrap();
+        fs::write(tokenizer.join("package.json"), r#"{"type":"module","exports":"./index.mjs"}"#).unwrap();
+        fs::write(
+            tokenizer.join("index.mjs"),
+            "export function getEncoding() { return {encode: text => text.split(/\\s+/).filter(Boolean)}; }\n",
+        )
+        .unwrap();
         let package = root.join("node_modules/braintrust");
         fs::create_dir_all(&package).unwrap();
         fs::write(package.join("package.json"), r#"{"type":"module","exports":"./index.mjs"}"#).unwrap();
@@ -4045,12 +4059,16 @@ fn readme_graph_examples_compile_with_their_documented_additions() {
         .skip(1)
         .map(|section| section.split_once("\n```").unwrap().0)
         .collect();
-    assert_eq!(blocks.len(), 4);
+    assert_eq!(blocks.len(), 5);
     for source in [
         blocks[0].to_owned(),
         blocks[1].to_owned(),
         format!("{}\n{}", blocks[0], blocks[2]).replace("(search:tool)", "(search:billing_lookup {service: \"billing\"})"),
-        format!("{}\n{}", blocks[0], blocks[3]),
+        format!(
+            "{}\n{}\n(search)-[:next]->(cleaned:clean_query) {{input: \"  Billing HELP \"}};",
+            blocks[0], blocks[3]
+        ),
+        format!("{}\n{}", blocks[0], blocks[4]),
     ] {
         let shape = write_shape(&source);
         let generated = bts()

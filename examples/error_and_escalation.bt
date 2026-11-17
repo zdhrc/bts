@@ -22,7 +22,6 @@
     |],
     output: {role: "assistant", content: "The June invoice is $1,240.00. Charging the card on file."},
     metadata: {model: "gpt-4o-mini", provider: "openai"},
-    metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
 }
     =[:exclusive]=>[
         -[failed:next {when: request.local.failed}]->(declined:tool {name: "charge_customer"}) {

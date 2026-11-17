@@ -19,7 +19,6 @@
                 ? "Checking the pod status for checkout-api."
                 : "Pulling the recent checkout-api logs."},
             metadata: {model: "claude-sonnet-4-5", provider: "anthropic", max_tokens: 1024},
-            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         },
     ]
         ->(inspect)
@@ -41,5 +40,4 @@
             |],
             output: {role: "assistant", content: "checkout-api is crash-looping. Review the recent configuration change and roll it back if it caused the failures."},
             metadata: {model: "claude-sonnet-4-5", provider: "anthropic", max_tokens: 1024},
-            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         };

@@ -86,7 +86,7 @@ Use chat messages for LLM inputs and an assistant message for the output so the 
 
 ### Metrics and labels
 
-Use durations and token counts that fit the content. Derive counts with `tokens()` or keep sampled `prompt_tokens + completion_tokens = tokens` exactly. Vary leaf durations, keep `time_to_first_token` below its LLM span duration, and make parent timing contain the work it represents. Put meaningful operational tags on the root. Do not add `demo`, `synthetic`, or similar provenance tags or metadata unless the user explicitly requests them.
+Use durations and token counts that fit the content. An `llm` span computes `prompt_tokens`, `completion_tokens` and `tokens` from its own input and output, so leave them out. Write `metrics` on an `llm` span only for what it adds or changes, such as `time_to_first_token` or a `prompt_tokens` of 0 for a cache hit. The object is merged over the computed counts. On other spans derive counts with `tokens()`. Vary leaf durations, keep `time_to_first_token` below its LLM span duration, and make parent timing contain the work it represents. Put meaningful operational tags on the root. Do not add `demo`, `synthetic`, or similar provenance tags or metadata unless the user explicitly requests them.
 
 Inspect the rendered result, not just the source. Check that names, nesting, chat messages, tool payloads, timing, and final output help a viewer understand what happened without a spoken explanation.
 

@@ -42,10 +42,5 @@
             },
             output: {role: "assistant", content: "Rotate keys under Settings > API. The old key stays valid for 24 hours. [doc_112]"},
             metadata: {model: "gpt-4o-mini", provider: "openai"},
-            metrics: {
-                prompt_tokens: tokens(self.input),
-                completion_tokens: tokens(self.output),
-                tokens: tokens(self.input) + tokens(self.output),
-                time_to_first_token: self.local.gen_time * range(0.1, 0.25),
-            },
+            metrics: {time_to_first_token: self.local.gen_time * range(0.1, 0.25)},
         };

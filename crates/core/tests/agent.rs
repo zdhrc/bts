@@ -224,6 +224,17 @@ fn execute_generated(model: &bts_core::mocking::Model, lang: ScorerLang, program
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, &file.contents).unwrap();
     }
+    // an llm step counts its tokens, and the tokenizer is not installed where the tests run
+    // these stand-ins count words, so token metrics here are not real counts
+    fs::write(directory.join("src/agents/tiktoken.py"), "def get_encoding(name):\n    class Words:\n        def encode_ordinary(self, text): return text.split()\n    return Words()\n").unwrap();
+    let tokenizer = directory.join("node_modules/js-tiktoken");
+    fs::create_dir_all(&tokenizer).unwrap();
+    fs::write(tokenizer.join("package.json"), r#"{"type":"module","exports":"./index.mjs"}"#).unwrap();
+    fs::write(
+        tokenizer.join("index.mjs"),
+        "export function getEncoding() { return {encode: text => text.split(/\\s+/).filter(Boolean)}; }\n",
+    )
+    .unwrap();
     let path = directory.join("src/agents").join(file);
     fs::write(&path, runner).unwrap();
     let output = Command::new(program).arg(&path).output().expect("local language runtime");
@@ -1806,6 +1817,114 @@ fn definitions_supply_context_values_to_data_and_code() {
 }
 
 // the name and output of every span, in the order the spans run
+#[test]
+fn kinds_compute_fields_for_data_and_code() {
+    // a kind states its output once, an extension restates it, and the last step writes its own
+    let source = r#"
++(clean_query:node) {output: {type: "string", value: lower(trim(self.input))}}
+    -[:extends]->(tool);
++(shout_query:node) {output: {value: upper(trim(self.input))}}
+    -[:extends]->(clean_query);
+
+(help:agent) {input: "  Rotate MY Keys ", output: request.output};
+(help)-[:next]->(request:task) {input: help.input, output: last.output};
+(request)-[:calls]->(clean:clean_query) {input: request.input}
+    -[:next]->(loud:shout_query) {input: request.input}
+        -[:next]->(last:clean_query) {input: loud.output, output: "written"};
+"#;
+    let spans = |question: &str| {
+        [
+            ("request", json!(question), json!("written")),
+            ("clean", json!(question), json!(question.trim().to_lowercase())),
+            ("loud", json!(question), json!(question.trim().to_uppercase())),
+            ("last", json!(question.trim().to_uppercase()), json!("written")),
+        ]
+        .map(|(name, input, output)| (name.to_owned(), input, output))
+    };
+    let batch = one_trace(source);
+    let data: Vec<_> = (batch.events.iter())
+        .map(|event| {
+            let project = |value: &Option<data::Value>| value.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
+            (event.name.clone(), project(&event.input), project(&event.output))
+        })
+        .collect();
+    assert_eq!(data, spans("  Rotate MY Keys "));
+    let model = lower(source).unwrap();
+    let code = |details: &Value| -> Vec<_> {
+        (details["spans"].as_array().unwrap().iter())
+            .map(|span| {
+                (
+                    span["name"].as_str().unwrap().to_owned(),
+                    span["input"].clone(),
+                    span["output"].clone(),
+                )
+            })
+            .collect()
+    };
+    for details in generated_runs(&model, "help") {
+        assert_eq!(code(&details), spans("  Rotate MY Keys "));
+    }
+    // the field is computed when the agent runs, from the input its caller supplies
+    let python = execute_generated(
+        &model,
+        ScorerLang::Python,
+        "python3",
+        "check.py",
+        "from help_agent import run_details\nimport json\nprint(json.dumps(run_details(' New QUESTION  ')))",
+    );
+    let typescript = execute_generated(
+        &model,
+        ScorerLang::Typescript,
+        "node",
+        "check.mts",
+        "import {runDetails} from './help_agent.mts'; console.log(JSON.stringify(runDetails(' New QUESTION  ')));",
+    );
+    for details in [python, typescript] {
+        assert_eq!(code(&details), spans(" New QUESTION  "));
+    }
+    // no step function shows that a value came from its kind
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let written = source.replace(
+            "(clean:clean_query) {input: request.input}",
+            "(clean:clean_query) {input: request.input, output: lower(trim(self.input))}",
+        );
+        assert_ne!(written, source);
+        let files = |source: &str| -> Vec<_> {
+            let assembly = code::assemble_agents(&lower(source).unwrap(), lang, &CodeTarget::new("local-test")).unwrap();
+            assembly.files.into_iter().map(|file| (file.name, file.contents)).collect()
+        };
+        assert_eq!(files(source), files(&written));
+    }
+}
+
+#[test]
+fn generated_agents_count_the_tokens_of_their_llm_steps() {
+    // the tokenizer stand-in counts words, so these are not real token counts
+    let source = r#"(chat:agent) {input: "one two three", output: cached.output};
+(chat)-[:next]->(request:task) {input: chat.input, output: cached.output};
+(request)-[:calls]->(bare:llm)
+    -[:next]->(timed:llm) {input: request.input, output: "four five", metrics: {time_to_first_token: 0.25}}
+        -[:next]->(cached:llm) {input: request.input, output: "four five", metrics: {prompt_tokens: 0}};
+"#;
+    let model = lower(source).unwrap();
+    for details in generated_runs(&model, "chat") {
+        let metrics: Vec<_> = (details["spans"].as_array().unwrap().iter())
+            .map(|span| (span["name"].as_str().unwrap().to_owned(), span["metrics"].clone()))
+            .collect();
+        let expected = [
+            ("request", Value::Null),
+            ("bare", json!({"prompt_tokens": 0, "completion_tokens": 0, "tokens": 0})),
+            (
+                "timed",
+                json!({"prompt_tokens": 3, "completion_tokens": 2, "tokens": 5, "time_to_first_token": 0.25}),
+            ),
+            ("cached", json!({"prompt_tokens": 0, "completion_tokens": 2, "tokens": 2})),
+        ]
+        .map(|(name, metrics)| (name.to_owned(), metrics));
+        assert_eq!(metrics, expected);
+    }
+}
+
 fn outputs(batch: &data::EventBatch) -> Vec<Value> {
     (batch.events.iter())
         .map(|event| json!([event.name, event.output.as_ref().map(|output| output.project(&()).unwrap())]))
@@ -1935,6 +2054,7 @@ fn every_example_agent_reads_as_written_by_hand() {
     // no deferred values, no span bookkeeping, and no helper under a private name
     for source in [
         include_str!("../../../examples/agent_tool_loop.bt"),
+        include_str!("../../../examples/computed_fields.bt"),
         include_str!("../../../examples/customer_support_agent.bt"),
         include_str!("../../../examples/dataset_cases.bt"),
         include_str!("../../../examples/error_and_escalation.bt"),

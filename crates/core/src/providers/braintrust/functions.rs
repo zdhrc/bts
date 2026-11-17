@@ -38,13 +38,14 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
             id: Id::new("func.tokens"),
             name: "tokens",
             syntax: "tokens(value)",
-            summary: "The exact number of tokens in a string, or in the JSON serialization of an array or object, as an integer, on evaluation. Counts with the o200k_base encoding used by current OpenAI models.",
+            summary: "The exact number of tokens in a string, or in the JSON serialization of an array or object, as an integer, on evaluation. Null has no tokens and counts 0. Counts with the o200k_base encoding used by current OpenAI models.",
             examples: &["tokens(\"What is the weather in Tokyo?\")", "tokens(settings.prompt)"],
             rules: CALL_RULES,
         },
         params: &[ParamDesc {
             name: "value",
             accepts: &[FieldType::String, FieldType::Array, FieldType::Object],
+            nullable: true,
             constant: false,
             bounds: None,
         }],
@@ -67,12 +68,14 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
             ParamDesc {
                 name: "path",
                 accepts: &[FieldType::String],
+                nullable: false,
                 constant: true,
                 bounds: None,
             },
             ParamDesc {
                 name: "content_type",
                 accepts: &[FieldType::String],
+                nullable: false,
                 constant: true,
                 bounds: None,
             },
@@ -92,6 +95,7 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
         params: &[ParamDesc {
             name: "size",
             accepts: &[FieldType::Number],
+            nullable: false,
             constant: false,
             bounds: Some((0, NOISE_SIZE_CAP)),
         }],
@@ -161,6 +165,8 @@ fn tokens(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, Eval
     let [value] = args else { return Err(EvaluateError::Shape) };
     // containers count their compact json serialization
     let count = match value {
+        // nothing was said, so nothing is counted
+        Value::Null => 0,
         Value::String(text) => count_tokens(text),
         value => {
             let projected = (evaluation.project(value)).map_err(|_| EvaluateError::UnsupportedAttachment)?;
@@ -221,6 +227,7 @@ const PY_TOKENS: &str = r#"
 def _tokens(value):
     import tiktoken
     value = _value(value)
+    if value is None: return 0
     text = value if isinstance(value, str) else _json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return len(tiktoken.get_encoding("o200k_base").encode_ordinary(text))
 "#;
@@ -230,6 +237,7 @@ import { getEncoding as _getEncoding } from "js-tiktoken";
 const _encoding = _getEncoding("o200k_base");
 function _tokens(value: unknown): number {
     value = _serialize(value);
+    if (value === null || value === undefined) return 0;
     const sorted = (item: any): any => Array.isArray(item) ? item.map(sorted) : item !== null && typeof item === "object" ? Object.fromEntries(Object.keys(item).sort().map(key => [key, sorted(item[key])])) : item;
     return _encoding.encode(typeof value === "string" ? value : JSON.stringify(sorted(value)), [], []).length;
 }

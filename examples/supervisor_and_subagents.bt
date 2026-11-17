@@ -36,7 +36,6 @@
             input: context.arrivals,
             output: {role: "assistant", content: "p95 latency increased from 418ms to 493ms in v42. Profile the new synchronous fraud check to confirm its contribution."},
             metadata: {model: "gpt-4o", provider: "openai"},
-            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         };
 # an optional specialist follows the synthesis without becoming a required junct input
 (synthesis)

@@ -38,5 +38,4 @@
             output: turn.output,
             metadata: {model: "gpt-4o-mini", provider: "openai", temperature: 0.3},
             duration: range(0.3, 0.8),
-            metrics: {prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)},
         };
