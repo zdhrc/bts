@@ -1120,7 +1120,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: ids::KNOWN_FUNCTIONS,
-        summary: "A function call may only use the documented functions listed in this spec.",
+        summary: "A function call may only use the documented functions listed in this spec. An unknown name is an error at the call, with the nearest known name when one is close.",
     },
     RuleDesc {
         tags: &[],
@@ -1563,6 +1563,14 @@ const EXAMPLES: &[Example] = &[
         note: "Each line continues from the last node of the line it sits under, so the edges run a to b, b to c and c to d.",
         source: "(a:node)\n    -[:next]->(b:node)\n        -[:next]->(c:node)\n            -[:next]->(d:node);",
         valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.unknown-function"),
+        summary: "A call names a function the language or the provider defines",
+        note: "The misspelled name is rejected at the call, with the nearest known function.",
+        source: r#"(a:node) {value: uper("hello")};"#,
+        valid: false,
     },
     Example {
         tags: &[],

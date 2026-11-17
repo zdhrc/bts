@@ -1427,10 +1427,12 @@ impl<'a> ExpressionModeler<'a> {
     fn model_func(&mut self, name: String, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
         // the descriptor's name doubles as the &'static str for diagnostics
         let Some(func) = spec::SPEC.function(&name).map(|desc| desc.name) else {
+            let nearest = crate::modeling::suggestion(&name, spec::SPEC.functions.iter().map(|desc| desc.name));
             self.errors.push(Error::new(
                 ErrorKind::UnknownFunction {
                     rule: spec::ids::KNOWN_FUNCTIONS,
                     name,
+                    nearest,
                 },
                 range,
             ));
@@ -2701,6 +2703,7 @@ enum ErrorKind {
     UnknownFunction {
         rule: spec::Id,
         name: String,
+        nearest: String,
     },
     EmptyChoice {
         rule: spec::Id,
@@ -2843,9 +2846,9 @@ impl fmt::Display for ErrorKind {
                     rule.summary
                 )
             }
-            Self::UnknownFunction { rule, name } => {
+            Self::UnknownFunction { rule, name, nearest } => {
                 let rule = rule_desc(*rule);
-                write!(formatter, "unknown function `{name}`; {}", rule.summary)
+                write!(formatter, "unknown function `{name}`{nearest}; {}", rule.summary)
             }
             Self::EmptyChoice { rule } => {
                 let rule = rule_desc(*rule);

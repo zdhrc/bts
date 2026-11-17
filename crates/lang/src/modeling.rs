@@ -2072,7 +2072,7 @@ fn distance(left: &str, right: &str) -> usize {
 }
 
 // names the closest known name when a misspelling is within two edits of it
-fn suggestion<'a>(name: &str, known: impl Iterator<Item = &'a str>) -> String {
+pub(crate) fn suggestion<'a>(name: &str, known: impl Iterator<Item = &'a str>) -> String {
     known
         .map(|candidate| (distance(name, candidate), candidate))
         .filter(|(distance, candidate)| *distance <= 2 && *distance < candidate.len())

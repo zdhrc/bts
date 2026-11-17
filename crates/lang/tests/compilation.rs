@@ -3331,3 +3331,14 @@ fn primitives_match_the_language_reference() {
         }
     }
 }
+
+#[test]
+fn unknown_function_names_suggest_the_nearest_builtin() {
+    let source = "(values:vars) {value: uper(\"a\")};";
+    let errors = compile(source).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].what.starts_with("unknown function `uper`, did you mean `upper`?"));
+    assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], "uper(\"a\")");
+    let errors = compile("(values:vars) {value: unrelated_name(1)};").unwrap_err();
+    assert!(errors[0].what.starts_with("unknown function `unrelated_name`;"));
+}
