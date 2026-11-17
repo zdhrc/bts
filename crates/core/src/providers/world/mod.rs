@@ -29,13 +29,15 @@ pub const SCHEMA: bts_lang::ProviderSchema<'static> = bts_lang::ProviderSchema {
     id: "world",
     name: "World",
     definitions: &[defs::SOURCE],
-    // a walk, and the steps it leads to: a part, or a holder of values such as a statement
-    nodes: &["walk", "part", "vars"],
+    // a step of a walk is any node that gives something, so only the walk is listed beside the conversation
+    nodes: &["walk", "conversation"],
     edges: &["next"],
     // a walk takes one branch at a fork
     forks: &["weighted", "exclusive"],
     junctions: &[],
-    context: &[walk::STEPS],
+    // a walk reads its steps, and may be drawn for something computed from the trace index
+    // a conversation reads its identifier
+    context: &[walk::STEPS, "trace_index", walk::IDENTITY],
     functions: functions::DESCRIPTORS,
 };
 
@@ -49,11 +51,16 @@ impl super::Contributor for Bundle {
     }
 
     fn internal(&self) -> &'static [&'static str] {
-        &[walk::PICK]
+        &[walk::PICK, walk::ID]
     }
 
     fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {
         walk::elements(model)
+    }
+
+    /// A walk, its edges and its forks are checked against the schema. A step is checked by what it gives.
+    fn walked(&self, model: &bts_lang::Model) -> bts_lang::Diags {
+        model.unsupported(&SCHEMA, &walk::checked(model))
     }
 
     /// The value of `steps` on every walk.

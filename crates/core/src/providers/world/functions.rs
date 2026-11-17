@@ -550,27 +550,53 @@ pub static FUNCTIONS: &[Function] = &[
         name: "merge",
         check: None,
         data: Some(super::walk::merge),
-        python: Some(walked("_world_merge", "merge_objects", false, super::walk::PY_MERGE)),
-        typescript: Some(walked("_world_merge", "mergeObjects", false, super::walk::TS_MERGE)),
+        python: Some(walked("_world_merge", "merge_objects", super::walk::PY_MERGE)),
+        typescript: Some(walked("_world_merge", "mergeObjects", super::walk::TS_MERGE)),
     },
     // what a weighted fork in a walk lowers to, which no author calls
     Function {
         name: super::walk::PICK,
         check: None,
         data: Some(super::walk::pick),
-        python: Some(walked("_world_pick", "take_branch", true, super::walk::PY_PICK)),
-        typescript: Some(walked("_world_pick", "takeBranch", true, super::walk::TS_PICK)),
+        python: Some(seeded("_world_pick", "take_branch")),
+        typescript: Some(seeded("_world_pick", "takeBranch")),
+    },
+    // what the identifier of a conversation lowers to
+    Function {
+        name: super::walk::ID,
+        check: None,
+        data: Some(super::walk::id),
+        python: Some(seeded("_world_id", "conversation_id")),
+        typescript: Some(seeded("_world_id", "conversationId")),
     },
 ];
 
-// a helper a walk uses, defined by its own text
-const fn walked(name: &'static str, reads_as: &'static str, random: bool, text: &'static str) -> Helper {
+// a helper that draws by the seed of the run, defined in the text those helpers share
+const fn seeded(name: &'static str, reads_as: &'static str) -> Helper {
     Helper {
         name,
         reads_as: Some(reads_as),
-        random,
-        // the one helper that draws is the one that needs the seed
-        seeded: random,
+        random: true,
+        seeded: true,
+        counts: false,
+        texts: false,
+        text: "",
+        operation: None,
+        runtime: Some(Runtime {
+            name: "world",
+            source: super::walk::runtime,
+        }),
+        scorer: None,
+    }
+}
+
+// a helper a walk uses, defined by its own text
+const fn walked(name: &'static str, reads_as: &'static str, text: &'static str) -> Helper {
+    Helper {
+        name,
+        reads_as: Some(reads_as),
+        random: false,
+        seeded: false,
         counts: false,
         texts: false,
         text,

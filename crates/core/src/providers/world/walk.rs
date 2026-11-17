@@ -14,6 +14,10 @@
 //! A draw is addressed, not sequenced. It is a function of the seed, the trace index
 //! and the fork, so it is the same wherever and however often the walk is read, and
 //! the same in data generation and in a generated agent given the seed.
+//!
+//! A walk may say what it is drawn for with its `per` property. That value then
+//! stands in for the trace index, so every trace that gives the same value sees the
+//! same walk: one conversation, one customer, or the whole run.
 
 use crate::mocking::data::Value;
 use crate::mocking::{EvaluateError, Evaluation};
@@ -30,8 +34,16 @@ pub const WALK: &str = "walk";
 pub const STEPS: &str = "steps";
 /// The field a step hands to its walk.
 pub const GIVES: &str = "gives";
+/// The property that says what a walk is drawn for, in place of the trace.
+pub const PER: &str = "per";
 /// The internal function a weighted fork lowers to. No author can write the name.
 pub const PICK: &str = "world.pick";
+/// The kind of several traces in a row that belong together.
+pub const CONVERSATION: &str = "conversation";
+/// The context key a conversation reads its identifier through.
+pub const IDENTITY: &str = "identity";
+/// The internal function a conversation's identifier lowers to.
+pub const ID: &str = "world.id";
 
 // what leaves a node, in the order written
 #[derive(Clone, Copy)]
@@ -43,6 +55,12 @@ enum Leaving {
 fn roots(model: &Model) -> impl Iterator<Item = NodeId> + '_ {
     (model.nodes.iter().enumerate())
         .filter(|(_, node)| model.derives(&node.kind, WALK))
+        .map(|(index, _)| NodeId(index))
+}
+
+fn conversations(model: &Model) -> impl Iterator<Item = NodeId> + '_ {
+    (model.nodes.iter().enumerate())
+        .filter(|(_, node)| model.derives(&node.kind, CONVERSATION))
         .map(|(index, _)| NodeId(index))
 }
 
@@ -62,12 +80,27 @@ fn leaving(model: &Model, node: NodeId) -> Vec<Leaving> {
     found.into_iter().map(|(_, leaving)| leaving).collect()
 }
 
+/// The elements the world provider checks against its schema: what it walks, without the steps.
+///
+/// A step is any node that gives something, whatever its kind, and [`supply`] reports one that gives nothing.
+pub fn checked(model: &Model) -> Vec<ElementId> {
+    (elements(model).into_iter())
+        .filter(|element| match element {
+            ElementId::Node(node) => {
+                let kind = &model.nodes[node.0].kind;
+                model.derives(kind, WALK) || model.derives(kind, CONVERSATION)
+            }
+            _ => true,
+        })
+        .collect()
+}
+
 /// The elements the world provider walks: every walk, and the steps, edges and forks it leads to.
 ///
 /// A junction that joins any of them is included, so it is reported as unsupported.
 pub fn elements(model: &Model) -> Vec<ElementId> {
     let mut nodes = BTreeSet::new();
-    let mut pending: Vec<NodeId> = roots(model).collect();
+    let mut pending: Vec<NodeId> = roots(model).chain(conversations(model)).collect();
     let mut elements = BTreeSet::new();
     while let Some(node) = pending.pop() {
         if !nodes.insert(node) {
@@ -109,6 +142,8 @@ fn fail(range: SrcRange, what: impl Into<String>) -> Diag {
 struct Walker<'a> {
     model: &'a Model,
     name: String,
+    // what the walk is drawn for, when it says
+    per: Option<Graph>,
     // the steps being visited, to find a path that returns to itself
     path: Vec<NodeId>,
     // each fork's place in the walk, so a fork reached along two paths draws once
@@ -255,14 +290,16 @@ impl Walker<'_> {
                     weights.push(ArrayElem::Item(value(weight)));
                 }
                 let options = branches.into_iter().map(|(_, steps)| ArrayElem::Item(steps)).collect();
+                let mut args = vec![
+                    Graph::Str(format!("{}.{}", self.name, place + 1)),
+                    Graph::Array(Array { elem: weights }),
+                    Graph::Array(Array { elem: options }),
+                ];
+                args.extend(self.per.clone());
                 Ok(Graph::Func {
                     func: Func::Call {
                         function: PICK.to_owned(),
-                        args: vec![
-                            Graph::Str(format!("{}.{}", self.name, place + 1)),
-                            Graph::Array(Array { elem: weights }),
-                            Graph::Array(Array { elem: options }),
-                        ],
+                        args,
                         returns: FieldType::Array,
                         shape: None,
                     },
@@ -310,14 +347,49 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
     }) {
         return Err(fail(junction.range, "a walk takes one path, so nothing in it is joined"));
     }
+    // a conversation has no steps, and its identifier is drawn for its number
+    for conversation in conversations(model) {
+        let node = &model.nodes[conversation.0];
+        if let Some(edge) = model.edges.iter().find(|edge| edge.source == conversation) {
+            return Err(fail(edge.range, "a conversation has no steps, so nothing leaves it"));
+        }
+        if let Some(fork) = model.forks.iter().find(|fork| fork.source == conversation) {
+            return Err(fail(fork.range, "a conversation has no steps, so nothing leaves it"));
+        }
+        let number = (model.bindings.iter())
+            .position(|binding| {
+                binding.owner == ElementId::Node(conversation) && !binding.property && binding.path == ["number"]
+            })
+            .ok_or_else(|| fail(node.range, "a conversation needs a `number` field"))?;
+        let name = node.name.clone().unwrap_or_else(|| format!("conversation{}", conversation.0));
+        supplied.context.push(Supply {
+            node: conversation,
+            key: IDENTITY,
+            value: Graph::Func {
+                func: Func::Call {
+                    function: ID.to_owned(),
+                    args: vec![Graph::Str(name), Graph::BindingRef(BindingId(number), node.range)],
+                    returns: FieldType::String,
+                    shape: None,
+                },
+                range: node.range,
+            },
+        });
+    }
     let mut always = BTreeSet::new();
     let mut behind: BTreeMap<NodeId, String> = BTreeMap::new();
     for root in roots(model) {
         let node = &model.nodes[root.0];
         let name = node.name.clone().unwrap_or_else(|| format!("walk{}", root.0));
+        let per = (node.props.iter())
+            .map(|id| &model.bindings[id.0])
+            .find(|binding| binding.path == [PER])
+            .map(|binding| binding.value.clone())
+            .filter(|value| !matches!(value, Graph::Null));
         let mut walker = Walker {
             model,
             name: name.clone(),
+            per,
             path: Vec::new(),
             forks: Vec::new(),
             depth: 0,
@@ -357,6 +429,11 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
 ///
 /// FNV-1a over the bytes of the address, then the 32-bit finalizer of MurmurHash3.
 pub fn draw(address: &str) -> f64 {
+    f64::from(hash(address)) / 4_294_967_296.0
+}
+
+/// The 32 bits an address hashes to, the same in Rust, Python and TypeScript.
+pub fn hash(address: &str) -> u32 {
     let mut value: u32 = 2_166_136_261;
     for byte in address.bytes() {
         value = (value ^ u32::from(byte)).wrapping_mul(16_777_619);
@@ -366,13 +443,33 @@ pub fn draw(address: &str) -> f64 {
     value ^= value >> 13;
     value = value.wrapping_mul(0xc2b2_ae35);
     value ^= value >> 16;
-    f64::from(value) / 4_294_967_296.0
+    value
 }
 
-/// The address of a fork's draw in one trace.
-pub fn address(seed: u64, trace_index: usize, label: &str) -> String {
-    format!("{seed}/{trace_index}/{label}")
+/// The address of a fork's draw: the seed, what the walk is drawn for, and the fork.
+///
+/// A walk that does not say is drawn for the trace, by its index.
+pub fn address(seed: u64, per: &str, label: &str) -> String {
+    format!("{seed}/{per}/{label}")
 }
+
+// what a walk is drawn for, as the text every consumer writes the same way
+fn drawn_for(per: &Value) -> Result<String, EvaluateError> {
+    match per {
+        Value::String(text) => Ok(text.clone()),
+        Value::Number(number) => match (number.as_i64(), number.as_u64(), number.as_f64()) {
+            (Some(whole), _, _) => Ok(whole.to_string()),
+            (_, Some(whole), _) => Ok(whole.to_string()),
+            (_, _, Some(float)) if float.fract() == 0.0 && float.abs() <= 9_007_199_254_740_991.0 => {
+                Ok((float as i64).to_string())
+            }
+            _ => Err(invalid(PER_SHAPE)),
+        },
+        _ => Err(invalid(PER_SHAPE)),
+    }
+}
+
+const PER_SHAPE: &str = "a walk is drawn per a string or a whole number";
 
 /// The branch a draw takes among weights, or none when no weight is positive.
 pub fn take(weights: &[f64], draw: f64) -> Option<usize> {
@@ -402,7 +499,11 @@ fn invalid(what: &'static str) -> EvaluateError {
 
 /// Evaluates the pick a weighted fork lowers to: the steps of the branch its draw takes.
 pub(super) fn pick(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
-    let [Value::String(label), Value::Array(weights), Value::Array(options)] = args else {
+    let (Value::String(label), Value::Array(weights), Value::Array(options), per) = (match args {
+        [label, weights, options] => (label, weights, options, None),
+        [label, weights, options, per] => (label, weights, options, Some(per)),
+        _ => return Err(EvaluateError::Shape),
+    }) else {
         return Err(EvaluateError::Shape);
     };
     let weights = (weights.iter())
@@ -414,11 +515,26 @@ pub(super) fn pick(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Va
         })
         .collect::<Result<Vec<_>, _>>()?;
     let (seed, trace_index) = evaluation.address();
-    let taken = take(&weights, draw(&address(seed, trace_index, label)));
+    let per = match per {
+        Some(per) => drawn_for(per)?,
+        None => trace_index.to_string(),
+    };
+    let taken = take(&weights, draw(&address(seed, &per, label)));
     Ok(match taken.and_then(|index| options.get(index)) {
         Some(steps) => steps.clone(),
         None => Value::Array(vec![]),
     })
+}
+
+/// Evaluates a conversation's identifier: sixteen hex digits drawn for its number.
+pub(super) fn id(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    let [Value::String(label), per] = args else {
+        return Err(EvaluateError::Shape);
+    };
+    let (seed, _) = evaluation.address();
+    let per = drawn_for(per)?;
+    let half = |part: &str| hash(&address(seed, &per, &format!("{label}#{part}")));
+    Ok(Value::String(format!("{:08x}{:08x}", half("a"), half("b"))))
 }
 
 /// Evaluates `merge`: one object from many, where later keys win and null changes nothing.
@@ -443,8 +559,17 @@ pub(super) fn merge(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, Eva
     Ok(Value::Object(merged))
 }
 
-/// The Python text of the helpers a walk needs. `seeded` gives a run its seed.
-pub(super) const PY_PICK: &str = r#"
+/// The text the helpers that need the seed share, for one language.
+pub(super) fn runtime(lang: crate::mocking::ScorerLang, _agent: bool) -> String {
+    match lang {
+        crate::mocking::ScorerLang::Python => PY_RUNTIME,
+        crate::mocking::ScorerLang::Typescript => TS_RUNTIME,
+    }
+    .to_owned()
+}
+
+// `seeded` gives a run its seed
+const PY_RUNTIME: &str = r#"
 def seeded(random_source, seed=None):
     if seed is None:
         seed = int(_draw(random_source) * 4294967296)
@@ -454,7 +579,7 @@ def seeded(random_source, seed=None):
     return source
 
 
-def _world_draw(address):
+def _world_hash(address):
     value = 2166136261
     for byte in address.encode("utf-8"):
         value = ((value ^ byte) * 16777619) & 0xFFFFFFFF
@@ -463,7 +588,11 @@ def _world_draw(address):
     value ^= value >> 13
     value = (value * 0xC2B2AE35) & 0xFFFFFFFF
     value ^= value >> 16
-    return value / 4294967296
+    return value
+
+
+def _world_draw(address):
+    return _world_hash(address) / 4294967296
 
 
 def _world_take(weights, draw):
@@ -478,19 +607,32 @@ def _world_take(weights, draw):
     return last
 
 
-def _world_pick(label, weights, options, random_source):
+def _world_per(per):
+    per = _value(per)
+    if isinstance(per, str): return per
+    if type(per) is int or (type(per) is float and per.is_integer() and abs(per) <= 9007199254740991): return str(int(per))
+    raise TypeError("a walk is drawn per a string or a whole number")
+
+
+def _world_pick(label, weights, options, *rest):
+    *per, random_source = rest
     weights = [float(_num(weight)) for weight in _value(weights)]
     if any(weight < 0 for weight in weights): raise ValueError("a branch weight is a finite number that is not negative")
-    taken = _world_take(weights, _world_draw(f"{random_source.seed}/0/{label}"))
+    drawn_for = _world_per(per[0]) if per else "0"
+    taken = _world_take(weights, _world_draw(f"{random_source.seed}/{drawn_for}/{label}"))
     return [] if taken is None else _value(options)[taken]
+
+
+def _world_id(label, per, random_source):
+    address = f"{random_source.seed}/{_world_per(per)}/{label}#"
+    return f"{_world_hash(address + 'a'):08x}{_world_hash(address + 'b'):08x}"
 "#;
 
-/// The TypeScript text of the helpers a walk needs.
-pub(super) const TS_PICK: &str = r#"
+const TS_RUNTIME: &str = r#"
 function seeded(randomSource: () => number, seed?: number | bigint): () => number {
     return Object.assign(() => randomSource(), { seed: seed ?? Math.floor(_draw(randomSource) * 4294967296) });
 }
-function _world_draw(address: string): number {
+function _world_hash(address: string): number {
     let value = 2166136261;
     for (const byte of new TextEncoder().encode(address)) value = Math.imul(value ^ byte, 16777619) >>> 0;
     value ^= value >>> 16;
@@ -498,7 +640,10 @@ function _world_draw(address: string): number {
     value ^= value >>> 13;
     value = Math.imul(value, 0xc2b2ae35) >>> 0;
     value ^= value >>> 16;
-    return (value >>> 0) / 4294967296;
+    return value >>> 0;
+}
+function _world_draw(address: string): number {
+    return _world_hash(address) / 4294967296;
 }
 function _world_take(weights: number[], draw: number): number | null {
     const total = weights.reduce((sum, weight) => sum + weight, 0);
@@ -514,14 +659,28 @@ function _world_take(weights: number[], draw: number): number | null {
     }
     return last;
 }
-function _world_pick(label: string, weights: unknown, options: unknown, randomSource: () => number): unknown[] {
+function _world_per(per: unknown): string {
+    per = _serialize(per);
+    if (typeof per === "string") return per;
+    if (typeof per === "number" && Number.isSafeInteger(per)) return String(per);
+    throw new TypeError("a walk is drawn per a string or a whole number");
+}
+function _world_pick(label: string, weights: unknown, options: unknown, ...rest: unknown[]): unknown[] {
+    const randomSource = rest[rest.length - 1] as () => number;
+    const drawnFor = rest.length > 1 ? _world_per(rest[0]) : "0";
     const numbers: number[] = (_serialize(weights) as unknown[]).map(weight => {
         if (typeof weight !== "number" || !Number.isFinite(weight) || weight < 0) throw new RangeError("a branch weight is a finite number that is not negative");
         return weight;
     });
     const seed = (randomSource as { seed?: number | bigint }).seed;
-    const taken = _world_take(numbers, _world_draw(`${seed}/0/${label}`));
+    const taken = _world_take(numbers, _world_draw(`${seed}/${drawnFor}/${label}`));
     return taken === null ? [] : (_value(options) as unknown[][])[taken];
+}
+function _world_id(label: string, per: unknown, randomSource: () => number): string {
+    const seed = (randomSource as { seed?: number | bigint }).seed;
+    const address = `${seed}/${_world_per(per)}/${label}#`;
+    const half = (part: string) => _world_hash(address + part).toString(16).padStart(8, "0");
+    return half("a") + half("b");
 }
 "#;
 
@@ -561,8 +720,9 @@ mod tests {
         assert_eq!(draw("42/0/ask.2"), 0.8749931799247861);
         // an address is hashed as its bytes
         assert_eq!(draw("7/3/名前.1"), 0.9960092506371439);
-        assert_eq!(draw("42/0/ask.1"), draw(&address(42, 0, "ask.1")));
+        assert_eq!(draw("42/0/ask.1"), draw(&address(42, "0", "ask.1")));
         assert_ne!(draw("42/0/ask.1"), draw("42/1/ask.1"));
+        assert_eq!(hash("42/0/chat#a"), 0x7afdce9);
     }
 
     #[test]

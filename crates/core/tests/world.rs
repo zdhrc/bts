@@ -203,7 +203,7 @@ fn steps_in_a_chain_are_walked_like_steps_in_a_fan() {
 #[test]
 fn an_author_declares_a_walk_and_its_steps() {
     let world = r#"+(itinerary:node) {legs: {type: "array", value: context.steps}}-[:extends]->(walk);
-+(leg:node {to: {type: "string", required: true}}) {gives: {type: "string", value: self.props.to}}-[:extends]->(vars);
++(leg:node {to: {type: "string", required: true}}) {gives: {type: "string", value: self.props.to}};
 (trip:itinerary)
     -[:next]->(:leg {to: "Lisbon"})
     -[:next]->(:leg {to: "Porto"});"#;
@@ -214,6 +214,205 @@ fn an_author_declares_a_walk_and_its_steps() {
         outputs(&shape("", merged), 1..2),
         [json!({"tense": "present", "modal": "must"})]
     );
+}
+
+#[test]
+fn an_author_changes_what_a_shipped_kind_computes_by_extending_it() {
+    // the provider decides what its kinds compute, and an extension states a field again
+    let world = r#"+(shout:node) {text: {value: upper(realize(self.sentence))}}
+    -[:extends]->(sentence);
++(numbered:node) {text: {value: format("{} rules. {}", len(self.items), compose(self.items))}}
+    -[:extends]->(list);
++(past:node) {defaults: {value: {tense: "past"}}}
+    -[:extends]->(sentence);
++(asked:node {form: {default: "question"}})
+    -[:extends]->(part);
++(house_rule:node {subject: {default: "the house"}})
+    -[:extends]->(policy);
+(ask:shout)
+    -[:next]->(:part {subject: "I", person: "first", modal: "must"})
+    -[:next]->(:part {verb: "change", complement: "my flight"});
+(rules:numbered)
+    -[:next]->(:policy {subject: "a change", verb: "cost", complement: "75 USD"})
+    -[:next]->(:house_rule {verb: "close", complement: "at noon"});
+(then:past)
+    -[:next]->(:part {subject: "the desk", verb: "close"});
+(may:sentence)
+    -[:next]->(:asked {subject: "I", person: "first", modal: "can", verb: "go"});"#;
+    let read = "{said: ask.text, clause: ask.sentence, rules: rules.text, items: rules.items, then: then.text, may: may.text}";
+    let output = outputs(&shape(world, read), 1..2).remove(0);
+    assert_eq!(output["said"], "I MUST CHANGE MY FLIGHT.");
+    // what the extension did not state is still the shipped kind's
+    assert_eq!(output["clause"]["clause"]["modal"], "must");
+    assert_eq!(output["rules"], "2 rules. A change costs 75 USD. The house closes at noon.");
+    assert_eq!(
+        output["items"],
+        json!(["A change costs 75 USD.", "The house closes at noon."])
+    );
+    assert_eq!(output["then"], "The desk closed.");
+    assert_eq!(output["may"], "Can I go?");
+    // an instance starts from defaults of its own too, and a part still wins over them
+    let world = r#"(was:sentence) {defaults: {tense: "past", subject: "the desk"}}
+    -[:next]->(:part {verb: "open"});
+(is:sentence) {defaults: {tense: "past", subject: "the desk"}}
+    -[:next]->(:part {verb: "open", tense: "present"});"#;
+    assert_eq!(
+        outputs(&shape(world, "[|was.text, is.text|]"), 1..2),
+        [json!(["The desk opened.", "The desk opens."])]
+    );
+    // an instance states a field of its own in the same way
+    let world = r#"(ask:sentence) {text: "whatever is written here"}
+    -[:next]->(:part {subject: "I", person: "first", verb: "go"});"#;
+    assert_eq!(
+        outputs(&shape(world, "[|ask.text, ask.grammar.verb|]"), 1..2),
+        [json!(["whatever is written here", "go"])]
+    );
+}
+
+#[test]
+fn a_walk_says_what_it_is_drawn_for() {
+    // three traces in a row are one conversation, the house is drawn once for the run, the weather for each trace
+    let fork = |verbs: [&str; 4]| {
+        let branches: Vec<_> = (verbs.iter())
+            .map(|verb| format!("        -[:next {{weight: 1}}]->(:part {{verb: \"{verb}\"}}),"))
+            .collect();
+        format!("    =[:weighted]=>[\n{}\n    ];", branches.join("\n"))
+    };
+    let world = format!(
+        "(mood:sentence {{per: floor(context.trace_index / 3)}})\n    -[:next]->(:part {{subject: \"I\", person: \"first\"}})\n{}\n(house:sentence {{per: \"run\"}})\n    -[:next]->(:part {{subject: \"the desk\"}})\n{}\n(each:sentence)\n    -[:next]->(:part {{subject: \"it\"}})\n{}",
+        fork(["wait", "leave", "stay", "go"]),
+        fork(["open", "close", "change", "go"]),
+        fork(["open", "close", "change", "go"]),
+    );
+    let source = shape(&world, "[|mood.text, house.text, each.text|]");
+    let model = SELECTED
+        .compile(&source)
+        .unwrap_or_else(|errors| panic!("{errors}\n{source}"));
+    let batch = data::generate(
+        model,
+        30,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        5,
+        &(),
+    )
+    .unwrap();
+    let said: Vec<_> = (batch.events.iter())
+        .map(|event| event.output.as_ref().unwrap().project(&()).unwrap())
+        .collect();
+    assert_eq!(said.len(), 30);
+    for conversation in said.chunks(3) {
+        assert!(
+            conversation.iter().all(|turn| turn[0] == conversation[0][0]),
+            "{conversation:?}"
+        );
+    }
+    let distinct = |index: usize| said.iter().map(|turn| turn[index].to_string()).collect::<BTreeSet<_>>().len();
+    assert!(distinct(0) > 1 && distinct(2) > 1);
+    assert_eq!(distinct(1), 1);
+    // conversations differ from one another, and so do the traces within one
+    assert!(
+        said.chunks(3)
+            .any(|conversation| conversation.iter().any(|turn| turn[2] != conversation[0][2]))
+    );
+    // what a walk is drawn for is a string or a whole number
+    let half = source.replace("floor(context.trace_index / 3)", "0.5");
+    let model = SELECTED.compile(&half).unwrap();
+    let error = data::generate(
+        model,
+        1,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        5,
+        &(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("a walk is drawn per a string or a whole number"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_conversation_is_several_traces_that_belong_together() {
+    // three traces in a row are one conversation, and the traveler keeps one mood through it
+    let world = r#"(chat:conversation {turns: 3});
+(mood:sentence {per: chat.number})
+    -[:next]->(:part {subject: "I", person: "first"})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:part {verb: "wait"}),
+        -[:next {weight: 1}]->(:part {verb: "leave"}),
+        -[:next {weight: 1}]->(:part {verb: "stay"}),
+        -[:next {weight: 1}]->(:part {verb: "go"}),
+    ];"#;
+    let read = "{id: chat.id, number: chat.number, turn: chat.turn, first: chat.first, last: chat.last, mood: mood.text}";
+    let source = shape(world, read);
+    let turns = |source: &str, seed: u64| -> Vec<Value> {
+        let model = SELECTED.compile(source).unwrap_or_else(|errors| panic!("{errors}\n{source}"));
+        let batch = data::generate(
+            model,
+            30,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            seed,
+            &(),
+        )
+        .unwrap();
+        (batch.events.iter())
+            .map(|event| event.output.as_ref().unwrap().project(&()).unwrap())
+            .collect()
+    };
+    let said = turns(&source, 5);
+    let mut ids = BTreeSet::new();
+    for (number, conversation) in said.chunks(3).enumerate() {
+        for (turn, trace) in conversation.iter().enumerate() {
+            // every trace of a conversation carries its identifier and sees the same world
+            assert_eq!(trace["id"], conversation[0]["id"]);
+            assert_eq!(trace["mood"], conversation[0]["mood"]);
+            assert_eq!(trace["number"], number);
+            assert_eq!(trace["turn"], turn);
+            assert_eq!(trace["first"], turn == 0);
+            assert_eq!(trace["last"], turn == 2);
+        }
+        let id = conversation[0]["id"].as_str().unwrap();
+        assert!(id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        ids.insert(id.to_owned());
+    }
+    // each conversation has its own identifier, and they do not all share a mood
+    assert_eq!(ids.len(), 10);
+    assert!(said.iter().any(|trace| trace["mood"] != said[0]["mood"]));
+    // the same seed gives the same conversations, and another seed gives others
+    assert_eq!(said, turns(&source, 5));
+    assert_ne!(said[0]["id"], turns(&source, 6)[0]["id"]);
+    // without turns every trace is its own conversation
+    let single = turns(&source.replace("{turns: 3}", ""), 5);
+    assert!(single.iter().all(|trace| trace["first"] == true && trace["last"] == true));
+    assert_eq!(
+        single
+            .iter()
+            .map(|trace| trace["id"].to_string())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        30
+    );
+    // an extension says where a conversation ends in its own way
+    let paired = format!(
+        "+(pair:node) {{number: {{value: floor(context.trace_index / 2)}}, turn: {{value: context.trace_index % 2}}}}\n    -[:extends]->(conversation);\n{}",
+        source.replace("(chat:conversation {turns: 3})", "(chat:pair)")
+    );
+    let paired = turns(&paired, 5);
+    assert_eq!(paired[0]["id"], paired[1]["id"]);
+    assert_ne!(paired[1]["id"], paired[2]["id"]);
+    assert_eq!(paired[3]["turn"], 1);
+    // a conversation has no steps
+    let found = rejected(&shape(
+        "(chat:conversation)-[:next]->(:policy {subject: \"a\", verb: \"be\"});",
+        "chat.id",
+    ));
+    assert!(found.contains("a conversation has no steps, so nothing leaves it"), "{found}");
 }
 
 #[test]
@@ -244,6 +443,11 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
         ),
         (
             "(w:list)-[:next]->(p:vars) {x: 1};".to_owned(),
+            "w.text",
+            "this step gives nothing to `w`, its kind needs a `gives` field",
+        ),
+        (
+            "+(stop:node {at: {type: \"string\"}});\n(w:list)-[:next]->(p:stop {at: \"noon\"});".to_owned(),
             "w.text",
             "this step gives nothing to `w`, its kind needs a `gives` field",
         ),

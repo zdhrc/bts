@@ -2183,6 +2183,133 @@ fn the_world_example_agrees_in_data_and_code() {
 }
 
 #[test]
+fn a_walk_drawn_for_more_than_a_trace_agrees_in_data_and_code() {
+    // the desk is drawn once for the run and the mood once for every three traces
+    let source = r#"(desk:sentence {per: "run"})
+    -[:next]->(:part {subject: "the desk"})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:part {verb: "open", complement: "at nine"}),
+        -[:next {weight: 1}]->(:part {verb: "open", complement: "at ten"}),
+        -[:next {weight: 1}]->(:part {verb: "close", complement: "at noon"}),
+    ];
+(mood:sentence {per: floor(context.trace_index / 3)})
+    -[:next]->(:part {subject: "I", person: "first"})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:part {verb: "wait"}),
+        -[:next {weight: 1}]->(:part {verb: "leave"}),
+        -[:next {weight: 1}]->(:part {verb: "stay"}),
+    ];
+(desk_hours:agent) {input: "hi", output: t.output};
+(desk_hours)-[:next]->(t:task {name: "t"}) {input: desk_hours.input, output: [|desk.text, mood.text|]};
+"#;
+    let model = lower(source).unwrap();
+    for seed in [1u64, 2, 3, 4, 5, 6] {
+        let batch = data::generate(
+            model.clone(),
+            6,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            seed,
+            &(),
+        )
+        .unwrap();
+        let said: Vec<_> = (batch.events.iter())
+            .map(|event| event.output.as_ref().unwrap().project(&()).unwrap())
+            .collect();
+        assert!(said.iter().all(|turn| turn[0] == said[0][0]), "{said:?}");
+        assert!(said[..3].iter().all(|turn| turn[1] == said[0][1]), "{said:?}");
+        assert!(said[3..].iter().all(|turn| turn[1] == said[3][1]), "{said:?}");
+        // an agent given the seed is the first trace of the run
+        let python = execute_generated(
+            &model,
+            ScorerLang::Python,
+            "python3",
+            "check.py",
+            &format!("from desk_hours_agent import run_details\nimport json\nprint(json.dumps(run_details(seed={seed})))"),
+        );
+        let typescript = execute_generated(
+            &model,
+            ScorerLang::Typescript,
+            "node",
+            "check.mts",
+            &format!(
+                "import {{runDetails}} from './desk_hours_agent.mts'; console.log(JSON.stringify(runDetails(undefined, Math.random, {seed})));"
+            ),
+        );
+        assert_eq!(python["output"], said[0]);
+        assert_eq!(typescript["output"], said[0]);
+    }
+}
+
+#[test]
+fn a_conversation_agrees_in_data_and_code() {
+    // an agent given the seed is the first turn of the first conversation of the run
+    let source = r#"(chat:conversation {turns: 3});
+(mood:sentence {per: chat.number})
+    -[:next]->(:part {subject: "I", person: "first"})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:part {verb: "wait"}),
+        -[:next {weight: 1}]->(:part {verb: "leave"}),
+        -[:next {weight: 1}]->(:part {verb: "stay"}),
+    ];
+(desk:agent) {input: "hi", output: t.output};
+(desk)-[:next]->(t:task {name: "turn"}) {
+    input: desk.input,
+    output: {id: chat.id, turn: chat.turn, first: chat.first, last: chat.last, mood: mood.text},
+    metadata: {conversation_id: chat.id},
+};
+"#;
+    let model = lower(source).unwrap();
+    for seed in [1u64, 2, 3, u64::MAX] {
+        let batch = data::generate(
+            model.clone(),
+            3,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            seed,
+            &(),
+        )
+        .unwrap();
+        let first = batch.events[0].output.as_ref().unwrap().project(&()).unwrap();
+        let identifier = |event: &data::Event| event.metadata.as_ref().unwrap()["conversation_id"].project(&()).unwrap();
+        assert_eq!(identifier(&batch.events[0]), first["id"]);
+        assert_eq!(identifier(&batch.events[2]), first["id"]);
+        let python = execute_generated(
+            &model,
+            ScorerLang::Python,
+            "python3",
+            "check.py",
+            &format!("from desk_agent import run_details\nimport json\nprint(json.dumps(run_details(seed={seed})))"),
+        );
+        let typescript = execute_generated(
+            &model,
+            ScorerLang::Typescript,
+            "node",
+            "check.mts",
+            &format!(
+                "import {{runDetails}} from './desk_agent.mts'; console.log(JSON.stringify(runDetails(undefined, Math.random, {seed}n)));"
+            ),
+        );
+        assert_eq!(python["output"], first);
+        assert_eq!(typescript["output"], first);
+        assert_eq!(python["spans"][0]["metadata"]["conversation_id"], first["id"]);
+        assert_eq!(typescript["spans"][0]["metadata"]["conversation_id"], first["id"]);
+    }
+    // what the conversation computes prints under readable names
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("desk_agent.") && !file.name.contains("runtime"))
+            .unwrap();
+        for told in ["_floor", "_world", "_lazy"] {
+            assert!(!agent.contents.contains(told), "{told} in {}", agent.contents);
+        }
+    }
+}
+
+#[test]
 fn every_example_agent_reads_as_written_by_hand() {
     // no deferred values, no span bookkeeping, and no helper under a private name
     for source in [

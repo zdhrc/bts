@@ -49,8 +49,21 @@ pub const SOURCE: Source<'static> = Source {
 # a walk is something built by the steps it leads to, and it stands beside an agent
 # the provider visits what leaves each node in the order written, and takes one branch at each fork
 # steps is what each visited step gives, in order
-+(walk:node)
-    -[:requires {steps: {type: "array"}}]->(context);
+# per says what the walk is drawn for: traces that give the same value see the same walk, and left out it is the trace
++(walk:node {per: {type: "any", default: null}})
+    -[:requires {steps: {type: "array"}, trace_index: {type: "number"}}]->(context);
+
+# a conversation is several traces in a row that belong together, and it stands beside an agent
+# turns is how many traces one conversation has, number counts the conversations of a run and turn the traces within one
+# id is the same for every trace of one conversation, and a walk drawn per number is too
++(conversation:node {turns: {type: "number", default: 1}}) {
+    number: {type: "number", value: floor(context.trace_index / self.props.turns)},
+    turn: {type: "number", value: context.trace_index % self.props.turns},
+    first: {type: "boolean", value: self.turn == 0},
+    last: {type: "boolean", value: self.turn == self.props.turns - 1},
+    id: {type: "string", value: context.identity},
+}
+    -[:requires {trace_index: {type: "number"}, identity: {type: "string"}}]->(context);
 
 # a part is some of a sentence's grammar, and gives what it was written with
 +(part:node {
@@ -76,11 +89,14 @@ pub const SOURCE: Source<'static> = Source {
 };
 
 # a sentence is a walk whose parts add up to one clause, and a later part's keys win
-# grammar is the parts merged, sentence is the clause for the functions that relate sentences
+# defaults is what the sentence starts from before its parts, and an instance writes only the keys it changes
+# grammar is the parts merged over the defaults, sentence is the clause for the functions that relate sentences
 +(sentence:node) {
-    grammar: {type: "object", value: merge(
-        {subject: null, person: "third", number: "singular", verb: null, complement: null, modal: null, tense: "present", form: "statement"},
-        context.steps)},
+    defaults: {type: "object", value: {
+        subject: null, person: "third", number: "singular", verb: null,
+        complement: null, modal: null, tense: "present", form: "statement",
+    }},
+    grammar: {type: "object", value: merge(self.defaults, context.steps)},
     sentence: {type: "object", value: {clause: {
         subject: {text: self.grammar.subject, person: self.grammar.person, number: self.grammar.number},
         predicate: {verb: self.grammar.verb, complement: self.grammar.complement},
