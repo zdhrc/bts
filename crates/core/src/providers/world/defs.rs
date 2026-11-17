@@ -55,10 +55,15 @@ pub const SOURCE: Source<'static> = Source {
 
 # a conversation is several traces in a row that belong together, and it stands beside an agent
 # turns is how many traces one conversation has, and with up_to each conversation runs for turns to up_to of them
+# weights says how likely each of those lengths is, the first for turns and the last for up_to
 # number counts the conversations of a run, turn the traces within one, and length is how many turns this one has
 # place is where the trace sits, worked out once, and the three read it
 # id is the same for every trace of one conversation, and a walk drawn per number is too
-+(conversation:node {turns: {type: "number", default: 1}, up_to: {type: "any", default: null}}) {
++(conversation:node {
+    turns: {type: "number", default: 1},
+    up_to: {type: "any", default: null},
+    weights: {type: "any", default: null},
+}) {
     place: {type: "object", value: context.place},
     number: {type: "number", value: self.place.number},
     turn: {type: "number", value: self.place.turn},

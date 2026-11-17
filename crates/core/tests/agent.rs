@@ -2124,6 +2124,34 @@ fn the_world_example_agrees_in_data_and_code() {
         }
     }
     assert_eq!(runs[0], runs[1]);
+    // an agent given a trace as well builds the world of that trace
+    let third = data::generate(
+        model.clone(),
+        4,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        7,
+        &(),
+    )
+    .unwrap();
+    let asked = project(&third.events[3 * 3 + 2].input)[1]["content"].clone();
+    let python = execute_generated(
+        &model,
+        ScorerLang::Python,
+        "python3",
+        "check.py",
+        "from flight_change_agent import run_details\nimport json\nprint(json.dumps(run_details(seed=7, trace=3)))",
+    );
+    let typescript = execute_generated(
+        &model,
+        ScorerLang::Typescript,
+        "node",
+        "check.mts",
+        "import {runDetails} from './flight_change_agent.mts'; console.log(JSON.stringify(runDetails(undefined, Math.random, 7, 3)));",
+    );
+    assert_eq!(python["spans"][2]["input"][1]["content"], asked);
+    assert_eq!(typescript["spans"][2]["input"][1]["content"], asked);
     // without a seed the agent still builds one of the worlds the graph allows
     for details in generated_runs(&model, "flight_change") {
         let asked = details["spans"][2]["input"][1]["content"].as_str().unwrap().to_owned();
@@ -2169,8 +2197,8 @@ fn the_world_example_agrees_in_data_and_code() {
             .find(|file| file.name.contains("flight_change_agent.") && !file.name.contains("runtime"))
             .unwrap();
         let seeded = match lang {
-            ScorerLang::Python => "ExecutionContext(logger, seeded(random_source, seed))",
-            ScorerLang::Typescript => "new ExecutionContext(logger, seeded(randomSource, seed))",
+            ScorerLang::Python => "ExecutionContext(logger, seeded(random_source, seed, trace))",
+            ScorerLang::Typescript => "new ExecutionContext(logger, seeded(randomSource, seed, trace))",
         };
         assert!(agent.contents.contains(seeded), "{}", agent.contents);
     }
@@ -2244,9 +2272,10 @@ fn a_walk_drawn_for_more_than_a_trace_agrees_in_data_and_code() {
 
 #[test]
 fn a_conversation_agrees_in_data_and_code() {
-    // an agent given the seed is the first turn of the first conversation of the run
+    // an agent given the seed and a trace is that trace of the run, so it can be any turn of any conversation
     // each conversation runs for two to five turns
-    let source = r#"(chat:conversation {turns: 2, up_to: 5});
+    // short conversations are the likeliest
+    let source = r#"(chat:conversation {turns: 2, up_to: 5, weights: [|4, 3, 2, 1|]});
 (mood:sentence {per: chat.number})
     -[:next]->(:part {subject: "I", person: "first"})
     =[:weighted]=>[
@@ -2263,10 +2292,11 @@ fn a_conversation_agrees_in_data_and_code() {
 "#;
     let model = lower(source).unwrap();
     let mut lengths = std::collections::BTreeSet::new();
-    for seed in [1u64, 2, 3, 4, 5, 6, u64::MAX] {
+    let mut later = 0;
+    for seed in [1u64, 2, 3, u64::MAX] {
         let batch = data::generate(
             model.clone(),
-            2,
+            12,
             Duration::from_secs(3600),
             data::Distribution::Linear,
             UNIX_EPOCH + Duration::from_secs(7200),
@@ -2274,17 +2304,23 @@ fn a_conversation_agrees_in_data_and_code() {
             &(),
         )
         .unwrap();
-        let first = batch.events[0].output.as_ref().unwrap().project(&()).unwrap();
+        let traces: Vec<_> = (batch.events.iter())
+            .map(|event| event.output.as_ref().unwrap().project(&()).unwrap())
+            .collect();
         let identifier = |event: &data::Event| event.metadata.as_ref().unwrap()["conversation_id"].project(&()).unwrap();
-        assert_eq!(identifier(&batch.events[0]), first["id"]);
-        assert_eq!(identifier(&batch.events[1]), first["id"]);
-        lengths.insert(first["length"].as_u64().unwrap());
+        for (event, trace) in batch.events.iter().zip(&traces) {
+            assert_eq!(identifier(event), trace["id"]);
+            lengths.insert(trace["length"].as_u64().unwrap());
+            later += usize::from(trace["turn"] != 0);
+        }
         let python = execute_generated(
             &model,
             ScorerLang::Python,
             "python3",
             "check.py",
-            &format!("from desk_agent import run_details\nimport json\nprint(json.dumps(run_details(seed={seed})))"),
+            &format!(
+                "from desk_agent import run_details\nimport json\nprint(json.dumps([run_details(seed={seed}, trace=trace) for trace in range(12)]))"
+            ),
         );
         let typescript = execute_generated(
             &model,
@@ -2292,14 +2328,17 @@ fn a_conversation_agrees_in_data_and_code() {
             "node",
             "check.mts",
             &format!(
-                "import {{runDetails}} from './desk_agent.mts'; console.log(JSON.stringify(runDetails(undefined, Math.random, {seed}n)));"
+                "import {{runDetails}} from './desk_agent.mts'; console.log(JSON.stringify([...Array(12).keys()].map(trace => runDetails(undefined, Math.random, {seed}n, trace))));"
             ),
         );
-        assert_eq!(python["output"], first);
-        assert_eq!(typescript["output"], first);
-        assert_eq!(python["spans"][0]["metadata"]["conversation_id"], first["id"]);
-        assert_eq!(typescript["spans"][0]["metadata"]["conversation_id"], first["id"]);
+        for (index, trace) in traces.iter().enumerate() {
+            assert_eq!(&python[index]["output"], trace, "python, seed {seed}, trace {index}");
+            assert_eq!(&typescript[index]["output"], trace, "typescript, seed {seed}, trace {index}");
+            assert_eq!(python[index]["spans"][0]["metadata"]["conversation_id"], trace["id"]);
+            assert_eq!(typescript[index]["spans"][0]["metadata"]["conversation_id"], trace["id"]);
+        }
     }
+    assert!(later > 12, "{later}");
     assert!(lengths.len() > 1, "{lengths:?}");
     // what the conversation computes prints under readable names
     for lang in [ScorerLang::Python, ScorerLang::Typescript] {

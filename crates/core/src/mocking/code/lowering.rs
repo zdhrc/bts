@@ -562,6 +562,8 @@ struct Context<'a> {
     aliases: Vec<(String, String)>,
     // calls to provider functions an agent in this language cannot run
     unsupported: &'a Unsupported,
+    // how the agent reads which trace of a run it is, when it can be told
+    trace_index: Option<Expr>,
 }
 
 /// Provider function calls a consumer met and cannot run, each at its location.
@@ -982,7 +984,8 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
 }
 fn context_ref(reference: CtxRef, ctx: &Context<'_>) -> Result<Expr, String> {
     if reference == CtxRef::TraceIndex {
-        return Ok(Expr::number(0));
+        // an agent that cannot be told is the first trace
+        return Ok(ctx.trace_index.clone().unwrap_or_else(|| Expr::number(0)));
     }
     if let CtxRef::RepeatIndexAt(node) = reference {
         return ctx
@@ -1193,7 +1196,7 @@ mod execution {
         lang: ScorerLang,
         unsupported: &Unsupported,
     ) -> Result<Agent, String> {
-        emit_form(model, trace, output, lang, true, unsupported)
+        emit_form(model, trace, output, lang, true, false, unsupported)
     }
     // `ordered` prints statements in the order they run, and is tried before the deferred form
     fn emit_form(
@@ -1202,6 +1205,8 @@ mod execution {
         output: &Value,
         lang: ScorerLang,
         ordered: bool,
+        // whether the agent reads which trace of a run it is
+        told: bool,
         unsupported: &Unsupported,
     ) -> Result<Agent, String> {
         let try_ordered = ordered;
@@ -1232,7 +1237,7 @@ mod execution {
             Ok(())
         }
         collect(&trace.children, trace.node, &mut parents, &mut bindings)?;
-        let mut used: HashSet<String> = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval item_at trim_text format_value duration_seconds checked_number validate_input count_tokens as_list new_uuid sample_range step_history fold_items agent_result slice_items length_of as_count values_equal calculate require_arrivals group_arrivals select_option weighted_option as_number as_boolean as_integer itemAt trimText formatValue durationSeconds checkedNumber validateInput countTokens asList newUuid sampleRange stepHistory foldItems agentResult sliceItems lengthOf asCount valuesEqual requireArrivals groupArrivals selectOption weightedOption asNumber asBoolean asInteger remainder divide parse_input parseInput round_down round_up round_number absolute clamp roundDown roundUp roundNumber seed seeded".split_whitespace().map(str::to_owned).collect();
+        let mut used: HashSet<String> = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval item_at trim_text format_value duration_seconds checked_number validate_input count_tokens as_list new_uuid sample_range step_history fold_items agent_result slice_items length_of as_count values_equal calculate require_arrivals group_arrivals select_option weighted_option as_number as_boolean as_integer itemAt trimText formatValue durationSeconds checkedNumber validateInput countTokens asList newUuid sampleRange stepHistory foldItems agentResult sliceItems lengthOf asCount valuesEqual requireArrivals groupArrivals selectOption weightedOption asNumber asBoolean asInteger remainder divide parse_input parseInput round_down round_up round_number absolute clamp roundDown roundUp roundNumber seed seeded trace trace_of traceOf".split_whitespace().map(str::to_owned).collect();
         let reserved = used.clone();
         let names = collect_names(&trace.children, lang, &mut used);
         // values that took a number only because another scope already used their name
@@ -1278,6 +1283,10 @@ mod execution {
             unkept: Vec::new(),
             aliases,
             unsupported,
+            trace_index: told.then(|| {
+                let name = if lang == ScorerLang::Python { "trace_of" } else { "traceOf" };
+                Expr::call(name, vec![Expr::Name(random_name(lang).into())])
+            }),
         };
         let all_bindings = model.bindings.iter().chain(&trace.bindings).cloned().collect::<Vec<_>>();
         let mut direct_ctx = ctx.clone();
@@ -1335,13 +1344,24 @@ mod execution {
         }
         // a helper that needs the run's seed gets it from the random source, and the agent takes one
         let seeded = helpers.iter().any(|helper| helper.seeded);
-        let seed = seeded.then(|| match lang {
-            ScorerLang::Python => code::Parameter::new("seed").with_default(Expr::Null).keyword(),
-            ScorerLang::Typescript => code::Parameter::new("seed")
-                // a seed past what a number holds exactly is given as a bigint
-                .typed("number | bigint | undefined")
-                .with_default(Expr::from("undefined")),
-        });
+        // such an agent can be any trace of the run, so it is printed again reading which one it is
+        if seeded && !told {
+            return emit_form(model, trace, output, lang, ordered, true, unsupported);
+        }
+        let seed: Vec<code::Parameter> = match (seeded, lang) {
+            (false, _) => vec![],
+            (true, ScorerLang::Python) => vec![
+                code::Parameter::new("seed").with_default(Expr::Null).keyword(),
+                code::Parameter::new("trace").with_default(Expr::number(0)).keyword(),
+            ],
+            (true, ScorerLang::Typescript) => vec![
+                code::Parameter::new("seed")
+                    // a seed past what a number holds exactly is given as a bigint
+                    .typed("number | bigint | undefined")
+                    .with_default(Expr::from("undefined")),
+                code::Parameter::new("trace").typed("number").with_default(Expr::number(0)),
+            ],
+        };
         let mut parameters = match lang {
             ScorerLang::Python => vec![
                 code::Parameter::new("input").with_default("_MISSING"),
@@ -1379,6 +1399,7 @@ mod execution {
                 };
                 if seeded {
                     keywords.push(("seed".into(), "seed".into()));
+                    keywords.push(("trace".into(), "trace".into()));
                 }
                 Expr::Call {
                     function: Box::new(name.into()),
@@ -1397,6 +1418,7 @@ mod execution {
                         args.push(Expr::Null);
                     }
                     args.push("seed".into());
+                    args.push("trace".into());
                 }
                 Expr::call(name, args)
             }
@@ -1433,13 +1455,13 @@ mod execution {
         let contracts = if direct_ctx.direct && matches!(functions[0].body.get(1), Some(Statement::TraceScope { .. })) {
             match native::functions(&mut functions, lang, &numbered, &helpers) {
                 Some(contracts) => contracts,
-                None => return emit_form(model, trace, output, lang, false, unsupported),
+                None => return emit_form(model, trace, output, lang, false, told, unsupported),
             }
         } else {
             vec![]
         };
         if seeded {
-            let seeded = |source: Expr| Expr::call("seeded", vec![source, "seed".into()]);
+            let seeded = |source: Expr| Expr::call("seeded", vec![source, "seed".into(), "trace".into()]);
             let mut given = false;
             let execute = (functions.iter_mut())
                 .find(|function| function.name == "_execute")

@@ -398,6 +398,7 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
                         },
                         prop("turns").unwrap_or(Graph::Num(bts_lang::Number::Int(1))),
                         prop("up_to").unwrap_or(Graph::Null),
+                        prop("weights").unwrap_or(Graph::Null),
                     ],
                     returns: FieldType::Object,
                     shape: Some(PLACE_SHAPE),
@@ -585,8 +586,9 @@ pub(super) fn id(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Valu
 /// With one length every conversation has `turns` traces. With `up_to`, each draws a
 /// length from `turns` to `up_to`, and a trace counts from the start of its block of
 /// [`BLOCK`] traces. The last conversation of a block ends with the block, and its
-/// length is the turns it has.
-pub fn place(seed: u64, label: &str, index: u64, turns: u64, up_to: Option<u64>) -> (u64, u64, u64) {
+/// length is the turns it has. The lengths are equally likely unless each is given a
+/// weight, the first for `turns` and the last for `up_to`, at least one of them positive.
+pub fn place(seed: u64, label: &str, index: u64, turns: u64, up_to: Option<u64>, weights: Option<&[f64]>) -> (u64, u64, u64) {
     let Some(up_to) = up_to else {
         return (index / turns, index % turns, turns);
     };
@@ -594,7 +596,11 @@ pub fn place(seed: u64, label: &str, index: u64, turns: u64, up_to: Option<u64>)
     let (mut start, mut count) = (0, 0);
     loop {
         let drawn = draw(&address(seed, &block.to_string(), &format!("{label}#{count}")));
-        let length = turns + (drawn * (up_to - turns + 1) as f64) as u64;
+        let length = turns
+            + match weights {
+                Some(weights) => take(weights, drawn).unwrap_or(0) as u64,
+                None => (drawn * (up_to - turns + 1) as f64) as u64,
+            };
         if start + length > offset {
             return (block * BLOCK + count, offset - start, length.min(BLOCK - start));
         }
@@ -620,10 +626,12 @@ fn turns_of(value: &Value) -> Result<u64, EvaluateError> {
 }
 
 const TURNS_SHAPE: &str = "a conversation has a whole number of turns from 1 to 256";
+const WEIGHTS_SHAPE: &str =
+    "a conversation takes one weight for each length from turns to up_to, none negative and one positive";
 
 /// Evaluates a conversation's place for one trace.
 pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
-    let [Value::String(label), Value::Number(index), turns, up_to] = args else {
+    let [Value::String(label), Value::Number(index), turns, up_to, weights] = args else {
         return Err(EvaluateError::Shape);
     };
     let index = index.as_u64().ok_or(EvaluateError::Shape)?;
@@ -635,8 +643,23 @@ pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Va
     if up_to.is_some_and(|up_to| up_to < turns) {
         return Err(invalid("a conversation runs up to at least as many turns as it starts with"));
     }
+    let weights = match (weights, up_to) {
+        (Value::Null, _) => None,
+        (Value::Array(weights), Some(up_to)) => {
+            let weights = (weights.iter())
+                .map(|weight| match weight {
+                    Value::Number(number) => number.as_f64().filter(|weight| weight.is_finite() && *weight >= 0.0),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|weights| weights.len() as u64 == up_to - turns + 1 && weights.iter().any(|weight| *weight > 0.0))
+                .ok_or_else(|| invalid(WEIGHTS_SHAPE))?;
+            Some(weights)
+        }
+        _ => return Err(invalid(WEIGHTS_SHAPE)),
+    };
     let (seed, _) = evaluation.address();
-    let (number, turn, length) = place(seed, label, index, turns, up_to);
+    let (number, turn, length) = place(seed, label, index, turns, up_to, weights.as_deref());
     let whole = |value: u64| Value::Number(value.into());
     Ok(Value::Object(BTreeMap::from([
         ("number".to_owned(), whole(number)),
@@ -678,13 +701,17 @@ pub(super) fn runtime(lang: crate::mocking::ScorerLang, _agent: bool) -> String 
 
 // `seeded` gives a run its seed
 const PY_RUNTIME: &str = r#"
-def seeded(random_source, seed=None):
+def seeded(random_source, seed=None, trace=0):
     if seed is None:
         seed = int(_draw(random_source) * 4294967296)
     def source():
         return random_source()
-    source.seed = seed
+    source.seed, source.trace = seed, trace
     return source
+
+
+def trace_of(random_source):
+    return random_source.trace
 
 
 def _world_hash(address):
@@ -726,7 +753,7 @@ def _world_pick(label, weights, options, *rest):
     *per, random_source = rest
     weights = [float(_num(weight)) for weight in _value(weights)]
     if any(weight < 0 for weight in weights): raise ValueError("a branch weight is a finite number that is not negative")
-    drawn_for = _world_per(per[0]) if per else "0"
+    drawn_for = _world_per(per[0]) if per else str(random_source.trace)
     taken = _world_take(weights, _world_draw(f"{random_source.seed}/{drawn_for}/{label}"))
     return [] if taken is None else _value(options)[taken]
 
@@ -738,16 +765,23 @@ def _world_turns(value):
     return value
 
 
-def _world_turn(label, index, turns, up_to, random_source):
-    index, turns = int(_value(index)), _world_turns(turns)
-    if _value(up_to) is None: return {"number": index // turns, "turn": index % turns, "length": turns}
+def _world_turn(label, index, turns, up_to, weights, random_source):
+    index, turns, weights = int(_value(index)), _world_turns(turns), _value(weights)
+    shape = "a conversation takes one weight for each length from turns to up_to, none negative and one positive"
+    if _value(up_to) is None:
+        if weights is not None: raise ValueError(shape)
+        return {"number": index // turns, "turn": index % turns, "length": turns}
     up_to = _world_turns(up_to)
     if up_to < turns: raise ValueError("a conversation runs up to at least as many turns as it starts with")
+    if weights is not None:
+        if not isinstance(weights, list) or len(weights) != up_to - turns + 1: raise ValueError(shape)
+        if any(type(weight) not in (int, float) or not _math.isfinite(weight) or weight < 0 for weight in weights) or not any(weights): raise ValueError(shape)
+        weights = [float(weight) for weight in weights]
     block, offset = divmod(index, 256)
     start, count = 0, 0
     while True:
         drawn = _world_draw(f"{random_source.seed}/{block}/{label}#{count}")
-        length = turns + int(drawn * (up_to - turns + 1))
+        length = turns + (int(drawn * (up_to - turns + 1)) if weights is None else _world_take(weights, drawn))
         if start + length > offset: return {"number": block * 256 + count, "turn": offset - start, "length": min(length, 256 - start)}
         start += length
         count += 1
@@ -759,8 +793,11 @@ def _world_id(label, per, random_source):
 "#;
 
 const TS_RUNTIME: &str = r#"
-function seeded(randomSource: () => number, seed?: number | bigint): () => number {
-    return Object.assign(() => randomSource(), { seed: seed ?? Math.floor(_draw(randomSource) * 4294967296) });
+function seeded(randomSource: () => number, seed?: number | bigint, trace: number = 0): () => number {
+    return Object.assign(() => randomSource(), { seed: seed ?? Math.floor(_draw(randomSource) * 4294967296), trace });
+}
+function traceOf(randomSource: () => number): number {
+    return (randomSource as { trace?: number }).trace ?? 0;
 }
 function _world_hash(address: string): number {
     let value = 2166136261;
@@ -797,7 +834,7 @@ function _world_per(per: unknown): string {
 }
 function _world_pick(label: string, weights: unknown, options: unknown, ...rest: unknown[]): unknown[] {
     const randomSource = rest[rest.length - 1] as () => number;
-    const drawnFor = rest.length > 1 ? _world_per(rest[0]) : "0";
+    const drawnFor = rest.length > 1 ? _world_per(rest[0]) : String(traceOf(randomSource));
     const numbers: number[] = (_serialize(weights) as unknown[]).map(weight => {
         if (typeof weight !== "number" || !Number.isFinite(weight) || weight < 0) throw new RangeError("a branch weight is a finite number that is not negative");
         return weight;
@@ -811,19 +848,28 @@ function _world_turns(value: unknown): number {
     if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 256) throw new RangeError("a conversation has a whole number of turns from 1 to 256");
     return value;
 }
-function _world_turn(label: string, index: unknown, turnsValue: unknown, upToValue: unknown, randomSource: () => number): { number: number; turn: number; length: number } {
+function _world_turn(label: string, index: unknown, turnsValue: unknown, upToValue: unknown, weightsValue: unknown, randomSource: () => number): { number: number; turn: number; length: number } {
     const at = Number(_serialize(index));
     const turns = _world_turns(turnsValue);
-    if (_serialize(upToValue) === null || _serialize(upToValue) === undefined) return { number: Math.floor(at / turns), turn: at % turns, length: turns };
+    const weights = _serialize(weightsValue) ?? null;
+    const shape = "a conversation takes one weight for each length from turns to up_to, none negative and one positive";
+    if (_serialize(upToValue) === null || _serialize(upToValue) === undefined) {
+        if (weights !== null) throw new RangeError(shape);
+        return { number: Math.floor(at / turns), turn: at % turns, length: turns };
+    }
     const upTo = _world_turns(upToValue);
     if (upTo < turns) throw new RangeError("a conversation runs up to at least as many turns as it starts with");
+    if (weights !== null) {
+        if (!Array.isArray(weights) || weights.length !== upTo - turns + 1) throw new RangeError(shape);
+        if (weights.some(weight => typeof weight !== "number" || !Number.isFinite(weight) || weight < 0) || !weights.some(weight => weight > 0)) throw new RangeError(shape);
+    }
     const seed = (randomSource as { seed?: number | bigint }).seed;
     const block = Math.floor(at / 256);
     const offset = at % 256;
     let start = 0;
     for (let count = 0; ; count += 1) {
         const drawn = _world_draw(`${seed}/${block}/${label}#${count}`);
-        const length = turns + Math.floor(drawn * (upTo - turns + 1));
+        const length = turns + (weights === null ? Math.floor(drawn * (upTo - turns + 1)) : (_world_take(weights, drawn) as number));
         if (start + length > offset) return { number: block * 256 + count, turn: offset - start, length: Math.min(length, 256 - start) };
         start += length;
     }
@@ -880,13 +926,13 @@ mod tests {
     #[test]
     fn a_trace_finds_its_place_among_conversations() {
         // with one length the place is arithmetic
-        assert_eq!(place(7, "chat", 7, 3, None), (2, 1, 3));
+        assert_eq!(place(7, "chat", 7, 3, None, None), (2, 1, 3));
         // with a range every trace of a block belongs to one conversation, in order, with no gaps
         let mut lengths = BTreeSet::new();
         for block in 0..4 {
             let (mut expected, mut left) = (None, 0);
             for offset in 0..BLOCK {
-                let (number, turn, length) = place(7, "chat", block * BLOCK + offset, 2, Some(6));
+                let (number, turn, length) = place(7, "chat", block * BLOCK + offset, 2, Some(6), None);
                 if left == 0 {
                     // a conversation opens where the one before it closed
                     assert_eq!(turn, 0);
@@ -905,10 +951,37 @@ mod tests {
         }
         // every length in the range turns up
         assert!((2..=6).all(|length| lengths.contains(&length)), "{lengths:?}");
-        assert_eq!(place(7, "chat", 300, 2, Some(6)), place(7, "chat", 300, 2, Some(6)));
+        assert_eq!(
+            place(7, "chat", 300, 2, Some(6), None),
+            place(7, "chat", 300, 2, Some(6), None)
+        );
+        // equal weights are the same draw as no weights, and a length with no weight never turns up
+        for index in 0..BLOCK {
+            assert_eq!(
+                place(7, "chat", index, 2, Some(6), None),
+                place(7, "chat", index, 2, Some(6), Some(&[1.0; 5]))
+            );
+            let (_, turn, length) = place(7, "chat", index, 2, Some(4), Some(&[5.0, 0.0, 1.0]));
+            assert!(
+                length == 2 || length == 4 || (length == 1 && index == BLOCK - 1),
+                "{index} {turn} {length}"
+            );
+        }
+        // most conversations are short when the short lengths weigh the most
+        let opens = |weights: Option<&[f64]>, wanted: u64| {
+            (0..4 * BLOCK)
+                .map(|index| place(7, "chat", index, 1, Some(4), weights))
+                .filter(|(_, turn, length)| *turn == 0 && *length == wanted)
+                .count()
+        };
+        assert!(opens(Some(&[8.0, 4.0, 2.0, 1.0]), 1) > 3 * opens(Some(&[8.0, 4.0, 2.0, 1.0]), 4));
         assert_ne!(
-            (0..64).map(|index| place(7, "chat", index, 2, Some(6))).collect::<Vec<_>>(),
-            (0..64).map(|index| place(8, "chat", index, 2, Some(6))).collect::<Vec<_>>()
+            (0..64)
+                .map(|index| place(7, "chat", index, 2, Some(6), None))
+                .collect::<Vec<_>>(),
+            (0..64)
+                .map(|index| place(8, "chat", index, 2, Some(6), None))
+                .collect::<Vec<_>>()
         );
     }
 

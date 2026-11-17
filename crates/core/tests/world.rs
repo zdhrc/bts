@@ -435,8 +435,29 @@ fn a_conversation_is_several_traces_that_belong_together() {
     }
     assert!((2..=6).all(|length| lengths.contains(&length)), "{lengths:?}");
     assert_eq!(said, traces(&varied, 5, 600));
+    // weights say how likely each length is, and a length with no weight never opens a conversation
+    let weighted = source.replace("{turns: 3}", "{turns: 1, up_to: 4, weights: [|8, 0, 2, 1|]}");
+    let said = traces(&weighted, 5, 255);
+    let opened = |length: u64| {
+        said.iter()
+            .filter(|trace| trace["turn"] == 0 && trace["length"] == length)
+            .count()
+    };
+    assert_eq!(opened(2), 0);
+    assert!(
+        opened(1) > 2 * opened(3) && opened(3) > 0 && opened(4) > 0,
+        "{} {} {}",
+        opened(1),
+        opened(3),
+        opened(4)
+    );
     // the bounds are whole numbers of turns, the second no smaller than the first
+    let weights = "a conversation takes one weight for each length from turns to up_to, none negative and one positive";
     for (written, message) in [
+        ("{turns: 2, up_to: 4, weights: [|1, 2|]}", weights),
+        ("{turns: 2, up_to: 4, weights: [|0, 0, 0|]}", weights),
+        ("{turns: 2, up_to: 4, weights: [|1, -1, 1|]}", weights),
+        ("{turns: 2, weights: [|1|]}", weights),
         (
             "{turns: 4, up_to: 2}",
             "a conversation runs up to at least as many turns as it starts with",

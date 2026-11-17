@@ -158,9 +158,11 @@ pub struct Helper {
     pub random: bool,
     /// Whether a call needs the seed of the run.
     ///
-    /// The random source such a helper is passed carries the seed as `seed`. An
-    /// agent that calls one takes an optional seed and wraps its random source with
-    /// `seeded`, which the helper's text defines.
+    /// The random source such a helper is passed carries the seed as `seed` and
+    /// which trace of the run the agent is as `trace`. An agent that calls one takes
+    /// an optional seed and trace and wraps its random source with `seeded`. It
+    /// reads its trace index with `trace_of`, or `traceOf` in TypeScript. The
+    /// helper's text defines both.
     pub seeded: bool,
     /// Whether the result is a count, which typed code can rely on.
     pub counts: bool,
