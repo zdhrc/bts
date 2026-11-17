@@ -3707,6 +3707,70 @@ fn computed_fields_are_lowered_for_each_instance_that_omits_them() {
     assert_eq!(keys("c"), ["width", "height", "area"]);
     assert!(matches!(entry("c", "height"), Value::Num(Int(6))));
 
+    // an object an extension states is merged over the object it inherits, level by level of extension
+    let model = compiled(
+        r#"
+        +(sized:node) {
+            scale: {type: "number", default: 2},
+            size: {type: "object", value: {width: self.scale, height: self.size.width * 3, area: {unit: "m"}}},
+            label: {type: "any", value: {text: "kind"}},
+            note: {type: "any", value: "plain"},
+        };
+        +(wide:node) {size: {value: {depth: 1, width: 5, area: {scale: 1}}}, label: {value: "stated"}, note: {value: {text: "object"}}}
+            -[:extends]->(sized);
+        +(deep:node) {size: {value: {depth: 9}}}
+            -[:extends]->(wide);
+        +(spread:node) {size: {value: {...{depth: 1}}}}
+            -[:extends]->(sized);
+        +(fixed:node) {size: {default: {depth: 1}}}
+            -[:extends]->(sized);
+        (a:wide);
+        (b:deep);
+        (c:deep) {size: {height: 4, extra: true}};
+        (d:spread);
+        (e:fixed);
+        (f:sized);
+        "#,
+    );
+    let keys = |node: &str| -> Vec<String> {
+        let Value::Object(object) = &binding(&model, node, "size").value else {
+            panic!("{node}")
+        };
+        object.elem.iter().map(|entry| entry.key.clone()).collect()
+    };
+    let entry = |node: &str, key: &str| -> Value {
+        let owner = model.names[node];
+        (model.bindings.iter())
+            .find(|binding| binding.owner == owner && binding.path == ["size", key])
+            .unwrap_or_else(|| panic!("{node}.{key}"))
+            .value
+            .clone()
+    };
+    // the inherited keys keep their place, a stated key replaces the inherited one, and new keys follow
+    assert_eq!(keys("a"), ["width", "height", "area", "depth"]);
+    assert!(matches!(entry("a", "width"), Value::Num(Int(5))));
+    // an inherited key reads the stated one, and a nested object is replaced, not merged
+    assert!(matches!(entry("a", "height"), Value::Num(Int(15))));
+    let Value::Object(area) = entry("a", "area") else { panic!() };
+    assert_eq!(area.elem[0].key, "scale");
+    // a value that is no object replaces the inherited one whole, in either direction
+    assert!(matches!(&binding(&model, "a", "label").value, Value::Str(text) if text == "stated"));
+    assert!(matches!(&binding(&model, "a", "note").value, Value::Object(object) if object.elem.len() == 1));
+    // an extension of an extension is merged over what that one made
+    assert_eq!(keys("b"), ["width", "height", "area", "depth"]);
+    assert!(matches!(entry("b", "depth"), Value::Num(Int(9))));
+    assert!(matches!(entry("b", "width"), Value::Num(Int(5))));
+    // an instance writes over the merged object in the same way
+    assert_eq!(keys("c"), ["width", "height", "area", "depth", "extra"]);
+    assert!(matches!(entry("c", "height"), Value::Num(Int(4))));
+    assert!(matches!(entry("c", "depth"), Value::Num(Int(9))));
+    // an object with a spread replaces the inherited value whole, and so does a default
+    assert_eq!(keys("d"), ["depth"]);
+    assert_eq!(keys("e"), ["depth"]);
+    // the base is what it was
+    assert_eq!(keys("f"), ["width", "height", "area"]);
+    assert!(matches!(entry("f", "width"), Value::Num(Int(2))));
+
     // a kind that comes from a provider's definitions computes the same way, with the provider's functions
     let provider = ProviderSchema {
         definitions: &[Source {

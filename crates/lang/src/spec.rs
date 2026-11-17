@@ -734,7 +734,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.inheritance"),
-        summary: "Extensions inherit properties, fields, requiredness, defaults, values, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults and values. Stating a default replaces an inherited value, and stating a value replaces an inherited default. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type, and a computed value must satisfy it for each instance. Declared properties are strict. Content fields are strict for a closed kind and free for an open one. Described content fields receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive their value or default when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value. Extensions inherit context keys. A declaration may narrow an inherited key from any to a specific type and cannot change a concrete type. One kind may both provide and require a key. The key history cannot be declared.",
+        summary: "Extensions inherit properties, fields, requiredness, defaults, values, roles and traits. They may add entries, narrow any to a specific type, require optional fields and override defaults and values. Stating a default replaces an inherited value, and stating a value replaces an inherited default. An object value stated over an inherited object value is merged over it by key, one level deep, the way an object an instance writes is merged over a computed object: the inherited keys keep their place, a stated key replaces the inherited one, and new keys follow. A stated value that is not an object literal, or an object with a spread, replaces the inherited value whole, and so does any value stated over one that is not an object literal. An instance writes over the merged object in the same way. They cannot change a concrete inherited type or make a required field optional. Effective defaults must satisfy the effective type, and a computed value must satisfy it for each instance. Declared properties are strict. Content fields are strict for a closed kind and free for an open one. Described content fields receive type and requiredness checks. Bindings retain declared types for subsequent references even when their values depend on runtime context. Consumers must validate runtime values against these types. Each reachable alternative of a conditional expression must satisfy its expected type, while genuinely unknown runtime values defer validation. Missing fields receive their value or default when available, otherwise required fields must be explicitly supplied. An authored <- counts as a declared input, not a delivered value. Extensions inherit context keys. A declaration may narrow an inherited key from any to a specific type and cannot change a concrete type. One kind may both provide and require a key. The key history cannot be declared.",
     },
     RuleDesc {
         tags: &[],
@@ -1349,6 +1349,14 @@ const EXAMPLES: &[Example] = &[
         summary: "An object an instance writes is merged over a computed object",
         note: "a's size is {width: 9, height: 3, depth: 1}. The kind's keys keep their place, a replaces width and adds depth.",
         source: r#"+(box:node) {size: {type: "object", value: {width: 2, height: 3}}}; (a:box) {size: {depth: 1, width: 9}};"#,
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.computed-field-extension"),
+        summary: "An object an extension states is merged over the object it inherits",
+        note: "a's size is {width: 9, height: 3, depth: 1}. The extension states the keys it changes, and b writes over the merged object.",
+        source: r#"+(box:node) {size: {type: "object", value: {width: 2, height: 3}}}; +(crate:node) {size: {value: {depth: 1, width: 9}}}-[:extends]->(box); (a:crate); (b:crate) {size: {height: 4}};"#,
         valid: true,
     },
     Example {

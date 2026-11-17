@@ -213,6 +213,18 @@ impl Modeler {
             if let Err(diags) = resolved {
                 self.errors.extend(diags);
             }
+            // a base resolves before what extends it, so each value is merged over one that is already whole
+            for (stated, inherited) in std::mem::take(&mut resolver.over) {
+                let at = |range: SrcRange| (range.source, range.start, range.end);
+                let (Some(base), Some(written)) = (self.values.get(&at(inherited)), self.values.get(&at(stated))) else {
+                    continue;
+                };
+                if let Some((items, _)) = merged(base, written) {
+                    let mut value = written.clone();
+                    value.kind = ast::ExprKind::Object(items);
+                    self.values.insert(at(stated), value);
+                }
+            }
         }
         // an instance of a definition that failed to resolve is left unchecked rather than checked against a partial schema
         for (index, entry) in resolver.entries.iter().enumerate() {
@@ -1984,8 +1996,8 @@ fn literal_keys(expr: &ast::Expr) -> Option<Vec<&ast::Attr>> {
         .collect()
 }
 
-// what an instance wrote over what its kind computes: the kind's keys in their order, each replaced by the
-// instance's when it writes one, then the keys only the instance has. Also the keys left to the kind
+// what an instance or an extension wrote over what a kind computes: the kind's keys in their order, each
+// replaced by the written one when there is one, then the keys only the writer has. Also the keys left to the kind
 fn merged(computed: &ast::Expr, written: &ast::Expr) -> Option<(Vec<ast::ObjectItem>, HashSet<String>)> {
     let (computed, written) = (literal_keys(computed)?, literal_keys(written)?);
     let mut kept = HashSet::new();
@@ -2006,13 +2018,18 @@ fn merged(computed: &ast::Expr, written: &ast::Expr) -> Option<(Vec<ast::ObjectI
 }
 
 // descriptors written directly in a definition's header braces or body
-fn schema_attrs(attrs: &[ast::Attr], inherited: &mut Vec<FieldSchema>, content: bool) -> Result<()> {
+fn schema_attrs(
+    attrs: &[ast::Attr],
+    inherited: &mut Vec<FieldSchema>,
+    content: bool,
+    over: &mut Vec<(SrcRange, SrcRange)>,
+) -> Result<()> {
     let mut seen = HashSet::new();
     let mut errors = Vec::new();
     for attr in attrs {
         if !seen.insert(&attr.key) {
             errors.extend(error(attr.range, "duplicate schema key"));
-        } else if let Err(diags) = schema_field(attr.clone(), inherited, content) {
+        } else if let Err(diags) = schema_field(attr.clone(), inherited, content, over) {
             errors.extend(diags);
         }
     }
@@ -2030,7 +2047,12 @@ fn narrows(previous: &FieldSchema, schema: &FieldSchema, range: SrcRange) -> Res
     Ok(())
 }
 
-fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>, content: bool) -> Result<()> {
+fn schema_field(
+    field: ast::Attr,
+    inherited: &mut Vec<FieldSchema>,
+    content: bool,
+    over: &mut Vec<(SrcRange, SrcRange)>,
+) -> Result<()> {
     {
         let previous = inherited.iter().find(|entry| entry.name == field.key).cloned();
         let mut schema = previous.clone().unwrap_or(FieldSchema {
@@ -2088,7 +2110,13 @@ fn schema_field(field: ast::Attr, inherited: &mut Vec<FieldSchema>, content: boo
         match stated {
             (Some(_), Some(at)) => return Err(error(at, "a field takes a default or a value, not both")),
             (Some(_), None) => schema.value = None,
-            (None, Some(_)) => schema.default = None,
+            (None, Some(stated)) => {
+                schema.default = None;
+                // an object stated over an inherited object is merged over it, like one an instance writes
+                if let Some(inherited) = previous.as_ref().and_then(|previous| previous.value) {
+                    over.push((stated, inherited));
+                }
+            }
             (None, None) => {}
         }
         if let Some(previous) = &previous {
@@ -2284,6 +2312,8 @@ struct Definitions<'a> {
     traits: Vec<Option<Trait>>,
     // the trait entry that supplied a property, field or context key of a kind
     origins: Vec<HashMap<(Entry, String), usize>>,
+    // each value an extension states over one it inherits, in the order the definitions resolve
+    over: Vec<(SrcRange, SrcRange)>,
 }
 
 impl<'a> Definitions<'a> {
@@ -2424,10 +2454,12 @@ impl<'a> Definitions<'a> {
         if resolved.on.is_empty() {
             errors.extend(error(range, "a trait needs at least one `on` relationship"));
         }
-        if let Err(diags) = schema_attrs(head.header.props.as_deref().unwrap_or(&[]), &mut resolved.props, false) {
+        let props = head.header.props.as_deref().unwrap_or(&[]);
+        if let Err(diags) = schema_attrs(props, &mut resolved.props, false, &mut self.over) {
             errors.extend(diags);
         }
-        if let Err(diags) = schema_attrs(head.body.as_deref().unwrap_or(&[]), &mut resolved.fields, true) {
+        let body = head.body.as_deref().unwrap_or(&[]);
+        if let Err(diags) = schema_attrs(body, &mut resolved.fields, true, &mut self.over) {
             errors.extend(diags);
         }
         for relationship in &relationships {
@@ -2681,13 +2713,13 @@ impl<'a> Definitions<'a> {
                 false
             });
         }
-        if let Err(diags) = schema_attrs(&props, &mut kind.props, false) {
+        if let Err(diags) = schema_attrs(&props, &mut kind.props, false, &mut self.over) {
             errors.extend(diags);
         }
         let body = head.body.as_deref().unwrap_or(&[]);
         if construct != Construct::Node && !body.is_empty() {
             errors.extend(error(body[0].range, "only node kinds have content fields"));
-        } else if let Err(diags) = schema_attrs(body, &mut kind.fields, true) {
+        } else if let Err(diags) = schema_attrs(body, &mut kind.fields, true, &mut self.over) {
             errors.extend(diags);
         }
         if kind.fields.iter().any(|field| field.name == "props") {
