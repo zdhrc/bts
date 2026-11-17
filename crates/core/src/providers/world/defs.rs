@@ -5,7 +5,7 @@ pub const SOURCE: Source<'static> = Source {
     name: "world.bt",
     text: r#"
 # a statement is one English sentence, written as its grammar
-# sentence is the grammar as an object, for the functions that relate sentences
+# clause is the grammar as an object, for the functions that relate sentences
 +(statement:node {
     subject: {type: "string", required: true},
     person: {type: "string", default: "third"},
@@ -15,13 +15,13 @@ pub const SOURCE: Source<'static> = Source {
     modal: {type: "any", default: null},
     tense: {type: "string", default: "present"},
 }) {
-    sentence: {type: "object", value: {clause: {
+    clause: {type: "object", value: {clause: {
         subject: {text: self.props.subject, person: self.props.person, number: self.props.number},
         predicate: {verb: self.props.verb, complement: self.props.complement},
         modal: self.props.modal,
         tense: self.props.tense,
     }}},
-    text: {type: "string", value: realize(self.sentence)},
+    text: {type: "string", value: realize(self.clause)},
     # as a step of a walk, a statement gives its text
     gives: {type: "string", value: self.text},
 }
@@ -63,12 +63,12 @@ pub const SOURCE: Source<'static> = Source {
     }]->(context);
 
 # a given is a value written down, for a walk to take as it is
-+(given:node {is: {type: "any", required: true}}) {
-    gives: {type: "any", value: self.props.is},
++(given:node {value: {type: "any", required: true}}) {
+    gives: {type: "any", value: self.props.value},
 };
 
-# a choice gives nothing itself, so it is a place to hang a fork, such as inside a repeat
-+(choice:node) {
+# an either gives nothing itself, so it is a place to hang a fork, such as inside a repeat
++(either:node) {
     gives: {type: "any", value: null},
 };
 
@@ -149,14 +149,14 @@ pub const SOURCE: Source<'static> = Source {
 
 # a sentence is a walk whose parts add up to one clause, and a later part's keys win
 # defaults is what the sentence starts from before its parts, and an instance writes only the keys it changes
-# grammar is the parts merged over the defaults, sentence is the clause for the functions that relate sentences
+# grammar is the parts merged over the defaults, and clause is that grammar as the object the sentence functions take
 +(sentence:node) {
     defaults: {type: "object", value: {
         subject: null, person: "third", number: "singular", verb: null,
         complement: null, modal: null, tense: "present", form: "statement",
     }},
     grammar: {type: "object", value: merge(self.defaults, context.steps)},
-    sentence: {type: "object", value: {clause: {
+    clause: {type: "object", value: {clause: {
         subject: {text: self.grammar.subject, person: self.grammar.person, number: self.grammar.number},
         predicate: {verb: self.grammar.verb, complement: self.grammar.complement},
         modal: self.grammar.modal,
@@ -164,7 +164,7 @@ pub const SOURCE: Source<'static> = Source {
         form: self.grammar.form,
     }}},
     # plain is the sentence as its grammar reads, and text is that or the way of the speaker that leads to it
-    plain: {type: "string", value: realize(self.sentence)},
+    plain: {type: "string", value: realize(self.clause)},
     text: {type: "string", value: context.spoken ? context.styled : self.plain},
     gives: {type: "string", value: self.text},
 }

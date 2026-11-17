@@ -263,7 +263,7 @@ impl Walker<'_> {
             if !self.rounds.is_empty() {
                 return Err(fail(
                     self.model.nodes[target.0].range,
-                    "a walk inside a repeat is built once, so every round would give the same. Repeat a `choice` with a fork under it",
+                    "a walk inside a repeat is built once, so every round would give the same. Repeat an `either` with a fork under it",
                 ));
             }
             self.inner.push(target);

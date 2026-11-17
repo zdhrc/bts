@@ -105,7 +105,7 @@ fn a_sentence_is_built_from_the_parts_a_walk_visits() {
     for output in outputs(
         &shape(
             ASK,
-            "{first: ask.text, again: ask.text, grammar: ask.grammar, clause: ask.sentence}",
+            "{first: ask.text, again: ask.text, grammar: ask.grammar, clause: ask.clause}",
         ),
         0..16,
     ) {
@@ -121,7 +121,7 @@ fn a_list_has_one_item_for_each_step() {
     let world = r#"(policies:list)
     -[:next]->(fee:policy {subject: "a same-day change", verb: "cost", complement: "75 USD"})
     -[:next]->(window:policy {subject: "the change window", verb: "close", complement: "two hours before departure"});"#;
-    let read = "{items: policies.items, text: policies.text, fee: fee.text, clause: fee.sentence}";
+    let read = "{items: policies.items, text: policies.text, fee: fee.text, clause: fee.clause}";
     let output = outputs(&shape(world, read), 1..2).remove(0);
     assert_eq!(
         output["items"],
@@ -219,7 +219,7 @@ fn an_author_declares_a_walk_and_its_steps() {
 #[test]
 fn an_author_changes_what_a_shipped_kind_computes_by_extending_it() {
     // the provider decides what its kinds compute, and an extension states a field again
-    let world = r#"+(shout:node) {text: {value: upper(realize(self.sentence))}}
+    let world = r#"+(shout:node) {text: {value: upper(realize(self.clause))}}
     -[:extends]->(sentence);
 +(numbered:node) {text: {value: format("{} rules. {}", len(self.items), compose(self.items))}}
     -[:extends]->(list);
@@ -239,7 +239,7 @@ fn an_author_changes_what_a_shipped_kind_computes_by_extending_it() {
     -[:next]->(:part {subject: "the desk", verb: "close"});
 (may:sentence)
     -[:next]->(:asked {subject: "I", person: "first", modal: "can", verb: "go"});"#;
-    let read = "{said: ask.text, clause: ask.sentence, rules: rules.text, items: rules.items, then: then.text, may: may.text}";
+    let read = "{said: ask.text, clause: ask.clause, rules: rules.text, items: rules.items, then: then.text, may: may.text}";
     let output = outputs(&shape(world, read), 1..2).remove(0);
     assert_eq!(output["said"], "I MUST CHANGE MY FLIGHT.");
     // what the extension did not state is still the shipped kind's
@@ -349,7 +349,7 @@ fn a_walk_is_a_step_of_another_walk() {
     let said = outputs(
         &shape(
             world,
-            "{fee: fee.text, clause: fee.sentence, all: policies.text, items: policies.items}",
+            "{fee: fee.text, clause: fee.clause, all: policies.text, items: policies.items}",
         ),
         0..24,
     );
@@ -370,17 +370,17 @@ fn a_walk_is_a_step_of_another_walk() {
 fn a_fact_has_a_value_and_an_entity_has_attributes() {
     let world = r#"(fare:fact)
     =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {is: 1240.5}),
-        -[:next {weight: 1}]->(:given {is: 980}),
+        -[:next {weight: 1}]->(:given {value: 1240.5}),
+        -[:next {weight: 1}]->(:given {value: 980}),
     ];
 (flight:entity)
-    -[:next]->(:given {is: {date: "2026-11-20"}})
+    -[:next]->(:given {value: {date: "2026-11-20"}})
     =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {is: {departs: "17:30"}}),
-        -[:next {weight: 1}]->(:given {is: {departs: "19:05"}}),
+        -[:next {weight: 1}]->(:given {value: {departs: "17:30"}}),
+        -[:next {weight: 1}]->(:given {value: {departs: "19:05"}}),
     ];
 (traveler:entity)
-    -[:next]->(:given {is: {name: a.input}});
+    -[:next]->(:given {value: {name: a.input}});
 (holds:relation);
 (holds)-[:incidence]-(traveler);
 (holds)-[:incidence]-(flight);"#;
@@ -401,7 +401,7 @@ fn a_fact_has_a_value_and_an_entity_has_attributes() {
     // an entity that is part of no relation is related to nothing
     assert_eq!(
         outputs(
-            &shape("(alone:entity)-[:next]->(:given {is: {a: 1}});", "alone.related"),
+            &shape("(alone:entity)-[:next]->(:given {value: {a: 1}});", "alone.related"),
             1..2
         ),
         [json!({})]
@@ -409,8 +409,8 @@ fn a_fact_has_a_value_and_an_entity_has_attributes() {
     // the world a caller meets depends on the input
     let world = r#"(perk:fact)
     =[:exclusive]=>[
-        -[:next {when: a.input == "gold"}]->(:given {is: "lounge access"}),
-        -[:next {when: a.input != "gold"}]->(:given {is: "a seat"}),
+        -[:next {when: a.input == "gold"}]->(:given {value: "lounge access"}),
+        -[:next {when: a.input != "gold"}]->(:given {value: "a seat"}),
     ];"#;
     assert_eq!(outputs(&shape(world, "perk.value"), 1..2), [json!("a seat")]);
     assert_eq!(
@@ -421,10 +421,10 @@ fn a_fact_has_a_value_and_an_entity_has_attributes() {
 
 #[test]
 fn relations_have_a_direction_and_a_setting_gathers_walks() {
-    let world = r#"(traveler:entity)-[:next]->(:given {is: {name: "Maya"}});
-(booking:entity)-[:next]->(:given {is: {code: "AB42"}});
-(spare:entity)-[:next]->(:given {is: {code: "ZZ99"}});
-(friend:entity)-[:next]->(:given {is: {name: "Sam"}});
+    let world = r#"(traveler:entity)-[:next]->(:given {value: {name: "Maya"}});
+(booking:entity)-[:next]->(:given {value: {code: "AB42"}});
+(spare:entity)-[:next]->(:given {value: {code: "ZZ99"}});
+(friend:entity)-[:next]->(:given {value: {name: "Sam"}});
 (holds:relation);
 (holds)-[:incidence {role: "input"}]-(traveler);
 (holds)-[:incidence {role: "output"}]-(booking);
@@ -452,7 +452,7 @@ fn relations_have_a_direction_and_a_setting_gathers_walks() {
 #[test]
 fn a_world_reads_what_the_agent_was_given_and_what_its_steps_return() {
     let source = r#"(receipt:entity)
-    -[:next]->(:given {is: {charged: charge.output.amount, to: desk.input.name}});
+    -[:next]->(:given {value: {charged: charge.output.amount, to: desk.input.name}});
 (note:sentence)
     -[:next]->(:part {subject: "the charge", verb: "be", complement: charge.output.status});
 (desk:agent) {input: {name: "Maya"}, output: done.output};
@@ -489,7 +489,7 @@ fn a_repeat_fork_walks_its_branches_once_for_each_round() {
     let world = r#"(reasons:list)
     -[:next]->(:policy {subject: "the desk", verb: "open"})
     =[:repeat {count: 3}]=>[
-        -[:next]->(reason:choice),
+        -[:next]->(reason:either),
     ];
 (reason)
     =[:weighted]=>[
@@ -711,14 +711,14 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
         ),
         (
             format!(
-                "(w:list)\n    =[:repeat {{count: other.value}}]=>[\n        -[:next]->{policy},\n    ];\n(other:fact)-[:next]->(:given {{is: 2}});"
+                "(w:list)\n    =[:repeat {{count: other.value}}]=>[\n        -[:next]->{policy},\n    ];\n(other:fact)-[:next]->(:given {{value: 2}});"
             ),
             "w.text",
             "a repeat fork in a walk is written with a whole count from 0 to 64",
         ),
         (
             format!(
-                "(w:entity)-[:next]->(:given {{is: {{a: 1}}}});\n(r:relation);\n(r)-[:incidence]-(w);\n(r)-[:incidence]-{policy};"
+                "(w:entity)-[:next]->(:given {{value: {{a: 1}}}});\n(r:relation);\n(r)-[:incidence]-(w);\n(r)-[:incidence]-{policy};"
             ),
             "w.related",
             "a relation in a world joins walks, and this is not one",
@@ -747,10 +747,10 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
         (
             "(w:list)\n    =[:repeat {count: 2}]=>[\n        -[:next]->(s:sentence),\n    ];\n(s)-[:next]->(:part {subject: \"a\", verb: \"be\"});".to_owned(),
             "w.text",
-            "a walk inside a repeat is built once, so every round would give the same. Repeat a `choice` with a fork under it",
+            "a walk inside a repeat is built once, so every round would give the same. Repeat an `either` with a fork under it",
         ),
         (
-            "(w:entity)-[:next]->(:given {is: {a: 1}});\n(all:setting {nodes: [|(w), (p)|], edges: [||]});\n(p:vars) {x: 1};".to_owned(),
+            "(w:entity)-[:next]->(:given {value: {a: 1}});\n(all:setting {nodes: [|(w), (p)|], edges: [||]});\n(p:vars) {x: 1};".to_owned(),
             "all.members",
             "a network in a world gathers named walks, and this is not one",
         ),

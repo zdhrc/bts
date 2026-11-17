@@ -12,17 +12,17 @@
 # a fact with a value, and an entity whose attributes add up
 (fare:fact)
     =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {is: 1240.5}),
-        -[:next {weight: 1}]->(:given {is: 980}),
+        -[:next {weight: 1}]->(:given {value: 1240.5}),
+        -[:next {weight: 1}]->(:given {value: 980}),
     ];
 (flight:entity)
-    -[:next]->(:given {is: {date: "2026-11-20"}})
+    -[:next]->(:given {value: {date: "2026-11-20"}})
     =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {is: {departs: "17:30"}}),
-        -[:next {weight: 1}]->(:given {is: {departs: "19:05"}}),
+        -[:next {weight: 1}]->(:given {value: {departs: "17:30"}}),
+        -[:next {weight: 1}]->(:given {value: {departs: "19:05"}}),
     ];
 (traveler:entity)
-    -[:next]->(:given {is: {name: desk.input.name}});
+    -[:next]->(:given {value: {name: desk.input.name}});
 (holds:relation);
 (holds)-[:incidence]-(traveler);
 (holds)-[:incidence]-(flight);
@@ -35,7 +35,7 @@
 # three reasons, each drawn for itself
 (reasons:list)
     =[:repeat {count: 3}]=>[
-        -[:next]->(reason:choice),
+        -[:next]->(reason:either),
     ];
 (reason)
     =[:weighted]=>[

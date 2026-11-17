@@ -1,11 +1,11 @@
 # the hotel's reservations stand beside the agent as entities of a world, each defined once
 # the lookup tool finds a reservation by its number, so every step that reads a booking reads the same one
 (overnight_stay:entity)
-    -[:next]->(:given {is: {id: "HTL-4821", booking: {status: "confirmed", overnight_check_in: true}}});
+    -[:next]->(:given {value: {id: "HTL-4821", booking: {status: "confirmed", overnight_check_in: true}}});
 (evening_stay:entity)
-    -[:next]->(:given {is: {id: "HTL-7390", booking: {status: "confirmed", overnight_check_in: false}}});
+    -[:next]->(:given {value: {id: "HTL-7390", booking: {status: "confirmed", overnight_check_in: false}}});
 (cancelled_stay:entity)
-    -[:next]->(:given {is: {id: "HTL-9102", booking: {status: "cancelled", overnight_check_in: true}}});
+    -[:next]->(:given {value: {id: "HTL-9102", booking: {status: "cancelled", overnight_check_in: true}}});
 
 ("customer-support-agent":agent) {input: [|{name: "Maya", reservation_id: "HTL-4821", arrival_hour: 25, message: "My flight is delayed. Can I still check in when I arrive?"}, {name: "Riley", reservation_id: "HTL-7390", arrival_hour: 26, message: "Will the front desk still be open?"}, {name: "Avery", reservation_id: "HTL-9102", arrival_hour: 25, message: "Can you check that my booking is active?"}|], output: ("late-arrival").output};
 ("customer-support-agent")-[:next]->("late-arrival");

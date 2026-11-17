@@ -15,10 +15,10 @@
 
 # the later flight the search finds: the date never changes, and the departure and its fare are drawn together
 (later:entity)
-    -[:next]->(:given {is: {date: "2026-11-20"}})
+    -[:next]->(:given {value: {date: "2026-11-20"}})
     =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {is: {departs: "17:30", fare_difference: 1240.5}}),
-        -[:next {weight: 1}]->(:given {is: {departs: "19:05", fare_difference: 980}}),
+        -[:next {weight: 1}]->(:given {value: {departs: "17:30", fare_difference: 1240.5}}),
+        -[:next {weight: 1}]->(:given {value: {departs: "19:05", fare_difference: 980}}),
     ];
 
 # the traveler writes in text messages, and each fork chooses one part of what they ask
@@ -56,7 +56,7 @@
             {role: "user", content: ask.text},
         |],
         output: {role: "assistant", content: format("{} It leaves on {} at {}. {}",
-            combine([|found.sentence, fee.sentence|], "and"),
+            combine([|found.clause, fee.clause|], "and"),
             format_date(search.output.date, {style: "long"}),
             format_time(search.output.departs),
             payment.text)},
