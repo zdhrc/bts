@@ -157,7 +157,9 @@ The expression reads `self` and `context` only, so the kind works in any shape. 
 
 The provider's `llm` kind uses this to count tokens. Every `llm` step gets `prompt_tokens`, `completion_tokens` and `tokens` in its `metrics` without writing them, and `metrics: {time_to_first_token: 0.2}` adds to those counts. See [computed fields](examples/computed_fields.bt).
 
-The world provider writes what people say as graph. A `statement` is one sentence written as its grammar, and an `intent` is something a speaker wants, worded differently in each trace. Both hold values and emit no spans, so they sit on the agent's path before the steps that read them. See [flight change](examples/flight_change.bt).
+The world provider builds the setting an agent works in. A `walk` stands beside the agent, and the steps under it say how one instance is put together. A `sentence` is a walk whose parts add up to one clause, with a fork wherever there is more than one way to say it. A `list` has one item for each step, such as the policies an agent works under. The agent reads them by name, a walk emits no spans, and the same seed builds the same world in generated data and in a generated agent. See [flight change](examples/flight_change.bt).
+
+The provider also writes what people say as graph on the agent's path. A `statement` is one sentence written as its grammar, and an `intent` is something a speaker wants, worded differently in each trace. Both hold values and emit no spans, so they sit before the steps that read them.
 
 ## Use the model
 
