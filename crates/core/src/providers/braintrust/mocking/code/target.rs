@@ -114,9 +114,10 @@ impl AgentTarget for CodeTarget {
         context: &CodebaseContext<'_>,
     ) -> Result<CodebasePlan, Error> {
         let modules = sources.iter().map(|source| source.name.clone()).collect::<Vec<_>>();
+        // the token helper is the only generated code that imports a tokenizer
         let tokens = sources
             .iter()
-            .any(|source| source.contents.contains("def _tokens(") || source.contents.contains("function _tokens("));
+            .any(|source| source.contents.contains("import tiktoken") || source.contents.contains("\"js-tiktoken\""));
         let mut files = manifests::plan_agents(&modules, lang, context, tokens).map_err(Error::Manifest)?;
         files.extend(sources.iter().map(|source| CodebaseFile {
             path: source.name.clone().into(),
@@ -484,6 +485,35 @@ dependencies = ["braintrust==0.40.0", "requests>=2"]
             Some("src/agents")
         );
         assert!(!manifest.contains("tiktoken"));
+    }
+
+    #[test]
+    fn an_agent_that_counts_tokens_depends_on_a_tokenizer() {
+        // an llm step counts its own tokens, so the shape never names the function
+        let model = compile(
+            r#"(counted:agent) {input: "hi", output: reply.output};
+(counted)-[:next]->(request:task) {input: counted.input, output: reply.output};
+(request)-[:calls]->(reply:llm {name: "reply"}) {input: request.input, output: "hello"};"#,
+        )
+        .unwrap();
+        let target = CodeTarget::new("");
+        let files = MemoryFiles(BTreeMap::new());
+        let context = CodebaseContext {
+            root: Path::new("/virtual/agent"),
+            files: &files,
+        };
+        for (lang, manifest, package) in [
+            (ScorerLang::Python, "pyproject.toml", "tiktoken>=0.9,<1"),
+            (ScorerLang::Typescript, "package.json", "js-tiktoken"),
+        ] {
+            let assembly = code::assemble_agents(&model, lang, &target).unwrap();
+            let plan = target.agent_codebase(&assembly.files, lang, &context).unwrap();
+            let manifest = &(plan.files.iter())
+                .find(|file| file.path == Path::new(manifest))
+                .unwrap()
+                .contents;
+            assert!(manifest.contains(package), "{manifest}");
+        }
     }
 
     #[test]
