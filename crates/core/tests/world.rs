@@ -347,13 +347,13 @@ fn a_conversation_is_several_traces_that_belong_together() {
         -[:next {weight: 1}]->(:part {verb: "stay"}),
         -[:next {weight: 1}]->(:part {verb: "go"}),
     ];"#;
-    let read = "{id: chat.id, number: chat.number, turn: chat.turn, first: chat.first, last: chat.last, mood: mood.text}";
+    let read = "{id: chat.id, number: chat.number, turn: chat.turn, length: chat.length, first: chat.first, last: chat.last, mood: mood.text}";
     let source = shape(world, read);
-    let turns = |source: &str, seed: u64| -> Vec<Value> {
+    let traces = |source: &str, seed: u64, count: usize| -> Vec<Value> {
         let model = SELECTED.compile(source).unwrap_or_else(|errors| panic!("{errors}\n{source}"));
         let batch = data::generate(
             model,
-            30,
+            count,
             Duration::from_secs(3600),
             data::Distribution::Linear,
             UNIX_EPOCH + Duration::from_secs(7200),
@@ -365,6 +365,7 @@ fn a_conversation_is_several_traces_that_belong_together() {
             .map(|event| event.output.as_ref().unwrap().project(&()).unwrap())
             .collect()
     };
+    let turns = |source: &str, seed: u64| traces(source, seed, 30);
     let said = turns(&source, 5);
     let mut ids = BTreeSet::new();
     for (number, conversation) in said.chunks(3).enumerate() {
@@ -374,6 +375,7 @@ fn a_conversation_is_several_traces_that_belong_together() {
             assert_eq!(trace["mood"], conversation[0]["mood"]);
             assert_eq!(trace["number"], number);
             assert_eq!(trace["turn"], turn);
+            assert_eq!(trace["length"], 3);
             assert_eq!(trace["first"], turn == 0);
             assert_eq!(trace["last"], turn == 2);
         }
@@ -407,6 +409,57 @@ fn a_conversation_is_several_traces_that_belong_together() {
     assert_eq!(paired[0]["id"], paired[1]["id"]);
     assert_ne!(paired[1]["id"], paired[2]["id"]);
     assert_eq!(paired[3]["turn"], 1);
+    // with up_to each conversation runs for its own number of turns, and the traces still line up
+    let varied = source.replace("{turns: 3}", "{turns: 2, up_to: 6}");
+    let said = traces(&varied, 5, 600);
+    let mut lengths = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut at = 0;
+    while at < said.len() {
+        let opening = &said[at];
+        let length = opening["length"].as_u64().unwrap() as usize;
+        assert_eq!(opening["turn"], 0);
+        assert_eq!(opening["first"], true);
+        // only a conversation that a block of 256 traces cuts short has fewer turns than the fewest
+        assert!((2..=6).contains(&length) || (at + length).is_multiple_of(256), "{opening}");
+        for (turn, trace) in said[at..].iter().take(length).enumerate() {
+            assert_eq!(trace["id"], opening["id"]);
+            assert_eq!(trace["mood"], opening["mood"]);
+            assert_eq!(trace["turn"], turn);
+            assert_eq!(trace["length"], length);
+            assert_eq!(trace["last"], turn == length - 1);
+        }
+        assert!(ids.insert(opening["id"].to_string()), "{opening}");
+        lengths.insert(length);
+        at += length;
+    }
+    assert!((2..=6).all(|length| lengths.contains(&length)), "{lengths:?}");
+    assert_eq!(said, traces(&varied, 5, 600));
+    // the bounds are whole numbers of turns, the second no smaller than the first
+    for (written, message) in [
+        (
+            "{turns: 4, up_to: 2}",
+            "a conversation runs up to at least as many turns as it starts with",
+        ),
+        ("{turns: 0}", "a conversation has a whole number of turns from 1 to 256"),
+        (
+            "{turns: 2, up_to: 2.5}",
+            "a conversation has a whole number of turns from 1 to 256",
+        ),
+    ] {
+        let model = SELECTED.compile(&source.replace("{turns: 3}", written)).unwrap();
+        let error = data::generate(
+            model,
+            1,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            5,
+            &(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
     // a conversation has no steps
     let found = rejected(&shape(
         "(chat:conversation)-[:next]->(:policy {subject: \"a\", verb: \"be\"});",

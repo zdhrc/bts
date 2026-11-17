@@ -561,6 +561,14 @@ pub static FUNCTIONS: &[Function] = &[
         python: Some(seeded("_world_pick", "take_branch")),
         typescript: Some(seeded("_world_pick", "takeBranch")),
     },
+    // what the place of a trace among conversations lowers to
+    Function {
+        name: super::walk::TURN,
+        check: None,
+        data: Some(super::walk::turn),
+        python: Some(seeded("_world_turn", "conversation_turn")),
+        typescript: Some(seeded("_world_turn", "conversationTurn")),
+    },
     // what the identifier of a conversation lowers to
     Function {
         name: super::walk::ID,

@@ -36,8 +36,8 @@ pub const SCHEMA: bts_lang::ProviderSchema<'static> = bts_lang::ProviderSchema {
     forks: &["weighted", "exclusive"],
     junctions: &[],
     // a walk reads its steps, and may be drawn for something computed from the trace index
-    // a conversation reads its identifier
-    context: &[walk::STEPS, "trace_index", walk::IDENTITY],
+    // a conversation reads its place in the run and its identifier
+    context: &[walk::STEPS, "trace_index", walk::PLACE, walk::IDENTITY],
     functions: functions::DESCRIPTORS,
 };
 
@@ -51,7 +51,7 @@ impl super::Contributor for Bundle {
     }
 
     fn internal(&self) -> &'static [&'static str] {
-        &[walk::PICK, walk::ID]
+        &[walk::PICK, walk::TURN, walk::ID]
     }
 
     fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {

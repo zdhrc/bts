@@ -54,16 +54,20 @@ pub const SOURCE: Source<'static> = Source {
     -[:requires {steps: {type: "array"}, trace_index: {type: "number"}}]->(context);
 
 # a conversation is several traces in a row that belong together, and it stands beside an agent
-# turns is how many traces one conversation has, number counts the conversations of a run and turn the traces within one
+# turns is how many traces one conversation has, and with up_to each conversation runs for turns to up_to of them
+# number counts the conversations of a run, turn the traces within one, and length is how many turns this one has
+# place is where the trace sits, worked out once, and the three read it
 # id is the same for every trace of one conversation, and a walk drawn per number is too
-+(conversation:node {turns: {type: "number", default: 1}}) {
-    number: {type: "number", value: floor(context.trace_index / self.props.turns)},
-    turn: {type: "number", value: context.trace_index % self.props.turns},
++(conversation:node {turns: {type: "number", default: 1}, up_to: {type: "any", default: null}}) {
+    place: {type: "object", value: context.place},
+    number: {type: "number", value: self.place.number},
+    turn: {type: "number", value: self.place.turn},
+    length: {type: "number", value: self.place.length},
     first: {type: "boolean", value: self.turn == 0},
-    last: {type: "boolean", value: self.turn == self.props.turns - 1},
+    last: {type: "boolean", value: self.turn == self.length - 1},
     id: {type: "string", value: context.identity},
 }
-    -[:requires {trace_index: {type: "number"}, identity: {type: "string"}}]->(context);
+    -[:requires {trace_index: {type: "number"}, place: {type: "object"}, identity: {type: "string"}}]->(context);
 
 # a part is some of a sentence's grammar, and gives what it was written with
 +(part:node {

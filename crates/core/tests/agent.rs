@@ -2245,7 +2245,8 @@ fn a_walk_drawn_for_more_than_a_trace_agrees_in_data_and_code() {
 #[test]
 fn a_conversation_agrees_in_data_and_code() {
     // an agent given the seed is the first turn of the first conversation of the run
-    let source = r#"(chat:conversation {turns: 3});
+    // each conversation runs for two to five turns
+    let source = r#"(chat:conversation {turns: 2, up_to: 5});
 (mood:sentence {per: chat.number})
     -[:next]->(:part {subject: "I", person: "first"})
     =[:weighted]=>[
@@ -2256,15 +2257,16 @@ fn a_conversation_agrees_in_data_and_code() {
 (desk:agent) {input: "hi", output: t.output};
 (desk)-[:next]->(t:task {name: "turn"}) {
     input: desk.input,
-    output: {id: chat.id, turn: chat.turn, first: chat.first, last: chat.last, mood: mood.text},
+    output: {id: chat.id, turn: chat.turn, length: chat.length, first: chat.first, last: chat.last, mood: mood.text},
     metadata: {conversation_id: chat.id},
 };
 "#;
     let model = lower(source).unwrap();
-    for seed in [1u64, 2, 3, u64::MAX] {
+    let mut lengths = std::collections::BTreeSet::new();
+    for seed in [1u64, 2, 3, 4, 5, 6, u64::MAX] {
         let batch = data::generate(
             model.clone(),
-            3,
+            2,
             Duration::from_secs(3600),
             data::Distribution::Linear,
             UNIX_EPOCH + Duration::from_secs(7200),
@@ -2275,7 +2277,8 @@ fn a_conversation_agrees_in_data_and_code() {
         let first = batch.events[0].output.as_ref().unwrap().project(&()).unwrap();
         let identifier = |event: &data::Event| event.metadata.as_ref().unwrap()["conversation_id"].project(&()).unwrap();
         assert_eq!(identifier(&batch.events[0]), first["id"]);
-        assert_eq!(identifier(&batch.events[2]), first["id"]);
+        assert_eq!(identifier(&batch.events[1]), first["id"]);
+        lengths.insert(first["length"].as_u64().unwrap());
         let python = execute_generated(
             &model,
             ScorerLang::Python,
@@ -2297,6 +2300,7 @@ fn a_conversation_agrees_in_data_and_code() {
         assert_eq!(python["spans"][0]["metadata"]["conversation_id"], first["id"]);
         assert_eq!(typescript["spans"][0]["metadata"]["conversation_id"], first["id"]);
     }
+    assert!(lengths.len() > 1, "{lengths:?}");
     // what the conversation computes prints under readable names
     for lang in [ScorerLang::Python, ScorerLang::Typescript] {
         let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();

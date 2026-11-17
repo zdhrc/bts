@@ -301,17 +301,17 @@ fn world_conforms_to_the_provider_contract() {
     assert_eq!(schema.edges, ["next"]);
     assert_eq!(schema.forks, ["weighted", "exclusive"]);
     assert!(schema.junctions.is_empty());
-    assert_eq!(schema.context, ["steps", "trace_index", "identity"]);
-    // the twelve English functions and merge are declared, and what a fork and an identifier lower to is internal
+    assert_eq!(schema.context, ["steps", "trace_index", "place", "identity"]);
+    // the twelve English functions and merge are declared, and what a fork and a conversation lower to is internal
     assert_eq!(schema.functions.len(), 13);
-    assert_eq!(world::Bundle.functions().len(), 15);
-    assert_eq!(world::Bundle.internal(), ["world.pick", "world.id"]);
+    assert_eq!(world::Bundle.functions().len(), 16);
+    assert_eq!(world::Bundle.internal(), ["world.pick", "world.turn", "world.id"]);
     for function in world::Bundle.functions() {
         assert!(function.runs(Consumer::Data), "{}", function.name);
         assert!(function.runs(Consumer::Agent(ScorerLang::Python)), "{}", function.name);
         assert!(function.runs(Consumer::Agent(ScorerLang::Typescript)), "{}", function.name);
         // the English functions run in scorers too, and what serves a walk does not
-        let walks = ["merge", "world.pick", "world.id"].contains(&function.name);
+        let walks = ["merge", "world.pick", "world.turn", "world.id"].contains(&function.name);
         assert_eq!(function.runs(Consumer::Scorer), !walks, "{}", function.name);
     }
 }
@@ -326,8 +326,8 @@ fn a_provider_joined_by_a_contributor_has_the_kinds_and_functions_of_both() {
     let sources: Vec<_> = schema.definitions.iter().map(|source| source.name).collect();
     assert_eq!(sources, ["braintrust.bt", "world.bt"]);
     assert_eq!(schema.functions.len(), 16);
-    assert_eq!(joined.functions().len(), 18);
-    assert_eq!(joined.internal(), ["world.pick", "world.id"]);
+    assert_eq!(joined.functions().len(), 19);
+    assert_eq!(joined.internal(), ["world.pick", "world.turn", "world.id"]);
     let parts: Vec<_> = joined.parts().iter().map(|part| part.schema.id).collect();
     assert_eq!(parts, ["braintrust", "world"]);
 
