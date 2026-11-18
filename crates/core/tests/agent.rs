@@ -250,7 +250,7 @@ fn graph_agent_rejects_invalid_parenting_and_unsupported_flow() {
     for (source, message) in [
         (
             SOURCE.replace("(request)-[:calls, :feeds", "(request)-[:next, :feeds"),
-            "`lookup` has no parent span, go down from `request` with a `calls` edge",
+            "`lookup` has no parent span, go down from `request` with a `calls` edge, or indent this line under the step it follows",
         ),
         (
             format!("{SOURCE}\n(request)-[:calls]->(other:task) {{output: 1}}; (other)-[:calls]->(lookup);"),

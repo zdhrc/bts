@@ -744,7 +744,7 @@ fn structure(graph: &graph::Model, agent: graph::NodeId) -> Result<Structure, Er
             return Err(located(
                 edge.range,
                 format!(
-                    "{} has no parent span, go down from {} with a `calls` edge",
+                    "{} has no parent span, go down from {} with a `calls` edge, or indent this line under the step it follows",
                     named(edge.target),
                     named(*entry)
                 ),
@@ -2792,7 +2792,18 @@ impl<'a> AgentLowering<'a> {
                 }
             }
             if owners.len() != 1 {
-                return Err("external value references need one owning agent".into());
+                let named = match &self.graph.nodes[node.0].name {
+                    Some(name) => format!("`{name}`"),
+                    None => "this node".to_owned(),
+                };
+                return Err(if owners.is_empty() {
+                    format!(
+                        "{named} is read here and is on no agent's path, put it on the path before the step that reads it or under a walk beside the agent"
+                    )
+                } else {
+                    format!("{named} is on the path of more than one agent, and a read from outside a path needs one")
+                }
+                .into());
             }
             let mut owner = AgentLowering::new(self.graph, owners[0], self.beside, self.result)?;
             let value = owner.reference(id)?;

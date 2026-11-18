@@ -800,5 +800,8 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
     let alone = braintrust::Bundle
         .compile_module(&shape("(w:vars) {text: hex(4)};", "w.text"), false)
         .unwrap_err();
-    assert_eq!(alone[0].what, "external value references need one owning agent");
+    assert_eq!(
+        alone[0].what,
+        "`w` is read here and is on no agent's path, put it on the path before the step that reads it or under a walk beside the agent"
+    );
 }
