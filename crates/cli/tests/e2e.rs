@@ -3555,6 +3555,84 @@ assert.equal(scorers[0]({output, expected: row.expected}).score, Number(process.
 }
 
 #[test]
+#[ignore = "installs TypeScript and the generated agents' dependencies and is run explicitly in CI"]
+fn every_example_agent_type_checks() {
+    // nothing else compiles the generated TypeScript, and Node runs it without checking a type
+    let root = write_project_context(Uuid::new_v4());
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut shapes: Vec<_> = fs::read_dir(&examples)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "bt"))
+        .collect();
+    shapes.sort();
+    // the world an author copies from the skill is checked beside the examples
+    let skill = include_str!("../../core/src/providers/world/skill.rs");
+    let world = skill.rsplit_once("```bts\n").unwrap().1.split_once("\n```").unwrap().0;
+    fs::write(root.join("skill_world.bt"), world).unwrap();
+    shapes.push(root.join("skill_world.bt"));
+
+    let npm = |directory: &std::path::Path, args: &[&str]| {
+        let output = Command::new("npm")
+            .current_dir(directory)
+            .args(args)
+            .output()
+            .expect("npm, which the type check installs TypeScript with");
+        let said = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), said)
+    };
+    let mut without_agents = Vec::new();
+    let mut checked = Vec::new();
+    for shape in &shapes {
+        let name = shape.file_stem().unwrap().to_str().unwrap().to_owned();
+        let out = root.join(&name);
+        let built = bts()
+            .current_dir(&root)
+            .args(["build", "agent", "--lang", "typescript", "--from"])
+            .arg(shape)
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&built.stderr);
+        if stderr.contains("the shape declares no agent blocks") {
+            without_agents.push(name);
+            continue;
+        }
+        assert!(built.status.success(), "{name}: {stderr}");
+        let (installed, said) = npm(&out, &["install", "--no-audit", "--no-fund"]);
+        assert!(installed, "{name}: npm install failed in {}:\n{said}", out.display());
+        let (compiled, said) = npm(&out, &["run", "build"]);
+        assert!(
+            compiled,
+            "{name}: tsc rejected the generated agent in {}:\n{said}",
+            out.display()
+        );
+        checked.push(name);
+    }
+    assert_eq!(without_agents, ["code_scorer", "judge_scorer"]);
+    assert!(
+        checked.len() >= 14 && checked.contains(&"skill_world".to_owned()),
+        "{checked:?}"
+    );
+
+    // the check has teeth: an agent that reads no walk takes no seed, and tsc says so where Node would not
+    let agent = root.join("agent_tool_loop");
+    fs::write(
+        agent.join("src/agents/seeded.mts"),
+        "import { runDetails } from \"./ops_agent.mts\";\nconsole.log(runDetails(undefined, Math.random, 7, 3));\n",
+    )
+    .unwrap();
+    let (compiled, said) = npm(&agent, &["run", "build"]);
+    assert!(!compiled && said.contains("Expected 0-2 arguments, but got 4"), "{said}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "installs generated SDK dependencies and is run explicitly in CI"]
 fn agent_evals_register_and_run_with_braintrust_sdks() {
     let root = write_project_context(Uuid::new_v4());
