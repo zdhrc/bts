@@ -203,6 +203,9 @@ pub struct Binding {
     pub label: Option<String>,
     /// The value expression to inspect or evaluate.
     pub value: Value,
+    /// Where the author wrote the element this expression belongs to, when a definition supplies the expression.
+    /// A failure inside the definition is reported there, since the author cannot change the definition.
+    pub origin: Option<SrcRange>,
 }
 
 /// A named root definition and the behavior nested beneath it.

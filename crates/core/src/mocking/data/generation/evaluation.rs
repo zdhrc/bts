@@ -176,6 +176,8 @@ struct Instance {
     // the stable address of this instantiation, the basis for its slots' rngs
     path: u64,
     bindings: Vec<(String, BindSlot)>,
+    // for each binding, where the author wrote the element a definition computes it for
+    origins: Vec<Option<SrcRange>>,
     fields: FieldSlots,
 }
 
@@ -303,6 +305,7 @@ impl<'m> Ctx<'m> {
                 .iter()
                 .map(|binding| (binding.name.clone(), BindSlot::Todo(binding.value.clone())))
                 .collect(),
+            origins: bindings.iter().map(|binding| binding.origin).collect(),
             fields,
         };
         let index = self.instances.len();
@@ -614,8 +617,14 @@ impl<'m> Ctx<'m> {
                         self.instances[instance].bindings[position].1 = BindSlot::Done(value.clone());
                         Ok(value)
                     }
-                    Err(error) => {
+                    Err(mut error) => {
                         self.instances[instance].bindings[position].1 = BindSlot::Todo(expr);
+                        // a failure inside a definition is reported where the author wrote the element it computes for
+                        if error.range.source != 0
+                            && let Some(origin) = self.instances[instance].origins[position]
+                        {
+                            error.range = origin;
+                        }
                         Err(error)
                     }
                 }
@@ -3468,6 +3477,28 @@ mod tests {
             assert_eq!(output["time"], JsonValue::from("5:30 PM"));
             assert_eq!(output["composed"], JsonValue::from("Hello Maya. The guest can check in."));
         }
+    }
+
+    #[test]
+    fn a_failure_inside_a_definition_is_reported_where_the_author_wrote_the_element() {
+        // a verb that is not a constant is looked up when a trace reads the sentence, inside the provider's definitions
+        // the author cannot change those, so the failure is reported at the sentence they wrote
+        let source = r#"(action:fact) -[:next]->(:given {value: "escalate"});
+(ask:sentence)
+    -[:next]->(:part {subject: "I", person: "first", verb: action.value, complement: "the case"});
+(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "t"}) {input: a.input, output: ask.text};
+"#;
+        let error = plan(compile_with_world(source).unwrap(), 1, 1).unwrap_err();
+        assert!(error.to_string().contains(r#"unknown English verb "escalate""#), "{error}");
+        assert_eq!(error.range.source, 0);
+        assert_eq!(&source[error.range.start..error.range.end], "(ask:sentence)");
+        // a failure in what the author wrote stays where it is
+        let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "t"}) {input: a.input, output: realize({clause: {subject: {text: "I", person: "first"}, predicate: {verb: a.input}}})};
+"#;
+        let error = plan(compile_with_world(source).unwrap(), 1, 1).unwrap_err();
+        assert!(source[error.range.start..error.range.end].starts_with("realize("), "{error}");
     }
 
     #[test]

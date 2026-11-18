@@ -1270,6 +1270,7 @@ impl<'a> AgentLowering<'a> {
                 bindings.push(execution::Binding {
                     name: format!("binding_{index}"),
                     label: None,
+                    origin: self.origin(graph::BindingId(index)),
                     value: self.binding_value(graph::BindingId(index))?,
                 });
             }
@@ -1283,6 +1284,7 @@ impl<'a> AgentLowering<'a> {
                     bindings.push(execution::Binding {
                         name: format!("edge_value_{}", id.0),
                         label: None,
+                        origin: None,
                         value: self.binding_value(*id)?,
                     });
                 }
@@ -1316,6 +1318,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("guard_{}", id.0),
                 label: None,
+                origin: None,
                 value: self.binding_value(id)?,
             });
         }
@@ -1344,6 +1347,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("binding_{}", id.0),
                 label: None,
+                origin: self.origin(id),
                 value,
             });
         }
@@ -1698,6 +1702,7 @@ impl<'a> AgentLowering<'a> {
                     Ok(execution::Binding {
                         name: format!("fork_input_{}", id.0),
                         label: None,
+                        origin: None,
                         value: self.binding_value(id)?,
                     })
                 })
@@ -1856,6 +1861,7 @@ impl<'a> AgentLowering<'a> {
                 bindings.push(execution::Binding {
                     name: format!("guard_{}", id.0),
                     label: None,
+                    origin: None,
                     value: self.binding_value(id)?,
                 });
             }
@@ -1896,6 +1902,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("fork_pick_{index}"),
                 label: None,
+                origin: None,
                 value: execution::Value::Func {
                     func: execution::Func::ForkPick(branches),
                     range: fork.range,
@@ -1944,12 +1951,14 @@ impl<'a> AgentLowering<'a> {
                 bindings.push(execution::Binding {
                     name,
                     label: None,
+                    origin: None,
                     value: value?,
                 });
             } else {
                 bindings.push(execution::Binding {
                     name,
                     label: None,
+                    origin: None,
                     value: self.binding_value(graph::BindingId(id))?,
                 });
             }
@@ -1972,6 +1981,7 @@ impl<'a> AgentLowering<'a> {
                     bindings.push(execution::Binding {
                         name: format!("correlate_{index}"),
                         label: None,
+                        origin: None,
                         value: value?,
                     });
                 }
@@ -2009,6 +2019,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("emissions_{index}"),
                 label: None,
+                origin: None,
                 value: value?,
             });
         }
@@ -2851,6 +2862,18 @@ impl<'a> AgentLowering<'a> {
             .collect();
         let steps = self.route(node, End::Span)?;
         Ok(self.block(steps, execution::Accessor::Field(field), path, range))
+    }
+
+    // where the author wrote the element a definition computes this binding for
+    fn origin(&self, id: graph::BindingId) -> Option<graph::SrcRange> {
+        let binding = &self.graph.bindings[id.0];
+        let written = match binding.owner {
+            graph::ElementId::Node(node) => self.graph.nodes[node.0].range,
+            graph::ElementId::Edge(edge) => self.graph.edges[edge.0].range,
+            graph::ElementId::Fork(fork) => self.graph.forks[fork.0].range,
+            graph::ElementId::Junction(junction) => self.graph.junctions[junction.0].range,
+        };
+        (binding.range.source != 0 && written.source == 0).then_some(written)
     }
 
     fn binding_value(&mut self, id: graph::BindingId) -> Result<execution::Value, Error> {
