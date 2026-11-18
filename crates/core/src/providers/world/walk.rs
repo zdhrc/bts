@@ -23,8 +23,8 @@ use crate::mocking::data::Value;
 use crate::mocking::{EvaluateError, Evaluation};
 use crate::providers::{Supplied, Supply};
 use bts_lang::{
-    Array, ArrayElem, BindingId, Diag, DiagPhase, Direction, EdgeId, ElementId, FieldType, ForkId, Func, Model, NodeId, Object,
-    Primitive, SrcRange, Value as Graph,
+    Array, ArrayElem, BindingId, Diag, DiagPhase, Diags, Direction, EdgeId, ElementId, FieldType, ForkId, Func, Model, NodeId,
+    Object, Primitive, SrcRange, Value as Graph,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,6 +48,12 @@ pub const RELATED: &str = "related";
 pub const PICK: &str = "world.pick";
 /// The kind of several traces in a row that belong together.
 pub const SERIES: &str = "series";
+/// The kinds that take a verb, the property they take it in, and the field a sentence starts from.
+const STATEMENT: &str = "statement";
+const PART: &str = "part";
+const SENTENCE: &str = "sentence";
+const VERB: &str = "verb";
+const DEFAULTS: &str = "defaults";
 /// The context key a series reads its identifier through.
 pub const IDENTITY: &str = "identity";
 /// The internal function a series' identifier lowers to.
@@ -162,6 +168,38 @@ pub fn elements(model: &Model) -> Vec<ElementId> {
         }
     }
     elements.into_iter().collect()
+}
+
+/// Reports each verb written as a word the provider has no forms for.
+///
+/// A sentence is put into words when a trace reads it, which is after a shape has
+/// been checked and only on the branch a draw takes. A verb written as a constant
+/// on a `statement`, a `part` or a sentence's `defaults` is known when the shape
+/// compiles, so it is looked up there and reported where it is written.
+pub fn verbs(model: &Model) -> Diags {
+    let mut diags = Diags::new();
+    for binding in &model.bindings {
+        let ElementId::Node(node) = binding.owner else { continue };
+        let kind = &model.nodes[node.0].kind;
+        let written = if binding.property {
+            binding.path == [VERB] && (model.derives(kind, STATEMENT) || model.derives(kind, PART))
+        } else {
+            binding.path == [DEFAULTS, VERB] && model.derives(kind, SENTENCE)
+        };
+        if written
+            && binding.range.source == 0
+            && let Graph::Str(verb) = &binding.value
+            && super::english::Verb::lookup(verb).is_none()
+        {
+            diags.push(fail(
+                binding.range,
+                format!(
+                    "unknown English verb {verb:?}, write its forms as {{base: {verb:?}, third_person_singular: \"...\", past: \"...\", past_participle: \"...\", present_participle: \"...\"}}"
+                ),
+            ));
+        }
+    }
+    diags
 }
 
 fn fail(range: SrcRange, what: impl Into<String>) -> Diag {

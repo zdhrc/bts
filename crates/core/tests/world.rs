@@ -681,6 +681,32 @@ fn a_series_is_several_traces_that_belong_together() {
 }
 
 #[test]
+fn a_verb_without_forms_is_rejected_where_it_is_written() {
+    // a sentence is put into words when a trace reads it, on the branch a draw takes
+    // a verb written as a word is looked up when the shape compiles, so no branch hides it
+    let unknown = "unknown English verb \"appreciate\", write its forms as {base: \"appreciate\"";
+    for world in [
+        "(w:list)\n    -[:next]->(:policy {subject: \"we\", person: \"first\", number: \"plural\", verb: \"appreciate\"});",
+        "(w:sentence)\n    =[:weighted]=>[\n        -[:next {weight: 99}]->(:part {subject: \"I\", person: \"first\", verb: \"wait\"}),\n        -[:next {weight: 1}]->(:part {subject: \"I\", person: \"first\", verb: \"appreciate\"}),\n    ];",
+        "(w:sentence) {defaults: {verb: \"appreciate\"}}\n    -[:next]->(:part {subject: \"I\", person: \"first\"});",
+    ] {
+        let source = shape(world, "w.text");
+        let errors = SELECTED.compile_module(&source, false).unwrap_err();
+        assert!(errors[0].what.starts_with(unknown), "{}\n{world}", errors[0].what);
+        // the error is at the verb, in the author's own source
+        assert_eq!(errors[0].r#where.source, 0);
+        assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], "\"appreciate\"");
+    }
+    // a verb written with its forms, and a verb the provider knows, compile
+    for world in [
+        "(w:sentence)\n    -[:next]->(:part {subject: \"I\", person: \"first\", verb: {base: \"appreciate\", third_person_singular: \"appreciates\", past: \"appreciated\", past_participle: \"appreciated\", present_participle: \"appreciating\"}});",
+        "(w:sentence)\n    -[:next]->(:part {subject: \"I\", person: \"first\", verb: \"wait\"});",
+    ] {
+        SELECTED.compile_module(&shape(world, "w.text"), false).unwrap();
+    }
+}
+
+#[test]
 fn a_world_graph_rejects_what_a_walk_cannot_take() {
     let policy = r#"(p:policy {subject: "a", verb: "be"})"#;
     for (world, read, message) in [

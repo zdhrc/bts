@@ -70,8 +70,11 @@ impl super::Contributor for Bundle {
     }
 
     /// A walk, its edges and its forks are checked against the schema. A step is checked by what it gives.
+    /// A verb written as a word is looked up wherever it is written.
     fn walked(&self, model: &bts_lang::Model) -> bts_lang::Diags {
-        model.unsupported(&SCHEMA, &walk::checked(model))
+        let mut diags = model.unsupported(&SCHEMA, &walk::checked(model));
+        diags.extend(walk::verbs(model));
+        diags
     }
 
     /// The value of `steps` on every walk.
