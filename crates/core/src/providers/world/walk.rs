@@ -202,6 +202,189 @@ pub fn verbs(model: &Model) -> Diags {
     diags
 }
 
+/// Reports each function that samples, written in a walk drawn `per` something that outlasts a trace.
+///
+/// Such a walk is the same for every trace that gives the same `per`, by its forks
+/// and its draws. A function that samples is drawn again for every trace, and a
+/// generated agent draws its own, so the walk would not be the same after all.
+pub fn samples(model: &Model) -> Diags {
+    let mut diags = Diags::new();
+    for root in roots(model) {
+        let stated = (model.nodes[root.0].props.iter())
+            .map(|id| &model.bindings[id.0])
+            .any(|binding| binding.path == [PER] && !matches!(binding.value, Graph::Null));
+        if !stated {
+            continue;
+        }
+        // the walk and what it leads to, up to a walk that is a step, which says for itself
+        let mut owners = BTreeSet::from([ElementId::Node(root)]);
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            for (index, edge) in model.edges.iter().enumerate() {
+                if edge.source == node && edge.primitive == Primitive::Next && owners.insert(ElementId::Edge(EdgeId(index))) {
+                    let target = ElementId::Node(edge.target);
+                    if !model.derives(&model.nodes[edge.target.0].kind, WALK) && owners.insert(target) {
+                        pending.push(edge.target);
+                    }
+                }
+            }
+            for (index, fork) in model.forks.iter().enumerate() {
+                if fork.source == node {
+                    owners.insert(ElementId::Fork(ForkId(index)));
+                }
+            }
+        }
+        for binding in &model.bindings {
+            if !owners.contains(&binding.owner) {
+                continue;
+            }
+            let mut found = Vec::new();
+            sampled(&binding.value, &mut found);
+            for (function, range) in found {
+                // a kind the provider ships samples by its draws
+                if range.source != 0 {
+                    continue;
+                }
+                diags.push(fail(
+                    range,
+                    format!(
+                        "`{function}` samples again on every trace, and this walk is drawn `{PER}` something that outlasts one. Draw the value with a fork of `given` steps, or compute it from `context.draws` in a kind of your own"
+                    ),
+                ));
+            }
+        }
+    }
+    diags
+}
+
+// the functions in a value that sample, each with where it is written
+fn sampled(value: &Graph, found: &mut Vec<(&'static str, SrcRange)>) {
+    fn each(values: &[&Graph], found: &mut Vec<(&'static str, SrcRange)>) {
+        values.iter().for_each(|value| sampled(value, found));
+    }
+    match value {
+        Graph::Input { .. }
+        | Graph::FieldRef(_)
+        | Graph::Str(_)
+        | Graph::Num(_)
+        | Graph::Bool(_)
+        | Graph::Null
+        | Graph::Context { .. }
+        | Graph::BindingRef(..)
+        | Graph::GraphRef { .. } => {}
+        Graph::Template(template) => {
+            for part in &template.parts {
+                if let bts_lang::Part::Dynamic(value) = part {
+                    each(&[value], found);
+                }
+            }
+        }
+        Graph::Array(array) => {
+            for ArrayElem::Item(value) | ArrayElem::Spread(value) in &array.elem {
+                each(&[value], found);
+            }
+        }
+        Graph::Object(object) => object.elem.iter().for_each(|field| each(&[&field.value], found)),
+        Graph::Unary { operand, .. } => each(&[operand], found),
+        Graph::Binary { lhs, rhs, .. } => each(&[lhs, rhs], found),
+        Graph::Cond { cond, then, otherwise } => each(&[cond, then, otherwise], found),
+        Graph::Index { target, index, .. } => each(&[target, index], found),
+        Graph::Slice { target, start, end, .. } => {
+            each(&[target], found);
+            for bound in start.iter().chain(end) {
+                each(&[bound], found);
+            }
+        }
+        Graph::Func { func, range } => {
+            let name = match func {
+                // `vary` handed its draws takes its choices from them
+                Func::Call { function, args, .. } => match function.as_str() {
+                    "express" => Some("express"),
+                    "expression" => Some("expression"),
+                    "vary" if args.len() < 3 => Some("vary"),
+                    _ => None,
+                },
+                Func::Choice(_) => Some("choice"),
+                Func::Range(_) => Some("range"),
+                Func::Weighted(_) => Some("weighted"),
+                Func::Normal { .. } => Some("normal"),
+                Func::Lognormal { .. } => Some("lognormal"),
+                Func::Exponential { .. } => Some("exponential"),
+                Func::Pareto { .. } => Some("pareto"),
+                Func::Beta { .. } => Some("beta"),
+                Func::Poisson { .. } => Some("poisson"),
+                Func::Chance { .. } => Some("chance"),
+                Func::Sample { .. } => Some("sample"),
+                Func::Uuid => Some("uuid"),
+                Func::Hex { .. } => Some("hex"),
+                Func::Alphanum { .. } => Some("alphanum"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                found.push((name, *range));
+            }
+            match func {
+                Func::Call { args, .. } | Func::Format { args, .. } => args.iter().for_each(|value| each(&[value], found)),
+                Func::Choice(values) | Func::Min(values) | Func::Max(values) => {
+                    values.iter().for_each(|value| each(&[value], found))
+                }
+                Func::Weighted(options) => options.iter().for_each(|option| each(&[&option.value], found)),
+                Func::Range(_)
+                | Func::Normal { .. }
+                | Func::Lognormal { .. }
+                | Func::Exponential { .. }
+                | Func::Pareto { .. }
+                | Func::Beta { .. }
+                | Func::Poisson { .. }
+                | Func::Chance { .. }
+                | Func::Uuid
+                | Func::Hex { .. }
+                | Func::Alphanum { .. } => {}
+                Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => each(&[text], found),
+                Func::Len { target: value }
+                | Func::Round { value }
+                | Func::Floor { value }
+                | Func::Ceil { value }
+                | Func::Abs { value } => each(&[value], found),
+                Func::Replace { text, from, to } => each(&[text, from, to], found),
+                Func::Clamp { value, min, max } => each(&[value, min, max], found),
+                Func::Split {
+                    text: first,
+                    separator: second,
+                }
+                | Func::Join {
+                    array: first,
+                    separator: second,
+                }
+                | Func::Compose {
+                    array: first,
+                    separator: second,
+                }
+                | Func::Render {
+                    template: first,
+                    values: second,
+                }
+                | Func::Sample {
+                    array: first,
+                    count: second,
+                }
+                | Func::Contains {
+                    target: first,
+                    needle: second,
+                }
+                | Func::StartsWith {
+                    text: first,
+                    prefix: second,
+                }
+                | Func::EndsWith {
+                    text: first,
+                    suffix: second,
+                } => each(&[first, second], found),
+            }
+        }
+    }
+}
+
 fn fail(range: SrcRange, what: impl Into<String>) -> Diag {
     Diag {
         when: DiagPhase::Validation,
@@ -1193,6 +1376,7 @@ function _world_merge(base: unknown, objects: unknown): Record<string, any> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Provider as _;
 
     // the agent tests check that Python and TypeScript take the same branches from the same seeds
     #[test]
@@ -1279,5 +1463,68 @@ mod tests {
         assert_eq!(take(&[0.0, 1.0], 0.0), Some(1));
         assert_eq!(take(&[0.0, 0.0], 0.3), None);
         assert_eq!(take(&[], 0.3), None);
+    }
+
+    // the world beside an agent of one step
+    fn shape(world: &str) -> String {
+        format!(
+            "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-[:next]->(t:task {{name: \"t\"}}) {{input: a.input, output: \"ok\"}};\n"
+        )
+    }
+
+    fn provider() -> crate::providers::With<crate::providers::braintrust::Bundle, crate::providers::world::Bundle> {
+        crate::providers::With(crate::providers::braintrust::Bundle, crate::providers::world::Bundle)
+    }
+
+    fn rejected(source: &str) -> String {
+        let errors = provider().compile_module(source, false).unwrap_err();
+        errors.into_iter().map(|error| error.what).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn a_walk_drawn_for_more_than_a_trace_holds_nothing_that_samples() {
+        // a function that samples is drawn again for every trace, so the walk would differ from turn to turn
+        let told = |function: &str| format!("`{function}` samples again on every trace");
+        for (world, function) in [
+            (r#"(ticket:fact {per: "run"}) -[:next]->(:given {value: hex(8)});"#, "hex"),
+            (
+                r#"(ticket:fact {per: "run"}) -[:next]->(:given {value: {id: format("T-{}", range(1, 9))}});"#,
+                "range",
+            ),
+            (
+                r#"(customer:persona {style: choice("professional", "text_message"), per: "run"})
+        -[:next]->(:statement {subject: "I", person: "first", verb: "wait"});"#,
+                "choice",
+            ),
+            (
+                r#"(ask:sentence {per: "run"})
+        -[:next]->(:part {subject: "I", person: "first", verb: "need", complement: uuid()});"#,
+                "uuid",
+            ),
+            (
+                r#"(mood:fact {per: "run"}) -[:next]->(:given {value: vary("I am calm.")});"#,
+                "vary",
+            ),
+        ] {
+            let source = shape(world);
+            let errors = rejected(&source);
+            assert!(errors.contains(&told(function)), "{world}: {errors}");
+            // the same walk drawn for each trace may sample, since a new value is what it asks for
+            let each_trace = source.replace(r#", per: "run""#, "").replace(r#" {per: "run"}"#, "");
+            assert_ne!(each_trace, source);
+            provider()
+                .compile(&each_trace)
+                .unwrap_or_else(|errors| panic!("{errors}\n{each_trace}"));
+        }
+        // it is reported where it is written
+        let source = shape(r#"(ticket:fact {per: "run"}) -[:next]->(:given {value: hex(8)});"#);
+        let errors = provider().compile_module(&source, false).unwrap_err();
+        let error = errors.into_iter().next().unwrap();
+        assert_eq!(&source[error.r#where.start..error.r#where.end], "hex(8)");
+        // a walk that is a step says for itself what it is drawn for
+        let inner = r#"(outer:list {per: "run"})
+        -[:next]->(code:fact)
+            -[:next]->(:given {value: hex(8)});"#;
+        provider().compile(&shape(inner)).unwrap_or_else(|errors| panic!("{errors}"));
     }
 }
