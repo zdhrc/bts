@@ -4902,6 +4902,7 @@ mod native {
                 }),
             }
         }
+        declare_before_reads(&mut output, &env.eager);
         code::rewrite(&mut output, &mut |value| {
             if let Expr::Call {
                 function,
@@ -4919,6 +4920,69 @@ mod native {
         inline_local_reads(&mut output);
         env.types.borrow_mut().extend(env.names.clone());
         output
+    }
+
+    // A value is taken where a statement is sure to read it. A statement before that may read it
+    // on one side of a choice, itself or through a deferred value, so it is declared before that one.
+    fn declare_before_reads(output: &mut Vec<Statement>, eager: &HashSet<String>) {
+        let deferred = |statement: &Statement| {
+            matches!(statement, Statement::Variable(Variable::Declare { value: Expr::Call { function, .. }, .. })
+                if matches!(&**function, Expr::Name(name) if name == "_lazy"))
+        };
+        loop {
+            let through: HashMap<String, HashSet<Dependency>> = output
+                .iter()
+                .filter(|statement| deferred(statement))
+                .filter_map(|statement| match statement {
+                    Statement::Variable(Variable::Declare { name, value, .. }) => Some((name.clone(), value.references())),
+                    _ => None,
+                })
+                .collect();
+            let reads = |statement: &Statement| {
+                let mut found = code::references(std::slice::from_ref(statement));
+                let mut pending: Vec<_> = found.iter().cloned().collect();
+                while let Some(read) = pending.pop() {
+                    if let Dependency::Variable(name) = &read
+                        && let Some(more) = through.get(name)
+                    {
+                        pending.extend(more.iter().filter(|more| found.insert((*more).clone())).cloned());
+                    }
+                }
+                found
+            };
+            let late = output.iter().enumerate().find_map(|(index, statement)| {
+                let Statement::Variable(Variable::Declare { name, .. }) = statement else {
+                    return None;
+                };
+                if !eager.contains(name) || deferred(statement) {
+                    return None;
+                }
+                let own = Dependency::Variable(name.clone());
+                output[..index]
+                    .iter()
+                    .position(|earlier| {
+                        !deferred(earlier) && !matches!(earlier, Statement::Function(_)) && reads(earlier).contains(&own)
+                    })
+                    .map(|first| (index, first))
+            });
+            let Some((index, mut first)) = late else { break };
+            // a choice keeps the name it assigns directly above it
+            if first > 0
+                && matches!(&output[first], Statement::If { .. })
+                && matches!(
+                    &output[first - 1],
+                    Statement::Variable(Variable::Declare {
+                        value: Expr::Null,
+                        mutable: true,
+                        ..
+                    })
+                )
+            {
+                first -= 1;
+            }
+            let declaration = output.remove(index);
+            output.insert(first, declaration);
+        }
     }
 
     // A pure deferred read used entirely within one pure expression needs no

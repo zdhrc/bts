@@ -2479,6 +2479,68 @@ fn a_series_agrees_in_data_and_code() {
 }
 
 #[test]
+fn an_agent_input_that_reads_a_series_agrees_in_data_and_code() {
+    // what the caller would say is part of the world, so the authored input reads the turn and a walk drawn for the series
+    // the entry reads the series again after its input, which is where the series is sure to be read
+    let source = r#"(chat:series {turns: 2, up_to: 4});
+(caller:entity {per: chat.number})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:given {value: {name: "Ada"}}),
+        -[:next {weight: 1}]->(:given {value: {name: "Bo"}}),
+        -[:next {weight: 1}]->(:given {value: {name: "Cy"}}),
+    ];
+(desk:agent) {input: {name: caller.attributes.name, turn: chat.turn}, output: t.output};
+(desk)-[:next]->(t:task {name: "turn"}) {
+    input: desk.input,
+    output: t.input.name,
+    metadata: {conversation_id: chat.id, name: caller.attributes.name},
+};
+"#;
+    let model = lower(source).unwrap();
+    for seed in [1u64, 2] {
+        let batch = data::generate(
+            model.clone(),
+            8,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            seed,
+            &(),
+        )
+        .unwrap();
+        let python = execute_generated(
+            &model,
+            ScorerLang::Python,
+            "python3",
+            "check.py",
+            &format!(
+                "from desk_agent import run_details\nimport json\nprint(json.dumps([run_details(seed={seed}, trace=trace) for trace in range(8)]))"
+            ),
+        );
+        let typescript = execute_generated(
+            &model,
+            ScorerLang::Typescript,
+            "node",
+            "check.mts",
+            &format!(
+                "import {{runDetails}} from './desk_agent.mts'; console.log(JSON.stringify([...Array(8).keys()].map(trace => runDetails(undefined, Math.random, {seed}, trace))));"
+            ),
+        );
+        for (index, event) in batch.events.iter().enumerate() {
+            let input = event.input.as_ref().unwrap().project(&()).unwrap();
+            let conversation = event.metadata.as_ref().unwrap()["conversation_id"].project(&()).unwrap();
+            for (lang, run) in [("python", &python), ("typescript", &typescript)] {
+                assert_eq!(run[index]["spans"][0]["input"], input, "{lang}, seed {seed}, trace {index}");
+                assert_eq!(
+                    run[index]["spans"][0]["metadata"]["conversation_id"], conversation,
+                    "{lang}, seed {seed}, trace {index}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn every_example_agent_reads_as_written_by_hand() {
     // no deferred values, no span bookkeeping, and no helper under a private name
     for source in [
