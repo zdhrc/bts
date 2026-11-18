@@ -681,6 +681,46 @@ fn a_series_is_several_traces_that_belong_together() {
 }
 
 #[test]
+fn the_world_example_in_the_skill_generates() {
+    // the skill's complete example is the first world an author copies, so it compiles and runs as printed
+    let example = bts_core::providers::world::skill::DEFINITIONS
+        .rsplit_once("```bts\n")
+        .unwrap()
+        .1
+        .split_once("\n```")
+        .unwrap()
+        .0;
+    let model = SELECTED.compile(example).unwrap_or_else(|errors| panic!("{errors}"));
+    let batch = data::generate(
+        model,
+        40,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        3,
+        &(),
+    )
+    .unwrap();
+    let roots: Vec<_> = batch.events.iter().filter(|event| event.span_parents.is_empty()).collect();
+    assert_eq!(roots.len(), 40);
+    let mut turns = std::collections::BTreeMap::<String, Vec<u64>>::new();
+    for root in &roots {
+        let metadata = root.metadata.as_ref().unwrap();
+        let thread = metadata["thread_id"].project(&()).unwrap().as_str().unwrap().to_owned();
+        let turn = metadata["turn"].project(&()).unwrap().as_u64().unwrap();
+        turns.entry(thread).or_default().push(turn);
+        // a turn carries the messages before it
+        let input = root.input.as_ref().unwrap().project(&()).unwrap();
+        assert_eq!(input["earlier"].as_array().unwrap().len() as u64, turn);
+    }
+    // every thread counts its turns from zero without a gap
+    assert!(turns.len() > 8, "{turns:?}");
+    for (thread, turns) in &turns {
+        assert_eq!(*turns, (0..turns.len() as u64).collect::<Vec<_>>(), "{thread}");
+    }
+}
+
+#[test]
 fn a_verb_without_forms_is_rejected_where_it_is_written() {
     // a sentence is put into words when a trace reads it, on the branch a draw takes
     // a verb written as a word is looked up when the shape compiles, so no branch hides it

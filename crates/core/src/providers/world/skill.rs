@@ -4,6 +4,8 @@ pub const DEFINITIONS: &str = r#"## World definitions
 
 The world provider represents English as graph. A `statement` is one sentence written as its grammar, and its `text` field is the sentence. An `intent` is something a speaker wants, and its `text` is worded differently on each evaluation. A kind with the `speaker` trait gives the intents beneath it a way of talking. These nodes emit no spans. Place them on the agent's path before the steps that read them. The world functions do the same work inside an expression.
 
+Write a subject in lowercase unless it is a name. A sentence starts with a capital when its first word is an ordinary lowercase word, so `subject: "refunds"` reads `Refunds return to the card.` as a statement and `Do refunds return to the card?` as a question. A first word with a capital, a digit or other marks is a name or an identifier and stays as written. A `verb` is a word the provider has forms for, or its five forms written out as `{base: "appreciate", third_person_singular: "appreciates", past: "appreciated", past_participle: "appreciated", present_participle: "appreciating"}`. `bts check syntax` reports a verb written as a word the provider has no forms for.
+
 ### Building a world beside the agent
 
 A `walk` is something the provider builds by walking a graph. Write it as its own root statement, beside the agent and not on its path. The steps it leads to say how one instance is put together.
@@ -17,7 +19,7 @@ A `walk` is something the provider builds by walking a graph. Write it as its ow
 
 The walks the provider ships:
 
-- A `sentence` is a walk whose steps are parts. A `part` is some of the grammar of a sentence, written with the same properties as a `statement` plus `form` (`statement` or `question`), all optional. A part sets only what it is written with, and a later part's keys win. `text` is the sentence, `clause` is its grammar for functions such as `combine`, and `grammar` is the parts merged over `defaults`. Put a fork wherever there is more than one way to say it. To start a sentence from something other than third person, singular, present tense and a statement, write the keys that change in `defaults`, such as `{defaults: {tense: "past"}}`.
+- A `sentence` is a walk whose steps are parts. A `part` is some of the grammar of a sentence, written with the same properties as a `statement` plus `form` (`statement` or `question`), all optional. A part sets only what it is written with, and a later part's keys win. `text` is the sentence, `clause` is its grammar for functions such as `combine`, and `grammar` is the parts merged over `defaults`. Put a fork wherever there is more than one way to say it. To start a sentence from something other than third person, singular, present tense and a statement, write the keys that change in its `defaults` field. It is a field, so it goes in the body after the node and not among the properties: `(ask:sentence) {defaults: {tense: "past"}}`.
 - A `list` is a walk with one item for each step. `items` is what the steps gave and `text` is the items composed into one string. A `statement` gives its text, so a list of statements is a list of sentences.
 - A `policy` is a statement that states a rule. Define the rules an agent works under once, as the steps of a `list`, and read them wherever they are needed.
 - A `fact` is one value in the world, the first its walk gives. A `given` is a step that gives the value written in `value`. `(fare:fact)` with a weighted fork of `given` steps is a fare that differs from trace to trace, read as `fare.value`.
@@ -29,6 +31,8 @@ The walks the provider ships:
 A `relation` node joins the walks it has `incidence` edges to, written `(holds:relation); (holds)-[:incidence]-(traveler); (holds)-[:incidence]-(booking);`. Each entity in it reads the others through `related`, an object with one key for each relation the entity is part of, holding what the other walks give: `traveler.related.holds` is a list with the booking's attributes. Name relations of one entity apart. A relation with a direction is read from the other side: with `{role: "input"}` on the traveler's edge and `{role: "output"}` on the booking's, the traveler reads the outputs and the booking reads the inputs.
 
 A `setting` gathers walks under one name. It is a network, so the walks go in `nodes`: `(trip:setting {nodes: [|(traveler), (booking)|], edges: [||]})`. `trip.members` holds what each of them gives, by name, which is a way to hand a step the whole situation at once.
+
+A walk reads another walk by name, wherever a value is written: in a property, as `(customer:persona {style: tone.value})`, in a guard, as `when: plan.attributes.interval == "annual"`, and in what a step gives, as `(:given {value: {amount: plan.attributes.price}})`. This is how one part of a world depends on another.
 
 An agent reads a world by name: `policies.text`, `ask.text`, or the field of a step, such as `fee.clause`. A step's own fields say what the step is, whether or not a walk visits it, so read the walk to know what was built. No edge joins the two.
 
@@ -43,13 +47,104 @@ A `series` is several traces in a row that belong together, such as the turns of
 - `id` is an identifier that is the same for every trace of one series and different for the next. Put it wherever the traces should carry it, such as `metadata: {conversation_id: chat.id}`.
 - `number` tells the series of a run apart and `turn` counts the traces within one from zero. `length` is how many turns this series has, and `first` and `last` say whether a trace opens or closes it. Use them to make turns differ, such as a guard on `chat.last` for the step that closes a series.
 - A walk drawn `per: chat.number` is the same for every trace of the series, so the people in it keep their wording and the rules stay the rules.
+- What a persona says over a series is one list, so a turn reads its own message as `customer.said[chat.turn]` and the messages before it as `customer.said[0:chat.turn]`.
 
 With `up_to`, a trace finds its place by counting series from the start of its block of 256 traces, so the last series of each block ends with the block and may be shorter than `turns`. Its `length` is the turns it has.
 
-To end series somewhere else, declare a kind that extends `series` and states `number`, `turn` and `length` again from `context.trace_index`. A generated agent is one trace. Given `seed` and `trace` it is that trace of the run, so it can be any turn of any series, and without `trace` it is the first. A draw depends only on the seed, the trace and the fork, so the same seed gives the same world in generated data and in a generated agent. Data generation takes `--seed`. A generated agent that reads a walk takes an optional `seed` and `trace` in `run`, `run_details` and `run_traced`. With the seed of a data run it builds the world of that run's first trace, and with `trace` as well the world of that trace, counted from zero. In TypeScript a seed too large for a number is given as a bigint. Other random values, such as `choice` or `express`, are not shared this way.
+To end series somewhere else, declare a kind that extends `series` and states `number`, `turn` and `length` again from `context.trace_index`. A generated agent is one trace. Given `seed` and `trace` it is that trace of the run, so it can be any turn of any series, and without `trace` it is the first. A draw depends only on the seed, the trace and the fork, so the same seed gives the same world in generated data and in a generated agent. Data generation takes `--seed`. A generated agent that reads a walk takes an optional `seed` and `trace` in `run`, `run_details` and `run_traced`. With the seed of a data run it builds the world of that run's first trace, and with `trace` as well the world of that trace, counted from zero. In Python they are keywords, as `run_details(seed=7, trace=3)`. In TypeScript they follow the input and the random source in order, as `runDetails(undefined, Math.random, 7, 3)`, where `undefined` takes the authored input, and a seed too large for a number is given as a bigint.
+
+Only forks and `context.draws` are drawn this way. A function that samples, such as `hex`, `choice` or `express`, is drawn again for every trace when it is written inside a walk, even a walk drawn `per` a series, and a generated agent draws its own. For a value that stays the same across a series, write a fork of `given` steps or compute it from `context.draws` in a kind of your own.
 
 Use a world graph for what is true of the setting whatever the agent does: rules, facts, and what the people the agent talks to say. Keep what the agent itself does and says on its path. The provider decides what its kinds compute, and an extension changes it. Declare a kind that extends `sentence`, `list`, `part` or `policy` and state the field or the default again, such as `+(shout:node) {text: {value: upper(realize(self.clause))}}` with `-[:extends]->(sentence)` on the next line. A kind or an instance that states an object field again, such as `defaults`, writes only the keys it changes.
 
-To build something of your own, declare a kind that extends `walk` and computes its fields from `context.steps`. A step is a node of any kind that computes `gives`, and a step whose `gives` is null adds nothing. `merge` adds up steps that give objects. Every walk reads `context.draws`, a list of numbers from zero up to one that are the same in data and in an agent given the seed. Hand them to `vary`, or index into them, when a kind of your own samples. A key a walk's kind requires that nothing leads to it with is null, so a kind asks whether it is there with `context.key == null`. Comparing with null works for a value of any shape.
+To build something of your own, declare a kind that extends `walk` and computes its fields from `context.steps`. A step is a node of any kind that computes `gives`, and a step whose `gives` is null adds nothing. `merge` adds up steps that give objects. Every walk reads `context.draws`, a list of 32 numbers from zero up to one that are the same in data and in an agent given the seed. Hand them to `vary`, or index into them, when a kind of your own samples. A key a walk's kind requires that nothing leads to it with is null, so a kind asks whether it is there with `context.key == null`. Comparing with null works for a value of any shape.
+
+### A complete world
+
+One shape with each piece in place: a series, a fact, two entities that belong together, rules of which one varies, a persona whose way of writing is drawn once for the series, and an agent that reads them all. Steal the structure and replace the content.
+
+```bts
+# a thread is one to four traces, one for each message a customer sends
+(thread:series {turns: 1, up_to: 4});
+
+# how the customer writes, the same for the whole thread
+(tone:fact {per: thread.number})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:given {value: "professional"}),
+        -[:next {weight: 2}]->(:given {value: "text_message"}),
+    ];
+
+(plan:entity {per: thread.number})
+    =[:weighted]=>[
+        -[:next {weight: 3}]->(:given {value: {name: "Team", interval: "monthly", price: 49}}),
+        -[:next {weight: 1}]->(:given {value: {name: "Team", interval: "annual", price: 490}}),
+    ];
+
+# the invoice reads the plan it bills
+(invoice:entity {per: thread.number})
+    -[:next]->(:given {value: {amount: plan.attributes.price}})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:given {value: {id: "INV-20418", issued: "2026-10-02"}}),
+        -[:next {weight: 1}]->(:given {value: {id: "INV-20733", issued: "2026-10-17"}}),
+    ];
+
+(billed:relation);
+(billed)-[:incidence]-(plan);
+(billed)-[:incidence]-(invoice);
+
+# two rules are fixed and the refund window follows the plan
+(policies:list {per: thread.number})
+    -[:next]->(:policy {subject: "agents", number: "plural", modal: "must", verb: "check", complement: "the invoice first"})
+    -[:next]->(refund:sentence)
+        -[:next]->(:part {subject: "customers", number: "plural", modal: "can", verb: "request"})
+        =[:exclusive]=>[
+            -[:next {when: plan.attributes.interval == "annual"}]->(:part {complement: "a refund within 30 days"}),
+            -[:next {when: plan.attributes.interval == "monthly"}]->(:part {complement: "a refund within 14 days"}),
+        ]
+    -[:next]->(:policy {subject: "refunds", number: "plural", verb: "return", complement: "to the original card"});
+
+# what the customer says, one sentence for each turn of the thread
+(customer:persona {style: tone.value, per: thread.number})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "you", person: "second", verb: "charge", tense: "past"})
+        =[:weighted]=>[
+            -[:next {weight: 1}]->(:part {complement: "me twice this month"}),
+            -[:next {weight: 1}]->(:part {complement: "me after I canceled"}),
+        ]
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "the invoice number", verb: "be", complement: invoice.attributes.id})
+    -[:next]->(:sentence) {defaults: {form: "question", modal: "can"}}
+        -[:next]->(:part {subject: "you", person: "second", verb: "refund", complement: "the charge"})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "that", verb: "work", complement: "for me"});
+
+(support:agent) {
+    input: {message: customer.said[thread.turn], earlier: customer.said[0:thread.turn]},
+    output: handle.output,
+};
+(support)-[:next]->(handle:task {name: "handle_message"}) {
+    input: support.input,
+    output: reply.output.content,
+    metadata: {thread_id: thread.id, turn: thread.turn},
+}
+    -[:calls]->(lookup:tool {name: "lookup_invoice"}) {
+        input: {message: handle.input.message},
+        output: {invoice: invoice.attributes, plan: invoice.related.billed[0]},
+    }
+        -[:next]->(reply:llm {name: "chat_completion"}) {
+            input: [|
+                {role: "system", content: policies.text},
+                {role: "user", content: handle.input.message},
+            |],
+            output: {
+                role: "assistant",
+                content: compose([|
+                    format("Invoice {} is for the {} plan.", lookup.output.invoice.id, lookup.output.plan.name),
+                    refund.text,
+                    thread.last ? "Is there anything else?" : null,
+                |]),
+            },
+        };
+```
 
 "#;
