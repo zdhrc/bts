@@ -76,7 +76,7 @@ pub struct Supply {
     /// The node that reads the key.
     pub node: NodeId,
     /// The key, read as `context.key`.
-    pub key: &'static str,
+    pub key: String,
     /// What the key holds.
     pub value: Value,
 }

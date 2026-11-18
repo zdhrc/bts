@@ -3009,16 +3009,35 @@ impl<'a> AgentLowering<'a> {
                 operand: Box::new(self.value(operand)?),
                 range: *range,
             },
-            G::Binary { op, lhs, rhs, range } => V::Binary {
-                op: *op,
-                lhs: Box::new(self.value(lhs)?),
-                rhs: Box::new(self.value(rhs)?),
-                range: *range,
-            },
-            G::Cond { cond, then, otherwise } => V::Cond {
-                cond: Box::new(self.value(cond)?),
-                then: Box::new(self.value(then)?),
-                otherwise: Box::new(self.value(otherwise)?),
+            G::Binary { op, lhs, rhs, range } => {
+                let (lhs, rhs) = (self.value(lhs)?, self.value(rhs)?);
+                // whether something written out is null is plain before anything runs
+                let written = |value: &V| match value {
+                    V::Null => Some(true),
+                    V::Object(_) | V::Array(_) | V::Str(_) | V::Num(_) | V::Bool(_) => Some(false),
+                    _ => None,
+                };
+                let null = |value: &V| matches!(value, V::Null);
+                match (op, written(&lhs), written(&rhs)) {
+                    (execution::BinOp::Eq, Some(left), Some(right)) if null(&lhs) || null(&rhs) => V::Bool(left == right),
+                    (execution::BinOp::Ne, Some(left), Some(right)) if null(&lhs) || null(&rhs) => V::Bool(left != right),
+                    _ => V::Binary {
+                        op: *op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                        range: *range,
+                    },
+                }
+            }
+            G::Cond { cond, then, otherwise } => match self.value(cond)? {
+                // a condition that is already decided leaves only the branch it takes
+                V::Bool(true) => self.value(then)?,
+                V::Bool(false) => self.value(otherwise)?,
+                cond => V::Cond {
+                    cond: Box::new(cond),
+                    then: Box::new(self.value(then)?),
+                    otherwise: Box::new(self.value(otherwise)?),
+                },
             },
             G::Index { target, index, range } => V::Index {
                 target: Box::new(self.value(target)?),

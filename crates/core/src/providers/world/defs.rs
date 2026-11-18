@@ -50,15 +50,13 @@ pub const SOURCE: Source<'static> = Source {
 # the provider visits what leaves each node in the order written, and takes one branch at each fork
 # steps is what each visited step gives, in order
 # per says what the walk is drawn for: traces that give the same value see the same walk, and left out it is the trace
-# speaker is who says the walk and spoken says whether a speaker leads to it, and related is what relations join it to
+# draws are numbers a kind may sample by, the same in data and in an agent given the seed, and related is what relations join it to
 # a walk that is a step of another gives that walk what its own gives says
 +(walk:node {per: {type: "any", default: null}})
     -[:requires {
         steps: {type: "array"},
         trace_index: {type: "number"},
-        speaker: {type: "any"},
-        spoken: {type: "boolean"},
-        styled: {type: "any"},
+        draws: {type: "array"},
         related: {type: "object"},
     }]->(context);
 
@@ -103,13 +101,13 @@ pub const SOURCE: Source<'static> = Source {
     -[:extends]->(walk)
     -[:has]->(speaker);
 
-# a conversation is several traces in a row that belong together, and it stands beside an agent
-# turns is how many traces one conversation has, and with up_to each conversation runs for turns to up_to of them
+# a series is several traces in a row that belong together, such as the turns of a conversation, and it stands beside an agent
+# turns is how many traces one series has, and with up_to each series runs for turns to up_to of them
 # weights says how likely each of those lengths is, the first for turns and the last for up_to
-# number counts the conversations of a run, turn the traces within one, and length is how many turns this one has
+# number counts the series of a run, turn the traces within one, and length is how many turns this one has
 # place is where the trace sits, worked out once, and the three read it
-# id is the same for every trace of one conversation, and a walk drawn per number is too
-+(conversation:node {
+# id is the same for every trace of one series, and a walk drawn per number is too
++(series:node {
     turns: {type: "number", default: 1},
     up_to: {type: "any", default: null},
     weights: {type: "any", default: null},
@@ -165,10 +163,11 @@ pub const SOURCE: Source<'static> = Source {
     }}},
     # plain is the sentence as its grammar reads, and text is that or the way of the speaker that leads to it
     plain: {type: "string", value: realize(self.clause)},
-    text: {type: "string", value: context.spoken ? context.styled : self.plain},
+    text: {type: "string", value: context.speaker == null ? self.plain : vary(self.plain, context.speaker.wording, context.draws)},
     gives: {type: "string", value: self.text},
 }
-    -[:extends]->(walk);
+    -[:extends]->(walk)
+    -[:requires {speaker: {type: "any"}}]->(context);
 
 # a list is a walk with one item for each step
 +(list:node) {

@@ -36,15 +36,9 @@ pub const STEPS: &str = "steps";
 pub const GIVES: &str = "gives";
 /// The property that says what a walk is drawn for, in place of the trace.
 pub const PER: &str = "per";
-/// The context key a walk reads who says it through.
-pub const SPEAKER: &str = "speaker";
-/// The context key that says whether a speaker leads to a walk.
-pub const SPOKEN: &str = "spoken";
-/// The context key a sentence reads its styled text through, when a speaker leads to it.
-pub const STYLED: &str = "styled";
-/// The internal function that says a sentence a speaker's way.
-pub const SAY: &str = "world.say";
-/// The internal function that gives the draws a styled sentence is said by.
+/// The context key a walk reads its draws through.
+pub const DRAWS_KEY: &str = "draws";
+/// The internal function that gives a walk its draws.
 pub const DRAWS: &str = "world.draws";
 /// The context key a network reads what its walks give through.
 pub const MEMBERS: &str = "members";
@@ -53,21 +47,21 @@ pub const RELATED: &str = "related";
 /// The internal function a weighted fork lowers to. No author can write the name.
 pub const PICK: &str = "world.pick";
 /// The kind of several traces in a row that belong together.
-pub const CONVERSATION: &str = "conversation";
-/// The context key a conversation reads its identifier through.
+pub const SERIES: &str = "series";
+/// The context key a series reads its identifier through.
 pub const IDENTITY: &str = "identity";
-/// The internal function a conversation's identifier lowers to.
+/// The internal function a series' identifier lowers to.
 pub const ID: &str = "world.id";
-/// The context key a conversation reads its place in the run through.
+/// The context key a series reads its place in the run through.
 pub const PLACE: &str = "place";
-/// The internal function a conversation's place lowers to.
+/// The internal function a series' place lowers to.
 pub const TURN: &str = "world.turn";
-/// How many traces a conversation of varying length counts back through to find its place.
+/// How many traces a series of varying length counts back through to find its place.
 ///
-/// The last conversation of each block ends where the block does.
+/// The last series of each block ends where the block does.
 pub const BLOCK: u64 = 256;
 
-// what a conversation's place holds, so reads into it are typed
+// what a series' place holds, so reads into it are typed
 const PLACE_SHAPE: bts_lang::ResultShape = bts_lang::ResultShape::Object(&[
     ("number", bts_lang::ResultShape::Scalar(FieldType::Number)),
     ("turn", bts_lang::ResultShape::Scalar(FieldType::Number)),
@@ -87,9 +81,9 @@ fn roots(model: &Model) -> impl Iterator<Item = NodeId> + '_ {
         .map(|(index, _)| NodeId(index))
 }
 
-fn conversations(model: &Model) -> impl Iterator<Item = NodeId> + '_ {
+fn each_series(model: &Model) -> impl Iterator<Item = NodeId> + '_ {
     (model.nodes.iter().enumerate())
-        .filter(|(_, node)| model.derives(&node.kind, CONVERSATION))
+        .filter(|(_, node)| model.derives(&node.kind, SERIES))
         .map(|(index, _)| NodeId(index))
 }
 
@@ -109,17 +103,16 @@ fn leaving(model: &Model, node: NodeId) -> Vec<Leaving> {
     found.into_iter().map(|(_, leaving)| leaving).collect()
 }
 
-/// The elements the world provider checks against its schema: what it walks, without the steps.
+/// The elements the world provider checks against its schema: what it walks, without the walks and their steps.
 ///
 /// A step is any node that gives something, whatever its kind, and [`supply`] reports one that gives nothing.
+/// A walk is a walk by its kind, and a key its kind requires that nothing leads to it with is null.
 pub fn checked(model: &Model) -> Vec<ElementId> {
     (elements(model).into_iter())
         .filter(|element| match element {
             ElementId::Node(node) => {
                 let kind = &model.nodes[node.0].kind;
-                model.derives(kind, WALK)
-                    || model.derives(kind, CONVERSATION)
-                    || matches!(model.nodes[node.0].primitive, Primitive::Relation | Primitive::Network)
+                model.derives(kind, SERIES) || matches!(model.nodes[node.0].primitive, Primitive::Relation | Primitive::Network)
             }
             _ => true,
         })
@@ -131,7 +124,7 @@ pub fn checked(model: &Model) -> Vec<ElementId> {
 /// A junction that joins any of them is included, so it is reported as unsupported.
 pub fn elements(model: &Model) -> Vec<ElementId> {
     let mut nodes = BTreeSet::new();
-    let mut pending: Vec<NodeId> = roots(model).chain(conversations(model)).collect();
+    let mut pending: Vec<NodeId> = roots(model).chain(each_series(model)).collect();
     let mut elements = BTreeSet::new();
     while let Some(node) = pending.pop() {
         if !nodes.insert(node) {
@@ -515,21 +508,19 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
     }) {
         return Err(fail(junction.range, "a walk takes one path, so nothing in it is joined"));
     }
-    // a conversation has no steps, and its identifier is drawn for its number
-    for conversation in conversations(model) {
-        let node = &model.nodes[conversation.0];
-        if let Some(edge) = model.edges.iter().find(|edge| edge.source == conversation) {
-            return Err(fail(edge.range, "a conversation has no steps, so nothing leaves it"));
+    // a series has no steps, and its identifier is drawn for its number
+    for series in each_series(model) {
+        let node = &model.nodes[series.0];
+        if let Some(edge) = model.edges.iter().find(|edge| edge.source == series) {
+            return Err(fail(edge.range, "a series has no steps, so nothing leaves it"));
         }
-        if let Some(fork) = model.forks.iter().find(|fork| fork.source == conversation) {
-            return Err(fail(fork.range, "a conversation has no steps, so nothing leaves it"));
+        if let Some(fork) = model.forks.iter().find(|fork| fork.source == series) {
+            return Err(fail(fork.range, "a series has no steps, so nothing leaves it"));
         }
         let number = (model.bindings.iter())
-            .position(|binding| {
-                binding.owner == ElementId::Node(conversation) && !binding.property && binding.path == ["number"]
-            })
-            .ok_or_else(|| fail(node.range, "a conversation needs a `number` field"))?;
-        let name = node.name.clone().unwrap_or_else(|| format!("conversation{}", conversation.0));
+            .position(|binding| binding.owner == ElementId::Node(series) && !binding.property && binding.path == ["number"])
+            .ok_or_else(|| fail(node.range, "a series needs a `number` field"))?;
+        let name = node.name.clone().unwrap_or_else(|| format!("series{}", series.0));
         // where a trace sits is worked out from its index, the fewest turns and the most
         let prop = |key: &str| {
             (node.props.iter())
@@ -538,15 +529,15 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
                 .map(|binding| binding.value.clone())
         };
         supplied.context.push(Supply {
-            node: conversation,
-            key: PLACE,
+            node: series,
+            key: PLACE.to_owned(),
             value: Graph::Func {
                 func: Func::Call {
                     function: TURN.to_owned(),
                     args: vec![
                         Graph::Str(name.clone()),
                         Graph::Context {
-                            owner: ElementId::Node(conversation),
+                            owner: ElementId::Node(series),
                             path: vec!["trace_index".to_owned()],
                         },
                         prop("turns").unwrap_or(Graph::Num(bts_lang::Number::Int(1))),
@@ -560,8 +551,8 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
             },
         });
         supplied.context.push(Supply {
-            node: conversation,
-            key: IDENTITY,
+            node: series,
+            key: IDENTITY.to_owned(),
             value: Graph::Func {
                 func: Func::Call {
                     function: ID.to_owned(),
@@ -595,67 +586,49 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
         let steps = walker.leads(root)?;
         supplied.context.push(Supply {
             node: root,
-            key: STEPS,
+            key: STEPS.to_owned(),
             value: Graph::Array(Array { elem: steps }),
         });
-        // a walk no speaker leads to is said plainly
-        let spoken = (model.context.get(root.0).into_iter().flatten())
-            .filter(|supply| supply.key == SPEAKER)
-            .flat_map(|supply| &supply.suppliers)
-            .any(|supplier| (model.context_values.iter()).any(|value| value.key == SPEAKER && value.owner == *supplier));
-        if !spoken {
-            supplied.context.push(Supply {
-                node: root,
-                key: SPEAKER,
-                value: Graph::Null,
-            });
-        }
         supplied.context.push(Supply {
             node: root,
-            key: SPOKEN,
-            value: Graph::Bool(spoken),
-        });
-        supplied.context.push(Supply {
-            node: root,
-            key: RELATED,
+            key: RELATED.to_owned(),
             value: related(model, root)?,
         });
-        // a sentence a speaker leads to is said that speaker's way, by draws addressed like a fork's
-        let plain = (model.bindings.iter())
-            .position(|binding| binding.owner == ElementId::Node(root) && !binding.property && binding.path == ["plain"]);
-        let styled = match plain {
-            Some(plain) if spoken => {
-                let mut address = vec![Graph::Str(name.clone())];
-                address.extend(walker.per.clone());
-                let call = |function: &str, args, returns| Graph::Func {
-                    func: Func::Call {
-                        function: function.to_owned(),
-                        args,
-                        returns,
-                        shape: None,
-                    },
-                    range: node.range,
-                };
-                call(
-                    SAY,
-                    vec![
-                        Graph::BindingRef(BindingId(plain), node.range),
-                        Graph::Context {
-                            owner: ElementId::Node(root),
-                            path: vec![SPEAKER.to_owned(), "wording".to_owned()],
-                        },
-                        call(DRAWS, address, FieldType::Array),
-                    ],
-                    FieldType::String,
-                )
-            }
-            _ => Graph::Null,
-        };
+        // the numbers a walk's kind may sample by, addressed like a fork's draws
+        let mut address = vec![Graph::Str(name.clone())];
+        address.extend(walker.per.clone());
         supplied.context.push(Supply {
             node: root,
-            key: STYLED,
-            value: styled,
+            key: DRAWS_KEY.to_owned(),
+            value: Graph::Func {
+                func: Func::Call {
+                    function: DRAWS.to_owned(),
+                    args: address,
+                    returns: FieldType::Array,
+                    shape: None,
+                },
+                range: node.range,
+            },
         });
+        // a key the walk's kind requires and nothing leads to it with is null, so a kind can ask whether it is there
+        let required = (model.kind_names.get(&node.kind).into_iter())
+            .flat_map(|kind| &model.kinds[kind.0].requires)
+            .map(|key| key.name.as_str());
+        for key in required {
+            let known = [STEPS, RELATED, DRAWS_KEY, "trace_index", "history"].contains(&key)
+                || supplied.context.iter().any(|supply| supply.node == root && supply.key == key);
+            let led = (model.context.get(root.0).into_iter().flatten())
+                .filter(|supply| supply.key == key)
+                .flat_map(|supply| &supply.suppliers)
+                .any(|supplier| (model.context_values.iter()).any(|value| value.key == key && value.owner == *supplier));
+            if !known && !led {
+                supplied.context.push(Supply {
+                    node: root,
+                    key: key.to_owned(),
+                    value: Graph::Null,
+                });
+            }
+        }
         within.insert(root, walker.inner);
     }
     // a walk is built before the walk it is a step of, so none is a step of itself
@@ -695,7 +668,7 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
         }
         supplied.context.push(Supply {
             node: network.node,
-            key: MEMBERS,
+            key: MEMBERS.to_owned(),
             value: Graph::Object(Object { elem }),
         });
     }
@@ -803,7 +776,7 @@ pub(super) fn pick(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Va
     })
 }
 
-/// Evaluates a conversation's identifier: sixteen hex digits drawn for its number.
+/// Evaluates a series' identifier: sixteen hex digits drawn for its number.
 pub(super) fn id(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
     let [Value::String(label), per] = args else {
         return Err(EvaluateError::Shape);
@@ -814,11 +787,11 @@ pub(super) fn id(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Valu
     Ok(Value::String(format!("{:08x}{:08x}", half("a"), half("b"))))
 }
 
-/// Where a trace sits among conversations: the conversation's number, the turn within it and its length.
+/// Where a trace sits among series: the series' number, the turn within it and its length.
 ///
-/// With one length every conversation has `turns` traces. With `up_to`, each draws a
+/// With one length every series has `turns` traces. With `up_to`, each draws a
 /// length from `turns` to `up_to`, and a trace counts from the start of its block of
-/// [`BLOCK`] traces. The last conversation of a block ends with the block, and its
+/// [`BLOCK`] traces. The last series of a block ends with the block, and its
 /// length is the turns it has. The lengths are equally likely unless each is given a
 /// weight, the first for `turns` and the last for `up_to`, at least one of them positive.
 pub fn place(seed: u64, label: &str, index: u64, turns: u64, up_to: Option<u64>, weights: Option<&[f64]>) -> (u64, u64, u64) {
@@ -858,11 +831,10 @@ fn turns_of(value: &Value) -> Result<u64, EvaluateError> {
     }
 }
 
-const TURNS_SHAPE: &str = "a conversation has a whole number of turns from 1 to 256";
-const WEIGHTS_SHAPE: &str =
-    "a conversation takes one weight for each length from turns to up_to, none negative and one positive";
+const TURNS_SHAPE: &str = "a series has a whole number of turns from 1 to 256";
+const WEIGHTS_SHAPE: &str = "a series takes one weight for each length from turns to up_to, none negative and one positive";
 
-/// Evaluates a conversation's place for one trace.
+/// Evaluates a series' place for one trace.
 pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
     let [Value::String(label), Value::Number(index), turns, up_to, weights] = args else {
         return Err(EvaluateError::Shape);
@@ -874,7 +846,7 @@ pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Va
         up_to => Some(turns_of(up_to)?),
     };
     if up_to.is_some_and(|up_to| up_to < turns) {
-        return Err(invalid("a conversation runs up to at least as many turns as it starts with"));
+        return Err(invalid("a series runs up to at least as many turns as it starts with"));
     }
     let weights = match (weights, up_to) {
         (Value::Null, _) => None,
@@ -901,10 +873,10 @@ pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Va
     ])))
 }
 
-/// How many draws a styled sentence is given. Styling takes far fewer.
+/// How many draws a walk is given. Styling a sentence takes far fewer.
 pub const DRAWN: usize = 32;
 
-/// The numbers a sentence is styled by: [`DRAWN`] draws of 53 bits each, addressed like a fork's.
+/// The numbers a walk's kind may sample by: [`DRAWN`] draws of 53 bits each, addressed like a fork's.
 pub fn draws(seed: u64, per: &str, label: &str) -> Vec<f64> {
     (0..DRAWN)
         .map(|at| {
@@ -914,7 +886,7 @@ pub fn draws(seed: u64, per: &str, label: &str) -> Vec<f64> {
         .collect()
 }
 
-/// Evaluates the draws a styled sentence is said by.
+/// Evaluates the draws a walk is given.
 pub(super) fn drawn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
     let (seed, trace_index) = evaluation.address();
     let (label, per) = match args {
@@ -1023,18 +995,18 @@ def _world_pick(label, weights, options, *rest):
 def _world_turns(value):
     value = _value(value)
     if type(value) is float and value.is_integer(): value = int(value)
-    if type(value) is not int or not 1 <= value <= 256: raise ValueError("a conversation has a whole number of turns from 1 to 256")
+    if type(value) is not int or not 1 <= value <= 256: raise ValueError("a series has a whole number of turns from 1 to 256")
     return value
 
 
 def _world_turn(label, index, turns, up_to, weights, random_source):
     index, turns, weights = int(_value(index)), _world_turns(turns), _value(weights)
-    shape = "a conversation takes one weight for each length from turns to up_to, none negative and one positive"
+    shape = "a series takes one weight for each length from turns to up_to, none negative and one positive"
     if _value(up_to) is None:
         if weights is not None: raise ValueError(shape)
         return {"number": index // turns, "turn": index % turns, "length": turns}
     up_to = _world_turns(up_to)
-    if up_to < turns: raise ValueError("a conversation runs up to at least as many turns as it starts with")
+    if up_to < turns: raise ValueError("a series runs up to at least as many turns as it starts with")
     if weights is not None:
         if not isinstance(weights, list) or len(weights) != up_to - turns + 1: raise ValueError(shape)
         if any(type(weight) not in (int, float) or not _math.isfinite(weight) or weight < 0 for weight in weights) or not any(weights): raise ValueError(shape)
@@ -1113,20 +1085,20 @@ function _world_pick(label: string, weights: unknown, options: unknown, ...rest:
 }
 function _world_turns(value: unknown): number {
     value = _serialize(value);
-    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 256) throw new RangeError("a conversation has a whole number of turns from 1 to 256");
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 256) throw new RangeError("a series has a whole number of turns from 1 to 256");
     return value;
 }
 function _world_turn(label: string, index: unknown, turnsValue: unknown, upToValue: unknown, weightsValue: unknown, randomSource: () => number): { number: number; turn: number; length: number } {
     const at = Number(_serialize(index));
     const turns = _world_turns(turnsValue);
     const weights = _serialize(weightsValue) ?? null;
-    const shape = "a conversation takes one weight for each length from turns to up_to, none negative and one positive";
+    const shape = "a series takes one weight for each length from turns to up_to, none negative and one positive";
     if (_serialize(upToValue) === null || _serialize(upToValue) === undefined) {
         if (weights !== null) throw new RangeError(shape);
         return { number: Math.floor(at / turns), turn: at % turns, length: turns };
     }
     const upTo = _world_turns(upToValue);
-    if (upTo < turns) throw new RangeError("a conversation runs up to at least as many turns as it starts with");
+    if (upTo < turns) throw new RangeError("a series runs up to at least as many turns as it starts with");
     if (weights !== null) {
         if (!Array.isArray(weights) || weights.length !== upTo - turns + 1) throw new RangeError(shape);
         if (weights.some(weight => typeof weight !== "number" || !Number.isFinite(weight) || weight < 0) || !weights.some(weight => weight > 0)) throw new RangeError(shape);
@@ -1198,21 +1170,21 @@ mod tests {
     }
 
     #[test]
-    fn a_trace_finds_its_place_among_conversations() {
+    fn a_trace_finds_its_place_among_series() {
         // with one length the place is arithmetic
         assert_eq!(place(7, "chat", 7, 3, None, None), (2, 1, 3));
-        // with a range every trace of a block belongs to one conversation, in order, with no gaps
+        // with a range every trace of a block belongs to one series, in order, with no gaps
         let mut lengths = BTreeSet::new();
         for block in 0..4 {
             let (mut expected, mut left) = (None, 0);
             for offset in 0..BLOCK {
                 let (number, turn, length) = place(7, "chat", block * BLOCK + offset, 2, Some(6), None);
                 if left == 0 {
-                    // a conversation opens where the one before it closed
+                    // a series opens where the one before it closed
                     assert_eq!(turn, 0);
                     assert_eq!(number, expected.map_or(block * BLOCK, |last: u64| last + 1));
                     assert!((1..=6).contains(&length));
-                    // only the conversation the block cuts short has fewer turns than the fewest
+                    // only the series the block cuts short has fewer turns than the fewest
                     assert!(length >= 2 || offset + length == BLOCK);
                     lengths.insert(length);
                     (expected, left) = (Some(number), length);
@@ -1241,7 +1213,7 @@ mod tests {
                 "{index} {turn} {length}"
             );
         }
-        // most conversations are short when the short lengths weigh the most
+        // most series are short when the short lengths weigh the most
         let opens = |weights: Option<&[f64]>, wanted: u64| {
             (0..4 * BLOCK)
                 .map(|index| place(7, "chat", index, 1, Some(4), weights))

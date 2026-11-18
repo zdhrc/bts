@@ -1,5 +1,5 @@
 # a session is two traces in a row that carry one identifier: the window that opens it, then a later one
-(session:conversation {turns: 2});
+(session:series {turns: 2});
 
 # a selected window carries its own question, answer and prior context
 (copilot:agent) {input: null, output: request.output};

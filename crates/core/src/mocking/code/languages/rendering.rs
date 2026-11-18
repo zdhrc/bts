@@ -578,11 +578,11 @@ def _boolean(value):
 
 
 def _equal(left, right):
-    scalar = lambda value: value is None or type(value) in (str, bool, int, float)
-    if not scalar(left) or not scalar(right):
-        raise TypeError("equality requires scalar values")
     if left is None or right is None:
         return left is right
+    scalar = lambda value: type(value) in (str, bool, int, float)
+    if not scalar(left) or not scalar(right):
+        raise TypeError("equality requires scalar values")
     numeric = lambda value: type(value) in (int, float)
     if type(left) is not type(right) and not (numeric(left) and numeric(right)):
         raise TypeError("equality requires compatible scalar types")
@@ -708,11 +708,11 @@ function _boolean(value: unknown): boolean {
 function _equal(left: unknown, right: unknown): boolean {
     if (left instanceof _Float) left = left.value;
     if (right instanceof _Float) right = right.value;
-    const scalar = (value: unknown) => value === null || ["string", "boolean", "number"].includes(typeof value);
+    if (left === null || right === null) return left === right;
+    const scalar = (value: unknown) => ["string", "boolean", "number"].includes(typeof value);
     if (!scalar(left) || !scalar(right)) {
         throw new TypeError("equality requires scalar values");
     }
-    if (left === null || right === null) return left === right;
     if (typeof left !== typeof right) {
         throw new TypeError("equality requires compatible scalar types");
     }

@@ -297,28 +297,18 @@ fn world_conforms_to_the_provider_contract() {
     // it walks its own graphs, so it lists the walk, what a walk follows and the keys a walk reads
     // a step is any node that gives something, so no step kind is listed
     let schema = world::Bundle.schema();
-    assert_eq!(schema.nodes, ["walk", "conversation", "relation", "network"]);
+    assert_eq!(schema.nodes, ["walk", "series", "relation", "network"]);
     assert_eq!(schema.edges, ["next", "incidence"]);
     assert_eq!(schema.forks, ["weighted", "exclusive", "repeat"]);
     assert!(schema.junctions.is_empty());
     assert_eq!(
         schema.context,
-        [
-            "steps",
-            "trace_index",
-            "place",
-            "identity",
-            "speaker",
-            "spoken",
-            "styled",
-            "related",
-            "members"
-        ]
+        ["steps", "trace_index", "place", "identity", "draws", "related", "members"]
     );
-    // the twelve English functions and merge are declared, and what a fork and a conversation lower to is internal
+    // the twelve English functions and merge are declared, and what a fork and a series lower to is internal
     assert_eq!(schema.functions.len(), 13);
-    assert_eq!(world::Bundle.functions().len(), 18);
-    let internal = ["world.pick", "world.turn", "world.id", "world.draws", "world.say"];
+    assert_eq!(world::Bundle.functions().len(), 17);
+    let internal = ["world.pick", "world.turn", "world.id", "world.draws"];
     assert_eq!(world::Bundle.internal(), internal);
     for function in world::Bundle.functions() {
         assert!(function.runs(Consumer::Data), "{}", function.name);
@@ -340,8 +330,8 @@ fn a_provider_joined_by_a_contributor_has_the_kinds_and_functions_of_both() {
     let sources: Vec<_> = schema.definitions.iter().map(|source| source.name).collect();
     assert_eq!(sources, ["braintrust.bt", "world.bt"]);
     assert_eq!(schema.functions.len(), 16);
-    assert_eq!(joined.functions().len(), 21);
-    assert_eq!(joined.internal().len(), 5);
+    assert_eq!(joined.functions().len(), 20);
+    assert_eq!(joined.internal().len(), 4);
     let parts: Vec<_> = joined.parts().iter().map(|part| part.schema.id).collect();
     assert_eq!(parts, ["braintrust", "world"]);
 

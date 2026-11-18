@@ -2333,6 +2333,15 @@ fn eval_binary(op: BinOp, lhs: ModelValue, rhs: ModelValue, range: SrcRange, ctx
 
     // equality tolerates null so absence guards read naturally
     if matches!(op, BinOp::Eq | BinOp::Ne) {
+        // a comparison with null asks whether a value is there, whatever the value is
+        let absent = match (&lhs, &rhs) {
+            (ModelValue::Null, _) => Some(eval_is_null(rhs.clone(), ctx)?),
+            (_, ModelValue::Null) => Some(eval_is_null(lhs.clone(), ctx)?),
+            _ => None,
+        };
+        if let Some(absent) = absent {
+            return Ok(Scalar::Bool(if op == BinOp::Eq { absent } else { !absent }));
+        }
         let lhs = eval_nullable(lhs, ctx)?;
         let rhs = eval_nullable(rhs, ctx)?;
         let equal = match (&lhs, &rhs) {
@@ -2382,6 +2391,38 @@ fn eval_binary(op: BinOp, lhs: ModelValue, rhs: ModelValue, range: SrcRange, ctx
 }
 
 // a scalar or an explicit absence, for equality's null probes
+// whether a value is null, for a value of any shape
+fn eval_is_null(value: ModelValue, ctx: &mut Ctx) -> Result<bool, Error> {
+    match value {
+        ModelValue::Null => Ok(true),
+        ModelValue::Object(_) | ModelValue::Array(_) => Ok(false),
+        ModelValue::BlockRef { ref_id, .. } => Ok(matches!(ctx.resolve_ref(ref_id)?, JsonValue::Null)),
+        ModelValue::VarRef(name) => {
+            let value = ctx.force_binding(&name)?;
+            eval_is_null(value, ctx)
+        }
+        ModelValue::Index { target, index, range } => {
+            let value = eval_index(*target, *index, range, ctx)?;
+            eval_is_null(value, ctx)
+        }
+        ModelValue::Cond {
+            cond, then, otherwise, ..
+        } => {
+            let taken = if eval_operand(*cond, ctx)?.into_bool(ctx)? {
+                then
+            } else {
+                otherwise
+            };
+            eval_is_null(*taken, ctx)
+        }
+        ModelValue::Func { func, range } => {
+            let value = eval_func(func, range, ctx)?;
+            eval_is_null(value, ctx)
+        }
+        value => eval_operand(value, ctx).map(|_| false),
+    }
+}
+
 fn eval_nullable(value: ModelValue, ctx: &mut Ctx) -> Result<Option<Scalar>, Error> {
     match value {
         ModelValue::Null => Ok(None),

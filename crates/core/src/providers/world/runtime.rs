@@ -385,14 +385,15 @@ def _english_time(value, options):
     return result
 
 def _language_english(operation, args, random):
-    arities = {"express": (1,2), "expression": (1,2), "expression_candidates": (1,2), "realize": (1, 2), "vary": (1, 2), "combine": (2, 3), "refer": (2, 3), "remember": (2, 3), "unmentioned": (2, 2), "format_number": (1, 2), "format_date": (1, 2), "format_time": (1, 2), "say": (3, 3)}
+    arities = {"express": (1,2), "expression": (1,2), "expression_candidates": (1,2), "realize": (1, 2), "vary": (1, 3), "combine": (2, 3), "refer": (2, 3), "remember": (2, 3), "unmentioned": (2, 2), "format_number": (1, 2), "format_date": (1, 2), "format_time": (1, 2)}
     if operation not in arities or type(args) is not list or not arities[operation][0] <= len(args) <= arities[operation][1]: raise ValueError("invalid English call")
     if operation in ["express","expression","expression_candidates"]: return _english_expression(operation, args[0], args[1] if len(args) > 1 else {}, random)
     if operation == "realize": return _english_render(_english_sentence(args[0]), _english_render_options(args[1] if len(args) > 1 else {}))
-    if operation == "vary": return _english_vary(args[0], args[1] if len(args) > 1 else {}, random)
-    if operation == "say":
-        draws = iter(_english_array(args[2]))
-        return _english_vary(args[0], args[1], lambda: next(draws, 0.5))
+    if operation == "vary":
+        if len(args) > 2:
+            draws = iter(_english_array(args[2]))
+            random = lambda: next(draws, 0.5)
+        return _english_vary(args[0], args[1] if len(args) > 1 else {}, random)
     if operation == "combine":
         sentences = [_english_sentence(value) for value in _english_array(args[0])]
         relation = _english_enum(args[1], ["and", "but", "or", "because"])
@@ -1302,15 +1303,17 @@ function _englishTime(value: any, options: any): string {
     return result;
 }
 function _language_english(operation: string, args: any[], random: () => number): any {
-    const arities: any = {express:[1,2], expression:[1,2], expression_candidates:[1,2], realize: [1, 2], vary: [1, 2], combine: [2, 3], refer: [2, 3], remember: [2, 3], unmentioned: [2, 2], format_number: [1, 2], format_date: [1, 2], format_time: [1, 2], say: [3, 3]};
+    const arities: any = {express:[1,2], expression:[1,2], expression_candidates:[1,2], realize: [1, 2], vary: [1, 3], combine: [2, 3], refer: [2, 3], remember: [2, 3], unmentioned: [2, 2], format_number: [1, 2], format_date: [1, 2], format_time: [1, 2]};
     if (!Object.hasOwn(arities, operation) || !Array.isArray(args) || args.length < arities[operation][0] || args.length > arities[operation][1]) throw new Error("invalid English call");
     if (["express","expression","expression_candidates"].includes(operation)) return _englishExpression(operation,args[0],args.length > 1 ? args[1] : {},random);
     if (operation === "realize") return _englishRender(_englishSentence(args[0]), _englishRenderOptions(args.length > 1 ? args[1] : {}));
-    if (operation === "vary") return _englishVary(args[0], args.length > 1 ? args[1] : {}, random);
-    if (operation === "say") {
-        const draws = _englishArray(args[2]);
-        let at = 0;
-        return _englishVary(args[0], args[1], () => at < draws.length ? draws[at++] : 0.5);
+    if (operation === "vary") {
+        if (args.length > 2) {
+            const draws = _englishArray(args[2]);
+            let at = 0;
+            random = () => at < draws.length ? draws[at++] : 0.5;
+        }
+        return _englishVary(args[0], args.length > 1 ? args[1] : {}, random);
     }
     if (operation === "combine") {
         const sentences = _englishArray(args[0]).map(value => _englishSentence(value)), relation = _englishEnum(args[1], ["and", "but", "or", "because"]), options = _englishRenderOptions(args.length > 2 ? args[2] : {});

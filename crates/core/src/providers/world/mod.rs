@@ -29,25 +29,23 @@ pub const SCHEMA: bts_lang::ProviderSchema<'static> = bts_lang::ProviderSchema {
     id: "world",
     name: "World",
     definitions: &[defs::SOURCE],
-    // a step of a walk is any node that gives something, so only the walk is listed beside the conversation
+    // a step of a walk is any node that gives something, so only the walk is listed beside the series
     // a relation says which walks belong together
     // a network gathers walks under one name
-    nodes: &["walk", "conversation", "relation", "network"],
+    nodes: &["walk", "series", "relation", "network"],
     edges: &["next", "incidence"],
     // a walk takes one branch at a fork, or every branch of a repeat fork once for each round
     forks: &["weighted", "exclusive", "repeat"],
     junctions: &[],
     // a walk reads its steps, and may be drawn for something computed from the trace index
-    // a conversation reads its place in the run and its identifier
-    // a walk reads who says it and what it is related to
+    // a series reads its place in the run and its identifier
+    // a walk reads its draws and what it is related to
     context: &[
         walk::STEPS,
         "trace_index",
         walk::PLACE,
         walk::IDENTITY,
-        walk::SPEAKER,
-        walk::SPOKEN,
-        walk::STYLED,
+        walk::DRAWS_KEY,
         walk::RELATED,
         walk::MEMBERS,
     ],
@@ -64,7 +62,7 @@ impl super::Contributor for Bundle {
     }
 
     fn internal(&self) -> &'static [&'static str] {
-        &[walk::PICK, walk::TURN, walk::ID, walk::DRAWS, walk::SAY]
+        &[walk::PICK, walk::TURN, walk::ID, walk::DRAWS]
     }
 
     fn elements(&self, model: &bts_lang::Model) -> Vec<bts_lang::ElementId> {

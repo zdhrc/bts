@@ -77,9 +77,9 @@ fn the_world_provider_walks_its_own_elements_and_conforms() {
     assert_eq!(SELECTED.elements(&model).len(), walked.len() + agent.len());
     // it supplies the steps of the walk
     let supplied = world::Bundle.supply(&model).unwrap();
-    let keys: Vec<_> = supplied.context.iter().map(|supply| supply.key).collect();
-    // with its steps a walk is told that no speaker leads to it and that no relation joins it
-    assert_eq!(keys, ["steps", "speaker", "spoken", "related", "styled"]);
+    let keys: Vec<_> = supplied.context.iter().map(|supply| supply.key.as_str()).collect();
+    // with its steps a walk is given what it is related to and its draws, and null for the speaker nothing leads to it with
+    assert_eq!(keys, ["steps", "related", "draws", "speaker"]);
 }
 
 #[test]
@@ -530,9 +530,9 @@ fn a_persona_says_its_sentences_its_own_way() {
 }
 
 #[test]
-fn a_conversation_is_several_traces_that_belong_together() {
+fn a_series_is_several_traces_that_belong_together() {
     // three traces in a row are one conversation, and the traveler keeps one mood through it
-    let world = r#"(chat:conversation {turns: 3});
+    let world = r#"(chat:series {turns: 3});
 (mood:sentence {per: chat.number})
     -[:next]->(:part {subject: "I", person: "first"})
     =[:weighted]=>[
@@ -596,8 +596,8 @@ fn a_conversation_is_several_traces_that_belong_together() {
     );
     // an extension says where a conversation ends in its own way
     let paired = format!(
-        "+(pair:node) {{number: {{value: floor(context.trace_index / 2)}}, turn: {{value: context.trace_index % 2}}}}\n    -[:extends]->(conversation);\n{}",
-        source.replace("(chat:conversation {turns: 3})", "(chat:pair)")
+        "+(pair:node) {{number: {{value: floor(context.trace_index / 2)}}, turn: {{value: context.trace_index % 2}}}}\n    -[:extends]->(series);\n{}",
+        source.replace("(chat:series {turns: 3})", "(chat:pair)")
     );
     let paired = turns(&paired, 5);
     assert_eq!(paired[0]["id"], paired[1]["id"]);
@@ -646,7 +646,7 @@ fn a_conversation_is_several_traces_that_belong_together() {
         opened(4)
     );
     // the bounds are whole numbers of turns, the second no smaller than the first
-    let weights = "a conversation takes one weight for each length from turns to up_to, none negative and one positive";
+    let weights = "a series takes one weight for each length from turns to up_to, none negative and one positive";
     for (written, message) in [
         ("{turns: 2, up_to: 4, weights: [|1, 2|]}", weights),
         ("{turns: 2, up_to: 4, weights: [|0, 0, 0|]}", weights),
@@ -654,13 +654,10 @@ fn a_conversation_is_several_traces_that_belong_together() {
         ("{turns: 2, weights: [|1|]}", weights),
         (
             "{turns: 4, up_to: 2}",
-            "a conversation runs up to at least as many turns as it starts with",
+            "a series runs up to at least as many turns as it starts with",
         ),
-        ("{turns: 0}", "a conversation has a whole number of turns from 1 to 256"),
-        (
-            "{turns: 2, up_to: 2.5}",
-            "a conversation has a whole number of turns from 1 to 256",
-        ),
+        ("{turns: 0}", "a series has a whole number of turns from 1 to 256"),
+        ("{turns: 2, up_to: 2.5}", "a series has a whole number of turns from 1 to 256"),
     ] {
         let model = SELECTED.compile(&source.replace("{turns: 3}", written)).unwrap();
         let error = data::generate(
@@ -675,12 +672,12 @@ fn a_conversation_is_several_traces_that_belong_together() {
         .unwrap_err();
         assert!(error.to_string().contains(message), "{error}");
     }
-    // a conversation has no steps
+    // a series has no steps
     let found = rejected(&shape(
-        "(chat:conversation)-[:next]->(:policy {subject: \"a\", verb: \"be\"});",
+        "(chat:series)-[:next]->(:policy {subject: \"a\", verb: \"be\"});",
         "chat.id",
     ));
-    assert!(found.contains("a conversation has no steps, so nothing leaves it"), "{found}");
+    assert!(found.contains("a series has no steps, so nothing leaves it"), "{found}");
 }
 
 #[test]

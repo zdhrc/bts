@@ -2397,11 +2397,11 @@ fn a_way_of_talking_that_samples_agrees_in_data_and_code() {
 }
 
 #[test]
-fn a_conversation_agrees_in_data_and_code() {
+fn a_series_agrees_in_data_and_code() {
     // an agent given the seed and a trace is that trace of the run, so it can be any turn of any conversation
     // each conversation runs for two to five turns
     // short conversations are the likeliest
-    let source = r#"(chat:conversation {turns: 2, up_to: 5, weights: [|4, 3, 2, 1|]});
+    let source = r#"(chat:series {turns: 2, up_to: 5, weights: [|4, 3, 2, 1|]});
 (mood:sentence {per: chat.number})
     -[:next]->(:part {subject: "I", person: "first"})
     =[:weighted]=>[

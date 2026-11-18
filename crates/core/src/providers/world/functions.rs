@@ -198,8 +198,8 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
             tags: &[],
             id: Id::new("func.vary"),
             name: "vary",
-            syntax: "vary(text_or_sentence[, options])",
-            summary: "Varies English prose or a sentence object accepted by realize using scoped seeded randomness. Existing calls using only negation: boolean (true), condition_order: boolean (true), and rendering preserve their original behavior: uniform selection between the original and applicable alternatives, with unsupported prose unchanged. Adding any style control opts into bounded composition. style accepts neutral, professional, conversational, warm, terse, text_message, enthusiastic, or informal_chat. Explicit controls override preset defaults: contractions, shorthand, casual, slang, reductions, fragments, warmth, soften_requests, negation, and condition_order are booleans. New-mode negation only contracts recognized negative statements. All presets disable typos and request softening by default. punctuation accepts preserve, omit_period, exclamation, or expressive and affects the final terminal mark, preserving question marks, abbreviations, and code-like tokens. casing accepts preserve or lowercase and only lowercases reviewed everyday words and pronoun contractions. probability (default 1, range 0..1) gates wording, tone, and presentation once per message. max_changes (default 3, integer 0..16) bounds total edits. typos accepts probability (default 0, per message independently), max_errors (default 1, integer 0..16), and kinds (default all of common, omission, transposition, repetition). Typos apply only to reviewed lowercase words and share max_changes. protected is an array of nonempty case-sensitive literal strings. Quotations, code-like tokens, and authored structured subject references are protected automatically. Arbitrary prose names cannot be inferred reliably. alternatives is an array of {from: nonempty text, to: nonempty array of nonempty text} author-approved phrase families, matched literally at word boundaries. Author-supplied alternatives may authorize meaning changes. Built-in tone rules require warmth or soften_requests and never invent promises, urgency, or apologies. Fragments are limited to supported first-person progressive statements. Reductions require recognized infinitive constructions. Changes run in grammatical, phrase, tone, presentation, and typo stages with nonoverlapping choices within each stage. No draw is consumed for a zero or certain probability gate, a sole candidate, or no eligible edit. rendering applies only to structured input. Invalid options fail during evaluation.",
+            syntax: "vary(text_or_sentence[, options[, draws]])",
+            summary: "Varies English prose or a sentence object accepted by realize using scoped seeded randomness. Existing calls using only negation: boolean (true), condition_order: boolean (true), and rendering preserve their original behavior: uniform selection between the original and applicable alternatives, with unsupported prose unchanged. Adding any style control opts into bounded composition. style accepts neutral, professional, conversational, warm, terse, text_message, enthusiastic, or informal_chat. Explicit controls override preset defaults: contractions, shorthand, casual, slang, reductions, fragments, warmth, soften_requests, negation, and condition_order are booleans. New-mode negation only contracts recognized negative statements. All presets disable typos and request softening by default. punctuation accepts preserve, omit_period, exclamation, or expressive and affects the final terminal mark, preserving question marks, abbreviations, and code-like tokens. casing accepts preserve or lowercase and only lowercases reviewed everyday words and pronoun contractions. probability (default 1, range 0..1) gates wording, tone, and presentation once per message. max_changes (default 3, integer 0..16) bounds total edits. typos accepts probability (default 0, per message independently), max_errors (default 1, integer 0..16), and kinds (default all of common, omission, transposition, repetition). Typos apply only to reviewed lowercase words and share max_changes. protected is an array of nonempty case-sensitive literal strings. Quotations, code-like tokens, and authored structured subject references are protected automatically. Arbitrary prose names cannot be inferred reliably. alternatives is an array of {from: nonempty text, to: nonempty array of nonempty text} author-approved phrase families, matched literally at word boundaries. Author-supplied alternatives may authorize meaning changes. Built-in tone rules require warmth or soften_requests and never invent promises, urgency, or apologies. Fragments are limited to supported first-person progressive statements. Reductions require recognized infinitive constructions. Changes run in grammatical, phrase, tone, presentation, and typo stages with nonoverlapping choices within each stage. No draw is consumed for a zero or certain probability gate, a sole candidate, or no eligible edit. rendering applies only to structured input. Invalid options fail during evaluation. draws is an optional array of numbers from zero up to one. With it, vary takes its random choices from those numbers in order, in place of the scoped random source, so the result depends on them alone. A walk reads such numbers as context.draws, which are the same in generated data and in a generated agent given the seed.",
             examples: &[
                 r#"vary("The guest cannot check in.", { negation: true, condition_order: false })"#,
                 r#"vary("I am checking the file. Thank you.", { style: "text_message", max_changes: 6 })"#,
@@ -220,6 +220,14 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
             ParamDesc {
                 name: "options",
                 accepts: &[FieldType::Object],
+                nullable: false,
+                optional: true,
+                constant: false,
+                bounds: None,
+            },
+            ParamDesc {
+                name: "draws",
+                accepts: &[FieldType::Array],
                 nullable: false,
                 optional: true,
                 constant: false,
@@ -562,15 +570,15 @@ pub static FUNCTIONS: &[Function] = &[
         python: Some(seeded("_world_pick", "take_branch")),
         typescript: Some(seeded("_world_pick", "takeBranch")),
     },
-    // what the place of a trace among conversations lowers to
+    // what the place of a trace among series lowers to
     Function {
         name: super::walk::TURN,
         check: None,
         data: Some(super::walk::turn),
-        python: Some(seeded("_world_turn", "conversation_turn")),
-        typescript: Some(seeded("_world_turn", "conversationTurn")),
+        python: Some(seeded("_world_turn", "series_turn")),
+        typescript: Some(seeded("_world_turn", "seriesTurn")),
     },
-    // what the draws of a styled sentence lower to
+    // what the draws of a walk lower to
     Function {
         name: super::walk::DRAWS,
         check: None,
@@ -578,34 +586,17 @@ pub static FUNCTIONS: &[Function] = &[
         python: Some(seeded("_world_draws", "draws_for")),
         typescript: Some(seeded("_world_draws", "drawsFor")),
     },
-    // what a sentence said a speaker's way lowers to: styled by the draws it is handed
-    Function {
-        name: super::walk::SAY,
-        check: None,
-        data: Some(say),
-        python: Some(said()),
-        typescript: Some(said()),
-    },
-    // what the identifier of a conversation lowers to
+    // what the identifier of a series lowers to
     Function {
         name: super::walk::ID,
         check: None,
         data: Some(super::walk::id),
-        python: Some(seeded("_world_id", "conversation_id")),
-        typescript: Some(seeded("_world_id", "conversationId")),
+        python: Some(seeded("_world_id", "series_id")),
+        typescript: Some(seeded("_world_id", "seriesId")),
     },
 ];
 
-// styling goes through the English entry point, as an operation no author calls
-const fn said() -> Helper {
-    let Some(mut helper) = function("say", say, true).python else {
-        panic!("the English entry point has a helper");
-    };
-    helper.scorer = None;
-    helper
-}
-
-// the draws a sentence is styled by, played back as a random source
+// draws handed to `vary`, played back as its random source
 struct Replay<'a> {
     draws: &'a [f64],
     at: usize,
@@ -629,27 +620,6 @@ impl rand::RngCore for Replay<'_> {
             chunk.copy_from_slice(&next[..chunk.len()]);
         }
     }
-}
-
-// a sentence said a speaker's way, with the draws it was handed
-fn say(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
-    let [text, wording, Value::Array(draws)] = args else {
-        return Err(EvaluateError::Shape);
-    };
-    let draws = (draws.iter())
-        .map(|draw| match draw {
-            Value::Number(number) => number.as_f64().filter(|draw| (0.0..1.0).contains(draw)),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or(EvaluateError::Shape)?;
-    let plain = |value: &Value| {
-        (evaluation.plain(value)).map_err(|_| EvaluateError::Invalid("English functions do not accept attachments".into()))
-    };
-    let args = [plain(text)?, plain(wording)?];
-    run_english(Operation::Vary, &args, &mut Replay { draws: &draws, at: 0 })
-        .map(Value::from)
-        .map_err(|error| EvaluateError::Invalid(format!("say: {error}").into()))
 }
 
 // a helper that draws by the seed of the run, defined in the text those helpers share
@@ -754,7 +724,23 @@ fn evaluate(operation: Operation, args: &[Value], evaluation: &mut Evaluation<'_
             (evaluation.plain(arg)).map_err(|_| EvaluateError::Invalid("English functions do not accept attachments".into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    run_english(operation, &args, evaluation.random())
+    // vary handed its draws takes its choices from them, not from the random source
+    let result = match (operation, args.as_slice()) {
+        (Operation::Vary, [text, options, InputValue::Array(draws)]) => {
+            let draws = (draws.iter())
+                .map(|draw| draw.as_f64().filter(|draw| (0.0..1.0).contains(draw)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| EvaluateError::Invalid("vary: draws are numbers from zero up to one".into()))?;
+            run_english(
+                operation,
+                &[text.clone(), options.clone()],
+                &mut Replay { draws: &draws, at: 0 },
+            )
+        }
+        (Operation::Vary, [_, _, _]) => Err("draws are an array of numbers".to_owned()),
+        _ => run_english(operation, &args, evaluation.random()),
+    };
+    result
         .map(Value::from)
         .map_err(|error| EvaluateError::Invalid(format!("{}: {error}", operation.name()).into()))
 }
