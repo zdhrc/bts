@@ -2541,6 +2541,191 @@ fn an_agent_input_that_reads_a_series_agrees_in_data_and_code() {
 }
 
 #[test]
+fn a_conversation_is_the_messages_up_to_a_turn() {
+    // the lists are as long as the series, which is not known until a trace is drawn
+    let world = r#"(chat:series {turns: 3});
+(customer:persona {per: chat.number})
+    -[:next]->(:statement {subject: "I", person: "first", verb: "need", complement: "a refund"})
+    -[:next]->(:statement {subject: "the order", verb: "be", complement: "late"})
+    -[:next]->(:statement {subject: "that", verb: "work"});
+(helper:persona {per: chat.number})
+    -[:next]->(:statement {subject: "I", person: "first", modal: "can", verb: "help"})
+    -[:next]->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
+    -[:next]->(:statement {subject: "the refund", verb: "be", complement: "on its way"});"#;
+    let traces = |read: &str| {
+        let source = format!(
+            "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-[:next]->(t:task {{name: \"t\"}}) {{input: a.input, output: {read}}};\n"
+        );
+        let model = lower(&source).unwrap_or_else(|errors| panic!("{errors}"));
+        let generated = data::generate(
+            model,
+            3,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            1,
+            &(),
+        );
+        generated.map(|batch| {
+            (batch.events.iter())
+                .map(|event| event.output.as_ref().unwrap().project(&()).unwrap())
+                .collect::<Vec<_>>()
+        })
+    };
+    let message = |role: &str, content: &str| json!({"role": role, "content": content});
+    let both = r#"conversation({system: "Be brief.", user: customer.said, assistant: helper.said, turn: chat.turn})"#;
+    assert_eq!(
+        traces(both).unwrap(),
+        [
+            json!([message("system", "Be brief."), message("user", "I need a refund.")]),
+            json!([
+                message("system", "Be brief."),
+                message("user", "I need a refund."),
+                message("assistant", "I can help."),
+                message("user", "The order is late."),
+            ]),
+            json!([
+                message("system", "Be brief."),
+                message("user", "I need a refund."),
+                message("assistant", "I can help."),
+                message("user", "The order is late."),
+                message("assistant", "I see the order."),
+                message("user", "That works."),
+            ]),
+        ]
+    );
+    // without the replies it is what the user said, and a null system is left out
+    let alone = "conversation({system: null, user: customer.said, turn: chat.turn})";
+    assert_eq!(
+        traces(alone).unwrap()[2],
+        json!([
+            message("user", "I need a refund."),
+            message("user", "The order is late."),
+            message("user", "That works."),
+        ])
+    );
+    // a read into a message is typed by what the provider declares
+    let read = r#"upper(conversation({user: customer.said, turn: chat.turn})[0].content)"#;
+    assert_eq!(traces(read).unwrap()[0], json!("I NEED A REFUND."));
+    for (call, told) in [
+        (
+            "conversation({user: customer.said, turn: 3})",
+            "turn is a whole number that counts the user's messages from zero",
+        ),
+        (
+            "conversation({user: customer.said, turn: 0.5})",
+            "turn is a whole number that counts the user's messages from zero",
+        ),
+        (
+            "conversation({user: customer.said, assistant: helper.said[0:1], turn: 2})",
+            "assistant has a reply for every turn before this one",
+        ),
+        ("conversation({user: [|1|], turn: 0})", "user is a list of strings"),
+        (
+            "conversation({user: customer.said, turn: 0, system: 1})",
+            "system is a string",
+        ),
+        ("conversation({user: customer.said})", "takes an object with user and turn"),
+        (
+            "conversation({user: customer.said, turn: 0, agent: helper.said})",
+            "takes an object with user and turn",
+        ),
+    ] {
+        let error = traces(call).unwrap_err().to_string();
+        assert!(error.contains(told), "{call}: {error}");
+    }
+}
+
+#[test]
+fn a_conversation_agrees_in_data_and_code() {
+    // both sides of a chat are in the world, so any turn has the messages before it
+    let source = r#"(chat:series {turns: 2, up_to: 4});
+(customer:persona {style: "text_message", per: chat.number})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "I", person: "first", verb: "need"})
+        =[:weighted]=>[
+            -[:next {weight: 1}]->(:part {complement: "a refund"}),
+            -[:next {weight: 1}]->(:part {complement: "a receipt"}),
+        ]
+    -[:next]->(:statement {subject: "the order", verb: "be", complement: "late"})
+    -[:next]->(:statement {subject: "that", verb: "work"})
+    -[:next]->(:statement {subject: "I", person: "first", verb: "like", complement: "it"});
+(helper:persona {per: chat.number})
+    -[:next]->(:statement {subject: "I", person: "first", modal: "can", verb: "help"})
+    -[:next]->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
+    -[:next]->(:statement {subject: "the refund", verb: "be", complement: "on its way"})
+    -[:next]->(:statement {subject: "you", person: "second", verb: "be", complement: "welcome"});
+(desk:agent) {input: customer.said[chat.turn], output: answer.output};
+(desk)-[:next]->(answer:task {name: "answer"}) {input: desk.input, output: reply.output.content}
+    -[:calls]->(reply:llm {name: "chat_completion"}) {
+        input: conversation({system: "Be brief.", user: customer.said, assistant: helper.said, turn: chat.turn}),
+        output: {role: "assistant", content: helper.said[chat.turn]},
+    };
+"#;
+    let model = lower(source).unwrap();
+    let mut longest = 0;
+    for seed in [1u64, 2] {
+        let batch = data::generate(
+            model.clone(),
+            8,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            seed,
+            &(),
+        )
+        .unwrap();
+        let python = execute_generated(
+            &model,
+            ScorerLang::Python,
+            "python3",
+            "check.py",
+            &format!(
+                "from desk_agent import run_details\nimport json\nprint(json.dumps([run_details(seed={seed}, trace=trace) for trace in range(8)]))"
+            ),
+        );
+        let typescript = execute_generated(
+            &model,
+            ScorerLang::Typescript,
+            "node",
+            "check.mts",
+            &format!(
+                "import {{runDetails}} from './desk_agent.mts'; console.log(JSON.stringify([...Array(8).keys()].map(trace => runDetails(undefined, Math.random, {seed}, trace))));"
+            ),
+        );
+        let steps: Vec<_> = batch.events.iter().filter(|event| event.name == "chat_completion").collect();
+        assert_eq!(steps.len(), 8);
+        for (index, step) in steps.iter().enumerate() {
+            let input = step.input.as_ref().unwrap().project(&()).unwrap();
+            let messages = input.as_array().unwrap();
+            // a system message, a user message and a reply for each earlier turn, and the message of this turn
+            assert_eq!(messages.len() % 2, 0, "{input}");
+            assert_eq!(messages.last().unwrap()["role"], "user");
+            longest = longest.max(messages.len());
+            for (lang, run) in [("python", &python), ("typescript", &typescript)] {
+                let span = (run[index]["spans"].as_array().unwrap().iter())
+                    .find(|span| span["name"] == "chat_completion")
+                    .unwrap();
+                assert_eq!(span["input"], input, "{lang}, seed {seed}, trace {index}");
+            }
+        }
+    }
+    assert!(longest >= 6, "{longest}");
+    // the call reads as a library function in the generated agent
+    for (lang, name) in [
+        (ScorerLang::Python, "chat_messages("),
+        (ScorerLang::Typescript, "chatMessages("),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("desk_agent.") && !file.name.contains("runtime"))
+            .unwrap();
+        assert!(agent.contents.contains(name), "{}", agent.contents);
+        assert!(!agent.contents.contains("_world"), "{}", agent.contents);
+    }
+}
+
+#[test]
 fn every_example_agent_reads_as_written_by_hand() {
     // no deferred values, no span bookkeeping, and no helper under a private name
     for source in [

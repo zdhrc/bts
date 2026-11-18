@@ -305,9 +305,9 @@ fn world_conforms_to_the_provider_contract() {
         schema.context,
         ["steps", "trace_index", "place", "identity", "draws", "related", "members"]
     );
-    // the twelve English functions and merge are declared, and what a fork and a series lower to is internal
-    assert_eq!(schema.functions.len(), 13);
-    assert_eq!(world::Bundle.functions().len(), 17);
+    // the twelve English functions, merge and conversation are declared, and what a fork and a series lower to is internal
+    assert_eq!(schema.functions.len(), 14);
+    assert_eq!(world::Bundle.functions().len(), 18);
     let internal = ["world.pick", "world.turn", "world.id", "world.draws"];
     assert_eq!(world::Bundle.internal(), internal);
     for function in world::Bundle.functions() {
@@ -315,7 +315,7 @@ fn world_conforms_to_the_provider_contract() {
         assert!(function.runs(Consumer::Agent(ScorerLang::Python)), "{}", function.name);
         assert!(function.runs(Consumer::Agent(ScorerLang::Typescript)), "{}", function.name);
         // the English functions run in scorers too, and what serves a walk does not
-        let walks = function.name == "merge" || internal.contains(&function.name);
+        let walks = ["merge", "conversation"].contains(&function.name) || internal.contains(&function.name);
         assert_eq!(function.runs(Consumer::Scorer), !walks, "{}", function.name);
     }
 }
@@ -329,8 +329,8 @@ fn a_provider_joined_by_a_contributor_has_the_kinds_and_functions_of_both() {
     assert_eq!((schema.id, schema.name), ("braintrust", "Braintrust mocking"));
     let sources: Vec<_> = schema.definitions.iter().map(|source| source.name).collect();
     assert_eq!(sources, ["braintrust.bt", "world.bt"]);
-    assert_eq!(schema.functions.len(), 16);
-    assert_eq!(joined.functions().len(), 20);
+    assert_eq!(schema.functions.len(), 17);
+    assert_eq!(joined.functions().len(), 21);
     assert_eq!(joined.internal().len(), 4);
     let parts: Vec<_> = joined.parts().iter().map(|part| part.schema.id).collect();
     assert_eq!(parts, ["braintrust", "world"]);

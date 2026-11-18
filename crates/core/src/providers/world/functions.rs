@@ -13,6 +13,7 @@ use bts_lang::{FieldType, FunctionDesc, ParamDesc, ResultShape};
 use rand::Rng;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value as InputValue;
+use std::collections::BTreeMap;
 
 const CALL_RULES: &[RuleDesc] = &[FUNC_ARITY_RULE, FUNC_ARG_TYPES_RULE];
 
@@ -62,6 +63,8 @@ const EXPRESSION: ResultShape = ResultShape::Object(&[
     ("edits", ResultShape::Array(&EDIT)),
 ]);
 const CANDIDATES: ResultShape = ResultShape::Array(&CANDIDATE);
+// what `conversation` returns, so a read into one of its messages is typed
+const MESSAGES: ResultShape = ResultShape::Array(&ResultShape::Object(&[("role", TEXT), ("content", TEXT)]));
 
 /// What the language checks a call to each function against.
 pub const DESCRIPTORS: &[FunctionDesc] = &[
@@ -509,6 +512,29 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
         returns: FieldType::Object,
         shape: None,
     },
+    FunctionDesc {
+        doc: FuncDesc {
+            tags: &[],
+            id: Id::new("func.conversation"),
+            name: "conversation",
+            syntax: "conversation({user, turn[, system, assistant]})",
+            summary: "Makes the chat messages of one turn of a conversation, for the input of an llm step. user is the list of what the user says, one string for each turn, and turn is a whole number that counts them from zero. The result is the user's message at turn, after the messages of every turn before it. assistant is the list of what the assistant replied, and when it is given each earlier user message is followed by the reply of its turn, so it needs a reply for every turn before this one. system is a string that becomes a system message at the start. A null system or assistant is left out. Each message is {role, content}. The lists may be of any length, which a comprehension cannot take. Performs no random draws.",
+            examples: &[
+                r#"conversation({ system: policies.text, user: customer.said, assistant: helper.said, turn: chat.turn })"#,
+            ],
+            rules: CALL_RULES,
+        },
+        params: &[ParamDesc {
+            name: "said",
+            accepts: &[FieldType::Object],
+            nullable: false,
+            optional: false,
+            constant: false,
+            bounds: None,
+        }],
+        returns: FieldType::Array,
+        shape: Some(MESSAGES),
+    },
 ];
 
 // every function runs in data generation, in agents and in scorers, through one entry point
@@ -561,6 +587,13 @@ pub static FUNCTIONS: &[Function] = &[
         data: Some(super::walk::merge),
         python: Some(walked("_world_merge", "merge_objects", super::walk::PY_MERGE)),
         typescript: Some(walked("_world_merge", "mergeObjects", super::walk::TS_MERGE)),
+    },
+    Function {
+        name: "conversation",
+        check: None,
+        data: Some(conversation),
+        python: Some(walked("_world_conversation", "chat_messages", PY_CONVERSATION)),
+        typescript: Some(walked("_world_conversation", "chatMessages", TS_CONVERSATION)),
     },
     // what a weighted fork in a walk lowers to, which no author calls
     Function {
@@ -658,6 +691,146 @@ const fn walked(name: &'static str, reads_as: &'static str, text: &'static str) 
         scorer: None,
     }
 }
+
+const CONVERSATION_KEYS: &str = "conversation: takes an object with user and turn, and optionally system and assistant";
+const CONVERSATION_TURN: &str = "conversation: turn is a whole number that counts the user's messages from zero";
+const CONVERSATION_REPLIES: &str = "conversation: assistant has a reply for every turn before this one";
+
+/// Evaluates `conversation`: the messages of a chat up to the user's message at one turn.
+fn conversation(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    fn unfit(what: &'static str) -> EvaluateError {
+        EvaluateError::Invalid(what.into())
+    }
+    fn texts<'a>(value: &'a Value, shape: &'static str) -> Result<Vec<&'a String>, EvaluateError> {
+        let Value::Array(items) = value else {
+            return Err(unfit(shape));
+        };
+        (items.iter())
+            .map(|item| match item {
+                Value::String(text) => Ok(text),
+                _ => Err(unfit(shape)),
+            })
+            .collect()
+    }
+    fn message(role: &str, content: &str) -> Value {
+        Value::Object(BTreeMap::from([
+            ("role".to_owned(), Value::String(role.to_owned())),
+            ("content".to_owned(), Value::String(content.to_owned())),
+        ]))
+    }
+    let [Value::Object(said)] = args else {
+        return Err(unfit(CONVERSATION_KEYS));
+    };
+    if said
+        .keys()
+        .any(|key| !["system", "user", "assistant", "turn"].contains(&key.as_str()))
+    {
+        return Err(unfit(CONVERSATION_KEYS));
+    }
+    let user = texts(
+        said.get("user").ok_or_else(|| unfit(CONVERSATION_KEYS))?,
+        "conversation: user is a list of strings",
+    )?;
+    let assistant = match said.get("assistant") {
+        None | Some(Value::Null) => None,
+        Some(replies) => Some(texts(replies, "conversation: assistant is a list of strings")?),
+    };
+    let turn = match said.get("turn") {
+        Some(Value::Number(turn)) => turn.as_u64().and_then(|turn| usize::try_from(turn).ok()),
+        Some(_) => None,
+        None => return Err(unfit(CONVERSATION_KEYS)),
+    };
+    let turn = turn
+        .filter(|turn| *turn < user.len())
+        .ok_or_else(|| unfit(CONVERSATION_TURN))?;
+    if assistant.as_ref().is_some_and(|replies| replies.len() < turn) {
+        return Err(unfit(CONVERSATION_REPLIES));
+    }
+    let mut messages = Vec::new();
+    match said.get("system") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(system)) => messages.push(message("system", system)),
+        Some(_) => return Err(unfit("conversation: system is a string")),
+    }
+    for earlier in 0..turn {
+        messages.push(message("user", user[earlier]));
+        if let Some(replies) = &assistant {
+            messages.push(message("assistant", replies[earlier]));
+        }
+    }
+    messages.push(message("user", user[turn]));
+    Ok(Value::Array(messages))
+}
+
+// the Python text of `conversation`.
+const PY_CONVERSATION: &str = r#"
+def _world_conversation(said):
+    said = _value(said)
+    keys = "conversation: takes an object with user and turn, and optionally system and assistant"
+    if not isinstance(said, dict) or any(key not in ("system", "user", "assistant", "turn") for key in said): raise TypeError(keys)
+    if "user" not in said or "turn" not in said: raise TypeError(keys)
+    def texts(key):
+        items = said[key]
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            raise TypeError(f"conversation: {key} is a list of strings")
+        return items
+    user = texts("user")
+    assistant = texts("assistant") if said.get("assistant") is not None else None
+    turn = said["turn"]
+    if not isinstance(turn, int) or isinstance(turn, bool) or not 0 <= turn < len(user):
+        raise ValueError("conversation: turn is a whole number that counts the user's messages from zero")
+    if assistant is not None and len(assistant) < turn:
+        raise ValueError("conversation: assistant has a reply for every turn before this one")
+    messages = []
+    system = said.get("system")
+    if system is not None:
+        if not isinstance(system, str): raise TypeError("conversation: system is a string")
+        messages.append({"role": "system", "content": system})
+    for earlier in range(turn):
+        messages.append({"role": "user", "content": user[earlier]})
+        if assistant is not None: messages.append({"role": "assistant", "content": assistant[earlier]})
+    messages.append({"role": "user", "content": user[turn]})
+    return messages
+"#;
+
+// the TypeScript text of `conversation`.
+const TS_CONVERSATION: &str = r#"
+function _world_conversation(said: unknown): { role: string; content: string }[] {
+    const given = _value(said);
+    const keys = "conversation: takes an object with user and turn, and optionally system and assistant";
+    if (given === null || typeof given !== "object" || Array.isArray(given)) throw new TypeError(keys);
+    if (Object.keys(given).some((key) => !["system", "user", "assistant", "turn"].includes(key))) throw new TypeError(keys);
+    if (!("user" in given) || !("turn" in given)) throw new TypeError(keys);
+    const texts = (key: string): string[] => {
+        const items = given[key];
+        if (!Array.isArray(items) || !items.every((item) => typeof item === "string")) {
+            throw new TypeError(`conversation: ${key} is a list of strings`);
+        }
+        return items;
+    };
+    const user = texts("user");
+    const assistant = given.assistant === null || given.assistant === undefined ? null : texts("assistant");
+    const turn = given.turn;
+    if (typeof turn !== "number" || !Number.isInteger(turn) || turn < 0 || turn >= user.length) {
+        throw new RangeError("conversation: turn is a whole number that counts the user's messages from zero");
+    }
+    if (assistant !== null && assistant.length < turn) {
+        throw new RangeError("conversation: assistant has a reply for every turn before this one");
+    }
+    const messages: { role: string; content: string }[] = [];
+    const system = given.system;
+    if (system !== null && system !== undefined) {
+        if (typeof system !== "string") throw new TypeError("conversation: system is a string");
+        messages.push({ role: "system", content: system });
+    }
+    for (let earlier = 0; earlier < turn; earlier++) {
+        messages.push({ role: "user", content: user[earlier] });
+        if (assistant !== null) messages.push({ role: "assistant", content: assistant[earlier] });
+    }
+    messages.push({ role: "user", content: user[turn] });
+    return messages;
+}
+"#;
 
 #[derive(Clone, Copy)]
 enum Operation {
