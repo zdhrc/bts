@@ -126,7 +126,8 @@ pub fn experiment_result(
     format: &dyn AttachmentFormat,
 ) -> Result<EventBatch, Error> {
     let plan = evaluation::plan_experiment(model, task, row, index, seed, format).map_err(Error::Plan)?;
-    materialization::materialize(plan, Duration::from_secs(1), Distribution::Linear, now).map_err(Error::Materialize)
+    // one trace is placed so that it ends now, whatever the window, and the window only has to hold it
+    materialization::materialize(plan, Duration::from_secs(86_400), Distribution::Linear, now).map_err(Error::Materialize)
 }
 
 #[derive(Debug)]
@@ -544,6 +545,37 @@ mod experiment_tests {
         )
         .unwrap_err();
         assert!(matches!(error, Error::Plan(error) if error.kind() == EvaluationErrorKind::DivisionByZero));
+    }
+
+    #[test]
+    fn a_task_longer_than_a_second_is_an_experiment_result_that_ends_now() {
+        let source = r#"
+(slow:agent) {input: "fallback", output: answer.output};
+(slow)-[:next]->(answer:task) {input: slow.input, output: "ok", duration: 0.2}
+    -[:calls]->(first:tool {name: "first"}) {output: 1, duration: 1.5}
+        -[:next]->(second:tool {name: "second"}) {output: 2, duration: 1.5};
+
+(one:case) {input: "question"};
+(cases:dataset) {cases: [|(one)|]};
+(s:scorer) {score: 1};
+(e:experiment) {dataset: (cases), task: (answer), scorers: [|(s)|]};
+"#;
+        let model = crate::providers::braintrust::mocking::compile(source).unwrap();
+        let now = SystemTime::now();
+        let batch = experiment_result(
+            &model,
+            model.experiments[0].task,
+            &json!({"input":"question"}),
+            0,
+            42,
+            now,
+            &(),
+        )
+        .unwrap();
+        let root = batch.events.iter().find(|event| event.span_parents.is_empty()).unwrap();
+        let length = root.end.duration_since(root.start).unwrap();
+        assert!(length > Duration::from_secs(3), "{length:?}");
+        assert!(now.duration_since(root.end).unwrap() < Duration::from_millis(200));
     }
 
     #[test]
