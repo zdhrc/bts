@@ -272,64 +272,13 @@ fn validate_fragment(fragment: &str, field: &'static str) -> Result<(), Error> {
     Ok(())
 }
 
+// A sentence starts with a capital when its first word is an ordinary lowercase word.
+// A first word with a capital, a digit or other marks is a name or an identifier and stays as authored.
 fn sentence_start(text: &str) -> String {
-    let first_end = text.find(' ').unwrap_or(text.len());
-    let first = &text[..first_end];
-    if matches!(
-        first,
-        "if" | "the"
-            | "a"
-            | "an"
-            | "this"
-            | "that"
-            | "these"
-            | "those"
-            | "my"
-            | "your"
-            | "our"
-            | "their"
-            | "we"
-            | "you"
-            | "he"
-            | "she"
-            | "it"
-            | "they"
-            | "can"
-            | "could"
-            | "may"
-            | "might"
-            | "must"
-            | "should"
-            | "will"
-            | "would"
-            | "can't"
-            | "couldn't"
-            | "mustn't"
-            | "shouldn't"
-            | "won't"
-            | "wouldn't"
-            | "am"
-            | "is"
-            | "are"
-            | "was"
-            | "were"
-            | "have"
-            | "has"
-            | "had"
-            | "do"
-            | "does"
-            | "did"
-            | "isn't"
-            | "aren't"
-            | "wasn't"
-            | "weren't"
-            | "haven't"
-            | "hasn't"
-            | "hadn't"
-            | "don't"
-            | "doesn't"
-            | "didn't"
-    ) {
+    let first = &text[..text.find(' ').unwrap_or(text.len())];
+    let ordinary = first.starts_with(|c: char| c.is_ascii_lowercase())
+        && first.chars().all(|c| c.is_ascii_lowercase() || c == '\'' || c == '-');
+    if ordinary {
         let mut capitalized = text.to_owned();
         capitalized[..1].make_ascii_uppercase();
         capitalized
@@ -563,6 +512,18 @@ mod tests {
             realize(&sentence, &RealizeOptions::default()).unwrap(),
             "their_API can check in."
         );
+        // a plain noun starts the sentence with a capital, and a name or an identifier stays as authored
+        sentence.clause.subject.number = Number::Plural;
+        for (subject, expected) in [
+            ("guests", "Guests can check in."),
+            ("e-mail guests", "E-mail guests can check in."),
+            ("iPhone guests", "iPhone guests can check in."),
+            ("v2 guests", "v2 guests can check in."),
+            ("Guests", "Guests can check in."),
+        ] {
+            sentence.clause.subject.text = subject.into();
+            assert_eq!(realize(&sentence, &RealizeOptions::default()).unwrap(), expected);
+        }
     }
 
     #[test]

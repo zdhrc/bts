@@ -476,9 +476,9 @@ fn a_world_reads_what_the_agent_was_given_and_what_its_steps_return() {
     ];"#;
     for output in outputs(&shape(world, "{p: p.text, q: q.text, built: w.items}"), 0..8) {
         assert_eq!(output["p"], "A is.");
-        assert_eq!(output["q"], "b is.");
+        assert_eq!(output["q"], "B is.");
         assert!(
-            output["built"] == json!(["A is."]) || output["built"] == json!(["b is."]),
+            output["built"] == json!(["A is."]) || output["built"] == json!(["B is."]),
             "{output}"
         );
     }

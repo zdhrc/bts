@@ -102,8 +102,9 @@ def _english_contract(auxiliary):
     return next((row[2] for row in _EnglishData.data["negations"] if row[0] == auxiliary), None)
 
 def _english_start(text):
-    words = ["if", "the", "a", "an", "this", "that", "these", "those", "my", "your", "our", "their", "we", "you", "he", "she", "it", "they", "can", "could", "may", "might", "must", "should", "will", "would", "am", "is", "are", "was", "were", "have", "has", "had", "do", "does", "did"] + [row[2] for row in _EnglishData.data["negations"]]
-    return text[0].upper() + text[1:] if text.split(" ")[0] in words else text
+    first = text.split(" ")[0]
+    ordinary = "a" <= first[:1] <= "z" and all("a" <= c <= "z" or c in "'-" for c in first)
+    return text[0].upper() + text[1:] if ordinary else text
 
 def _english_render_clause(clause, style):
     subject, predicate = clause["subject"], clause["predicate"]
@@ -1043,8 +1044,7 @@ function _englishContract(auxiliary: string): string | undefined {
     return _englishData.negations.find((row: string[]) => row[0] === auxiliary)?.[2];
 }
 function _englishStart(text: string): string {
-    const words = ["if", "the", "a", "an", "this", "that", "these", "those", "my", "your", "our", "their", "we", "you", "he", "she", "it", "they", "can", "could", "may", "might", "must", "should", "will", "would", "am", "is", "are", "was", "were", "have", "has", "had", "do", "does", "did", ..._englishData.negations.map((row: string[]) => row[2])];
-    return words.includes(text.split(" ")[0]) ? text[0].toUpperCase() + text.slice(1) : text;
+    return /^[a-z][a-z'-]*$/.test(text.split(" ")[0]) ? text[0].toUpperCase() + text.slice(1) : text;
 }
 function _englishRenderClause(clause: any, style: string): string {
     const subject = clause.subject, predicate = clause.predicate, verb = predicate.verb;

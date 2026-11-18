@@ -685,16 +685,31 @@ mod parity {
         Case::valid("explicit optional nulls", "realize", json!([{"clause":{"subject":{"text":"the guest"},"predicate":{"verb":"arrive","complement":null},"modal":null},"condition":null}]))
             .golden(json!("The guest arrives.")),
     ];
-        for text in ["constructor", "__proto__", "toString", "Élodie", "\u{feff}Maya"] {
+        // an ordinary lowercase word starts the sentence with a capital, and every other subject stays as authored
+        for (text, start) in [
+            ("constructor", "Constructor"),
+            ("__proto__", "__proto__"),
+            ("toString", "toString"),
+            ("Élodie", "Élodie"),
+            ("\u{feff}Maya", "\u{feff}Maya"),
+        ] {
             cases.push(
                 Case::valid(
                     format!("authored subject {text}"),
                     "realize",
                     json!([sentence(text, "be", "ready")]),
                 )
-                .golden(json!(format!("{text} is ready."))),
+                .golden(json!(format!("{start} is ready."))),
             );
         }
+        cases.push(
+            Case::valid("plural noun subject", "realize", json!([{"clause":{"subject":{"text":"refunds","number":"plural"},"predicate":{"verb":"return","complement":"to the card"}}}]))
+                .golden(json!("Refunds return to the card.")),
+        );
+        cases.push(
+            Case::valid("noun subject in a question", "realize", json!([{"clause":{"subject":{"text":"refunds","number":"plural"},"predicate":{"verb":"return","complement":"to the card"},"form":"question"}}]))
+                .golden(json!("Do refunds return to the card?")),
+        );
         for tense in ["present", "past", "future"] {
             for aspect in ["simple", "progressive", "perfect", "perfect_progressive"] {
                 for polarity in ["positive", "negative"] {
