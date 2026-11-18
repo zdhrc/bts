@@ -704,15 +704,53 @@ fn the_world_example_in_the_skill_generates() {
     let roots: Vec<_> = batch.events.iter().filter(|event| event.span_parents.is_empty()).collect();
     assert_eq!(roots.len(), 40);
     let mut turns = std::collections::BTreeMap::<String, Vec<u64>>::new();
+    let mut replies = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let thread_of = |root: &data::Event| {
+        let thread = root.metadata.as_ref().unwrap()["thread_id"].project(&()).unwrap();
+        thread.as_str().unwrap().to_owned()
+    };
     for root in &roots {
         let metadata = root.metadata.as_ref().unwrap();
-        let thread = metadata["thread_id"].project(&()).unwrap().as_str().unwrap().to_owned();
+        let thread = thread_of(root);
         let turn = metadata["turn"].project(&()).unwrap().as_u64().unwrap();
         turns.entry(thread).or_default().push(turn);
         // a turn carries the messages before it
         let input = root.input.as_ref().unwrap().project(&()).unwrap();
         assert_eq!(input["earlier"].as_array().unwrap().len() as u64, turn);
+        // the llm step is handed the rules, each earlier turn with its reply, and this turn's message
+        let step = (batch.events.iter())
+            .find(|event| event.root_span_id == root.root_span_id && event.name == "chat_completion")
+            .unwrap();
+        let messages = step.input.as_ref().unwrap().project(&()).unwrap();
+        let messages = messages.as_array().unwrap();
+        assert_eq!(messages.len() as u64, 2 * turn + 2);
+        assert_eq!(messages.last().unwrap()["content"], input["message"]);
+        // the reply answers what the customer asked, and each turn has its own
+        let reply = root
+            .output
+            .as_ref()
+            .unwrap()
+            .project(&())
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let topic = metadata["topic"].project(&()).unwrap().as_str().unwrap().to_owned();
+        if turn == 0 {
+            let asked = input["message"].as_str().unwrap().to_lowercase();
+            let (said, answered) = match topic.as_str() {
+                "charged_twice" => ("twice", "second charge"),
+                _ => ("after i canceled", "after you canceled"),
+            };
+            assert!(asked.contains(said) && reply.contains(answered), "{topic}: {asked} / {reply}");
+        }
+        replies.entry(thread_of(root)).or_default().push(reply);
     }
+    for (thread, replies) in &replies {
+        let distinct: std::collections::BTreeSet<_> = replies.iter().collect();
+        assert_eq!(distinct.len(), replies.len(), "{thread}: {replies:?}");
+    }
+    assert!(replies.values().any(|replies| replies.len() > 2));
     // every thread counts its turns from zero without a gap
     assert!(turns.len() > 8, "{turns:?}");
     for (thread, turns) in &turns {
