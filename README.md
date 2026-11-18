@@ -204,7 +204,7 @@ uv run python -c 'from agents.support_agent import run; print(run({"question": "
 
 Call `run(input)` to supply an input, or `run()` for the authored fallback. Python also exports `run_details` and `run_traced`, and TypeScript exports `runDetails` and `runTraced`, to inspect spans or attach a Braintrust parent span. The mock executes authored behavior without contacting LLMs or tools. Agent-only shapes require no project or API key to build or run.
 
-Authored durations appear in detailed results without delaying execution. Traced spans use actual execution time. Generated agents accept an injectable random source but do not reproduce native `--seed` sampling. Local attachments remain unsupported in generated agents.
+Authored durations appear in detailed results without delaying execution. Traced spans use actual execution time. Generated agents accept an injectable random source. Values sampled by functions such as `choice` do not reproduce native `--seed` sampling. A world built by walks and series does, when the agent is given the same seed and trace. Local attachments remain unsupported in generated agents.
 
 ### Add cases and scorers
 
