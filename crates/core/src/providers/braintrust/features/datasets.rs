@@ -132,6 +132,12 @@ struct Case {
     span_path: Option<Vec<(String, String)>>,
     default_expected: bool,
 }
+/// The id of the row a case syncs to in a project.
+pub(super) fn row_id(project_id: &str, dataset: &str, case: &str) -> String {
+    data::stable_uuid(&format!("bts/dataset/{project_id}/{dataset}/{case}/row")).to_string()
+}
+/// The project a preview makes its row ids for.
+pub(super) const PREVIEW_PROJECT: &str = "preview";
 fn seed(key: &str) -> u64 {
     u64::from_le_bytes(data::stable_uuid(key).as_bytes()[..8].try_into().unwrap())
 }
@@ -149,9 +155,10 @@ fn prepare_for_project(
         .cases
         .iter()
         .map(|case| {
-            let row_id =
-                data::stable_uuid(&format!("bts/dataset/{}/{}/{}/row", project_id, dataset.name, case.name)).to_string();
-            let mut data = data::case_data(model, case, seed(&row_id), &braintrust_data::Format).map_err(Error::from)?;
+            let row_id = row_id(project_id, &dataset.name, &case.name);
+            // a case is drawn by its name, so its row reads the same in every project and in a preview
+            let case_key = format!("bts/dataset/{}/{}", dataset.name, case.name);
+            let mut data = data::case_data(model, case, seed(&case_key), &braintrust_data::Format).map_err(Error::from)?;
             data.resolve_attachment_paths(path).map_err(Error::from)?;
             let mut row =
                 serde_json::to_value(braintrust_data::Format.encode(&data).map_err(Error::Format)?)?["events"][0]["input"]
@@ -185,10 +192,10 @@ fn prepare_for_project(
                     .iter()
                     .find(|trace| trace.node == root_node)
                     .ok_or_else(|| invalid("source trace not found"))?;
-                let source_key = if matches!(case.source, DatasetSource::Group(_)) {
-                    format!("{row_id}/group/{index}")
+                let (source_key, source_seed) = if matches!(case.source, DatasetSource::Group(_)) {
+                    (format!("{row_id}/group/{index}"), seed(&format!("{case_key}/group/{index}")))
                 } else {
-                    row_id.clone()
+                    (row_id.clone(), seed(&case_key))
                 };
                 let filter: WriteFilter = format!(
                     "block.kind != \"trace\" || block.name == {}",
@@ -202,7 +209,7 @@ fn prepare_for_project(
                     Duration::from_secs(3600),
                     data::Distribution::Linear,
                     now,
-                    seed(&source_key),
+                    source_seed,
                     &filter,
                     &braintrust_data::Format,
                 )
@@ -698,9 +705,9 @@ pub fn fetch_snapshot(client: &Client, id: &str) -> Result<(Option<String>, Hash
 /// `dataset` must belong to the compiled `model`. Relative attachment paths are
 /// resolved against `path`, and source traces use the supplied clock value.
 pub fn preview_rows(dataset: &Dataset, model: &Model, path: &Path, now: SystemTime) -> Result<Vec<Value>, Error> {
-    let mut cases = prepare_for_project(dataset, model, "preview", path, now)?;
+    let mut cases = prepare_for_project(dataset, model, PREVIEW_PROJECT, path, now)?;
     for case in &mut cases {
-        finish_row_for_project(case, "preview")?;
+        finish_row_for_project(case, PREVIEW_PROJECT)?;
     }
     Ok(cases.into_iter().map(|case| case.row).collect())
 }
