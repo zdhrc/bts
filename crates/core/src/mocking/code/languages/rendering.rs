@@ -645,7 +645,7 @@ function _len(value: unknown): number {
     throw new TypeError("len requires a list or string");
 }
 
-function _index<T>(value: T[], key: number): T;
+function _index<T>(value: T[], key: unknown): T;
 function _index(value: unknown, key: unknown): unknown;
 function _index(value: unknown, key: unknown): unknown {
     if (Array.isArray(value)) {
@@ -657,6 +657,8 @@ function _index(value: unknown, key: unknown): unknown {
     return _field(value, key);
 }
 
+function _slice<T>(value: T[], start: unknown, end: unknown): T[];
+function _slice(value: unknown, start: unknown, end: unknown): unknown[];
 function _slice(value: unknown, start: unknown, end: unknown): unknown[] {
     if (!Array.isArray(value)) throw new TypeError("slice requires a list");
     return value.slice(start === null ? 0 : _count(start), end === null ? value.length : _count(end));
@@ -670,7 +672,7 @@ function _integer(value: unknown): number {
     return value;
 }
 
-function _arithmetic(op: string, left: unknown, right: unknown): number | _Float {
+function _arithmetic(op: string, left: unknown, right: unknown): number {
     if (_is_float(left) || _is_float(right)) {
         const a = _num(left), b = _num(right);
         if ((op === "/" || op === "%") && b === 0) throw new RangeError("division by zero");
@@ -1074,8 +1076,8 @@ function validate_input(value: unknown, schema: any, path = "input"): any {
     throw new TypeError(path + " must be a " + schema.type);
 }
 function checked_number(value: number): number { return _num(value); }
-function remainder(left: unknown, right: unknown): number | _Float { return _arithmetic("%", left, right); }
-function divide(left: unknown, right: unknown): number | _Float { return _arithmetic("/", left, right); }
+function remainder(left: unknown, right: unknown): number { return _arithmetic("%", left, right); }
+function divide(left: unknown, right: unknown): number { return _arithmetic("/", left, right); }
 
 class ExecutionContext {
     current: Span | null = null;
@@ -1088,7 +1090,7 @@ class ExecutionContext {
     pick(count: number): number { return _pick(count, this.random); }
     chance(probability: number): boolean { return _include(probability, this.random); }
     randomText(alphabet: string, length: number): string { return _random_text(alphabet, length, this.random); }
-    sample(distribution: string, parameters: number[]): number | _Float { return _sample(distribution, parameters, this.random); }
+    sample(distribution: string, parameters: number[]): number { return _sample(distribution, parameters, this.random); }
     trace(name: string, kind: string, key: string | null = null): Span {
         const span = new Span(name, kind, this.current, this.logger, key);
         span.context = this; span.parent = this.current;
@@ -1558,9 +1560,10 @@ class _Float {
     value: number;
     constructor(value: number) { this.value = value; }
 }
-function _float(value: number): _Float {
+// a float keeps its kind in a wrapper, which reads as a number wherever a number is expected
+function _float(value: number): number {
     if (!Number.isFinite(value)) throw new RangeError("non-finite result");
-    return new _Float(value);
+    return new _Float(value) as unknown as number;
 }
 function _is_float(value: unknown): boolean {
     return value instanceof _Float || (typeof value === "number" && !Number.isInteger(value));
@@ -1620,7 +1623,7 @@ function _contains(target: unknown, needle: unknown): boolean {
 }
 function _starts_with(text: unknown, prefix: unknown): boolean { return _string(text).startsWith(_string(prefix)); }
 function _ends_with(text: unknown, suffix: unknown): boolean { return _string(text).endsWith(_string(suffix)); }
-function _clamp(value: unknown, low: unknown, high: unknown): number | _Float {
+function _clamp(value: unknown, low: unknown, high: unknown): number {
     const number = _num(value), min = _num(low), max = _num(high);
     if (min > max) throw new RangeError("clamp bounds are out of order");
     const result = Math.min(Math.max(number, min), max);
@@ -1629,13 +1632,13 @@ function _clamp(value: unknown, low: unknown, high: unknown): number | _Float {
 function _round(value: unknown): number { const number = _num(value), magnitude = Math.abs(number), base = Math.floor(magnitude); const rounded = base + (magnitude - base >= 0.5 ? 1 : 0); return _integer(number >= 0 ? rounded : -rounded); }
 function _floor(value: unknown): number { return _integer(Math.floor(_num(value))); }
 function _ceil(value: unknown): number { return _integer(Math.ceil(_num(value))); }
-function _abs(value: unknown): number | _Float { const result = Math.abs(_num(value)); return _is_float(value) ? _float(result) : result; }
-function _extreme(values: unknown[], maximum: number): number | _Float {
+function _abs(value: unknown): number { const result = Math.abs(_num(value)); return _is_float(value) ? _float(result) : result; }
+function _extreme(values: unknown[], maximum: number): number {
     const numbers = values.map(_num);
     const result = numbers.reduce((a, b) => maximum ? Math.max(a, b) : Math.min(a, b));
     return values.some(_is_float) ? _float(result) : result;
 }
-function _range(low: number, high: number, integer: number, randomSource: () => number): number | _Float {
+function _range(low: number, high: number, integer: number, randomSource: () => number): number {
     _num(low); _num(high);
     const draw = _draw(randomSource);
     return integer ? _integer(Math.min(high, low + Math.floor(draw * (high - low + 1)))) : _float(low * (1 - draw) + high * draw);
@@ -1675,7 +1678,7 @@ function _log_factorial(value: number): number {
     const x = value + 1;
     return (x-0.5)*Math.log(x)-x+0.9189385332046727 + 1/(12*x) - 1/(360*x*x*x);
 }
-function _sample(kind: string, args: number[], randomSource: () => number): number | _Float {
+function _sample(kind: string, args: number[], randomSource: () => number): number {
     let value: number;
     if (kind === "normal") value = args[0] + args[1] * _normal(randomSource);
     else if (kind === "lognormal") value = args[0] * Math.exp(args[1] * _normal(randomSource));
