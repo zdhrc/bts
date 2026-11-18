@@ -76,7 +76,8 @@ pub(crate) fn protected_ranges(text: &str, terms: &[String]) -> Vec<std::ops::Ra
             .chars()
             .any(|c| c.is_numeric() || matches!(c, '@' | '/' | '\\' | '_' | '-' | ':' | '.' | '=' | '{' | '}'))
         {
-            ranges.push(start..start + token.len());
+            // the marks that close a sentence after the token are not part of it
+            ranges.push(start..start + core.len());
         }
         offset = start + token.len();
     }

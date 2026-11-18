@@ -163,7 +163,7 @@ pub const SOURCE: Source<'static> = Source {
     }}},
     # plain is the sentence as its grammar reads, and text is that or the way of the speaker that leads to it
     plain: {type: "string", value: realize(self.clause)},
-    text: {type: "string", value: context.speaker == null ? self.plain : vary(self.plain, context.speaker.wording, context.draws)},
+    text: {type: "string", value: context.speaker == null ? self.plain : vary(self.clause, context.speaker.wording, context.draws)},
     gives: {type: "string", value: self.text},
 }
     -[:extends]->(walk)

@@ -1195,6 +1195,59 @@ mod parity {
         ] {
             cases.push(Case::valid(format!("styled {text} {options}"), "vary", json!([text, options])).golden(json!(expected)));
         }
+        // casing and the closing mark belong to the style: every such edit applies, whatever the change budget
+        let texting = json!({"casing":"lowercase","punctuation":"omit_period","max_changes":1});
+        let said = |subject: Value, predicate: Value, rest: Value| {
+            let mut clause = json!({"subject": subject, "predicate": predicate});
+            clause.as_object_mut().unwrap().extend(rest.as_object().unwrap().clone());
+            json!({"clause": clause})
+        };
+        for (sentence, expected) in [
+            // a sentence the provider put into words loses the capital it gave it
+            (
+                said(
+                    json!({"text":"refunds","number":"plural"}),
+                    json!({"verb":"take","complement":"too long"}),
+                    json!({}),
+                ),
+                "refunds take too long",
+            ),
+            (
+                said(
+                    json!({"text":"I","person":"first"}),
+                    json!({"verb":"come","complement":"early"}),
+                    json!({"modal":"should","form":"question"}),
+                ),
+                "should i come early?",
+            ),
+            // a subject written with a capital is a name and keeps it
+            (said(json!({"text":"Ada"}), json!({"verb":"call"}), json!({})), "Ada calls"),
+            // the full stop goes after an identifier as after a word, and the identifier stays as written
+            (
+                said(
+                    json!({"text":"the invoice number"}),
+                    json!({"verb":"be","complement":"INV-20418"}),
+                    json!({}),
+                ),
+                "the invoice number is INV-20418",
+            ),
+            (
+                said(json!({"text":"ZX-42"}), json!({"verb":"be","complement":"late"}), json!({})),
+                "ZX-42 is late",
+            ),
+        ] {
+            cases.push(Case::valid(format!("texted {expected}"), "vary", json!([sentence, texting])).golden(json!(expected)));
+        }
+        for (text, expected) in [
+            // in text handed over as written a name cannot be told from a word, so only reviewed words are lowered
+            ("Refunds take too long.", "Refunds take too long"),
+            ("Thanks. Please check the code ZX-42.", "thanks. please check the code ZX-42"),
+            ("Dr. Maya can help.", "Dr. Maya can help"),
+            // a decimal is not the end of a sentence
+            ("It costs 3.50.", "it costs 3.50."),
+        ] {
+            cases.push(Case::valid(format!("texted {text}"), "vary", json!([text, texting])).golden(json!(expected)));
+        }
         for text in ["You'm", "He'st", "please\u{301}", "Company Inc.", "."] {
             cases.push(
                 Case::valid(

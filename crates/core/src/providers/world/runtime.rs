@@ -52,7 +52,7 @@ def _english_subject(value):
 def _english_verb(value):
     if type(value) is str:
         if value not in _EnglishData.data["verbs"]:
-            raise ValueError("unknown English verb")
+            raise ValueError(f'unknown English verb "{value}", supply its five explicit forms')
         return _EnglishData.data["verbs"][value]
     fields = ["base", "third_person_singular", "past", "past_participle", "present_participle"]
     value = _english_object(value, fields)
@@ -526,7 +526,7 @@ def _english_style_protected(text, terms):
     if quoted is not None: ranges.append((quoted[0], len(text)))
     for match in _english_re.finditer('[^' + _english_space_pattern[1:-1] + ']+', text):
         core = match.group().rstrip('.,!?;)]')
-        if any(c.isnumeric() or c in '@/\\_-:.={}' for c in core): ranges.append((match.start(), match.end()))
+        if any(c.isnumeric() or c in '@/\\_-:.={}' for c in core): ranges.append((match.start(), match.start()+len(core)))
     return ranges
 
 def _english_style_case(source, replacement):
@@ -543,9 +543,11 @@ def _english_style_start(text, start):
 def _english_style_candidates(text, options):
     data = _EnglishData.data['styles']
     protected = _english_style_protected(text, options['protected'])
+    terms = options['protected']
+    cased = _english_style_protected(text, [term for term in terms if _english_ascii_lower(term[:1]) + term[1:] == term or _english_ascii_lower(term[:1]) + term[1:] not in terms])
     edits = []
     def push(rule, start, end, replacement, stage):
-        if text[start:end] != replacement and not any(start < b and a < end for a,b in protected):
+        if text[start:end] != replacement and not any(start < b and a < end for a,b in (cased if rule == 'casing:lowercase' else protected)):
             edit = {'rule':rule, 'start':start, 'end':end, 'replacement':replacement, 'stage':stage}
             if edit not in edits: edits.append(edit)
     lower = _english_ascii_lower(text)
@@ -602,6 +604,14 @@ def _english_style_candidates(text, options):
         if punctuation == 'omit_period' and terminal: push('punctuation:omit_period', end-1, end, '', 3)
         elif punctuation == 'exclamation' and terminal: push('punctuation:exclamation', end-1, end, '!', 3)
         elif punctuation == 'expressive' and (terminal or mark == '!' and not before.endswith('!')): push('punctuation:expressive', end-1, end, '!!', 3)
+    if options['casing'] == 'lowercase' and options.get('realized'):
+        previous = ''
+        for match in _english_re.finditer('[^' + _english_space_pattern[1:-1] + ']+', text):
+            core = match.group().rstrip('.,!?;)]')
+            ordinary = 'A' <= core[:1] <= 'Z' and all('a' <= c <= 'z' for c in core[1:])
+            abbreviated = previous.endswith('.') and _english_ascii_lower(previous[:-1]) in data['abbreviations']
+            if ordinary and not abbreviated and _english_style_start(text, match.start()): push('casing:lowercase', match.start(), match.start()+len(core), _english_ascii_lower(core), 3)
+            previous = match.group()
     if options['casing'] == 'lowercase':
         for pronoun in data['contractions']:
             for match in _english_re.finditer(_english_re.escape(pronoun), text):
@@ -627,16 +637,17 @@ def _english_style(value, options, random, details=False):
     else:
         sentence = _english_sentence(value)
         text = _english_render(sentence, options['rendering'])
+        options['realized'] = True
         for clause in [sentence['clause']] + ([sentence['condition']] if sentence.get('condition') is not None else []):
             subject = clause['subject']['text']
             if _english_ascii_lower(subject) not in ['i','you','he','she','it','we','they']:
                 options['protected'] += [subject, _english_style_case('A', subject)]
     budget, edits, gate = int(options['max_changes']), [], None
-    for stage in range(5):
-        if budget == 0: break
+    for stage in range(5 if budget else 0):
+        if budget == 0 and stage != 3: continue
         candidates = [e for e in _english_style_candidates(text, options) if e['stage'] == stage]
         if not candidates: continue
-        limit = budget
+        limit = len(candidates) if stage == 3 else budget
         if stage < 4:
             if gate is None: gate = options['probability'] == 1 or options['probability'] > 0 and random() < options['probability']
             if not gate: continue
@@ -646,7 +657,7 @@ def _english_style(value, options, random, details=False):
             if limit == 0 or probability == 0 or probability < 1 and random() >= probability: continue
         for _ in range(limit):
             if not candidates: break
-            index = 0 if len(candidates) == 1 else min(len(candidates)-1, int(random()*len(candidates)))
+            index = 0 if stage == 3 or len(candidates) == 1 else min(len(candidates)-1, int(random()*len(candidates)))
             edit = candidates.pop(index)
             start,end,replacement = edit['start'],edit['end'],edit['replacement']
             candidates = [e for e in candidates if not (start < e['end'] and e['start'] < end)]
@@ -655,7 +666,7 @@ def _english_style(value, options, random, details=False):
                 if other['start'] >= end: other['start'] += difference; other['end'] += difference
             edits.append({'rule':edit['rule'],'range':{'start':len(text[:start].encode('utf-8')),'end':len(text[:end].encode('utf-8'))},'replacement':replacement,'stage':edit['stage']})
             text = text[:start] + replacement + text[end:]
-            budget -= 1
+            if stage != 3: budget -= 1
     return {'text':text,'edits':edits} if details else text
 
 def _english_expression_ids(values):
@@ -999,7 +1010,7 @@ function _englishSubject(value: any): any {
 }
 function _englishVerb(value: any): any {
     if (typeof value === "string") {
-        if (!Object.hasOwn(_englishData.verbs, value)) throw new Error("unknown English verb");
+        if (!Object.hasOwn(_englishData.verbs, value)) throw new Error(`unknown English verb "${value}", supply its five explicit forms`);
         return _englishData.verbs[value];
     }
     const fields = ["base", "third_person_singular", "past", "past_participle", "present_participle"];
@@ -1439,7 +1450,7 @@ function _englishStyleProtected(text: string, terms: string[]): [number,number][
     if (quoted !== null) ranges.push([quoted[0],text.length]);
     for (const match of text.matchAll(new RegExp('[^'+_englishSpace.slice(1,-1)+']+', 'gu'))) {
         const core = match[0].replace(/[.,!?;)\]]+$/u, '');
-        if (/[\p{N}@/\\_\-:.={}]/u.test(core)) ranges.push([match.index!,match.index!+match[0].length]);
+        if (/[\p{N}@/\\_\-:.={}]/u.test(core)) ranges.push([match.index!,match.index!+core.length]);
     }
     return ranges;
 }
@@ -1456,8 +1467,10 @@ function _englishStyleStart(text: string, start: number): boolean {
 }
 function _englishStyleCandidates(text: string, options: any): any[] {
     const data = _englishData.styles, protectedRanges = _englishStyleProtected(text, options.protected), edits: any[] = [];
+    const lowered = (term: string) => _englishAsciiLower(term.slice(0,1))+term.slice(1);
+    const casedRanges = _englishStyleProtected(text, options.protected.filter((term: string) => lowered(term) === term || !options.protected.includes(lowered(term))));
     const push = (rule: string, start: number, end: number, replacement: string, stage: number) => {
-        if (text.slice(start,end) !== replacement && !protectedRanges.some(([a,b]) => start < b && a < end)) {
+        if (text.slice(start,end) !== replacement && !(rule === 'casing:lowercase' ? casedRanges : protectedRanges).some(([a,b]) => start < b && a < end)) {
             const edit = {rule,start,end,replacement,stage};
             if (!edits.some(e => e.rule === rule && e.start === start && e.end === end && e.replacement === replacement && e.stage === stage)) edits.push(edit);
         }
@@ -1520,6 +1533,15 @@ function _englishStyleCandidates(text: string, options: any): any[] {
         else if (options.punctuation === 'exclamation' && terminal) push('punctuation:exclamation',end-1,end,'!',3);
         else if (options.punctuation === 'expressive' && (terminal || mark === '!' && !before.endsWith('!'))) push('punctuation:expressive',end-1,end,'!!',3);
     }
+    if (options.casing === 'lowercase' && options.realized) {
+        let previous = '';
+        for (const match of text.matchAll(new RegExp('[^'+_englishSpace.slice(1,-1)+']+', 'gu'))) {
+            const core = match[0].replace(/[.,!?;)\]]+$/u, '');
+            const abbreviated = previous.endsWith('.') && data.abbreviations.includes(_englishAsciiLower(previous.slice(0,-1)));
+            if (/^[A-Z][a-z]*$/.test(core) && !abbreviated && _englishStyleStart(text,match.index!)) push('casing:lowercase',match.index!,match.index!+core.length,_englishAsciiLower(core),3);
+            previous = match[0];
+        }
+    }
     if (options.casing === 'lowercase') for (const pronoun of data.contractions) {
         let start = text.indexOf(pronoun);
         while (start >= 0) {
@@ -1552,6 +1574,7 @@ function _englishStyle(value: any, supplied: any, random: () => number, details 
     else {
         const sentence = _englishSentence(value);
         text = _englishRender(sentence,options.rendering);
+        options.realized = true;
         for (const clause of [sentence.clause,...(sentence.condition != null ? [sentence.condition] : [])]) {
             const subject = clause.subject.text;
             if (!['i','you','he','she','it','we','they'].includes(_englishAsciiLower(subject))) options.protected.push(subject,_englishStyleCase('A',subject));
@@ -1559,11 +1582,11 @@ function _englishStyle(value: any, supplied: any, random: () => number, details 
     }
     const edits: any[] = [];
     let budget = options.max_changes, gate: boolean | null = null;
-    for (let stage=0; stage<=4; stage++) {
-        if (!budget) break;
+    for (let stage=0; options.max_changes && stage<=4; stage++) {
+        if (!budget && stage !== 3) continue;
         let candidates = _englishStyleCandidates(text,options).filter(e => e.stage === stage);
         if (!candidates.length) continue;
-        let limit = budget;
+        let limit = stage === 3 ? candidates.length : budget;
         if (stage < 4) {
             if (gate === null) gate = options.probability === 1 || options.probability > 0 && random() < options.probability;
             if (!gate) continue;
@@ -1574,14 +1597,14 @@ function _englishStyle(value: any, supplied: any, random: () => number, details 
         }
         for (let i=0; i<limit; i++) {
             if (!candidates.length) break;
-            const index = candidates.length === 1 ? 0 : Math.min(candidates.length-1,Math.floor(random()*candidates.length));
+            const index = stage === 3 || candidates.length === 1 ? 0 : Math.min(candidates.length-1,Math.floor(random()*candidates.length));
             const edit = candidates.splice(index,1)[0], {start,end,replacement} = edit;
             candidates = candidates.filter(e => !(start < e.end && e.start < end));
             const difference = replacement.length-(end-start);
             for (const other of candidates) if (other.start >= end) {other.start += difference; other.end += difference;}
             edits.push({rule:edit.rule,range:{start:new TextEncoder().encode(text.slice(0,start)).length,end:new TextEncoder().encode(text.slice(0,end)).length},replacement,stage:edit.stage});
             text = text.slice(0,start)+replacement+text.slice(end);
-            budget--;
+            if (stage !== 3) budget--;
         }
     }
     return details ? {text,edits} : text;
