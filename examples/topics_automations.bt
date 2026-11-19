@@ -1,7 +1,7 @@
 # later messages can reverse an earlier cancellation threat
 (catalog:vars) {
-    conversations: [|
-        [|
+    conversations: [
+        [
             {role: "user", content: "Can you put our VAT number on future invoices?"},
             {
                 role: "assistant",
@@ -9,8 +9,8 @@
             },
             {role: "user", content: "Found it, thanks. That's all I needed."},
             {role: "assistant", content: "You're welcome. Your tax ID is saved."},
-        |],
-        [|
+        ],
+        [
             {
                 role: "user",
                 content: "We've been charged for the same seats twice. This is my third ticket about it.",
@@ -27,8 +27,8 @@
                 role: "assistant",
                 content: "I've escalated the refund request to billing. I can't confirm a refund date yet.",
             },
-        |],
-        [|
+        ],
+        [
             {
                 role: "user",
                 content: "Nobody can sign in after we enabled SSO. We're losing time and I'm ready to cancel.",
@@ -44,8 +44,8 @@
             },
             {role: "user", content: "Thanks for sticking with us. We'll keep the rollout going."},
             {role: "assistant", content: "Glad we could get your team working again."},
-        |],
-        [|
+        ],
+        [
             {
                 role: "user",
                 content: "Our renewal is 40% higher, but half those seats haven't been used in months.",
@@ -62,8 +62,8 @@
                 role: "assistant",
                 content: "I've asked your account manager to review the plan and contact you before Friday.",
             },
-        |],
-        [|
+        ],
+        [
             {
                 role: "user",
                 content: "We decided to leave. Please export our conversation history and cancel the subscription at month end.",
@@ -80,28 +80,28 @@
                 role: "assistant",
                 content: "Yes. You'll receive the conversations and their attachments before cancellation takes effect.",
             },
-        |],
-    |]
+        ],
+    ]
 };
 
 ("subscription-support_agent":agent {name: "subscription-support"}) {input: catalog.conversations[range(0, 4)], output: ("subscription-support").output};
 
-("subscription-support_agent")-[:next]->("subscription-support");
+("subscription-support_agent")-|:next|->("subscription-support");
 ("subscription-support":task) {
     input: ("subscription-support_agent").input,
     output: ("subscription-support").local.turns[len (("subscription-support").local.turns) - 1],
     metadata: {conversation_id: uuid (), channel: "web-chat"},
-    tags: [|"support", "subscriptions"|],
+    tags: ["support", "subscriptions"],
     local: {turns: ("subscription-support_agent").input}
 };
 
-("subscription-support") =[:repeat {count: len (("subscription-support").local.turns) / 2}]=>[-[:calls]->(turn)];
+("subscription-support") =|:repeat {count: len (("subscription-support").local.turns) / 2}|=>[-|:calls|->(turn)];
 (turn:task) {
     input: ("subscription-support").local.turns[context.index * 2],
     output: ("subscription-support").local.turns[context.index * 2 + 1]
 };
 
-(turn)-[:calls]->("draft-reply");
+(turn)-|:calls|->("draft-reply");
 ("draft-reply":llm) {
     input: ("subscription-support").local.turns[: context.index * 2 + 1],
     output: turn.output,
@@ -117,7 +117,7 @@
 
 ("subscription-topics":automation) {
     type: "topics",
-    facets: [|"Retention signals"|],
+    facets: ["Retention signals"],
     scope: "trace",
     sampling_rate: 1,
     enabled: true

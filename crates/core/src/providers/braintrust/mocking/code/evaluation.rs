@@ -344,17 +344,17 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(task_root:task {name: "task"}) {input: task.input, output: self.input};
 (task:agent) {input: "hello", output: task_root.output};
-(task)-[:next]->(task_root);
+(task)-|:next|->(task_root);
 (dataset_cases_one:case {name: "one"}) {input: "hello"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
 ("first":scorer {file: "a-b"}) {score: 1};
 ("second":scorer {file: "a_b"}) {score: 0.5};
 ("judge-a":scorer) {judge: {model: "gpt-4o-mini", prompt: "Check ${context.output}", options: {yes: 1, no: 0}}};
 ("judge_a":scorer) {judge: {model: "gpt-4o-mini", prompt: "Check ${context.output}", options: {yes: 1, no: 0}}};
 ("safe":scorer) {score: 1};
-(experiment_code:experiment {name: "code"}) {task: (task_root), dataset: (dataset_cases), scorers: [|("first")|]};
-(experiment_judge:experiment {name: "judge"}) {task: (task_root), dataset: (dataset_cases), scorers: [|("judge-a")|]};
-(experiment_safe:experiment {name: "safe"}) {task: (task_root), dataset: (dataset_cases), scorers: [|("safe")|]};"#,
+(experiment_code:experiment {name: "code"}) {task: (task_root), dataset: (dataset_cases), scorers: [("first")]};
+(experiment_judge:experiment {name: "judge"}) {task: (task_root), dataset: (dataset_cases), scorers: [("judge-a")]};
+(experiment_safe:experiment {name: "safe"}) {task: (task_root), dataset: (dataset_cases), scorers: [("safe")]};"#,
         )
         .unwrap();
         for lang in [ScorerLang::Python, ScorerLang::Typescript] {
@@ -378,15 +378,15 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(task_root:task {name: "task"}) {input: task.input, output: self.input};
 (task:agent) {input: "hello", output: task_root.output};
-(task)-[:next]->(task_root);
+(task)-|:next|->(task_root);
 (dataset_cases_one:case {name: "one"}) {input: "hello"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
 ("quality":scorer) {score: 1};
 ("coverage":scorer {file: "quality"}) {score: 0.5};
 ("length":scorer {file: "quality"}) {score: 0.75};
 ("unrelated":scorer) {score: 0};
-(experiment_first:experiment {name: "first"}) {task: (task_root), dataset: (dataset_cases), scorers: [|("quality")|]};
-(experiment_second:experiment {name: "second"}) {task: (task_root), dataset: (dataset_cases), scorers: [|("coverage")|]};"#,
+(experiment_first:experiment {name: "first"}) {task: (task_root), dataset: (dataset_cases), scorers: [("quality")]};
+(experiment_second:experiment {name: "second"}) {task: (task_root), dataset: (dataset_cases), scorers: [("coverage")]};"#,
         )
         .unwrap();
         for lang in [ScorerLang::Python, ScorerLang::Typescript] {
@@ -460,15 +460,15 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(baseline_root:task {name: "baseline"}) {input: baseline.input, output: "baseline"};
 (baseline:agent) {input: "question", output: baseline_root.output};
-(baseline)-[:next]->(baseline_root);
+(baseline)-|:next|->(baseline_root);
 (candidate_root:task {name: "candidate"}) {input: candidate.input, output: "candidate"};
 (candidate:agent) {input: "question", output: candidate_root.output};
-(candidate)-[:next]->(candidate_root);
+(candidate)-|:next|->(candidate_root);
 (dataset_cases_one:case {name: "one"}) {input: "question", expected: "answer"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
 ("helpful":scorer) {judge: {model: "gpt-4o-mini", prompt: "Check ${context.output} for ${context.input}", options: {yes: 1, no: 0}}};
-(experiment_candidate:experiment {name: "candidate"}) {dataset: (dataset_cases), task: (candidate_root), scorers: [|("helpful")|], baseline: (experiment_baseline)};
-(experiment_baseline:experiment {name: "baseline"}) {dataset: (dataset_cases), task: (baseline_root), scorers: [|("helpful")|]};"#,
+(experiment_candidate:experiment {name: "candidate"}) {dataset: (dataset_cases), task: (candidate_root), scorers: [("helpful")], baseline: (experiment_baseline)};
+(experiment_baseline:experiment {name: "baseline"}) {dataset: (dataset_cases), task: (baseline_root), scorers: [("helpful")]};"#,
         )
         .unwrap();
         for lang in [ScorerLang::Python, ScorerLang::Typescript] {

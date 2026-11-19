@@ -107,7 +107,7 @@ fn preserves_native_seeded_samples() {
             output: {
                 integer: range(-10, 10),
                 choice: choice("alpha", "beta", "gamma"),
-                weighted: weighted([|"steady", 3|], [|"burst", 1|]),
+                weighted: weighted(["steady", 3], ["burst", 1]),
                 chance: chance(0.5),
                 uuid: uuid(),
                 hex: hex(8),
@@ -115,7 +115,7 @@ fn preserves_native_seeded_samples() {
             },
         };
         (sampler:agent) {input: null, output: sampling.output};
-        (sampler)-[:next]->(sampling);
+        (sampler)-|:next|->(sampling);
     "#;
     // captured from the original 64-bit native generator
     let expected = [
@@ -215,21 +215,21 @@ fn language_composition_is_seeded_and_preserves_structure() {
     let source = r#"
 (language:task) {
     input: author.input,
-    local: {selected: sample([|0, 1, 2, 3, 4, 5|], 3)},
+    local: {selected: sample([0, 1, 2, 3, 4, 5], 3)},
     output: {
         rendered: render("{{{name}}}: {n} {ok} {name}", {name: "Zoë", n: 2, ok: true}),
         literal: render("{text}", {text: "{untouched}"}),
-        composed: compose([|null, "", "hello", " world "|]),
-        nested: compose([|"Hi!", compose(sample([|"one", "two"|], 2), ", ")|]),
-        empty: compose([|null, ""|]),
+        composed: compose([null, "", "hello", " world "]),
+        nested: compose(["Hi!", compose(sample(["one", "two"], 2), ", ")]),
+        empty: compose([null, ""]),
         selected: self.local.selected,
         reused: self.local.selected,
-        duplicates: sample([|"same", "same"|], 2),
-        zero: sample([||], 0),
+        duplicates: sample(["same", "same"], 2),
+        zero: sample([], 0),
     },
 };
 (author:agent) {input: null, output: language.output};
-(author)-[:next]->(language);
+(author)-|:next|->(language);
 "#;
     let generate = || {
         data::generate(
@@ -281,16 +281,16 @@ fn language_composition_rejects_invalid_values() {
         r#"render("{name", { name: "x" })"#,
         r#"render("x}", {})"#,
         r#"render("{name}", { name: null })"#,
-        r#"render("{name}", { name: [||] })"#,
-        "compose([|false|])",
-        "compose([|1|])",
-        "compose([|{}|])",
-        "sample([|1|], -1)",
-        "sample([|1|], 2)",
-        "sample([|1|], 1.0)",
+        r#"render("{name}", { name: [] })"#,
+        "compose([false])",
+        "compose([1])",
+        "compose([{}])",
+        "sample([1], -1)",
+        "sample([1], 2)",
+        "sample([1], 1.0)",
     ] {
         let source = format!(
-            "(t:task) {{input: a.input, output: {expression}}}; (a:agent) {{input: null, output: t.output}}; (a)-[:next]->(t);"
+            "(t:task) {{input: a.input, output: {expression}}}; (a:agent) {{input: null, output: t.output}}; (a)-|:next|->(t);"
         );
         let model = compile(&source).unwrap();
         assert!(

@@ -1,33 +1,33 @@
 # independent workers produce findings that are collected in a stable order
 (digest:agent) {input: "Summarize last week's incident reports.", output: reduce_reports.output};
-(digest)-[:next]->(request:task {name: "incident-digest"}) {
+(digest)-|:next|->(request:task {name: "incident-digest"}) {
     input: digest.input,
     output: reduce_reports.output,
     metadata: {batch_id: format("batch_{}", hex(8))},
-    tags: [|"batch"|],
+    tags: ["batch"],
 };
 (request)
-    =[:parallel]=>[
-        -[database_report:calls]->(database:llm {name: "summarize_report"}) {
+    =|:parallel|=>[
+        -|database_report:calls|->(database:llm {name: "summarize_report"}) {
             input: "Sev-1: checkout errors spiked at 09:14. Database connections stayed at the limit until the pool was resized.",
             output: {report: "database", summary: "Connection pool exhausted during peak traffic.", severity: 1},
             duration: range(0.4, 1.2),
             metadata: {model: "gpt-4o-mini", provider: "openai"},
         },
-        -[deploy_report:calls]->(deploy:llm {name: "summarize_report"}) {
+        -|deploy_report:calls|->(deploy:llm {name: "summarize_report"}) {
             input: "Sev-2: 5xx rates climbed after the 14:00 deploy. Aggressive client retries amplified the load.",
             output: {report: "deployment", summary: "Retry storm after Tuesday's deploy.", severity: 2},
             duration: range(0.6, 1.5),
             metadata: {model: "gpt-4o-mini", provider: "openai"},
         },
-        -[queue_report:calls]->(queue:llm {name: "summarize_report"}) {
+        -|queue_report:calls|->(queue:llm {name: "summarize_report"}) {
             input: "Sev-2: a batch export saturated the worker queue. Interactive requests recovered after batch work was paused.",
             output: {report: "workers", summary: "Batch exports starved interactive requests.", severity: 2},
             duration: range(0.3, 0.9),
             metadata: {model: "gpt-4o-mini", provider: "openai"},
         },
     ]
-        >[:accumulate {observe: "result"} [database_report], [deploy_report], [queue_report]]>>(reduce_reports:task {name: "reduce"}) {
+        >|:accumulate {observe: "result"} |database_report|, |deploy_report|, |queue_report||>>(reduce_reports:task {name: "reduce"}) {
             input: context.arrivals,
             output: {reports: self.input, summary: "Three incidents exposed capacity limits in the database, retry policy and worker queue."},
         };

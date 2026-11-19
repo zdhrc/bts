@@ -328,17 +328,17 @@ mod tests {
     #[test]
     fn materializes_nested_spans_and_fields() {
         let model = compile(
-            r#"(support_sessions_root:task {name: "support-sessions"}) {tags: [|"chat", "prod"|], local: {system: """
+            r#"(support_sessions_root:task {name: "support-sessions"}) {tags: ["chat", "prod"], local: {system: """
                     You are a concise personal finance assistant.
                     Answer briefly.
                     """, meta: {model: "gpt-4o-mini", temperature: 0.2}}, input: support_sessions.input};
 (turn_0:task {name: "turn_0"}) {input: "How did NVDA do today?"};
-(Chat_Completion:llm {name: "Chat Completion"}) {input: [|{role: "system", content: support_sessions_root.local.system}, {role: "user", content: turn_0.input},|], output: {role: "assistant", content: "NVDA closed down 1.4% at $207.40."}, metadata: support_sessions_root.local.meta, metrics: {prompt_tokens: 612, completion_tokens: 24, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}};
+(Chat_Completion:llm {name: "Chat Completion"}) {input: [{role: "system", content: support_sessions_root.local.system}, {role: "user", content: turn_0.input},], output: {role: "assistant", content: "NVDA closed down 1.4% at $207.40."}, metadata: support_sessions_root.local.meta, metrics: {prompt_tokens: 612, completion_tokens: 24, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}};
 (turn_1:task {name: "turn_1"}) {};
 (Chat_Completion_1:llm {name: "Chat Completion"}) {metadata: support_sessions_root.local.meta};
 (support_sessions:agent) {input: null, output: null};
-(support_sessions)-[:next]->(support_sessions_root)-[:calls]->(turn_0)-[:calls]->(Chat_Completion);
-(turn_0)-[:next]->(turn_1)-[:calls]->(Chat_Completion_1);"#,
+(support_sessions)-|:next|->(support_sessions_root)-|:calls|->(turn_0)-|:calls|->(Chat_Completion);
+(turn_0)-|:next|->(turn_1)-|:calls|->(Chat_Completion_1);"#,
         )
         .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
@@ -407,7 +407,7 @@ mod tests {
         let source = r#"(example_root:task {name: "example"}) {expected: "4", error: {message: "timeout"}, input: example.input};
 (step:task {name: "step"}) {};
 (example:agent) {input: null, output: null};
-(example)-[:next]->(example_root)-[:calls]->(step);"#;
+(example)-|:next|->(example_root)-|:calls|->(step);"#;
         let model = compile(source).unwrap();
         let events = materialize(
             plan(model, 1, 0).unwrap(),
@@ -465,7 +465,7 @@ mod tests {
 (b:task {name: "b"}) {};
 (c:llm {name: "c"}) {duration: 1.5};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root)-[:calls]->(a)-[:next]->(b)-[:calls]->(c);"#;
+(t)-|:next|->(t_root)-|:calls|->(a)-|:next|->(b)-|:calls|->(c);"#;
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
@@ -514,7 +514,7 @@ mod tests {
 (b:task {name: "b"}) {duration: 2, wait: 30};
 (c:task {name: "c"}) {duration: 2, wait: 0};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root)-[:calls]->(a)-[:next]->(b)-[:next]->(c);"#;
+(t)-|:next|->(t_root)-|:calls|->(a)-|:next|->(b)-|:next|->(c);"#;
         let events = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
             Duration::from_secs(3_600),
@@ -549,7 +549,7 @@ mod tests {
     fn rejects_windows_shorter_than_the_longest_trace() {
         let source = r#"(t_root:task {name: "t"}) {duration: 7200, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let error = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
             Duration::from_secs(3_600),
@@ -566,7 +566,7 @@ mod tests {
         let model = compile(
             r#"(example_root:task {name: "example"}) {input: example.input};
 (example:agent) {input: null, output: null};
-(example)-[:next]->(example_root);"#,
+(example)-|:next|->(example_root);"#,
         )
         .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
@@ -591,7 +591,7 @@ mod tests {
         let model = compile(
             r#"(example_root:task {name: "example"}) {input: example.input};
 (example:agent) {input: null, output: null};
-(example)-[:next]->(example_root);"#,
+(example)-|:next|->(example_root);"#,
         )
         .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);

@@ -221,9 +221,9 @@ impl<'src> Parser<'src> {
         let start = self.peek().range.start;
         let indent = self.graph_indent()?;
         self.expect(token!(Equals), ErrorKind::UnexpectedToken)?;
-        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
         let header = self.parse_graph_header()?;
-        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
         self.expect(token!(FatArrow), ErrorKind::UnexpectedToken)?;
         self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
         let mut entries = Vec::new();
@@ -303,7 +303,7 @@ impl<'src> Parser<'src> {
     fn parse_junction(&mut self) -> Option<GraphJunction> {
         let start = self.peek().range.start;
         self.expect(token!(Gt), ErrorKind::UnexpectedToken)?;
-        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
         self.expect(token!(Colon), ErrorKind::ExpectedGraphKind)?;
         let kind_range = self.peek().range;
         let kind = self.expect(token!(Ident(value)), ErrorKind::ExpectedGraphKind)?;
@@ -313,10 +313,12 @@ impl<'src> Parser<'src> {
             None
         };
         let mut inputs = vec![self.parse_qualified_edge_reference()?];
-        while self.consume(token!(Comma)).is_some() && !self.check(token!(RBrack)) {
+        while self.consume(token!(Comma)).is_some()
+            && !(self.check(token!(Pipe)) && self.peek_ahead().kind == TokenKind::Junction)
+        {
             inputs.push(self.parse_qualified_edge_reference()?);
         }
-        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
         self.expect(token!(Junction), ErrorKind::UnexpectedToken)?;
         let target = self.parse_graph_node()?;
         let end = self.tokens[self.index - 1].range.end;
@@ -335,13 +337,13 @@ impl<'src> Parser<'src> {
             return self.parse_pattern_reference();
         }
         let start = self.peek().range.start;
-        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
         let mut expr = self.parse_graph_reference(start, GraphReferenceKind::Edge)?;
         while self.consume(token!(Dot)).is_some() {
-            self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+            self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
             let name = self.parse_graph_name()?;
             let end = self.peek().range.end;
-            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+            self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
             expr = Expr::new(
                 ExprKind::GraphMember {
                     target: Box::new(expr),
@@ -366,12 +368,12 @@ impl<'src> Parser<'src> {
         while matches!(self.peek().kind, TokenKind::Minus | TokenKind::Tilde) {
             let step_start = self.peek().range.start;
             let cycle = self.next().kind == TokenKind::Tilde;
-            self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+            self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
             let mut edges = vec![self.parse_pattern_constraint()?];
-            while self.consume(token!(Comma)).is_some() && !self.check(token!(RBrack)) {
+            while self.consume(token!(Comma)).is_some() && !self.check(token!(Pipe)) {
                 edges.push(self.parse_pattern_constraint()?);
             }
-            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+            self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
             let direction = self.parse_connection_direction(cycle)?;
             let target = self.parse_pattern_node()?;
             selections += edges.iter().filter(|edge| edge.selected).count() + selected_node(&target);
@@ -533,12 +535,12 @@ impl<'src> Parser<'src> {
     fn parse_graph_edge(&mut self) -> Option<GraphEdgeStep> {
         let start = self.peek().range.start;
         let cycle = self.next().kind == TokenKind::Tilde;
-        self.expect(token!(LBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
         let mut edges = vec![self.parse_graph_header()?];
-        while self.consume(token!(Comma)).is_some() && !self.check(token!(RBrack)) {
+        while self.consume(token!(Comma)).is_some() && !self.check(token!(Pipe)) {
             edges.push(self.parse_graph_header()?);
         }
-        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
         let direction = self.parse_connection_direction(cycle)?;
         let target = self.parse_graph_node()?;
         let end = self.tokens[self.index - 1].range.end;
@@ -555,7 +557,7 @@ impl<'src> Parser<'src> {
     fn parse_graph_reference(&mut self, start: usize, kind: GraphReferenceKind) -> Option<Expr> {
         let closing = match kind {
             GraphReferenceKind::Node => TokenKind::RParen,
-            GraphReferenceKind::Edge => TokenKind::RBrack,
+            GraphReferenceKind::Edge => TokenKind::Pipe,
         };
         let quoted_name = matches!(self.peek().kind, TokenKind::String(_)) && self.peek_ahead().kind == closing;
         let target = if quoted_name {
@@ -568,7 +570,7 @@ impl<'src> Parser<'src> {
         let end = self.peek().range.end;
         match kind {
             GraphReferenceKind::Node => self.expect(token!(RParen), ErrorKind::UnexpectedToken)?,
-            GraphReferenceKind::Edge => self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?,
+            GraphReferenceKind::Edge => self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?,
         }
         Some(Expr::new(
             ExprKind::GraphRef {
@@ -717,10 +719,10 @@ impl<'src> Parser<'src> {
                 }
                 TokenKind::Dot => {
                     self.next();
-                    if self.consume(token!(LBrack)).is_some() {
+                    if self.consume(token!(Pipe)).is_some() {
                         let name = self.parse_graph_name()?;
                         let end = self.peek().range.end;
-                        self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
+                        self.expect(token!(Pipe), ErrorKind::UnexpectedToken)?;
                         let start = expr.range.start;
                         expr = Expr::new(
                             ExprKind::GraphMember {
@@ -822,7 +824,7 @@ impl<'src> Parser<'src> {
                 // no ast node for grouping, the widened range keeps diagnostics on the delimiters
                 Some(Expr::new(expr.kind, self.range(start, end)))
             }
-            TokenKind::LBrack => {
+            TokenKind::Pipe => {
                 let start = self.next().range.start;
                 self.parse_graph_reference(start, GraphReferenceKind::Edge)
             }
@@ -872,7 +874,7 @@ impl<'src> Parser<'src> {
                     Some(Expr::new(ExprKind::Ref { path: vec![name] }, range))
                 }
             }
-            TokenKind::ArrayOpen => {
+            TokenKind::LBrack => {
                 let start = self.peek().range.start;
                 self.next();
 
@@ -881,7 +883,7 @@ impl<'src> Parser<'src> {
                 }
 
                 let mut values = Vec::new();
-                while !self.check(token!(ArrayClose)) {
+                while !self.check(token!(RBrack)) {
                     let range = self.peek().range;
                     if self.consume(token!(Ellipsis)).is_some() {
                         let operand = self.parse_expr()?;
@@ -896,7 +898,7 @@ impl<'src> Parser<'src> {
                     }
                 }
                 let end = self.peek().range.end;
-                self.expect(token!(ArrayClose), ErrorKind::UnexpectedToken)?;
+                self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
 
                 Some(Expr::new(ExprKind::Array(values), self.range(start, end)))
             }
@@ -936,12 +938,12 @@ impl<'src> Parser<'src> {
         }
     }
 
-    // for is only a keyword right after [| or {, and {for: 1} stays a field
+    // for is only a keyword right after [ or {, and {for: 1} stays a field
     fn at_for_keyword(&self) -> bool {
         matches!(&self.peek().kind, TokenKind::Ident(value) if value == "for") && self.peek_ahead().kind != TokenKind::Colon
     }
 
-    // [|for x in xs : body if cond|] and {for k, v in xs : key => value if cond}
+    // [for x in xs : body if cond] and {for k, v in xs : key => value if cond}
     fn parse_for(&mut self, start: usize, object: bool) -> Option<Expr> {
         self.next();
 
@@ -972,7 +974,7 @@ impl<'src> Parser<'src> {
         if object {
             self.expect(token!(RBrace), ErrorKind::UnexpectedToken)?;
         } else {
-            self.expect(token!(ArrayClose), ErrorKind::UnexpectedToken)?;
+            self.expect(token!(RBrack), ErrorKind::UnexpectedToken)?;
         }
 
         Some(Expr::new(
@@ -1270,7 +1272,7 @@ mod tests {
         };
         assert!(matches!(&operand.kind, ExprKind::Num(value) if value == "0.5"));
 
-        let ExprKind::Array(items) = &parse_value("[|null, -1|]").kind else {
+        let ExprKind::Array(items) = &parse_value("[null, -1]").kind else {
             panic!("expected an array");
         };
         assert!(matches!(items[0].kind, ExprKind::Null));
@@ -1302,7 +1304,7 @@ mod tests {
         };
         assert!(matches!(&expr.kind, ExprKind::Ref { path } if path == &["trace", "index"]));
 
-        let ExprKind::Array(tags) = &parse_value(r#"[|"t-${trace.index}"|]"#).kind else {
+        let ExprKind::Array(tags) = &parse_value(r#"["t-${trace.index}"]"#).kind else {
             panic!("expected an array");
         };
         assert!(matches!(&tags[0].kind, ExprKind::Template(parts) if parts.len() == 2));
@@ -1393,7 +1395,7 @@ mod tests {
         assert!(matches!(&expr.kind, ExprKind::Ref { path } if path == &["var", "meta"]));
         assert_eq!(&source[expr.range.start..expr.range.end], "var.meta");
 
-        let ExprKind::Array(items) = &parse_value("[|var.x, 1|]").kind else {
+        let ExprKind::Array(items) = &parse_value("[var.x, 1]").kind else {
             panic!("expected an array");
         };
         assert!(matches!(&items[0].kind, ExprKind::Ref { path } if path == &["var", "x"]));
@@ -1418,7 +1420,7 @@ mod tests {
 
     #[test]
     fn parses_loop_references_as_paths() {
-        let ExprKind::For { body, .. } = &parse_value("[|for trace in [|1|] : trace|]").kind else {
+        let ExprKind::For { body, .. } = &parse_value("[for trace in [1] : trace]").kind else {
             panic!("expected a for expression");
         };
         assert!(matches!(&body.kind, ExprKind::Ref { path } if path == &["trace"]));
@@ -1520,9 +1522,9 @@ mod tests {
 
     #[test]
     fn parses_indexes_on_literals_and_calls() {
-        assert!(matches!(parse_value("[|1, 2|][0]").kind, ExprKind::Index { .. }));
+        assert!(matches!(parse_value("[1, 2][0]").kind, ExprKind::Index { .. }));
         assert!(matches!(parse_value("{a: 1}.a").kind, ExprKind::Index { .. }));
-        assert!(matches!(parse_value("choice([|1|], [|2|])[0]").kind, ExprKind::Index { .. }));
+        assert!(matches!(parse_value("choice([1], [2])[0]").kind, ExprKind::Index { .. }));
         assert!(matches!(parse_value("${var.xs}[0]").kind, ExprKind::Index { .. }));
     }
 
@@ -1534,18 +1536,18 @@ mod tests {
     #[test]
     fn rejects_accessors_without_a_field_name() {
         assert_error_kinds("var.xs.", &[ErrorKind::ExpectedAccessorField]);
-        // a bracket after a dot selects a graph member by name, not by index
-        assert_first_error("var.xs.[0]", ErrorKind::ExpectedGraphName);
+        // a pipe after a dot selects a graph member by name, not by index
+        assert_first_error("var.xs.|0|", ErrorKind::ExpectedGraphName);
     }
 
     #[test]
     fn parses_arrays_with_optional_trailing_comma() {
-        let ExprKind::Array(empty) = &parse_value("[| |]").kind else {
+        let ExprKind::Array(empty) = &parse_value("[ ]").kind else {
             panic!("expected an array");
         };
         assert!(empty.is_empty());
 
-        let ExprKind::Array(tags) = &parse_value(r#"[|"x", "y",|]"#).kind else {
+        let ExprKind::Array(tags) = &parse_value(r#"["x", "y",]"#).kind else {
             panic!("expected an array");
         };
         assert_eq!(tags.len(), 2);
@@ -1592,7 +1594,7 @@ mod tests {
 
     #[test]
     fn rejects_unclosed_arrays_and_objects() {
-        assert_error_kinds(r#"[|"x""#, &[ErrorKind::UnexpectedToken]);
+        assert_error_kinds(r#"["x""#, &[ErrorKind::UnexpectedToken]);
         assert_error_kinds("{x: 1", &[ErrorKind::UnexpectedToken]);
     }
 
@@ -1728,7 +1730,7 @@ mod tests {
 
     #[test]
     fn parses_operators_inside_arrays_args_and_objects() {
-        let expr = parse_value("[|1 + 2|]");
+        let expr = parse_value("[1 + 2]");
         let ExprKind::Array(items) = &expr.kind else {
             panic!("expected an array");
         };
@@ -1753,8 +1755,8 @@ mod tests {
 
     #[test]
     fn parses_a_missing_comma_between_numbers_as_subtraction() {
-        // [|1 -2|] is subtraction, not two items
-        let expr = parse_value("[|1 -2|]");
+        // [1 -2] is subtraction, not two items
+        let expr = parse_value("[1 -2]");
         let ExprKind::Array(items) = &expr.kind else {
             panic!("expected an array");
         };
@@ -1816,7 +1818,7 @@ mod tests {
 
     #[test]
     fn parses_spread_elements_in_arrays() {
-        let source = "[|1, ...var.xs, 2|]";
+        let source = "[1, ...var.xs, 2]";
         let expr = parse_value(source);
 
         let ExprKind::Array(values) = &expr.kind else {
@@ -1848,12 +1850,12 @@ mod tests {
 
     #[test]
     fn rejects_spreads_without_an_operand() {
-        assert_first_error("[|...|]", ErrorKind::ExpectedExpression);
+        assert_first_error("[...]", ErrorKind::ExpectedExpression);
     }
 
     #[test]
     fn parses_array_for_exprs() {
-        let source = "[|for x in var.xs : x * 2|]";
+        let source = "[for x in var.xs : x * 2]";
         let expr = parse_value(source);
 
         let ExprKind::For {
@@ -1880,7 +1882,7 @@ mod tests {
 
     #[test]
     fn parses_for_exprs_with_two_bindings_and_a_filter() {
-        let expr = parse_value("[|for i, x in var.xs : x if i > 0|]");
+        let expr = parse_value("[for i, x in var.xs : x if i > 0]");
 
         let ExprKind::For { bindings, cond, .. } = &expr.kind else {
             panic!("expected a for expression");
@@ -1903,7 +1905,7 @@ mod tests {
 
     #[test]
     fn parses_nested_for_exprs_with_shadowing_scopes() {
-        let expr = parse_value("[|for x in var.xs : [|for y in x : y|]|]");
+        let expr = parse_value("[for x in var.xs : [for y in x : y]]");
 
         let ExprKind::For { body, .. } = &expr.kind else {
             panic!("expected a for expression");
@@ -1929,19 +1931,19 @@ mod tests {
     fn parses_out_of_scope_refs_for_the_modeler_to_reject() {
         // x is out of scope in the collection and after the for expr, but scoping
         // is the modeler's concern, both parse as plain references
-        assert!(parse("[|for x in x : x|]").is_ok());
-        assert!(parse("[|[|for x in var.xs : x|], x|]").is_ok());
+        assert!(parse("[for x in x : x]").is_ok());
+        assert!(parse("[[for x in var.xs : x], x]").is_ok());
     }
 
     #[test]
     fn rejects_malformed_for_exprs() {
         // a missing binding lands on `in`, which reads as a reserved binding name
-        assert_first_error("[|for in var.xs : 1|]", ErrorKind::ReservedForBinding);
-        assert_first_error("[|for x var.xs : x|]", ErrorKind::ExpectedForIn);
-        assert_first_error("[|for x in var.xs x|]", ErrorKind::ExpectedForColon);
+        assert_first_error("[for in var.xs : 1]", ErrorKind::ReservedForBinding);
+        assert_first_error("[for x var.xs : x]", ErrorKind::ExpectedForIn);
+        assert_first_error("[for x in var.xs x]", ErrorKind::ExpectedForColon);
         assert_first_error("{for k in var.m : k}", ErrorKind::ExpectedForArrow);
-        assert_first_error("[|for self in var.xs : 1|]", ErrorKind::ReservedForBinding);
-        assert_first_error("[|for x, x in var.xs : x|]", ErrorKind::DuplicateForBinding);
+        assert_first_error("[for self in var.xs : 1]", ErrorKind::ReservedForBinding);
+        assert_first_error("[for x, x in var.xs : x]", ErrorKind::DuplicateForBinding);
     }
 
     #[test]

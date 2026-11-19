@@ -25,15 +25,15 @@ pub const SOURCE: Source<'static> = Source {
     # as a step of a walk, a statement gives its text
     gives: {type: "string", value: self.text},
 }
-    -[:extends]->(vars);
+    -|:extends|->(vars);
 
 # a policy is a statement that states a rule
-+(policy:node)-[:extends]->(statement);
++(policy:node)-|:extends|->(statement);
 
 # a speaker gives everything said beneath it a way of talking
 +(speaker:trait {style: {type: "string", default: "conversational"}})
-    -[:on]->(node)
-    -[:provides {speaker: {type: "object", value: {wording: {style: self.props.style}}}}]->(context);
+    -|:on|->(node)
+    -|:provides {speaker: {type: "object", value: {wording: {style: self.props.style}}}}|->(context);
 
 # an intent is something a speaker wants, said a different way each time
 +(intent:node {name: {type: "string", required: true}}) {
@@ -43,8 +43,8 @@ pub const SOURCE: Source<'static> = Source {
         {intent: self.props.name, constructions: self.constructions, families: self.families},
         {speaker: context.speaker})},
 }
-    -[:extends]->(vars)
-    -[:requires {speaker: {type: "object"}}]->(context);
+    -|:extends|->(vars)
+    -|:requires {speaker: {type: "object"}}|->(context);
 
 # a walk is something built by the steps it leads to, and it stands beside an agent
 # the provider visits what leaves each node in the order written, and takes one branch at each fork
@@ -53,12 +53,12 @@ pub const SOURCE: Source<'static> = Source {
 # draws are numbers a kind may sample by, the same in data and in an agent given the seed, and related is what relations join it to
 # a walk that is a step of another gives that walk what its own gives says
 +(walk:node {per: {type: "any", default: null}})
-    -[:requires {
+    -|:requires {
         steps: {type: "array"},
         trace_index: {type: "number"},
         draws: {type: "array"},
         related: {type: "object"},
-    }]->(context);
+    }|->(context);
 
 # a given is a value written down, for a walk to take as it is
 +(given:node {value: {type: "any", required: true}}) {
@@ -75,7 +75,7 @@ pub const SOURCE: Source<'static> = Source {
     value: {type: "any", value: context.steps[0]},
     gives: {type: "any", value: self.value},
 }
-    -[:extends]->(walk);
+    -|:extends|->(walk);
 
 # an entity is something in the world with attributes, which its steps add up to
 # related holds, for each relation the entity is part of, the attributes of the others in it
@@ -84,22 +84,22 @@ pub const SOURCE: Source<'static> = Source {
     related: {type: "object", value: context.related},
     gives: {type: "object", value: self.attributes},
 }
-    -[:extends]->(walk);
+    -|:extends|->(walk);
 
 # a setting gathers walks under one name, listed in nodes, and members holds what each of them gives
 +(setting:node) {
     members: {type: "object", value: context.members},
 }
-    -[:extends]->(network)
-    -[:requires {members: {type: "object"}}]->(context);
+    -|:extends|->(network)
+    -|:requires {members: {type: "object"}}|->(context);
 
 # a persona is someone in the world, and the sentences under it are said their way
 +(persona:node) {
     said: {type: "array", value: context.steps},
     gives: {type: "array", value: self.said},
 }
-    -[:extends]->(walk)
-    -[:has]->(speaker);
+    -|:extends|->(walk)
+    -|:has|->(speaker);
 
 # a series is several traces in a row that belong together, such as the turns of a conversation, and it stands beside an agent
 # turns is how many traces one series has, and with up_to each series runs for turns to up_to of them
@@ -120,7 +120,7 @@ pub const SOURCE: Source<'static> = Source {
     last: {type: "boolean", value: self.turn == self.length - 1},
     id: {type: "string", value: context.identity},
 }
-    -[:requires {trace_index: {type: "number"}, place: {type: "object"}, identity: {type: "string"}}]->(context);
+    -|:requires {trace_index: {type: "number"}, place: {type: "object"}, identity: {type: "string"}}|->(context);
 
 # a part is some of a sentence's grammar, and gives what it was written with
 +(part:node {
@@ -166,8 +166,8 @@ pub const SOURCE: Source<'static> = Source {
     text: {type: "string", value: context.speaker == null ? self.plain : vary(self.clause, context.speaker.wording, context.draws)},
     gives: {type: "string", value: self.text},
 }
-    -[:extends]->(walk)
-    -[:requires {speaker: {type: "any"}}]->(context);
+    -|:extends|->(walk)
+    -|:requires {speaker: {type: "any"}}|->(context);
 
 # a list is a walk with one item for each step
 +(list:node) {
@@ -175,6 +175,6 @@ pub const SOURCE: Source<'static> = Source {
     text: {type: "string", value: paragraph(context.steps)},
     gives: {type: "string", value: self.text},
 }
-    -[:extends]->(walk);
+    -|:extends|->(walk);
 "#,
 };

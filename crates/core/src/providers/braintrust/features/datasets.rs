@@ -1131,9 +1131,9 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(one_root:task {name: "one"}) {input: one.input};
 (one:agent) {input: "question", output: null};
-(one)-[:next]->(one_root);
-(dataset_cases_group:case {name: "group"}) {traces: [|(one_root) , (one_root)|]};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_group)|]};"#,
+(one)-|:next|->(one_root);
+(dataset_cases_group:case {name: "group"}) {traces: [(one_root) , (one_root)]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_group)]};"#,
         )
         .unwrap();
         let mut plans = prepare(
@@ -1158,7 +1158,7 @@ mod tests {
     fn inline_plan(client: &Client) -> (Dataset, Vec<Case>) {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(dataset_cases_one:case {name: "one"}) {input: "new"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};"#,
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};"#,
         )
         .unwrap();
         let plans = prepare(
@@ -1245,9 +1245,9 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(one_root:task {name: "one"}) {input: one.input};
 (one:agent) {input: null, output: null};
-(one)-[:next]->(one_root);
+(one)-|:next|->(one_root);
 (dataset_cases_one:case {name: "one"}) {source: (one_root)};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};"#,
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};"#,
         )
         .unwrap();
         let config = Braintrust::new("test".to_owned(), uuid::Uuid::nil());

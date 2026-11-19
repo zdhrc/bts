@@ -11,14 +11,14 @@ use std::{
 use uuid::Uuid;
 
 const SIMPLE_SHAPE: &str = r#"(conversation_agent:agent {name: "conversation"}) {input: null, output: conversation.output};
-(conversation_agent)-[:next]->(conversation);
+(conversation_agent)-|:next|->(conversation);
 (conversation:task) {
     input: conversation_agent.input,
     output: null
 };
-(conversation)-[:calls]->(turn);
+(conversation)-|:calls|->(turn);
 (turn:task);
-(turn)-[:calls]->("gpt-4o-mini");
+(turn)-|:calls|->("gpt-4o-mini");
 ("gpt-4o-mini":llm) {
     input: "Hello ${context.trace_index}",
     output: choice(true, false) ? "Hi!" : "Hey!",
@@ -29,13 +29,13 @@ const SIMPLE_SHAPE: &str = r#"(conversation_agent:agent {name: "conversation"}) 
 #[test]
 fn experiment_selection_errors_precede_credentials_and_seed_output() {
     let experiments = r#"(t_agent:agent {name: "t"}) {input: "fallback", output: t.output};
-(t_agent)-[:next]->(t);
+(t_agent)-|:next|->(t);
 (t:task) {
     input: t_agent.input,
     output: t.input
 };
 (cases:dataset) {
-    cases: [|(one)|]
+    cases: [(one)]
 };
 (one:case) {
     input: "question"
@@ -46,12 +46,12 @@ fn experiment_selection_errors_precede_credentials_and_seed_output() {
 (baseline:experiment) {
     dataset: (cases),
     task: (t),
-    scorers: [|(quality)|]
+    scorers: [(quality)]
 };
 (fixed:experiment) {
     dataset: (cases),
     task: (t),
-    scorers: [|(quality)|],
+    scorers: [(quality)],
     baseline: (baseline)
 };"#;
     let cases = [
@@ -109,36 +109,36 @@ fn experiment_selection_errors_precede_credentials_and_seed_output() {
 fn experiment_dry_run_selects_tasks_without_auth_or_scorer_calls() {
     let shape = write_shape(
         r#"(workflow_agent:agent {name: "workflow"}) {input: null, output: workflow.output};
-(workflow_agent)-[:next]->(workflow);
+(workflow_agent)-|:next|->(workflow);
 (workflow:task) {
     input: workflow_agent.input,
     output: null
 };
-(workflow) =[:repeat {count: range(- 2, - 1)}]=>[-[:calls]->(unused_unused)];
+(workflow) =|:repeat {count: range(- 2, - 1)}|=>[-|:calls|->(unused_unused)];
 (unused_unused:tool {name: "unused"}) {
     output: "unused"
 };
-(workflow)-[:calls]->(answer);
+(workflow)-|:calls|->(answer);
 (answer:task) {
     input: "fallback",
     output: self.input == "blocked" ? "Cannot recover this account" : "Recovery instructions sent"
 };
-(answer)-[:calls]->(reply);
+(answer)-|:calls|->(reply);
 (reply:llm) {
     input: answer.input,
     output: answer.output
 };
-(answer)-[:calls]->(quality);
+(answer)-|:calls|->(quality);
 (quality:scorer) {
     score: 0
 };
 (unrelated_agent:agent {name: "unrelated"}) {input: null, output: unrelated.output};
-(unrelated_agent)-[:next]->(unrelated);
+(unrelated_agent)-|:next|->(unrelated);
 (unrelated:task) {
     input: unrelated_agent.input,
     output: null
 };
-(unrelated) =[:repeat {count: range(- 2, - 1)}]=>[-[:calls]->(unused_unused_)];
+(unrelated) =|:repeat {count: range(- 2, - 1)}|=>[-|:calls|->(unused_unused_)];
 (unused_unused_:tool {name: "unused"}) {
     output: "unused"
 };
@@ -146,7 +146,7 @@ fn experiment_dry_run_selects_tasks_without_auth_or_scorer_calls() {
     score: context.output == context.expected ? 1 : 0
 };
 (cases:dataset) {
-    cases: [|(blocked), (normal)|]
+    cases: [(blocked), (normal)]
 };
 (blocked:case) {
     input: "blocked",
@@ -159,12 +159,12 @@ fn experiment_dry_run_selects_tasks_without_auth_or_scorer_calls() {
 (selected:experiment) {
     dataset: (cases),
     task: (answer),
-    scorers: [|(quality)|]
+    scorers: [(quality)]
 };
 (other:experiment) {
     dataset: (cases),
     task: (workflow),
-    scorers: [|(quality)|]
+    scorers: [(quality)]
 };"#,
     );
     let output = bts()
@@ -202,13 +202,13 @@ fn experiment_upload_failure_reports_completed_runs_in_human_and_json_output() {
     fs::write(
         &shape,
         r#"(t_agent:agent {name: "t"}) {input: "fallback", output: t.output};
-(t_agent)-[:next]->(t);
+(t_agent)-|:next|->(t);
 (t:task) {
     input: t_agent.input,
     output: t.input
 };
 (cases:dataset) {
-    cases: [|(one)|]
+    cases: [(one)]
 };
 (one:case) {
     input: "question"
@@ -219,12 +219,12 @@ fn experiment_upload_failure_reports_completed_runs_in_human_and_json_output() {
 (baseline:experiment) {
     dataset: (cases),
     task: (t),
-    scorers: [|(quality)|]
+    scorers: [(quality)]
 };
 (fixed:experiment) {
     dataset: (cases),
     task: (t),
-    scorers: [|(quality)|],
+    scorers: [(quality)],
     baseline: (baseline)
 };"#,
     )
@@ -354,16 +354,16 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
 fn write_filter_omits_synthetic_scorers_without_changing_application_values() {
     let shape = write_shape(
         r#"(support_agent:agent {name: "support"}) {input: "question ${context.trace_index}", output: support.output};
-(support_agent)-[:next]->(support);
+(support_agent)-|:next|->(support);
 (support:task) {
     input: support_agent.input,
-    output: weighted([|"resolved", 3|],[|"escalated", 1|])
+    output: weighted(["resolved", 3],["escalated", 1])
 };
-(support)-[:calls]->("Chat Completion");
+(support)-|:calls|->("Chat Completion");
 ("Chat Completion":llm) {
     output: support.output
 };
-("Chat Completion")-[:calls]->("answer-quality");
+("Chat Completion")-|:calls|->("answer-quality");
 ("answer-quality":scorer) {
     score: clamp(normal(0.75, 0.1), 0, 1),
     reason: format("Observed {}", support.output)
@@ -432,21 +432,21 @@ fn write_filter_omits_synthetic_scorers_without_changing_application_values() {
 fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     let shape = write_shape(
         r#"(session_agent:agent {name: "session"}) {input: null, output: session.output};
-(session_agent)-[:next]->(session);
+(session_agent)-|:next|->(session);
 (session:task) {
     input: session_agent.input,
     output: null
 };
-(session) =[:repeat {count: range(1, 4)}]=>[-[:calls]->(turn)];
+(session) =|:repeat {count: range(1, 4)}|=>[-|:calls|->(turn)];
 (turn:task) {
     input: "question ${context.index}"
 };
-(turn)-[:calls]->(draft);
+(turn)-|:calls|->(draft);
 (draft:llm);
-(session) =[:weighted]=>[-[:calls {weight: 1}]->(get_order_status), -[:calls {weight: 1}]->(summarize_session)];
+(session) =|:weighted|=>[-|:calls {weight: 1}|->(get_order_status), -|:calls {weight: 1}|->(summarize_session)];
 (get_order_status:tool);
 (summarize_session:function);
-(session) =[:conditional]=>[-[:calls {when: chance(0.25)}]->(escalation)];
+(session) =|:conditional|=>[-|:calls {when: chance(0.25)}|->(escalation)];
 (escalation:task);
 "#,
     );
@@ -492,13 +492,13 @@ fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
 fn dry_run_resolves_context_references_in_expressions() {
     let shape = write_shape(
         r#"(conversation_agent:agent {name: "conversation"}) {input: null, output: conversation.output};
-(conversation_agent)-[:next]->(conversation);
+(conversation_agent)-|:next|->(conversation);
 (conversation:task) {
     input: conversation_agent.input,
     output: null,
-    local: {messages: [|"q0", "a0", "q1", "a1", "q2", "a2"|]}
+    local: {messages: ["q0", "a0", "q1", "a1", "q2", "a2"]}
 };
-(conversation) =[:repeat {count: 3}]=>[-[:calls]->(chat)];
+(conversation) =|:repeat {count: 3}|=>[-|:calls|->(chat)];
 (chat:llm) {
     input: conversation.local.messages[: ${context.index * 2} + 1],
     output: conversation.local.messages[${context.index * 2} + 1],
@@ -577,12 +577,12 @@ fn dry_run_fills_an_absolute_window_at_the_requested_rate() {
 fn dry_run_honors_span_durations() {
     let shape = write_shape(
         r#"(session_agent:agent {name: "session"}) {input: null, output: session.output};
-(session_agent)-[:next]->(session);
+(session_agent)-|:next|->(session);
 (session:task) {
     input: session_agent.input,
     output: null
 };
-(session)-[:calls]->(chat);
+(session)-|:calls|->(chat);
 (chat:llm) {
     duration: 2.5
 };
@@ -612,7 +612,7 @@ fn dry_run_honors_span_durations() {
 fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     let shape = write_shape(
         r#"(t_agent:agent {name: "t"}) {input: 100 / range(0, 0), output: t.output};
-(t_agent)-[:next]->(t);
+(t_agent)-|:next|->(t);
 (t:task) {
     input: t_agent.input,
     output: null
@@ -640,14 +640,14 @@ fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
 fn threads_referenced_content_across_spans() {
     let shape = write_shape(
         r#"(support_agent:agent {name: "support"}) {input: "Can I get invoices with our VAT number on them?", output: support.output};
-(support_agent)-[:next]->(support);
+(support_agent)-|:next|->(support);
 (support:task) {
     input: support_agent.input,
     output: chat.output.content
 };
-(support)-[:calls]->(chat);
+(support)-|:calls|->(chat);
 (chat:llm) {
-    input: [|{role: "user", content: support.input}|],
+    input: [{role: "user", content: support.input}],
     output: {role: "assistant", content: choice("Yes -- add it under Billing Settings.", "Yes, in Tax IDs.")},
     metrics: {prompt_tokens: round(lognormal(400, 0.3)), completion_tokens: round(lognormal(40, 0.5)), tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}
 };
@@ -717,7 +717,7 @@ fn uploads_an_attachment_before_inserting_its_reference() {
     fs::write(&file, contents).unwrap();
     let path_literal = serde_json::to_string(&file.display().to_string()).unwrap();
     let shape = write_shape(&format!(
-        "(review_agent:agent) {{input: {{document: attachment({path_literal}, \"application/pdf\")}}, output: null}}; (review_agent)-[:next]->(review:task) {{input: review_agent.input}};"
+        "(review_agent:agent) {{input: {{document: attachment({path_literal}, \"application/pdf\")}}, output: null}}; (review_agent)-|:next|->(review:task) {{input: review_agent.input}};"
     ));
     let project_id = Uuid::new_v4();
     let root = write_project_context(project_id);
@@ -780,20 +780,20 @@ fn uploads_an_attachment_before_inserting_its_reference() {
 fn filtered_blocks_do_not_upload_attachments_or_emit_scorer_spans() {
     let shape = write_shape(
         r#"(review_agent:agent {name: "review"}) {input: null, output: review.output};
-(review_agent)-[:next]->(review);
+(review_agent)-|:next|->(review);
 (review:task) {
     input: review_agent.input,
     output: null
 };
-(review)-[:calls]->("attachment-holder");
+(review)-|:calls|->("attachment-holder");
 ("attachment-holder":task) {
     output: attachment("filtered-out.pdf", "application/pdf")
 };
-(review)-[:calls]->(scored);
+(review)-|:calls|->(scored);
 (scored:task) {
     output: "ok"
 };
-(scored)-[:calls]->("inline-score");
+(scored)-|:calls|->("inline-score");
 ("inline-score":scorer) {
     score: 1
 };
@@ -848,7 +848,7 @@ fn attachment_keys_are_run_scoped_and_distinguish_full_paths() {
     fs::write(
         &shape,
         format!(
-            "(review_agent:agent) {{input: {{first: attachment({first_name}, \"application/pdf\"), same: attachment({first_path}, \"application/pdf\"), second: attachment({second_path}, \"application/pdf\"), other_type: attachment({first_path}, \"text/plain\")}}, output: null}}; (review_agent)-[:next]->(review:task) {{input: review_agent.input}};"
+            "(review_agent:agent) {{input: {{first: attachment({first_name}, \"application/pdf\"), same: attachment({first_path}, \"application/pdf\"), second: attachment({second_path}, \"application/pdf\"), other_type: attachment({first_path}, \"text/plain\")}}, output: null}}; (review_agent)-|:next|->(review:task) {{input: review_agent.input}};"
         ),
     )
     .unwrap();
@@ -893,7 +893,7 @@ fn resolves_relative_attachments_from_the_shape_directory() {
     fs::write(
         &shape,
         r#"(review_agent:agent {name: "review"}) {input: {document: attachment("report.pdf", "application/pdf")}, output: review.output};
-(review_agent)-[:next]->(review);
+(review_agent)-|:next|->(review);
 (review:task) {
     input: review_agent.input,
     output: null
@@ -1129,17 +1129,17 @@ const AUTOMATION_SYNC_SHAPE: &str = r#"("reset-instructions":scorer) {
 };
 ("score-reset-instructions":automation) {
     type: "scorer",
-    scorers: [|"reset-instructions"|],
+    scorers: ["reset-instructions"],
     scope: "span",
-    span_names: [|"password-reset-answer"|],
+    span_names: ["password-reset-answer"],
     sampling_rate: 1.0,
     enabled: true
 };
 ("judge-final-response":automation) {
     type: "scorer",
-    scorers: [|"response-helpfulness"|],
+    scorers: ["response-helpfulness"],
     scope: "span",
-    span_names: [|"password-reset-assistant"|],
+    span_names: ["password-reset-assistant"],
     sampling_rate: 1.0,
     enabled: true
 };"#;
@@ -1429,17 +1429,17 @@ const TOPICS_SYNC_SHAPE: &str = r#"("Churn risk":facet) {
 };
 ("support-topics":automation) {
     type: "topics",
-    facets: [|"Churn risk"|],
+    facets: ["Churn risk"],
     scope: "trace"
 };
 ("other-topics":automation) {
     type: "topics",
-    facets: [|"Ignored"|],
+    facets: ["Ignored"],
     scope: "trace"
 };
 (score:automation) {
     type: "scorer",
-    scorers: [|"not-pushed"|],
+    scorers: ["not-pushed"],
     scope: "span",
     root: true
 };"#;
@@ -1842,7 +1842,7 @@ fn sync_scorers_removes_owned_rules_without_deleting_pushed_functions() {
 };
 (rule:automation) {
     type: "scorer",
-    scorers: [|"brand"|],
+    scorers: ["brand"],
     scope: "span",
     root: true
 };"#,
@@ -1886,8 +1886,8 @@ fn sync_scorer_selection_keeps_all_functions_in_shared_automation() {
     let project = Uuid::new_v4();
     let root = write_project_context(project);
     let source = AUTOMATION_SYNC_SHAPE.replace(
-        "scorers: [|\"reset-instructions\"|]",
-        "scorers: [|\"reset-instructions\", \"response-helpfulness\"|]",
+        "scorers: [\"reset-instructions\"]",
+        "scorers: [\"reset-instructions\", \"response-helpfulness\"]",
     );
     let shape = write_shape(&source);
     let functions = ["reset-instructions", "response-helpfulness"].map(|slug| serde_json::json!({ "objects": [{ "id": slug, "project_id": project.to_string(), "slug": slug, "function_type": "scorer" }] }));
@@ -1922,19 +1922,19 @@ fn sync_dataset_selection_skips_unselected_source_generation() {
     let root = write_project_context(project);
     let shape = write_shape(
         r#"(unavailable_agent:agent {name: "unavailable"}) {input: attachment("missing-selection.jpg", "image/jpeg"), output: unavailable.output};
-(unavailable_agent)-[:next]->(unavailable);
+(unavailable_agent)-|:next|->(unavailable);
 (unavailable:task) {
     input: unavailable_agent.input,
     output: null
 };
 (keep:dataset) {
-    cases: [|(inline)|]
+    cases: [(inline)]
 };
 (inline:case) {
     input: "hello"
 };
 (skip:dataset) {
-    cases: [|(source_case)|]
+    cases: [(source_case)]
 };
 (source_case:case {name: "source"}) {
     source: (unavailable)
@@ -1977,7 +1977,7 @@ fn sync_commands_share_one_state_file_and_remove_dataset_blocks() {
     let shape = root.join("shape.bt");
     fs::write(
         &shape,
-        format!("{TOPICS_SYNC_SHAPE}\n(cases:dataset) {{cases: [|(one)|]}}; (one:case) {{input: \"hello\"}};"),
+        format!("{TOPICS_SYNC_SHAPE}\n(cases:dataset) {{cases: [(one)]}}; (one:case) {{input: \"hello\"}};"),
     )
     .unwrap();
     let (api, requests) = serve_json_sequence(existing_topics(project));
@@ -2042,7 +2042,7 @@ fn sync_datasets_keeps_shared_datasets_until_the_last_shape_removes_them() {
         fs::write(
             shape,
             r#"(cases:dataset) {
-    cases: [||]
+    cases: []
 };"#,
         )
         .unwrap();
@@ -2074,7 +2074,7 @@ fn sync_datasets_recovers_an_ambiguous_create_without_creating_a_duplicate() {
     fs::write(
         &shape,
         r#"(cases:dataset) {
-    cases: [||]
+    cases: []
 };"#,
     )
     .unwrap();
@@ -2104,7 +2104,7 @@ fn sync_datasets_recovers_an_ambiguous_create_without_creating_a_duplicate() {
 fn syntax_check_validates_files_and_stdin_semantics() {
     let shape = write_shape(
         r#"(valid_agent:agent {name: "valid"}) {input: null, output: valid.output};
-(valid_agent)-[:next]->(valid);
+(valid_agent)-|:next|->(valid);
 (valid:task) {
     output: "hello",
     input: valid_agent.input
@@ -2119,7 +2119,7 @@ fn syntax_check_validates_files_and_stdin_semantics() {
     for (source, expected) in [
         (
             r#"(valid_agent:agent {name: "valid"}) {input: null, output: valid.output};
-(valid_agent)-[:next]->(valid);
+(valid_agent)-|:next|->(valid);
 (valid:task) {
     output: "hello",
     input: valid_agent.input
@@ -2129,7 +2129,7 @@ fn syntax_check_validates_files_and_stdin_semantics() {
         ),
         (
             r#"(invalid_agent:agent {name: "invalid"}) {input: null, output: invalid.output};
-(invalid_agent)-[:next]->(invalid);
+(invalid_agent)-|:next|->(invalid);
 (invalid:task) {
     output: missing.output,
     input: invalid_agent.input
@@ -2164,7 +2164,7 @@ fn syntax_check_validates_files_and_stdin_semantics() {
 }
 
 const AGENT_HELLO_WORLD: &str = r#"("hello-world":agent) {input: "Hello, world!", output: ("trace_hello-world").output};
-("hello-world")-[:next]->("trace_hello-world");
+("hello-world")-|:next|->("trace_hello-world");
 ("trace_hello-world":task {name: "hello-world"}) {
     input: ("hello-world").input,
     output: self.input
@@ -2265,9 +2265,9 @@ fn agent_typescript_builds_and_runs_without_project_or_sdk() {
             "{}\n{}",
             AGENT_HELLO_WORLD,
             r#"(literals:agent) {input: null, output: trace_literals.output};
-(literals)-[:next]->(trace_literals);
+(literals)-|:next|->(trace_literals);
 (trace_literals:task {name: "literals"}) {
-    output: {label: "ordinary key", values:[|true, false, null, 42, 1.5, "hello\nworld"|]},
+    output: {label: "ordinary key", values:[true, false, null, 42, 1.5, "hello\nworld"]},
     input: literals.input
 };
 "#,
@@ -2604,7 +2604,7 @@ fn agent_scalar_expressions_preserve_integer_and_short_circuit_semantics() {
     let root = std::env::temp_dir().join(format!("bts-agent-expressions-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let source = r#"(expressions:agent) {input: {n: - 7, d: 3, guard: false}, output: values.output};
-(expressions)-[:next]->(values);
+(expressions)-|:next|->(values);
 (values:task) {
     input: expressions.input,
     output: {sum: values.local.amount + self.input.d, difference: values.local.amount - self.input.d, product: values.local.amount * self.input.d, quotient: values.local.amount / self.input.d, sum_quotient: ${values.local.amount + self.input.d} / 4, sum_text: format("{}", values.local.amount + self.input.d), remainder: values.local.amount % self.input.d, negated: - values.local.amount, less: values.local.amount < self.input.d, at_most: values.local.amount <= self.input.d, greater: values.local.amount > self.input.d, at_least: values.local.amount >= self.input.d, unequal: values.local.amount != self.input.d, guarded: self.input.guard && values.local.guarded_value, fallback: ! self.input.guard || values.local.guarded_value, text: "n=${self.input.n}, flag=${self.input.guard}"},
@@ -2614,14 +2614,14 @@ fn agent_scalar_expressions_preserve_integer_and_short_circuit_semantics() {
         unused_value: self.input.also_missing,
     }
 };
-("float-values":agent) {input: {n: 6.0, nested:[|6.0|]}, output: ("trace_float-values").output};
-("float-values")-[:next]->("trace_float-values");
+("float-values":agent) {input: {n: 6.0, nested:[6.0]}, output: ("trace_float-values").output};
+("float-values")-|:next|->("trace_float-values");
 ("trace_float-values":task {name: "float-values"}) {
     input: ("float-values").input,
     metadata: {number: number.output},
     output: {input_quotient: self.input.n / 4, input_text: format("{}", self.input.n), array_quotient: self.input.nested[0] / 4, child_quotient: number.output / 4, child_text: format("{}", number.output), metadata_quotient: self.metadata.number / 4, metadata_text: format("{}", self.metadata.number), arithmetic_quotient: ${6.5 - 0.5} / 4, arithmetic_text: format("{}", 6.5 - 0.5)}
 };
-("trace_float-values")-[:calls]->(number);
+("trace_float-values")-|:calls|->(number);
 (number:tool) {
     output: 6.0
 };
@@ -2746,47 +2746,47 @@ fn agent_collections_and_nested_repeats_run_in_both_languages() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("collections.bt"),
-        r#"(collections:agent) {input: {values:[|10, 20, 30|], start: 1, end: 99, index: 0, text: "a😀é"}, output: t.output};
-(collections)-[:next]->(t);
+        r#"(collections:agent) {input: {values:[10, 20, 30], start: 1, end: 99, index: 0, text: "a😀é"}, output: t.output};
+(collections)-|:next|->(t);
 (t:task) {
     input: collections.input,
-    output: {names:[|("same-name").output, ("same name").output, ("123 lookup").output, class.output, ("!!!").output|], selected: self.input.values[self.input.index], sliced: self.input.values[self.input.start : self.input.end], length: len(self.input.text), results: row_results.output, first: row_results.output[0], tail: row_results.output[1 : 99], empty: never_results.output}
+    output: {names:[("same-name").output, ("same name").output, ("123 lookup").output, class.output, ("!!!").output], selected: self.input.values[self.input.index], sliced: self.input.values[self.input.start : self.input.end], length: len(self.input.text), results: row_results.output, first: row_results.output[0], tail: row_results.output[1 : 99], empty: never_results.output}
 };
-(t)-[:calls]->("same-name");
+(t)-|:calls|->("same-name");
 ("same-name":tool) {
     output: "first"
 };
-(t)-[:calls]->("same name");
+(t)-|:calls|->("same name");
 ("same name":tool) {
     output: "second"
 };
-(t)-[:calls]->("123 lookup");
+(t)-|:calls|->("123 lookup");
 ("123 lookup":tool) {
     output: "numeric"
 };
-(t)-[:calls]->(class);
+(t)-|:calls|->(class);
 (class:tool) {
     output: "keyword"
 };
-(t)-[:calls]->("!!!");
+(t)-|:calls|->("!!!");
 ("!!!":tool) {
     output: "punctuation"
 };
 (t)
-    =[:repeat {count: 2}]=>[-[row_arrival:calls]->(row)]
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [row_arrival]]>>(row_results:task) {output: context.accumulator};
+    =|:repeat {count: 2}|=>[-|row_arrival:calls|->(row)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |row_arrival||>>(row_results:task) {output: context.accumulator};
 (row:task) {
     output: cell_results.output
 };
 (row)
-    =[:repeat {count: 2}]=>[-[cell_arrival:calls]->(cell)]
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [cell_arrival]]>>(cell_results:task) {output: context.accumulator};
+    =|:repeat {count: 2}|=>[-|cell_arrival:calls|->(cell)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |cell_arrival||>>(cell_results:task) {output: context.accumulator};
 (cell:tool) {
     output: {index: context.index, count: context.count, label: "cell-${context.index}"}
 };
 (t)
-    =[:repeat {count: 0}]=>[-[never_arrival:calls]->(never)]
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [never_arrival]]>>(never_results:task) {output: context.accumulator};
+    =|:repeat {count: 0}|=>[-|never_arrival:calls|->(never)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |never_arrival||>>(never_results:task) {output: context.accumulator};
 (never:tool) {
     output: "unreachable"
 };
@@ -2854,7 +2854,7 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
     fs::write(
         root.join("branches.bt"),
         r#"(branches:agent) {input: {}, output: root.output};
-(branches)-[:next]->(root:task) {
+(branches)-|:next|->(root:task) {
     input: branches.input,
     local: {route: range(0, 1)},
     output: {
@@ -2867,16 +2867,16 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
         batch: results.output,
     },
 };
-(root) =[:exclusive]=>[
-    -[:calls {when: source.local.route == 0}]->(left_route:tool) {output: {side: "left", other: null}},
-    -[:calls {when: source.local.route == 1}]->(right_route:tool) {output: {side: "right", other: null}},
+(root) =|:exclusive|=>[
+    -|:calls {when: source.local.route == 0}|->(left_route:tool) {output: {side: "left", other: null}},
+    -|:calls {when: source.local.route == 1}|->(right_route:tool) {output: {side: "right", other: null}},
 ];
-(root) =[:conditional]=>[
-    -[:calls {when: false}]->(bad:tool) {output: root.input.missing},
-    -[:calls {when: true}]->(good:tool) {output: "yes"},
+(root) =|:conditional|=>[
+    -|:calls {when: false}|->(bad:tool) {output: root.input.missing},
+    -|:calls {when: true}|->(good:tool) {output: "yes"},
 ];
 (root)
-    =[:repeat {count: 2}]=>[-[item:calls]->(row:task) {
+    =|:repeat {count: 2}|=>[-|item:calls|->(row:task) {
         local: {included: chance(0.5), pick: self.local.included ? range(0, 1) : -1},
         output: {
             included: self.local.included, chosen: self.local.included ? self.local.pick : null,
@@ -2884,10 +2884,10 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
             other: self.local.included && self.local.pick == 1 ? manual.output : null,
         },
     }]
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [item]]>>(results:task) {output: context.accumulator};
-(row) =[:exclusive]=>[
-    -[:calls {when: source.local.included && source.local.pick == 0}]->(fast:tool) {output: format("request-{}", context.index)},
-    -[:calls {when: source.local.included && source.local.pick == 1}]->(manual:tool) {output: format("request-{}", context.index)},
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |item||>>(results:task) {output: context.accumulator};
+(row) =|:exclusive|=>[
+    -|:calls {when: source.local.included && source.local.pick == 0}|->(fast:tool) {output: format("request-{}", context.index)},
+    -|:calls {when: source.local.included && source.local.pick == 1}|->(manual:tool) {output: format("request-{}", context.index)},
 ];
 "#,
     )
@@ -2968,37 +2968,37 @@ fn agent_text_numeric_fields_and_forward_references_match_planner() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("fields.bt"),
-        r#"(fields:agent) {input: {text: "  Straße|HELLO  ", number: - 2.5, items:[|"alpha", 2, true|], separator: "|", index: 0, duration: 0.25}, output: t.output};
-(fields)-[:next]->(t);
+        r#"(fields:agent) {input: {text: "  Straße|HELLO  ", number: - 2.5, items:["alpha", 2, true], separator: "|", index: 0, duration: 0.25}, output: t.output};
+(fields)-|:next|->(t);
 (t:task) {
     input: fields.input,
     expected: {answer: "ready"},
     error: null,
     metadata: {second: self.metadata.first, first: "ready", reference: later.output},
     metrics: {total: self.metrics.first + 2, first: 3},
-    tags: [|"support", "fields"|],
+    tags: ["support", "fields"],
     duration: self.input.duration,
-    output: {upper: upper(trim(self.input.text)), lower: lower(trim(self.input.text)), replaced: replace(self.input.text, "|", "/"), unchanged: replace(self.input.text, "", "ignored"), parts: split(trim(self.input.text), self.input.separator), joined: join(self.input.items, ","), rendered: render("{{{name}}}: {n} {ok}", {name: self.metadata.first, n: 6.0, ok: true}), composed: compose([|null, "", "Hi!", render("{text}", {text: self.metadata.first})|]), sampled: sample([|"one", "two"|], 2), sample_empty: sample([||], 0), has: contains(self.input.items, "alpha"), distinct: contains(self.input.items, 1), starts: starts_with(trim(self.input.text), "Straße"), ends: ends_with(trim(self.input.text), "HELLO"), formatted: format("{}:{}", self.metadata.first, self.metrics.total), spread:[|"start",...self.input.items, "end"|], float_division: self.input.number / - 2, float_remainder: self.input.number % 2, float_text: format("{}", max(self.input.number, 4)), clamped: clamp(self.input.number, - 2, 2), rounded: round(self.input.number), floored: floor(self.input.number), ceiling: ceil(self.input.number), absolute: abs(self.input.number), smallest: min(self.input.number, 4, - 1), largest: max(self.input.number, 4, - 1), forward: earlier.output, expected: self.expected.answer, absent_error: self.error, error_only: ("error-only").error, selected:[|self.input.text, self.input.does_not_exist|][self.input.index]}
+    output: {upper: upper(trim(self.input.text)), lower: lower(trim(self.input.text)), replaced: replace(self.input.text, "|", "/"), unchanged: replace(self.input.text, "", "ignored"), parts: split(trim(self.input.text), self.input.separator), joined: join(self.input.items, ","), rendered: render("{{{name}}}: {n} {ok}", {name: self.metadata.first, n: 6.0, ok: true}), composed: compose([null, "", "Hi!", render("{text}", {text: self.metadata.first})]), sampled: sample(["one", "two"], 2), sample_empty: sample([], 0), has: contains(self.input.items, "alpha"), distinct: contains(self.input.items, 1), starts: starts_with(trim(self.input.text), "Straße"), ends: ends_with(trim(self.input.text), "HELLO"), formatted: format("{}:{}", self.metadata.first, self.metrics.total), spread:["start",...self.input.items, "end"], float_division: self.input.number / - 2, float_remainder: self.input.number % 2, float_text: format("{}", max(self.input.number, 4)), clamped: clamp(self.input.number, - 2, 2), rounded: round(self.input.number), floored: floor(self.input.number), ceiling: ceil(self.input.number), absolute: abs(self.input.number), smallest: min(self.input.number, 4, - 1), largest: max(self.input.number, 4, - 1), forward: earlier.output, expected: self.expected.answer, absent_error: self.error, error_only: ("error-only").error, selected:[self.input.text, self.input.does_not_exist][self.input.index]}
 };
-(t)-[:calls]->("error-only");
+(t)-|:calls|->("error-only");
 ("error-only":tool) {
     error: "timeout",
     duration: 0.01
 };
-(t)-[:calls]->(earlier);
+(t)-|:calls|->(earlier);
 (earlier:tool) {
     input: later.output,
     output: self.input,
     metadata: {status: self.output},
     duration: 0.15
 };
-(t)-[:calls]->(later);
+(t)-|:calls|->(later);
 (later:tool) {
     input: inner.output,
     output: format("{}", self.input),
     error: "reservation-unavailable"
 };
-(later)-[:calls]->(inner);
+(later)-|:calls|->(inner);
 (inner:function) {
     output: t.metadata.first,
     duration: 0.2
@@ -3159,19 +3159,19 @@ fn agent_random_values_are_cached_scoped_and_lazy() {
     fs::write(
         root.join("random.bt"),
         r#"(random:agent) {input: {}, output: t.output};
-(random)-[:next]->(t);
+(random)-|:next|->(t);
 (t:task) {
     input: random.input,
-    output: {shared: t.local.shared, copy: t.local.shared, forward: later.output, forward_copy: later.output, chosen: choice("safe", self.input.missing), weighted: weighted([|self.input.missing, 0|],[|"safe", 1|]), certain: chance(1), impossible: chance(0), float_division: range(1.0, 1.0) / 2, float_text: format("{}", range(1.0, 1.0)), normal: normal(10, 2), lognormal: lognormal(2, 0.3), exponential: exponential(3), pareto: pareto(2, 3), beta: beta(2, 3), poisson: poisson(6), large_poisson: poisson(1000000), uuid: uuid(), hex: hex(12), alphanum: alphanum(16), noise: noise(20), rows: row_results.output},
+    output: {shared: t.local.shared, copy: t.local.shared, forward: later.output, forward_copy: later.output, chosen: choice("safe", self.input.missing), weighted: weighted([self.input.missing, 0],["safe", 1]), certain: chance(1), impossible: chance(0), float_division: range(1.0, 1.0) / 2, float_text: format("{}", range(1.0, 1.0)), normal: normal(10, 2), lognormal: lognormal(2, 0.3), exponential: exponential(3), pareto: pareto(2, 3), beta: beta(2, 3), poisson: poisson(6), large_poisson: poisson(1000000), uuid: uuid(), hex: hex(12), alphanum: alphanum(16), noise: noise(20), rows: row_results.output},
     local: {shared: range(10, 20)}
 };
-(t)-[:calls]->(later);
+(t)-|:calls|->(later);
 (later:tool) {
     output: range(100, 200)
 };
 (t)
-    =[:repeat {count: 2}]=>[-[row_arrival:calls]->(row)]
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [row_arrival]]>>(row_results:task) {output: context.accumulator};
+    =|:repeat {count: 2}|=>[-|row_arrival:calls|->(row)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |row_arrival||>>(row_results:task) {output: context.accumulator};
 (row:tool) {
     local: {row_value: range(1, 100)},
     output: {value: row.local.row_value, copy: row.local.row_value}
@@ -3265,21 +3265,21 @@ fn agent_traces_execution_and_preserves_partial_failures() {
     fs::write(
         root.join("trace.bt"),
         r#"(workflow:agent) {input: {divisor: 2}, output: trace_workflow.output};
-(workflow)-[:next]->(trace_workflow);
+(workflow)-|:next|->(trace_workflow);
 (trace_workflow:task {name: "workflow"}) {
     input: workflow.input,
     output: compute.output
 };
-(trace_workflow)-[:calls]->(first);
+(trace_workflow)-|:calls|->(first);
 (first:tool) {
     output: range(1, 2)
 };
-(trace_workflow)-[:calls]->(compute);
+(trace_workflow)-|:calls|->(compute);
 (compute:tool) {
     input: trace_workflow.input,
     output: 10 / self.input.divisor
 };
-(trace_workflow)-[:calls]->("never-on-failure");
+(trace_workflow)-|:calls|->("never-on-failure");
 ("never-on-failure":tool) {
     output: "done"
 };
@@ -3379,19 +3379,19 @@ fn agent_native_values_preserve_results_names_and_lazy_failures() {
     fs::write(
         root.join("native.bt"),
         r#"(native:agent) {input: {}, output: t.output};
-(native)-[:next]->(t);
+(native)-|:next|->(t);
 (t:task) {
     input: native.input,
     output: {value: calculate.output, guarded: false && t.local.unused},
     local: {root_request: 6, unused: self.input.missing}
 };
-(t)-[:calls]->(calculate);
+(t)-|:calls|->(calculate);
 (calculate:tool) {
     input: {base: t.local.root_request},
     output: {amount: calculate.local.next * 2, copy: calculate.local.next, label: upper("ready")},
     local: {next: self.input.base + 1}
 };
-(t) =[:repeat {count: 2}]=>[-[:calls]->(check)];
+(t) =|:repeat {count: 2}|=>[-|:calls|->(check)];
 (check:tool) {
     output: context.index
 };
@@ -3449,13 +3449,13 @@ fn scorer_rebuild_updates_existing_agent_evals_in_both_languages() {
     let root = write_project_context(Uuid::new_v4());
     let shape = root.join("support.bt");
     let source = r#"(support:agent) {input: "hello", output: trace_support.output};
-(support)-[:next]->(trace_support);
+(support)-|:next|->(trace_support);
 (trace_support:task {name: "support"}) {
     input: support.input,
     output: self.input
 };
 (cases:dataset) {
-    cases: [|(hello)|]
+    cases: [(hello)]
 };
 (hello:case) {
     input: "hello",
@@ -3467,7 +3467,7 @@ fn scorer_rebuild_updates_existing_agent_evals_in_both_languages() {
 (experiment_support:experiment {name: "support"}) {
     dataset: (cases),
     task: (trace_support),
-    scorers: [|(quality)|]
+    scorers: [(quality)]
 };"#;
     for lang in ["python", "typescript"] {
         fs::write(&shape, source).unwrap();
@@ -3651,13 +3651,13 @@ fn agent_evals_register_and_run_with_braintrust_sdks() {
     score: 0.5
 };
 (judged:agent) {input: {question: "ticket"}, output: trace_judged.output};
-(judged)-[:next]->(trace_judged);
+(judged)-|:next|->(trace_judged);
 (trace_judged:task {name: "judged"}) {
     input: judged.input,
     output: self.input.question
 };
 ("judged-cases":dataset) {
-    cases: [|(one)|]
+    cases: [(one)]
 };
 (one:case) {
     input: {question: "ticket"},
@@ -3670,18 +3670,18 @@ fn agent_evals_register_and_run_with_braintrust_sdks() {
 ("judged-candidate":experiment) {
     dataset: ("judged-cases"),
     task: (trace_judged),
-    scorers: [|("local-judge")|],
+    scorers: [("local-judge")],
     baseline: ("judged-baseline")
 };
 ("judged-baseline":experiment) {
     dataset: ("judged-cases"),
     task: (trace_judged),
-    scorers: [|("local-judge")|]
+    scorers: [("local-judge")]
 };
 ("callable-check":experiment) {
     dataset: ("judged-cases"),
     task: (trace_judged),
-    scorers: [|(class), (foo), ("foo-scorer")|]
+    scorers: [(class), (foo), ("foo-scorer")]
 };"#
         ),
     )
@@ -3867,54 +3867,54 @@ fn selected_agent_evals_snapshot_dynamic_and_source_cases() {
     fs::write(
         root.join("cases.bt"),
         r#"(echo:agent) {input: 0, output: trace_echo.output};
-(echo)-[:next]->(trace_echo);
+(echo)-|:next|->(trace_echo);
 (trace_echo:task {name: "echo"}) {
     input: echo.input,
     output: self.input
 };
-(group:agent) {input: [|0|], output: trace_group.output};
-(group)-[:next]->(trace_group);
+(group:agent) {input: [0], output: trace_group.output};
+(group)-|:next|->(trace_group);
 (trace_group:task {name: "group"}) {
     input: group.input,
     output: self.input
 };
 (unrelated:agent) {input: null, output: trace_unrelated.output};
-(unrelated)-[:next]->(trace_unrelated);
+(unrelated)-|:next|->(trace_unrelated);
 (trace_unrelated:task {name: "unrelated"}) {
     output: attachment("unused.pdf", "application/pdf"),
     input: unrelated.input
 };
 (source_agent:agent {name: "source"}) {input: range(1, 1000000), output: source_task.output};
-(source_agent)-[:next]->(source_task);
+(source_agent)-|:next|->(source_task);
 (source_task:task {name: "source"}) {
     input: source_agent.input,
     output: self.input
 };
-(source_task)-[:calls]->(part);
+(source_task)-|:calls|->(part);
 (part:tool) {
     input: 7,
     output: self.input
 };
 (second_agent:agent {name: "second"}) {input: 8, output: second.output};
-(second_agent)-[:next]->(second);
+(second_agent)-|:next|->(second);
 (second:task) {
     input: second_agent.input,
     output: self.input
 };
 (third_agent:agent {name: "third"}) {input: 9, output: third.output};
-(third_agent)-[:next]->(third);
+(third_agent)-|:next|->(third);
 (third:task) {
     input: third_agent.input,
     output: self.input
 };
 (cases:dataset) {
-    cases: [|(dynamic), (trace), (span)|]
+    cases: [(dynamic), (trace), (span)]
 };
 (dynamic:case) {
     input: source_task.input,
     expected: source_task.output,
     metadata: {kind: lower("DYNAMIC")},
-    tags: [|"CASE"|]
+    tags: ["CASE"]
 };
 (trace:case) {
     source: (source_task)
@@ -3923,10 +3923,10 @@ fn selected_agent_evals_snapshot_dynamic_and_source_cases() {
     source: (part)
 };
 (groups:dataset) {
-    cases: [|(ordered)|]
+    cases: [(ordered)]
 };
 (ordered:case) {
-    traces: [|(second), (third)|]
+    traces: [(second), (third)]
 };
 (exact:scorer) {
     score: context.output == context.expected ? 1 : 0
@@ -3934,12 +3934,12 @@ fn selected_agent_evals_snapshot_dynamic_and_source_cases() {
 (check:experiment) {
     dataset: (cases),
     task: (trace_echo),
-    scorers: [|(exact)|]
+    scorers: [(exact)]
 };
 ("group-check":experiment) {
     dataset: (groups),
     task: (trace_group),
-    scorers: [|(exact)|]
+    scorers: [(exact)]
 };"#,
     )
     .unwrap();
@@ -4145,7 +4145,7 @@ fn readme_graph_examples_compile_with_their_documented_additions() {
         blocks[1].to_owned(),
         format!("{}\n{}", blocks[0], blocks[2]).replace("(search:tool)", "(search:billing_lookup {service: \"billing\"})"),
         format!(
-            "{}\n{}\n(search)-[:next]->(cleaned:clean_query) {{input: \"  Billing HELP \"}};",
+            "{}\n{}\n(search)-|:next|->(cleaned:clean_query) {{input: \"  Billing HELP \"}};",
             blocks[0], blocks[3]
         ),
         format!("{}\n{}", blocks[0], blocks[4]),

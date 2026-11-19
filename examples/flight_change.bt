@@ -4,59 +4,59 @@
 # the policies the agent works under, defined once, each a step of the list
 # the fee is a sentence of its own, so it can differ from trace to trace and still be read by name
 (policies:list)
-    -[:next]->(fee:sentence)
-        -[:next]->(:part {subject: "a same-day change", verb: "cost"})
-        =[:weighted]=>[
-            -[:next {weight: 3}]->(:part {complement: "75 USD"}),
-            -[:next {weight: 1}]->(:part {complement: "50 USD"}),
+    -|:next|->(fee:sentence)
+        -|:next|->(:part {subject: "a same-day change", verb: "cost"})
+        =|:weighted|=>[
+            -|:next {weight: 3}|->(:part {complement: "75 USD"}),
+            -|:next {weight: 1}|->(:part {complement: "50 USD"}),
         ]
-    -[:next]->(window:policy {subject: "the change window", verb: "close", complement: "two hours before departure"})
-    -[:next]->(payment:policy {subject: "the fare difference", verb: "be", modal: "must", complement: "paid before the new ticket is issued"});
+    -|:next|->(window:policy {subject: "the change window", verb: "close", complement: "two hours before departure"})
+    -|:next|->(payment:policy {subject: "the fare difference", verb: "be", modal: "must", complement: "paid before the new ticket is issued"});
 
 # the later flight the search finds: the date never changes, and the departure and its fare are drawn together
 (later:entity)
-    -[:next]->(:given {value: {date: "2026-11-20"}})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {value: {departs: "17:30", fare_difference: 1240.5}}),
-        -[:next {weight: 1}]->(:given {value: {departs: "19:05", fare_difference: 980}}),
+    -|:next|->(:given {value: {date: "2026-11-20"}})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:given {value: {departs: "17:30", fare_difference: 1240.5}}),
+        -|:next {weight: 1}|->(:given {value: {departs: "19:05", fare_difference: 980}}),
     ];
 
 # the traveler writes in text messages, and each fork chooses one part of what they ask
 (traveler:persona {style: "text_message"})
-    -[:next]->(ask:sentence)
-        -[:next]->(:part {subject: "I", person: "first"})
-        =[:weighted]=>[
-            -[:next {weight: 2}]->(:part {modal: "can", form: "question"}),
-            -[:next {weight: 1}]->(:part {modal: "could", form: "question"}),
-            -[:next {weight: 1}]->(:part {modal: "must"}),
+    -|:next|->(ask:sentence)
+        -|:next|->(:part {subject: "I", person: "first"})
+        =|:weighted|=>[
+            -|:next {weight: 2}|->(:part {modal: "can", form: "question"}),
+            -|:next {weight: 1}|->(:part {modal: "could", form: "question"}),
+            -|:next {weight: 1}|->(:part {modal: "must"}),
         ]
-        =[:weighted]=>[
-            -[:next {weight: 1}]->(:part {verb: "change", complement: "my flight"}),
-            -[:next {weight: 1}]->(:part {verb: "switch", complement: "to a later flight"}),
+        =|:weighted|=>[
+            -|:next {weight: 1}|->(:part {verb: "change", complement: "my flight"}),
+            -|:next {weight: 1}|->(:part {verb: "switch", complement: "to a later flight"}),
         ];
 
 # the agent reads the world by name
 (flight_change:agent) {input: {booking: "AB42"}, output: reply.output.content};
-(flight_change)-[:next]->(request:task {name: "flight-change"}) {
+(flight_change)-|:next|->(request:task {name: "flight-change"}) {
     input: flight_change.input,
     output: reply.output.content,
-    tags: [|"flight-change"|],
+    tags: ["flight-change"],
 };
-(request)-[:calls]->(search:tool {name: "search_flights"}) {
+(request)-|:calls|->(search:tool {name: "search_flights"}) {
         input: {booking: request.input.booking},
         # the tool returns the flight the world holds, so the reply quotes the same one
         output: later.attributes,
     }
     # what the agent says is a statement on its own path
-    -[:next]->(found:statement {subject: "I", person: "first", verb: "find", complement: "a later flight", tense: "past"})
+    -|:next|->(found:statement {subject: "I", person: "first", verb: "find", complement: "a later flight", tense: "past"})
     # the reply relates two statements and formats what the search returned
-    -[:next]->(reply:llm {name: "Chat Completion"}) {
-        input: [|
-            {role: "system", content: compose([|"Follow the change policies.", policies.text|])},
+    -|:next|->(reply:llm {name: "Chat Completion"}) {
+        input: [
+            {role: "system", content: compose(["Follow the change policies.", policies.text])},
             {role: "user", content: ask.text},
-        |],
+        ],
         output: {role: "assistant", content: format("{} It leaves on {} at {}. {}",
-            combine([|found.clause, fee.clause|], "and"),
+            combine([found.clause, fee.clause], "and"),
             format_date(search.output.date, {style: "long"}),
             format_time(search.output.departs),
             payment.text)},

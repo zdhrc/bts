@@ -441,8 +441,8 @@ mod tests {
 (quality:scorer) {score: 1};
 (one:case) {input: "hello"};
 (two:case) {input: "world"};
-(first:dataset) {cases: [|(one)|]};
-(second:dataset) {cases: [|(two)|]};
+(first:dataset) {cases: [(one)]};
+(second:dataset) {cases: [(two)]};
 "#,
         )
         .unwrap();
@@ -490,31 +490,31 @@ mod tests {
 
     const AGENTS: &str = r#"(source_root:task {name: "source"}) {input: source_node.input, output: "answer", local: {identifier: range (1 , 100)}};
 (source_node:agent) {input: {id: source_root.local.identifier}, output: source_root.output};
-(source_node)-[:next]->(source_root);
+(source_node)-|:next|->(source_root);
 (oldest_root:task {name: "oldest"}) {input: oldest.input, output: self.input, local: {identifier: range (1 , 100)}};
 (oldest:agent) {input: "oldest", output: oldest_root.output};
-(oldest)-[:next]->(oldest_root);
+(oldest)-|:next|->(oldest_root);
 (baseline_root:task {name: "baseline"}) {input: baseline.input, output: self.input, local: {identifier: range (1 , 100)}};
 (baseline:agent) {input: "baseline", output: baseline_root.output};
-(baseline)-[:next]->(baseline_root);
+(baseline)-|:next|->(baseline_root);
 (candidate_root:task {name: "candidate"}) {input: candidate.input, output: self.input, local: {identifier: range (1 , 100)}};
 (candidate:agent) {input: "candidate", output: candidate_root.output};
-(candidate)-[:next]->(candidate_root);
+(candidate)-|:next|->(candidate_root);
 (other_root:task {name: "other"}) {input: other.input, output: self.input, local: {identifier: range (1 , 100)}};
 (other:agent) {input: "other", output: other_root.output};
-(other)-[:next]->(other_root);
+(other)-|:next|->(other_root);
 ("quality":scorer) {score: 1};
 ("unrelated":scorer) {score: 0};
 (dataset_shared_trace_source:case {name: "trace-source"}) {source: (source_root)};
-(dataset_shared:dataset {name: "shared"}) {cases: [|(dataset_shared_trace_source)|]};
+(dataset_shared:dataset {name: "shared"}) {cases: [(dataset_shared_trace_source)]};
 (dataset_other_inline:case {name: "inline"}) {input: "other"};
-(dataset_other:dataset {name: "other"}) {cases: [|(dataset_other_inline)|]};
-(experiment_oldest:experiment {name: "oldest"}) {task: (oldest_root), dataset: (dataset_shared), scorers: [|("quality")|]};
-(experiment_baseline:experiment {name: "baseline"}) {task: (baseline_root), dataset: (dataset_shared), scorers: [|("quality")|], baseline: (experiment_oldest)};
-(experiment_candidate:experiment {name: "candidate"}) {task: (candidate_root), dataset: (dataset_shared), scorers: [|("quality")|], baseline: (experiment_baseline)};
-(experiment_candidate_extra:experiment {name: "candidate-extra"}) {task: (candidate_root), dataset: (dataset_shared), scorers: [|("quality")|]};
-(experiment_sibling:experiment {name: "sibling"}) {task: (baseline_root), dataset: (dataset_other), scorers: [|("unrelated")|]};
-(experiment_other:experiment {name: "other"}) {task: (other_root), dataset: (dataset_other), scorers: [|("unrelated")|]};"#;
+(dataset_other:dataset {name: "other"}) {cases: [(dataset_other_inline)]};
+(experiment_oldest:experiment {name: "oldest"}) {task: (oldest_root), dataset: (dataset_shared), scorers: [("quality")]};
+(experiment_baseline:experiment {name: "baseline"}) {task: (baseline_root), dataset: (dataset_shared), scorers: [("quality")], baseline: (experiment_oldest)};
+(experiment_candidate:experiment {name: "candidate"}) {task: (candidate_root), dataset: (dataset_shared), scorers: [("quality")], baseline: (experiment_baseline)};
+(experiment_candidate_extra:experiment {name: "candidate-extra"}) {task: (candidate_root), dataset: (dataset_shared), scorers: [("quality")]};
+(experiment_sibling:experiment {name: "sibling"}) {task: (baseline_root), dataset: (dataset_other), scorers: [("unrelated")]};
+(experiment_other:experiment {name: "other"}) {task: (other_root), dataset: (dataset_other), scorers: [("unrelated")]};"#;
 
     #[test]
     fn experiment_selection_keeps_baseline_dependencies_and_trace_reference_indexes() {
@@ -610,11 +610,11 @@ mod tests {
         let mut model = crate::providers::braintrust::mocking::compile(
             r#"(shared_root:task {name: "shared"}) {output: "answer", input: second.input};
 (second:agent) {input: null, output: shared_root.output};
-(second)-[:next]->(shared_root);
+(second)-|:next|->(shared_root);
 ("quality":scorer) {score: 1};
 (dataset_cases_one:case {name: "one"}) {input: "question"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
-(experiment_check:experiment {name: "check"}) {task: (shared_root), dataset: (dataset_cases), scorers: [|("quality")|]};"#,
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
+(experiment_check:experiment {name: "check"}) {task: (shared_root), dataset: (dataset_cases), scorers: [("quality")]};"#,
         )
         .unwrap();
         let mut first = model.agents[0].clone();
@@ -639,19 +639,19 @@ mod tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"(first_root:task {name: "first"}) {output: "first", input: a_b.input};
 (a_b:agent {name: "a-b"}) {input: null, output: first_root.output};
-(a_b)-[:next]->(first_root);
+(a_b)-|:next|->(first_root);
 (second_root:task {name: "second"}) {output: "second", input: a_b_1.input};
 (a_b_1:agent {name: "a_b"}) {input: null, output: second_root.output};
-(a_b_1)-[:next]->(second_root);
+(a_b_1)-|:next|->(second_root);
 (safe_root:task {name: "safe"}) {output: "safe", input: safe.input};
 (safe:agent) {input: null, output: safe_root.output};
-(safe)-[:next]->(safe_root);
+(safe)-|:next|->(safe_root);
 ("quality":scorer) {score: 1};
 (dataset_cases_one:case {name: "one"}) {input: "hello"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
-(experiment_check_a:experiment {name: "check-a"}) {task: (safe_root), dataset: (dataset_cases), scorers: [|("quality")|]};
-(experiment_check_b:experiment {name: "check_a"}) {task: (safe_root), dataset: (dataset_cases), scorers: [|("quality")|]};
-(experiment_safe:experiment {name: "safe"}) {task: (safe_root), dataset: (dataset_cases), scorers: [|("quality")|]};"#,
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
+(experiment_check_a:experiment {name: "check-a"}) {task: (safe_root), dataset: (dataset_cases), scorers: [("quality")]};
+(experiment_check_b:experiment {name: "check_a"}) {task: (safe_root), dataset: (dataset_cases), scorers: [("quality")]};
+(experiment_safe:experiment {name: "safe"}) {task: (safe_root), dataset: (dataset_cases), scorers: [("quality")]};"#,
         )
         .unwrap();
         for selector in [

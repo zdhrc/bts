@@ -2807,7 +2807,7 @@ fn relationship(step: &ast::GraphEdgeStep) -> Result<Relationship> {
         ));
     }
     if step.cycle || step.direction != Direction::Directed {
-        return Err(error(step.range, "a relationship edge is written -[:kind]->"));
+        return Err(error(step.range, "a relationship edge is written -|:kind|->"));
     }
     let target = match &step.target {
         ast::GraphNode::Reference(ast::Expr {
@@ -2827,7 +2827,7 @@ fn relationship(step: &ast::GraphEdgeStep) -> Result<Relationship> {
         return Err(error(
             step.range,
             format!(
-                "`{}` lists context keys and targets context, written -[:{} {{key: {{type: \"any\"}}}}]->(context)",
+                "`{}` lists context keys and targets context, written -|:{} {{key: {{type: \"any\"}}}}|->(context)",
                 header.kind, header.kind
             ),
         ));

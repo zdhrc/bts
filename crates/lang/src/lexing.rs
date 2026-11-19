@@ -28,8 +28,7 @@ pub(super) enum TokenKind {
     RBrack,
     LParen,
     RParen,
-    ArrayOpen,
-    ArrayClose,
+    Pipe,
 
     Comma,
     Dot,
@@ -128,10 +127,7 @@ impl<'src> Lexer<'src> {
             // parenbraceckets
             '{' => tokens.push(Token::new(TokenKind::LBrace, idx, idx + ch.len_utf8())),
             '}' => tokens.push(Token::new(TokenKind::RBrace, idx, idx + ch.len_utf8())),
-            '[' => match self.lex_trailing('|') {
-                Some(end) => tokens.push(Token::new(TokenKind::ArrayOpen, idx, end)),
-                None => tokens.push(Token::new(TokenKind::LBrack, idx, idx + 1)),
-            },
+            '[' => tokens.push(Token::new(TokenKind::LBrack, idx, idx + 1)),
             ']' => tokens.push(Token::new(TokenKind::RBrack, idx, idx + ch.len_utf8())),
             '(' => tokens.push(Token::new(TokenKind::LParen, idx, idx + ch.len_utf8())),
             ')' => tokens.push(Token::new(TokenKind::RParen, idx, idx + ch.len_utf8())),
@@ -225,10 +221,11 @@ impl<'src> Lexer<'src> {
                 None => tokens.push(Token::new(TokenKind::Gt, idx, idx + ch.len_utf8())),
             },
 
-            // a closing array bar takes precedence over logical or
-            '|' if matches!(self.peek(), Some((_, ']'))) => {
-                let end = self.lex_trailing(']').expect("peeked character is present");
-                tokens.push(Token::new(TokenKind::ArrayClose, idx, end));
+            // the last edge reference and a junction close meet as ||>>
+            '|' if self.src[idx..].starts_with("||>>") => {
+                self.next();
+                tokens.push(Token::new(TokenKind::Pipe, idx, idx + 1));
+                tokens.push(Token::new(TokenKind::Pipe, idx + 1, idx + 2));
             }
             '&' => match self.lex_paired(ch) {
                 Some(end) => tokens.push(Token::new(TokenKind::AmpAmp, idx, end)),
@@ -241,12 +238,7 @@ impl<'src> Lexer<'src> {
             },
             '|' => match self.lex_paired(ch) {
                 Some(end) => tokens.push(Token::new(TokenKind::PipePipe, idx, end)),
-                None => {
-                    errors.push(Error::new(
-                        ErrorKind::UnpairedOperator(ch),
-                        SrcRange::new(idx, idx + ch.len_utf8()),
-                    ));
-                }
+                None => tokens.push(Token::new(TokenKind::Pipe, idx, idx + 1)),
             },
 
             // ident:
@@ -928,7 +920,7 @@ mod tests {
 
     #[test]
     fn lexes_graph_punctuation_with_exact_ranges() {
-        let source = "-> ~> ~ >> ?<> @ ; [| |] => <-";
+        let source = "-> ~> ~ >> ?<> @ ; [ ] => <-";
         let tokens = Lexer::new(source).lex().unwrap();
         let expected = [
             (TokenKind::Arrow, "->"),
@@ -939,8 +931,8 @@ mod tests {
             (TokenKind::PatternClose, ">"),
             (TokenKind::At, "@"),
             (TokenKind::Semicolon, ";"),
-            (TokenKind::ArrayOpen, "[|"),
-            (TokenKind::ArrayClose, "|]"),
+            (TokenKind::LBrack, "["),
+            (TokenKind::RBrack, "]"),
             (TokenKind::FatArrow, "=>"),
             (TokenKind::Upstream, "<-"),
         ];
@@ -953,27 +945,47 @@ mod tests {
 
     #[test]
     fn distinguishes_arrays_references_indexes_and_logical_or() {
-        let source = "[||] [|a||b,[edge],xs[0]|]";
+        let source = "[] [a||b,|edge|,xs[0]]";
         let kinds: Vec<_> = Lexer::new(source).lex().unwrap().into_iter().map(|t| t.kind).collect();
         assert_eq!(
             kinds,
             vec![
-                TokenKind::ArrayOpen,
-                TokenKind::ArrayClose,
-                TokenKind::ArrayOpen,
+                TokenKind::LBrack,
+                TokenKind::RBrack,
+                TokenKind::LBrack,
                 TokenKind::Ident("a".into()),
                 TokenKind::PipePipe,
                 TokenKind::Ident("b".into()),
                 TokenKind::Comma,
-                TokenKind::LBrack,
+                TokenKind::Pipe,
                 TokenKind::Ident("edge".into()),
-                TokenKind::RBrack,
+                TokenKind::Pipe,
                 TokenKind::Comma,
                 TokenKind::Ident("xs".into()),
                 TokenKind::LBrack,
                 TokenKind::Number("0".into()),
                 TokenKind::RBrack,
-                TokenKind::ArrayClose,
+                TokenKind::RBrack,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn separates_a_junction_close_from_the_last_edge_reference() {
+        let tokens = Lexer::new("|edge||>> a || b").lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Pipe,
+                TokenKind::Ident("edge".into()),
+                TokenKind::Pipe,
+                TokenKind::Pipe,
+                TokenKind::Junction,
+                TokenKind::Ident("a".into()),
+                TokenKind::PipePipe,
+                TokenKind::Ident("b".into()),
                 TokenKind::Eof,
             ]
         );
@@ -992,7 +1004,7 @@ mod tests {
 
     #[test]
     fn retains_layout_positions_across_comments_strings_and_crlf() {
-        let source = "(a)\r\n    # comment\r\n    -[:next]->(b) {text: \"é\"}\r\n        ->(b);";
+        let source = "(a)\r\n    # comment\r\n    -|:next|->(b) {text: \"é\"}\r\n        ->(b);";
         let tokens = Lexer::new(source).lex().unwrap();
         for token in &tokens {
             let expected = source[..token.range.start].rfind('\n').map_or(0, |i| i + 1);
@@ -1187,9 +1199,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unpaired_logical_operators() {
+    fn rejects_unpaired_ampersands() {
         assert_error_kinds("a & b", &[ErrorKind::UnpairedOperator('&')]);
-        assert_error_kinds("a | b", &[ErrorKind::UnpairedOperator('|')]);
 
         let errors = Lexer::new("a & b").lex().unwrap_err();
         assert_eq!(errors[0].range(), SrcRange::new(2, 3));

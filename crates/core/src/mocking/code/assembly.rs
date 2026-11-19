@@ -415,10 +415,10 @@ mod agent_tests {
         let model = compile(
             r#"(count_root:task {name: "count"}) {output: tokens("hello"), input: count.input};
 (count:agent) {input: null, output: count_root.output};
-(count)-[:next]->(count_root);
+(count)-|:next|->(count_root);
 (plain_root:task {name: "plain"}) {output: "hello", input: plain.input};
 (plain:agent) {input: null, output: plain_root.output};
-(plain)-[:next]->(plain_root);"#,
+(plain)-|:next|->(plain_root);"#,
         )
         .unwrap();
         let target = CodeTarget::new("");
@@ -459,9 +459,9 @@ mod agent_tests {
         let target = CodeTarget::new("");
         for source in [
             r#"(first:agent {name: "a-b"}) {input: null, output: "ok"};
-(first)-[:next]->(first_root:task) {input: first.input};
+(first)-|:next|->(first_root:task) {input: first.input};
 (second:agent {name: "a_b"}) {input: null, output: "ok"};
-(second)-[:next]->(second_root:task) {input: second.input};"#,
+(second)-|:next|->(second_root:task) {input: second.input};"#,
             "(quality:scorer) {score: 1};",
         ] {
             for lang in [ScorerLang::Python, ScorerLang::Typescript] {
@@ -471,7 +471,7 @@ mod agent_tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {output: 9007199254740993, input: a.input};
 (a:agent) {input: null, output: t_root.output};
-(a)-[:next]->(t_root);"#,
+(a)-|:next|->(t_root);"#,
         )
         .unwrap();
         assert!(assemble_agents(&model, ScorerLang::Python, &target).is_ok());

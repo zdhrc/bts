@@ -1,51 +1,51 @@
 # every piece of a world in one shape: a policy that varies inside a list, a fact, entities and a relation,
 # a persona, a repeat, and a world that reads the agent's input
 (policies:list)
-    -[:next]->(fee:sentence)
-        -[:next]->(:part {subject: "a same-day change", verb: "cost"})
-        =[:weighted]=>[
-            -[:next {weight: 1}]->(:part {complement: "75 USD"}),
-            -[:next {weight: 1}]->(:part {complement: "50 USD"}),
+    -|:next|->(fee:sentence)
+        -|:next|->(:part {subject: "a same-day change", verb: "cost"})
+        =|:weighted|=>[
+            -|:next {weight: 1}|->(:part {complement: "75 USD"}),
+            -|:next {weight: 1}|->(:part {complement: "50 USD"}),
         ]
-    -[:next]->(window:policy {subject: "the change window", verb: "close", complement: "two hours before departure"});
+    -|:next|->(window:policy {subject: "the change window", verb: "close", complement: "two hours before departure"});
 
 # a fact with a value, and an entity whose attributes add up
 (fare:fact)
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {value: 1240.5}),
-        -[:next {weight: 1}]->(:given {value: 980}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:given {value: 1240.5}),
+        -|:next {weight: 1}|->(:given {value: 980}),
     ];
 (flight:entity)
-    -[:next]->(:given {value: {date: "2026-11-20"}})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {value: {departs: "17:30"}}),
-        -[:next {weight: 1}]->(:given {value: {departs: "19:05"}}),
+    -|:next|->(:given {value: {date: "2026-11-20"}})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:given {value: {departs: "17:30"}}),
+        -|:next {weight: 1}|->(:given {value: {departs: "19:05"}}),
     ];
 (traveler:entity)
-    -[:next]->(:given {value: {name: desk.input.name}});
+    -|:next|->(:given {value: {name: desk.input.name}});
 (holds:relation);
-(holds)-[:incidence]-(traveler);
-(holds)-[:incidence]-(flight);
+(holds)-|:incidence|-(traveler);
+(holds)-|:incidence|-(flight);
 
 # someone who talks in text messages
 (maya:persona {style: "text_message"})
-    -[:next]->(ask:sentence)
-        -[:next]->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});
+    -|:next|->(ask:sentence)
+        -|:next|->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});
 
 # three reasons, each drawn for itself
 (reasons:list)
-    =[:repeat {count: 3}]=>[
-        -[:next]->(reason:either),
+    =|:repeat {count: 3}|=>[
+        -|:next|->(reason:either),
     ];
 (reason)
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "leave", complement: "late"}),
-        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "close", complement: "early"}),
-        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "change"}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:policy {subject: "the flight", verb: "leave", complement: "late"}),
+        -|:next {weight: 1}|->(:policy {subject: "the flight", verb: "close", complement: "early"}),
+        -|:next {weight: 1}|->(:policy {subject: "the flight", verb: "change"}),
     ];
 
 (desk:agent) {input: {name: "Maya"}, output: t.output};
-(desk)-[:next]->(t:task {name: "t"}) {
+(desk)-|:next|->(t:task {name: "t"}) {
     input: desk.input,
     output: {policies: policies.text, fee: fee.text, fare: fare.value, flight: flight.attributes, holds: traveler.related.holds, who: traveler.attributes.name, ask: ask.text, said: maya.said, reasons: reasons.items},
 };

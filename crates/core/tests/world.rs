@@ -11,7 +11,7 @@ const SELECTED: With<braintrust::Bundle, world::Bundle> = With(braintrust::Bundl
 // an agent of one step whose output reads the world
 fn shape(world: &str, read: &str) -> String {
     format!(
-        "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-[:next]->(t:task {{name: \"t\"}}) {{input: a.input, output: {read}}};\n"
+        "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-|:next|->(t:task {{name: \"t\"}}) {{input: a.input, output: {read}}};\n"
     )
 }
 
@@ -41,15 +41,15 @@ fn rejected(source: &str) -> String {
 }
 
 const ASK: &str = r#"(ask:sentence)
-    -[:next]->(:part {subject: "I", person: "first"})
-    =[:weighted]=>[
-        -[:next {weight: 2}]->(can:part {modal: "can", form: "question"}),
-        -[:next {weight: 1}]->(:part {modal: "could", form: "question"}),
-        -[:next {weight: 1}]->(:part {modal: "must"}),
+    -|:next|->(:part {subject: "I", person: "first"})
+    =|:weighted|=>[
+        -|:next {weight: 2}|->(can:part {modal: "can", form: "question"}),
+        -|:next {weight: 1}|->(:part {modal: "could", form: "question"}),
+        -|:next {weight: 1}|->(:part {modal: "must"}),
     ]
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:part {verb: "change", complement: "my flight"}),
-        -[:next {weight: 1}]->(:part {verb: "switch", complement: "to a later flight"}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:part {verb: "change", complement: "my flight"}),
+        -|:next {weight: 1}|->(:part {verb: "switch", complement: "to a later flight"}),
     ];"#;
 
 #[test]
@@ -119,8 +119,8 @@ fn a_sentence_is_built_from_the_parts_a_walk_visits() {
 #[test]
 fn a_list_has_one_item_for_each_step() {
     let world = r#"(policies:list)
-    -[:next]->(fee:policy {subject: "a same-day change", verb: "cost", complement: "75 USD"})
-    -[:next]->(window:policy {subject: "the change window", verb: "close", complement: "two hours before departure"});"#;
+    -|:next|->(fee:policy {subject: "a same-day change", verb: "cost", complement: "75 USD"})
+    -|:next|->(window:policy {subject: "the change window", verb: "close", complement: "two hours before departure"});"#;
     let read = "{items: policies.items, text: policies.text, fee: fee.text, clause: fee.clause}";
     let output = outputs(&shape(world, read), 1..2).remove(0);
     assert_eq!(
@@ -142,10 +142,10 @@ fn a_list_has_one_item_for_each_step() {
 #[test]
 fn a_walk_takes_the_branch_whose_guard_holds() {
     let world = r#"(said:sentence)
-    -[:next]->(mood:part {subject: "I", person: "first", tense: "past"})
-    =[:exclusive]=>[
-        -[:next {when: mood.props.tense == "past"}]->(:part {verb: "go"}),
-        -[:next {when: mood.props.tense != "past"}]->(:part {verb: "stay"}),
+    -|:next|->(mood:part {subject: "I", person: "first", tense: "past"})
+    =|:exclusive|=>[
+        -|:next {when: mood.props.tense == "past"}|->(:part {verb: "go"}),
+        -|:next {when: mood.props.tense != "past"}|->(:part {verb: "stay"}),
     ];"#;
     assert_eq!(outputs(&shape(world, "said.text"), 1..2), [json!("I went.")]);
     let present = world.replace(r#"tense: "past"}"#, r#"tense: "present"}"#);
@@ -155,14 +155,14 @@ fn a_walk_takes_the_branch_whose_guard_holds() {
 #[test]
 fn steps_in_a_chain_are_walked_like_steps_in_a_fan() {
     // each step leads to the next, and the branches rejoin by hand
-    let world = r#"(said:sentence)-[:next]->(who:part {subject: "I", person: "first"});
+    let world = r#"(said:sentence)-|:next|->(who:part {subject: "I", person: "first"});
 (who)
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(can:part {modal: "can"}),
-        -[:next {weight: 1}]->(must:part {modal: "must"}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(can:part {modal: "can"}),
+        -|:next {weight: 1}|->(must:part {modal: "must"}),
     ];
-(can)-[:next]->(what);
-(must)-[:next]->(what);
+(can)-|:next|->(what);
+(must)-|:next|->(what);
 (what:part {verb: "go"});"#;
     let said: BTreeSet<_> = (outputs(&shape(world, "said.text"), 0..32).into_iter())
         .map(|text| text.as_str().unwrap().to_owned())
@@ -170,19 +170,19 @@ fn steps_in_a_chain_are_walked_like_steps_in_a_fan() {
     assert_eq!(said.into_iter().collect::<Vec<_>>(), ["I can go.", "I must go."]);
     // a branch of several steps gives several values, and a fork that is skipped shifts no other draw
     let world = r#"(said:sentence)
-    -[:next]->(:part {subject: "I", person: "first"})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(polite:part {form: "question"}),
-        -[:next {weight: 1}]->(:part {modal: "must"}),
+    -|:next|->(:part {subject: "I", person: "first"})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(polite:part {form: "question"}),
+        -|:next {weight: 1}|->(:part {modal: "must"}),
     ]
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:part {verb: "go"}),
-        -[:next {weight: 1}]->(:part {verb: "stay"}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:part {verb: "go"}),
+        -|:next {weight: 1}|->(:part {verb: "stay"}),
     ];
 (polite)
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:part {modal: "can"}),
-        -[:next {weight: 1}]->(:part {modal: "could"}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:part {modal: "can"}),
+        -|:next {weight: 1}|->(:part {modal: "could"}),
     ];"#;
     let said: BTreeSet<_> = (outputs(&shape(world, "said.text"), 0..96).into_iter())
         .map(|text| text.as_str().unwrap().to_owned())
@@ -202,14 +202,14 @@ fn steps_in_a_chain_are_walked_like_steps_in_a_fan() {
 
 #[test]
 fn an_author_declares_a_walk_and_its_steps() {
-    let world = r#"+(itinerary:node) {legs: {type: "array", value: context.steps}}-[:extends]->(walk);
+    let world = r#"+(itinerary:node) {legs: {type: "array", value: context.steps}}-|:extends|->(walk);
 +(leg:node {to: {type: "string", required: true}}) {gives: {type: "string", value: self.props.to}};
 (trip:itinerary)
-    -[:next]->(:leg {to: "Lisbon"})
-    -[:next]->(:leg {to: "Porto"});"#;
+    -|:next|->(:leg {to: "Lisbon"})
+    -|:next|->(:leg {to: "Porto"});"#;
     assert_eq!(outputs(&shape(world, "trip.legs"), 1..2), [json!(["Lisbon", "Porto"])]);
     // merge adds up what steps give: later keys win and null changes nothing
-    let merged = r#"merge({tense: "present", modal: null}, [|{modal: "can"}, {tense: null}, null, {modal: "must"}|])"#;
+    let merged = r#"merge({tense: "present", modal: null}, [{modal: "can"}, {tense: null}, null, {modal: "must"}])"#;
     assert_eq!(
         outputs(&shape("", merged), 1..2),
         [json!({"tense": "present", "modal": "must"})]
@@ -220,25 +220,25 @@ fn an_author_declares_a_walk_and_its_steps() {
 fn an_author_changes_what_a_shipped_kind_computes_by_extending_it() {
     // the provider decides what its kinds compute, and an extension states a field again
     let world = r#"+(shout:node) {text: {value: upper(realize(self.clause))}}
-    -[:extends]->(sentence);
+    -|:extends|->(sentence);
 +(numbered:node) {text: {value: format("{} rules. {}", len(self.items), compose(self.items))}}
-    -[:extends]->(list);
+    -|:extends|->(list);
 +(past:node) {defaults: {value: {tense: "past"}}}
-    -[:extends]->(sentence);
+    -|:extends|->(sentence);
 +(asked:node {form: {default: "question"}})
-    -[:extends]->(part);
+    -|:extends|->(part);
 +(house_rule:node {subject: {default: "the house"}})
-    -[:extends]->(policy);
+    -|:extends|->(policy);
 (ask:shout)
-    -[:next]->(:part {subject: "I", person: "first", modal: "must"})
-    -[:next]->(:part {verb: "change", complement: "my flight"});
+    -|:next|->(:part {subject: "I", person: "first", modal: "must"})
+    -|:next|->(:part {verb: "change", complement: "my flight"});
 (rules:numbered)
-    -[:next]->(:policy {subject: "a change", verb: "cost", complement: "75 USD"})
-    -[:next]->(:house_rule {verb: "close", complement: "at noon"});
+    -|:next|->(:policy {subject: "a change", verb: "cost", complement: "75 USD"})
+    -|:next|->(:house_rule {verb: "close", complement: "at noon"});
 (then:past)
-    -[:next]->(:part {subject: "the desk", verb: "close"});
+    -|:next|->(:part {subject: "the desk", verb: "close"});
 (may:sentence)
-    -[:next]->(:asked {subject: "I", person: "first", modal: "can", verb: "go"});"#;
+    -|:next|->(:asked {subject: "I", person: "first", modal: "can", verb: "go"});"#;
     let read = "{said: ask.text, clause: ask.clause, rules: rules.text, items: rules.items, then: then.text, may: may.text}";
     let output = outputs(&shape(world, read), 1..2).remove(0);
     assert_eq!(output["said"], "I MUST CHANGE MY FLIGHT.");
@@ -253,18 +253,18 @@ fn an_author_changes_what_a_shipped_kind_computes_by_extending_it() {
     assert_eq!(output["may"], "Can I go?");
     // an instance starts from defaults of its own too, and a part still wins over them
     let world = r#"(was:sentence) {defaults: {tense: "past", subject: "the desk"}}
-    -[:next]->(:part {verb: "open"});
+    -|:next|->(:part {verb: "open"});
 (is:sentence) {defaults: {tense: "past", subject: "the desk"}}
-    -[:next]->(:part {verb: "open", tense: "present"});"#;
+    -|:next|->(:part {verb: "open", tense: "present"});"#;
     assert_eq!(
-        outputs(&shape(world, "[|was.text, is.text|]"), 1..2),
+        outputs(&shape(world, "[was.text, is.text]"), 1..2),
         [json!(["The desk opened.", "The desk opens."])]
     );
     // an instance states a field of its own in the same way
     let world = r#"(ask:sentence) {text: "whatever is written here"}
-    -[:next]->(:part {subject: "I", person: "first", verb: "go"});"#;
+    -|:next|->(:part {subject: "I", person: "first", verb: "go"});"#;
     assert_eq!(
-        outputs(&shape(world, "[|ask.text, ask.grammar.verb|]"), 1..2),
+        outputs(&shape(world, "[ask.text, ask.grammar.verb]"), 1..2),
         [json!(["whatever is written here", "go"])]
     );
 }
@@ -274,17 +274,17 @@ fn a_walk_says_what_it_is_drawn_for() {
     // three traces in a row are one conversation, the house is drawn once for the run, the weather for each trace
     let fork = |verbs: [&str; 4]| {
         let branches: Vec<_> = (verbs.iter())
-            .map(|verb| format!("        -[:next {{weight: 1}}]->(:part {{verb: \"{verb}\"}}),"))
+            .map(|verb| format!("        -|:next {{weight: 1}}|->(:part {{verb: \"{verb}\"}}),"))
             .collect();
-        format!("    =[:weighted]=>[\n{}\n    ];", branches.join("\n"))
+        format!("    =|:weighted|=>[\n{}\n    ];", branches.join("\n"))
     };
     let world = format!(
-        "(mood:sentence {{per: floor(context.trace_index / 3)}})\n    -[:next]->(:part {{subject: \"I\", person: \"first\"}})\n{}\n(house:sentence {{per: \"run\"}})\n    -[:next]->(:part {{subject: \"the desk\"}})\n{}\n(each:sentence)\n    -[:next]->(:part {{subject: \"it\"}})\n{}",
+        "(mood:sentence {{per: floor(context.trace_index / 3)}})\n    -|:next|->(:part {{subject: \"I\", person: \"first\"}})\n{}\n(house:sentence {{per: \"run\"}})\n    -|:next|->(:part {{subject: \"the desk\"}})\n{}\n(each:sentence)\n    -|:next|->(:part {{subject: \"it\"}})\n{}",
         fork(["wait", "leave", "stay", "go"]),
         fork(["open", "close", "change", "go"]),
         fork(["open", "close", "change", "go"]),
     );
-    let source = shape(&world, "[|mood.text, house.text, each.text|]");
+    let source = shape(&world, "[mood.text, house.text, each.text]");
     let model = SELECTED
         .compile(&source)
         .unwrap_or_else(|errors| panic!("{errors}\n{source}"));
@@ -339,13 +339,13 @@ fn a_walk_says_what_it_is_drawn_for() {
 fn a_walk_is_a_step_of_another_walk() {
     // one policy of the list varies, and it is read by name and through the list alike
     let world = r#"(policies:list)
-    -[:next]->(fee:sentence)
-        -[:next]->(:part {subject: "a same-day change", verb: "cost"})
-        =[:weighted]=>[
-            -[:next {weight: 1}]->(:part {complement: "75 USD"}),
-            -[:next {weight: 1}]->(:part {complement: "50 USD"}),
+    -|:next|->(fee:sentence)
+        -|:next|->(:part {subject: "a same-day change", verb: "cost"})
+        =|:weighted|=>[
+            -|:next {weight: 1}|->(:part {complement: "75 USD"}),
+            -|:next {weight: 1}|->(:part {complement: "50 USD"}),
         ]
-    -[:next]->(window:policy {subject: "the change window", verb: "close", complement: "at noon"});"#;
+    -|:next|->(window:policy {subject: "the change window", verb: "close", complement: "at noon"});"#;
     let said = outputs(
         &shape(
             world,
@@ -371,12 +371,12 @@ fn a_walk_that_is_a_step_is_drawn_for_what_its_walk_is_drawn_for() {
     // the sentence does not say, so its fork is drawn once for each conversation like the persona it is a step of
     let world = r#"(chat:series {turns: 4});
 (customer:persona {per: chat.number})
-    -[:next]->(:sentence)
-        -[:next]->(:part {subject: "I", person: "first"})
-        =[:weighted]=>[
-            -[:next {weight: 1}]->(:part {verb: "need", complement: "a refund"}),
-            -[:next {weight: 1}]->(:part {verb: "want", complement: "my money back"}),
-            -[:next {weight: 1}]->(:part {verb: "have", complement: "a billing problem"}),
+    -|:next|->(:sentence)
+        -|:next|->(:part {subject: "I", person: "first"})
+        =|:weighted|=>[
+            -|:next {weight: 1}|->(:part {verb: "need", complement: "a refund"}),
+            -|:next {weight: 1}|->(:part {verb: "want", complement: "my money back"}),
+            -|:next {weight: 1}|->(:part {verb: "have", complement: "a billing problem"}),
         ];"#;
     let said = |world: &str| -> Vec<String> {
         let source = shape(world, "customer.said[0]");
@@ -426,21 +426,21 @@ fn a_walk_that_is_a_step_is_drawn_for_what_its_walk_is_drawn_for() {
 #[test]
 fn a_fact_has_a_value_and_an_entity_has_attributes() {
     let world = r#"(fare:fact)
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {value: 1240.5}),
-        -[:next {weight: 1}]->(:given {value: 980}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:given {value: 1240.5}),
+        -|:next {weight: 1}|->(:given {value: 980}),
     ];
 (flight:entity)
-    -[:next]->(:given {value: {date: "2026-11-20"}})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {value: {departs: "17:30"}}),
-        -[:next {weight: 1}]->(:given {value: {departs: "19:05"}}),
+    -|:next|->(:given {value: {date: "2026-11-20"}})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:given {value: {departs: "17:30"}}),
+        -|:next {weight: 1}|->(:given {value: {departs: "19:05"}}),
     ];
 (traveler:entity)
-    -[:next]->(:given {value: {name: a.input}});
+    -|:next|->(:given {value: {name: a.input}});
 (holds:relation);
-(holds)-[:incidence]-(traveler);
-(holds)-[:incidence]-(flight);"#;
+(holds)-|:incidence|-(traveler);
+(holds)-|:incidence|-(flight);"#;
     let read = "{fare: fare.value, flight: flight.attributes, departs: flight.attributes.departs, holds: traveler.related.holds, held_by: flight.related.holds, who: traveler.attributes}";
     let said = outputs(&shape(world, read), 0..24);
     let distinct = |key: &str| said.iter().map(|trace| trace[key].to_string()).collect::<BTreeSet<_>>();
@@ -458,16 +458,16 @@ fn a_fact_has_a_value_and_an_entity_has_attributes() {
     // an entity that is part of no relation is related to nothing
     assert_eq!(
         outputs(
-            &shape("(alone:entity)-[:next]->(:given {value: {a: 1}});", "alone.related"),
+            &shape("(alone:entity)-|:next|->(:given {value: {a: 1}});", "alone.related"),
             1..2
         ),
         [json!({})]
     );
     // the world a caller meets depends on the input
     let world = r#"(perk:fact)
-    =[:exclusive]=>[
-        -[:next {when: a.input == "gold"}]->(:given {value: "lounge access"}),
-        -[:next {when: a.input != "gold"}]->(:given {value: "a seat"}),
+    =|:exclusive|=>[
+        -|:next {when: a.input == "gold"}|->(:given {value: "lounge access"}),
+        -|:next {when: a.input != "gold"}|->(:given {value: "a seat"}),
     ];"#;
     assert_eq!(outputs(&shape(world, "perk.value"), 1..2), [json!("a seat")]);
     assert_eq!(
@@ -478,18 +478,18 @@ fn a_fact_has_a_value_and_an_entity_has_attributes() {
 
 #[test]
 fn relations_have_a_direction_and_a_setting_gathers_walks() {
-    let world = r#"(traveler:entity)-[:next]->(:given {value: {name: "Maya"}});
-(booking:entity)-[:next]->(:given {value: {code: "AB42"}});
-(spare:entity)-[:next]->(:given {value: {code: "ZZ99"}});
-(friend:entity)-[:next]->(:given {value: {name: "Sam"}});
+    let world = r#"(traveler:entity)-|:next|->(:given {value: {name: "Maya"}});
+(booking:entity)-|:next|->(:given {value: {code: "AB42"}});
+(spare:entity)-|:next|->(:given {value: {code: "ZZ99"}});
+(friend:entity)-|:next|->(:given {value: {name: "Sam"}});
 (holds:relation);
-(holds)-[:incidence {role: "input"}]-(traveler);
-(holds)-[:incidence {role: "output"}]-(booking);
-(holds)-[:incidence {role: "output"}]-(spare);
+(holds)-|:incidence {role: "input"}|-(traveler);
+(holds)-|:incidence {role: "output"}|-(booking);
+(holds)-|:incidence {role: "output"}|-(spare);
 (knows:relation);
-(knows)-[:incidence]-(traveler);
-(knows)-[:incidence]-(friend);
-(trip:setting {nodes: [|(traveler), (booking)|], edges: [||]});"#;
+(knows)-|:incidence|-(traveler);
+(knows)-|:incidence|-(friend);
+(trip:setting {nodes: [(traveler), (booking)], edges: []});"#;
     let read = "{has: traveler.related, held: booking.related.holds, spare: spare.related.holds, friend: friend.related, trip: trip.members}";
     let output = outputs(&shape(world, read), 1..2).remove(0);
     // an input reads the outputs and an output reads the inputs, never its own side
@@ -509,13 +509,13 @@ fn relations_have_a_direction_and_a_setting_gathers_walks() {
 #[test]
 fn a_world_reads_what_the_agent_was_given_and_what_its_steps_return() {
     let source = r#"(receipt:entity)
-    -[:next]->(:given {value: {charged: charge.output.amount, to: desk.input.name}});
+    -|:next|->(:given {value: {charged: charge.output.amount, to: desk.input.name}});
 (note:sentence)
-    -[:next]->(:part {subject: "the charge", verb: "be", complement: charge.output.status});
+    -|:next|->(:part {subject: "the charge", verb: "be", complement: charge.output.status});
 (desk:agent) {input: {name: "Maya"}, output: done.output};
-(desk)-[:next]->(t:task {name: "t"}) {input: desk.input, output: done.output};
-(t)-[:calls]->(charge:tool {name: "charge"}) {input: t.input, output: {amount: range(10, 20), status: choice("settled", "pending")}}
-    -[:next]->(done:task {name: "done"}) {input: charge.output, output: {receipt: receipt.attributes, note: note.text, amount: charge.output.amount, status: charge.output.status}};
+(desk)-|:next|->(t:task {name: "t"}) {input: desk.input, output: done.output};
+(t)-|:calls|->(charge:tool {name: "charge"}) {input: t.input, output: {amount: range(10, 20), status: choice("settled", "pending")}}
+    -|:next|->(done:task {name: "done"}) {input: charge.output, output: {receipt: receipt.attributes, note: note.text, amount: charge.output.amount, status: charge.output.status}};
 "#;
     for output in outputs(source, 0..12) {
         // the world quotes the one charge the step made, whatever it drew
@@ -527,9 +527,9 @@ fn a_world_reads_what_the_agent_was_given_and_what_its_steps_return() {
     }
     // a step's own fields are read by name whether or not the walk visits the step
     let world = r#"(w:list)
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(p:policy {subject: "a", verb: "be"}),
-        -[:next {weight: 1}]->(q:policy {subject: "b", verb: "be"}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(p:policy {subject: "a", verb: "be"}),
+        -|:next {weight: 1}|->(q:policy {subject: "b", verb: "be"}),
     ];"#;
     for output in outputs(&shape(world, "{p: p.text, q: q.text, built: w.items}"), 0..8) {
         assert_eq!(output["p"], "A is.");
@@ -544,15 +544,15 @@ fn a_world_reads_what_the_agent_was_given_and_what_its_steps_return() {
 #[test]
 fn a_repeat_fork_walks_its_branches_once_for_each_round() {
     let world = r#"(reasons:list)
-    -[:next]->(:policy {subject: "the desk", verb: "open"})
-    =[:repeat {count: 3}]=>[
-        -[:next]->(reason:either),
+    -|:next|->(:policy {subject: "the desk", verb: "open"})
+    =|:repeat {count: 3}|=>[
+        -|:next|->(reason:either),
     ];
 (reason)
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "leave", complement: "late"}),
-        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "close", complement: "early"}),
-        -[:next {weight: 1}]->(:policy {subject: "the flight", verb: "change"}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:policy {subject: "the flight", verb: "leave", complement: "late"}),
+        -|:next {weight: 1}|->(:policy {subject: "the flight", verb: "close", complement: "early"}),
+        -|:next {weight: 1}|->(:policy {subject: "the flight", verb: "change"}),
     ];"#;
     let said = outputs(&shape(world, "reasons.items"), 0..24);
     let mut mixed = false;
@@ -573,16 +573,16 @@ fn a_repeat_fork_walks_its_branches_once_for_each_round() {
 #[test]
 fn a_persona_says_its_sentences_its_own_way() {
     let world = r#"(maya:persona {style: "text_message"})
-    -[:next]->(ask:sentence)
-        -[:next]->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});
+    -|:next|->(ask:sentence)
+        -|:next|->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});
 (plain:sentence)
-    -[:next]->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});"#;
+    -|:next|->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight"});"#;
     let output = outputs(&shape(world, "{ask: ask.text, said: maya.said, plain: plain.text}"), 1..2).remove(0);
     assert_eq!(output["plain"], "Can I change my flight?");
     assert_eq!(output["ask"], "can i change my flight?");
     assert_eq!(output["said"], json!(["can i change my flight?"]));
     // the sentence as its grammar reads is still there
-    let output = outputs(&shape(world, "[|ask.plain, ask.text|]"), 1..2).remove(0);
+    let output = outputs(&shape(world, "[ask.plain, ask.text]"), 1..2).remove(0);
     assert_eq!(output, json!(["Can I change my flight?", "can i change my flight?"]));
 }
 
@@ -591,12 +591,12 @@ fn a_series_is_several_traces_that_belong_together() {
     // three traces in a row are one conversation, and the traveler keeps one mood through it
     let world = r#"(chat:series {turns: 3});
 (mood:sentence {per: chat.number})
-    -[:next]->(:part {subject: "I", person: "first"})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:part {verb: "wait"}),
-        -[:next {weight: 1}]->(:part {verb: "leave"}),
-        -[:next {weight: 1}]->(:part {verb: "stay"}),
-        -[:next {weight: 1}]->(:part {verb: "go"}),
+    -|:next|->(:part {subject: "I", person: "first"})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:part {verb: "wait"}),
+        -|:next {weight: 1}|->(:part {verb: "leave"}),
+        -|:next {weight: 1}|->(:part {verb: "stay"}),
+        -|:next {weight: 1}|->(:part {verb: "go"}),
     ];"#;
     let read = "{id: chat.id, number: chat.number, turn: chat.turn, length: chat.length, first: chat.first, last: chat.last, mood: mood.text}";
     let source = shape(world, read);
@@ -653,7 +653,7 @@ fn a_series_is_several_traces_that_belong_together() {
     );
     // an extension says where a conversation ends in its own way
     let paired = format!(
-        "+(pair:node) {{number: {{value: floor(context.trace_index / 2)}}, turn: {{value: context.trace_index % 2}}}}\n    -[:extends]->(series);\n{}",
+        "+(pair:node) {{number: {{value: floor(context.trace_index / 2)}}, turn: {{value: context.trace_index % 2}}}}\n    -|:extends|->(series);\n{}",
         source.replace("(chat:series {turns: 3})", "(chat:pair)")
     );
     let paired = turns(&paired, 5);
@@ -687,7 +687,7 @@ fn a_series_is_several_traces_that_belong_together() {
     assert!((2..=6).all(|length| lengths.contains(&length)), "{lengths:?}");
     assert_eq!(said, traces(&varied, 5, 600));
     // weights say how likely each length is, and a length with no weight never opens a conversation
-    let weighted = source.replace("{turns: 3}", "{turns: 1, up_to: 4, weights: [|8, 0, 2, 1|]}");
+    let weighted = source.replace("{turns: 3}", "{turns: 1, up_to: 4, weights: [8, 0, 2, 1]}");
     let said = traces(&weighted, 5, 255);
     let opened = |length: u64| {
         said.iter()
@@ -705,10 +705,10 @@ fn a_series_is_several_traces_that_belong_together() {
     // the bounds are whole numbers of turns, the second no smaller than the first
     let weights = "a series takes one weight for each length from turns to up_to, none negative and one positive";
     for (written, message) in [
-        ("{turns: 2, up_to: 4, weights: [|1, 2|]}", weights),
-        ("{turns: 2, up_to: 4, weights: [|0, 0, 0|]}", weights),
-        ("{turns: 2, up_to: 4, weights: [|1, -1, 1|]}", weights),
-        ("{turns: 2, weights: [|1|]}", weights),
+        ("{turns: 2, up_to: 4, weights: [1, 2]}", weights),
+        ("{turns: 2, up_to: 4, weights: [0, 0, 0]}", weights),
+        ("{turns: 2, up_to: 4, weights: [1, -1, 1]}", weights),
+        ("{turns: 2, weights: [1]}", weights),
         (
             "{turns: 4, up_to: 2}",
             "a series runs up to at least as many turns as it starts with",
@@ -721,7 +721,7 @@ fn a_series_is_several_traces_that_belong_together() {
         assert!(found.contains(message), "{written}: {found}");
     }
     // lengths that are computed are checked by the trace that reads them
-    let computed = source.replace("{turns: 3}", "{turns: 2, up_to: 4, weights: [|1, range(1, 2)|]}");
+    let computed = source.replace("{turns: 3}", "{turns: 2, up_to: 4, weights: [1, range(1, 2)]}");
     let model = SELECTED.compile(&computed).unwrap();
     let error = data::generate(
         model,
@@ -736,7 +736,7 @@ fn a_series_is_several_traces_that_belong_together() {
     assert!(error.to_string().contains(weights), "{error}");
     // a series has no steps
     let found = rejected(&shape(
-        "(chat:series)-[:next]->(:policy {subject: \"a\", verb: \"be\"});",
+        "(chat:series)-|:next|->(:policy {subject: \"a\", verb: \"be\"});",
         "chat.id",
     ));
     assert!(found.contains("a series has no steps, so nothing leaves it"), "{found}");
@@ -762,18 +762,18 @@ fn dividing_two_integers_gives_an_integer() {
 fn a_list_keeps_its_sentences_apart() {
     // a text message drops the full stop of each sentence, and the list puts one back between them
     let world = r#"(customer:persona {style: "text_message"})
-    -[:next]->(:list)
-        -[:next]->(:sentence)
-            -[:next]->(:part {subject: "someone", verb: "hit", tense: "past", complement: "my car"})
-        -[:next]->(:sentence) {defaults: {form: "question", modal: "can"}}
-            -[:next]->(:part {subject: "you", person: "second", verb: "help"})
-        -[:next]->(:sentence)
-            -[:next]->(:part {subject: "I", person: "first", verb: "need", complement: "a claim"});"#;
+    -|:next|->(:list)
+        -|:next|->(:sentence)
+            -|:next|->(:part {subject: "someone", verb: "hit", tense: "past", complement: "my car"})
+        -|:next|->(:sentence) {defaults: {form: "question", modal: "can"}}
+            -|:next|->(:part {subject: "you", person: "second", verb: "help"})
+        -|:next|->(:sentence)
+            -|:next|->(:part {subject: "I", person: "first", verb: "need", complement: "a claim"});"#;
     let said = outputs(&shape(world, "customer.said[0]"), 0..1);
     assert_eq!(said[0], "someone hit my car. can you help? i need a claim");
     // sentences that end as written are joined as they are, and nothing is added after the last
     let joined = outputs(
-        &shape("", r#"paragraph([|"It rained.", null, "", "Did it stop?", "Not yet"|])"#),
+        &shape("", r#"paragraph(["It rained.", null, "", "Did it stop?", "Not yet"])"#),
         0..1,
     );
     assert_eq!(joined[0], "It rained. Did it stop? Not yet");
@@ -783,13 +783,13 @@ fn a_list_keeps_its_sentences_apart() {
 fn a_tag_is_written_or_computed() {
     // a tag reads the world, a condition or a function like any other string
     let source = r#"(line:fact)
-    -[:next]->(:given {value: "home"});
+    -|:next|->(:given {value: "home"});
 (a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "t"}) {
+(a)-|:next|->(t:task {name: "t"}) {
     input: a.input,
     output: "ok",
     local: {vip: true},
-    tags: [|"claims", line.value, self.local.vip ? "vip" : "standard", lower("WEB")|],
+    tags: ["claims", line.value, self.local.vip ? "vip" : "standard", lower("WEB")],
 };
 "#;
     let model = SELECTED.compile(source).unwrap_or_else(|errors| panic!("{errors}"));
@@ -893,9 +893,9 @@ fn a_verb_without_forms_is_rejected_where_it_is_written() {
     // a verb written as a word is looked up when the shape compiles, so no branch hides it
     let unknown = "unknown English verb \"reconcile\", write its forms as {base: \"reconcile\"";
     for world in [
-        "(w:list)\n    -[:next]->(:policy {subject: \"we\", person: \"first\", number: \"plural\", verb: \"reconcile\"});",
-        "(w:sentence)\n    =[:weighted]=>[\n        -[:next {weight: 99}]->(:part {subject: \"I\", person: \"first\", verb: \"wait\"}),\n        -[:next {weight: 1}]->(:part {subject: \"I\", person: \"first\", verb: \"reconcile\"}),\n    ];",
-        "(w:sentence) {defaults: {verb: \"reconcile\"}}\n    -[:next]->(:part {subject: \"I\", person: \"first\"});",
+        "(w:list)\n    -|:next|->(:policy {subject: \"we\", person: \"first\", number: \"plural\", verb: \"reconcile\"});",
+        "(w:sentence)\n    =|:weighted|=>[\n        -|:next {weight: 99}|->(:part {subject: \"I\", person: \"first\", verb: \"wait\"}),\n        -|:next {weight: 1}|->(:part {subject: \"I\", person: \"first\", verb: \"reconcile\"}),\n    ];",
+        "(w:sentence) {defaults: {verb: \"reconcile\"}}\n    -|:next|->(:part {subject: \"I\", person: \"first\"});",
     ] {
         let source = shape(world, "w.text");
         let errors = SELECTED.compile_module(&source, false).unwrap_err();
@@ -906,8 +906,8 @@ fn a_verb_without_forms_is_rejected_where_it_is_written() {
     }
     // a verb written with its forms, and a verb the provider knows, compile
     for world in [
-        "(w:sentence)\n    -[:next]->(:part {subject: \"I\", person: \"first\", verb: {base: \"reconcile\", third_person_singular: \"reconciles\", past: \"reconciled\", past_participle: \"reconciled\", present_participle: \"reconciling\"}});",
-        "(w:sentence)\n    -[:next]->(:part {subject: \"I\", person: \"first\", verb: \"wait\"});",
+        "(w:sentence)\n    -|:next|->(:part {subject: \"I\", person: \"first\", verb: {base: \"reconcile\", third_person_singular: \"reconciles\", past: \"reconciled\", past_participle: \"reconciled\", present_participle: \"reconciling\"}});",
+        "(w:sentence)\n    -|:next|->(:part {subject: \"I\", person: \"first\", verb: \"wait\"});",
     ] {
         SELECTED.compile_module(&shape(world, "w.text"), false).unwrap();
     }
@@ -915,7 +915,7 @@ fn a_verb_without_forms_is_rejected_where_it_is_written() {
     let forms = "{base: \"reconcile\", third_person_singular: \"reconciles\", past: \"reconciled\", past_participle: \"reconciled\", present_participle: \"reconciling\"}";
     for kind in ["statement", "policy"] {
         let world =
-            format!("(w:list)\n    -[:next]->(:{kind} {{subject: \"the team\", verb: {forms}, complement: \"the report\"}});");
+            format!("(w:list)\n    -|:next|->(:{kind} {{subject: \"the team\", verb: {forms}, complement: \"the report\"}});");
         let said = outputs(&shape(&world, "w.text"), 0..1);
         assert_eq!(said[0], "The team reconciles the report.");
     }
@@ -927,74 +927,74 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
     for (world, read, message) in [
         (
             format!(
-                "(w:list)\n    =[:weighted]=>[\n        -[x:next {{weight: 1}}]->{policy},\n        -[y:next {{weight: 1}}]->(q:policy {{subject: \"b\", verb: \"be\"}}),\n    ]\n        >[:first [x], [y]]>>(r:policy {{subject: \"c\", verb: \"be\"}});"
+                "(w:list)\n    =|:weighted|=>[\n        -|x:next {{weight: 1}}|->{policy},\n        -|y:next {{weight: 1}}|->(q:policy {{subject: \"b\", verb: \"be\"}}),\n    ]\n        >|:first |x|, |y||>>(r:policy {{subject: \"c\", verb: \"be\"}});"
             ),
             "w.text",
             "junction kind `first` is not supported by World",
         ),
         (
-            format!("(w:list)\n    =[:parallel]=>[\n        -[:next]->{policy},\n    ];"),
+            format!("(w:list)\n    =|:parallel|=>[\n        -|:next|->{policy},\n    ];"),
             "w.text",
             "fork kind `parallel` is not supported by World",
         ),
         (
-            format!("(w:list)-[:calls]->{policy};"),
+            format!("(w:list)-|:calls|->{policy};"),
             "w.text",
             "a walk follows `next` edges, not `calls`",
         ),
         (
-            "(w:list)-[:next]->(s:list)-[:next]->(w);".to_owned(),
+            "(w:list)-|:next|->(s:list)-|:next|->(w);".to_owned(),
             "w.text",
             "this walk is a step of a walk that is a step of it, and a walk cannot build itself",
         ),
         (
             format!(
-                "(w:list)\n    =[:repeat {{count: other.value}}]=>[\n        -[:next]->{policy},\n    ];\n(other:fact)-[:next]->(:given {{value: 2}});"
+                "(w:list)\n    =|:repeat {{count: other.value}}|=>[\n        -|:next|->{policy},\n    ];\n(other:fact)-|:next|->(:given {{value: 2}});"
             ),
             "w.text",
             "a repeat fork in a walk is written with a whole count from 0 to 64",
         ),
         (
             format!(
-                "(w:entity)-[:next]->(:given {{value: {{a: 1}}}});\n(r:relation);\n(r)-[:incidence]-(w);\n(r)-[:incidence]-{policy};"
+                "(w:entity)-|:next|->(:given {{value: {{a: 1}}}});\n(r:relation);\n(r)-|:incidence|-(w);\n(r)-|:incidence|-{policy};"
             ),
             "w.related",
             "a relation in a world joins walks, and this is not one",
         ),
         (
-            "(w:list)-[:next]->(p:vars) {x: 1};".to_owned(),
+            "(w:list)-|:next|->(p:vars) {x: 1};".to_owned(),
             "w.text",
             "this step gives nothing to `w`, its kind needs a `gives` field",
         ),
         (
-            "+(stop:node {at: {type: \"string\"}});\n(w:list)-[:next]->(p:stop {at: \"noon\"});".to_owned(),
+            "+(stop:node {at: {type: \"string\"}});\n(w:list)-|:next|->(p:stop {at: \"noon\"});".to_owned(),
             "w.text",
             "this step gives nothing to `w`, its kind needs a `gives` field",
         ),
         (
-            format!("(w:list)-[:next {{when: true}}]->{policy};"),
+            format!("(w:list)-|:next {{when: true}}|->{policy};"),
             "w.text",
             "a step outside a fork is always taken, so its edge takes no properties",
         ),
         (
-            format!("(w:list)\n    =[:weighted]=>[\n        -[:next {{weight: 1, when: true}}]->{policy},\n    ];"),
+            format!("(w:list)\n    =|:weighted|=>[\n        -|:next {{weight: 1, when: true}}|->{policy},\n    ];"),
             "w.text",
             "a weighted fork in a walk chooses by weight alone",
         ),
         // one walk is built once, so it cannot be what a repeat repeats
         (
-            "(w:list)\n    =[:repeat {count: 2}]=>[\n        -[:next]->(s:sentence),\n    ];\n(s)-[:next]->(:part {subject: \"a\", verb: \"be\"});".to_owned(),
+            "(w:list)\n    =|:repeat {count: 2}|=>[\n        -|:next|->(s:sentence),\n    ];\n(s)-|:next|->(:part {subject: \"a\", verb: \"be\"});".to_owned(),
             "w.text",
             "a walk inside a repeat is built once, so every round would give the same. Repeat an `either` with a fork under it",
         ),
         (
-            "(w:entity)-[:next]->(:given {value: {a: 1}});\n(all:setting {nodes: [|(w), (p)|], edges: [||]});\n(p:vars) {x: 1};".to_owned(),
+            "(w:entity)-|:next|->(:given {value: {a: 1}});\n(all:setting {nodes: [(w), (p)], edges: []});\n(p:vars) {x: 1};".to_owned(),
             "all.members",
             "a network in a world gathers named walks, and this is not one",
         ),
         // the steps of a walk are not a key an agent's step can read
         (
-            format!("(w:list)-[:next]->{policy};"),
+            format!("(w:list)-|:next|->{policy};"),
             "context.steps",
             "context key `steps` is not available here",
         ),
@@ -1004,7 +1004,7 @@ fn a_world_graph_rejects_what_a_walk_cannot_take() {
     }
     // a walk stands beside the agent, never on its path
     let on_path = format!(
-        "(a:agent) {{input: \"hi\", output: t.output}};\n(a)-[:next]->(t:task {{name: \"t\"}}) {{input: a.input, output: w.text}};\n(t)-[:calls]->(w:list)-[:next]->{policy};"
+        "(a:agent) {{input: \"hi\", output: t.output}};\n(a)-|:next|->(t:task {{name: \"t\"}}) {{input: a.input, output: w.text}};\n(t)-|:calls|->(w:list)-|:next|->{policy};"
     );
     let found = rejected(&on_path);
     assert!(

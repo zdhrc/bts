@@ -118,7 +118,7 @@ fn generate_and_send<B: DataProvider>(bundle: &B, client: &B::Client) -> RunResu
         model: compile(
             r#"(flow_root:task {name: "flow"}) {output: "ok", input: flow.input};
 (flow:agent) {input: null, output: flow_root.output};
-(flow)-[:next]->(flow_root);"#,
+(flow)-|:next|->(flow_root);"#,
         )
         .unwrap(),
         count: 1,
@@ -337,8 +337,8 @@ fn a_provider_joined_by_a_contributor_has_the_kinds_and_functions_of_both() {
 
     // a shape uses the kinds of both, and a call finds what runs it whichever declared it
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task) {input: a.input, output: {said: s.text, counted: tokens(s.text)}};
-(t)-[:calls]->(s:statement {subject: "the desk", verb: "open"});"#;
+(a)-|:next|->(t:task) {input: a.input, output: {said: s.text, counted: tokens(s.text)}};
+(t)-|:calls|->(s:statement {subject: "the desk", verb: "open"});"#;
     let model = joined.compile(source).unwrap();
     let batch = data::generate(
         model,
@@ -607,13 +607,13 @@ fn a_provider_compiles_source_against_its_own_definitions() {
 }
 
 const TWO_AGENTS: &str = r#"(files:agent) {input: null, output: work.output};
-(files)-[:next]->(work);
+(files)-|:next|->(work);
 (work:task {name: "work"}) {
     input: files.input,
     output: {report: attachment("report.pdf", "application/pdf"), size: tokens("four words of text")},
 };
 (other:agent) {input: null, output: plain.output};
-(other)-[:next]->(plain);
+(other)-|:next|->(plain);
 (plain:task {name: "plain"}) {input: other.input, output: noise(8)};
 ("length":scorer {lang: "python"}) {score: clamp(tokens(context.output) / 400, 0.1, 0.9)};
 ("fixed":scorer {lang: "python"}) {score: 0.5};
@@ -719,11 +719,11 @@ fn a_function_a_consumer_cannot_run_is_reported_where_it_is_called() {
 fn a_computed_field_a_consumer_cannot_run_is_reported_at_its_call() {
     // the kind states the call once, so the report points into the kind for the agent that uses it
     let source = r#"+(reporting:node) {output: {value: {report: attachment("report.pdf", "application/pdf")}}}
-    -[:extends]->(task);
+    -|:extends|->(task);
 (files:agent) {input: null, output: work.output};
-(files)-[:next]->(work:reporting {name: "work"}) {input: files.input};
+(files)-|:next|->(work:reporting {name: "work"}) {input: files.input};
 (other:agent) {input: null, output: plain.output};
-(other)-[:next]->(plain:task {name: "plain"}) {input: other.input, output: "plain"};
+(other)-|:next|->(plain:task {name: "plain"}) {input: other.input, output: "plain"};
 "#;
     let model = compile(source).unwrap();
     let target = braintrust::mocking::code::CodeTarget::new("local-test");
@@ -745,11 +745,11 @@ fn an_llm_span_counts_its_own_tokens() {
     use braintrust::functions::count_tokens;
     // no step writes a token count: the llm kind computes them, and an object in metrics is merged over them
     let source = r#"(chat:agent) {input: "How do I rotate API keys?", output: full.output};
-(chat)-[:next]->(request:task {name: "request"}) {input: chat.input, output: full.output};
-(request)-[:calls]->(bare:llm {name: "bare"})
-    -[:next]->(full:llm {name: "full"}) {input: request.input, output: "Under Settings."}
-        -[:next]->(timed:llm {name: "timed"}) {input: request.input, output: "Under Settings.", metrics: {time_to_first_token: 0.25}}
-            -[:next]->(cached:llm {name: "cached"}) {input: request.input, output: "Under Settings.", metrics: {prompt_tokens: 0}};
+(chat)-|:next|->(request:task {name: "request"}) {input: chat.input, output: full.output};
+(request)-|:calls|->(bare:llm {name: "bare"})
+    -|:next|->(full:llm {name: "full"}) {input: request.input, output: "Under Settings."}
+        -|:next|->(timed:llm {name: "timed"}) {input: request.input, output: "Under Settings.", metrics: {time_to_first_token: 0.25}}
+            -|:next|->(cached:llm {name: "cached"}) {input: request.input, output: "Under Settings.", metrics: {prompt_tokens: 0}};
 "#;
     let model = compile(source).unwrap();
     let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);

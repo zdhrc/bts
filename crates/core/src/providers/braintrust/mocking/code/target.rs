@@ -438,7 +438,7 @@ mod agent_tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {output: "hello", input: hello.input};
 (hello:agent) {input: null, output: t_root.output};
-(hello)-[:next]->(t_root);"#,
+(hello)-|:next|->(t_root);"#,
         )
         .unwrap();
         let target = CodeTarget::new("");
@@ -492,8 +492,8 @@ dependencies = ["braintrust==0.40.0", "requests>=2"]
         // an llm step counts its own tokens, so the shape never names the function
         let model = compile(
             r#"(counted:agent) {input: "hi", output: reply.output};
-(counted)-[:next]->(request:task) {input: counted.input, output: reply.output};
-(request)-[:calls]->(reply:llm {name: "reply"}) {input: request.input, output: "hello"};"#,
+(counted)-|:next|->(request:task) {input: counted.input, output: reply.output};
+(request)-|:calls|->(reply:llm {name: "reply"}) {input: request.input, output: "hello"};"#,
         )
         .unwrap();
         let target = CodeTarget::new("");
@@ -523,9 +523,9 @@ dependencies = ["braintrust==0.40.0", "requests>=2"]
             include_str!("../../../../../tests/fixtures/agent.bt"),
             r#"
 (one:case) {input: {patient_id: "p-123"}};
-(cases:dataset) {cases: [|(one)|]};
+(cases:dataset) {cases: [(one)]};
 (quality:scorer) {score: 1};
-(customer_support:experiment) {dataset: (cases), task: (request), scorers: [|(quality)|]};
+(customer_support:experiment) {dataset: (cases), task: (request), scorers: [(quality)]};
 "#
         );
         let model = compile(&source).unwrap();

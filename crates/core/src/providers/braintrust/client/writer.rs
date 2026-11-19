@@ -796,7 +796,7 @@ mod tests {
 (third:task {name: "third"}) {};
 (fourth:task {name: "fourth"}) {};
 (send:agent) {input: null, output: null};
-(send)-[:next]->(send_root)-[:calls]->(first)-[:next]->(second)-[:next]->(third)-[:next]->(fourth);"#,
+(send)-|:next|->(send_root)-|:calls|->(first)-|:next|->(second)-|:next|->(third)-|:next|->(fourth);"#,
         )
         .unwrap();
         let events = data::generate(
@@ -832,7 +832,7 @@ mod tests {
         let model = compile(
             r#"(example_root:task {name: "example"}) {input: example.input};
 (example:agent) {input: null, output: null};
-(example)-[:next]->(example_root);"#,
+(example)-|:next|->(example_root);"#,
         )
         .unwrap();
         let events = data::generate(

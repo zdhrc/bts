@@ -67,27 +67,27 @@ This graph models a support agent that looks up an article and uses it in a resp
     output: reply.output,
 };
 
-(support)-[:next]->(request:task) {
+(support)-|:next|->(request:task) {
     input: support.input,
     output: reply.output,
-    tags: [|"billing"|],
+    tags: ["billing"],
 };
 
-(request)-[:calls]->(search:tool) {
+(request)-|:calls|->(search:tool) {
     input: {query: request.input.question},
     output: {article: "Download invoices from Billing > Invoices."},
 }
-    -[:next, :feeds {
+    -|:next, :feeds {
         value: {question: request.input.question, article: source.output.article},
         into: target.input,
-    }]->(reply:llm) {
+    }|->(reply:llm) {
         input: <-,
         output: self.input.article,
         duration: range(0.4, 0.8),
     };
 ```
 
-`(search:tool)` declares a named `node`. `(search)` refers to it. The body holds fields, which can contain literals, expressions, and references to other `nodes`. Arrays use `[|...|]`. Commas separate fields and array items, and semicolons end root statements.
+`(search:tool)` declares a named `node`. `(search)` refers to it. The body holds fields, which can contain literals, expressions, and references to other `nodes`. Arrays use `[...]`. Commas separate fields and array items, and semicolons end root statements.
 
 `Edges` state different relationships explicitly:
 
@@ -107,32 +107,32 @@ The Braintrust provider interprets the `agent` `node` and every step its entry l
 
 ```bts
 (intake:agent) {input: "Find my patient record", output: finish.output};
-(intake)-[:next]->(intake_request:task) {
+(intake)-|:next|->(intake_request:task) {
     input: intake.input,
     output: finish.output,
 };
-(intake_request)-[:calls]->(lookup:tool) {
+(intake_request)-|:calls|->(lookup:tool) {
     input: intake_request.input,
     output: {found: chance(0.8)},
 };
 
 (lookup)
-    =[:exclusive]=>[
-        -[known:next {when: source.output.found}]->(schedule:task) {
+    =|:exclusive|=>[
+        -|known:next {when: source.output.found}|->(schedule:task) {
             output: "Route to scheduling",
         },
-        -[unknown:next {when: !source.output.found}]->(register:task) {
+        -|unknown:next {when: !source.output.found}|->(register:task) {
             output: "Route to registration",
         },
     ]
-        >[:first {observe: "result"} [known], [unknown]]>>(finish:task) {
+        >|:first {observe: "result"} |known|, |unknown||>>(finish:task) {
             output: context.arrivals[0].value,
         };
 ```
 
 `exclusive` chooses a qualifying branch. `first` observes a selected branch's result and supplies it to `finish`. `Node` names identify definitions, while named `edges` such as `[known]` identify the `junct`'s inputs. Indentation attaches continuations to the correct `fork`.
 
-Other kinds express other behaviors: `parallel` splits work across branches, `weighted` samples alternatives, `repeat` creates a count of occurrences, and `each` distributes array items. `Juncts` such as `accumulate` and `reduce` combine results. Explicit cycle `edges` use `~[:next]~>` and can carry guards and traversal limits.
+Other kinds express other behaviors: `parallel` splits work across branches, `weighted` samples alternatives, `repeat` creates a count of occurrences, and `each` distributes array items. `Juncts` such as `accumulate` and `reduce` combine results. Explicit cycle `edges` use `~|:next|~>` and can carry guards and traversal limits.
 
 See [parallel workers](examples/fanout_parallel_workers.bt), [tool loops](examples/agent_tool_loop.bt), [multi-turn conversations](examples/multi_turn_conversation.bt), and [supervisor delegation](examples/supervisor_and_subagents.bt). The generated skill documents the available kinds, their properties, and runtime constraints.
 
@@ -141,7 +141,7 @@ See [parallel workers](examples/fanout_parallel_workers.bt), [tool loops](exampl
 A definition starts with `+` and is written like a `node`: its header holds property descriptors, its body holds field descriptors, and an `extends` `edge` names its base. Kinds can add schemas to existing primitives or provider definitions. For example, append this to `support.bt`:
 
 ```bts
-+(billing_lookup:node {service: {type: "string", required: true}})-[:extends]->(tool);
++(billing_lookup:node {service: {type: "string", required: true}})-|:extends|->(tool);
 ```
 
 Then change `(search:tool)` to `(search:billing_lookup {service: "billing"})`. Properties inside the `node` header configure that instance and are checked against the inherited schema. The body remains its data and expressions. This extension adds a contract, not a service implementation.
@@ -150,7 +150,7 @@ A field descriptor can also carry `value`, an expression that computes the field
 
 ```bts
 +(clean_query:node) {output: {type: "string", value: lower(trim(self.input))}}
-    -[:extends]->(tool);
+    -|:extends|->(tool);
 ```
 
 The expression reads `self` and `context` only, so the kind works in any shape. An instance that writes the field replaces the computed value. When both are objects they are merged by key, and the instance's keys win.
@@ -214,16 +214,16 @@ Append these definitions to `support.bt`:
 (invoice_case:case) {
     input: {question: "Where can I download my invoices?"},
     expected: "Download invoices from Billing > Invoices.",
-    tags: [|"billing"|],
+    tags: ["billing"],
 };
 
-(regressions:dataset) {cases: [|(invoice_case)|]};
+(regressions:dataset) {cases: [(invoice_case)]};
 (correctness:scorer) {score: context.output == context.expected ? 1 : 0};
 
 (support_check:experiment) {
     dataset: (regressions),
     task: (request),
-    scorers: [|(correctness)|],
+    scorers: [(correctness)],
 };
 ```
 
@@ -288,7 +288,7 @@ await init();
 
 const source = `
 (support:agent) {input: "Help with billing", output: request.output};
-(support)-[:next]->(request:task) {
+(support)-|:next|->(request:task) {
     input: support.input,
     output: choice("resolved", "escalated"),
 };

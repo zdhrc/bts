@@ -18,7 +18,7 @@ function assert(condition: unknown, message: string): asserts condition {
 export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
     await init({ module_or_path: bytes });
 
-    const source = '(a:agent) {input: null, output: run.output}; (a)-[:next]->(run:task) {input: a.input, output: "hello"};';
+    const source = '(a:agent) {input: null, output: run.output}; (a)-|:next|->(run:task) {input: a.input, output: "hello"};';
     const validation = validate(source);
     assert(validation.valid && validation.diagnostics.length === 0, "valid source was rejected");
     const invalid = validate('(a:agent) {input: null, output: missing.output};');
@@ -61,7 +61,7 @@ export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
     };
     const agentSource = `
 (hello:agent) {input: {name: "Ada"}, output: request.output};
-(hello)-[:next]->(request:task) {input: hello.input, output: "Hello \${self.input.name}"};
+(hello)-|:next|->(request:task) {input: hello.input, output: "Hello \${self.input.name}"};
 `;
     const agent = build(agentSource, agentOptions);
     if (!agent.ok) throw new Error(`${agent.error.stage}: ${agent.error.message}`);
@@ -71,8 +71,8 @@ export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
         && agent.value.removals[0].expected === previous, "missing guarded removal");
     const evaluationSource = `${agentSource}
 (quality:scorer) {score: context.output == context.expected ? 1 : 0};
-(cases:dataset) {cases: [|(sampled)|]}; (sampled:case) {input: {name: choice("Ada", "Grace", "Linus")}, expected: "Hello Ada"};
-(hello_eval:experiment {name: "hello"}) {dataset: (cases), task: (request), scorers: [|(quality)|]};
+(cases:dataset) {cases: [(sampled)]}; (sampled:case) {input: {name: choice("Ada", "Grace", "Linus")}, expected: "Hello Ada"};
+(hello_eval:experiment {name: "hello"}) {dataset: (cases), task: (request), scorers: [(quality)]};
 `;
     const evaluation = build(evaluationSource, {
         target: "agent", lang: "python", project: "Package Check", seed: "18446744073709551615",

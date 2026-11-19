@@ -2875,9 +2875,9 @@ mod tests {
     fn preserves_typed_attachments_through_references_and_bindings() {
         let model = compile(
             r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["files"][0]};
-(copy:tool {name: "copy"}) {input: {nested: [|copy.local.picked|]}, output: source_root.output, local: {picked: source_root.output}};
-(source_node:agent) {input: {files: [|attachment("report.txt", "text/plain")|]}, output: source_root.output};
-(source_node)-[:next]->(source_root)-[:calls]->(copy);"#,
+(copy:tool {name: "copy"}) {input: {nested: [copy.local.picked]}, output: source_root.output, local: {picked: source_root.output}};
+(source_node:agent) {input: {files: [attachment("report.txt", "text/plain")]}, output: source_root.output};
+(source_node)-|:next|->(source_root)-|:calls|->(copy);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -2892,9 +2892,9 @@ mod tests {
     #[test]
     fn uses_the_selected_attachment_projection_for_fields_and_tokens() {
         let model = compile(
-            r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["name"], metrics: {count: tokens([|self.input|])}};
+            r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["name"], metrics: {count: tokens([self.input])}};
 (source_node:agent) {input: attachment("report.txt", "text/plain"), output: source_root.output};
-(source_node)-[:next]->(source_root);"#,
+(source_node)-|:next|->(source_root);"#,
         )
         .unwrap();
         let plan = plan_with_filter(model, 1, 0, &WriteFilter::default(), &AttachmentView).unwrap();
@@ -2911,7 +2911,7 @@ mod tests {
     fn unsupported_attachment_projection_keeps_the_expression_range() {
         let source = r#"(source_root:task {name: "source"}) {input: source_node.input, metrics: {count: tokens(self.input)}};
 (source_node:agent) {input: attachment("report.txt", "text/plain"), output: null};
-(source_node)-[:next]->(source_root);"#;
+(source_node)-|:next|->(source_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnsupportedAttachment);
         assert_eq!(&source[error.range.start..error.range.end], "tokens(self.input)");
@@ -2937,7 +2937,7 @@ mod tests {
             let source = format!(
                 r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
 (source_node:agent) {{input: source_root.local.file, output: source_root.output}};
-(source_node)-[:next]->(source_root);"#
+(source_node)-|:next|->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch, "{expression}");
@@ -2961,14 +2961,14 @@ mod tests {
             ),
             (
                 serde_json::json!(["first", "second"]),
-                "[|...source_root.local.selected|]",
+                "[...source_root.local.selected]",
                 value!(["first", "second"]),
             ),
         ] {
             let source = format!(
                 r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
 (source_node:agent) {{input: source_root.local.file, output: source_root.output}};
-(source_node)-[:next]->(source_root);"#
+(source_node)-|:next|->(source_root);"#
             );
             let plan = plan_with_projection(&source, projection).unwrap();
             assert_eq!(plan.events[0].fields.output.as_ref(), Some(&expected), "{expression}");
@@ -3017,7 +3017,7 @@ mod tests {
             let source = format!(
                 r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
 (source_node:agent) {{input: source_root.local.file, output: source_root.output}};
-(source_node)-[:next]->(source_root);"#
+(source_node)-|:next|->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), kind, "{expression}");
@@ -3027,9 +3027,9 @@ mod tests {
 
     #[test]
     fn attachment_projection_rejects_non_array_spreads_without_panicking() {
-        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, output: [|... self.input|]};
+        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, output: [... self.input]};
 (source_node:agent) {input: attachment("report.txt", "text/plain"), output: source_root.output};
-(source_node)-[:next]->(source_root);"#;
+(source_node)-|:next|->(source_root);"#;
         for projection in [serde_json::json!({}), serde_json::json!("value"), InputValue::Null] {
             let error = plan_with_projection(source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch);
@@ -3040,31 +3040,27 @@ mod tests {
     #[test]
     fn attachment_projection_spreads_report_the_current_expression() {
         for (projection, expression, expected) in [
-            (
-                serde_json::json!("value"),
-                "[|...self.expected, ...self.input|]",
-                "self.input",
-            ),
+            (serde_json::json!("value"), "[...self.expected, ...self.input]", "self.input"),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"[|...self.expected, ...source_root.local.selected["nested"]|]"#,
+                r#"[...self.expected, ...source_root.local.selected["nested"]]"#,
                 r#"source_root.local.selected["nested"]"#,
             ),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"[|...source_root.local.selected["nested"]|]"#,
+                r#"[...source_root.local.selected["nested"]]"#,
                 r#"source_root.local.selected["nested"]"#,
             ),
             (
                 serde_json::json!("value"),
-                "[|...self.expected, ...choice(self.input, self.input)|]",
+                "[...self.expected, ...choice(self.input, self.input)]",
                 "choice(self.input, self.input)",
             ),
         ] {
             let source = format!(
-                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, expected: [|"seed"|], output: {expression}, local: {{selected: source_root.input}}}};
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, expected: ["seed"], output: {expression}, local: {{selected: source_root.input}}}};
 (source_node:agent) {{input: attachment("report.txt", "text/plain"), output: source_root.output}};
-(source_node)-[:next]->(source_root);"#
+(source_node)-|:next|->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch, "{expression}");
@@ -3076,7 +3072,7 @@ mod tests {
     fn attachment_projection_accepts_any_json_for_projection_and_token_counting() {
         let source = r#"(source_root:task {name: "source"}) {input: source_node.input, metrics: {count: tokens(self.input)}};
 (source_node:agent) {input: attachment("report.txt", "text/plain"), output: null};
-(source_node)-[:next]->(source_root);"#;
+(source_node)-|:next|->(source_root);"#;
         for projection in [
             serde_json::json!({"name": "report.txt"}),
             serde_json::json!(["value"]),
@@ -3108,7 +3104,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input, metrics: {delta: - 0.5}};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3121,9 +3117,9 @@ mod tests {
     #[test]
     fn resolves_trace_index_per_generated_trace() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {input: t.input, tags: [|"t-${context.trace_index}"|]};
+            r#"(t_root:task {name: "t"}) {input: t.input, tags: ["t-${context.trace_index}"]};
 (t:agent) {input: "q ${context.trace_index}", output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 3, 0).unwrap();
@@ -3147,8 +3143,8 @@ mod tests {
 (turn:task {name: "turn"}) {metrics: {turn: context.index + 1, of: context.count}};
 (t:agent) {input: context.trace_index, output: null};
 
-(t_root)=[:repeat {count: 3}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:repeat {count: 3}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 2, 0).unwrap();
@@ -3165,12 +3161,12 @@ mod tests {
     #[test]
     fn slices_trace_scope_vars_by_repeat_index() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {local: {messages: [|"q0" , "a0" , "q1" , "a1"|]}, input: t.input};
+            r#"(t_root:task {name: "t"}) {local: {messages: ["q0" , "a0" , "q1" , "a1"]}, input: t.input};
 (turn:task {name: "turn"}) {input: t_root.local.messages [: ${context.index * 2} + 1]};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: 2}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:repeat {count: 2}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3184,9 +3180,9 @@ mod tests {
         let model = compile(
             r#"
 (t:agent) {input: null, output: null};
-(t)-[:next]->(root:task) {input: t.input};
-(root)=[:repeat {count: 2}]=>[-[:calls]->(iteration:node) {index: context.index}];
-(iteration)=[:repeat {count: iteration.index + 1}]=>[-[:calls]->(step:task) {metrics: {inner: context.index, of: context.count}}];
+(t)-|:next|->(root:task) {input: t.input};
+(root)=|:repeat {count: 2}|=>[-|:calls|->(iteration:node) {index: context.index}];
+(iteration)=|:repeat {count: iteration.index + 1}|=>[-|:calls|->(step:task) {metrics: {inner: context.index, of: context.count}}];
 "#,
         )
         .unwrap();
@@ -3210,10 +3206,10 @@ mod tests {
         let model = compile(
             r#"(first_root:task {name: "first"}) {input: first.input};
 (first:agent) {input: null, output: null};
-(first)-[:next]->(first_root);
+(first)-|:next|->(first_root);
 (second_root:task {name: "second"}) {input: second.input};
 (second:agent) {input: null, output: null};
-(second)-[:next]->(second_root);"#,
+(second)-|:next|->(second_root);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 0).unwrap();
@@ -3230,7 +3226,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: choice("a", "b"), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 20, 7).unwrap();
@@ -3246,7 +3242,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {metrics: {tokens: range(80, 400), temp: range(0.0, 1.0)}, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 20, 7).unwrap();
@@ -3264,8 +3260,8 @@ mod tests {
     fn evaluates_weighted_picks_proportionally_to_their_weights() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: weighted([|"common", 9|], [|"rare", 1|], [|"never", 0|]), output: null};
-(t)-[:next]->(t_root);"#,
+(t:agent) {input: weighted(["common", 9], ["rare", 1], ["never", 0]), output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 200, 7).unwrap();
@@ -3284,8 +3280,8 @@ mod tests {
     fn evaluates_weighted_picks_with_dynamic_values() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: weighted([|range(1, 3), 1|], [|10, 1|]), output: null};
-(t)-[:next]->(t_root);"#,
+(t:agent) {input: weighted([range(1, 3), 1], [10, 1]), output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 40, 7).unwrap();
@@ -3301,7 +3297,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {metrics: {normal: normal(100, 10), lognormal: lognormal(300, 0.5), exponential: exponential(250), pareto: pareto(100, 1.5), beta: beta(2, 5), poisson: poisson(3)}, input: t.input};
 (t:agent) {input: chance(0.5), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan_a = plan(model, 50, 7).unwrap();
@@ -3334,7 +3330,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {metrics: {normal: normal(100, 10), lognormal: lognormal(300, 0.5), exponential: exponential(250), pareto: pareto(100, 1.5), beta: beta(2, 5), poisson: poisson(3)}, input: t.input};
 (t:agent) {input: chance(0.5), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan_b = plan(model, 50, 7).unwrap();
@@ -3346,7 +3342,7 @@ mod tests {
         let always = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: chance(1), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan_a = plan(always, 10, 7).unwrap();
@@ -3360,7 +3356,7 @@ mod tests {
         let never = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: chance(0), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan_b = plan(never, 10, 7).unwrap();
@@ -3375,9 +3371,9 @@ mod tests {
     #[test]
     fn evaluates_string_funcs() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {input: t.input, output: split("a,b,c", ","), metadata: {sub: contains("gpt-4o-mini", "mini"), missing: contains("gpt-4o", "mini"), elem: contains(t_root.tags, "beta"), absent: contains(t_root.tags, "gamma"), prefix: starts_with("gpt-4o", "gpt"), suffix: ends_with("gpt-4o", "4o"), chars: len("hello"), elems: len(t_root.tags)}, tags: [|"alpha", "beta"|]};
-(t:agent) {input: [|upper("get"), lower("WARN"), trim("  padded  "), replace("a b c", " ", "-"), replace("keep", "", "x"), join(t_root.tags, ", "), join([|1, 2.5, true|], "-"), format("model={} n={}", "gpt", 4),|], output: t_root.output};
-(t)-[:next]->(t_root);"#,
+            r#"(t_root:task {name: "t"}) {input: t.input, output: split("a,b,c", ","), metadata: {sub: contains("gpt-4o-mini", "mini"), missing: contains("gpt-4o", "mini"), elem: contains(t_root.tags, "beta"), absent: contains(t_root.tags, "gamma"), prefix: starts_with("gpt-4o", "gpt"), suffix: ends_with("gpt-4o", "4o"), chars: len("hello"), elems: len(t_root.tags)}, tags: ["alpha", "beta"]};
+(t:agent) {input: [upper("get"), lower("WARN"), trim("  padded  "), replace("a b c", " ", "-"), replace("keep", "", "x"), join(t_root.tags, ", "), join([1, 2.5, true], "-"), format("model={} n={}", "gpt", 4),], output: t_root.output};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3420,9 +3416,9 @@ mod tests {
     #[test]
     fn evaluates_token_counts() {
         let model = compile(
-            r#"(t_root:task {name: "t"}) {metrics: {text: tokens("What is the weather in Tokyo?"), empty: tokens(""), messages: tokens([|{role: "user", content: "hi"}|])}, input: t.input};
+            r#"(t_root:task {name: "t"}) {metrics: {text: tokens("What is the weather in Tokyo?"), empty: tokens(""), messages: tokens([{role: "user", content: "hi"}])}, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3440,7 +3436,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: upper(choice("get", "post")), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let planned = plan(model, 20, 7).unwrap();
@@ -3457,7 +3453,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input, output: len(split("a,b", ","))};
 (t:agent) {input: split("a,b,c", ",") [range(0, 2)], output: t_root.output};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let planned = plan(model, 10, 7).unwrap();
@@ -3473,7 +3469,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: format("n={} f={} b={}", range(1, 1), 0.5, chance(1)), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3483,9 +3479,9 @@ mod tests {
 
     #[test]
     fn english_functions_materialize_composable_grammar_and_explicit_context() {
-        let source = r#"(t_root:task {name: "t"}) {output: {sentence: realize(t_root.local.arrival), combined: combine([|t_root.local.arrival, t_root.local.checkin|], "and"), first: refer(t_root.local.guest, {}), later: refer(t_root.local.guest, t_root.local.context), reset: refer(t_root.local.guest, {}), context: t_root.local.context, details: unmentioned([|{id: "arrival", text: "The arrival is recorded."}, {id: "key", text: "Your key is at reception."}|], t_root.local.context), amount: format_number("1234567.125", {locale: "en-IN", fraction_digits: 2}), date: format_date("2026-11-10", {locale: "en-GB"}), time: format_time("17:30", {locale: "en-US"}), composed: compose([|render("Hello {name}.", {name: t_root.local.guest.label}), realize(t_root.local.checkin)|])}, local: {guest: {id: "guest_1", label: "Maya", pronouns: {subject: "she", object: "her", possessive_determiner: "her", possessive: "hers"}}, arrival: {clause: {subject: {text: "the guest"}, predicate: {verb: "arrive"}, tense: "future"}}, checkin: {clause: {subject: {text: "the guest"}, predicate: {verb: "check", complement: "in"}, modal: "can"}}, context: remember({}, [|t_root.local.guest|], [|"arrival"|])}, input: t.input};
+        let source = r#"(t_root:task {name: "t"}) {output: {sentence: realize(t_root.local.arrival), combined: combine([t_root.local.arrival, t_root.local.checkin], "and"), first: refer(t_root.local.guest, {}), later: refer(t_root.local.guest, t_root.local.context), reset: refer(t_root.local.guest, {}), context: t_root.local.context, details: unmentioned([{id: "arrival", text: "The arrival is recorded."}, {id: "key", text: "Your key is at reception."}], t_root.local.context), amount: format_number("1234567.125", {locale: "en-IN", fraction_digits: 2}), date: format_date("2026-11-10", {locale: "en-GB"}), time: format_time("17:30", {locale: "en-US"}), composed: compose([render("Hello {name}.", {name: t_root.local.guest.label}), realize(t_root.local.checkin)])}, local: {guest: {id: "guest_1", label: "Maya", pronouns: {subject: "she", object: "her", possessive_determiner: "her", possessive: "hers"}}, arrival: {clause: {subject: {text: "the guest"}, predicate: {verb: "arrive"}, tense: "future"}}, checkin: {clause: {subject: {text: "the guest"}, predicate: {verb: "check", complement: "in"}, modal: "can"}}, context: remember({}, [t_root.local.guest], ["arrival"])}, input: t.input};
 (t:agent) {input: null, output: t_root.output};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let generated = plan(compile_with_world(source).unwrap(), 2, 42).unwrap();
         for event in generated.events.iter() {
             let output = event.fields.output.as_ref().unwrap();
@@ -3512,11 +3508,11 @@ mod tests {
     fn a_failure_inside_a_definition_is_reported_where_the_author_wrote_the_element() {
         // a verb that is not a constant is looked up when a trace reads the sentence, inside the provider's definitions
         // the author cannot change those, so the failure is reported at the sentence they wrote
-        let source = r#"(action:fact) -[:next]->(:given {value: "defenestrate"});
+        let source = r#"(action:fact) -|:next|->(:given {value: "defenestrate"});
 (ask:sentence)
-    -[:next]->(:part {subject: "I", person: "first", verb: action.value, complement: "the case"});
+    -|:next|->(:part {subject: "I", person: "first", verb: action.value, complement: "the case"});
 (a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "t"}) {input: a.input, output: ask.text};
+(a)-|:next|->(t:task {name: "t"}) {input: a.input, output: ask.text};
 "#;
         let error = plan(compile_with_world(source).unwrap(), 1, 1).unwrap_err();
         assert!(
@@ -3527,7 +3523,7 @@ mod tests {
         assert_eq!(&source[error.range.start..error.range.end], "(ask:sentence)");
         // a failure in what the author wrote stays where it is
         let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "t"}) {input: a.input, output: realize({clause: {subject: {text: "I", person: "first"}, predicate: {verb: a.input}}})};
+(a)-|:next|->(t:task {name: "t"}) {input: a.input, output: realize({clause: {subject: {text: "I", person: "first"}, predicate: {verb: a.input}}})};
 "#;
         let error = plan(compile_with_world(source).unwrap(), 1, 1).unwrap_err();
         assert!(source[error.range.start..error.range.end].starts_with("realize("), "{error}");
@@ -3537,7 +3533,7 @@ mod tests {
     fn english_variation_uses_scoped_randomness_and_binding_caching() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.reply, local: {reply: vary("The guest cannot check in.")}};
 (t:agent) {input: t_root.local.reply, output: t_root.output};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let first = plan(compile_with_world(source).unwrap(), 32, 7).unwrap();
         assert_eq!(first, plan(compile_with_world(source).unwrap(), 32, 7).unwrap());
         let outputs = first
@@ -3569,10 +3565,10 @@ mod tests {
             (r#"format_date("2026-02-30")"#, "date"),
             (r#"format_time("25:30")"#, "time"),
             (r#"format_number("12", { locale: "fr-FR" })"#, "en-US"),
-            (r#"combine([||], "and")"#, "propositions"),
+            (r#"combine([], "and")"#, "propositions"),
         ] {
             let source = format!(
-                "(t_root:task {{name: \"t\"}}) {{output: {expression}, input: t.input}};\n(t:agent) {{input: null, output: t_root.output}};\n(t)-[:next]->(t_root);"
+                "(t_root:task {{name: \"t\"}}) {{output: {expression}, input: t.input}};\n(t:agent) {{input: null, output: t_root.output}};\n(t)-|:next|->(t_root);"
             );
             let error = plan(compile_with_world(&source).unwrap(), 1, 0).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::InvalidCall);
@@ -3589,7 +3585,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {metrics: {low: clamp(1, 5, 10), high: clamp(50, 5, 10), inside: clamp(7, 5, 10), promoted: clamp(7, 5.0, 10), round: round(2.5), down: floor(2.9), up: ceil(2.1), int: round(3), abs: abs(0 - 4), fabs: abs(0.0 - 4.5), min: min(3, 1, 2), max: max(3, 1, 2), fmin: min(3, 1.5)}, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3615,7 +3611,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {metrics: {latency: clamp(lognormal(300, 1.5), 20, 1000)}, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 50, 7).unwrap();
@@ -3630,26 +3626,26 @@ mod tests {
     fn fails_on_invalid_dynamic_func_values() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: clamp(1, range(5, 5), 2), output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "clamp bounds are out of order");
         assert_eq!(&source[error.range.start..error.range.end], "clamp(1, range(5, 5), 2)");
 
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: split("a,b", choice(",", "")), output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 20, 7).unwrap_err();
         assert_eq!(error.to_string(), "split separator is empty");
 
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: join([|{}|], ","), output: null};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: join([{}], ","), output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "join element is not a string, number, or boolean");
 
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: round(99999999999999999999.0 * range(1.0, 1.0)), output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
     }
@@ -3657,8 +3653,8 @@ mod tests {
     #[test]
     fn evaluates_id_funcs_reproducibly() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|uuid(), hex(16), alphanum(12), hex(0)|], output: null};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: [uuid(), hex(16), alphanum(12), hex(0)], output: null};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 5, 7).unwrap();
 
         let mut uuids = std::collections::HashSet::new();
@@ -3691,8 +3687,8 @@ mod tests {
     #[test]
     fn evaluates_noise_reproducibly_and_rejects_bad_sizes() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|noise(64), noise(round(range(10, 20))), noise(0)|], output: null};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: [noise(64), noise(round(range(10, 20))), noise(0)], output: null};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
         for event in plan_a.events.iter() {
             let JsonValue::Array(values) = event.fields.input.as_ref().unwrap() else {
@@ -3714,10 +3710,10 @@ mod tests {
         for source in [
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: noise(range(1, 1) - 2), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: noise(range(1.5, 1.5)), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         ] {
             let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
             assert_eq!(error.to_string(), "noise size is not an integer between 0 and 8388608");
@@ -3728,8 +3724,8 @@ mod tests {
     fn evaluates_nested_funcs_and_funcs_from_vars() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input, local: {style: choice("clear", "vague")}};
-(t:agent) {input: [|choice(range(1, 3), "x"), t_root.local.style|], output: null};
-(t)-[:next]->(t_root);"#,
+(t:agent) {input: [choice(range(1, 3), "x"), t_root.local.style], output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 20, 7).unwrap();
@@ -3751,7 +3747,7 @@ mod tests {
     fn reproduces_the_same_plan_for_the_same_seed() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input, metrics: {n: range(0, 1000000)}};
 (t:agent) {input: choice("a", "b", "c"), output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let first = plan(compile(source).unwrap(), 10, 42).unwrap();
         let second = plan(compile(source).unwrap(), 10, 42).unwrap();
 
@@ -3763,7 +3759,7 @@ mod tests {
         // trace 3 of a 5-trace run must match trace 3 of a 4-trace run
         let source = r#"(t_root:task {name: "t"}) {metrics: {n: range(0, 1000000)}, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let longer = plan(compile(source).unwrap(), 5, 42).unwrap();
         let shorter = plan(compile(source).unwrap(), 4, 42).unwrap();
 
@@ -3774,7 +3770,7 @@ mod tests {
     fn evaluates_dynamic_arithmetic_within_bounds() {
         let source = r#"(t_root:task {name: "t"}) {metrics: {n: range(1, 5) * 100, m: - range(1, 5)}, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         for event in plan_a.events.iter() {
@@ -3795,7 +3791,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: choice(true, false) ? "a": "b", output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 20, 7).unwrap();
@@ -3812,7 +3808,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: "i ${context.trace_index}" == "i 1" ? 1: 0, output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 3, 0).unwrap();
@@ -3831,7 +3827,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: range(0, 0) == 0 ? 0: 100 / range(0, 0), output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let planned = plan(model, 5, 7).unwrap();
@@ -3840,7 +3836,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: range(0, 0) != 0 && 100 / range(0, 0) > 1, output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let planned = plan(model, 5, 7).unwrap();
@@ -3850,8 +3846,8 @@ mod tests {
     #[test]
     fn evaluates_dynamic_indexes_within_their_containers() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.user [choice("a", "b")], local: {user: {a: 1, b: 2}}};
-(t:agent) {input: [|"a", "b", "c"|][range(0, 2)], output: t_root.output};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: ["a", "b", "c"][range(0, 2)], output: t_root.output};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut inputs = std::collections::HashSet::new();
@@ -3871,9 +3867,9 @@ mod tests {
 
     #[test]
     fn evaluates_nested_dynamic_indexes() {
-        let source = r#"(t_root:task {name: "t"}) {input: t.input, local: {matrix: [|[|1, 2|], [|3, 4|]|]}};
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, local: {matrix: [[1, 2], [3, 4]]}};
 (t:agent) {input: t_root.local.matrix [range(0, 1)][range(0, 1)], output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3887,8 +3883,8 @@ mod tests {
         // the division by zero sits in an unselected element, so nothing fails
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|0, 100 / range(0, 0)|][range(0, 0)], output: null};
-(t)-[:next]->(t_root);"#,
+(t:agent) {input: [0, 100 / range(0, 0)][range(0, 0)], output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let planned = plan(model, 5, 7).unwrap();
@@ -3899,30 +3895,30 @@ mod tests {
     #[test]
     fn fails_on_invalid_dynamic_indexes() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|1|][range(1, 1)], output: null};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: [1][range(1, 1)], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "array index is out of bounds");
-        assert_eq!(&source[error.range.start..error.range.end], "[|1|][range(1, 1)]");
+        assert_eq!(&source[error.range.start..error.range.end], "[1][range(1, 1)]");
 
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|1, 2|][range(0.0, 0.0)], output: null};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: [1, 2][range(0.0, 0.0)], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "array index is not an integer");
 
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: {a: 1}[choice("b")], output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "object key is not present");
     }
 
     #[test]
     fn evaluates_dynamic_slices_with_clamped_bounds() {
-        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: [|1, 2|][0: range(5, 5)], metadata: {empty: [|1, 2|][range(1, 1): 0], large_end: [|1, 2|][: range(4294967296, 4294967296)], large_start: [|1, 2|][range(9223372036854775807, 9223372036854775807):]}};
-(t:agent) {input: [|1, 2, 3, 4|][range(1, 1): range(3, 3)], output: t_root.output};
-(t)-[:next]->(t_root);"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: [1, 2][0: range(5, 5)], metadata: {empty: [1, 2][range(1, 1): 0], large_end: [1, 2][: range(4294967296, 4294967296)], large_start: [1, 2][range(9223372036854775807, 9223372036854775807):]}};
+(t:agent) {input: [1, 2, 3, 4][range(1, 1): range(3, 3)], output: t_root.output};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
 
         for event in plan_a.events.iter() {
@@ -3942,8 +3938,8 @@ mod tests {
     fn evaluates_indexes_into_sliced_targets() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|1, 2, 3|][range(1, 1):][0], output: null};
-(t)-[:next]->(t_root);"#,
+(t:agent) {input: [1, 2, 3][range(1, 1):][0], output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let planned = plan(model, 1, 0).unwrap();
@@ -3954,15 +3950,15 @@ mod tests {
     #[test]
     fn fails_on_invalid_dynamic_slice_bounds() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|1, 2|][0 - range(1, 1):], output: null};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: [1, 2][0 - range(1, 1):], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "slice bound is negative");
-        assert_eq!(&source[error.range.start..error.range.end], "[|1, 2|][0 - range(1, 1):]");
+        assert_eq!(&source[error.range.start..error.range.end], "[1, 2][0 - range(1, 1):]");
 
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|1, 2|][range(0.5, 0.5):], output: null};
-(t)-[:next]->(t_root);"#;
+(t:agent) {input: [1, 2][range(0.5, 0.5):], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "slice bound is not an integer");
     }
@@ -3971,8 +3967,8 @@ mod tests {
     fn evaluates_unrolled_for_bodies_per_trace() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(t:agent) {input: [|for x in [|1, 2|]: x * range(1, 3)|], output: null};
-(t)-[:next]->(t_root);"#,
+(t:agent) {input: [for x in [1, 2]: x * range(1, 3)], output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 20, 7).unwrap();
@@ -3990,7 +3986,7 @@ mod tests {
     fn fails_on_dynamic_division_by_zero() {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
 (t:agent) {input: 100 / range(0, 0), output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
 
         assert_eq!(error.to_string(), "expression divides by zero");
@@ -4001,7 +3997,7 @@ mod tests {
     fn fails_on_dynamic_overflow_and_non_finite_results() {
         let source = r#"(t_root:task {name: "t"}) {metrics: {n: 9223372036854775807 + range(1, 1)}, input: t.input};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root);"#;
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
 
@@ -4010,7 +4006,7 @@ mod tests {
         let source = format!(
             r#"(t_root:task {{name: "t"}}) {{input: t.input}};
 (t:agent) {{input: {big} * range(2.0, 2.0), output: null}};
-(t)-[:next]->(t_root);"#
+(t)-|:next|->(t_root);"#
         );
         let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
@@ -4024,9 +4020,9 @@ mod tests {
 (reply:llm {name: "reply"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: 3}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);
-(turn)-[:calls]->(reply);"#,
+(t_root)=|:repeat {count: 3}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);
+(turn)-|:calls|->(reply);"#,
         )
         .unwrap();
         let plan = plan(model, 2, 0).unwrap();
@@ -4049,8 +4045,8 @@ mod tests {
 (turn:task {name: "turn"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: 0}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:repeat {count: 0}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 3, 0).unwrap();
@@ -4064,8 +4060,8 @@ mod tests {
 (turn:task {name: "turn"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: range (1 , 4)}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);"#;
+(t_root)=|:repeat {count: range (1 , 4)}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut lengths = std::collections::HashSet::new();
@@ -4087,9 +4083,9 @@ mod tests {
 (inner:task {name: "inner"}) {input: "i ${context.index}"};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: 2}]=>[-[:calls]->(outer)];
-(outer)=[:repeat {count: 2}]=>[-[:calls]->(inner)];
-(t)-[:next]->(t_root);"#;
+(t_root)=|:repeat {count: 2}|=>[-|:calls|->(outer)];
+(outer)=|:repeat {count: 2}|=>[-|:calls|->(inner)];
+(t)-|:next|->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 1, 0).unwrap();
 
         let inputs: Vec<_> = plan
@@ -4107,8 +4103,8 @@ mod tests {
 (b:function {name: "b"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:conditional]=>[-[:calls {when: t_root.local.branch_0_selection == 0}]->(a), -[:calls {when: t_root.local.branch_0_selection == 1}]->(b)];
-(t)-[:next]->(t_root);"#;
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection == 0}|->(a), -|:calls {when: t_root.local.branch_0_selection == 1}|->(b)];
+(t)-|:next|->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut picked = std::collections::HashSet::new();
@@ -4126,8 +4122,8 @@ mod tests {
 (extra:task {name: "extra"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:conditional]=>[-[:calls {when: t_root.local.branch_0_selection}]->(extra)];
-(t)-[:next]->(t_root);"#;
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(extra)];
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 40, 7).unwrap();
 
         let lengths: Vec<_> = plan_a.traces.iter().map(std::ops::Range::len).collect();
@@ -4143,8 +4139,8 @@ mod tests {
 (extra:task {name: "extra"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:conditional]=>[-[:calls {when: t_root.local.branch_0_selection}]->(extra)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(extra)];
+(t)-|:next|->(t_root);"#,
             )
             .unwrap(),
             10,
@@ -4158,8 +4154,8 @@ mod tests {
 (extra:task {name: "extra"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:conditional]=>[-[:calls {when: t_root.local.branch_0_selection}]->(extra)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(extra)];
+(t)-|:next|->(t_root);"#,
             )
             .unwrap(),
             10,
@@ -4173,11 +4169,11 @@ mod tests {
     fn redraws_nested_dynamic_blocks_per_iteration() {
         let source = r#"
 (t:agent) {input: null, output: null};
-(t)-[:next]->(root:task) {input: t.input};
-(root)=[:repeat {count: 8}]=>[-[:calls]->(iteration:node) {pick: range(0, 1)}];
-(iteration)=[:exclusive]=>[
-    -[:calls {when: iteration.pick == 0}]->(a:tool),
-    -[:calls {when: iteration.pick == 1}]->(b:function),
+(t)-|:next|->(root:task) {input: t.input};
+(root)=|:repeat {count: 8}|=>[-|:calls|->(iteration:node) {pick: range(0, 1)}];
+(iteration)=|:exclusive|=>[
+    -|:calls {when: iteration.pick == 0}|->(a:tool),
+    -|:calls {when: iteration.pick == 1}|->(b:function),
 ];
 "#;
         let plan = plan(compile(source).unwrap(), 5, 7).unwrap();
@@ -4197,8 +4193,8 @@ mod tests {
 (turn:task {name: "turn"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: 0 - range(2, 2)}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);"#;
+(t_root)=|:repeat {count: 0 - range(2, 2)}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "repeat count is negative");
         assert_eq!(&source[error.range.start..error.range.end], "0 - range(2, 2)");
@@ -4207,8 +4203,8 @@ mod tests {
 (turn:task {name: "turn"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: range(0.5, 0.5)}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);"#;
+(t_root)=|:repeat {count: range(0.5, 0.5)}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "repeat count is not an integer");
 
@@ -4216,8 +4212,8 @@ mod tests {
 (turn:task {name: "turn"}) {};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:conditional]=>[-[:calls {when: t_root.local.branch_0_selection}]->(turn)];
-(t)-[:next]->(t_root);"#;
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(turn)];
+(t)-|:next|->(t_root);"#;
         let mut model = compile(source).unwrap();
         let ModelChild::Maybe(branch) = &mut model.traces[0].children[0] else {
             panic!("conditional branch")
@@ -4232,7 +4228,7 @@ mod tests {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
 (turn:task {name: "turn"}) {duration: range(0.2, 5.0)};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root)-[:calls]->(turn);"#;
+(t)-|:next|->(t_root)-|:calls|->(turn);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let durations: std::collections::HashSet<_> = plan_a
@@ -4252,7 +4248,7 @@ mod tests {
         let source = r#"(t_root:task {name: "t"}) {input: t.input};
 (turn:task {name: "turn"}) {duration: 0.0 - range(1.0, 1.0)};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root)-[:calls]->(turn);"#;
+(t)-|:next|->(t_root)-|:calls|->(turn);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "duration is not a positive number of seconds");
         assert_eq!(&source[error.range.start..error.range.end], "0.0 - range(1.0, 1.0)");
@@ -4268,11 +4264,11 @@ mod tests {
 (escalation:task {name: "escalation"}) {};
 (session:agent) {input: null, output: null};
 
-(session_root)=["turns":repeat {count: range (1 , 4)}]=>[-[:calls]->(turn)];
-(session_root)=[:conditional]=>[-[:calls {when: session_root.local.branch_1_selection == 0}]->(get_order_status), -[:calls {when: session_root.local.branch_1_selection == 1}]->(summarize_session)];
-(session_root)=[:conditional]=>[-[:calls {when: session_root.local.branch_2_selection}]->(escalation)];
-(session)-[:next]->(session_root);
-(turn)-[:calls]->(draft);"#;
+(session_root)=|"turns":repeat {count: range (1 , 4)}|=>[-|:calls|->(turn)];
+(session_root)=|:conditional|=>[-|:calls {when: session_root.local.branch_1_selection == 0}|->(get_order_status), -|:calls {when: session_root.local.branch_1_selection == 1}|->(summarize_session)];
+(session_root)=|:conditional|=>[-|:calls {when: session_root.local.branch_2_selection}|->(escalation)];
+(session)-|:next|->(session_root);
+(turn)-|:calls|->(draft);"#;
         let model = compile(source).unwrap();
         let plan_a = plan(model, 10, 42).unwrap();
 
@@ -4297,7 +4293,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.x, local: {x: range(0, 1000000)}};
 (t:agent) {input: t_root.local.x, output: t_root.output};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 4, 7).unwrap();
@@ -4322,8 +4318,8 @@ mod tests {
 (turn:task {name: "turn"}) {input: turn.local.r, output: turn.local.r, local: {r: range (0 , 1000000)}};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: 3}]=>[-[:calls]->(turn)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:repeat {count: 3}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 3).unwrap();
@@ -4346,7 +4342,7 @@ mod tests {
             r#"(t_root:task {name: "t"}) {input: t.input};
 (Chat_Completion:llm {name: "Chat Completion"}) {metrics: {prompt_tokens: Chat_Completion.local.pt, completion_tokens: Chat_Completion.local.ct, tokens: Chat_Completion.local.pt + Chat_Completion.local.ct}, local: {pt: round(lognormal(600, 0.4)), ct: round(lognormal(90, 0.7))}};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root)-[:calls]->(Chat_Completion);"#,
+(t)-|:next|->(t_root)-|:calls|->(Chat_Completion);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 11).unwrap();
@@ -4365,7 +4361,7 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input, metadata: {model: t_root.local.m}, local: {m: choice("gpt-4o", "gpt-4o-mini")}};
 (t:agent) {input: "model: ${t_root.local.m}", output: null};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 6, 5).unwrap();
@@ -4384,8 +4380,8 @@ mod tests {
 (b:task {name: "b"}) {input: a.local.c, output: a.local.c};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:conditional]=>[-[:calls {when: t_root.local.branch_0_selection == 0}]->(a), -[:calls {when: t_root.local.branch_0_selection == 1}]->(b)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection == 0}|->(a), -|:calls {when: t_root.local.branch_0_selection == 1}|->(b)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 13).unwrap();
@@ -4403,8 +4399,8 @@ mod tests {
 (escalation:task {name: "escalation"}) {input: escalation.local.e, local: {e: range (0 , 1000000)}};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:conditional]=>[-[:calls {when: t_root.local.branch_0_selection}]->(escalation)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(escalation)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 32, 17).unwrap();
@@ -4418,9 +4414,9 @@ mod tests {
         let model = compile(
             r#"(t_root:task {name: "t"}) {output: chat.output.content, metadata: {echoed: "${chat.output.content}"}, input: t.input};
 (plan:task {name: "plan"}) {output: "planned"};
-(chat:llm {name: "chat"}) {input: [|{role: "user", content: plan.output}|], output: {role: "assistant", content: choice("alpha", "beta")}};
+(chat:llm {name: "chat"}) {input: [{role: "user", content: plan.output}], output: {role: "assistant", content: choice("alpha", "beta")}};
 (t:agent) {input: null, output: t_root.output};
-(t)-[:next]->(t_root)-[:calls]->(plan)-[:next]->(chat);"#,
+(t)-|:next|->(t_root)-|:calls|->(plan)-|:next|->(chat);"#,
         )
         .unwrap();
         let plan = plan(model, 4, 11).unwrap();
@@ -4447,7 +4443,7 @@ mod tests {
             r#"(t_root:task {name: "t"}) {input: t.input};
 (chat:llm {name: "chat"}) {output: "brief answer", metrics: {prompt_tokens: round(lognormal(600, 0.4)), completion_tokens: round(lognormal(90, 0.7)), tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens, exact: tokens(self.output)}};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root)-[:calls]->(chat);"#,
+(t)-|:next|->(t_root)-|:calls|->(chat);"#,
         )
         .unwrap();
         let plan = plan(model, 3, 5).unwrap();
@@ -4468,8 +4464,8 @@ mod tests {
 (use:tool {name: "use"}) {input: gen.output};
 (t:agent) {input: null, output: null};
 
-(t_root)=[:repeat {count: 4}]=>[-[:calls]->(gen), -[:calls]->(use)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|:repeat {count: 4}|=>[-|:calls|->(gen), -|:calls|->(use)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 2, 23).unwrap();
@@ -4495,7 +4491,7 @@ mod tests {
 (a:task {name: "a"}) {input: roll.output};
 (b:task {name: "b"}) {input: roll.output};
 (t:agent) {input: null, output: null};
-(t)-[:next]->(t_root)-[:calls]->(roll)-[:next]->(a)-[:next]->(b);"#,
+(t)-|:next|->(t_root)-|:calls|->(roll)-|:next|->(a)-|:next|->(b);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 3).unwrap();
@@ -4510,8 +4506,8 @@ mod tests {
         let mut model = compile(
             r#"
 (t:agent) {input: null, output: null};
-(t)-[:next]->(root:task) {input: t.input};
-(root)-[:calls]->(x:llm) {input: 1};
+(t)-|:next|->(root:task) {input: t.input};
+(root)-|:calls|->(x:llm) {input: 1};
 "#,
         )
         .unwrap();
@@ -4541,11 +4537,11 @@ mod tests {
     fn accumulates_history_across_iterations() {
         let model = compile(
             r#"(t_root:task {name: "t"}) {input: t.input};
-(chat:llm {name: "chat"}) {input: [|{role: "user", content: t_root.input} , ... context.history.chat|], output: {role: "assistant", content: "reply ${context.index}"}};
+(chat:llm {name: "chat"}) {input: [{role: "user", content: t_root.input} , ... context.history.chat], output: {role: "assistant", content: "reply ${context.index}"}};
 (t:agent) {input: "q", output: null};
 
-(t_root)=["rounds":repeat {count: 3}]=>[-[:calls]->(chat)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|"rounds":repeat {count: 3}|=>[-|:calls|->(chat)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 7).unwrap();
@@ -4567,8 +4563,8 @@ mod tests {
 (step:task {name: "step"}) {output: range (0 , 1000), input: context.index > 0 ? context.history.step[context.index - 1].output : - 1};
 (t:agent) {input: null, output: null};
 
-(t_root)=["r":repeat {count: 3}]=>[-[:calls]->(step)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|"r":repeat {count: 3}|=>[-|:calls|->(step)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 13).unwrap();
@@ -4586,8 +4582,8 @@ mod tests {
 (step:task {name: "step"}) {input: context.history.step[context.index + 2].output, output: 1};
 (t:agent) {input: null, output: null};
 
-(t_root)=["r":repeat {count: 2}]=>[-[:calls]->(step)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|"r":repeat {count: 2}|=>[-|:calls|->(step)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let error = plan(model, 1, 0).unwrap_err();
@@ -4603,9 +4599,9 @@ mod tests {
 (again:task {name: "again"}) {output: 1};
 (t:agent) {input: null, output: null};
 
-(t_root)=["outcome":conditional]=>[-[:calls {when: t_root.local.branch_0_selection == 0}]->(resolved), -[:calls {when: t_root.local.branch_0_selection == 1}]->(escalated)];
-(t_root)=["retry":conditional]=>[-[:calls {when: t_root.local.branch_1_selection}]->(again)];
-(t)-[:next]->(t_root);"#,
+(t_root)=|"outcome":conditional|=>[-|:calls {when: t_root.local.branch_0_selection == 0}|->(resolved), -|:calls {when: t_root.local.branch_0_selection == 1}|->(escalated)];
+(t_root)=|"retry":conditional|=>[-|:calls {when: t_root.local.branch_1_selection}|->(again)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 16, 29).unwrap();
@@ -4637,13 +4633,13 @@ mod tests {
         let before = compile(
             r#"(t_root:task {name: "t"}) {input: t.input, output: "x"};
 (t:agent) {input: range(0, 1000000), output: t_root.output};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let after = compile(
             r#"(t_root:task {name: "t"}) {input: t.input, output: "y ${context.trace_index}"};
 (t:agent) {input: range(0, 1000000), output: t_root.output};
-(t)-[:next]->(t_root);"#,
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
 

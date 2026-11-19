@@ -1,42 +1,42 @@
 # sample a whole conversation so each turn has a coherent history and outcome
 (billing:agent) {
     input: choice(
-        [|
+        [
             {role: "user", content: "Can I get invoices with our VAT number on them?"},
             {role: "assistant", content: "Yes, add it under Billing Settings > Tax IDs and future invoices will include it."},
-        |],
-        [|
+        ],
+        [
             {role: "user", content: "I was charged twice this month."},
             {role: "assistant", content: "I see two charges, on the 3rd and the 5th. The one on the 5th is for the seat you added."},
             {role: "user", content: "We didn't add any seats."},
             {role: "assistant", content: "The seat was added by jordan@ on the 4th. I can remove it and refund the difference."},
             {role: "user", content: "Yes, please refund it."},
             {role: "assistant", content: "Done. The refund lands in 3-5 business days."},
-        |],
+        ],
     ),
     output: request.output,
 };
-(billing)-[:next]->(request:task {name: "billing-support"}) {
+(billing)-|:next|->(request:task {name: "billing-support"}) {
     input: billing.input,
     local: {turns: billing.input},
     output: self.local.turns[len(self.local.turns) - 1],
     metadata: {conversation_id: uuid(), entrypoint: "web-chat"},
-    tags: [|"support", "billing"|],
+    tags: ["support", "billing"],
 };
 (request)
-    =[:repeat {count: len(request.local.turns) / 2}]=>[
-        -[:calls]->(turn:task) {
+    =|:repeat {count: len(request.local.turns) / 2}|=>[
+        -|:calls|->(turn:task) {
             input: request.local.turns[context.index * 2],
             output: request.local.turns[context.index * 2 + 1],
             # the customer takes a while to read a reply and write back
             wait: context.index == 0 ? 0 : range(8, 60),
         },
     ]
-        ->(turn)-[:calls]->(reply:llm {name: "Chat Completion"}) {
-            input: [|
+        ->(turn)-|:calls|->(reply:llm {name: "Chat Completion"}) {
+            input: [
                 {role: "system", content: "You are a support assistant for a billing product. Be concise and cite the relevant policy when you refuse."},
                 ...request.local.turns[:context.index * 2 + 1],
-            |],
+            ],
             output: turn.output,
             metadata: {model: "gpt-4o-mini", provider: "openai", temperature: 0.3},
             duration: range(0.3, 0.8),

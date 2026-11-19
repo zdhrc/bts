@@ -1468,7 +1468,7 @@ mod parity {
                 .join(",")
         );
         let source = format!(
-            "(corpus_root:task {{name: \"corpus\"}}) {{input: corpus.input, output: {call}}};\n(corpus:agent) {{input: {{args: [||]}}, output: corpus_root.output}};\n(corpus)-[:next]->(corpus_root);"
+            "(corpus_root:task {{name: \"corpus\"}}) {{input: corpus.input, output: {call}}};\n(corpus:agent) {{input: {{args: []}}, output: corpus_root.output}};\n(corpus)-|:next|->(corpus_root);"
         );
         let mut model = compile(&source).unwrap_or_else(|errors| panic!("{} did not compile: {errors:?}\n{source}", case.name));
         model.traces[0].fields.input = Some(input_value(&json!({"args":case.args})));

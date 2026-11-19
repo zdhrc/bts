@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn emits_nested_scorer_repeats() {
         let generated = emit(
-            r#"("s":scorer) {score: 0, steps: [|{repeat: len(context.output), steps: [|{when: context.output [context.index] == context.expected, score: 1}, {repeat: context.index + 1, steps: [|{when: context.index < context.count, score: 0.5}|]}|]}|]};"#,
+            r#"("s":scorer) {score: 0, steps: [{repeat: len(context.output), steps: [{when: context.output [context.index] == context.expected, score: 1}, {repeat: context.index + 1, steps: [{when: context.index < context.count, score: 0.5}]}]}]};"#,
         );
         assert!(generated.contains("repeat_count = len(output)"));
         assert!(generated.contains("for repeat_index in range(repeat_count):"));
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn emits_nested_when_fallthrough() {
         let generated = emit(
-            r#"("s":scorer) {score: 0, steps: [|{when: len(context.output) > 0, score: 0.5, steps: [|{when: context.output [0] == context.expected, score: 1}|]}|]};"#,
+            r#"("s":scorer) {score: 0, steps: [{when: len(context.output) > 0, score: 0.5, steps: [{when: context.output [0] == context.expected, score: 1}]}]};"#,
         );
         assert!(generated.contains("    if len(output) > 0:\n        if output[0] == expected:\n            return"));
         assert!(generated.contains("\n        return {\"name\": \"s\", \"score\": 0.5"));
@@ -234,7 +234,7 @@ def scorer_response_length(output, input=None, expected=None, metadata=None):
     #[test]
     fn never_chains_python_comparisons() {
         let generated = emit(
-            r#"("s":scorer) {score: 0.5, steps: [|{when: ${len(context.output) > 1} == ${len(context.input) > 1}, score: 0}|]};"#,
+            r#"("s":scorer) {score: 0.5, steps: [{when: ${len(context.output) > 1} == ${len(context.input) > 1}, score: 0}]};"#,
         );
         assert!(
             generated.contains("if (len(output) > 1) == (len(input) > 1):"),
@@ -276,12 +276,11 @@ def scorer_response_length(output, input=None, expected=None, metadata=None):
     #[test]
     fn interpolates_templates_as_f_strings() {
         // a quote-free hole makes an f-string
-        let generated = emit(r#"("s":scorer) {score: 0.5, steps: [|{when: "${context.output}!" == "pro!", score: 1}|]};"#);
+        let generated = emit(r#"("s":scorer) {score: 0.5, steps: [{when: "${context.output}!" == "pro!", score: 1}]};"#);
         assert!(generated.contains(r#"if f"{output}!" == "pro!":"#), "generated:\n{generated}");
 
         // Ordinary keyed access uses the other quote style inside the f-string.
-        let generated =
-            emit(r#"("s":scorer) {score: 0.5, steps: [|{when: "${context.metadata.tier}!" == "pro!", score: 1}|]};"#);
+        let generated = emit(r#"("s":scorer) {score: 0.5, steps: [{when: "${context.metadata.tier}!" == "pro!", score: 1}]};"#);
         assert!(
             generated.contains(r#"if f"{metadata['tier']}!" == "pro!":"#),
             "generated:\n{generated}"

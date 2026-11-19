@@ -10,19 +10,19 @@ use std::{
 };
 
 const SOURCE: &str = r#"# shared mock data and mock code case
-+(patient_lookup:node) {patient_id: {type: "string"}}-[:extends]->(tool);
++(patient_lookup:node) {patient_id: {type: "string"}}-|:extends|->(tool);
 
 (intake:agent) {
     input: {patient_id: "p-123"},
     output: request.output,
 };
 
-(intake)-[:next]->(request:task) {
+(intake)-|:next|->(request:task) {
     input: intake.input,
     output: lookup.output,
 };
 
-(request)-[:calls, :feeds {value: source.input.patient_id, into: target.patient_id}]->(lookup:patient_lookup) {
+(request)-|:calls, :feeds {value: source.input.patient_id, into: target.patient_id}|->(lookup:patient_lookup) {
     patient_id: <-,
     input: {patient_id: self.patient_id},
     output: {patient_id: self.patient_id, found: true},
@@ -113,9 +113,9 @@ fn graph_agent_preserves_sibling_progression_and_inherited_kinds() {
         .replace("lookup:patient_lookup", "lookup:lookup_kind")
         .replace("output: lookup.output", "output: finish.output");
     let source = format!(
-        r#"+(intake_kind:node)-[:extends]->(agent); +(lookup_kind:node)-[:extends]->(patient_lookup);
+        r#"+(intake_kind:node)-|:extends|->(agent); +(lookup_kind:node)-|:extends|->(patient_lookup);
 {source}
-(lookup)-[:next]->(finish:tool) {{input: intake.input, output: {{patient_id: self.input.patient_id, found: true}}}};
+(lookup)-|:next|->(finish:tool) {{input: intake.input, output: {{patient_id: self.input.patient_id, found: true}}}};
 "#
     );
     check_agent(&source, true);
@@ -249,27 +249,27 @@ fn execute_generated(model: &bts_core::mocking::Model, lang: ScorerLang, program
 fn graph_agent_rejects_invalid_parenting_and_unsupported_flow() {
     for (source, message) in [
         (
-            SOURCE.replace("(request)-[:calls, :feeds", "(request)-[:next, :feeds"),
+            SOURCE.replace("(request)-|:calls, :feeds", "(request)-|:next, :feeds"),
             "`lookup` has no parent span, go down from `request` with a `calls` edge, or indent this line under the step it follows",
         ),
         (
-            format!("{SOURCE}\n(request)-[:calls]->(other:task) {{output: 1}}; (other)-[:calls]->(lookup);"),
+            format!("{SOURCE}\n(request)-|:calls|->(other:task) {{output: 1}}; (other)-|:calls|->(lookup);"),
             "`lookup` is reached under different parent spans, `request` and `other`",
         ),
         (
-            format!("{SOURCE}\n(intake)-[:contains]->(lookup);"),
+            format!("{SOURCE}\n(intake)-|:contains|->(lookup);"),
             "agent membership comes from the entry edge, remove this `contains` edge",
         ),
         (
-            SOURCE.replace("(intake)-[:next]->(request:task)", "(intake)-[:calls]->(request:task)"),
+            SOURCE.replace("(intake)-|:next|->(request:task)", "(intake)-|:calls|->(request:task)"),
             "an agent emits no span, enter its first step with a `next` edge",
         ),
         (
             SOURCE.replace("found: true}", "found: true, under: context.parent}"),
             "`context.parent` is supplied to the provider and cannot be read by a field",
         ),
-        (format!("{SOURCE}\n(lookup)~[:next]~>(request);"), "cycle edges"),
-        (format!("{SOURCE}\n(request)-[:next]->(lookup);"), "multiple next"),
+        (format!("{SOURCE}\n(lookup)~|:next|~>(request);"), "cycle edges"),
+        (format!("{SOURCE}\n(request)-|:next|->(lookup);"), "multiple next"),
         (
             SOURCE.replace(
                 ":calls, :feeds {value: source.input.patient_id, into: target.patient_id}",
@@ -322,13 +322,13 @@ fn typed_propagation_is_checked_by_data_and_generated_code() {
         ("string", "\"patient\""),
         ("number", "42"),
         ("boolean", "true"),
-        ("array", "[|1|]"),
+        ("array", "[1]"),
         ("object", "{}"),
     ] {
         for valid in [true, false] {
             let value = if valid { value } else { "null" };
             let source = format!(
-                "+(checked_tool:node) {{patient_id: {{type: \"{ty}\"}}}}-[:extends]->(tool);\n{}",
+                "+(checked_tool:node) {{patient_id: {{type: \"{ty}\"}}}}-|:extends|->(tool);\n{}",
                 SOURCE
                     .replace("lookup:patient_lookup", "lookup:checked_tool")
                     .replace("\"p-123\"", value)
@@ -427,13 +427,13 @@ fn agent_result_does_not_overwrite_span_output() {
 fn guarded_forks_select_the_same_spans_in_data_and_code() {
     let source = r#"
 (intake:agent) {input: {route: "lookup"}, output: request.output};
-(intake)-[:next]->(request:task) {
+(intake)-|:next|->(request:task) {
     input: intake.input,
     output: self.input.route == "lookup" ? lookup.output: self.input.route == "fallback" ? fallback.output: "none",
 }
-    =[:exclusive]=>[
-        -[:calls {when: source.input.route == "lookup"}]->(lookup:tool) {output: "found"},
-        -[:calls {when: source.input.route == "fallback"}]->(fallback:tool) {output: "deferred"},
+    =|:exclusive|=>[
+        -|:calls {when: source.input.route == "lookup"}|->(lookup:tool) {output: "found"},
+        -|:calls {when: source.input.route == "fallback"}|->(fallback:tool) {output: "deferred"},
     ];
 "#;
     for (route, result, count) in [("lookup", "found", 2), ("fallback", "deferred", 2), ("other", "none", 1)] {
@@ -488,8 +488,8 @@ fn scorer_node_supports_span_and_callable_behaviors() {
     use code::Emitter;
     let source = r#"
 (checker:agent) {input: "yes", output: root.output};
-(checker)-[:next]->(root:task) {input: checker.input, output: self.input, expected: "yes"};
-(root)-[:calls {when: source.input != "skip"}]->(quality:scorer {file: "checks"}) {
+(checker)-|:next|->(root:task) {input: checker.input, output: self.input, expected: "yes"};
+(root)-|:calls {when: source.input != "skip"}|->(quality:scorer {file: "checks"}) {
     score: context.output == context.expected ? 1: 0,
     reason: "compared output to expected",
 };
@@ -577,13 +577,13 @@ fn scorer_node_supports_span_and_callable_behaviors() {
 fn accumulate_groups_results_and_rejects_missing_inputs() {
     let source = r#"
 (joined:agent) {input: true, output: finish.output};
-(joined)-[:next]->(root:task) {input: joined.input};
+(joined)-|:next|->(root:task) {input: joined.input};
 (root)
-    =[:conditional]=>[
-        -[first:calls {when: source.input}]->(left_task:tool) {output: "first"},
-        -[second:calls]->(right_task:tool) {output: "second"},
+    =|:conditional|=>[
+        -|first:calls {when: source.input}|->(left_task:tool) {output: "first"},
+        -|second:calls|->(right_task:tool) {output: "second"},
     ]
-        >[:accumulate {observe: "result"} [second], [first]]>>(finish:task) {output: context.arrivals};
+        >|:accumulate {observe: "result"} |second|, |first||>>(finish:task) {output: context.arrivals};
 "#;
     let expected = json!([{"edge": "second", "value": "second"}, {"edge": "first", "value": "first"}]);
     let model = lower(source).unwrap();
@@ -646,11 +646,11 @@ console.log(JSON.stringify(ok));
 #[test]
 fn each_materializes_distinct_occurrences() {
     let source = r#"
-(batch:agent) {input: [|"a", "b", "c"|], output: "done"};
-(batch)-[:next]->(root:task) {input: batch.input};
+(batch:agent) {input: ["a", "b", "c"], output: "done"};
+(batch)-|:next|->(root:task) {input: batch.input};
 (root)
-    =[:each {items: source.input}]=>[
-        -[:calls]->(work:tool) {input: context.item, output: {value: self.input, index: context.index}},
+    =|:each {items: source.input}|=>[
+        -|:calls|->(work:tool) {input: context.item, output: {value: self.input, index: context.index}},
     ];
 "#;
     let model = lower(source).unwrap();
@@ -699,10 +699,10 @@ fn each_materializes_distinct_occurrences() {
 fn repeat_preserves_iteration_scope_and_empty_groups() {
     let source = r#"
 (batch:agent) {input: 3, output: "done"};
-(batch)-[:next]->(root:task) {input: batch.input};
+(batch)-|:next|->(root:task) {input: batch.input};
 (root)
-    =[:repeat {count: source.input}]=>[
-        -[:calls]->(work:tool) {
+    =|:repeat {count: source.input}|=>[
+        -|:calls|->(work:tool) {
             local: {token: hex(8)},
             output: {index: context.index, count: context.count, first: self.local.token, second: self.local.token},
         },
@@ -761,10 +761,10 @@ fn repeat_preserves_iteration_scope_and_empty_groups() {
 fn repeat_history_contains_only_completed_earlier_occurrences() {
     let source = r#"
 (history_agent:agent) {input: 3, output: "done"};
-(history_agent)-[:next]->(root:task) {input: history_agent.input};
+(history_agent)-|:next|->(root:task) {input: history_agent.input};
 (root)
-    =[:repeat {count: source.input}]=>[
-        -[:calls]->(turn:task) {
+    =|:repeat {count: source.input}|=>[
+        -|:calls|->(turn:task) {
             input: context.history.turn,
             output: context.index,
         },
@@ -773,8 +773,8 @@ fn repeat_history_contains_only_completed_earlier_occurrences() {
     for nested in [false, true] {
         let source = if nested {
             source.replace(
-                "(root)\n    =[:repeat",
-                "(root)=[:repeat {count: 2}]=>[-[:calls]->(group:task) {input: root.input}];\n(group)\n    =[:repeat",
+                "(root)\n    =|:repeat",
+                "(root)=|:repeat {count: 2}|=>[-|:calls|->(group:task) {input: root.input}];\n(group)\n    =|:repeat",
             )
         } else {
             source.to_owned()
@@ -839,10 +839,10 @@ fn repeat_history_contains_only_completed_earlier_occurrences() {
 fn weighted_forks_select_once_and_allow_no_selection() {
     let source = r#"
 (router:agent) {input: {enabled: true, weight: 8}, output: root.output};
-(router)-[:next]->(root:task) {input: router.input, output: "done"};
-(root) =[:weighted]=>[
-    -[:calls {weight: source.input.weight, when: source.input.enabled}]->(a:tool) {output: "a"},
-    -[:calls {weight: 2, when: source.input.enabled}]->(b:tool) {output: "b"},
+(router)-|:next|->(root:task) {input: router.input, output: "done"};
+(root) =|:weighted|=>[
+    -|:calls {weight: source.input.weight, when: source.input.enabled}|->(a:tool) {output: "a"},
+    -|:calls {weight: 2, when: source.input.enabled}|->(b:tool) {output: "b"},
 ];
 "#;
     let model = lower(source).unwrap();
@@ -926,11 +926,11 @@ console.log(JSON.stringify(selected.output));
 fn weighted_forks_resample_in_each_repetition_scope() {
     let source = r#"
 (router:agent) {input: true, output: "done"};
-(router)-[:next]->(root:task) {input: router.input};
-(root) =[:repeat {count: 3}]=>[-[:calls]->(turn:task) {input: context.index}];
-(turn) =[:weighted]=>[
-    -[:calls {weight: source.input == 0 ? 1 : 0}]->(a:tool) {output: "a"},
-    -[:calls {weight: source.input == 0 ? 0 : 1}]->(b:tool) {output: "b"},
+(router)-|:next|->(root:task) {input: router.input};
+(root) =|:repeat {count: 3}|=>[-|:calls|->(turn:task) {input: context.index}];
+(turn) =|:weighted|=>[
+    -|:calls {weight: source.input == 0 ? 1 : 0}|->(a:tool) {output: "a"},
+    -|:calls {weight: source.input == 0 ? 0 : 1}|->(b:tool) {output: "b"},
 ];
 "#;
     let model = lower(source).unwrap();
@@ -969,15 +969,15 @@ fn weighted_forks_resample_in_each_repetition_scope() {
 
 const CYCLE_SOURCE: &str = r#"
 (retrying:agent) {input: {attempt: 0}, output: finish.output};
-(retrying)-[:next]->(root:task) {input: retrying.input, output: finish.output};
-(root)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool) {
+(retrying)-|:next|->(root:task) {input: retrying.input, output: finish.output};
+(root)-|:calls, :feeds {value: source.input, into: target.input}|->(lookup:tool) {
     input: <-,
     output: {attempt: self.input.attempt, earlier: len(context.history.lookup)},
 };
-(lookup)-[:next]->(check:task) {output: {retry: lookup.output.attempt < 2, next_input: {attempt: lookup.output.attempt + 1}}};
-(check) =[:exclusive]=>[
-    ~[:next {when: source.output.retry, max_traversals: 3}, :feeds {when: source.output.retry, value: source.output.next_input, into: target.input}]~>(lookup),
-    -[:next {when: !source.output.retry}]->(finish:task) {output: lookup.output},
+(lookup)-|:next|->(check:task) {output: {retry: lookup.output.attempt < 2, next_input: {attempt: lookup.output.attempt + 1}}};
+(check) =|:exclusive|=>[
+    ~|:next {when: source.output.retry, max_traversals: 3}, :feeds {when: source.output.retry, value: source.output.next_input, into: target.input}|~>(lookup),
+    -|:next {when: !source.output.retry}|->(finish:task) {output: lookup.output},
 ];
 "#;
 
@@ -1073,12 +1073,12 @@ fn cycles_create_fresh_occurrences_carry_inputs_and_preserve_history() {
 fn junction_strategies_execute_in_native_python_and_typescript() {
     let source = r#"
 (joined:agent) {input: true, output: "done"};
-(joined)-[:next]->(root:task) {input: joined.input};
-(root) =[:parallel]=>[
-    -[a:calls]->(left_task:tool) {output: 2},
-    -[b:calls]->(right_task:tool) {output: 3},
+(joined)-|:next|->(root:task) {input: joined.input};
+(root) =|:parallel|=>[
+    -|a:calls|->(left_task:tool) {output: 2},
+    -|b:calls|->(right_task:tool) {output: 3},
 ]
-    >[:STRATEGY {observe: "result" CONFIG} [b], [a]]>>(finish:task) {output: RESULT};
+    >|:STRATEGY {observe: "result" CONFIG} |b|, |a||>>(finish:task) {output: RESULT};
 "#;
     for (kind, config, result, expected) in [
         (
@@ -1162,12 +1162,12 @@ fn generated_failure(model: &bts_core::mocking::Model, name: &str, message: &str
 
 const QUEUED_SOURCE: &str = r#"
 (joined:agent) {input: true, output: "done"};
-(joined)-[:next]->(root:task) {input: joined.input};
-(root) =[:repeat {count: 3}]=>[
-    -[a:calls]->(left_task:tool) {output: context.index + 1},
-    -[b:calls]->(right_task:tool) {output: context.index + 10},
+(joined)-|:next|->(root:task) {input: joined.input};
+(root) =|:repeat {count: 3}|=>[
+    -|a:calls|->(left_task:tool) {output: context.index + 1},
+    -|b:calls|->(right_task:tool) {output: context.index + 10},
 ]
-    >[:accumulate {observe: "result"} [b], [a]]>>(finish:task) {output: context.arrivals};
+    >|:accumulate {observe: "result"} |b|, |a||>>(finish:task) {output: context.arrivals};
 "#;
 
 #[test]
@@ -1202,7 +1202,7 @@ fn junction_queues_consume_repeated_inputs_and_reduce_at_closure() {
         ),
         (
             QUEUED_SOURCE
-                .replace(":repeat {count: 3}", ":each {items: [|{a: 1, b: 2}, {b: 2, a: 1}|]}")
+                .replace(":repeat {count: 3}", ":each {items: [{a: 1, b: 2}, {b: 2, a: 1}]}")
                 .replace(
                     ":accumulate {observe: \"result\"}",
                     ":first {observe: \"result\", correlate: context.item}",
@@ -1211,7 +1211,7 @@ fn junction_queues_consume_repeated_inputs_and_reduce_at_closure() {
         ),
         (
             QUEUED_SOURCE
-                .replace(":repeat {count: 3}", ":each {items: [|\"a\", \"b\"|]}")
+                .replace(":repeat {count: 3}", ":each {items: [\"a\", \"b\"]}")
                 .replace(
                     ":accumulate {observe: \"result\"}",
                     ":accumulate {observe: \"result\", correlate: context.item}",
@@ -1257,10 +1257,10 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
     // one step reached along two edges would run twice, which is refused before anything runs
     let ambiguous = r#"
 (joined:agent) {input: true, output: finish.output};
-(joined)-[:next]->(root:task) {input: joined.input};
+(joined)-|:next|->(root:task) {input: joined.input};
 (shared:tool) {output: 1};
-(root) =[:parallel]=>[-[a:calls]->(shared), -[b:calls]->(shared)]
-    >[:accumulate {observe: "result"} [a], [b]]>>(finish:task) {output: shared.output};
+(root) =|:parallel|=>[-|a:calls|->(shared), -|b:calls|->(shared)]
+    >|:accumulate {observe: "result"} |a|, |b||>>(finish:task) {output: shared.output};
 "#;
     let error = lower(ambiguous).unwrap_err();
     assert!(error.contains("multiple next edges to one target"), "{error}");
@@ -1278,7 +1278,7 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
         (
             QUEUED_SOURCE
                 .replace(":repeat {count: 3}", ":conditional")
-                .replace("[a:calls]", "[a:calls {when: false}]")
+                .replace("|a:calls|", "|a:calls {when: false}|")
                 .replace("context.index + 1", "1")
                 .replace("context.index + 10", "10")
                 .replace(":accumulate", ":quorum")
@@ -1306,8 +1306,8 @@ fn cycles_and_junctions_fail_explicitly_without_partial_success() {
 #[test]
 fn cycle_groups_keep_limits_and_values_separate_inside_repetition() {
     let source = CYCLE_SOURCE.replace("output: finish.output", "output: \"done\"")
-        .replace("(root)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool)",
-            "(root) =[:repeat {count: 2}]=>[-[:calls]->(turn:task) {input: root.input}]; (turn)-[:calls, :feeds {value: source.input, into: target.input}]->(lookup:tool)")
+        .replace("(root)-|:calls, :feeds {value: source.input, into: target.input}|->(lookup:tool)",
+            "(root) =|:repeat {count: 2}|=>[-|:calls|->(turn:task) {input: root.input}]; (turn)-|:calls, :feeds {value: source.input, into: target.input}|->(lookup:tool)")
         .replace("max_traversals: 3","max_traversals: 2");
     let batch = one_trace(&source);
     let outputs: Vec<_> = batch
@@ -1337,7 +1337,7 @@ fn cycle_groups_keep_limits_and_values_separate_inside_repetition() {
 #[test]
 fn weighted_cycles_preserve_named_history_and_budget_failures() {
     let source = CYCLE_SOURCE
-        .replace("=[:exclusive]", "=[:weighted]")
+        .replace("=|:exclusive|", "=|:weighted|")
         .replace("when: source.output.retry", "weight: 1, when: source.output.retry")
         .replace("when: !source.output.retry", "weight: 1, when: !source.output.retry")
         .replace("(lookup:tool)", "(lookup:tool {name: \"patient_lookup\"})");
@@ -1370,10 +1370,10 @@ fn weighted_cycles_preserve_named_history_and_budget_failures() {
 #[test]
 fn junction_results_wait_for_destination_payload_dependencies() {
     let source = QUEUED_SOURCE
-        .replace("=[:repeat {count: 3}]", "=[:parallel]")
+        .replace("=|:repeat {count: 3}|", "=|:parallel|")
         .replace("output: context.index + 10", "output: 10")
         .replace("output: context.index + 1", "output: child.output");
-    let source = format!("{source}\n(left_task)-[:calls]->(child:tool) {{output: 1}};");
+    let source = format!("{source}\n(left_task)-|:calls|->(child:tool) {{output: 1}};");
     let expected = json!([{ "edge":"b", "value":10 },{ "edge":"a", "value":1 }]);
     let batch = one_trace(&source);
     assert_eq!(
@@ -1407,23 +1407,23 @@ fn junction_results_wait_for_destination_payload_dependencies() {
 fn consumer_rejections_point_at_the_offending_element() {
     let fork = r#"
 (route:agent) {input: "question", output: request.output};
-(route)-[:next]->(request:task) {input: route.input, output: "done"};
-(request)=[:fork]=>[-[:calls]->(answer:tool)];
+(route)-|:next|->(request:task) {input: route.input, output: "done"};
+(request)=|:fork|=>[-|:calls|->(answer:tool)];
 "#;
     for (source, located, message) in [
         (
-            format!("{SOURCE}\n(lookup)-[:next {{weight: 2}}]->(finish:tool) {{output: 1}};"),
+            format!("{SOURCE}\n(lookup)-|:next {{weight: 2}}|->(finish:tool) {{output: 1}};"),
             "2",
             "configured next edges are not supported by mocking yet",
         ),
         (
-            format!("{SOURCE}\n(request)-[:requires]->(lookup);"),
+            format!("{SOURCE}\n(request)-|:requires|->(lookup);"),
             ":requires",
             "edge kind `requires` is not supported by Braintrust mocking",
         ),
         (
             fork.to_owned(),
-            "=[:fork]=>[-[:calls]->(answer:tool)]",
+            "=|:fork|=>[-|:calls|->(answer:tool)]",
             "fork kind `fork` is not supported by Braintrust mocking",
         ),
     ] {
@@ -1437,12 +1437,12 @@ fn consumer_rejections_point_at_the_offending_element() {
     // the probe misspellings from the graph contracts plan never reach the consumer
     for (source, located, message) in [
         (
-            format!("{SOURCE}\n(lookup)-[:next {{whne: true}}]->(finish:tool) {{output: 1}};"),
+            format!("{SOURCE}\n(lookup)-|:next {{whne: true}}|->(finish:tool) {{output: 1}};"),
             "whne",
             "unknown property `whne` for built-in kind `next`, did you mean `when`?",
         ),
         (
-            format!("{SOURCE}\n(lookup)-[:nxet]->(finish:tool) {{output: 1}};"),
+            format!("{SOURCE}\n(lookup)-|:nxet|->(finish:tool) {{output: 1}};"),
             "nxet",
             "unknown edge kind `nxet`, did you mean `next`?",
         ),
@@ -1471,12 +1471,12 @@ fn consumer_rejections_point_at_the_offending_element() {
     }
     // a misspelled context key is a compile error at the read, with the keys available there
     let source = r#"(probe:agent) {input: null, output: null};
-(probe)-[:next]->(a:task {name: "a"})
-    =[:parallel]=>[
-        -[one:next]->(b:task {name: "b"}),
-        -[two:next]->(c:task {name: "c"}),
+(probe)-|:next|->(a:task {name: "a"})
+    =|:parallel|=>[
+        -|one:next|->(b:task {name: "b"}),
+        -|two:next|->(c:task {name: "c"}),
     ]
-        >[:accumulate [one], [two]]>>(joined:task {name: "joined"}) {input: context.arivals};"#;
+        >|:accumulate |one|, |two||>>(joined:task {name: "joined"}) {input: context.arivals};"#;
     let errors = Bundle.compile_module(source, false).unwrap_err();
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert_eq!(
@@ -1522,12 +1522,12 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
     // a static plan: every reply sits under the turn of its own iteration
     let repeated = r#"
 (chat:agent) {input: "hi", output: request.output};
-(chat)-[:next]->(request:task) {input: chat.input, output: "done"};
+(chat)-|:next|->(request:task) {input: chat.input, output: "done"};
 (request)
-    =[:repeat {count: 3}]=>[
-        -[:calls]->(turn:task) {input: context.index, output: "turn"},
+    =|:repeat {count: 3}|=>[
+        -|:calls|->(turn:task) {input: context.index, output: "turn"},
     ]
-        ->(turn)-[:calls]->(reply:llm) {input: turn.input, output: "reply"};
+        ->(turn)-|:calls|->(reply:llm) {input: turn.input, output: "reply"};
 "#;
     let spans = span_parents(&one_trace(repeated));
     assert_eq!(spans.len(), 7);
@@ -1538,12 +1538,12 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
     // each iterates over items the same way
     let iterated = r#"
 (chat:agent) {input: "hi", output: request.output};
-(chat)-[:next]->(request:task) {input: chat.input, output: "done", local: {files: [|"a.txt", "b.txt"|]}};
+(chat)-|:next|->(request:task) {input: chat.input, output: "done", local: {files: ["a.txt", "b.txt"]}};
 (request)
-    =[:each {items: request.local.files}]=>[
-        -[:calls]->(file:task) {input: context.item, output: "read"},
+    =|:each {items: request.local.files}|=>[
+        -|:calls|->(file:task) {input: context.item, output: "read"},
     ]
-        ->(file)-[:calls]->(parse:tool) {input: file.input, output: "parsed"};
+        ->(file)-|:calls|->(parse:tool) {input: file.input, output: "parsed"};
 "#;
     let spans = span_parents(&one_trace(iterated));
     assert_eq!(spans.len(), 5);
@@ -1554,13 +1554,13 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
     // a reduce junction on the rounds: each probe sits under its own round and the fold follows the loop
     let flowing = r#"
 (chat:agent) {input: "hi", output: closing.output};
-(chat)-[:next]->(request:task) {input: chat.input, output: closing.output};
+(chat)-|:next|->(request:task) {input: chat.input, output: closing.output};
 (request)
-    =[:repeat {count: 3}]=>[
-        -[rounds:calls]->(inspect:task) {input: context.index, output: context.index},
+    =|:repeat {count: 3}|=>[
+        -|rounds:calls|->(inspect:task) {input: context.index, output: context.index},
     ]
-        ->(inspect)-[:calls]->(probe:tool) {input: inspect.input, output: "probed"}
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [rounds]]>>(closing:llm) {
+        ->(inspect)-|:calls|->(probe:tool) {input: inspect.input, output: "probed"}
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |rounds||>>(closing:llm) {
             input: context.accumulator,
             output: "summary",
         };
@@ -1590,12 +1590,12 @@ fn calls_parents_each_occurrence_of_a_repeated_step() {
 fn next_from_a_nested_task_returns_to_its_level() {
     let source = r#"
 (chat:agent) {input: "hi", output: request.output};
-(chat)-[:next]->(request:task) {input: chat.input, output: summary.output};
-(request)-[:calls]->(plan:llm) {input: request.input, output: "plan"}
-    -[:next]->(research:task) {input: plan.output, output: read.output}
-        -[:calls]->(search:tool) {input: research.input, output: "hits"}
-            -[:next]->(read:tool) {input: search.output, output: "notes"};
-(research)-[:next]->(summary:llm) {input: read.output, output: "summary"};
+(chat)-|:next|->(request:task) {input: chat.input, output: summary.output};
+(request)-|:calls|->(plan:llm) {input: request.input, output: "plan"}
+    -|:next|->(research:task) {input: plan.output, output: read.output}
+        -|:calls|->(search:tool) {input: research.input, output: "hits"}
+            -|:next|->(read:tool) {input: search.output, output: "notes"};
+(research)-|:next|->(summary:llm) {input: read.output, output: "summary"};
 "#;
     assert_eq!(
         parent_names(&one_trace(source)),
@@ -1610,11 +1610,11 @@ fn next_from_a_nested_task_returns_to_its_level() {
     );
     // the steps inside a task are declared before the step that follows it
     let reordered = source.replace(
-        "(chat)-[:next]->(request:task) {input: chat.input, output: summary.output};",
-        "(chat)-[:next]->(request:task) {input: chat.input, output: summary.output};\n(research)-[:next]->(summary);",
+        "(chat)-|:next|->(request:task) {input: chat.input, output: summary.output};",
+        "(chat)-|:next|->(request:task) {input: chat.input, output: summary.output};\n(research)-|:next|->(summary);",
     );
     let reordered = reordered.replace(
-        "(research)-[:next]->(summary:llm) {input: read.output, output: \"summary\"};",
+        "(research)-|:next|->(summary:llm) {input: read.output, output: \"summary\"};",
         "(summary:llm) {input: read.output, output: \"summary\"};",
     );
     assert!(
@@ -1628,15 +1628,15 @@ fn next_from_a_nested_task_returns_to_its_level() {
 fn a_junction_target_takes_the_parent_its_inputs_carry() {
     let source = r#"
 (chat:agent) {input: "hi", output: synthesis.output};
-(chat)-[:next]->(request:task) {input: chat.input, output: synthesis.output};
-(request)-[:calls]->(delegate:llm) {input: request.input, output: "split"}
-    =[:parallel]=>[
-        -[a:next]->(metrics:task) {input: "pull metrics", output: metrics_reply.output},
-        -[b:next]->(diff:task) {input: "diff releases", output: diff_reply.output},
+(chat)-|:next|->(request:task) {input: chat.input, output: synthesis.output};
+(request)-|:calls|->(delegate:llm) {input: request.input, output: "split"}
+    =|:parallel|=>[
+        -|a:next|->(metrics:task) {input: "pull metrics", output: metrics_reply.output},
+        -|b:next|->(diff:task) {input: "diff releases", output: diff_reply.output},
     ]
-        ->(metrics)-[:calls]->(metrics_reply:llm) {input: metrics.input, output: "p95 up"}
-        ->(diff)-[:calls]->(diff_reply:llm) {input: diff.input, output: "new check"}
-        >[:accumulate {observe: "result"} [a], [b]]>>(synthesis:llm) {input: context.arrivals, output: "answer"};
+        ->(metrics)-|:calls|->(metrics_reply:llm) {input: metrics.input, output: "p95 up"}
+        ->(diff)-|:calls|->(diff_reply:llm) {input: diff.input, output: "new check"}
+        >|:accumulate {observe: "result"} |a|, |b||>>(synthesis:llm) {input: context.arrivals, output: "answer"};
 "#;
     assert_eq!(
         parent_names(&one_trace(source)),
@@ -1651,7 +1651,7 @@ fn a_junction_target_takes_the_parent_its_inputs_carry() {
         ])
     );
     // inputs that disagree are rejected at the junction
-    let disagreeing = source.replace("-[a:next]->", "-[a:calls]->");
+    let disagreeing = source.replace("-|a:next|->", "-|a:calls|->");
     let errors = Bundle.compile_module(&disagreeing, false).unwrap_err();
     assert_eq!(errors.len(), 1, "{errors:#?}");
     assert_eq!(
@@ -1660,7 +1660,7 @@ fn a_junction_target_takes_the_parent_its_inputs_carry() {
     );
     let range = errors[0].r#where;
     assert!(
-        disagreeing[range.start..range.end].starts_with(">[:accumulate"),
+        disagreeing[range.start..range.end].starts_with(">|:accumulate"),
         "{errors:#?}"
     );
 }
@@ -1670,10 +1670,10 @@ fn agents_share_a_step_under_their_own_parents() {
     let source = r#"
 (first:agent) {input: "one", output: first_request.output};
 (second:agent) {input: "two", output: second_request.output};
-(first)-[:next]->(first_request:task) {input: first.input, output: "first done"};
-(second)-[:next]->(second_request:task) {input: second.input, output: "second done"};
-(first_request)-[:calls]->(lookup:tool) {input: "key", output: "value"};
-(second_request)-[:calls]->(lookup);
+(first)-|:next|->(first_request:task) {input: first.input, output: "first done"};
+(second)-|:next|->(second_request:task) {input: second.input, output: "second done"};
+(first_request)-|:calls|->(lookup:tool) {input: "key", output: "value"};
+(second_request)-|:calls|->(lookup);
 "#;
     let model = lower(source).unwrap();
     let mut seen = Vec::new();
@@ -1703,12 +1703,12 @@ fn agents_share_a_step_under_their_own_parents() {
 fn a_step_after_a_rounds_step_runs_in_every_round() {
     // act follows think on its level, so each round runs both and act can read the round
     let source = r#"(loop:agent) {input: "x", output: request.output};
-(loop)-[:next]->(request:task) {input: loop.input, output: "done"};
+(loop)-|:next|->(request:task) {input: loop.input, output: "done"};
 (request)
-    =[:repeat {count: 2}]=>[
-        -[:calls]->(think:llm) {input: context.index, output: "thought"},
+    =|:repeat {count: 2}|=>[
+        -|:calls|->(think:llm) {input: context.index, output: "thought"},
     ]
-        ->(think)-[:next]->(act:tool) {input: {round: context.index, thought: think.input}, output: "acted"};
+        ->(think)-|:next|->(act:tool) {input: {round: context.index, thought: think.input}, output: "acted"};
 "#;
     let expected = [
         ("request", json!("x")),
@@ -1742,25 +1742,25 @@ fn definitions_supply_context_values_to_data_and_code() {
     // the agent supplies its tenant to every step, and each turn supplies its own ticket to its reply
     let source = r#"
 +(tenant_scoped:trait {tenant: {type: "string", required: true}})
-    -[:on]->(node)
-    -[:provides {tenant: {type: "string", value: self.props.tenant}}]->(context);
+    -|:on|->(node)
+    -|:provides {tenant: {type: "string", value: self.props.tenant}}|->(context);
 +(scoped_agent:node)
-    -[:extends]->(agent)
-    -[:has]->(tenant_scoped);
+    -|:extends|->(agent)
+    -|:has|->(tenant_scoped);
 +(ticketed:trait)
-    -[:on]->(node)
-    -[:provides {ticket: {type: "object", value: {id: self.input, round: context.index}}}]->(context);
+    -|:on|->(node)
+    -|:provides {ticket: {type: "object", value: {id: self.input, round: context.index}}}|->(context);
 +(ticket_task:node)
-    -[:extends]->(task)
-    -[:has]->(ticketed);
+    -|:extends|->(task)
+    -|:has|->(ticketed);
 
 (support:scoped_agent {tenant: "acme"}) {input: "refund", output: request.output};
-(support)-[:next]->(request:task) {input: support.input, output: context.tenant};
+(support)-|:next|->(request:task) {input: support.input, output: context.tenant};
 (request)
-    =[:repeat {count: 2}]=>[
-        -[:calls]->(turn:ticket_task) {input: "T-${context.index}", output: "handled"},
+    =|:repeat {count: 2}|=>[
+        -|:calls|->(turn:ticket_task) {input: "T-${context.index}", output: "handled"},
     ]
-        ->(turn)-[:calls]->(reply:llm) {input: {tenant: context.tenant, ticket: context.ticket}, output: "ok"};
+        ->(turn)-|:calls|->(reply:llm) {input: {tenant: context.tenant, ticket: context.ticket}, output: "ok"};
 "#;
     let reply = |round: i64| json!({"tenant": "acme", "ticket": {"id": format!("T-{round}"), "round": round}});
     let expected = [
@@ -1802,16 +1802,16 @@ fn definitions_supply_context_values_to_data_and_code() {
     // two suppliers on two paths leave the reader without one value
     let ambiguous = r#"
 +(assigned:edge {direction: "directed"})
-    -[:extends]->(calls)
-    -[:provides {owner: {type: "string", value: target.input}}]->(context);
+    -|:extends|->(calls)
+    -|:provides {owner: {type: "string", value: target.input}}|->(context);
 (pair:agent) {input: "x", output: request.output};
-(pair)-[:next]->(request:task) {input: pair.input, output: "done"};
+(pair)-|:next|->(request:task) {input: pair.input, output: "done"};
 (request)
-    =[:parallel]=>[
-        -[a:assigned]->(first_owner:task) {input: "ann", output: "l"},
-        -[b:assigned]->(second_owner:task) {input: "bo", output: "r"},
+    =|:parallel|=>[
+        -|a:assigned|->(first_owner:task) {input: "ann", output: "l"},
+        -|b:assigned|->(second_owner:task) {input: "bo", output: "r"},
     ]
-        >[:accumulate {observe: "result"} [a], [b]]>>(finish:task) {input: context.owner, output: "f"};
+        >|:accumulate {observe: "result"} |a|, |b||>>(finish:task) {input: context.owner, output: "f"};
 "#;
     assert_eq!(
         lower(ambiguous).unwrap_err(),
@@ -1825,15 +1825,15 @@ fn kinds_compute_fields_for_data_and_code() {
     // a kind states its output once, an extension restates it, and the last step writes its own
     let source = r#"
 +(clean_query:node) {output: {type: "string", value: lower(trim(self.input))}}
-    -[:extends]->(tool);
+    -|:extends|->(tool);
 +(shout_query:node) {output: {value: upper(trim(self.input))}}
-    -[:extends]->(clean_query);
+    -|:extends|->(clean_query);
 
 (help:agent) {input: "  Rotate MY Keys ", output: request.output};
-(help)-[:next]->(request:task) {input: help.input, output: last.output};
-(request)-[:calls]->(clean:clean_query) {input: request.input}
-    -[:next]->(loud:shout_query) {input: request.input}
-        -[:next]->(last:clean_query) {input: loud.output, output: "written"};
+(help)-|:next|->(request:task) {input: help.input, output: last.output};
+(request)-|:calls|->(clean:clean_query) {input: request.input}
+    -|:next|->(loud:shout_query) {input: request.input}
+        -|:next|->(last:clean_query) {input: loud.output, output: "written"};
 "#;
     let spans = |question: &str| {
         [
@@ -1904,10 +1904,10 @@ fn kinds_compute_fields_for_data_and_code() {
 fn generated_agents_count_the_tokens_of_their_llm_steps() {
     // the tokenizer stand-in counts words, so these are not real token counts
     let source = r#"(chat:agent) {input: "one two three", output: cached.output};
-(chat)-[:next]->(request:task) {input: chat.input, output: cached.output};
-(request)-[:calls]->(bare:llm)
-    -[:next]->(timed:llm) {input: request.input, output: "four five", metrics: {time_to_first_token: 0.25}}
-        -[:next]->(cached:llm) {input: request.input, output: "four five", metrics: {prompt_tokens: 0}};
+(chat)-|:next|->(request:task) {input: chat.input, output: cached.output};
+(request)-|:calls|->(bare:llm)
+    -|:next|->(timed:llm) {input: request.input, output: "four five", metrics: {time_to_first_token: 0.25}}
+        -|:next|->(cached:llm) {input: request.input, output: "four five", metrics: {prompt_tokens: 0}};
 "#;
     let model = lower(source).unwrap();
     for details in generated_runs(&model, "chat") {
@@ -1939,30 +1939,30 @@ fn loops_rounds_and_keyed_junctions_agree_in_data_and_code() {
     // a loop holds a fork that repeats, and each round of the loop runs every round of the fork
     let rounds_in_a_loop = r#"
 (looping:agent) {input: 0, output: last.output};
-(looping)-[:next]->(root:task) {input: looping.input};
-(root)-[:calls]->(turn:task) {output: len(context.history.turn)}
-    =[:repeat {count: 2}]=>[-[:calls]->(work:tool) {output: context.index + turn.output * 10}];
-(turn)~[:next {when: source.output < 2, max_traversals: 5}]~>(turn);
-(turn)-[:next {when: source.output >= 2}]->(last:task) {output: turn.output};
+(looping)-|:next|->(root:task) {input: looping.input};
+(root)-|:calls|->(turn:task) {output: len(context.history.turn)}
+    =|:repeat {count: 2}|=>[-|:calls|->(work:tool) {output: context.index + turn.output * 10}];
+(turn)~|:next {when: source.output < 2, max_traversals: 5}|~>(turn);
+(turn)-|:next {when: source.output >= 2}|->(last:task) {output: turn.output};
 "#;
     // a correlated reduce closes one group for each key, in the order the keys first arrive
     let keyed_reduce = r#"
 (looping:agent) {input: 0, output: "done"};
-(looping)-[:next]->(root:task) {input: looping.input};
-(root) =[:each {items: [|"x", "y", "x"|]}]=>[
-    -[a:calls]->(part:tool) {output: context.index + 1},
+(looping)-|:next|->(root:task) {input: looping.input};
+(root) =|:each {items: ["x", "y", "x"]}|=>[
+    -|a:calls|->(part:tool) {output: context.index + 1},
 ]
-    >[:reduce {observe: "result", correlate: context.item, initial: 0, combine: context.accumulator + context.arrival.value} [a]]>>(finish:task) {
+    >|:reduce {observe: "result", correlate: context.item, initial: 0, combine: context.accumulator + context.arrival.value} |a||>>(finish:task) {
         output: {total: context.accumulator, arrivals: context.arrivals},
     };
 "#;
     // a junction without a fork joins the edges that leave one step
     let joined_edges = r#"
 (looping:agent) {input: 0, output: finish.output};
-(looping)-[:next]->(root:task) {input: looping.input};
-(root)-[x:calls]->(one:tool) {output: 1};
-(root)-[y:calls]->(two:tool) {output: 2};
->[:accumulate {observe: "result"} [x], [y]]>>(finish:task) {output: context.arrivals};
+(looping)-|:next|->(root:task) {input: looping.input};
+(root)-|x:calls|->(one:tool) {output: 1};
+(root)-|y:calls|->(two:tool) {output: 2};
+>|:accumulate {observe: "result"} |x|, |y||>>(finish:task) {output: context.arrivals};
 "#;
     for (source, expected) in [
         (
@@ -2015,30 +2015,30 @@ fn loops_rounds_and_keyed_junctions_agree_in_data_and_code() {
 fn shapes_without_a_nested_form_are_refused_with_a_location() {
     let base = r#"
 (looping:agent) {input: 0, output: "done"};
-(looping)-[:next]->(root:task) {input: looping.input};
-(root)-[:calls]->(first:tool) {output: 1};
-(first)-[:next]->(second:tool) {output: 2};
+(looping)-|:next|->(root:task) {input: looping.input};
+(root)-|:calls|->(first:tool) {output: 1};
+(first)-|:next|->(second:tool) {output: 2};
 "#;
     for (source, located, message) in [
         (
-            format!("{base}(root)-[:calls]->(other:tool) {{output: 3}};\n(other)~[:next {{when: false}}]~>(first);"),
+            format!("{base}(root)-|:calls|->(other:tool) {{output: 3}};\n(other)~|:next {{when: false}}|~>(first);"),
             ":next {when: false}",
             "a loop-back must return to a step that leads to its source",
         ),
         (
-            format!("{base}(second)~[:next {{when: false}}]~>(first);\n(second)~[retry:next {{when: false}}]~>(first);"),
+            format!("{base}(second)~|:next {{when: false}}|~>(first);\n(second)~|retry:next {{when: false}}|~>(first);"),
             "retry:next {when: false}",
             "more than one loop-back to one step is not supported by mocking yet",
         ),
         (
-            format!("{base}(second)~[:next {{when: false}}]~>(root);"),
+            format!("{base}(second)~|:next {{when: false}}|~>(root);"),
             ":next {when: false}",
             "cycle edges cannot target the trace entry span",
         ),
         (
             base.replace(
-                "(first)-[:next]->(second:tool) {output: 2};",
-                "(root) =[:repeat {count: 2}]=>[-[:calls]->(second:tool) {output: 2}];\n(root)-[:calls]->(reader:tool) {output: second.output};",
+                "(first)-|:next|->(second:tool) {output: 2};",
+                "(root) =|:repeat {count: 2}|=>[-|:calls|->(second:tool) {output: 2}];\n(root)-|:calls|->(reader:tool) {output: second.output};",
             ),
             "(second:tool) {output: 2}",
             "`second` runs once for each round of its fork, read it from a step in the round or through a junction",
@@ -2211,21 +2211,21 @@ fn the_world_example_agrees_in_data_and_code() {
 fn a_walk_drawn_for_more_than_a_trace_agrees_in_data_and_code() {
     // the desk is drawn once for the run and the mood once for every three traces
     let source = r#"(desk:sentence {per: "run"})
-    -[:next]->(:part {subject: "the desk"})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:part {verb: "open", complement: "at nine"}),
-        -[:next {weight: 1}]->(:part {verb: "open", complement: "at ten"}),
-        -[:next {weight: 1}]->(:part {verb: "close", complement: "at noon"}),
+    -|:next|->(:part {subject: "the desk"})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:part {verb: "open", complement: "at nine"}),
+        -|:next {weight: 1}|->(:part {verb: "open", complement: "at ten"}),
+        -|:next {weight: 1}|->(:part {verb: "close", complement: "at noon"}),
     ];
 (mood:sentence {per: floor(context.trace_index / 3)})
-    -[:next]->(:part {subject: "I", person: "first"})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:part {verb: "wait"}),
-        -[:next {weight: 1}]->(:part {verb: "leave"}),
-        -[:next {weight: 1}]->(:part {verb: "stay"}),
+    -|:next|->(:part {subject: "I", person: "first"})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:part {verb: "wait"}),
+        -|:next {weight: 1}|->(:part {verb: "leave"}),
+        -|:next {weight: 1}|->(:part {verb: "stay"}),
     ];
 (desk_hours:agent) {input: "hi", output: t.output};
-(desk_hours)-[:next]->(t:task {name: "t"}) {input: desk_hours.input, output: [|desk.text, mood.text|]};
+(desk_hours)-|:next|->(t:task {name: "t"}) {input: desk_hours.input, output: [desk.text, mood.text]};
 "#;
     let model = lower(source).unwrap();
     for seed in [1u64, 2, 3, 4, 5, 6] {
@@ -2343,18 +2343,18 @@ fn every_piece_of_a_world_agrees_in_data_and_code() {
 fn a_way_of_talking_that_samples_agrees_in_data_and_code() {
     // typos and a wording that may or may not apply are drawn by the seed, like a fork
     let source = r#"+(sloppy:trait)
-    -[:on]->(node)
-    -[:provides {speaker: {type: "object", value: {wording: {style: "text_message", probability: 0.6, typos: {probability: 0.7, max_errors: 2}}}}}]->(context);
+    -|:on|->(node)
+    -|:provides {speaker: {type: "object", value: {wording: {style: "text_message", probability: 0.6, typos: {probability: 0.7, max_errors: 2}}}}}|->(context);
 +(texter:node) {said: {type: "array", value: context.steps}, gives: {type: "array", value: self.said}}
-    -[:extends]->(walk)
-    -[:has]->(sloppy);
+    -|:extends|->(walk)
+    -|:has|->(sloppy);
 (maya:texter)
-    -[:next]->(one:sentence)
-        -[:next]->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight because the meeting moved"})
-    -[:next]->(two:sentence)
-        -[:next]->(:part {subject: "the people", number: "plural", verb: "think", complement: "that the ticket was really expensive"});
+    -|:next|->(one:sentence)
+        -|:next|->(:part {subject: "I", person: "first", modal: "can", form: "question", verb: "change", complement: "my flight because the meeting moved"})
+    -|:next|->(two:sentence)
+        -|:next|->(:part {subject: "the people", number: "plural", verb: "think", complement: "that the ticket was really expensive"});
 (texts:agent) {input: "hi", output: t.output};
-(texts)-[:next]->(t:task {name: "t"}) {input: texts.input, output: maya.said};
+(texts)-|:next|->(t:task {name: "t"}) {input: texts.input, output: maya.said};
 "#;
     let model = lower(source).unwrap();
     let seeds: Vec<u64> = (1..=16).collect();
@@ -2401,16 +2401,16 @@ fn a_series_agrees_in_data_and_code() {
     // an agent given the seed and a trace is that trace of the run, so it can be any turn of any conversation
     // each conversation runs for two to five turns
     // short conversations are the likeliest
-    let source = r#"(chat:series {turns: 2, up_to: 5, weights: [|4, 3, 2, 1|]});
+    let source = r#"(chat:series {turns: 2, up_to: 5, weights: [4, 3, 2, 1]});
 (mood:sentence {per: chat.number})
-    -[:next]->(:part {subject: "I", person: "first"})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:part {verb: "wait"}),
-        -[:next {weight: 1}]->(:part {verb: "leave"}),
-        -[:next {weight: 1}]->(:part {verb: "stay"}),
+    -|:next|->(:part {subject: "I", person: "first"})
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:part {verb: "wait"}),
+        -|:next {weight: 1}|->(:part {verb: "leave"}),
+        -|:next {weight: 1}|->(:part {verb: "stay"}),
     ];
 (desk:agent) {input: "hi", output: t.output};
-(desk)-[:next]->(t:task {name: "turn"}) {
+(desk)-|:next|->(t:task {name: "turn"}) {
     input: desk.input,
     output: {id: chat.id, turn: chat.turn, length: chat.length, first: chat.first, last: chat.last, mood: mood.text},
     metadata: {conversation_id: chat.id},
@@ -2484,13 +2484,13 @@ fn an_agent_input_that_reads_a_series_agrees_in_data_and_code() {
     // the entry reads the series again after its input, which is where the series is sure to be read
     let source = r#"(chat:series {turns: 2, up_to: 4});
 (caller:entity {per: chat.number})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {value: {name: "Ada"}}),
-        -[:next {weight: 1}]->(:given {value: {name: "Bo"}}),
-        -[:next {weight: 1}]->(:given {value: {name: "Cy"}}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:given {value: {name: "Ada"}}),
+        -|:next {weight: 1}|->(:given {value: {name: "Bo"}}),
+        -|:next {weight: 1}|->(:given {value: {name: "Cy"}}),
     ];
 (desk:agent) {input: {name: caller.attributes.name, turn: chat.turn}, output: t.output};
-(desk)-[:next]->(t:task {name: "turn"}) {
+(desk)-|:next|->(t:task {name: "turn"}) {
     input: desk.input,
     output: t.input.name,
     metadata: {conversation_id: chat.id, name: caller.attributes.name},
@@ -2545,20 +2545,20 @@ fn a_conversation_is_the_messages_up_to_a_turn() {
     // the lists are as long as the series, which is not known until a trace is drawn
     let world = r#"(chat:series {turns: 3});
 (customer:persona {per: chat.number})
-    -[:next]->(:statement {subject: "I", person: "first", verb: "need", complement: "a refund"})
-    -[:next]->(:statement {subject: "the order", verb: "be", complement: "late"})
-    -[:next]->(:statement {subject: "that", verb: "work"});
+    -|:next|->(:statement {subject: "I", person: "first", verb: "need", complement: "a refund"})
+    -|:next|->(:statement {subject: "the order", verb: "be", complement: "late"})
+    -|:next|->(:statement {subject: "that", verb: "work"});
 (helper:persona {per: chat.number})
-    -[:next]->(:statement {subject: "I", person: "first", modal: "can", verb: "help"})
-    -[:next]->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
-    -[:next]->(:statement {subject: "the refund", verb: "be", complement: "on its way"});
+    -|:next|->(:statement {subject: "I", person: "first", modal: "can", verb: "help"})
+    -|:next|->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
+    -|:next|->(:statement {subject: "the refund", verb: "be", complement: "on its way"});
 (lookups:list {per: chat.number})
-    -[:next]->(:given {value: [|{role: "assistant", content: null, tool_calls: [|{id: "call_1", name: "find_order"}|]}, {role: "tool", tool_call_id: "call_1", content: {status: "late"}}|]})
-    -[:next]->(:given {value: [||]})
-    -[:next]->(:given {value: [||]});"#;
+    -|:next|->(:given {value: [{role: "assistant", content: null, tool_calls: [{id: "call_1", name: "find_order"}]}, {role: "tool", tool_call_id: "call_1", content: {status: "late"}}]})
+    -|:next|->(:given {value: []})
+    -|:next|->(:given {value: []});"#;
     let traces = |read: &str| {
         let source = format!(
-            "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-[:next]->(t:task {{name: \"t\"}}) {{input: a.input, output: {read}}};\n"
+            "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-|:next|->(t:task {{name: \"t\"}}) {{input: a.input, output: {read}}};\n"
         );
         let model = lower(&source).unwrap_or_else(|errors| panic!("{errors}"));
         let generated = data::generate(
@@ -2640,17 +2640,17 @@ fn a_conversation_is_the_messages_up_to_a_turn() {
             "conversation({user: customer.said, assistant: helper.said[0:1], turn: 2})",
             "assistant has a reply for every turn before this one",
         ),
-        ("conversation({user: [|1|], turn: 0})", "user is a list of strings"),
+        ("conversation({user: [1], turn: 0})", "user is a list of strings"),
         (
             "conversation({user: customer.said, turn: 0, system: 1})",
             "system is a string",
         ),
         (
-            "conversation({user: customer.said, between: [|[||]|], turn: 2})",
+            "conversation({user: customer.said, between: [[]], turn: 2})",
             "between has an entry for every turn before this one",
         ),
         (
-            "conversation({user: customer.said, between: [|1, 2, 3|], turn: 2})",
+            "conversation({user: customer.said, between: [1, 2, 3], turn: 2})",
             "between has an entry for every turn before this one",
         ),
         ("conversation({user: customer.said})", "takes an object with user and turn"),
@@ -2667,10 +2667,10 @@ fn a_conversation_is_the_messages_up_to_a_turn() {
 #[test]
 fn json_text_and_decimal_places_agree_in_data_and_code() {
     let source = r#"(desk:agent) {input: "hi", output: answer.output};
-(desk)-[:next]->(answer:task {name: "answer"}) {
+(desk)-|:next|->(answer:task {name: "answer"}) {
     input: desk.input,
     output: {
-        arguments: json({claim_id: "CLM-1", amount: 12.5, whole: 1.0, count: 3, tags: [|"a", true, null|], nested: {z: 1, a: 2}}),
+        arguments: json({claim_id: "CLM-1", amount: 12.5, whole: 1.0, count: 3, tags: ["a", true, null], nested: {z: 1, a: 2}}),
         text: json("it's plain text"),
         nothing: json(null),
         score: decimal(0.8649, 2),
@@ -2737,28 +2737,28 @@ fn a_conversation_agrees_in_data_and_code() {
     // both sides of a chat are in the world, so any turn has the messages before it
     let source = r#"(chat:series {turns: 2, up_to: 4});
 (customer:persona {style: "text_message", per: chat.number})
-    -[:next]->(:sentence)
-        -[:next]->(:part {subject: "I", person: "first", verb: "need"})
-        =[:weighted]=>[
-            -[:next {weight: 1}]->(:part {complement: "a refund"}),
-            -[:next {weight: 1}]->(:part {complement: "a receipt"}),
+    -|:next|->(:sentence)
+        -|:next|->(:part {subject: "I", person: "first", verb: "need"})
+        =|:weighted|=>[
+            -|:next {weight: 1}|->(:part {complement: "a refund"}),
+            -|:next {weight: 1}|->(:part {complement: "a receipt"}),
         ]
-    -[:next]->(:statement {subject: "the order", verb: "be", complement: "late"})
-    -[:next]->(:statement {subject: "that", verb: "work"})
-    -[:next]->(:statement {subject: "I", person: "first", verb: "like", complement: "it"});
+    -|:next|->(:statement {subject: "the order", verb: "be", complement: "late"})
+    -|:next|->(:statement {subject: "that", verb: "work"})
+    -|:next|->(:statement {subject: "I", person: "first", verb: "like", complement: "it"});
 (helper:persona {per: chat.number})
-    -[:next]->(:statement {subject: "I", person: "first", modal: "can", verb: "help"})
-    -[:next]->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
-    -[:next]->(:statement {subject: "the refund", verb: "be", complement: "on its way"})
-    -[:next]->(:statement {subject: "you", person: "second", verb: "be", complement: "welcome"});
+    -|:next|->(:statement {subject: "I", person: "first", modal: "can", verb: "help"})
+    -|:next|->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
+    -|:next|->(:statement {subject: "the refund", verb: "be", complement: "on its way"})
+    -|:next|->(:statement {subject: "you", person: "second", verb: "be", complement: "welcome"});
 (lookups:list {per: chat.number})
-    -[:next]->(:given {value: [|{role: "assistant", content: null, tool_calls: [|{id: "call_1", name: "find_order"}|]}, {role: "tool", tool_call_id: "call_1", content: {status: "late"}}|]})
-    -[:next]->(:given {value: [||]})
-    -[:next]->(:given {value: [||]})
-    -[:next]->(:given {value: [||]});
+    -|:next|->(:given {value: [{role: "assistant", content: null, tool_calls: [{id: "call_1", name: "find_order"}]}, {role: "tool", tool_call_id: "call_1", content: {status: "late"}}]})
+    -|:next|->(:given {value: []})
+    -|:next|->(:given {value: []})
+    -|:next|->(:given {value: []});
 (desk:agent) {input: customer.said[chat.turn], output: answer.output};
-(desk)-[:next]->(answer:task {name: "answer"}) {input: desk.input, output: reply.output.content}
-    -[:calls]->(reply:llm {name: "chat_completion"}) {
+(desk)-|:next|->(answer:task {name: "answer"}) {input: desk.input, output: reply.output.content}
+    -|:calls|->(reply:llm {name: "chat_completion"}) {
         input: conversation({system: "Be brief.", user: customer.said, assistant: helper.said, between: lookups.items, turn: chat.turn}),
         output: {role: "assistant", content: helper.said[chat.turn]},
     };
@@ -2916,12 +2916,12 @@ fn a_loop_without_an_ordered_form_runs_in_the_deferred_form() {
 fn a_duration_reaches_the_step_that_logs_it() {
     // one branch of a fork draws its duration and the other writes it, as a float or from a local
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {slow: a.input == "hi"}};
-(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(a)-|:next|->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {slow: a.input == "hi"}};
+(t)-|:calls|->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
 (plan)
-    =[:exclusive]=>[
-        -[:next {when: !t.local.slow}]->(quick:tool {name: "lookup"}) {input: t.input, output: {found: true}, duration: range(0.1, 0.2)},
-        -[:next {when: t.local.slow}]->(slow:tool {name: "lookup"}) {input: t.input, output: {found: false}, duration: 3.0},
+    =|:exclusive|=>[
+        -|:next {when: !t.local.slow}|->(quick:tool {name: "lookup"}) {input: t.input, output: {found: true}, duration: range(0.1, 0.2)},
+        -|:next {when: t.local.slow}|->(slow:tool {name: "lookup"}) {input: t.input, output: {found: false}, duration: 3.0},
     ];
 "#;
     for (written, seconds) in [("3.0", 3.0), ("t.local.slow ? 1.5 : 2", 1.5)] {
@@ -2962,8 +2962,8 @@ fn a_duration_reaches_the_step_that_logs_it() {
 #[test]
 fn a_result_that_may_be_null_has_one_named_type() {
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {sent: chance(0.5)}}
-    -[:calls]->(mail:tool {name: "send_summary"}) {
+(a)-|:next|->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {sent: chance(0.5)}}
+    -|:calls|->(mail:tool {name: "send_summary"}) {
         input: t.input,
         output: t.local.sent ? {delivered: true} : null,
     };
@@ -3044,7 +3044,7 @@ fn step<'a>(details: &'a Value, name: &str) -> &'a Value {
 fn a_format_adds_no_empty_text() {
     // a template that starts or ends with a value has no text before or after it
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {
+(a)-|:next|->(t:task {name: "turn"}) {
     input: a.input,
     output: {id: format("msg_{}", hex(12)), cost: format("{} dollars", 5), both: format("{}{}", a.input, 5), only: format("{}", 7)},
 };
@@ -3069,8 +3069,8 @@ fn a_format_adds_no_empty_text() {
 #[test]
 fn an_error_and_a_result_are_set_only_where_they_have_a_value() {
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {sent: a.input == "hi"}}
-    -[:calls]->(mail:tool {name: "send_summary"}) {
+(a)-|:next|->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {sent: a.input == "hi"}}
+    -|:calls|->(mail:tool {name: "send_summary"}) {
         input: t.input,
         output: t.local.sent ? {delivered: true} : null,
         error: t.local.sent ? null : "550 mailbox unavailable",
@@ -3103,12 +3103,12 @@ fn an_error_and_a_result_are_set_only_where_they_have_a_value() {
 #[test]
 fn a_step_that_returns_nothing_has_no_result_type() {
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {down: a.input == "hi"}};
-(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(a)-|:next|->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {down: a.input == "hi"}};
+(t)-|:calls|->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
 (plan)
-    =[:exclusive]=>[
-        -[:next {when: !t.local.down}]->(found:tool {name: "lookup"}) {input: t.input, output: {found: true}},
-        -[:next {when: t.local.down}]->(failed:tool {name: "lookup"}) {input: t.input, output: null, error: "upstream did not respond"},
+    =|:exclusive|=>[
+        -|:next {when: !t.local.down}|->(found:tool {name: "lookup"}) {input: t.input, output: {found: true}},
+        -|:next {when: t.local.down}|->(failed:tool {name: "lookup"}) {input: t.input, output: null, error: "upstream did not respond"},
     ];
 "#;
     let model = lower(source).unwrap();
@@ -3147,15 +3147,15 @@ fn a_step_that_returns_nothing_has_no_result_type() {
 #[test]
 fn durations_that_meet_are_named_for_their_steps() {
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {known: a.input == "hi"}};
-(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(a)-|:next|->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {known: a.input == "hi"}};
+(t)-|:calls|->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
 (plan)
-    =[:exclusive]=>[
-        -[:next {when: !t.local.known}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello", duration: range(0.5, 0.6)},
-        -[:next {when: t.local.known}]->(screen:task {name: "screen"}) {input: t.input, output: assess.output},
+    =|:exclusive|=>[
+        -|:next {when: !t.local.known}|->(greet:tool {name: "greet"}) {input: t.input, output: "hello", duration: range(0.5, 0.6)},
+        -|:next {when: t.local.known}|->(screen:task {name: "screen"}) {input: t.input, output: assess.output},
     ];
-(screen)-[:calls]->(history:tool {name: "history"}) {input: t.input, output: {prior: 0}, duration: range(0.1, 0.2)}
-    -[:next]->(assess:tool {name: "assess"}) {input: history.output, output: "low", duration: range(0.3, 0.4)};
+(screen)-|:calls|->(history:tool {name: "history"}) {input: t.input, output: {prior: 0}, duration: range(0.1, 0.2)}
+    -|:next|->(assess:tool {name: "assess"}) {input: history.output, output: "low", duration: range(0.3, 0.4)};
 "#;
     let model = lower(source).unwrap();
     for (lang, both, alone) in [
@@ -3199,15 +3199,15 @@ fn a_draw_that_cannot_fail_is_a_plain_value() {
     // text around a draw and a draw held within bounds are computed where they are declared,
     // so the steps that read them take a string and a number
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {known: a.input == "hi", call_id: format("call_{}", alphanum(24))}};
-(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: {id: t.local.call_id}};
+(a)-|:next|->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {known: a.input == "hi", call_id: format("call_{}", alphanum(24))}};
+(t)-|:calls|->(plan:llm {name: "plan"}) {input: t.input, output: {id: t.local.call_id}};
 (plan)
-    =[:exclusive]=>[
-        -[:next {when: !t.local.known}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
-        -[:next {when: t.local.known}]->(screen:task {name: "screen"}) {input: {id: t.local.call_id}, output: assess.output},
+    =|:exclusive|=>[
+        -|:next {when: !t.local.known}|->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
+        -|:next {when: t.local.known}|->(screen:task {name: "screen"}) {input: {id: t.local.call_id}, output: assess.output},
     ];
-(screen)-[:calls]->(history:tool {name: "history"}) {input: t.input, output: {prior: 0}, duration: range(0.1, 0.2)}
-    -[:next]->(assess:llm {name: "assess"}) {input: history.output, output: "low", duration: clamp(lognormal(0.6, 0.3), 0.3, 2.5)};
+(screen)-|:calls|->(history:tool {name: "history"}) {input: t.input, output: {prior: 0}, duration: range(0.1, 0.2)}
+    -|:next|->(assess:llm {name: "assess"}) {input: history.output, output: "low", duration: clamp(lognormal(0.6, 0.3), 0.3, 2.5)};
 "#;
     let model = lower(source).unwrap();
     for (lang, typed) in [
@@ -3235,31 +3235,31 @@ fn a_step_reads_the_steps_inside_an_earlier_turn() {
     // each turn after the first reads the reply of the turn before it, which sits inside that turn,
     // and the last step reads a reply that is only there on one branch
     let source = r#"(desk:agent) {input: "hi", output: conv.output};
-(desk)-[:next]->(conv:task {name: "conversation"}) {
+(desk)-|:next|->(conv:task {name: "conversation"}) {
     input: desk.input,
     output: "done",
-    local: {kind: weighted([|"a", 1|], [|"b", 1|])},
+    local: {kind: weighted(["a", 1], ["b", 1])},
 };
 (conv)
-    =[:exclusive]=>[
-        -[:calls {when: conv.local.kind == "a"}]->(a1:task {name: "turn"}) {input: "first a", output: a1_reply.output},
-        -[:calls {when: conv.local.kind == "b"}]->(b1:task {name: "turn"}) {input: "first b", output: "ok"},
+    =|:exclusive|=>[
+        -|:calls {when: conv.local.kind == "a"}|->(a1:task {name: "turn"}) {input: "first a", output: a1_reply.output},
+        -|:calls {when: conv.local.kind == "b"}|->(b1:task {name: "turn"}) {input: "first b", output: "ok"},
     ];
-(a1)-[:calls]->(a1_reply:llm {name: "chat"}) {
-        input: [|{role: "user", content: a1.input}|],
+(a1)-|:calls|->(a1_reply:llm {name: "chat"}) {
+        input: [{role: "user", content: a1.input}],
         output: {role: "assistant", content: "reply one"},
     };
-(a1)-[:next]->(a2:task {name: "turn"}) {input: "second a", output: a2_reply.output};
-(a2)-[:calls]->(a2_reply:llm {name: "chat"}) {
-        input: [|...a1_reply.input, a1_reply.output, {role: "user", content: a2.input}|],
+(a1)-|:next|->(a2:task {name: "turn"}) {input: "second a", output: a2_reply.output};
+(a2)-|:calls|->(a2_reply:llm {name: "chat"}) {
+        input: [...a1_reply.input, a1_reply.output, {role: "user", content: a2.input}],
         output: {role: "assistant", content: "reply two"},
     };
-(a2)-[:next]->(a3:task {name: "turn"}) {input: "third a", output: a3_reply.output};
-(a3)-[:calls]->(a3_reply:llm {name: "chat"}) {
-        input: [|...a2_reply.input, a2_reply.output, {role: "user", content: a3.input}|],
+(a2)-|:next|->(a3:task {name: "turn"}) {input: "third a", output: a3_reply.output};
+(a3)-|:calls|->(a3_reply:llm {name: "chat"}) {
+        input: [...a2_reply.input, a2_reply.output, {role: "user", content: a3.input}],
         output: {role: "assistant", content: "reply three"},
     };
-(conv)-[:calls]->(after:task {name: "after"}) {input: a1.input, output: a3_reply.output};
+(conv)-|:calls|->(after:task {name: "after"}) {input: a1.input, output: a3_reply.output};
 "#;
     let model = lower(source).unwrap();
     let second = json!([
@@ -3348,9 +3348,9 @@ fn a_scorer_divides_two_integers_as_the_data_does() {
     // 900 characters over 400 is 2, and a hundred short of a thousand over 30 is 3 short with 10 left over
     let source = r#"
 (checker:agent) {input: "go", output: root.output};
-(checker)-[:next]->(root:task) {input: checker.input, output: "OUTPUT"};
-(root)-[:calls]->(length:scorer) {score: clamp(len(context.output) / 400, 0, 5) / 10.0};
-(root)-[:calls]->(short:scorer) {score: ${${len(context.output) - 1000} / 30 + ${len(context.output) - 1000} % 30} / -100.0};
+(checker)-|:next|->(root:task) {input: checker.input, output: "OUTPUT"};
+(root)-|:calls|->(length:scorer) {score: clamp(len(context.output) / 400, 0, 5) / 10.0};
+(root)-|:calls|->(short:scorer) {score: ${${len(context.output) - 1000} / 30 + ${len(context.output) - 1000} % 30} / -100.0};
 "#
     .replace("OUTPUT", &"x".repeat(900));
     let model = lower(&source).unwrap();
@@ -3486,37 +3486,37 @@ fn run_records(details: &Value) -> Vec<String> {
 #[test]
 fn a_world_is_computed_once_as_typed_values() {
     // a series, a fact, an entity and a persona with a fork, read by the agent's input and by two steps
-    let source = r#"(chat:series {turns: 2, up_to: 4, weights: [|3, 2, 1|]});
+    let source = r#"(chat:series {turns: 2, up_to: 4, weights: [3, 2, 1]});
 (tone:fact {per: chat.number})
-    =[:weighted]=>[
-        -[:next {weight: 2}]->(:given {value: "conversational"}),
-        -[:next {weight: 1}]->(:given {value: "professional"}),
+    =|:weighted|=>[
+        -|:next {weight: 2}|->(:given {value: "conversational"}),
+        -|:next {weight: 1}|->(:given {value: "professional"}),
     ];
 (person:entity {per: chat.number})
-    =[:weighted]=>[
-        -[:next {weight: 1}]->(:given {value: {name: "Renee Castillo", customer_id: "cus_48121"}}),
-        -[:next {weight: 1}]->(:given {value: {name: "Owen Brandt", customer_id: "cus_50977"}}),
+    =|:weighted|=>[
+        -|:next {weight: 1}|->(:given {value: {name: "Renee Castillo", customer_id: "cus_48121"}}),
+        -|:next {weight: 1}|->(:given {value: {name: "Owen Brandt", customer_id: "cus_50977"}}),
     ];
 (customer:persona {style: tone.value, per: chat.number})
-    -[:next]->(:sentence)
-        -[:next]->(:part {subject: "I", person: "first"})
-        =[:weighted]=>[
-            -[:next {weight: 2}]->(:part {verb: "need", complement: "to file a claim"}),
-            -[:next {weight: 1}]->(:part {verb: "want", complement: "to open a claim"}),
+    -|:next|->(:sentence)
+        -|:next|->(:part {subject: "I", person: "first"})
+        =|:weighted|=>[
+            -|:next {weight: 2}|->(:part {verb: "need", complement: "to file a claim"}),
+            -|:next {weight: 1}|->(:part {verb: "want", complement: "to open a claim"}),
         ]
-    -[:next]->(:sentence) {defaults: {form: "question"}}
-        -[:next]->(:part {subject: "my deductible", verb: "apply", complement: "to this claim"})
-    -[:next]->(:sentence) {defaults: {form: "question"}}
-        -[:next]->(:part {subject: "I", person: "first", modal: "can", verb: "upload", complement: "the photos"})
-    -[:next]->(:sentence)
-        -[:next]->(:part {subject: "that", verb: "help", complement: "a lot"});
+    -|:next|->(:sentence) {defaults: {form: "question"}}
+        -|:next|->(:part {subject: "my deductible", verb: "apply", complement: "to this claim"})
+    -|:next|->(:sentence) {defaults: {form: "question"}}
+        -|:next|->(:part {subject: "I", person: "first", modal: "can", verb: "upload", complement: "the photos"})
+    -|:next|->(:sentence)
+        -|:next|->(:part {subject: "that", verb: "help", complement: "a lot"});
 (desk:agent) {input: {message: customer.said[chat.turn], customer_id: person.attributes.customer_id}, output: t.output};
-(desk)-[:next]->(t:task {name: "turn"}) {
+(desk)-|:next|->(t:task {name: "turn"}) {
     input: desk.input,
     output: {id: chat.id, turn: chat.turn, tone: tone.value, name: person.attributes.name, reply: reply.output},
 };
-(t)-[:calls]->(lookup:tool {name: "lookup"}) {input: {customer_id: person.attributes.customer_id}, output: {holder: person.attributes.name, tone: tone.value}}
-    -[:next]->(reply:llm {name: "reply"}) {input: conversation({user: customer.said, turn: chat.turn}), output: format("Thanks {}", person.attributes.name)};
+(t)-|:calls|->(lookup:tool {name: "lookup"}) {input: {customer_id: person.attributes.customer_id}, output: {holder: person.attributes.name, tone: tone.value}}
+    -|:next|->(reply:llm {name: "reply"}) {input: conversation({user: customer.said, turn: chat.turn}), output: format("Thanks {}", person.attributes.name)};
 "#;
     let model = lower(source).unwrap();
     for (lang, typed) in [
@@ -3603,16 +3603,16 @@ fn a_value_that_can_fail_is_computed_on_the_branch_that_reads_it() {
     // the history asks for a turn nobody wrote, so computing it raises, and only the step that
     // does not run for this input reads it
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {
+(a)-|:next|->(t:task {name: "turn"}) {
     input: a.input,
     output: "ok",
-    local: {known: a.input == "hi", history: conversation({user: [|"one"|], turn: 3})},
+    local: {known: a.input == "hi", history: conversation({user: ["one"], turn: 3})},
 };
-(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(t)-|:calls|->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
 (plan)
-    =[:exclusive]=>[
-        -[:next {when: t.local.known}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
-        -[:next {when: !t.local.known}]->(recall:tool {name: "recall"}) {input: t.local.history, output: "none"},
+    =|:exclusive|=>[
+        -|:next {when: t.local.known}|->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
+        -|:next {when: !t.local.known}|->(recall:tool {name: "recall"}) {input: t.local.history, output: "none"},
     ];
 "#;
     let model = lower(source).unwrap();
@@ -3677,24 +3677,24 @@ fn a_value_that_can_fail_is_computed_on_the_branch_that_reads_it() {
 fn values_are_named_for_what_owns_them() {
     // two steps keep a value under one name that no local may take, and a walk has two sentences without names
     let source = r#"(customer:persona {style: "text_message"})
-    -[:next]->(:sentence)
-        -[:next]->(:part {subject: "I", person: "first", verb: "need", complement: "to file a claim"})
-    -[:next]->(:sentence)
-        -[:next]->(:part {subject: "that", verb: "help", complement: "a lot"});
+    -|:next|->(:sentence)
+        -|:next|->(:part {subject: "I", person: "first", verb: "need", complement: "to file a claim"})
+    -|:next|->(:sentence)
+        -|:next|->(:part {subject: "that", verb: "help", complement: "a lot"});
 (a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: customer.said};
-(t)-[:calls]->(first:llm {name: "plan"}) {
+(a)-|:next|->(t:task {name: "turn"}) {input: a.input, output: customer.said};
+(t)-|:calls|->(first:llm {name: "plan"}) {
     local: {arguments: {customer_id: t.input}},
     input: t.input,
     output: {name: "lookup", arguments: self.local.arguments},
 }
-    -[:next]->(lookup:tool {name: "lookup"}) {input: first.local.arguments, output: "found"}
-    -[:next]->(second:llm {name: "plan"}) {
+    -|:next|->(lookup:tool {name: "lookup"}) {input: first.local.arguments, output: "found"}
+    -|:next|->(second:llm {name: "plan"}) {
         local: {arguments: {claim_id: lookup.output}},
         input: lookup.output,
         output: {name: "update", arguments: self.local.arguments},
     }
-    -[:next]->(update:tool {name: "update"}) {input: second.local.arguments, output: "done"};
+    -|:next|->(update:tool {name: "update"}) {input: second.local.arguments, output: "done"};
 "#;
     let model = lower(source).unwrap();
     for (lang, owned) in [
@@ -3745,22 +3745,22 @@ fn a_value_that_can_fail_on_two_branches_is_computed_on_each() {
     // two steps that never run together read a history that raises, a ticket that is drawn,
     // and a note that both draws and may raise for what the agent is given
     let source = r#"(a:agent) {input: "hi", output: t.output};
-(a)-[:next]->(t:task {name: "turn"}) {
+(a)-|:next|->(t:task {name: "turn"}) {
     input: a.input,
     output: "ok",
     local: {
-        history: conversation({user: [|"one"|], turn: 3}),
+        history: conversation({user: ["one"], turn: 3}),
         ticket: format("T-{}", range(100, 999)),
-        note: paragraph([|format("N-{}", range(100, 999)), a.input|]),
+        note: paragraph([format("N-{}", range(100, 999)), a.input]),
     },
 };
-(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(t)-|:calls|->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
 (plan)
-    =[:exclusive]=>[
-        -[:next {when: t.input == "hi"}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
-        -[:next {when: t.input == "a"}]->(recall:tool {name: "recall"}) {input: {history: t.local.history, ticket: t.local.ticket}, output: "none"},
-        -[:next {when: t.input == "b"}]->(review:tool {name: "review"}) {input: {note: t.local.note, ticket: t.local.ticket}, output: "some"},
-        -[:next {when: t.input == "c"}]->(revise:tool {name: "revise"}) {input: {note: t.local.note, ticket: t.local.ticket}, output: "more"},
+    =|:exclusive|=>[
+        -|:next {when: t.input == "hi"}|->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
+        -|:next {when: t.input == "a"}|->(recall:tool {name: "recall"}) {input: {history: t.local.history, ticket: t.local.ticket}, output: "none"},
+        -|:next {when: t.input == "b"}|->(review:tool {name: "review"}) {input: {note: t.local.note, ticket: t.local.ticket}, output: "some"},
+        -|:next {when: t.input == "c"}|->(revise:tool {name: "revise"}) {input: {note: t.local.note, ticket: t.local.ticket}, output: "more"},
     ];
 "#;
     let model = lower(source).unwrap();

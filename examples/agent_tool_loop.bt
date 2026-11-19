@@ -1,14 +1,14 @@
 # each round retains earlier assistant messages and chooses one diagnostic tool
 (ops:agent) {input: "Why is checkout-api throwing 502s?", output: closing.output.content};
-(ops)-[:next]->(request:task {name: "ops-agent"}) {
+(ops)-|:next|->(request:task {name: "ops-agent"}) {
     input: ops.input,
     output: closing.output.content,
     metadata: {run_id: uuid()},
-    tags: [|"agent", "ops"|],
+    tags: ["agent", "ops"],
 };
 (request)
-    =[:repeat {count: weighted([|1, 5|], [|2, 3|], [|3, 1.5|], [|4, 0.5|])}]=>[
-        -[rounds:calls]->(inspect:llm {name: "anthropic.messages.create"}) {
+    =|:repeat {count: weighted([1, 5], [2, 3], [3, 1.5], [4, 0.5])}|=>[
+        -|rounds:calls|->(inspect:llm {name: "anthropic.messages.create"}) {
             local: {route: range(0, 1)},
             input: {
                 system: "You are an ops agent. Inspect the cluster with tools before answering.",
@@ -22,22 +22,22 @@
         },
     ]
         ->(inspect)
-            =[:exclusive]=>[
-                -[:next {when: inspect.local.route == 0}]->(pods:tool {name: "get_pod_status"}) {
+            =|:exclusive|=>[
+                -|:next {when: inspect.local.route == 0}|->(pods:tool {name: "get_pod_status"}) {
                     input: {namespace: "prod", selector: "app=checkout-api"},
                     output: {ready: choice("1/3", "2/3", "3/3"), restarts: poisson(2)},
                 },
-                -[:next {when: inspect.local.route == 1}]->(logs:tool {name: "get_recent_logs"}) {
+                -|:next {when: inspect.local.route == 1}|->(logs:tool {name: "get_recent_logs"}) {
                     input: {service: "checkout-api", lines: 200},
                     output: {error_count: poisson(6), sample: "upstream connect error or disconnect before headers"},
                 },
             ]
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [rounds]]>>(closing:llm {name: "anthropic.messages.create"}) {
-            input: [|
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |rounds||>>(closing:llm {name: "anthropic.messages.create"}) {
+            input: [
                 {role: "system", content: "Summarize the investigation and the next action."},
                 {role: "user", content: request.input},
                 ...context.accumulator,
-            |],
+            ],
             output: {role: "assistant", content: "checkout-api is crash-looping. Review the recent configuration change and roll it back if it caused the failures."},
             metadata: {model: "claude-sonnet-4-5", provider: "anthropic", max_tokens: 1024},
         };

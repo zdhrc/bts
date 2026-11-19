@@ -661,15 +661,15 @@ mod tests {
 
     const SOURCE: &str = r#"(old_root:task {name: "old"}) {input: old.input, output: "wrong"};
 (old:agent) {input: "fallback", output: old_root.output};
-(old)-[:next]->(old_root);
+(old)-|:next|->(old_root);
 (new_root:task {name: "new"}) {input: new.input, output: new_root.input};
 (new:agent) {input: "fallback", output: new_root.output};
-(new)-[:next]->(new_root);
+(new)-|:next|->(new_root);
 (dataset_cases_local:case {name: "local"}) {input: "local value"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_local)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_local)]};
 ("quality":scorer) {score: context.input == context.output ? 1 : 0};
-(experiment_fixed:experiment {name: "fixed"}) {dataset: (dataset_cases), task: (new_root), scorers: [|("quality")|], baseline: (experiment_baseline)};
-(experiment_baseline:experiment {name: "baseline"}) {dataset: (dataset_cases), task: (old_root), scorers: [|("quality")|]};"#;
+(experiment_fixed:experiment {name: "fixed"}) {dataset: (dataset_cases), task: (new_root), scorers: [("quality")], baseline: (experiment_baseline)};
+(experiment_baseline:experiment {name: "baseline"}) {dataset: (dataset_cases), task: (old_root), scorers: [("quality")]};"#;
 
     fn body(request: &str) -> Value {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
@@ -843,13 +843,13 @@ mod tests {
         // the task samples and reads its place in the run, so a row drawn or placed differently would show
         let source = r#"(root:task {name: "answer"}) {input: answer.input, output: {code: hex(8), place: context.trace_index, said: root.input}};
 (answer:agent) {input: "fallback", output: root.output};
-(answer)-[:next]->(root);
+(answer)-|:next|->(root);
 (first:case {name: "first"}) {input: hex(6)};
 (second:case {name: "second"}) {input: hex(6)};
 (third:case {name: "third"}) {input: hex(6)};
-(cases:dataset {name: "cases"}) {cases: [|(first), (second), (third)|]};
+(cases:dataset {name: "cases"}) {cases: [(first), (second), (third)]};
 ("quality":scorer) {score: 1};
-(run:experiment {name: "run"}) {dataset: (cases), task: (root), scorers: [|("quality")|]};"#;
+(run:experiment {name: "run"}) {dataset: (cases), task: (root), scorers: [("quality")]};"#;
         let model = crate::providers::braintrust::mocking::compile(source).unwrap();
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7200);
         let path = Path::new("shape.bt");

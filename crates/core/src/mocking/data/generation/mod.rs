@@ -297,9 +297,9 @@ mod snapshot_tests {
         let model = compile(
             r#"(sample_root:task {name: "sample"}) {input: sample.input, output: self.input.first + self.input.second};
 (sample:agent) {input: {first: range (1 , 1000000000), second: range (1 , 1000000000)}, output: sample_root.output};
-(sample)-[:next]->(sample_root);
-(dataset_cases_inline:case {name: "inline"}) {input: (sample_root).input, expected: (sample_root).output, metadata: {first: (sample_root).input.first}, tags: [|"sample-${(sample_root).input.second}"|]};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_inline)|]};"#,
+(sample)-|:next|->(sample_root);
+(dataset_cases_inline:case {name: "inline"}) {input: (sample_root).input, expected: (sample_root).output, metadata: {first: (sample_root).input.first}, tags: ["sample-${(sample_root).input.second}"]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_inline)]};"#,
         )
         .unwrap();
         let row = snapshot(&model, 0, 42);
@@ -319,17 +319,17 @@ mod snapshot_tests {
 (answer:task {name: "answer"}) {input: support_root.input.request};
 (reply:tool {name: "reply"}) {input: {query: answer.input}, output: {answer: "answer", request: self.input.query}};
 (support:agent) {input: {request: "question"}, output: support_root.output};
-(support)-[:next]->(support_root)-[:calls]->(answer)-[:calls]->(reply);
+(support)-|:next|->(support_root)-|:calls|->(answer)-|:calls|->(reply);
 (deferred_root:task {name: "deferred"}) {input: deferred.input, output: 1 / range (0 , 0)};
 (deferred:agent) {input: "question", output: deferred_root.output};
-(deferred)-[:next]->(deferred_root);
+(deferred)-|:next|->(deferred_root);
 (dataset_cases_trace:case {name: "trace"}) {source: (support_root)};
 (dataset_cases_span:case {name: "span"}) {source: (reply)};
 (dataset_cases_trace_override:case {name: "trace-override"}) {source: (support_root), expected: "reviewed trace"};
 (dataset_cases_span_override:case {name: "span-override"}) {source: (reply), expected: null};
 (dataset_cases_unused_output:case {name: "unused-output"}) {source: (deferred_root), expected: "reviewed"};
 (dataset_cases_invalid_default:case {name: "invalid-default"}) {source: (deferred_root)};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_trace), (dataset_cases_span), (dataset_cases_trace_override), (dataset_cases_span_override), (dataset_cases_unused_output), (dataset_cases_invalid_default)|]};"#,
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_trace), (dataset_cases_span), (dataset_cases_trace_override), (dataset_cases_span_override), (dataset_cases_unused_output), (dataset_cases_invalid_default)]};"#,
         )
         .unwrap();
         let expected = json!({"answer": "answer", "request": "question"});
@@ -356,13 +356,13 @@ mod snapshot_tests {
         let model = compile(
             r#"(first_root:task {name: "first"}) {input: first.input, output: self.input.number * 2};
 (first:agent) {input: {label: "first", number: range (1 , 1000000)}, output: first_root.output};
-(first)-[:next]->(first_root);
+(first)-|:next|->(first_root);
 (second_root:task {name: "second"}) {input: second.input, output: self.input.number * 2};
 (second:agent) {input: {label: "second", number: range (1 , 1000000)}, output: second_root.output};
-(second)-[:next]->(second_root);
-(dataset_cases_group:case {name: "group"}) {traces: [|(second_root) , (first_root) , (second_root)|]};
-(dataset_cases_override:case {name: "override"}) {traces: [|(second_root) , (first_root)|], expected: "reviewed group"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_group), (dataset_cases_override)|]};"#,
+(second)-|:next|->(second_root);
+(dataset_cases_group:case {name: "group"}) {traces: [(second_root) , (first_root) , (second_root)]};
+(dataset_cases_override:case {name: "override"}) {traces: [(second_root) , (first_root)], expected: "reviewed group"};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_group), (dataset_cases_override)]};"#,
         )
         .unwrap();
         let row = snapshot(&model, 0, 17);
@@ -389,15 +389,15 @@ mod snapshot_tests {
             r#"(empty_root:task {name: "empty"}) {input: empty.input};
 (empty_1:task {name: "empty"}) {};
 (empty:agent) {input: null, output: null};
-(empty)-[:next]->(empty_root)-[:calls]->(empty_1);
+(empty)-|:next|->(empty_root)-|:calls|->(empty_1);
 (answer_root:task {name: "answer"}) {output: "answer", input: answer.input};
 (answer:agent) {input: null, output: answer_root.output};
-(answer)-[:next]->(answer_root);
+(answer)-|:next|->(answer_root);
 (dataset_cases_trace:case {name: "trace"}) {source: (empty_root)};
 (dataset_cases_span:case {name: "span"}) {source: (empty_1)};
 (dataset_cases_answer:case {name: "answer"}) {source: (answer_root)};
-(dataset_cases_group:case {name: "group"}) {traces: [|(empty_root) , (answer_root)|]};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_trace), (dataset_cases_span), (dataset_cases_answer), (dataset_cases_group)|]};"#,
+(dataset_cases_group:case {name: "group"}) {traces: [(empty_root) , (answer_root)]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_trace), (dataset_cases_span), (dataset_cases_answer), (dataset_cases_group)]};"#,
         )
         .unwrap();
         assert_eq!(snapshot(&model, 0, 42), json!({"input": null}));
@@ -414,11 +414,11 @@ mod snapshot_tests {
         let model = compile(
             r#"(document_root:task {name: "document"}) {input: document.input};
 (document:agent) {input: attachment ("report.txt" , "text/plain"), output: null};
-(document)-[:next]->(document_root);
-(dataset_cases_inline:case {name: "inline"}) {input: {files: [|attachment ("report.txt" , "text/plain")|]}};
+(document)-|:next|->(document_root);
+(dataset_cases_inline:case {name: "inline"}) {input: {files: [attachment ("report.txt" , "text/plain")]}};
 (dataset_cases_trace:case {name: "trace"}) {source: (document_root)};
 (dataset_cases_projected:case {name: "projected"}) {input: (document_root).input.filename};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_inline), (dataset_cases_trace), (dataset_cases_projected)|]};"#,
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_inline), (dataset_cases_trace), (dataset_cases_projected)]};"#,
         )
         .unwrap();
         let inline = case_snapshot(&model, &model.datasets[0].cases[0], 42).unwrap();
@@ -445,16 +445,16 @@ mod experiment_tests {
     #[test]
     fn materializes_fields_from_a_resolved_case_source() {
         let model = crate::providers::braintrust::mocking::compile(
-            r#"+(support_task:node) {source: {type: "any"}}-[:extends]->(task);
+            r#"+(support_task:node) {source: {type: "any"}}-|:extends|->(task);
 (support_root:support_task {name: "support"}) {input: support.input, source: (support_root)};
 (lookup:task {name: "lookup"}) {output: "answer"};
 (support:agent) {input: "question", output: null};
-(support)-[:next]->(support_root)-[:calls]->(lookup);
+(support)-|:next|->(support_root)-|:calls|->(lookup);
 (dataset_cases_whole:case {name: "whole"}) {source: support_root.source};
 (dataset_cases_span:case {name: "span"}) {source: (lookup)};
 (dataset_cases_fields:case {name: "fields"}) {input: support_root.source.input, expected: lookup.output};
-(dataset_cases_group:case {name: "group"}) {traces: [|support_root.source , (support_root)|]};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_whole), (dataset_cases_span), (dataset_cases_fields), (dataset_cases_group)|]};"#,
+(dataset_cases_group:case {name: "group"}) {traces: [support_root.source , (support_root)]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_whole), (dataset_cases_span), (dataset_cases_fields), (dataset_cases_group)]};"#,
         )
         .unwrap();
         let batch = case_data(&model, &model.datasets[0].cases[2], 3, &()).unwrap();
@@ -469,19 +469,19 @@ mod experiment_tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"
 (workflow:agent) {input: "outer", output: null};
-(workflow)-[:next]->(root:task) {input: workflow.input};
-(root)=[:repeat {count: range(-2, -1)}]=>[-[:calls]->(unused:tool) {output: "unused"}];
-(root)-[:calls]->(selected:task {name: "answer"}) {
+(workflow)-|:next|->(root:task) {input: workflow.input};
+(root)=|:repeat {count: range(-2, -1)}|=>[-|:calls|->(unused:tool) {output: "unused"}];
+(root)-|:calls|->(selected:task {name: "answer"}) {
  input: "fallback", output: self.input == "use" ? details.output : "no dependency"
-}-[:calls]->(first:llm) {output: second.output}-[:next]->(second:llm) {output: "reply"};
+}-|:calls|->(first:llm) {output: second.output}-|:next|->(second:llm) {output: "reply"};
 (context_agent:agent) {input: null, output: null};
-(context_agent)-[:next]->(details:task) {input: context_agent.input, output: "support context"};
-(details)=[:repeat {count: range(-2, -1)}]=>[-[:calls]->(context_unused:tool) {output: "unused"}];
+(context_agent)-|:next|->(details:task) {input: context_agent.input, output: "support context"};
+(details)=|:repeat {count: range(-2, -1)}|=>[-|:calls|->(context_unused:tool) {output: "unused"}];
 
 (one:case) {input: "question"};
-(cases:dataset) {cases: [|(one)|]};
+(cases:dataset) {cases: [(one)]};
 (s:scorer) {score: 1};
-(e:experiment) {dataset: (cases), task: (selected), scorers: [|(s)|]};
+(e:experiment) {dataset: (cases), task: (selected), scorers: [(s)]};
 "#,
         )
         .unwrap();
@@ -509,14 +509,14 @@ mod experiment_tests {
     fn selected_trace_skips_unrelated_errors_but_reports_used_dependency_errors() {
         let source = r#"
 (good:agent) {input: "fallback", output: selected.output};
-(good)-[:next]->(selected:task) {input: good.input, output: "ok"};
+(good)-|:next|->(selected:task) {input: good.input, output: "ok"};
 (bad:agent) {input: null, output: bad_root.output};
-(bad)-[:next]->(bad_root:task) {input: bad.input, output: 1 / range(0, 0)};
+(bad)-|:next|->(bad_root:task) {input: bad.input, output: 1 / range(0, 0)};
 
 (one:case) {input: "question"};
-(cases:dataset) {cases: [|(one)|]};
+(cases:dataset) {cases: [(one)]};
 (s:scorer) {score: 1};
-(e:experiment) {dataset: (cases), task: (selected), scorers: [|(s)|]};
+(e:experiment) {dataset: (cases), task: (selected), scorers: [(s)]};
 "#;
         let model = crate::providers::braintrust::mocking::compile(source).unwrap();
         assert!(
@@ -551,14 +551,14 @@ mod experiment_tests {
     fn a_task_longer_than_a_second_is_an_experiment_result_that_ends_now() {
         let source = r#"
 (slow:agent) {input: "fallback", output: answer.output};
-(slow)-[:next]->(answer:task) {input: slow.input, output: "ok", duration: 0.2}
-    -[:calls]->(first:tool {name: "first"}) {output: 1, duration: 1.5}
-        -[:next]->(second:tool {name: "second"}) {output: 2, duration: 1.5};
+(slow)-|:next|->(answer:task) {input: slow.input, output: "ok", duration: 0.2}
+    -|:calls|->(first:tool {name: "first"}) {output: 1, duration: 1.5}
+        -|:next|->(second:tool {name: "second"}) {output: 2, duration: 1.5};
 
 (one:case) {input: "question"};
-(cases:dataset) {cases: [|(one)|]};
+(cases:dataset) {cases: [(one)]};
 (s:scorer) {score: 1};
-(e:experiment) {dataset: (cases), task: (answer), scorers: [|(s)|]};
+(e:experiment) {dataset: (cases), task: (answer), scorers: [(s)]};
 "#;
         let model = crate::providers::braintrust::mocking::compile(source).unwrap();
         let now = SystemTime::now();
@@ -581,19 +581,19 @@ mod experiment_tests {
     #[test]
     fn dataset_fields_drive_selected_subtree_and_preserve_original_scopes() {
         let model = crate::providers::braintrust::mocking::compile(
-            r#"+(text_task:node) {input: {type: "string"}}-[:extends]->(task);
-+(text_tool:node) {output: {type: "string"}}-[:extends]->(tool);
+            r#"+(text_task:node) {input: {type: "string"}}-|:extends|->(task);
++(text_tool:node) {output: {type: "string"}}-|:extends|->(tool);
 (workflow_root:task {name: "workflow"}) {input: workflow.input, local: {context: "root variable"}};
 (context_node:text_tool {name: "context"}) {output: workflow_root.local.context};
 (answer:text_task {name: "answer"}) {input: "task fallback", expected: "task expectation", metadata: {tier: "free", channel: "chat"}, output: "${self.input}/${trim(self.expected)}/${trim(self.metadata.tier)}/${context_node.output}"};
 (reply:llm {name: "reply"}) {input: answer.input, output: answer.output};
 (quality:scorer {name: "quality"}) {score: 0};
 (workflow:agent) {input: "outer fallback", output: null};
-(workflow)-[:next]->(workflow_root)-[:calls]->(context_node)-[:next]->(answer)-[:calls]->(reply)-[:next]->(quality);
+(workflow)-|:next|->(workflow_root)-|:calls|->(context_node)-|:next|->(answer)-|:calls|->(reply)-|:next|->(quality);
 (dataset_cases_one:case {name: "one"}) {input: "dataset input"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_one)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
 (quality_function:scorer {name: "quality"}) {score: 1};
-(experiment_e:experiment {name: "e"}) {dataset: (dataset_cases), task: (answer), scorers: [|(quality_function)|]};"#,
+(experiment_e:experiment {name: "e"}) {dataset: (dataset_cases), task: (answer), scorers: [(quality_function)]};"#,
         )
         .unwrap();
         let row = json!({"input":"dataset input", "expected":"dataset expectation", "metadata":{"tier":"enterprise"}, "tags":["regression"]});
@@ -619,13 +619,13 @@ mod experiment_tests {
         let model = crate::providers::braintrust::mocking::compile(
             r#"
 (t:agent) {input: "fallback", output: selected.output};
-(t)-[:next]->(selected:task) {input: t.input, output: self.input};
-(selected)=[:repeat {count: 2}]=>[-[:calls]->(lookup:tool) {input: selected.input, output: context.index}];
+(t)-|:next|->(selected:task) {input: t.input, output: self.input};
+(selected)=|:repeat {count: 2}|=>[-|:calls|->(lookup:tool) {input: selected.input, output: context.index}];
 
 (one:case) {input: "question"};
-(cases:dataset) {cases: [|(one)|]};
+(cases:dataset) {cases: [(one)]};
 (s:scorer) {score: 1};
-(e:experiment) {dataset: (cases), task: (selected), scorers: [|(s)|]};
+(e:experiment) {dataset: (cases), task: (selected), scorers: [(s)]};
 "#,
         )
         .unwrap();

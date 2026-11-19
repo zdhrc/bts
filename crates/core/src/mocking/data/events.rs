@@ -247,8 +247,8 @@ mod tests {
 
         let model = compile(
             r#"(example_root:task {name: "example"}) {input: example.input, output: self.input ["files"][0], metadata: {copied: self.output}};
-(example:agent) {input: {files: [|attachment("report.txt", "text/plain")|]}, output: example_root.output};
-(example)-[:next]->(example_root);"#,
+(example:agent) {input: {files: [attachment("report.txt", "text/plain")]}, output: example_root.output};
+(example)-|:next|->(example_root);"#,
         )
         .unwrap();
         let mut batch = generate(

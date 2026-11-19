@@ -1,147 +1,147 @@
 ("password-reset-assistant_agent":agent {name: "password-reset-assistant"}) {input: {email: "sam@example.com", message: "Please help me reset my password."}, output: ("password-reset-assistant").output};
-("password-reset-assistant_agent")-[:next]->("password-reset-assistant");
+("password-reset-assistant_agent")-|:next|->("password-reset-assistant");
 ("password-reset-assistant":task) {
     input: ("password-reset-assistant_agent").input,
     output: ("password-reset-assistant").local.route == 0 ? ("delivered-reset").output : ("password-reset-assistant").local.route == 1 ? ("delivery-failed-reset").output : ("blocked-reset").output,
-    metadata: {required_steps: ("password-reset-assistant").local.route == 2 ?[|"lookup_account"|] :[|"lookup_account", "issue_reset_link", "send_reset_email"|]},
-    tags: [|"support", "password-reset"|],
+    metadata: {required_steps: ("password-reset-assistant").local.route == 2 ?["lookup_account"] :["lookup_account", "issue_reset_link", "send_reset_email"]},
+    tags: ["support", "password-reset"],
     local: {route: range(0, 2)}
 };
-("password-reset-assistant") =[:exclusive]=>[-[:calls {when: source.local.route == 0}]->("delivered-reset"), -[:calls {when: source.local.route == 1}]->("delivery-failed-reset"), -[:calls {when: source.local.route == 2}]->("blocked-reset")];
+("password-reset-assistant") =|:exclusive|=>[-|:calls {when: source.local.route == 0}|->("delivered-reset"), -|:calls {when: source.local.route == 1}|->("delivery-failed-reset"), -|:calls {when: source.local.route == 2}|->("blocked-reset")];
 ("delivered-reset":task) {
     input: ("password-reset-assistant").input,
-    output: {status: "sent", reply: ("draft-reset-reply").output.content, actions: [|{step: "lookup_account", status: ("verify-reset-request").output.lookup.status}, {step: "issue_reset_link", status: ("execute-reset").output.link.status}, {step: "send_reset_email", status: ("execute-reset").output.delivery.status},|]}
+    output: {status: "sent", reply: ("draft-reset-reply").output.content, actions: [{step: "lookup_account", status: ("verify-reset-request").output.lookup.status}, {step: "issue_reset_link", status: ("execute-reset").output.link.status}, {step: "send_reset_email", status: ("execute-reset").output.delivery.status},]}
 };
-("delivered-reset")-[:calls]->("verify-reset-request");
+("delivered-reset")-|:calls|->("verify-reset-request");
 ("verify-reset-request":task) {
     input: {email: ("password-reset-assistant").input.email},
     output: {lookup: ("lookup-account").output, decision: "approved", reason: "verified email and unlocked account"}
 };
-("verify-reset-request")-[:calls]->("lookup-account");
+("verify-reset-request")-|:calls|->("lookup-account");
 ("lookup-account":tool) {
     input: {email: ("password-reset-assistant").input.email},
     output: {status: "found", email: ("password-reset-assistant").input.email, account_id: "acct_2048", email_verified: true, locked: false}
 };
-("delivered-reset")-[:calls]->("execute-reset");
+("delivered-reset")-|:calls|->("execute-reset");
 ("execute-reset":task) {
     input: {account_id: ("verify-reset-request").output.lookup.account_id},
     output: {link: ("issue-reset-link").output, delivery: ("send-reset-email").output}
 };
-("execute-reset")-[:calls]->("issue-reset-link");
+("execute-reset")-|:calls|->("issue-reset-link");
 ("issue-reset-link":tool) {
     input: {account_id: ("verify-reset-request").output.lookup.account_id},
     output: {status: "issued", expires_in_minutes: 30}
 };
-("execute-reset")-[:calls]->("send-reset-email");
+("execute-reset")-|:calls|->("send-reset-email");
 ("send-reset-email":tool) {
     input: {email: ("password-reset-assistant").input.email, link_status: ("issue-reset-link").output.status},
     output: {status: "sent", provider_message_id: "msg_81"}
 };
-("delivered-reset")-[:calls]->("draft-reset-reply");
+("delivered-reset")-|:calls|->("draft-reset-reply");
 ("draft-reset-reply":llm) {
-    input: [|{role: "user", content: ("password-reset-assistant").input.message}|],
+    input: [{role: "user", content: ("password-reset-assistant").input.message}],
     output: {role: "assistant", content: "I sent a password reset link. Check your email and follow the link within 30 minutes."},
     metadata: {model: "gpt-4o-mini"}
 };
 ("delivery-failed-reset":task) {
     input: ("password-reset-assistant").input,
-    output: {status: "delivery_failed", reply: ("delivery-failed-reset_draft-reset-reply").output.content, actions: [|{step: "lookup_account", status: ("delivery-failed-reset_verify-reset-request").output.lookup.status}, {step: "issue_reset_link", status: ("delivery-failed-reset_execute-reset").output.link.status}, {step: "send_reset_email", status: ("delivery-failed-reset_execute-reset").output.delivery.status},|]}
+    output: {status: "delivery_failed", reply: ("delivery-failed-reset_draft-reset-reply").output.content, actions: [{step: "lookup_account", status: ("delivery-failed-reset_verify-reset-request").output.lookup.status}, {step: "issue_reset_link", status: ("delivery-failed-reset_execute-reset").output.link.status}, {step: "send_reset_email", status: ("delivery-failed-reset_execute-reset").output.delivery.status},]}
 };
-("delivery-failed-reset")-[:calls]->("delivery-failed-reset_verify-reset-request");
+("delivery-failed-reset")-|:calls|->("delivery-failed-reset_verify-reset-request");
 ("delivery-failed-reset_verify-reset-request":task {name: "verify-reset-request"}) {
     input: {email: ("password-reset-assistant").input.email},
     output: {lookup: ("verify-reset-request_lookup-account").output, decision: "approved", reason: "verified email and unlocked account"}
 };
-("delivery-failed-reset_verify-reset-request")-[:calls]->("verify-reset-request_lookup-account");
+("delivery-failed-reset_verify-reset-request")-|:calls|->("verify-reset-request_lookup-account");
 ("verify-reset-request_lookup-account":tool {name: "lookup-account"}) {
     input: {email: ("password-reset-assistant").input.email},
     output: {status: "found", email: ("password-reset-assistant").input.email, account_id: "acct_2048", email_verified: true, locked: false}
 };
-("delivery-failed-reset")-[:calls]->("delivery-failed-reset_execute-reset");
+("delivery-failed-reset")-|:calls|->("delivery-failed-reset_execute-reset");
 ("delivery-failed-reset_execute-reset":task {name: "execute-reset"}) {
     input: {account_id: ("delivery-failed-reset_verify-reset-request").output.lookup.account_id},
     output: {link: ("execute-reset_issue-reset-link").output, delivery: ("execute-reset_send-reset-email").output}
 };
-("delivery-failed-reset_execute-reset")-[:calls]->("execute-reset_issue-reset-link");
+("delivery-failed-reset_execute-reset")-|:calls|->("execute-reset_issue-reset-link");
 ("execute-reset_issue-reset-link":tool {name: "issue-reset-link"}) {
     input: {account_id: ("delivery-failed-reset_verify-reset-request").output.lookup.account_id},
     output: {status: "issued", expires_in_minutes: 30}
 };
-("delivery-failed-reset_execute-reset")-[:calls]->("execute-reset_send-reset-email");
+("delivery-failed-reset_execute-reset")-|:calls|->("execute-reset_send-reset-email");
 ("execute-reset_send-reset-email":tool {name: "send-reset-email"}) {
     input: {email: ("password-reset-assistant").input.email, link_status: ("execute-reset_issue-reset-link").output.status},
     output: {status: "failed", provider_message_id: null},
     error: "Email provider timed out"
 };
-("delivery-failed-reset")-[:calls]->("delivery-failed-reset_draft-reset-reply");
+("delivery-failed-reset")-|:calls|->("delivery-failed-reset_draft-reset-reply");
 ("delivery-failed-reset_draft-reset-reply":llm {name: "draft-reset-reply"}) {
-    input: [|{role: "user", content: ("password-reset-assistant").input.message}|],
+    input: [{role: "user", content: ("password-reset-assistant").input.message}],
     output: {role: "assistant", content: "I sent a password reset link. Check your email and follow the link within 30 minutes."},
     metadata: {model: "gpt-4o-mini"}
 };
 ("blocked-reset":task) {
     input: ("password-reset-assistant").input,
-    output: {status: "blocked", reply: ("blocked-reset_draft-reset-reply").output.content, actions: [|{step: "lookup_account", status: ("blocked-reset_verify-reset-request").output.lookup.status},|]}
+    output: {status: "blocked", reply: ("blocked-reset_draft-reset-reply").output.content, actions: [{step: "lookup_account", status: ("blocked-reset_verify-reset-request").output.lookup.status},]}
 };
-("blocked-reset")-[:calls]->("blocked-reset_verify-reset-request");
+("blocked-reset")-|:calls|->("blocked-reset_verify-reset-request");
 ("blocked-reset_verify-reset-request":task {name: "verify-reset-request"}) {
     input: {email: ("password-reset-assistant").input.email},
     output: {lookup: ("verify-reset-request_lookup-account_").output, decision: "blocked", reason: "account locked"}
 };
-("blocked-reset_verify-reset-request")-[:calls]->("verify-reset-request_lookup-account_");
+("blocked-reset_verify-reset-request")-|:calls|->("verify-reset-request_lookup-account_");
 ("verify-reset-request_lookup-account_":tool {name: "lookup-account"}) {
     input: {email: ("password-reset-assistant").input.email},
     output: {status: "found", email: ("password-reset-assistant").input.email, account_id: "acct_2048", email_verified: true, locked: true}
 };
-("blocked-reset")-[:calls]->("blocked-reset_draft-reset-reply");
+("blocked-reset")-|:calls|->("blocked-reset_draft-reset-reply");
 ("blocked-reset_draft-reset-reply":llm {name: "draft-reset-reply"}) {
-    input: [|{role: "user", content: ("password-reset-assistant").input.message}|],
+    input: [{role: "user", content: ("password-reset-assistant").input.message}],
     output: {role: "assistant", content: "I can't complete this password reset because the account is locked. Please contact support."},
     metadata: {model: "gpt-4o-mini"}
 };
 ("reset-topic-clarity":scorer) {
-    steps: [|{when: contains (lower (context.output.content), "password reset"), score: 1}|],
+    steps: [{when: contains (lower (context.output.content), "password reset"), score: 1}],
     score: 0
 };
 ("no-password-collection":scorer) {
-    steps: [|{when: contains (lower (context.output.content), "send me your password") || contains (lower (context.output.content), "tell me your password"), score: 0}|],
+    steps: [{when: contains (lower (context.output.content), "send me your password") || contains (lower (context.output.content), "tell me your password"), score: 0}],
     score: 1
 };
 ("verification-gate":scorer) {
-    steps: [|{when: context.output.lookup.locked == true, steps: [|{when: context.output.decision == "blocked" && context.output.reason == "account locked", score: 1}|]}, {when: context.output.lookup.locked == false && context.output.lookup.email_verified == true, steps: [|{when: context.output.decision == "approved", score: 1}|]}|],
+    steps: [{when: context.output.lookup.locked == true, steps: [{when: context.output.decision == "blocked" && context.output.reason == "account locked", score: 1}]}, {when: context.output.lookup.locked == false && context.output.lookup.email_verified == true, steps: [{when: context.output.decision == "approved", score: 1}]}],
     score: 0
 };
 ("lookup-request-binding":scorer) {
-    steps: [|{when: context.output.lookup.status == "found", steps: [|{when: context.output.lookup.email == context.input.email && context.output.lookup.account_id != null, score: 1}|]}|],
+    steps: [{when: context.output.lookup.status == "found", steps: [{when: context.output.lookup.email == context.input.email && context.output.lookup.account_id != null, score: 1}]}],
     score: 0
 };
 ("reset-workflow-order":scorer) {
-    steps: [|{when: len (context.output.actions) != len (context.metadata.required_steps), score: 0}, {repeat: len (context.metadata.required_steps), steps: [|{when: context.output.actions[context.index].step != context.metadata.required_steps[context.index], score: 0}|]}|],
+    steps: [{when: len (context.output.actions) != len (context.metadata.required_steps), score: 0}, {repeat: len (context.metadata.required_steps), steps: [{when: context.output.actions[context.index].step != context.metadata.required_steps[context.index], score: 0}]}],
     score: 1
 };
 ("reset-outcome-honesty":scorer) {
-    steps: [|{when: context.output.status == "blocked", steps: [|{when: contains (lower (context.output.reply), "contact support") && len (context.output.actions) == 1, score: 1}|]}, {when: context.output.status == "sent" || context.output.status == "delivery_failed", steps: [|{repeat: len (context.output.actions), steps: [|{when: context.output.actions[context.index].step == "send_reset_email", steps: [|{when: context.output.actions[context.index].status == "sent" && contains (lower (context.output.reply), "check your email"), score: 1}, {when: context.output.actions[context.index].status == "failed" && ! contains (lower (context.output.reply), "check your email"), score: 1}|]}|]}|]}|],
+    steps: [{when: context.output.status == "blocked", steps: [{when: contains (lower (context.output.reply), "contact support") && len (context.output.actions) == 1, score: 1}]}, {when: context.output.status == "sent" || context.output.status == "delivery_failed", steps: [{repeat: len (context.output.actions), steps: [{when: context.output.actions[context.index].step == "send_reset_email", steps: [{when: context.output.actions[context.index].status == "sent" && contains (lower (context.output.reply), "check your email"), score: 1}, {when: context.output.actions[context.index].status == "failed" && ! contains (lower (context.output.reply), "check your email"), score: 1}]}]}]}],
     score: 0
 };
 ("review-reset-reply":automation) {
     type: "scorer",
-    scorers: [|"reset-topic-clarity", "no-password-collection"|],
+    scorers: ["reset-topic-clarity", "no-password-collection"],
     scope: "span",
-    span_names: [|"draft-reset-reply"|],
+    span_names: ["draft-reset-reply"],
     sampling_rate: 1.0,
     enabled: true
 };
 ("review-verification":automation) {
     type: "scorer",
-    scorers: [|"verification-gate", "lookup-request-binding"|],
+    scorers: ["verification-gate", "lookup-request-binding"],
     scope: "span",
-    span_names: [|"verify-reset-request"|],
+    span_names: ["verify-reset-request"],
     sampling_rate: 1.0,
     enabled: true
 };
 ("review-reset-workflow":automation) {
     type: "scorer",
-    scorers: [|"reset-workflow-order", "reset-outcome-honesty"|],
+    scorers: ["reset-workflow-order", "reset-outcome-honesty"],
     scope: "span",
     root: true,
     sampling_rate: 1.0,

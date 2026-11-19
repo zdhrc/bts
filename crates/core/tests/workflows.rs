@@ -12,11 +12,11 @@ fn previews_experiments_through_the_public_api() {
     let model = bts_core::providers::braintrust::mocking::compile(
         r#"(answer_root:task {name: "answer"}) {input: answer.input, output: answer_root.input};
 (answer:agent) {input: "fallback", output: answer_root.output};
-(answer)-[:next]->(answer_root);
+(answer)-|:next|->(answer_root);
 (dataset_cases_question:case {name: "question"}) {input: "hello"};
-(dataset_cases:dataset {name: "cases"}) {cases: [|(dataset_cases_question)|]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_question)]};
 ("quality":scorer) {score: context.input == context.output ? 1 : 0};
-(experiment_trial:experiment {name: "trial"}) {dataset: (dataset_cases), task: (answer_root), scorers: [|("quality")|]};"#,
+(experiment_trial:experiment {name: "trial"}) {dataset: (dataset_cases), task: (answer_root), scorers: [("quality")]};"#,
     )
     .unwrap();
     let preview = experiments::preview(&model, &[], Path::new("shape.bt"), 42, UNIX_EPOCH + Duration::from_secs(3600)).unwrap();
@@ -61,7 +61,7 @@ fn prepares_preview_attachments_without_reading_or_uploading_files() {
     let model = bts_core::providers::braintrust::mocking::compile(
         r#"(review_root:task {name: "review"}) {input: review.input};
 (review:agent) {input: {first: attachment("report.pdf", "application/pdf"), second: attachment("report.pdf", "application/pdf")}, output: null};
-(review)-[:next]->(review_root);"#,
+(review)-|:next|->(review_root);"#,
     )
     .unwrap();
     let batch = data::prepare(
@@ -136,7 +136,7 @@ fn generation_errors_keep_their_kind_range_and_diagnostic_conversion() {
     use std::error::Error as _;
     let source = r#"(run_root:task {name: "run"}) {output: 1 / context.trace_index, input: run.input};
 (run:agent) {input: null, output: run_root.output};
-(run)-[:next]->(run_root);"#;
+(run)-|:next|->(run_root);"#;
     let error = data::generate(
         bts_core::providers::braintrust::mocking::compile(source).unwrap(),
         1,
@@ -166,7 +166,7 @@ fn materialization_errors_expose_the_failure_and_event() {
         bts_core::providers::braintrust::mocking::compile(
             r#"(run_root:task {name: "run"}) {input: run.input};
 (run:agent) {input: null, output: null};
-(run)-[:next]->(run_root);"#,
+(run)-|:next|->(run_root);"#,
         )
         .unwrap(),
         1,
@@ -222,12 +222,12 @@ fn experiment_preview_keeps_the_underlying_generation_failure() {
     let model = bts_core::providers::braintrust::mocking::compile(
         r#"
         (run:agent) {input: null, output: null};
-        (run)-[:next]->(root:task) {input: run.input};
-        (root)=[:repeat {count: range(-2, -1)}]=>[-[:calls]->(step:tool)];
+        (run)-|:next|->(root:task) {input: run.input};
+        (root)=|:repeat {count: range(-2, -1)}|=>[-|:calls|->(step:tool)];
         (one:case) {input: "hello"};
-        (cases:dataset) {cases: [|(one)|]};
+        (cases:dataset) {cases: [(one)]};
         (quality:scorer) {score: 1};
-        (trial:experiment) {dataset: (cases), task: (root), scorers: [|(quality)|]};
+        (trial:experiment) {dataset: (cases), task: (root), scorers: [(quality)]};
     "#,
     )
     .unwrap();

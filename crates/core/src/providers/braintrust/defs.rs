@@ -21,7 +21,7 @@ pub const SOURCE: Source<'static> = Source {
     expected: {type: "any", role: "input"},
     metadata: {type: "object", role: "input"},
 }
-    -[:requires {trace_index: {type: "number"}}]->(context);
+    -|:requires {trace_index: {type: "number"}}|->(context);
 
 # provider schemas describe span data, they do not execute or emit spans
 # names are optional so anonymous graph nodes remain usable
@@ -41,10 +41,10 @@ pub const SOURCE: Source<'static> = Source {
     wait: {type: "number"},
     local: {type: "object"},
 }
-    -[:requires {trace_index: {type: "number"}}]->(context);
+    -|:requires {trace_index: {type: "number"}}|->(context);
 
-+(tool:node)-[:extends]->(span);
-+(task:node)-[:extends]->(span);
++(tool:node)-|:extends|->(span);
++(task:node)-|:extends|->(span);
 # an llm span counts its own tokens, and an object written in metrics is merged over these keys
 # a step without input or output counts none for it
 +(llm:node) {
@@ -56,15 +56,15 @@ pub const SOURCE: Source<'static> = Source {
         tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens,
     }},
 }
-    -[:extends]->(span);
-+(function:node)-[:extends]->(span);
+    -|:extends|->(span);
++(function:node)-|:extends|->(span);
 
 # calls schedules its target like next and goes down a level
 # its target and the steps that follow along next edges are children of its source
 # next stays on the level it is on, and consumers keep the parent open through its children
 +(calls:edge {direction: "directed"})
-    -[:extends]->(next)
-    -[:provides {parent: {type: "object"}}]->(context);
+    -|:extends|->(next)
+    -|:provides {parent: {type: "object"}}|->(context);
 
 # one scorer expression supports emitted spans and callable scorer functions
 # context reads the parent span during emission and caller arguments in a function
@@ -77,15 +77,15 @@ pub const SOURCE: Source<'static> = Source {
     judge: {type: "object"},
     reason: {type: "string"},
 }
-    -[:extends]->(span)
-    -[:requires {
+    -|:extends|->(span)
+    -|:requires {
         input: {type: "any"},
         output: {type: "any"},
         expected: {type: "any"},
         metadata: {type: "object"},
         index: {type: "number"},
         count: {type: "number"},
-    }]->(context);
+    }|->(context);
 
 # datasets and evaluations connect authored cases to modeled behavior
 +(dataset:node {name: {type: "string"}}) {description: {type: "string"}, cases: {type: "array", required: true}};

@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn emits_nested_scorer_repeats() {
         let generated = emit(
-            r#"("s":scorer) {score: 0, steps: [|{repeat: len(context.output), steps: [|{when: context.output [context.index] == context.expected, score: 1}, {repeat: context.index + 1, steps: [|{when: context.index < context.count, score: 0.5}|]}|]}|]};"#,
+            r#"("s":scorer) {score: 0, steps: [{repeat: len(context.output), steps: [{when: context.output [context.index] == context.expected, score: 1}, {repeat: context.index + 1, steps: [{when: context.index < context.count, score: 0.5}]}]}]};"#,
         );
         assert!(generated.contains("const repeatCount = output.length;"));
         assert!(generated.contains("for (let repeatIndex = 0; repeatIndex < repeatCount;"));
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn emits_nested_when_fallthrough() {
         let generated = emit(
-            r#"("s":scorer) {score: 0, steps: [|{when: len(context.output) > 0, score: 0.5, steps: [|{when: context.output [0] == context.expected, score: 1}|]}|]};"#,
+            r#"("s":scorer) {score: 0, steps: [{when: len(context.output) > 0, score: 0.5, steps: [{when: context.output [0] == context.expected, score: 1}]}]};"#,
         );
         assert!(generated.contains("  if (output.length > 0) {\n    if (output[0] === expected) {\n      return"));
         assert!(generated.contains("\n    return { name: \"s\", score: 0.5"));
@@ -258,7 +258,7 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
     #[test]
     fn dots_identifier_keys_and_brackets_the_rest() {
         let generated = emit(
-            r#"("s":scorer) {score: 0.5, steps: [|{when: context.metadata.tier == context.metadata ["user tier"], score: 0}|]};"#,
+            r#"("s":scorer) {score: 0.5, steps: [{when: context.metadata.tier == context.metadata ["user tier"], score: 0}]};"#,
         );
         assert!(
             generated.contains(r#"if (metadata.tier === metadata["user tier"]) {"#),
@@ -269,7 +269,7 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
     #[test]
     fn escapes_template_literals() {
         let generated = emit(
-            r#"("s":scorer) {score: 0.5, steps: [|{when: "`${context.output}` costs $${metadata.cost}" == "x", score: 0}|]};"#,
+            r#"("s":scorer) {score: 0.5, steps: [{when: "`${context.output}` costs $${metadata.cost}" == "x", score: 0}]};"#,
         );
         assert!(
             generated.contains(r#"if (`\`${output}\` costs \${metadata.cost}` === "x") {"#),

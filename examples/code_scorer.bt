@@ -1,12 +1,12 @@
 ("response-quality":scorer {lang: "python", file: "quality"}) {
     score: clamp(normal(0.78, 0.12), 0, 1),
-    steps: [|
+    steps: [
         {when: context.output == null, score: 0},
         {when: contains(context.output, "I'm sorry"), score: range(0.1, 0.4)},
-    |],
+    ],
 };
 
 ("response-length":scorer {lang: "python", file: "quality"}) {
     score: clamp(len(context.output) / 400.0, 0.1, 0.9),
-    steps: [|{when: context.output == null, score: 0}|],
+    steps: [{when: context.output == null, score: 0}],
 };

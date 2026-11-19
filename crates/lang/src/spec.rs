@@ -433,8 +433,8 @@ const FUNCS: &[FuncDesc] = &[
         syntax: "weighted([value, weight], ...)",
         summary: "Picks one of its `[value, weight]` pairs at random on evaluation, with probability proportional to its weight. Values may be any value, including nested functions; weights are constant non-negative numbers that need not sum to 1.",
         examples: &[
-            "weighted([|\"gpt-4o\", 8|], [|\"gpt-4o-mini\", 2|])",
-            "weighted([|range(1, 3), 0.9|], [|10, 0.1|])",
+            "weighted([\"gpt-4o\", 8], [\"gpt-4o-mini\", 2])",
+            "weighted([range(1, 3), 0.9], [10, 0.1])",
         ],
         rules: WEIGHTED_RULES,
     },
@@ -561,7 +561,7 @@ const FUNCS: &[FuncDesc] = &[
         name: "compose",
         syntax: "compose(parts[, separator])",
         summary: "Joins string parts, skipping null and empty strings. The separator defaults to a space. Whitespace and punctuation are preserved. Other element types fail during evaluation.",
-        examples: &[r#"compose([|"Hi!", null, "How can I help?"|])"#],
+        examples: &[r#"compose(["Hi!", null, "How can I help?"])"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -570,7 +570,7 @@ const FUNCS: &[FuncDesc] = &[
         name: "sample",
         syntax: "sample(array, count)",
         summary: "Selects array positions uniformly without replacement and returns their values in source order. Duplicate values remain distinct positions. Count must be an integer from zero through the array length, otherwise evaluation fails.",
-        examples: &[r#"sample([|"parking", "keys", "hours"|], 2)"#],
+        examples: &[r#"sample(["parking", "keys", "hours"], 2)"#],
         rules: TEXT_FUNC_RULES,
     },
     FuncDesc {
@@ -579,7 +579,7 @@ const FUNCS: &[FuncDesc] = &[
         name: "join",
         syntax: "join(array, separator)",
         summary: "Joins the elements of an array into one string with the separator between them on evaluation; string, number, and boolean elements are stringified.",
-        examples: &["join(settings.tags, \", \")", "join([|1, 2, 3|], \"-\")"],
+        examples: &["join(settings.tags, \", \")", "join([1, 2, 3], \"-\")"],
         rules: JOIN_FUNC_RULES,
     },
     FuncDesc {
@@ -741,7 +741,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("kind.relationships"),
-        summary: "A relationship is one unnamed directed edge from the definition head to a name: -[:extends]->(base), -[:has]->(trait) or -[:on]->(construct). extends, has and on take no properties. Targets are references resolved in the kind namespace, never declarations. One relationship may follow the head on its line. Two or more are aligned continuation lines, so each starts at the head. A relationship that continues from another relationship's target, an edge list, a fork, a loop-back or an undirected edge is an error. Kinds accept extends and has. Traits accept extends and on. provides and requires each take a brace list of context keys and target the reserved name context: -[:provides {key: {type: \"string\"}}]->(context). Each key takes a descriptor. A required key accepts type alone, any when omitted. A provided key accepts type and value, the expression its elements supply: -[:provides {key: {type: \"string\", value: self.props.name}}]->(context). Kinds and traits on every construct accept both.",
+        summary: "A relationship is one unnamed directed edge from the definition head to a name: -|:extends|->(base), -|:has|->(trait) or -|:on|->(construct). extends, has and on take no properties. Targets are references resolved in the kind namespace, never declarations. One relationship may follow the head on its line. Two or more are aligned continuation lines, so each starts at the head. A relationship that continues from another relationship's target, an edge list, a fork, a loop-back or an undirected edge is an error. Kinds accept extends and has. Traits accept extends and on. provides and requires each take a brace list of context keys and target the reserved name context: -|:provides {key: {type: \"string\"}}|->(context). Each key takes a descriptor. A required key accepts type alone, any when omitted. A provided key accepts type and value, the expression its elements supply: -|:provides {key: {type: \"string\", value: self.props.name}}|->(context). Kinds and traits on every construct accept both.",
     },
     RuleDesc {
         tags: &[],
@@ -761,7 +761,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.direction"),
-        summary: "Ordinary connectors are -[headers]-> for directed edges and -[headers]- for undirected edges. Each declaration creates a distinct identity, including parallel edges and self-connections. The root edge kind and link permit either direction. next, requires, contains and feeds require directed edges. incidence requires undirected edges. Direction is set in an edge kind's definition header, not an instance property. Directed and undirected connections can coexist between the same nodes.",
+        summary: "Ordinary connectors are -|headers|-> for directed edges and -|headers|- for undirected edges. Each declaration creates a distinct identity, including parallel edges and self-connections. The root edge kind and link permit either direction. next, requires, contains and feeds require directed edges. incidence requires undirected edges. Direction is set in an edge kind's definition header, not an instance property. Directed and undirected connections can coexist between the same nodes.",
     },
     RuleDesc {
         tags: &[],
@@ -867,7 +867,7 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     RuleDesc {
         tags: &[],
         id: Id::new("graph.cycles"),
-        summary: "Cycle punctuation explicitly marks directed loop-back behavior, independently of mathematical cycles. It always requires ~[headers]~> with an arrowhead. There is no undirected loop-back connector. Ordinary self-connections are allowed in either direction category. Compilation does not require a marked edge to close a topological cycle or require unmarked edges to form a DAG. Network acyclicity checks inspect all selected connections regardless of loop markers. Graph cycles do not permit circular field dependencies. Each traversed loop-back creates a fresh target occurrence and evaluates its outgoing paths again. source denotes the current occurrence and target the new occurrence. Explicit feeds supplies values before target evaluation, with no implicit copying of prior fields. max_traversals is an optional nonnegative integer bound on traversals of that edge within its execution group. A qualifying traversal beyond the limit fails rather than silently terminating. Mocking also stops a loop-back that sets no max_traversals after 10000 traversals. Cycle edges can be fork branches and do not implicitly suppress other outgoing edges. Exclusive forks express mutually exclusive retry and exit paths. context.history exposes completed earlier occurrences in the current execution or repetition batch and excludes in-flight occurrences. It is readable on every node. Its view is fixed when the reading occurrence starts, even when its fields are evaluated later.",
+        summary: "Cycle punctuation explicitly marks directed loop-back behavior, independently of mathematical cycles. It always requires ~|headers|~> with an arrowhead. There is no undirected loop-back connector. Ordinary self-connections are allowed in either direction category. Compilation does not require a marked edge to close a topological cycle or require unmarked edges to form a DAG. Network acyclicity checks inspect all selected connections regardless of loop markers. Graph cycles do not permit circular field dependencies. Each traversed loop-back creates a fresh target occurrence and evaluates its outgoing paths again. source denotes the current occurrence and target the new occurrence. Explicit feeds supplies values before target evaluation, with no implicit copying of prior fields. max_traversals is an optional nonnegative integer bound on traversals of that edge within its execution group. A qualifying traversal beyond the limit fails rather than silently terminating. Mocking also stops a loop-back that sets no max_traversals after 10000 traversals. Cycle edges can be fork branches and do not implicitly suppress other outgoing edges. Exclusive forks express mutually exclusive retry and exit paths. context.history exposes completed earlier occurrences in the current execution or repetition batch and excludes in-flight occurrences. It is readable on every node. Its view is fixed when the reading occurrence starts, even when its fields are evaluated later.",
     },
     RuleDesc {
         tags: &[],
@@ -1201,9 +1201,9 @@ const EXPRESSIONS: &[ExprDesc] = &[
     ExprDesc {
         tags: &[],
         id: Id::new("expression.values"),
-        syntax: "null | true | false | number | string | [|values|] | {key: value}",
+        syntax: "null | true | false | number | string | |values| | {key: value}",
         summary: "Scalars and comma-separated containers, with optional trailing commas.",
-        examples: &["[||]", "{ready: true}"],
+        examples: &["[]", "{ready: true}"],
         rules: &[],
     },
     ExprDesc {
@@ -1211,7 +1211,7 @@ const EXPRESSIONS: &[ExprDesc] = &[
         id: Id::new("expression.references"),
         syntax: "(node) | [edge_or_fork] | [fork].[edge] | ?<path>",
         summary: "Static graph references, with one @ marker in a path pattern.",
-        examples: &["(entry)", "[checks].[lookup]", "?<(entry)-[:next]->(@:task)>"],
+        examples: &["(entry)", "[checks].[lookup]", "?<(entry)-|:next|->(@:task)>"],
         rules: &[],
     },
     ExprDesc {
@@ -1225,9 +1225,9 @@ const EXPRESSIONS: &[ExprDesc] = &[
     ExprDesc {
         tags: &[],
         id: Id::new("expression.collections"),
-        syntax: "value[index] | value[start:end] | ...value | [|for x in values: expression|]",
+        syntax: "value|index| | value[start:end] | ...value | [for x in values: expression]",
         summary: "Indexing, slicing, spreads and comprehensions retain their type and bounds checks.",
-        examples: &["[|for x in [|1, 2|]: x + 1|]"],
+        examples: &["[for x in [1, 2]: x + 1]"],
         rules: &[],
     },
 ];
@@ -1237,7 +1237,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.kind-input"),
         summary: "A typed upstream input and a field destination",
         note: "Compilation retains the input and destination identities without delivering data.",
-        source: r#"+(receiver:node) {id: {type: "string", required: true}}; (a:node) {id: "p-1"} -[:feeds {value: source.id, into: target.id}]->(b:receiver) {id: <-};"#,
+        source: r#"+(receiver:node) {id: {type: "string", required: true}}; (a:node) {id: "p-1"} -|:feeds {value: source.id, into: target.id}|->(b:receiver) {id: <-};"#,
         valid: true,
     },
     Example {
@@ -1253,7 +1253,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.kind-junction"),
         summary: "A junction kind retains its base operation",
         note: "The head names the junction construct, and extends names the base whose operation the kind keeps.",
-        source: "+(joined:junction)-[:extends]->(accumulate); (:node)-[e:link]->(:node); >[:joined [e]]>>(:node);",
+        source: "+(joined:junction)-|:extends|->(accumulate); (:node)-|e:link|->(:node); >|:joined |e||>>(:node);",
         valid: true,
     },
     Example {
@@ -1261,7 +1261,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.trait"),
         summary: "A kind has a trait's properties and fields",
         note: "The trait applies to node kinds. Its property goes in the instance header and its field in the body.",
-        source: r#"+(metered:trait {unit: {type: "string", default: "ms"}}) {metrics: {type: "object", required: true}}-[:on]->(node); +(lookup:node)-[:has]->(metered); (a:lookup {unit: "s"}) {metrics: {elapsed: 2}};"#,
+        source: r#"+(metered:trait {unit: {type: "string", default: "ms"}}) {metrics: {type: "object", required: true}}-|:on|->(node); +(lookup:node)-|:has|->(metered); (a:lookup {unit: "s"}) {metrics: {elapsed: 2}};"#,
         valid: true,
     },
     Example {
@@ -1269,9 +1269,9 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.trait-collision"),
         summary: "Two traits cannot declare the same field",
         note: "The error is reported at the second has relationship.",
-        source: r#"+(metered:trait) {metrics: {type: "object"}}-[:on]->(node); +(counted:trait) {metrics: {type: "object"}}-[:on]->(node); +(lookup:node)
-    -[:has]->(metered)
-    -[:has]->(counted);"#,
+        source: r#"+(metered:trait) {metrics: {type: "object"}}-|:on|->(node); +(counted:trait) {metrics: {type: "object"}}-|:on|->(node); +(lookup:node)
+    -|:has|->(metered)
+    -|:has|->(counted);"#,
         valid: false,
     },
     Example {
@@ -1303,7 +1303,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.unknown-kind"),
         summary: "An unknown kind is an error",
         note: "Every kind is a built-in or a definition, for nodes, edges, forks and junctions alike.",
-        source: "(a:node)-[:nxet]->(b:node);",
+        source: "(a:node)-|:nxet|->(b:node);",
         valid: false,
     },
     Example {
@@ -1311,7 +1311,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.context-read"),
         summary: "A fork kind provides context to its branch destinations",
         note: "each provides item and index, so the branch destination may read them.",
-        source: "(a:node) {records: [|1, 2|]} =[:each {items: source.records}]=>[-[:next]->(b:node) {value: context.item}];",
+        source: "(a:node) {records: [1, 2]} =|:each {items: source.records}|=>[-|:next|->(b:node) {value: context.item}];",
         valid: true,
     },
     Example {
@@ -1319,7 +1319,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.context-unavailable"),
         summary: "A context key must reach its reader",
         note: "Nothing upstream of b provides item, so the read is rejected at the reference.",
-        source: "(a:node)-[:next]->(b:node) {value: context.item};",
+        source: "(a:node)-|:next|->(b:node) {value: context.item};",
         valid: false,
     },
     Example {
@@ -1328,8 +1328,8 @@ const EXAMPLES: &[Example] = &[
         summary: "A trait provides context to what its kinds lead to",
         note: "The key travels along the next edge from a to b. A consumer supplies its value.",
         source: r#"+(tenant_scoped:trait)
-    -[:on]->(node)
-    -[:provides {tenant: {type: "string"}}]->(context); +(entry:node)-[:has]->(tenant_scoped); (a:entry)-[:next]->(b:node) {tenant: context.tenant};"#,
+    -|:on|->(node)
+    -|:provides {tenant: {type: "string"}}|->(context); +(entry:node)-|:has|->(tenant_scoped); (a:entry)-|:next|->(b:node) {tenant: context.tenant};"#,
         valid: true,
     },
     Example {
@@ -1338,8 +1338,8 @@ const EXAMPLES: &[Example] = &[
         summary: "A trait supplies the value of the context it provides",
         note: "Every element of a kind with the trait supplies its own tenant property. b reads the value a supplies.",
         source: r#"+(tenant_scoped:trait {tenant: {type: "string", required: true}})
-    -[:on]->(node)
-    -[:provides {tenant: {type: "string", value: self.props.tenant}}]->(context); +(entry:node)-[:has]->(tenant_scoped); (a:entry {tenant: "acme"})-[:next]->(b:node) {tenant: context.tenant};"#,
+    -|:on|->(node)
+    -|:provides {tenant: {type: "string", value: self.props.tenant}}|->(context); +(entry:node)-|:has|->(tenant_scoped); (a:entry {tenant: "acme"})-|:next|->(b:node) {tenant: context.tenant};"#,
         valid: true,
     },
     Example {
@@ -1363,7 +1363,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.computed-field-extension"),
         summary: "An object an extension states is merged over the object it inherits",
         note: "a's size is {width: 9, height: 3, depth: 1}. The extension states the keys it changes, and b writes over the merged object.",
-        source: r#"+(box:node) {size: {type: "object", value: {width: 2, height: 3}}}; +(crate:node) {size: {value: {depth: 1, width: 9}}}-[:extends]->(box); (a:crate); (b:crate) {size: {height: 4}};"#,
+        source: r#"+(box:node) {size: {type: "object", value: {width: 2, height: 3}}}; +(crate:node) {size: {value: {depth: 1, width: 9}}}-|:extends|->(box); (a:crate); (b:crate) {size: {height: 4}};"#,
         valid: true,
     },
     Example {
@@ -1379,7 +1379,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.context-requires"),
         summary: "A kind requires the context its instances read",
         note: "The key is readable on every instance of the kind and is supplied from outside the graph.",
-        source: r#"+(caller_step:node {open: true})-[:requires {request_id: {type: "string"}}]->(context); (a:caller_step) {id: context.request_id};"#,
+        source: r#"+(caller_step:node {open: true})-|:requires {request_id: {type: "string"}}|->(context); (a:caller_step) {id: context.request_id};"#,
         valid: true,
     },
     Example {
@@ -1388,8 +1388,8 @@ const EXAMPLES: &[Example] = &[
         summary: "An edge kind provides context to its target",
         note: "The key reaches b across the delegated edge and continues to c along next. A consumer supplies its value.",
         source: r#"+(delegated:edge {direction: "directed"})
-    -[:extends]->(next)
-    -[:provides {owner: {type: "string"}}]->(context); (a:node)-[:delegated]->(b:node) {by: context.owner}; (b)-[:next]->(c:node) {by: context.owner};"#,
+    -|:extends|->(next)
+    -|:provides {owner: {type: "string"}}|->(context); (a:node)-|:delegated|->(b:node) {by: context.owner}; (b)-|:next|->(c:node) {by: context.owner};"#,
         valid: true,
     },
     Example {
@@ -1398,8 +1398,8 @@ const EXAMPLES: &[Example] = &[
         summary: "An edge's keys do not reach its source",
         note: "The delegated edge provides owner to b. Nothing provides it to a, so the read is rejected.",
         source: r#"+(delegated:edge {direction: "directed"})
-    -[:extends]->(next)
-    -[:provides {owner: {type: "string"}}]->(context); (a:node) {by: context.owner}; (a)-[:delegated]->(b:node);"#,
+    -|:extends|->(next)
+    -|:provides {owner: {type: "string"}}|->(context); (a:node) {by: context.owner}; (a)-|:delegated|->(b:node);"#,
         valid: false,
     },
     Example {
@@ -1407,7 +1407,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.graph"),
         summary: "A graph with a forward reference",
         note: "The root node kind takes any property and field.",
-        source: "(a:node)-[:next]->(b); (b:node);",
+        source: "(a:node)-|:next|->(b); (b:node);",
         valid: true,
     },
     Example {
@@ -1415,7 +1415,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.fan-out"),
         summary: "Aligned continuation lines share an origin",
         note: "All three edges leave a. Writing them as separate statements means the same.",
-        source: "(a:node)\n    -[:next]->(b:node)\n    -[:next]->(c:node)\n    -[:next]->(d:node);",
+        source: "(a:node)\n    -|:next|->(b:node)\n    -|:next|->(c:node)\n    -|:next|->(d:node);",
         valid: true,
     },
     Example {
@@ -1423,7 +1423,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.chain"),
         summary: "Deeper continuation lines chain",
         note: "Each line continues from the last node of the line it sits under, so the edges run a to b, b to c and c to d.",
-        source: "(a:node)\n    -[:next]->(b:node)\n        -[:next]->(c:node)\n            -[:next]->(d:node);",
+        source: "(a:node)\n    -|:next|->(b:node)\n        -|:next|->(c:node)\n            -|:next|->(d:node);",
         valid: true,
     },
     Example {
@@ -1439,7 +1439,7 @@ const EXAMPLES: &[Example] = &[
         id: Id::new("example.expressions"),
         summary: "Generic field expressions",
         note: "Constant arithmetic folds during compilation.",
-        source: "(values:vars) {n: ${1 + 2} * 3, items: [|for x in [|1, 2|]: x * 2|]};",
+        source: "(values:vars) {n: ${1 + 2} * 3, items: [for x in [1, 2]: x * 2]};",
         valid: true,
     },
     Example {
@@ -1470,8 +1470,8 @@ pub static SPEC: Spec = Spec {
         grammar: r#"document = { (root_path | definition), ";" }
 definition = "+(", identifier, ":", construct, [fields], ")", [fields], {relationship}
 construct = "node" | "edge" | "fork" | "junction" | "trait"
-relationship = "-[:", ("extends" | "has" | "on"), "]->(", identifier, ")"
-    | "-[:", ("provides" | "requires"), fields, "]->(context)"
+relationship = "-|:", ("extends" | "has" | "on"), "|->(", identifier, ")"
+    | "-|:", ("provides" | "requires"), fields, "|->(context)"
 root_path = (node | junction), steps
 attached_path = (selector | junction), steps
 steps = {edge | cycle}, [fork | arms]
@@ -1480,26 +1480,26 @@ arm = (edge | cycle), steps | fork
 node = "(", header, ")", [fields] | "(", reference_expression, ")"
 header = [name], ":", kind, [fields]
 headers = header, {",", header}, [","]
-edge = "-[", headers, ("]->" | "]-"), node
-cycle = "~[", headers, "]~>", node
-fork = "=[", header, "]=>[", (edge | cycle), {",", (edge | cycle)}, [","], "]", {attached_path}
+edge = "-|", headers, ("|->" | "|-"), node
+cycle = "~|", headers, "|~>", node
+fork = "=|", header, "|=>[", (edge | cycle), {",", (edge | cycle)}, [","], "]", {attached_path}
 selector = "->(", reference_expression, ")"
-junction = ">[:", kind, [fields], junction_input, {",", junction_input}, [","], "]>>", node
+junction = ">|:", kind, [fields], junction_input, {",", junction_input}, [","], "|>>", node
 junction_input = edge_reference | pattern
 fields = "{", [field, {",", field}, [","]], "}"
 field = identifier, ":", (expression | "<-")
 name = identifier | plain_string
 kind = identifier
-edge_reference = "[", reference_expression, "]", {".[", name, "]"}
+edge_reference = "|", reference_expression, "|", {".|", name, "|"}
 pattern = "?<", pattern_node, {pattern_step}, ">"
 pattern_node = "(", reference_expression, ")" | "(", ["@"], ":", kind, [fields], ")"
-pattern_step = ("-[", pattern_headers, ("]->" | "]-") | "~[", pattern_headers, "]~>"), pattern_node
+pattern_step = ("-|", pattern_headers, ("|->" | "|-") | "~|", pattern_headers, "|~>"), pattern_node
 pattern_headers = pattern_header, {",", pattern_header}, [","]
 pattern_header = ["@"], ":", kind, [fields]
-array = "[|", [expression, {",", expression}, [","]], "|]"
+array = "[", [expression, {",", expression}, [","]], "]"
 object = "{", [field, {",", field}, [","]], "}"
 group = "${", expression, "}"
-array_for = "[|for", bindings, "in", expression, ":", expression, ["if", expression], "|]"
+array_for = "[for", bindings, "in", expression, ":", expression, ["if", expression], "]"
 object_for = "{for", bindings, "in", expression, ":", expression, "=>", expression, ["if", expression], "}"
 bindings = identifier, [",", identifier]
 expression = conditional
@@ -1511,7 +1511,7 @@ comparison = additive, {("<" | "<=" | ">" | ">="), additive}
 additive = multiplicative, {("+" | "-"), multiplicative}
 multiplicative = unary, {("*" | "/" | "%"), unary}
 unary = ("!" | "-"), unary | postfix
-postfix = primary, {"[", expression, "]" | "[", [expression], ":", [expression], "]" | ".", identifier | ".[", name, "]"}
+postfix = primary, {"[", expression, "]" | "[", [expression], ":", [expression], "]" | ".", identifier | ".|", name, "|"}
 primary = scalar | template | array | object | array_for | object_for | group | call | reference
 call = identifier, "(", [expression, {",", expression}, [","]], ")"
 reference = identifier | "(", reference_expression, ")" | edge_reference | pattern
@@ -1527,7 +1527,7 @@ reference_expression = expression
             "Node bodies contain only fields. Node declarations are legal at path origins and connection targets. No declarations occur in expression values or properties. Empty node parentheses are invalid.",
             "Fork entries contain exactly one ordinary directed or undirected edge step. Edge lists share their endpoints but retain separate names, properties and identities. Fork lists and junction lists are nonempty.",
             "Root paths require semicolons. Internal entries require commas between entries on one line or multiple lines. A trailing comma is optional, including for a single entry. Array and object spreads use ...expression in an entry position.",
-            "References use parentheses and brackets, arrays use [| |], expression grouping uses ${ }.",
+            "Node references use parentheses and edge references use pipes. Arrays use [ ], and expression grouping uses ${ }.",
             "Every kind is a built-in or a declared name. Built-in kinds describe distinct structural or computational contracts, not interchangeable labels. This crate preserves those kinds and checks static rules, while runtime consumers implement their behavior. Definitions provide local kind schemas, same-category extension and traits. Package loading and runtime operation registration remain future work. Schema declarations do not install executable behavior. Consumers must honor inherited primitive contracts or explicitly reject unsupported capabilities.",
         ],
     },

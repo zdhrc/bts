@@ -463,7 +463,7 @@ mod tests {
             crate::providers::braintrust::mocking::compile(
                 r#"(run_root:task {name: "run"}) {output: "hello", input: run.input};
 (run:agent) {input: null, output: run_root.output};
-(run)-[:next]->(run_root);"#,
+(run)-|:next|->(run_root);"#,
             )
             .unwrap(),
             count,
@@ -569,7 +569,7 @@ mod tests {
                 model: crate::providers::braintrust::mocking::compile(
                     r#"(run_root:task {name: "run"}) {output: "hello", input: run.input};
 (run:agent) {input: null, output: run_root.output};
-(run)-[:next]->(run_root);"#,
+(run)-|:next|->(run_root);"#,
                 )
                 .unwrap(),
                 count: 2,

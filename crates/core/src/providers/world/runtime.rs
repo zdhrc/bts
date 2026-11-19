@@ -1956,14 +1956,14 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Value::Array(items) => format!("[|{}|]", items.iter().map(literal).collect::<Vec<_>>().join(", ")),
+            Value::Array(items) => format!("[{}]", items.iter().map(literal).collect::<Vec<_>>().join(", ")),
             value => value.to_string(),
         }
     }
 
     fn native(operation: &str, args: &[Value]) -> Value {
         let source = format!(
-            "(language_root:task {{name: \"language\"}}) {{output: {operation} ({}), input: language.input}};\n(language:agent) {{input: null, output: language_root.output}};\n(language)-[:next]->(language_root);",
+            "(language_root:task {{name: \"language\"}}) {{output: {operation} ({}), input: language.input}};\n(language:agent) {{input: null, output: language_root.output}};\n(language)-|:next|->(language_root);",
             args.iter().map(literal).collect::<Vec<_>>().join(", ")
         );
         let model = With(braintrust::Bundle, world::Bundle)

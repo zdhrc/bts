@@ -376,19 +376,19 @@ mod tests {
         fs::write(
             &path,
             r#"(agent_standalone:agent {name: "standalone"}) {input: null, output: standalone.output};
-(agent_standalone)-[:next]->(standalone);
+(agent_standalone)-|:next|->(standalone);
 (standalone:task) {
     output: "hello",
     input: agent_standalone.input
 };
 (agent_unrelated:agent {name: "unrelated"}) {input: null, output: unrelated.output};
-(agent_unrelated)-[:next]->(unrelated);
+(agent_unrelated)-|:next|->(unrelated);
 (unrelated:task) {
     output: "other",
     input: agent_unrelated.input
 };
 (cases:dataset) {
-    cases: [|(one)|]
+    cases: [(one)]
 };
 (one:case) {
     input: "question"
@@ -399,7 +399,7 @@ mod tests {
 (experiment_unrelated:experiment {name: "unrelated"}) {
     task: (unrelated),
     dataset: (cases),
-    scorers: [|(quality)|]
+    scorers: [(quality)]
 };"#,
         )
         .unwrap();

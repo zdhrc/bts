@@ -193,10 +193,10 @@ mod tests {
     #[test]
     fn preserves_event_order_timestamps_and_optional_wire_fields() {
         let batch = generate(
-            r#"(example_root:task {name: "example"}) {duration: 2, expected: "4", error: {message: "timeout"}, tags: [|"chat", "prod"|], input: example.input};
+            r#"(example_root:task {name: "example"}) {duration: 2, expected: "4", error: {message: "timeout"}, tags: ["chat", "prod"], input: example.input};
 (step:task {name: "step"}) {input: "question", duration: 1};
 (example:agent) {input: null, output: null};
-(example)-[:next]->(example_root)-[:calls]->(step);"#,
+(example)-|:next|->(example_root)-|:calls|->(step);"#,
         );
         let encoded = Format.encode(&batch).unwrap();
         let json = serde_json::to_value(&encoded).unwrap();
@@ -224,9 +224,9 @@ mod tests {
     #[test]
     fn projects_attachment_fields_and_token_counts_with_braintrust_encoding() {
         let batch = generate(
-            r#"(example_root:task {name: "example"}) {input: example.input, output: self.input ["type"], metrics: {count: tokens([|self.input|])}};
+            r#"(example_root:task {name: "example"}) {input: example.input, output: self.input ["type"], metrics: {count: tokens([self.input])}};
 (example:agent) {input: attachment("report.txt", "text/plain"), output: example_root.output};
-(example)-[:next]->(example_root);"#,
+(example)-|:next|->(example_root);"#,
         );
         let attachment = Format.attachment(&batch.attachments[0]).unwrap();
         let expected_tokens = tiktoken_rs::o200k_base()
@@ -248,7 +248,7 @@ mod tests {
         let mut batch = generate(
             r#"(example_root:task {name: "example"}) {input: example.input, output: {type: "braintrust_attachment", filename: "report.txt", content_type: "text/plain", key: self.input ["key"]}};
 (example:agent) {input: attachment("report.txt", "text/plain"), output: example_root.output};
-(example)-[:next]->(example_root);"#,
+(example)-|:next|->(example_root);"#,
         );
         let original = batch.attachments[0].key.clone();
         batch.reuse_attachments(&HashMap::from([(original.clone(), "stored".to_owned())]));

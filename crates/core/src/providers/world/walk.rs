@@ -1733,7 +1733,7 @@ mod tests {
     // the world beside an agent of one step
     fn shape(world: &str) -> String {
         format!(
-            "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-[:next]->(t:task {{name: \"t\"}}) {{input: a.input, output: \"ok\"}};\n"
+            "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-|:next|->(t:task {{name: \"t\"}}) {{input: a.input, output: \"ok\"}};\n"
         )
     }
 
@@ -1751,23 +1751,23 @@ mod tests {
         // a function that samples is drawn again for every trace, so the walk would differ from turn to turn
         let told = |function: &str| format!("`{function}` samples again on every trace");
         for (world, function) in [
-            (r#"(ticket:fact {per: "run"}) -[:next]->(:given {value: hex(8)});"#, "hex"),
+            (r#"(ticket:fact {per: "run"}) -|:next|->(:given {value: hex(8)});"#, "hex"),
             (
-                r#"(ticket:fact {per: "run"}) -[:next]->(:given {value: {id: format("T-{}", range(1, 9))}});"#,
+                r#"(ticket:fact {per: "run"}) -|:next|->(:given {value: {id: format("T-{}", range(1, 9))}});"#,
                 "range",
             ),
             (
                 r#"(customer:persona {style: choice("professional", "text_message"), per: "run"})
-        -[:next]->(:statement {subject: "I", person: "first", verb: "wait"});"#,
+        -|:next|->(:statement {subject: "I", person: "first", verb: "wait"});"#,
                 "choice",
             ),
             (
                 r#"(ask:sentence {per: "run"})
-        -[:next]->(:part {subject: "I", person: "first", verb: "need", complement: uuid()});"#,
+        -|:next|->(:part {subject: "I", person: "first", verb: "need", complement: uuid()});"#,
                 "uuid",
             ),
             (
-                r#"(mood:fact {per: "run"}) -[:next]->(:given {value: vary("I am calm.")});"#,
+                r#"(mood:fact {per: "run"}) -|:next|->(:given {value: vary("I am calm.")});"#,
                 "vary",
             ),
         ] {
@@ -1782,28 +1782,28 @@ mod tests {
                 .unwrap_or_else(|errors| panic!("{errors}\n{each_trace}"));
         }
         // it is reported where it is written
-        let source = shape(r#"(ticket:fact {per: "run"}) -[:next]->(:given {value: hex(8)});"#);
+        let source = shape(r#"(ticket:fact {per: "run"}) -|:next|->(:given {value: hex(8)});"#);
         let errors = provider().compile_module(&source, false).unwrap_err();
         let error = errors.into_iter().next().unwrap();
         assert_eq!(&source[error.r#where.start..error.r#where.end], "hex(8)");
         // a walk that is a step and does not say is drawn for what its walk is drawn for
         let inner = r#"(outer:list {per: "run"})
-        -[:next]->(code:fact)
-            -[:next]->(:given {value: hex(8)});"#;
+        -|:next|->(code:fact)
+            -|:next|->(:given {value: hex(8)});"#;
         assert!(rejected(&shape(inner)).contains(&told("hex")));
     }
 
     #[test]
     fn a_walk_that_is_a_step_of_walks_not_drawn_for_the_same_thing_has_to_say() {
         let shared = r#"(code:fact)
-        =[:weighted]=>[
-            -[:next {weight: 1}]->(:given {value: "a"}),
-            -[:next {weight: 1}]->(:given {value: "b"}),
+        =|:weighted|=>[
+            -|:next {weight: 1}|->(:given {value: "a"}),
+            -|:next {weight: 1}|->(:given {value: "b"}),
         ];
     (once:list {per: "run"})
-        -[:next]->(code);
+        -|:next|->(code);
     (often:list)
-        -[:next]->(code);"#;
+        -|:next|->(code);"#;
         assert!(rejected(&shape(shared)).contains("is a step of walks that are not drawn for the same thing"));
         let said = shared.replace("(code:fact)", r#"(code:fact {per: "run"})"#);
         provider().compile(&shape(&said)).unwrap_or_else(|errors| panic!("{errors}"));

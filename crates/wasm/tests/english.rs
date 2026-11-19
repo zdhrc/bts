@@ -53,7 +53,7 @@ fn public_browser_api_materializes_the_english_toolkit() {
 fn invalid_english_arguments_have_browser_source_diagnostics() {
     let expression = "format_date(self.input)";
     let source = format!(
-        "(a:agent) {{input: \"2026-02-30\", output: t.output}}; (a)-[:next]->(t:task) {{input: a.input, output: {expression}}};"
+        "(a:agent) {{input: \"2026-02-30\", output: t.output}}; (a)-|:next|->(t:task) {{input: a.input, output: {expression}}};"
     );
     let result = generate(&source, 1);
     assert_eq!(result["ok"], false, "{result}");

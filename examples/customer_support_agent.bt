@@ -1,18 +1,18 @@
 # the hotel's reservations stand beside the agent as entities of a world, each defined once
 # the lookup tool finds a reservation by its number, so every step that reads a booking reads the same one
 (overnight_stay:entity)
-    -[:next]->(:given {value: {id: "HTL-4821", booking: {status: "confirmed", overnight_check_in: true}}});
+    -|:next|->(:given {value: {id: "HTL-4821", booking: {status: "confirmed", overnight_check_in: true}}});
 (evening_stay:entity)
-    -[:next]->(:given {value: {id: "HTL-7390", booking: {status: "confirmed", overnight_check_in: false}}});
+    -|:next|->(:given {value: {id: "HTL-7390", booking: {status: "confirmed", overnight_check_in: false}}});
 (cancelled_stay:entity)
-    -[:next]->(:given {value: {id: "HTL-9102", booking: {status: "cancelled", overnight_check_in: true}}});
+    -|:next|->(:given {value: {id: "HTL-9102", booking: {status: "cancelled", overnight_check_in: true}}});
 
-("customer-support-agent":agent) {input: [|{name: "Maya", reservation_id: "HTL-4821", arrival_hour: 25, message: "My flight is delayed. Can I still check in when I arrive?"}, {name: "Riley", reservation_id: "HTL-7390", arrival_hour: 26, message: "Will the front desk still be open?"}, {name: "Avery", reservation_id: "HTL-9102", arrival_hour: 25, message: "Can you check that my booking is active?"}|], output: ("late-arrival").output};
-("customer-support-agent")-[:next]->("late-arrival");
+("customer-support-agent":agent) {input: [{name: "Maya", reservation_id: "HTL-4821", arrival_hour: 25, message: "My flight is delayed. Can I still check in when I arrive?"}, {name: "Riley", reservation_id: "HTL-7390", arrival_hour: 26, message: "Will the front desk still be open?"}, {name: "Avery", reservation_id: "HTL-9102", arrival_hour: 25, message: "Can you check that my booking is active?"}], output: ("late-arrival").output};
+("customer-support-agent")-|:next|->("late-arrival");
 ("late-arrival":task) {
     metadata: {batch_id: ("late-arrival").local.case_batch_id, correlation_id: ("late-arrival").local.case_batch_id, reply_count: len (self.output)},
     metrics: {requests: len (self.input)},
-    tags: [|"customer-support", "late-arrival"|],
+    tags: ["customer-support", "late-arrival"],
     expected: {replies: 3},
     duration: 0.1,
     input: ("customer-support-agent").input,
@@ -20,8 +20,8 @@
     local: {case_batch_id: hex (8)}
 };
 ("late-arrival")
-    =[:repeat {count: 3}]=>[-[requests:calls]->("handle-late-arrival")]
-        >[:reduce {observe: "result", initial: [||], combine: [|...context.accumulator, context.arrival.value|]} [requests]]>>(replies:task) {output: context.accumulator};
+    =|:repeat {count: 3}|=>[-|requests:calls|->("handle-late-arrival")]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |requests||>>(replies:task) {output: context.accumulator};
 ("handle-late-arrival":task) {
     input: ("late-arrival").input[: context.count][context.index],
     output: ("draft-reply").output,
@@ -31,12 +31,12 @@
         handoff: range(0, 1),
     }
 };
-("lookup-reservation") =[:conditional]=>[-[:next {when: ("handle-late-arrival").local.retried}]->("retry-reservation")];
+("lookup-reservation") =|:conditional|=>[-|:next {when: ("handle-late-arrival").local.retried}|->("retry-reservation")];
 ("retry-reservation":tool) {
     input: ("lookup-reservation").input,
     output: ("lookup-reservation").output
 };
-("lookup-reservation")-[:next]->("check-arrival-policy");
+("lookup-reservation")-|:next|->("check-arrival-policy");
 ("check-arrival-policy":function) {
     duration: 0.02,
     input: {arrival_hour: ("handle-late-arrival").input.arrival_hour, reservation: ("handle-late-arrival").local.retried ? ("retry-reservation").output : ("lookup-reservation").output},
@@ -48,7 +48,7 @@
         can_check_in: self.input.reservation.found && self.input.reservation.booking.status == "confirmed" && ${("handle-late-arrival").local.planned_hour < 24 || self.input.reservation.booking.overnight_check_in},
     }
 };
-("handle-late-arrival")-[:calls]->("lookup-reservation");
+("handle-late-arrival")-|:calls|->("lookup-reservation");
 ("lookup-reservation":tool) {
     input: {reservation_id: ("handle-late-arrival").input.reservation_id == null ? null : upper (trim (("handle-late-arrival").input.reservation_id))},
     error: self.output.found ? null : "reservation-not-found",
@@ -56,7 +56,7 @@
     duration: 0.05,
     output: self.input.reservation_id == overnight_stay.attributes.id ? {found: true, booking: overnight_stay.attributes.booking} : self.input.reservation_id == evening_stay.attributes.id ? {found: true, booking: evening_stay.attributes.booking} : self.input.reservation_id == cancelled_stay.attributes.id ? {found: true, booking: cancelled_stay.attributes.booking} : {found: false, booking: null}
 };
-("check-arrival-policy") =[:exclusive]=>[-[:next {when: ("handle-late-arrival").local.handoff == 0}]->("front-desk-message"), -[:next {when: ("handle-late-arrival").local.handoff == 1}]->("callback-request")];
+("check-arrival-policy") =|:exclusive|=>[-|:next {when: ("handle-late-arrival").local.handoff == 0}|->("front-desk-message"), -|:next {when: ("handle-late-arrival").local.handoff == 1}|->("callback-request")];
 ("front-desk-message":task) {
     input: ("check-arrival-policy").output,
     output: {channel: "front-desk-message", status: self.input.needs_staff ? "queued" : "not-required"}
@@ -65,11 +65,11 @@
     input: ("check-arrival-policy").output,
     output: {channel: "callback", status: self.input.needs_staff ? "queued" : "not-required"}
 };
-("check-arrival-policy")-[:next]->("draft-reply");
+("check-arrival-policy")-|:next|->("draft-reply");
 ("draft-reply":llm) {
     duration: range (0.4, 0.9),
     metadata: {language: "en", style: choice ("concise", "reassuring")},
-    metrics: {message_characters: len (self.input.message), reply_characters: len (self.output.content), confidence: weighted ([|0.96, 8|],[|0.81, 2|])},
+    metrics: {message_characters: len (self.input.message), reply_characters: len (self.output.content), confidence: weighted ([0.96, 8],[0.81, 2])},
     input: {name: ("handle-late-arrival").input.name, reservation_id: ("handle-late-arrival").input.reservation_id, message: trim (("handle-late-arrival").input.message), policy: ("check-arrival-policy").output, retried: ("handle-late-arrival").local.retried, handoff: ("handle-late-arrival").local.handoff == 0 ? ("front-desk-message").output : ("callback-request").output},
     output: {retried: self.input.retried, handoff: self.input.handoff, role: "assistant", recipient: self.input.name, content: ("draft-reply").local.reply_action == "check-in-on-arrival" ? "${("draft-reply").local.greeting} Your booking is confirmed and check-in at ${self.input.policy.clock_hour}:00 is available. Bring your ID and booking confirmation." : ("draft-reply").local.reply_action == "contact-front-desk" ? "${("draft-reply").local.greeting} Your booking is confirmed, but arriving ${self.input.policy.minutes_after_midnight} minutes after midnight needs an arrangement with the front desk. Please contact them before travelling; overnight access is not confirmed yet." : ("draft-reply").local.reply_action == "contact-reservations" ? "${("draft-reply").local.greeting} This booking is cancelled. Please contact reservations to arrange a new stay before travelling." : ("draft-reply").local.reply_action == "verify-arrival-time" ? "${("draft-reply").local.greeting} Please confirm your arrival date and time so we can check the correct arrival window." : "${("draft-reply").local.greeting} I couldn't find that reservation. Please double-check the number in your confirmation email.", reservation_id: self.input.reservation_id, next_step: ("draft-reply").local.reply_action, needs_staff: self.input.policy.needs_staff},
     local: {
@@ -78,22 +78,22 @@
     }
 };
 ("customer-support-cases":dataset) {
-    cases: [|("standard-arrivals"), ("reservation-recovery"), ("arrival-window")|]
+    cases: [("standard-arrivals"), ("reservation-recovery"), ("arrival-window")]
 };
 ("standard-arrivals":case) {
-    input: [|{name: "Maya", reservation_id: "HTL-4821", arrival_hour: 25, message: "My flight is delayed. Can I check in at 1 a.m.?"}, {name: "Riley", reservation_id: "HTL-7390", arrival_hour: 26, message: "Will the front desk still be open at 2 a.m.?"}, {name: "Avery", reservation_id: "HTL-9102", arrival_hour: 25, message: "Can you check that my booking is active?"}|],
-    expected: [|{next_step: "check-in-on-arrival", needs_staff: false}, {next_step: "contact-front-desk", needs_staff: true}, {next_step: "contact-reservations", needs_staff: true}|],
-    tags: [|"standard-arrivals"|]
+    input: [{name: "Maya", reservation_id: "HTL-4821", arrival_hour: 25, message: "My flight is delayed. Can I check in at 1 a.m.?"}, {name: "Riley", reservation_id: "HTL-7390", arrival_hour: 26, message: "Will the front desk still be open at 2 a.m.?"}, {name: "Avery", reservation_id: "HTL-9102", arrival_hour: 25, message: "Can you check that my booking is active?"}],
+    expected: [{next_step: "check-in-on-arrival", needs_staff: false}, {next_step: "contact-front-desk", needs_staff: true}, {next_step: "contact-reservations", needs_staff: true}],
+    tags: ["standard-arrivals"]
 };
 ("reservation-recovery":case) {
-    input: [|{name: "Sam", reservation_id: "UNKNOWN", arrival_hour: 25, message: "Can you find my booking?"}, {name: "Taylor", reservation_id: null, arrival_hour: 25, message: "I lost my confirmation email."}, {name: "Jordan", reservation_id: " htl-4821 ", arrival_hour: 25, message: "Please confirm late check-in."}|],
-    expected: [|{next_step: "verify-reservation-number", needs_staff: false}, {next_step: "verify-reservation-number", needs_staff: false}, {next_step: "check-in-on-arrival", needs_staff: false}|],
-    tags: [|"reservation-recovery"|]
+    input: [{name: "Sam", reservation_id: "UNKNOWN", arrival_hour: 25, message: "Can you find my booking?"}, {name: "Taylor", reservation_id: null, arrival_hour: 25, message: "I lost my confirmation email."}, {name: "Jordan", reservation_id: " htl-4821 ", arrival_hour: 25, message: "Please confirm late check-in."}],
+    expected: [{next_step: "verify-reservation-number", needs_staff: false}, {next_step: "verify-reservation-number", needs_staff: false}, {next_step: "check-in-on-arrival", needs_staff: false}],
+    tags: ["reservation-recovery"]
 };
 ("arrival-window":case) {
-    input: [|{name: "Morgan", reservation_id: "HTL-4821", arrival_hour: 14, message: "Can I arrive early?"}, {name: "Casey", reservation_id: "HTL-7390", arrival_hour: 23, message: "I should arrive before midnight."}, {name: "Quinn", reservation_id: "HTL-4821", arrival_hour: 30, message: "My flight arrives the next morning."}|],
-    expected: [|{next_step: "verify-arrival-time", needs_staff: false}, {next_step: "check-in-on-arrival", needs_staff: false}, {next_step: "verify-arrival-time", needs_staff: false}|],
-    tags: [|"arrival-window"|]
+    input: [{name: "Morgan", reservation_id: "HTL-4821", arrival_hour: 14, message: "Can I arrive early?"}, {name: "Casey", reservation_id: "HTL-7390", arrival_hour: 23, message: "I should arrive before midnight."}, {name: "Quinn", reservation_id: "HTL-4821", arrival_hour: 30, message: "My flight arrives the next morning."}],
+    expected: [{next_step: "verify-arrival-time", needs_staff: false}, {next_step: "check-in-on-arrival", needs_staff: false}, {next_step: "verify-arrival-time", needs_staff: false}],
+    tags: ["arrival-window"]
 };
 ("next-step-correctness":scorer) {
     score: len (context.output) == len (context.expected) && len (context.output) == 3 && context.output[0].next_step == context.expected[0].next_step && context.output[1].next_step == context.expected[1].next_step && context.output[2].next_step == context.expected[2].next_step ? 1 : 0
@@ -104,5 +104,5 @@
 ("customer-support":experiment) {
     dataset: ("customer-support-cases"),
     task: ("late-arrival"),
-    scorers: [|("next-step-correctness"), ("staff-escalation-correctness")|]
+    scorers: [("next-step-correctness"), ("staff-escalation-correctness")]
 };

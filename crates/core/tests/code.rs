@@ -368,7 +368,7 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
     let model = compile(
         r#"(request_root:task {name: "request"}) {output: "hello", input: support.input};
 (support:agent) {input: null, output: request_root.output};
-(support)-[:next]->(request_root);"#,
+(support)-|:next|->(request_root);"#,
     )
     .unwrap();
     let out = std::env::temp_dir().join(format!("bts-agent-target-{}", uuid::Uuid::new_v4()));
@@ -412,9 +412,9 @@ fn alternate_agent_target_assembles_and_plans_without_sdk_or_filesystem_access()
 #[test]
 fn language_functions_execute_in_generated_agents() {
     let model = compile(
-        r#"(language_root:task {name: "language"}) {input: language.input, output: {text: render(self.input.template, {name: "Zoë", n: 6.0, ok: true}), composed: compose(self.input.parts), selected: language_root.local.selected, reused: language_root.local.selected, all: sample([|"same", "same"|], 2), empty: sample([||], 0), nested: compose([|"Details:", compose(sample([|"one", "two"|], 2), ", ")|])}, local: {selected: sample([|0, 1, 2, 3, 4|], self.input.count)}};
-(language:agent) {input: {template: "{{{name}}}: {n} {ok}", count: 2, parts: [|null, "", "Hi!", "there"|]}, output: language_root.output};
-(language)-[:next]->(language_root);"#,
+        r#"(language_root:task {name: "language"}) {input: language.input, output: {text: render(self.input.template, {name: "Zoë", n: 6.0, ok: true}), composed: compose(self.input.parts), selected: language_root.local.selected, reused: language_root.local.selected, all: sample(["same", "same"], 2), empty: sample([], 0), nested: compose(["Details:", compose(sample(["one", "two"], 2), ", ")])}, local: {selected: sample([0, 1, 2, 3, 4], self.input.count)}};
+(language:agent) {input: {template: "{{{name}}}: {n} {ok}", count: 2, parts: [null, "", "Hi!", "there"]}, output: language_root.output};
+(language)-|:next|->(language_root);"#,
     )
     .unwrap();
     let root = std::env::temp_dir().join(format!("bts-language-{}", uuid::Uuid::new_v4()));
@@ -622,7 +622,7 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         ("self.input.n / 2", "1"),
         ("self.input.n / 2.0", "1.0"),
         ("choice(6.0, 6.0)", "6.0"),
-        ("weighted([|6.0, 1|], [|6.0, 2|])", "6.0"),
+        ("weighted([6.0, 1], [6.0, 2])", "6.0"),
         ("range(6.0, 6.0)", "6.0"),
         ("-self.input.n / 3", "0"),
         ("-self.input.n % 2", "0"),
@@ -630,7 +630,7 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         ("max(self.input.n, 1.0)", "2.0"),
         ("clamp(self.input.n, 0, 6.0)", "2.0"),
         ("abs(-self.input.n * 1.0)", "2.0"),
-        ("[|6.0|][0]", "6.0"),
+        ("[6.0][0]", "6.0"),
         ("self.input.n == 2 ? 6.0 : 7", "6.0"),
         ("true", "true"),
     ];
@@ -648,7 +648,7 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         )
     };
     let source = format!(
-        "(numeric_root:task {{name: \"numeric\"}}) {{input: numeric.input, output: [|{}|]}};\n(numeric:agent) {{input: {{n: 2}}, output: numeric_root.output}};\n(numeric)-[:next]->(numeric_root);",
+        "(numeric_root:task {{name: \"numeric\"}}) {{input: numeric.input, output: [{}]}};\n(numeric:agent) {{input: {{n: 2}}, output: numeric_root.output}};\n(numeric)-|:next|->(numeric_root);",
         cases
             .iter()
             .map(|(expression, _)| render(expression))
@@ -664,16 +664,16 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
     let invalid = [
         "1.0",
         "choice(1.0, 1.0)",
-        "weighted([|1.0, 1|], [|1.0, 2|])",
+        "weighted([1.0, 1], [1.0, 2])",
         "range(1.0, 1.0)",
         "self.input.n / 2.0",
         "min(self.input.n, 1.0)",
-        "[|1.0|][0]",
+        "[1.0][0]",
     ];
     for expression in invalid {
         assert!(
             generate(&format!(
-                "(t_root:task {{name: \"t\"}}) {{input: t.input, output: sample ([|1 , 2|] , {expression})}};\n(t:agent) {{input: {{n: 2}}, output: t_root.output}};\n(t)-[:next]->(t_root);"
+                "(t_root:task {{name: \"t\"}}) {{input: t.input, output: sample ([1 , 2] , {expression})}};\n(t:agent) {{input: {{n: 2}}, output: t_root.output}};\n(t)-|:next|->(t_root);"
             ))
             .is_err(),
             "{expression}"
@@ -692,11 +692,11 @@ fn language_numeric_contract_matches_native_agents_and_scorers() {
         .collect::<Vec<_>>();
     for (index, expression) in invalid.iter().enumerate() {
         scorers.push(format!(
-            "(\"sample{index}\":scorer) {{score: len (sample ([|1 , 2|] , {}))}};",
+            "(\"sample{index}\":scorer) {{score: len (sample ([1 , 2] , {}))}};",
             expression.replace("self.input", "context.input")
         ));
     }
-    scorers.push("(\"integer\":scorer) {score: len (sample ([|1 , 2|] , context.input.n / 2))};".into());
+    scorers.push("(\"integer\":scorer) {score: len (sample ([1 , 2] , context.input.n / 2))};".into());
     let scorer_model = compile(&scorers.join("\n")).unwrap();
     let items = scorer_model
         .scorers
