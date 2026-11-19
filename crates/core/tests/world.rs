@@ -367,6 +367,63 @@ fn a_walk_is_a_step_of_another_walk() {
 }
 
 #[test]
+fn a_walk_that_is_a_step_is_drawn_for_what_its_walk_is_drawn_for() {
+    // the sentence does not say, so its fork is drawn once for each conversation like the persona it is a step of
+    let world = r#"(chat:series {turns: 4});
+(customer:persona {per: chat.number})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "I", person: "first"})
+        =[:weighted]=>[
+            -[:next {weight: 1}]->(:part {verb: "need", complement: "a refund"}),
+            -[:next {weight: 1}]->(:part {verb: "want", complement: "my money back"}),
+            -[:next {weight: 1}]->(:part {verb: "have", complement: "a billing problem"}),
+        ];"#;
+    let said = |world: &str| -> Vec<String> {
+        let source = shape(world, "customer.said[0]");
+        let model = SELECTED
+            .compile(&source)
+            .unwrap_or_else(|errors| panic!("{errors}\n{source}"));
+        let batch = data::generate(
+            model,
+            48,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            3,
+            &(),
+        )
+        .unwrap();
+        (batch.events.iter())
+            .map(|event| {
+                event
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .project(&())
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    };
+    let turns = said(world);
+    assert_eq!(turns.len(), 48);
+    for conversation in turns.chunks(4) {
+        assert!(conversation.iter().all(|turn| *turn == conversation[0]), "{conversation:?}");
+    }
+    // conversations still differ from one another
+    assert!(turns.iter().collect::<BTreeSet<_>>().len() > 1);
+    // a step that says it is drawn for each trace is, whatever its walk is drawn for
+    let each_trace = said(&world.replace("(:sentence)", "(:sentence {per: context.trace_index})"));
+    assert!(
+        each_trace
+            .chunks(4)
+            .any(|conversation| conversation.iter().any(|turn| *turn != conversation[0]))
+    );
+}
+
+#[test]
 fn a_fact_has_a_value_and_an_entity_has_attributes() {
     let world = r#"(fare:fact)
     =[:weighted]=>[
@@ -659,25 +716,97 @@ fn a_series_is_several_traces_that_belong_together() {
         ("{turns: 0}", "a series has a whole number of turns from 1 to 256"),
         ("{turns: 2, up_to: 2.5}", "a series has a whole number of turns from 1 to 256"),
     ] {
-        let model = SELECTED.compile(&source.replace("{turns: 3}", written)).unwrap();
-        let error = data::generate(
-            model,
-            1,
-            Duration::from_secs(3600),
-            data::Distribution::Linear,
-            UNIX_EPOCH + Duration::from_secs(7200),
-            5,
-            &(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains(message), "{error}");
+        // lengths that are written are checked where the series is written, before any trace
+        let found = rejected(&source.replace("{turns: 3}", written));
+        assert!(found.contains(message), "{written}: {found}");
     }
+    // lengths that are computed are checked by the trace that reads them
+    let computed = source.replace("{turns: 3}", "{turns: 2, up_to: 4, weights: [|1, range(1, 2)|]}");
+    let model = SELECTED.compile(&computed).unwrap();
+    let error = data::generate(
+        model,
+        1,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        5,
+        &(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(weights), "{error}");
     // a series has no steps
     let found = rejected(&shape(
         "(chat:series)-[:next]->(:policy {subject: \"a\", verb: \"be\"});",
         "chat.id",
     ));
     assert!(found.contains("a series has no steps, so nothing leaves it"), "{found}");
+}
+
+#[test]
+fn dividing_two_integers_gives_an_integer() {
+    // the remainder is dropped toward zero, written or computed, and a float on either side gives a float
+    let said = outputs(
+        &shape(
+            "",
+            "{whole: 7 / 2, negative: -7 / 2, half: 7 / 2.0, drawn: range(8, 8) / 100, fraction: range(8, 8) / 100.0}",
+        ),
+        0..1,
+    );
+    assert_eq!(
+        said[0],
+        json!({"whole": 3, "negative": -3, "half": 3.5, "drawn": 0, "fraction": 0.08})
+    );
+}
+
+#[test]
+fn a_list_keeps_its_sentences_apart() {
+    // a text message drops the full stop of each sentence, and the list puts one back between them
+    let world = r#"(customer:persona {style: "text_message"})
+    -[:next]->(:list)
+        -[:next]->(:sentence)
+            -[:next]->(:part {subject: "someone", verb: "hit", tense: "past", complement: "my car"})
+        -[:next]->(:sentence) {defaults: {form: "question", modal: "can"}}
+            -[:next]->(:part {subject: "you", person: "second", verb: "help"})
+        -[:next]->(:sentence)
+            -[:next]->(:part {subject: "I", person: "first", verb: "need", complement: "a claim"});"#;
+    let said = outputs(&shape(world, "customer.said[0]"), 0..1);
+    assert_eq!(said[0], "someone hit my car. can you help? i need a claim");
+    // sentences that end as written are joined as they are, and nothing is added after the last
+    let joined = outputs(
+        &shape("", r#"paragraph([|"It rained.", null, "", "Did it stop?", "Not yet"|])"#),
+        0..1,
+    );
+    assert_eq!(joined[0], "It rained. Did it stop? Not yet");
+}
+
+#[test]
+fn a_tag_is_written_or_computed() {
+    // a tag reads the world, a condition or a function like any other string
+    let source = r#"(line:fact)
+    -[:next]->(:given {value: "home"});
+(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "t"}) {
+    input: a.input,
+    output: "ok",
+    local: {vip: true},
+    tags: [|"claims", line.value, self.local.vip ? "vip" : "standard", lower("WEB")|],
+};
+"#;
+    let model = SELECTED.compile(source).unwrap_or_else(|errors| panic!("{errors}"));
+    let batch = data::generate(
+        model,
+        1,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        1,
+        &(),
+    )
+    .unwrap();
+    assert_eq!(&*batch.events[0].tags, ["claims", "home", "vip", "web"]);
+    // a number is not a tag
+    let found = rejected(&source.replace("line.value", "3"));
+    assert!(found.contains("a tag is a string, written or computed"), "{found}");
 }
 
 #[test]
@@ -762,25 +891,33 @@ fn the_world_example_in_the_skill_generates() {
 fn a_verb_without_forms_is_rejected_where_it_is_written() {
     // a sentence is put into words when a trace reads it, on the branch a draw takes
     // a verb written as a word is looked up when the shape compiles, so no branch hides it
-    let unknown = "unknown English verb \"appreciate\", write its forms as {base: \"appreciate\"";
+    let unknown = "unknown English verb \"reconcile\", write its forms as {base: \"reconcile\"";
     for world in [
-        "(w:list)\n    -[:next]->(:policy {subject: \"we\", person: \"first\", number: \"plural\", verb: \"appreciate\"});",
-        "(w:sentence)\n    =[:weighted]=>[\n        -[:next {weight: 99}]->(:part {subject: \"I\", person: \"first\", verb: \"wait\"}),\n        -[:next {weight: 1}]->(:part {subject: \"I\", person: \"first\", verb: \"appreciate\"}),\n    ];",
-        "(w:sentence) {defaults: {verb: \"appreciate\"}}\n    -[:next]->(:part {subject: \"I\", person: \"first\"});",
+        "(w:list)\n    -[:next]->(:policy {subject: \"we\", person: \"first\", number: \"plural\", verb: \"reconcile\"});",
+        "(w:sentence)\n    =[:weighted]=>[\n        -[:next {weight: 99}]->(:part {subject: \"I\", person: \"first\", verb: \"wait\"}),\n        -[:next {weight: 1}]->(:part {subject: \"I\", person: \"first\", verb: \"reconcile\"}),\n    ];",
+        "(w:sentence) {defaults: {verb: \"reconcile\"}}\n    -[:next]->(:part {subject: \"I\", person: \"first\"});",
     ] {
         let source = shape(world, "w.text");
         let errors = SELECTED.compile_module(&source, false).unwrap_err();
         assert!(errors[0].what.starts_with(unknown), "{}\n{world}", errors[0].what);
         // the error is at the verb, in the author's own source
         assert_eq!(errors[0].r#where.source, 0);
-        assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], "\"appreciate\"");
+        assert_eq!(&source[errors[0].r#where.start..errors[0].r#where.end], "\"reconcile\"");
     }
     // a verb written with its forms, and a verb the provider knows, compile
     for world in [
-        "(w:sentence)\n    -[:next]->(:part {subject: \"I\", person: \"first\", verb: {base: \"appreciate\", third_person_singular: \"appreciates\", past: \"appreciated\", past_participle: \"appreciated\", present_participle: \"appreciating\"}});",
+        "(w:sentence)\n    -[:next]->(:part {subject: \"I\", person: \"first\", verb: {base: \"reconcile\", third_person_singular: \"reconciles\", past: \"reconciled\", past_participle: \"reconciled\", present_participle: \"reconciling\"}});",
         "(w:sentence)\n    -[:next]->(:part {subject: \"I\", person: \"first\", verb: \"wait\"});",
     ] {
         SELECTED.compile_module(&shape(world, "w.text"), false).unwrap();
+    }
+    // a statement and a policy take the forms the error asks for, as a part does
+    let forms = "{base: \"reconcile\", third_person_singular: \"reconciles\", past: \"reconciled\", past_participle: \"reconciled\", present_participle: \"reconciling\"}";
+    for kind in ["statement", "policy"] {
+        let world =
+            format!("(w:list)\n    -[:next]->(:{kind} {{subject: \"the team\", verb: {forms}, complement: \"the report\"}});");
+        let said = outputs(&shape(&world, "w.text"), 0..1);
+        assert_eq!(said[0], "The team reconciles the report.");
     }
 }
 

@@ -5,7 +5,9 @@ use std::ops::Range;
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{Analysis, ConditionPosition, Error, Form, NegationStyle, Polarity, RealizeOptions, Sentence, analyze, realize};
+use super::{
+    Analysis, ConditionPosition, Error, Form, NegationStyle, Polarity, RealizeOptions, Sentence, Verb, analyze, realize,
+};
 
 /// Enables independent transformations. Disabled controls leave wording alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -216,6 +218,36 @@ struct Conditional<'a> {
     before: bool,
 }
 
+// whether a word is followed by a question put with `if`, as in checking if it works
+fn asks(word: &str) -> bool {
+    const ASKING: &[&str] = &[
+        "ask",
+        "check",
+        "confirm",
+        "decide",
+        "determine",
+        "doubt",
+        "know",
+        "remember",
+        "see",
+        "test",
+        "verify",
+        "wonder",
+    ];
+    let word = word.to_lowercase();
+    matches!(word.as_str(), "sure" | "unsure" | "clear" | "unclear" | "idea" | "out")
+        || ASKING.iter().filter_map(|base| Verb::lookup(base)).any(|verb| {
+            [
+                &verb.base,
+                &verb.third_person_singular,
+                &verb.past,
+                &verb.past_participle,
+                &verb.present_participle,
+            ]
+            .contains(&&word)
+        })
+}
+
 impl<'a> Conditional<'a> {
     fn parse(source: &'a str) -> Option<Self> {
         let trimmed = source.trim();
@@ -239,6 +271,10 @@ impl<'a> Conditional<'a> {
             } else {
                 let (main, condition) = body.split_once(" if ")?;
                 if main.is_empty() || condition.is_empty() || main.contains(',') || condition.contains(',') {
+                    return None;
+                }
+                // after a word that asks, `if` means whether, and the clause is what is asked, not a condition
+                if main.rsplit(' ').next().is_some_and(asks) {
                     return None;
                 }
                 (condition, main, leading + main.len() + 4, leading, false)

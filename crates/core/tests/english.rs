@@ -1183,8 +1183,8 @@ mod parity {
             ("Thank you.", json!({"casual":true,"probability":0}), "Thank you."),
             (
                 "Thank you.",
-                json!({"style":"neutral","alternatives":[{"from":"Thank you","to":["Much appreciated"]}]}),
-                "Much appreciated.",
+                json!({"style":"neutral","alternatives":[{"from":"Thank you","to":["Much reconciled"]}]}),
+                "Much reconciled.",
             ),
             (
                 "I will check.",
@@ -1922,6 +1922,12 @@ fn styles_preserve_ambiguous_grammar_protected_text_and_questions() {
         ("I am not checking the file.", json!({"fragments":true,"negation":false})),
         ("I am checking the file?", json!({"fragments":true})),
         ("I am checking if the file exists.", json!({"fragments":true})),
+        ("I am checking if the file works.", json!({"fragments":true})),
+        (
+            "I wonder if the file opens.",
+            json!({"condition_order":true,"negation":false}),
+        ),
+        ("I am not sure if the file works.", json!({"fragments":true})),
         ("I will thank you tomorrow.", json!({"casual":true})),
         ("I am.", json!({"contractions":true})),
         ("Yes?", json!({"punctuation":"expressive"})),

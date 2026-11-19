@@ -18,9 +18,11 @@
 //! A walk may say what it is drawn for with its `per` property. That value then
 //! stands in for the trace index, so every trace that gives the same value sees the
 //! same walk: one conversation, one customer, or the whole run.
+//! A walk that is a step of another and does not say is drawn for what that walk is
+//! drawn for, so what is nested in a walk stays the same as long as the walk does.
 
 use crate::mocking::data::Value;
-use crate::mocking::{EvaluateError, Evaluation};
+use crate::mocking::{EvaluateError, Evaluation, Known};
 use crate::providers::{Supplied, Supply};
 use bts_lang::{
     Array, ArrayElem, BindingId, Diag, DiagPhase, Diags, Direction, EdgeId, ElementId, FieldType, ForkId, Func, Model, NodeId,
@@ -85,6 +87,87 @@ fn roots(model: &Model) -> impl Iterator<Item = NodeId> + '_ {
     (model.nodes.iter().enumerate())
         .filter(|(_, node)| model.derives(&node.kind, WALK))
         .map(|(index, _)| NodeId(index))
+}
+
+// the `per` a walk states, when it states one
+fn stated(model: &Model, walk: NodeId) -> Option<Graph> {
+    (model.nodes[walk.0].props.iter())
+        .map(|id| &model.bindings[id.0])
+        .find(|binding| binding.path == [PER])
+        .map(|binding| binding.value.clone())
+        .filter(|value| !matches!(value, Graph::Null))
+}
+
+// the walks a walk leads to as steps, up to each of them
+fn inner(model: &Model, walk: NodeId) -> Vec<NodeId> {
+    let mut found = Vec::new();
+    let mut seen = BTreeSet::from([walk]);
+    let mut pending = vec![walk];
+    while let Some(node) = pending.pop() {
+        for edge in &model.edges {
+            if edge.source != node || edge.primitive != Primitive::Next || !seen.insert(edge.target) {
+                continue;
+            }
+            if model.derives(&model.nodes[edge.target.0].kind, WALK) {
+                found.push(edge.target);
+            } else {
+                pending.push(edge.target);
+            }
+        }
+    }
+    found
+}
+
+/// What each walk is drawn for, or nothing for a walk drawn for each trace.
+///
+/// A walk that states `per` is drawn for that. A walk that is a step of another and
+/// does not say is drawn for what that walk is drawn for, so a fork nested in a walk
+/// drawn for a conversation is the same on every turn of it. A walk that is a step of
+/// several walks takes `per` from them only when one walk states it for them all.
+fn drawn_per(model: &Model) -> Result<BTreeMap<NodeId, Option<Graph>>, Diag> {
+    let mut outer: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    for root in roots(model) {
+        for step in inner(model, root) {
+            outer.entry(step).or_default().push(root);
+        }
+    }
+    // the walk whose `per` a walk is drawn for, itself when it states one
+    fn states(
+        model: &Model,
+        outer: &BTreeMap<NodeId, Vec<NodeId>>,
+        walk: NodeId,
+        path: &mut Vec<NodeId>,
+    ) -> Result<Option<NodeId>, Diag> {
+        if stated(model, walk).is_some() {
+            return Ok(Some(walk));
+        }
+        // a walk that is a step of itself is reported where walks are built
+        if path.contains(&walk) {
+            return Ok(None);
+        }
+        path.push(walk);
+        let mut found: Option<Option<NodeId>> = None;
+        for holder in outer.get(&walk).into_iter().flatten() {
+            let from = states(model, outer, *holder, path)?;
+            if found.is_some_and(|known| known != from) {
+                return Err(fail(
+                    model.nodes[walk.0].range,
+                    format!(
+                        "this walk is a step of walks that are not drawn for the same thing, so say what it is drawn for with `{PER}`"
+                    ),
+                ));
+            }
+            found = Some(from);
+        }
+        path.pop();
+        Ok(found.flatten())
+    }
+    roots(model)
+        .map(|root| {
+            let from = states(model, &outer, root, &mut Vec::new())?;
+            Ok((root, from.and_then(|walk| stated(model, walk))))
+        })
+        .collect()
 }
 
 fn each_series(model: &Model) -> impl Iterator<Item = NodeId> + '_ {
@@ -209,14 +292,15 @@ pub fn verbs(model: &Model) -> Diags {
 /// generated agent draws its own, so the walk would not be the same after all.
 pub fn samples(model: &Model) -> Diags {
     let mut diags = Diags::new();
+    // a walk whose steps disagree about `per` is reported where walks are built
+    let Ok(per) = drawn_per(model) else {
+        return diags;
+    };
     for root in roots(model) {
-        let stated = (model.nodes[root.0].props.iter())
-            .map(|id| &model.bindings[id.0])
-            .any(|binding| binding.path == [PER] && !matches!(binding.value, Graph::Null));
-        if !stated {
+        if per[&root].is_none() {
             continue;
         }
-        // the walk and what it leads to, up to a walk that is a step, which says for itself
+        // the walk and what it leads to, up to a walk that is a step, which is looked at for itself
         let mut owners = BTreeSet::from([ElementId::Node(root)]);
         let mut pending = vec![root];
         while let Some(node) = pending.pop() {
@@ -786,14 +870,11 @@ pub fn supply(model: &Model) -> Result<Supplied, Diag> {
         });
     }
     let mut within: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+    let mut drawn = drawn_per(model)?;
     for root in roots(model) {
         let node = &model.nodes[root.0];
         let name = node.name.clone().unwrap_or_else(|| format!("walk{}", root.0));
-        let per = (node.props.iter())
-            .map(|id| &model.bindings[id.0])
-            .find(|binding| binding.path == [PER])
-            .map(|binding| binding.value.clone())
-            .filter(|value| !matches!(value, Graph::Null));
+        let per = drawn.remove(&root).flatten();
         let mut walker = Walker {
             model,
             root,
@@ -1055,12 +1136,11 @@ fn turns_of(value: &Value) -> Result<u64, EvaluateError> {
 const TURNS_SHAPE: &str = "a series has a whole number of turns from 1 to 256";
 const WEIGHTS_SHAPE: &str = "a series takes one weight for each length from turns to up_to, none negative and one positive";
 
-/// Evaluates a series' place for one trace.
-pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
-    let [Value::String(label), Value::Number(index), turns, up_to, weights] = args else {
-        return Err(EvaluateError::Shape);
-    };
-    let index = index.as_u64().ok_or(EvaluateError::Shape)?;
+// the fewest turns, the most when stated, and a weight for each length when stated
+type Lengths = (u64, Option<u64>, Option<Vec<f64>>);
+
+// the lengths a series may run for, as its properties state them
+fn lengths(turns: &Value, up_to: &Value, weights: &Value) -> Result<Lengths, EvaluateError> {
     let turns = turns_of(turns)?;
     let up_to = match up_to {
         Value::Null => None,
@@ -1084,6 +1164,65 @@ pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Va
         }
         _ => return Err(invalid(WEIGHTS_SHAPE)),
     };
+    Ok((turns, up_to, weights))
+}
+
+// a property written as a number, null or a list of numbers, as the value a trace would read
+fn written(value: &Graph) -> Option<Value> {
+    match value {
+        Graph::Null => Some(Value::Null),
+        Graph::Num(bts_lang::Number::Int(whole)) => Some(Value::Number((*whole).into())),
+        Graph::Num(bts_lang::Number::Float(float)) => serde_json::Number::from_f64(*float).map(Value::Number),
+        Graph::Array(array) => (array.elem.iter())
+            .map(|elem| match elem {
+                ArrayElem::Item(item) => written(item),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        _ => None,
+    }
+}
+
+/// Reports a series whose written lengths cannot hold, where the series is written.
+///
+/// A trace would fail on them the first time it asked where it sits. Lengths that are
+/// computed are left to that trace.
+pub fn bounds(model: &Model) -> Diags {
+    let mut diags = Diags::new();
+    for series in each_series(model) {
+        let node = &model.nodes[series.0];
+        let prop = |key: &str| {
+            (node.props.iter())
+                .map(|id| &model.bindings[id.0])
+                .find(|binding| binding.path == [key])
+        };
+        let value = |key: &str, otherwise: Value| match prop(key) {
+            Some(binding) => written(&binding.value),
+            None => Some(otherwise),
+        };
+        let (Some(turns), Some(up_to), Some(weights)) = (
+            value("turns", Value::Number(1.into())),
+            value("up_to", Value::Null),
+            value("weights", Value::Null),
+        ) else {
+            continue;
+        };
+        if let Err(EvaluateError::Invalid(what)) = lengths(&turns, &up_to, &weights) {
+            let at = if what == WEIGHTS_SHAPE { prop("weights") } else { None };
+            diags.push(fail(at.map_or(node.range, |binding| binding.range), what));
+        }
+    }
+    diags
+}
+
+/// Evaluates a series' place for one trace.
+pub(super) fn turn(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    let [Value::String(label), Value::Number(index), turns, up_to, weights] = args else {
+        return Err(EvaluateError::Shape);
+    };
+    let index = index.as_u64().ok_or(EvaluateError::Shape)?;
+    let (turns, up_to, weights) = lengths(turns, up_to, weights)?;
     let (seed, _) = evaluation.address();
     let (number, turn, length) = place(seed, label, index, turns, up_to, weights.as_deref());
     let whole = |value: u64| Value::Number(value.into());
@@ -1293,7 +1432,7 @@ function _world_per(per: unknown): string {
     if (typeof per === "number" && Number.isSafeInteger(per)) return String(per);
     throw new TypeError("a walk is drawn per a string or a whole number");
 }
-function _world_pick(label: string, weights: unknown, options: unknown, ...rest: unknown[]): unknown[] {
+function _world_pick<T>(label: string, weights: unknown, options: T[][], ...rest: unknown[]): T[] {
     const randomSource = rest[rest.length - 1] as () => number;
     const drawnFor = rest.length > 1 ? _world_per(rest[0]) : String(traceOf(randomSource));
     const numbers: number[] = (_serialize(weights) as unknown[]).map(weight => {
@@ -1302,7 +1441,7 @@ function _world_pick(label: string, weights: unknown, options: unknown, ...rest:
     });
     const seed = (randomSource as { seed?: number | bigint }).seed;
     const taken = _world_take(numbers, _world_draw(`${seed}/${drawnFor}/${label}`));
-    return taken === null ? [] : (_value(options) as unknown[][])[taken];
+    return taken === null ? [] : (_value(options) as T[][])[taken];
 }
 function _world_turns(value: unknown): number {
     value = _serialize(value);
@@ -1349,6 +1488,132 @@ function _world_id(label: string, per: unknown, randomSource: () => number): str
 }
 "#;
 
+// a written whole number, which a series takes for its fewest and most turns
+fn written_turns(value: &Known) -> Option<u64> {
+    match value {
+        Known::Number { low, high, whole: true } if low == high && (1.0..=256.0).contains(low) => Some(*low as u64),
+        _ => None,
+    }
+}
+
+// a weight is a number that is not negative
+fn weight(value: &Known) -> Option<(f64, f64)> {
+    match value {
+        Known::Number { low, high, .. } if *low >= 0.0 && high.is_finite() => Some((*low, *high)),
+        _ => None,
+    }
+}
+
+/// Whether a weighted fork is sure to take a branch without raising.
+///
+/// It raises for a weight that is negative or no number, and for what it is drawn per
+/// when that is neither a string nor a whole number.
+pub(super) fn picks(args: &[Known]) -> bool {
+    let (weights, options, per) = match args {
+        [Known::Text(_), Known::Items(weights), Known::Items(options)] => (weights, options, None),
+        [Known::Text(_), Known::Items(weights), Known::Items(options), per] => (weights, options, Some(per)),
+        _ => return false,
+    };
+    weights.len() == options.len()
+        && weights.iter().all(|value| weight(value).is_some())
+        && !weights.iter().chain(options).any(|item| matches!(item, Known::Run(_)))
+        && options
+            .iter()
+            .all(|option| matches!(option, Known::Items(_) | Known::List(_)))
+        && per.is_none_or(Known::key)
+}
+
+/// What a weighted fork gives: the steps of a branch that can be taken, or none when no weight is positive.
+pub(super) fn picked(args: &[Known]) -> Known {
+    let [_, Known::Items(weights), Known::Items(options), ..] = args else {
+        return Known::List(Box::new(Known::Plain));
+    };
+    if weights.len() != options.len() || weights.iter().chain(options).any(|item| matches!(item, Known::Run(_))) {
+        return Known::List(Box::new(Known::Plain));
+    }
+    let mut taken = Vec::new();
+    for (value, option) in weights.iter().zip(options) {
+        match weight(value) {
+            // a weight of zero is never taken
+            Some((_, high)) if high <= 0.0 => {}
+            Some((low, _)) => taken.push((option.clone(), low > 0.0)),
+            None => return Known::List(Box::new(Known::Plain)),
+        }
+    }
+    // without a weight that is sure to be positive the fork may take nothing
+    let sure = taken.iter().any(|(_, positive)| *positive);
+    let options = taken.into_iter().map(|(option, _)| option);
+    let nothing = (!sure).then(|| Known::Items(vec![]));
+    options.chain(nothing).reduce(Known::join).unwrap_or(Known::Items(vec![]))
+}
+
+/// Whether the place of a trace in a series is sure to be found without raising.
+pub(super) fn places(args: &[Known]) -> bool {
+    let [Known::Text(_), Known::Number { low, whole: true, .. }, turns, up_to, weights] = args else {
+        return false;
+    };
+    let Some(turns) = written_turns(turns) else { return false };
+    if *low < 0.0 {
+        return false;
+    }
+    match (up_to, weights) {
+        (Known::Null, Known::Null) => true,
+        (up_to, weights) => {
+            let Some(up_to) = written_turns(up_to).filter(|up_to| *up_to >= turns) else {
+                return false;
+            };
+            match weights {
+                Known::Null => true,
+                Known::Items(weights) => {
+                    !weights.iter().any(|item| matches!(item, Known::Run(_)))
+                        && weights.len() as u64 == up_to - turns + 1
+                        && weights.iter().all(|value| weight(value).is_some())
+                        && weights.iter().any(|value| weight(value).is_some_and(|(low, _)| low > 0.0))
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+/// What the place of a trace in a series is: three whole numbers.
+pub(super) fn placed(_: &[Known]) -> Known {
+    Known::Object(BTreeMap::from([
+        ("number".to_owned(), Known::whole(0.0, 9_007_199_254_740_991.0)),
+        ("turn".to_owned(), Known::whole(0.0, (BLOCK - 1) as f64)),
+        ("length".to_owned(), Known::whole(1.0, BLOCK as f64)),
+    ]))
+}
+
+/// Whether the draws of a walk are sure to be given without raising.
+pub(super) fn draws_fit(args: &[Known]) -> bool {
+    match args {
+        [Known::Text(_)] => true,
+        [Known::Text(_), per] => per.key(),
+        _ => false,
+    }
+}
+
+/// What the draws of a walk are: as many numbers from zero up to one as a walk may read.
+pub(super) fn draws_given(_: &[Known]) -> Known {
+    let draw = Known::Number {
+        low: 0.0,
+        high: 1.0,
+        whole: false,
+    };
+    Known::Items(vec![draw; DRAWN])
+}
+
+/// Whether the identifier of a series is sure to be given without raising.
+pub(super) fn names(args: &[Known]) -> bool {
+    matches!(args, [Known::Text(_), per] if per.key())
+}
+
+/// What the identifier of a series is.
+pub(super) fn named(_: &[Known]) -> Known {
+    Known::Text(None)
+}
+
 /// The Python text of `merge`.
 pub(super) const PY_MERGE: &str = r#"
 def _world_merge(base, objects):
@@ -1362,14 +1627,14 @@ def _world_merge(base, objects):
 
 /// The TypeScript text of `merge`.
 pub(super) const TS_MERGE: &str = r#"
-function _world_merge(base: unknown, objects: unknown): Record<string, any> {
+function _world_merge<T = Record<string, any>>(base: unknown, objects: unknown): T {
     const merged: Record<string, any> = { ..._value(base) };
     for (const item of _value(objects) as unknown[]) {
         if (item === null || item === undefined) continue;
         if (typeof item !== "object" || Array.isArray(item)) throw new TypeError("merge: every item is an object or null");
         for (const [key, value] of Object.entries(item)) if (value !== null && value !== undefined) merged[key] = value;
     }
-    return merged;
+    return merged as T;
 }
 "#;
 
@@ -1521,10 +1786,26 @@ mod tests {
         let errors = provider().compile_module(&source, false).unwrap_err();
         let error = errors.into_iter().next().unwrap();
         assert_eq!(&source[error.r#where.start..error.r#where.end], "hex(8)");
-        // a walk that is a step says for itself what it is drawn for
+        // a walk that is a step and does not say is drawn for what its walk is drawn for
         let inner = r#"(outer:list {per: "run"})
         -[:next]->(code:fact)
             -[:next]->(:given {value: hex(8)});"#;
-        provider().compile(&shape(inner)).unwrap_or_else(|errors| panic!("{errors}"));
+        assert!(rejected(&shape(inner)).contains(&told("hex")));
+    }
+
+    #[test]
+    fn a_walk_that_is_a_step_of_walks_not_drawn_for_the_same_thing_has_to_say() {
+        let shared = r#"(code:fact)
+        =[:weighted]=>[
+            -[:next {weight: 1}]->(:given {value: "a"}),
+            -[:next {weight: 1}]->(:given {value: "b"}),
+        ];
+    (once:list {per: "run"})
+        -[:next]->(code);
+    (often:list)
+        -[:next]->(code);"#;
+        assert!(rejected(&shape(shared)).contains("is a step of walks that are not drawn for the same thing"));
+        let said = shared.replace("(code:fact)", r#"(code:fact {per: "run"})"#);
+        provider().compile(&shape(&said)).unwrap_or_else(|errors| panic!("{errors}"));
     }
 }

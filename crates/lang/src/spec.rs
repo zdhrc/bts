@@ -289,6 +289,8 @@ pub mod ids {
     /// Stable language rule or function identifier.
     pub const NONZERO_DIVISORS: Id = Id::new("rule.nonzero-divisors");
     /// Stable language rule or function identifier.
+    pub const INTEGER_ARITHMETIC: Id = Id::new("rule.integer-arithmetic");
+    /// Stable language rule or function identifier.
     pub const STATIC_STRUCTURE: Id = Id::new("rule.static-structure");
 }
 const FINITE_NUMBERS_RULE: RuleDesc = RuleDesc {
@@ -949,6 +951,11 @@ const LANGUAGE_RULES: &[RuleDesc] = &[
     },
     RuleDesc {
         tags: &[],
+        id: ids::INTEGER_ARITHMETIC,
+        summary: "Arithmetic on two integers gives an integer, and with a float on either side it gives a float. Dividing two integers drops the remainder toward zero, so `7 / 2` is 3 and `range(8, 60) / 100` is 0. Write one side as a float for a fraction, as in `range(8, 60) / 100.0`.",
+    },
+    RuleDesc {
+        tags: &[],
         id: ids::NONZERO_DIVISORS,
         summary: "Division and remainder require a nonzero divisor; a constant zero divisor is rejected during validation, and a divisor that evaluates to zero fails evaluation.",
     },
@@ -1417,6 +1424,14 @@ const EXAMPLES: &[Example] = &[
         summary: "Deeper continuation lines chain",
         note: "Each line continues from the last node of the line it sits under, so the edges run a to b, b to c and c to d.",
         source: "(a:node)\n    -[:next]->(b:node)\n        -[:next]->(c:node)\n            -[:next]->(d:node);",
+        valid: true,
+    },
+    Example {
+        tags: &[],
+        id: Id::new("example.integer-division"),
+        summary: "Dividing two integers gives an integer",
+        note: "whole is 3 and half is 3.5. One side written as a float makes the result a float.",
+        source: "(values:vars) {whole: 7 / 2, half: 7 / 2.0};",
         valid: true,
     },
     Example {

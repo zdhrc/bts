@@ -163,7 +163,7 @@ def scorer_response_quality(output, input=None, expected=None, metadata=None):
 def scorer_response_length(output, input=None, expected=None, metadata=None):
     if output is None:
         return {"name": "response-length", "score": 0, "metadata": {}}
-    return {"name": "response-length", "score": max(0.1, min(0.9, len(output) / 400)), "metadata": {}}
+    return {"name": "response-length", "score": max(0.1, min(0.9, len(output) / 400.0)), "metadata": {}}
 "#
         );
     }
@@ -209,6 +209,25 @@ def scorer_response_length(output, input=None, expected=None, metadata=None):
         assert_eq!(
             emit_score("len(context.output) > 5 ? 0.1 : 0.9"),
             "0.1 if len(output) > 5 else 0.9"
+        );
+    }
+
+    #[test]
+    fn divides_two_integers_toward_zero() {
+        assert_eq!(
+            emit_score("clamp(len(context.output) / 400, 0, 5) / 10.0"),
+            "max(0, min(5, int(len(output) / 400))) / 10.0"
+        );
+        // a float on either side, or a side the shape does not type, divides as written
+        assert_eq!(emit_score("len(context.output) / 400.0"), "len(output) / 400.0");
+        assert_eq!(emit_score("context.output / 400"), "output / 400");
+        // a remainder follows the side that is divided, which only matters when a side may be negative
+        assert_eq!(emit_score("len(context.output) % 7"), "len(output) % 7");
+        let generated = emit(r#"("s":scorer) {score: ${len(context.output) - 1000} % 30};"#);
+        assert!(generated.contains("import math\n"), "{generated}");
+        assert!(
+            generated.contains("\"score\": int(math.fmod(len(output) - 1000, 30))"),
+            "{generated}"
         );
     }
 

@@ -1270,6 +1270,7 @@ impl<'a> AgentLowering<'a> {
                 bindings.push(execution::Binding {
                     name: format!("binding_{index}"),
                     label: None,
+                    owner: None,
                     origin: self.origin(graph::BindingId(index)),
                     value: self.binding_value(graph::BindingId(index))?,
                 });
@@ -1284,6 +1285,7 @@ impl<'a> AgentLowering<'a> {
                     bindings.push(execution::Binding {
                         name: format!("edge_value_{}", id.0),
                         label: None,
+                        owner: None,
                         origin: None,
                         value: self.binding_value(*id)?,
                     });
@@ -1318,6 +1320,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("guard_{}", id.0),
                 label: None,
+                owner: None,
                 origin: None,
                 value: self.binding_value(id)?,
             });
@@ -1347,6 +1350,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("binding_{}", id.0),
                 label: None,
+                owner: None,
                 origin: self.origin(id),
                 value,
             });
@@ -1360,6 +1364,7 @@ impl<'a> AgentLowering<'a> {
         };
         for binding in &mut trace.bindings {
             binding.label = self.label(&binding.name);
+            binding.owner = self.owner(&binding.name);
         }
         self.label_children(&mut trace.children);
         self.result.traces.push(trace);
@@ -1394,6 +1399,7 @@ impl<'a> AgentLowering<'a> {
             };
             for binding in bindings {
                 binding.label = self.label(&binding.name);
+                binding.owner = self.owner(&binding.name);
             }
             if let Some(children) = children {
                 self.label_children(children);
@@ -1419,7 +1425,7 @@ impl<'a> AgentLowering<'a> {
                     }
                     // a value from beside the agent is known by what it belongs to
                     ("binding", graph::ElementId::Node(owner)) if self.beside.walks(owner) => {
-                        Some(format!("{}_{}", node(owner), binding.path.join("_")))
+                        Some(format!("{}_{}", self.walked(owner), binding.path.join("_")))
                     }
                     // a value a step keeps for itself is known by its own name
                     ("binding", graph::ElementId::Node(owner)) => {
@@ -1465,6 +1471,65 @@ impl<'a> AgentLowering<'a> {
             "emissions" => Some(format!("{}_arrivals", node(self.graph.junctions.get(index)?.target))),
             "correlate" => Some(format!("{}_key", node(self.graph.junctions.get(index)?.target))),
             _ => None,
+        }
+    }
+
+    // The step a value belongs to, for a value a step keeps for itself. Two steps may keep values
+    // under one name, and the step tells them apart.
+    fn owner(&self, name: &str) -> Option<execution::NodeId> {
+        let (role, index) = name.rsplit_once('_')?;
+        let binding = self.graph.bindings.get(index.parse::<usize>().ok()?)?;
+        match (role, binding.owner) {
+            ("binding", graph::ElementId::Node(owner))
+                if !self.beside.walks(owner) && binding.path.first().is_none_or(|key| key != CONTEXT_VALUE) =>
+            {
+                Some(Self::id(owner))
+            }
+            _ => None,
+        }
+    }
+
+    // the named step an unnamed step beside the agent is reached from
+    fn reached_from(&self, node: graph::NodeId) -> Option<graph::NodeId> {
+        let mut at = node;
+        let mut seen = HashSet::new();
+        loop {
+            if self.graph.nodes[at.0].name.is_some() {
+                return Some(at);
+            }
+            if !seen.insert(at) {
+                return None;
+            }
+            at = (self.graph.edges.iter())
+                .find(|edge| edge.target == at && edge.primitive == graph::Primitive::Next)?
+                .source;
+        }
+    }
+
+    // A readable name for a step beside the agent. A step without a name is known by the named step
+    // it is reached from, its kind, and its place among the steps of that kind reached from there.
+    fn walked(&self, node: graph::NodeId) -> String {
+        let own = &self.graph.nodes[node.0];
+        if let Some(name) = &own.name {
+            return name.clone();
+        }
+        let Some(start) = self.reached_from(node) else {
+            return own.kind.clone();
+        };
+        let alike: Vec<usize> = (0..self.graph.nodes.len())
+            .filter(|index| {
+                let other = &self.graph.nodes[*index];
+                other.name.is_none() && other.kind == own.kind && self.reached_from(graph::NodeId(*index)) == Some(start)
+            })
+            .collect();
+        let stem = format!(
+            "{}_{}",
+            self.graph.nodes[start.0].name.as_deref().unwrap_or_default(),
+            own.kind
+        );
+        match alike.iter().position(|index| *index == node.0) {
+            Some(place) if alike.len() > 1 => format!("{stem}_{}", place + 1),
+            _ => stem,
         }
     }
 
@@ -1702,6 +1767,7 @@ impl<'a> AgentLowering<'a> {
                     Ok(execution::Binding {
                         name: format!("fork_input_{}", id.0),
                         label: None,
+                        owner: None,
                         origin: None,
                         value: self.binding_value(id)?,
                     })
@@ -1861,6 +1927,7 @@ impl<'a> AgentLowering<'a> {
                 bindings.push(execution::Binding {
                     name: format!("guard_{}", id.0),
                     label: None,
+                    owner: None,
                     origin: None,
                     value: self.binding_value(id)?,
                 });
@@ -1902,6 +1969,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("fork_pick_{index}"),
                 label: None,
+                owner: None,
                 origin: None,
                 value: execution::Value::Func {
                     func: execution::Func::ForkPick(branches),
@@ -1951,6 +2019,7 @@ impl<'a> AgentLowering<'a> {
                 bindings.push(execution::Binding {
                     name,
                     label: None,
+                    owner: None,
                     origin: None,
                     value: value?,
                 });
@@ -1958,6 +2027,7 @@ impl<'a> AgentLowering<'a> {
                 bindings.push(execution::Binding {
                     name,
                     label: None,
+                    owner: None,
                     origin: None,
                     value: self.binding_value(graph::BindingId(id))?,
                 });
@@ -1981,6 +2051,7 @@ impl<'a> AgentLowering<'a> {
                     bindings.push(execution::Binding {
                         name: format!("correlate_{index}"),
                         label: None,
+                        owner: None,
                         origin: None,
                         value: value?,
                     });
@@ -2019,6 +2090,7 @@ impl<'a> AgentLowering<'a> {
             bindings.push(execution::Binding {
                 name: format!("emissions_{index}"),
                 label: None,
+                owner: None,
                 origin: None,
                 value: value?,
             });
@@ -2727,7 +2799,7 @@ impl<'a> AgentLowering<'a> {
         for id in self.graph.nodes[node.0].fields.clone() {
             let binding = &self.graph.bindings[id.0];
             let name = binding.path[0].as_str();
-            if Self::field(name).is_none() && name != "duration" && name != "scores" {
+            if Self::field(name).is_none() && !matches!(name, "duration" | "wait" | "scores") {
                 continue;
             }
             let value = self.binding_value(id)?;
@@ -2759,11 +2831,24 @@ impl<'a> AgentLowering<'a> {
                                 parts: vec![execution::Part::Lit(text)],
                             },
                             execution::ArrayElem::Item(execution::Value::Template(template)) => template,
-                            _ => return Err(located(binding.range, "mocking tags must be strings")),
+                            // a tag that is computed is put into text when a trace reads it
+                            execution::ArrayElem::Item(
+                                execution::Value::Num(_) | execution::Value::Bool(_) | execution::Value::Null,
+                            ) => return Err(located(binding.range, "a tag is a string, written or computed")),
+                            execution::ArrayElem::Item(value) => execution::Template {
+                                parts: vec![execution::Part::Dynamic(value)],
+                            },
+                            _ => {
+                                return Err(located(
+                                    binding.range,
+                                    "tags are listed one by one, a spread is not supported",
+                                ));
+                            }
                         });
                     }
                 }
                 "duration" => fields.duration = Some((execution::Value::VarRef(format!("binding_{}", id.0)), binding.range)),
+                "wait" => fields.wait = Some((execution::Value::VarRef(format!("binding_{}", id.0)), binding.range)),
                 "scores" => {
                     return Err(located(binding.range, "span scores are not supported by agent mocking yet"));
                 }

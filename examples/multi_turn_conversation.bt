@@ -28,6 +28,8 @@
         -[:calls]->(turn:task) {
             input: request.local.turns[context.index * 2],
             output: request.local.turns[context.index * 2 + 1],
+            # the customer takes a while to read a reply and write back
+            wait: context.index == 0 ? 0 : range(8, 60),
         },
     ]
         ->(turn)-[:calls]->(reply:llm {name: "Chat Completion"}) {

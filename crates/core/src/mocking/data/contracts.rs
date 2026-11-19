@@ -201,6 +201,9 @@ pub struct Binding {
     pub name: String,
     /// A readable name for consumers that print the expression. It has no effect on evaluation.
     pub label: Option<String>,
+    /// The block the expression belongs to, which need not be the block that declares it.
+    /// A consumer that prints two expressions with one label tells them apart by it. It has no effect on evaluation.
+    pub owner: Option<NodeId>,
     /// The value expression to inspect or evaluate.
     pub value: Value,
     /// Where the author wrote the element this expression belongs to, when a definition supplies the expression.
@@ -373,6 +376,8 @@ pub struct SpanFields {
     pub tags: Vec<Template>,
     /// A duration expression in seconds and its source location. This is a generation directive.
     pub duration: Option<(Value, SrcRange)>,
+    /// The seconds that pass before the span starts, and its source location. This is a generation directive.
+    pub wait: Option<(Value, SrcRange)>,
 }
 
 /// A named callable agent backed by a whole trace definition.

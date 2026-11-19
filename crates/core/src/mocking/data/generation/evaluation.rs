@@ -38,6 +38,8 @@ pub(super) struct EventPlan {
     pub(super) scores: Option<JsonMap<String, JsonValue>>,
     // total span duration; none takes the materializer's default slot
     pub(super) duration: Option<std::time::Duration>,
+    // the time that passes before the span starts, after the step before it
+    pub(super) wait: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -82,6 +84,7 @@ const COUNT_SALT: u64 = 0x01;
 const CHANCE_SALT: u64 = 0x02;
 const PICK_SALT: u64 = 0x03;
 const DURATION_SALT: u64 = 0x04;
+const WAIT_SALT: u64 = 0x07;
 const AGAIN_SALT: u64 = 0x05;
 const LIMIT_SALT: u64 = 0x06;
 // a loop that names no limit stops here
@@ -139,6 +142,7 @@ struct FieldSlots {
     tags: Vec<TagSlot>,
     // not a lazy slot: nothing references a duration, it evaluates at emission
     duration: Option<(ModelValue, SrcRange)>,
+    wait: Option<(ModelValue, SrcRange)>,
 }
 
 fn field_slots(fields: &ModelSpanFields) -> FieldSlots {
@@ -161,6 +165,7 @@ fn field_slots(fields: &ModelSpanFields) -> FieldSlots {
         metrics: keyed(&fields.metrics),
         tags: fields.tags.iter().cloned().map(TagSlot::Todo).collect(),
         duration: fields.duration.clone(),
+        wait: fields.wait.clone(),
     }
 }
 
@@ -1216,6 +1221,13 @@ impl Planner {
                     }
                     None => None,
                 };
+                let wait = match ctx.instances[instance].fields.wait.clone() {
+                    Some((value, range)) => {
+                        let rng = ctx.slot_rng(ctx.instances[instance].path, WAIT_SALT);
+                        Some(ctx.scoped(instance, rng, |ctx| eval_wait(value, range, ctx))?)
+                    }
+                    None => None,
+                };
                 self.events.push(EventPlan {
                     root,
                     parent,
@@ -1224,6 +1236,7 @@ impl Planner {
                     fields,
                     scores,
                     duration,
+                    wait,
                 });
                 Some(event_ref)
             }
@@ -1244,6 +1257,20 @@ fn eval_count(count: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<usize
         Scalar::Int(value) => usize::try_from(value).map_err(|_| Error::new(ErrorKind::NegativeRepeatCount, range)),
         Scalar::Float(_) => Err(Error::new(ErrorKind::NonIntegerRepeatCount, range)),
         _ => unreachable!("modeler validated the count as a number"),
+    }
+}
+
+// a wait may be zero, which a duration may not
+fn eval_wait(wait: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<std::time::Duration, Error> {
+    let seconds = match eval_operand(wait, ctx)? {
+        Scalar::Int(value) => value as f64,
+        Scalar::Float(value) => value,
+        _ => return Err(Error::new(ErrorKind::WaitOutOfRange, range)),
+    };
+    if seconds >= 0.0 {
+        std::time::Duration::try_from_secs_f64(seconds).map_err(|_| Error::new(ErrorKind::WaitOutOfRange, range))
+    } else {
+        Err(Error::new(ErrorKind::WaitOutOfRange, range))
     }
 }
 
@@ -2730,6 +2757,7 @@ pub enum ErrorKind {
     ScoreOutOfRange,
     ScorerReasonNotString,
     DurationOutOfRange,
+    WaitOutOfRange,
     InvalidCall,
     ClampBoundsOutOfOrder,
     EmptySplitSeparator,
@@ -2765,6 +2793,7 @@ impl fmt::Display for ErrorKind {
             Self::ScoreOutOfRange => "synthetic scorer score is not a number between 0 and 1",
             Self::ScorerReasonNotString => "synthetic scorer reason is not a string",
             Self::DurationOutOfRange => "duration is not a positive number of seconds",
+            Self::WaitOutOfRange => "wait is not a number of seconds from zero up",
             Self::InvalidCall => "invalid provider function call",
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
             Self::EmptySplitSeparator => "split separator is empty",
@@ -3483,14 +3512,17 @@ mod tests {
     fn a_failure_inside_a_definition_is_reported_where_the_author_wrote_the_element() {
         // a verb that is not a constant is looked up when a trace reads the sentence, inside the provider's definitions
         // the author cannot change those, so the failure is reported at the sentence they wrote
-        let source = r#"(action:fact) -[:next]->(:given {value: "escalate"});
+        let source = r#"(action:fact) -[:next]->(:given {value: "defenestrate"});
 (ask:sentence)
     -[:next]->(:part {subject: "I", person: "first", verb: action.value, complement: "the case"});
 (a:agent) {input: "hi", output: t.output};
 (a)-[:next]->(t:task {name: "t"}) {input: a.input, output: ask.text};
 "#;
         let error = plan(compile_with_world(source).unwrap(), 1, 1).unwrap_err();
-        assert!(error.to_string().contains(r#"unknown English verb "escalate""#), "{error}");
+        assert!(
+            error.to_string().contains(r#"unknown English verb "defenestrate""#),
+            "{error}"
+        );
         assert_eq!(error.range.source, 0);
         assert_eq!(&source[error.range.start..error.range.end], "(ask:sentence)");
         // a failure in what the author wrote stays where it is

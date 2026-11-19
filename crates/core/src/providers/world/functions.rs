@@ -7,7 +7,7 @@
 
 use super::english::{self, RealizeOptions, Sentence, VariationOptions};
 use crate::mocking::data::Value;
-use crate::mocking::{Evaluate, EvaluateError, Evaluation, Function, Helper, Runtime};
+use crate::mocking::{Evaluate, EvaluateError, Evaluation, Function, Helper, Known, Runtime};
 use bts_lang::spec::{FUNC_ARG_TYPES_RULE, FUNC_ARITY_RULE, FuncDesc, Id, RuleDesc};
 use bts_lang::{FieldType, FunctionDesc, ParamDesc, ResultShape};
 use rand::Rng;
@@ -517,10 +517,11 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
             tags: &[],
             id: Id::new("func.conversation"),
             name: "conversation",
-            syntax: "conversation({user, turn[, system, assistant]})",
-            summary: "Makes the chat messages of one turn of a conversation, for the input of an llm step. user is the list of what the user says, one string for each turn, and turn is a whole number that counts them from zero. The result is the user's message at turn, after the messages of every turn before it. assistant is the list of what the assistant replied, and when it is given each earlier user message is followed by the reply of its turn, so it needs a reply for every turn before this one. system is a string that becomes a system message at the start. A null system or assistant is left out. Each message is {role, content}. The lists may be of any length, which a comprehension cannot take. Performs no random draws.",
+            syntax: "conversation({user, turn[, system, assistant, between]})",
+            summary: "Makes the chat messages of one turn of a conversation, for the input of an llm step. user is the list of what the user says, one string for each turn, and turn is a whole number that counts them from zero. The result is the user's message at turn, after the messages of every turn before it. assistant is the list of what the assistant replied, and when it is given each earlier user message is followed by the reply of its turn, so it needs a reply for every turn before this one. system is a string that becomes a system message at the start. between is a list with one entry for each turn, the messages that passed between the user's message of that turn and the reply to it, such as the assistant's tool call and the tool's result. When it is given, the entry of each earlier turn is placed after that turn's user message and before its reply, as written, so it needs an entry for every turn before this one. An entry that is null or an empty list adds nothing. A null system, assistant or between is left out. Each message is {role, content}, and a message from between is whatever was written. The lists may be of any length, which a comprehension cannot take. Performs no random draws.",
             examples: &[
                 r#"conversation({ system: policies.text, user: customer.said, assistant: helper.said, turn: chat.turn })"#,
+                r#"conversation({ user: customer.said, assistant: helper.said, between: lookups.items, turn: chat.turn })"#,
             ],
             rules: CALL_RULES,
         },
@@ -535,10 +536,32 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
         returns: FieldType::Array,
         shape: Some(MESSAGES),
     },
+    FunctionDesc {
+        doc: FuncDesc {
+            tags: &[],
+            id: Id::new("func.paragraph"),
+            name: "paragraph",
+            syntax: "paragraph(sentences)",
+            summary: "Joins sentences into one message, with a space between them. A sentence that another follows and that does not end in a full stop, a question mark or an exclamation mark is given a full stop, so sentences written without one, as in a text message, do not run together. The last sentence is left as it is. Null and empty strings are skipped. A list uses it for its text. Performs no random draws.",
+            examples: &[r#"paragraph([|"someone hit my car", "i need to file a claim"|])"#],
+            rules: CALL_RULES,
+        },
+        params: &[ParamDesc {
+            name: "sentences",
+            accepts: &[FieldType::Array],
+            nullable: false,
+            optional: false,
+            constant: false,
+            bounds: None,
+        }],
+        returns: FieldType::String,
+        shape: None,
+    },
 ];
 
 // every function runs in data generation, in agents and in scorers, through one entry point
-const fn function(name: &'static str, data: Evaluate, texts: bool) -> Function {
+// `draws` says when a call takes its choices from the random stream of the run
+const fn function(name: &'static str, data: Evaluate, texts: bool, draws: fn(&[Known]) -> bool) -> Function {
     let helper = Helper {
         name: "_english",
         // generated agents read it as an ordinary library function
@@ -548,6 +571,10 @@ const fn function(name: &'static str, data: Evaluate, texts: bool) -> Function {
         counts: false,
         texts,
         plain: false,
+        // every function checks the shape of what it is given, so any call may raise
+        sure: None,
+        returns: None,
+        draws: Some(draws),
         text: "",
         operation: Some(name),
         runtime: Some(Runtime {
@@ -569,24 +596,24 @@ const fn function(name: &'static str, data: Evaluate, texts: bool) -> Function {
 ///
 /// The flag says whether the function returns text, as its descriptor declares.
 pub static FUNCTIONS: &[Function] = &[
-    function("realize", realize, true),
-    function("express", express, true),
-    function("expression", expression, false),
-    function("expression_candidates", expression_candidates, false),
-    function("vary", vary, true),
-    function("combine", combine, true),
-    function("refer", refer, true),
-    function("remember", remember, false),
-    function("unmentioned", unmentioned, false),
-    function("format_number", format_number, true),
-    function("format_date", format_date, true),
-    function("format_time", format_time, true),
+    function("realize", realize, true, never),
+    function("express", express, true, always),
+    function("expression", expression, false, always),
+    function("expression_candidates", expression_candidates, false, never),
+    function("vary", vary, true, unless_handed_draws),
+    function("combine", combine, true, never),
+    function("refer", refer, true, never),
+    function("remember", remember, false, never),
+    function("unmentioned", unmentioned, false, never),
+    function("format_number", format_number, true, never),
+    function("format_date", format_date, true, never),
+    function("format_time", format_time, true, never),
     Function {
         name: "merge",
         check: None,
         data: Some(super::walk::merge),
-        python: Some(walked("_world_merge", "merge_objects", super::walk::PY_MERGE)),
-        typescript: Some(walked("_world_merge", "mergeObjects", super::walk::TS_MERGE)),
+        python: Some(walked("_world_merge", "merge_objects", super::walk::PY_MERGE).known(merges, merged)),
+        typescript: Some(walked("_world_merge", "mergeObjects", super::walk::TS_MERGE).known(merges, merged)),
     },
     Function {
         name: "conversation",
@@ -595,39 +622,61 @@ pub static FUNCTIONS: &[Function] = &[
         python: Some(walked("_world_conversation", "chat_messages", PY_CONVERSATION)),
         typescript: Some(walked("_world_conversation", "chatMessages", TS_CONVERSATION)),
     },
+    Function {
+        name: "paragraph",
+        check: None,
+        data: Some(paragraph),
+        python: Some(walked("_world_paragraph", "join_sentences", PY_PARAGRAPH).known(joins, joined)),
+        typescript: Some(walked("_world_paragraph", "joinSentences", TS_PARAGRAPH).known(joins, joined)),
+    },
     // what a weighted fork in a walk lowers to, which no author calls
     Function {
         name: super::walk::PICK,
         check: None,
         data: Some(super::walk::pick),
-        python: Some(seeded("_world_pick", "take_branch")),
-        typescript: Some(seeded("_world_pick", "takeBranch")),
+        python: Some(seeded("_world_pick", "take_branch").known(super::walk::picks, super::walk::picked)),
+        typescript: Some(seeded("_world_pick", "takeBranch").known(super::walk::picks, super::walk::picked)),
     },
     // what the place of a trace among series lowers to
     Function {
         name: super::walk::TURN,
         check: None,
         data: Some(super::walk::turn),
-        python: Some(seeded("_world_turn", "series_turn")),
-        typescript: Some(seeded("_world_turn", "seriesTurn")),
+        python: Some(seeded("_world_turn", "series_turn").known(super::walk::places, super::walk::placed)),
+        typescript: Some(seeded("_world_turn", "seriesTurn").known(super::walk::places, super::walk::placed)),
     },
     // what the draws of a walk lower to
     Function {
         name: super::walk::DRAWS,
         check: None,
         data: Some(super::walk::drawn),
-        python: Some(seeded("_world_draws", "draws_for")),
-        typescript: Some(seeded("_world_draws", "drawsFor")),
+        python: Some(seeded("_world_draws", "draws_for").known(super::walk::draws_fit, super::walk::draws_given)),
+        typescript: Some(seeded("_world_draws", "drawsFor").known(super::walk::draws_fit, super::walk::draws_given)),
     },
     // what the identifier of a series lowers to
     Function {
         name: super::walk::ID,
         check: None,
         data: Some(super::walk::id),
-        python: Some(seeded("_world_id", "series_id")),
-        typescript: Some(seeded("_world_id", "seriesId")),
+        python: Some(seeded("_world_id", "series_id").known(super::walk::names, super::walk::named)),
+        typescript: Some(seeded("_world_id", "seriesId").known(super::walk::names, super::walk::named)),
     },
 ];
+
+// a function that makes no choice
+fn never(_: &[Known]) -> bool {
+    false
+}
+
+// a function that chooses among what it may say
+fn always(_: &[Known]) -> bool {
+    true
+}
+
+// `vary` takes its choices from the draws it is handed, and from the random stream without them
+fn unless_handed_draws(args: &[Known]) -> bool {
+    args.len() < 3
+}
 
 // draws handed to `vary`, played back as its random source
 struct Replay<'a> {
@@ -665,6 +714,10 @@ const fn seeded(name: &'static str, reads_as: &'static str) -> Helper {
         counts: false,
         texts: false,
         plain: true,
+        sure: None,
+        returns: None,
+        // what it draws depends on the seed alone, so a second call draws the same
+        draws: Some(never),
         text: "",
         operation: None,
         runtime: Some(Runtime {
@@ -685,6 +738,9 @@ const fn walked(name: &'static str, reads_as: &'static str, text: &'static str) 
         counts: false,
         texts: false,
         plain: true,
+        sure: None,
+        returns: None,
+        draws: None,
         text,
         operation: None,
         runtime: None,
@@ -692,9 +748,100 @@ const fn walked(name: &'static str, reads_as: &'static str, text: &'static str) 
     }
 }
 
-const CONVERSATION_KEYS: &str = "conversation: takes an object with user and turn, and optionally system and assistant";
+// an object, or nothing where an object may be left out
+fn object_or_null(item: &Known) -> bool {
+    match item {
+        Known::Object(_) | Known::Null => true,
+        Known::Maybe(item) => matches!(**item, Known::Object(_)),
+        Known::Run(item) => object_or_null(item),
+        _ => false,
+    }
+}
+
+// `merge` raises unless it starts from an object and every item is an object or null
+fn merges(args: &[Known]) -> bool {
+    match args {
+        [Known::Object(_), Known::Items(items)] => items.iter().all(object_or_null),
+        [Known::Object(_), Known::List(item)] => object_or_null(item),
+        _ => false,
+    }
+}
+
+// the keys `merge` is sure to give, since a later item replaces a key only where it states one
+fn merged(args: &[Known]) -> Known {
+    let [Known::Object(base), objects] = args else {
+        return Known::Plain;
+    };
+    let mut merged = base.clone();
+    // an item that is always there sets what it states, one that may be missing only widens a key
+    let mut lay = |item: &Known, always: bool| {
+        let (fields, always) = match item {
+            Known::Object(fields) => (fields, always),
+            Known::Maybe(item) | Known::Run(item) => match &**item {
+                Known::Object(fields) => (fields, false),
+                Known::Null => return true,
+                Known::Maybe(item) => match &**item {
+                    Known::Object(fields) => (fields, false),
+                    _ => return false,
+                },
+                _ => return false,
+            },
+            Known::Null => return true,
+            _ => return false,
+        };
+        for (key, value) in fields {
+            let stated = match value {
+                Known::Null => continue,
+                Known::Maybe(value) => match merged.remove(key) {
+                    Some(kept) => kept.join((**value).clone()),
+                    None => continue,
+                },
+                value if always => value.clone(),
+                value => match merged.remove(key) {
+                    Some(kept) => kept.join(value.clone()),
+                    None => continue,
+                },
+            };
+            merged.insert(key.clone(), stated);
+        }
+        true
+    };
+    let fits = match objects {
+        Known::Items(items) => items.iter().all(|item| lay(item, true)),
+        Known::List(item) => lay(item, false),
+        _ => false,
+    };
+    if fits { Known::Object(merged) } else { Known::Plain }
+}
+
+// `paragraph` raises unless every sentence is a string or null
+fn joins(args: &[Known]) -> bool {
+    let sentence = |item: &Known| match item {
+        Known::Text(_) | Known::Null => true,
+        Known::Maybe(item) | Known::Run(item) => match &**item {
+            Known::Text(_) | Known::Null => true,
+            Known::Maybe(item) => matches!(**item, Known::Text(_)),
+            _ => false,
+        },
+        _ => false,
+    };
+    match args {
+        [Known::Items(items)] => items.iter().all(sentence),
+        [Known::List(item)] => sentence(item),
+        _ => false,
+    }
+}
+
+fn joined(_: &[Known]) -> Known {
+    Known::Text(None)
+}
+
+const CONVERSATION_KEYS: &str =
+    "conversation: takes an object with user and turn, and optionally system, assistant and between";
 const CONVERSATION_TURN: &str = "conversation: turn is a whole number that counts the user's messages from zero";
 const CONVERSATION_REPLIES: &str = "conversation: assistant has a reply for every turn before this one";
+const CONVERSATION_BETWEEN: &str =
+    "conversation: between has an entry for every turn before this one, each a list of messages or null";
 
 /// Evaluates `conversation`: the messages of a chat up to the user's message at one turn.
 fn conversation(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
@@ -723,7 +870,7 @@ fn conversation(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, Evaluat
     };
     if said
         .keys()
-        .any(|key| !["system", "user", "assistant", "turn"].contains(&key.as_str()))
+        .any(|key| !["system", "user", "assistant", "between", "turn"].contains(&key.as_str()))
     {
         return Err(unfit(CONVERSATION_KEYS));
     }
@@ -746,6 +893,23 @@ fn conversation(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, Evaluat
     if assistant.as_ref().is_some_and(|replies| replies.len() < turn) {
         return Err(unfit(CONVERSATION_REPLIES));
     }
+    // what passed between a user's message and the reply to it, one entry for each turn
+    let between = match said.get("between") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(entries)) if entries.len() >= turn => {
+            let entries = (entries.iter())
+                .map(|entry| match entry {
+                    Value::Null => Ok(&[][..]),
+                    Value::Array(passed) if passed.iter().all(|message| matches!(message, Value::Object(_))) => {
+                        Ok(passed.as_slice())
+                    }
+                    _ => Err(unfit(CONVERSATION_BETWEEN)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Some(entries)
+        }
+        Some(_) => return Err(unfit(CONVERSATION_BETWEEN)),
+    };
     let mut messages = Vec::new();
     match said.get("system") {
         None | Some(Value::Null) => {}
@@ -754,6 +918,9 @@ fn conversation(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, Evaluat
     }
     for earlier in 0..turn {
         messages.push(message("user", user[earlier]));
+        if let Some(entries) = &between {
+            messages.extend(entries[earlier].iter().cloned());
+        }
         if let Some(replies) = &assistant {
             messages.push(message("assistant", replies[earlier]));
         }
@@ -762,12 +929,67 @@ fn conversation(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, Evaluat
     Ok(Value::Array(messages))
 }
 
+/// Evaluates `paragraph`: sentences joined so that none runs into the next.
+fn paragraph(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    let [Value::Array(items)] = args else {
+        return Err(EvaluateError::Invalid("paragraph: takes a list of strings".into()));
+    };
+    let mut sentences = Vec::new();
+    for item in items {
+        match item {
+            Value::Null => {}
+            Value::String(sentence) if sentence.is_empty() => {}
+            Value::String(sentence) => sentences.push(sentence.as_str()),
+            _ => return Err(EvaluateError::Invalid("paragraph: takes a list of strings".into())),
+        }
+    }
+    let mut joined = String::new();
+    for (index, sentence) in sentences.iter().enumerate() {
+        joined.push_str(sentence);
+        if index + 1 < sentences.len() {
+            if !sentence.trim_end().ends_with(['.', '?', '!']) {
+                joined.push('.');
+            }
+            joined.push(' ');
+        }
+    }
+    Ok(Value::String(joined))
+}
+
+// the Python text of `paragraph`.
+const PY_PARAGRAPH: &str = r#"
+def _world_paragraph(sentences):
+    sentences = _value(sentences)
+    if not isinstance(sentences, list) or not all(item is None or isinstance(item, str) for item in sentences):
+        raise TypeError("paragraph: takes a list of strings")
+    sentences = [item for item in sentences if item]
+    joined = ""
+    for index, sentence in enumerate(sentences):
+        joined += sentence
+        if index + 1 < len(sentences):
+            if not sentence.rstrip().endswith((".", "?", "!")): joined += "."
+            joined += " "
+    return joined
+"#;
+
+// the TypeScript text of `paragraph`.
+const TS_PARAGRAPH: &str = r#"
+function _world_paragraph(sentences: unknown): string {
+    const given = _value(sentences);
+    if (!Array.isArray(given) || !given.every((item) => item === null || typeof item === "string")) {
+        throw new TypeError("paragraph: takes a list of strings");
+    }
+    const kept: string[] = given.filter((item) => item !== null && item !== "");
+    return kept.map((sentence, index) => index + 1 < kept.length && !/[.?!]$/.test(sentence.trimEnd()) ? sentence + "." : sentence).join(" ");
+}
+"#;
+
 // the Python text of `conversation`.
 const PY_CONVERSATION: &str = r#"
 def _world_conversation(said):
     said = _value(said)
-    keys = "conversation: takes an object with user and turn, and optionally system and assistant"
-    if not isinstance(said, dict) or any(key not in ("system", "user", "assistant", "turn") for key in said): raise TypeError(keys)
+    keys = "conversation: takes an object with user and turn, and optionally system, assistant and between"
+    if not isinstance(said, dict) or any(key not in ("system", "user", "assistant", "between", "turn") for key in said): raise TypeError(keys)
     if "user" not in said or "turn" not in said: raise TypeError(keys)
     def texts(key):
         items = said[key]
@@ -781,6 +1003,14 @@ def _world_conversation(said):
         raise ValueError("conversation: turn is a whole number that counts the user's messages from zero")
     if assistant is not None and len(assistant) < turn:
         raise ValueError("conversation: assistant has a reply for every turn before this one")
+    between = said.get("between")
+    if between is not None:
+        fits = isinstance(between, list) and len(between) >= turn and all(
+            entry is None or (isinstance(entry, list) and all(isinstance(message, dict) for message in entry))
+            for entry in between
+        )
+        if not fits:
+            raise ValueError("conversation: between has an entry for every turn before this one, each a list of messages or null")
     messages = []
     system = said.get("system")
     if system is not None:
@@ -788,6 +1018,7 @@ def _world_conversation(said):
         messages.append({"role": "system", "content": system})
     for earlier in range(turn):
         messages.append({"role": "user", "content": user[earlier]})
+        if between is not None: messages.extend(between[earlier] or [])
         if assistant is not None: messages.append({"role": "assistant", "content": assistant[earlier]})
     messages.append({"role": "user", "content": user[turn]})
     return messages
@@ -795,11 +1026,11 @@ def _world_conversation(said):
 
 // the TypeScript text of `conversation`.
 const TS_CONVERSATION: &str = r#"
-function _world_conversation(said: unknown): { role: string; content: string }[] {
+function _world_conversation(said: unknown): { role: string; content: unknown; [key: string]: unknown }[] {
     const given = _value(said);
-    const keys = "conversation: takes an object with user and turn, and optionally system and assistant";
+    const keys = "conversation: takes an object with user and turn, and optionally system, assistant and between";
     if (given === null || typeof given !== "object" || Array.isArray(given)) throw new TypeError(keys);
-    if (Object.keys(given).some((key) => !["system", "user", "assistant", "turn"].includes(key))) throw new TypeError(keys);
+    if (Object.keys(given).some((key) => !["system", "user", "assistant", "between", "turn"].includes(key))) throw new TypeError(keys);
     if (!("user" in given) || !("turn" in given)) throw new TypeError(keys);
     const texts = (key: string): string[] => {
         const items = given[key];
@@ -817,7 +1048,13 @@ function _world_conversation(said: unknown): { role: string; content: string }[]
     if (assistant !== null && assistant.length < turn) {
         throw new RangeError("conversation: assistant has a reply for every turn before this one");
     }
-    const messages: { role: string; content: string }[] = [];
+    const between = given.between === null || given.between === undefined ? null : given.between;
+    const passed = (entry: unknown): entry is { role: string; content: unknown }[] =>
+        Array.isArray(entry) && entry.every((message) => message !== null && typeof message === "object" && !Array.isArray(message));
+    if (between !== null && !(Array.isArray(between) && between.length >= turn && between.every((entry) => entry === null || passed(entry)))) {
+        throw new RangeError("conversation: between has an entry for every turn before this one, each a list of messages or null");
+    }
+    const messages: { role: string; content: unknown; [key: string]: unknown }[] = [];
     const system = given.system;
     if (system !== null && system !== undefined) {
         if (typeof system !== "string") throw new TypeError("conversation: system is a string");
@@ -825,6 +1062,7 @@ function _world_conversation(said: unknown): { role: string; content: string }[]
     }
     for (let earlier = 0; earlier < turn; earlier++) {
         messages.push({ role: "user", content: user[earlier] });
+        if (between !== null && between[earlier] !== null) messages.push(...between[earlier]);
         if (assistant !== null) messages.push({ role: "assistant", content: assistant[earlier] });
     }
     messages.push({ role: "user", content: user[turn] });

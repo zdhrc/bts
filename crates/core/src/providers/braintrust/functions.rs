@@ -5,7 +5,7 @@
 //! calls. The two lists name the same functions in the same order.
 
 use crate::mocking::data::{Attachment, Value};
-use crate::mocking::{EvaluateError, Evaluation, Function, Helper};
+use crate::mocking::{EvaluateError, Evaluation, Function, Helper, Known};
 use bts_lang::spec::{FUNC_ARG_TYPES_RULE, FUNC_ARITY_RULE, FuncDesc, Id, RuleDesc};
 use bts_lang::{FieldType, FunctionDesc, ParamDesc};
 use std::path::Path;
@@ -108,6 +108,67 @@ pub const DESCRIPTORS: &[FunctionDesc] = &[
         returns: FieldType::String,
         shape: None,
     },
+    FunctionDesc {
+        doc: FuncDesc {
+            tags: &[],
+            id: Id::new("func.json"),
+            name: "json",
+            syntax: "json(value)",
+            summary: "The compact JSON text of a value, with the keys of an object in alphabetical order, on evaluation. Use it where an API carries JSON as a string, such as the arguments of a tool call in an assistant message or the content of a tool message. A string is given its JSON quotes.",
+            examples: &[
+                "json({ claim_id: \"CLM-204817\", status: \"open\" })",
+                "json(settings.prompt)",
+            ],
+            rules: CALL_RULES,
+        },
+        params: &[ParamDesc {
+            name: "value",
+            accepts: &[
+                FieldType::String,
+                FieldType::Number,
+                FieldType::Boolean,
+                FieldType::Array,
+                FieldType::Object,
+            ],
+            nullable: true,
+            optional: false,
+            constant: false,
+            bounds: None,
+        }],
+        returns: FieldType::String,
+        shape: None,
+    },
+    FunctionDesc {
+        doc: FuncDesc {
+            tags: &[],
+            id: Id::new("func.decimal"),
+            name: "decimal",
+            syntax: "decimal(value, places)",
+            summary: "Rounds a number to a constant number of decimal places, from 0 to 9, and gives a float, on evaluation. Halves round up. Use it for values a real system reports to a few places, such as a score of 0.86 or a price of 12.5.",
+            examples: &["decimal(range(0.82, 0.95), 2)", "decimal(lognormal(40, 0.6), 1)"],
+            rules: CALL_RULES,
+        },
+        params: &[
+            ParamDesc {
+                name: "value",
+                accepts: &[FieldType::Number],
+                nullable: false,
+                optional: false,
+                constant: false,
+                bounds: None,
+            },
+            ParamDesc {
+                name: "places",
+                accepts: &[FieldType::Number],
+                nullable: false,
+                optional: false,
+                constant: true,
+                bounds: Some((0, 9)),
+            },
+        ],
+        returns: FieldType::Number,
+        shape: None,
+    },
 ];
 
 /// What runs each function, for data generation and for generated agents.
@@ -124,6 +185,9 @@ pub static FUNCTIONS: &[Function] = &[
             counts: true,
             texts: false,
             plain: false,
+            sure: Some(plain_value),
+            returns: None,
+            draws: None,
             text: PY_TOKENS,
             operation: None,
             runtime: None,
@@ -137,6 +201,9 @@ pub static FUNCTIONS: &[Function] = &[
             counts: true,
             texts: false,
             plain: false,
+            sure: Some(plain_value),
+            returns: None,
+            draws: None,
             text: TS_TOKENS,
             operation: None,
             runtime: None,
@@ -163,6 +230,9 @@ pub static FUNCTIONS: &[Function] = &[
             counts: false,
             texts: false,
             plain: false,
+            sure: Some(noise_fits),
+            returns: Some(text),
+            draws: None,
             text: PY_NOISE,
             operation: None,
             runtime: None,
@@ -176,13 +246,142 @@ pub static FUNCTIONS: &[Function] = &[
             counts: false,
             texts: false,
             plain: false,
+            sure: Some(noise_fits),
+            returns: Some(text),
+            draws: None,
             text: TS_NOISE,
             operation: None,
             runtime: None,
             scorer: None,
         }),
     },
+    Function {
+        name: "json",
+        check: None,
+        data: Some(json),
+        python: Some(Helper {
+            name: "_json_text",
+            reads_as: Some("json_text"),
+            random: false,
+            seeded: false,
+            counts: false,
+            texts: false,
+            plain: false,
+            sure: Some(plain_value),
+            returns: Some(text),
+            draws: None,
+            text: PY_JSON,
+            operation: None,
+            runtime: None,
+            scorer: None,
+        }),
+        typescript: Some(Helper {
+            name: "_json_text",
+            reads_as: Some("jsonText"),
+            random: false,
+            seeded: false,
+            counts: false,
+            texts: false,
+            plain: false,
+            sure: Some(plain_value),
+            returns: Some(text),
+            draws: None,
+            text: TS_JSON,
+            operation: None,
+            runtime: None,
+            scorer: None,
+        }),
+    },
+    Function {
+        name: "decimal",
+        check: None,
+        data: Some(decimal),
+        python: Some(Helper {
+            name: "_decimal",
+            reads_as: Some("to_places"),
+            random: false,
+            seeded: false,
+            counts: false,
+            texts: false,
+            plain: false,
+            sure: Some(decimal_fits),
+            returns: Some(decimal_gives),
+            draws: None,
+            text: PY_DECIMAL,
+            operation: None,
+            runtime: None,
+            scorer: None,
+        }),
+        typescript: Some(Helper {
+            name: "_decimal",
+            reads_as: Some("toPlaces"),
+            random: false,
+            seeded: false,
+            counts: false,
+            texts: false,
+            plain: false,
+            sure: Some(decimal_fits),
+            returns: Some(decimal_gives),
+            draws: None,
+            text: TS_DECIMAL,
+            operation: None,
+            runtime: None,
+            scorer: None,
+        }),
+    },
 ];
+
+// `tokens` and `json` write out whatever plain data they are given
+fn plain_value(args: &[Known]) -> bool {
+    matches!(args, [value] if value.plain())
+}
+
+fn text(_: &[Known]) -> Known {
+    Known::Text(None)
+}
+
+// a written whole number from zero up to a limit
+fn written_count(value: &Known, limit: f64) -> Option<f64> {
+    match value {
+        Known::Number { low, high, whole: true } if low == high && (0.0..=limit).contains(low) => Some(*low),
+        _ => None,
+    }
+}
+
+// `noise` raises for a size that is no count or is past its limit
+fn noise_fits(args: &[Known]) -> bool {
+    matches!(args, [size] if written_count(size, 8_388_608.0).is_some())
+}
+
+// the number `decimal` rounds, which scaling by its places keeps finite, and those places
+fn decimal_parts(args: &[Known]) -> Option<(f64, f64, f64)> {
+    let [Known::Number { low, high, .. }, places] = args else {
+        return None;
+    };
+    let places = written_count(places, 9.0)?;
+    let safe = 9_007_199_254_740_991.0;
+    (*low >= -safe && *high <= safe).then_some((*low, *high, places))
+}
+
+// `decimal` raises for what is no finite number, and for places that are no whole number from 0 to 9
+fn decimal_fits(args: &[Known]) -> bool {
+    decimal_parts(args).is_some()
+}
+
+// rounding moves a number by at most half of its last place
+fn decimal_gives(args: &[Known]) -> Known {
+    match decimal_parts(args) {
+        Some((low, high, places)) => {
+            let half = 0.5 / 10f64.powf(places);
+            Known::Number {
+                low: low - half,
+                high: high + half,
+                whole: false,
+            }
+        }
+        None => Known::NUMBER,
+    }
+}
 
 // building the encoder parses the embedded vocab, do it once
 static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expect("the embedded vocab parses"));
@@ -205,6 +404,30 @@ fn tokens(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, Eval
         }
     };
     Ok(Value::from(count as i64))
+}
+
+// the same text the token count is taken from: compact, with keys in order
+fn json(args: &[Value], evaluation: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    let [value] = args else { return Err(EvaluateError::Shape) };
+    let projected = (evaluation.project(value)).map_err(|_| EvaluateError::UnsupportedAttachment)?;
+    Ok(Value::String(projected.to_string()))
+}
+
+// half up at the last place kept, by the same arithmetic in data and in an agent
+fn decimal(args: &[Value], _: &mut Evaluation<'_>) -> Result<Value, EvaluateError> {
+    let [Value::Number(value), Value::Number(places)] = args else {
+        return Err(EvaluateError::Shape);
+    };
+    let (Some(value), Some(places)) = (value.as_f64(), places.as_u64().filter(|places| *places <= 9)) else {
+        return Err(EvaluateError::Invalid(
+            "decimal takes a number and a whole number of places from 0 to 9".into(),
+        ));
+    };
+    let scale = 10f64.powi(places as i32);
+    let rounded = (value * scale + 0.5).floor() / scale;
+    serde_json::Number::from_f64(rounded)
+        .map(Value::Number)
+        .ok_or_else(|| EvaluateError::Invalid("decimal takes a finite number".into()))
 }
 
 fn check_attachment(args: &[bts_lang::Value]) -> Result<(), String> {
@@ -273,6 +496,45 @@ function _tokens(value: unknown): number {
     if (value === null || value === undefined) return 0;
     const sorted = (item: any): any => Array.isArray(item) ? item.map(sorted) : item !== null && typeof item === "object" ? Object.fromEntries(Object.keys(item).sort().map(key => [key, sorted(item[key])])) : item;
     return _encoding.encode(typeof value === "string" ? value : JSON.stringify(sorted(value)), [], []).length;
+}
+"#;
+
+const PY_JSON: &str = r#"
+def _json_text(value):
+    return _json.dumps(_value(value), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+"#;
+
+const TS_JSON: &str = r#"
+function _json_text(value: unknown): string {
+    // a float that is whole keeps its point, as it does in generated data
+    const write = (given: unknown): string => {
+        const item: any = _force(given);
+        if (item instanceof _Float) return Number.isInteger(item.value) ? item.value.toFixed(1) : String(item.value);
+        if (Array.isArray(item)) return "[" + item.map(write).join(",") + "]";
+        if (item !== null && typeof item === "object") {
+            return "{" + Object.keys(item).sort().map(key => JSON.stringify(key) + ":" + write(item[key])).join(",") + "}";
+        }
+        return item === undefined ? "null" : JSON.stringify(item);
+    };
+    return write(value);
+}
+"#;
+
+const PY_DECIMAL: &str = r#"
+def _decimal(value, places):
+    import math
+    value, places = _num(value), _count(places)
+    if places > 9: raise ValueError("decimal takes a number and a whole number of places from 0 to 9")
+    scale = float(10 ** places)
+    return math.floor(value * scale + 0.5) / scale
+"#;
+
+const TS_DECIMAL: &str = r#"
+function _decimal(value: unknown, places: unknown): number {
+    const kept = _count(places);
+    if (kept > 9) throw new RangeError("decimal takes a number and a whole number of places from 0 to 9");
+    const scale = 10 ** kept;
+    return _float(Math.floor(_num(value) * scale + 0.5) / scale);
 }
 "#;
 

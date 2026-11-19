@@ -11,4 +11,4 @@ pub use data::contracts::{
     ScorerSpan, Selection, Span, SpanFields, SpanKind, Step, Trace,
 };
 pub use data::value::expr::*;
-pub use functions::{Check, Consumer, Evaluate, EvaluateError, Evaluation, Function, Helper, Runtime};
+pub use functions::{Check, Consumer, Evaluate, EvaluateError, Evaluation, Function, Helper, Known, Runtime};

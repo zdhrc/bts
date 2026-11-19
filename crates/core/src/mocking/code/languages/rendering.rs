@@ -92,7 +92,15 @@ fn expression_at(value: &Expr, lang: ScorerLang, context: u8) -> String {
                 UnaryOp::Not => (if python { "not " } else { "!" }, if python { 4 } else { 8 }),
                 UnaryOp::Neg => ("-", 8),
             };
-            (format!("{operator}{}", at(value, prec + 1)), prec)
+            // two values that are not the same one are compared in one step
+            if let (UnaryOp::Not, Expr::Identity(left, right)) = (op, &**value) {
+                (
+                    format!("{} {} {}", at(left, 6), if python { "is not" } else { "!==" }, at(right, 6)),
+                    5,
+                )
+            } else {
+                (format!("{operator}{}", at(value, prec + 1)), prec)
+            }
         }
         Expr::Conditional { condition, yes, no } => (
             if python {
@@ -437,7 +445,9 @@ pub(in crate::mocking::code) fn statements(
                 source.push_str(&if lang == ScorerLang::Python {
                     format!("{indent}with {scope}:\n")
                 } else {
-                    format!("{indent}return {scope}.run(() => {{\n")
+                    // a scope that hands nothing back is run, not returned
+                    let returned = if returns(body) { "return " } else { "" };
+                    format!("{indent}{returned}{scope}.run(() => {{\n")
                 });
                 source.push_str(&block(body, lang, width, indentation + width));
                 if lang == ScorerLang::Typescript {
@@ -452,6 +462,17 @@ pub(in crate::mocking::code) fn statements(
         }
     }
     source
+}
+
+fn returns(body: &[Statement]) -> bool {
+    body.iter().any(|statement| match statement {
+        Statement::Return(_) => true,
+        Statement::If {
+            then_body, else_body, ..
+        } => returns(then_body) || returns(else_body),
+        Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => returns(body),
+        _ => false,
+    })
 }
 
 fn block(body: &[Statement], lang: ScorerLang, width: usize, indentation: usize) -> String {

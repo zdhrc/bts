@@ -189,7 +189,7 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
   if (output == null) {
     return { name: "response-length", score: 0, metadata: {} };
   }
-  return { name: "response-length", score: Math.max(0.1, Math.min(0.9, output.length / 400)), metadata: {} };
+  return { name: "response-length", score: Math.max(0.1, Math.min(0.9, output.length / 400.0)), metadata: {} };
 }
 "#
         );
@@ -220,6 +220,21 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
         );
         assert!(generated.contains("function scorer_a_1("));
         assert!(generated.contains("function scorer_a1("));
+    }
+
+    #[test]
+    fn divides_two_integers_toward_zero() {
+        let generated = emit(r#"("s":scorer) {score: clamp(len(context.output) / 400, 0, 5) / 10.0};"#);
+        assert!(
+            generated.contains("score: Math.max(0, Math.min(5, Math.trunc(output.length / 400))) / 10.0"),
+            "{generated}"
+        );
+        // a float on either side, or a side the shape does not type, divides as written
+        let generated = emit(r#"("s":scorer) {score: context.output / 400};"#);
+        assert!(generated.contains("score: output / 400,"), "{generated}");
+        // the remainder already follows the side that is divided
+        let generated = emit(r#"("s":scorer) {score: ${len(context.output) - 1000} % 30};"#);
+        assert!(generated.contains("score: (output.length - 1000) % 30,"), "{generated}");
     }
 
     #[test]

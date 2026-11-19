@@ -2551,7 +2551,11 @@ fn a_conversation_is_the_messages_up_to_a_turn() {
 (helper:persona {per: chat.number})
     -[:next]->(:statement {subject: "I", person: "first", modal: "can", verb: "help"})
     -[:next]->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
-    -[:next]->(:statement {subject: "the refund", verb: "be", complement: "on its way"});"#;
+    -[:next]->(:statement {subject: "the refund", verb: "be", complement: "on its way"});
+(lookups:list {per: chat.number})
+    -[:next]->(:given {value: [|{role: "assistant", content: null, tool_calls: [|{id: "call_1", name: "find_order"}|]}, {role: "tool", tool_call_id: "call_1", content: {status: "late"}}|]})
+    -[:next]->(:given {value: [||]})
+    -[:next]->(:given {value: [||]});"#;
     let traces = |read: &str| {
         let source = format!(
             "{world}\n(a:agent) {{input: \"hi\", output: t.output}};\n(a)-[:next]->(t:task {{name: \"t\"}}) {{input: a.input, output: {read}}};\n"
@@ -2604,6 +2608,22 @@ fn a_conversation_is_the_messages_up_to_a_turn() {
             message("user", "That works."),
         ])
     );
+    // what passed between a message and its reply on an earlier turn sits between them, as written
+    let with_calls = "conversation({user: customer.said, assistant: helper.said, between: lookups.items, turn: chat.turn})";
+    let called = traces(with_calls).unwrap();
+    assert_eq!(called[0], json!([message("user", "I need a refund.")]));
+    assert_eq!(
+        called[2],
+        json!([
+            message("user", "I need a refund."),
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1", "name": "find_order"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": {"status": "late"}},
+            message("assistant", "I can help."),
+            message("user", "The order is late."),
+            message("assistant", "I see the order."),
+            message("user", "That works."),
+        ])
+    );
     // a read into a message is typed by what the provider declares
     let read = r#"upper(conversation({user: customer.said, turn: chat.turn})[0].content)"#;
     assert_eq!(traces(read).unwrap()[0], json!("I NEED A REFUND."));
@@ -2625,6 +2645,14 @@ fn a_conversation_is_the_messages_up_to_a_turn() {
             "conversation({user: customer.said, turn: 0, system: 1})",
             "system is a string",
         ),
+        (
+            "conversation({user: customer.said, between: [|[||]|], turn: 2})",
+            "between has an entry for every turn before this one",
+        ),
+        (
+            "conversation({user: customer.said, between: [|1, 2, 3|], turn: 2})",
+            "between has an entry for every turn before this one",
+        ),
         ("conversation({user: customer.said})", "takes an object with user and turn"),
         (
             "conversation({user: customer.said, turn: 0, agent: helper.said})",
@@ -2633,6 +2661,74 @@ fn a_conversation_is_the_messages_up_to_a_turn() {
     ] {
         let error = traces(call).unwrap_err().to_string();
         assert!(error.contains(told), "{call}: {error}");
+    }
+}
+
+#[test]
+fn json_text_and_decimal_places_agree_in_data_and_code() {
+    let source = r#"(desk:agent) {input: "hi", output: answer.output};
+(desk)-[:next]->(answer:task {name: "answer"}) {
+    input: desk.input,
+    output: {
+        arguments: json({claim_id: "CLM-1", amount: 12.5, whole: 1.0, count: 3, tags: [|"a", true, null|], nested: {z: 1, a: 2}}),
+        text: json("it's plain text"),
+        nothing: json(null),
+        score: decimal(0.8649, 2),
+        half: decimal(7.25, 1),
+        kept: decimal(3, 2),
+        below: decimal(0.004, 2),
+    },
+};
+"#;
+    let model = lower(source).unwrap_or_else(|errors| panic!("{errors}"));
+    let batch = data::generate(
+        model.clone(),
+        1,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        1,
+        &(),
+    )
+    .unwrap();
+    let output = batch.events[0].output.as_ref().unwrap().project(&()).unwrap();
+    assert_eq!(
+        output,
+        json!({
+            // compact, with the keys of each object in order
+            "arguments": r#"{"amount":12.5,"claim_id":"CLM-1","count":3,"nested":{"a":2,"z":1},"tags":["a",true,null],"whole":1.0}"#,
+            "text": r#""it's plain text""#,
+            "nothing": "null",
+            // halves round up, and the result is a float
+            "score": 0.86,
+            "half": 7.3,
+            "kept": 3.0,
+            "below": 0.0,
+        })
+    );
+    let python = execute_generated(
+        &model,
+        ScorerLang::Python,
+        "python3",
+        "check.py",
+        "from desk_agent import run_details\nimport json\nprint(json.dumps(run_details()))",
+    );
+    let typescript = execute_generated(
+        &model,
+        ScorerLang::Typescript,
+        "node",
+        "check.mts",
+        "import {runDetails} from './desk_agent.mts'; console.log(JSON.stringify(runDetails()));",
+    );
+    for (lang, run) in [("python", &python), ("typescript", &typescript)] {
+        for (key, expected) in output.as_object().unwrap() {
+            let found = &run["output"][key];
+            match expected.as_f64() {
+                // a whole float prints without its point in JavaScript, so numbers are compared by value
+                Some(number) => assert_eq!(found.as_f64(), Some(number), "{lang} {key}"),
+                None => assert_eq!(found, expected, "{lang} {key}"),
+            }
+        }
     }
 }
 
@@ -2655,10 +2751,15 @@ fn a_conversation_agrees_in_data_and_code() {
     -[:next]->(:statement {subject: "I", person: "first", verb: "see", complement: "the order"})
     -[:next]->(:statement {subject: "the refund", verb: "be", complement: "on its way"})
     -[:next]->(:statement {subject: "you", person: "second", verb: "be", complement: "welcome"});
+(lookups:list {per: chat.number})
+    -[:next]->(:given {value: [|{role: "assistant", content: null, tool_calls: [|{id: "call_1", name: "find_order"}|]}, {role: "tool", tool_call_id: "call_1", content: {status: "late"}}|]})
+    -[:next]->(:given {value: [||]})
+    -[:next]->(:given {value: [||]})
+    -[:next]->(:given {value: [||]});
 (desk:agent) {input: customer.said[chat.turn], output: answer.output};
 (desk)-[:next]->(answer:task {name: "answer"}) {input: desk.input, output: reply.output.content}
     -[:calls]->(reply:llm {name: "chat_completion"}) {
-        input: conversation({system: "Be brief.", user: customer.said, assistant: helper.said, turn: chat.turn}),
+        input: conversation({system: "Be brief.", user: customer.said, assistant: helper.said, between: lookups.items, turn: chat.turn}),
         output: {role: "assistant", content: helper.said[chat.turn]},
     };
 "#;
@@ -2698,7 +2799,7 @@ fn a_conversation_agrees_in_data_and_code() {
         for (index, step) in steps.iter().enumerate() {
             let input = step.input.as_ref().unwrap().project(&()).unwrap();
             let messages = input.as_array().unwrap();
-            // a system message, a user message and a reply for each earlier turn, and the message of this turn
+            // a system message, a user message and a reply for each earlier turn, the tool call and its result of the first, and the message of this turn
             assert_eq!(messages.len() % 2, 0, "{input}");
             assert_eq!(messages.last().unwrap()["role"], "user");
             longest = longest.max(messages.len());
@@ -2808,5 +2909,914 @@ fn a_loop_without_an_ordered_form_runs_in_the_deferred_form() {
                 .collect::<Vec<_>>(),
             names
         );
+    }
+}
+
+#[test]
+fn a_duration_reaches_the_step_that_logs_it() {
+    // one branch of a fork draws its duration and the other writes it, as a float or from a local
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {slow: a.input == "hi"}};
+(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(plan)
+    =[:exclusive]=>[
+        -[:next {when: !t.local.slow}]->(quick:tool {name: "lookup"}) {input: t.input, output: {found: true}, duration: range(0.1, 0.2)},
+        -[:next {when: t.local.slow}]->(slow:tool {name: "lookup"}) {input: t.input, output: {found: false}, duration: 3.0},
+    ];
+"#;
+    for (written, seconds) in [("3.0", 3.0), ("t.local.slow ? 1.5 : 2", 1.5)] {
+        let model = lower(&source.replace("duration: 3.0", &format!("duration: {written}"))).unwrap();
+        // a written number is handed to the step, in either language, and not kept behind a helper
+        for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+            let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+            let agent = (assembly.files.iter())
+                .find(|file| file.name.contains("a_agent.") && !file.name.contains("runtime"))
+                .unwrap();
+            // one that is computed is a value of the branch that runs the step, and no helper is called for it
+            let helper = agent.contents.contains("def slow_duration") || agent.contents.contains("function slowDuration");
+            assert!(!helper, "{}", agent.contents);
+            let computed = if lang == ScorerLang::Python {
+                "duration = 1.5 if turn_slow else 2"
+            } else {
+                "const duration = turnSlow ? 1.5 : 2"
+            };
+            assert_eq!(agent.contents.contains(computed), written != "3.0", "{}", agent.contents);
+            // a float needs no mark where it is only read as seconds
+            assert!(!agent.contents.contains("_float"), "{}", agent.contents);
+            // the agent's own value that a step is also called is named for the agent, not numbered
+            let own = if lang == ScorerLang::Python { "turn_slow" } else { "turnSlow" };
+            assert!(agent.contents.contains(own), "{}", agent.contents);
+            for numbered in ["slow2", "slow_2", "duration2", "duration_2"] {
+                assert!(!agent.contents.contains(numbered), "{numbered} in {}", agent.contents);
+            }
+        }
+        // a step that reads a name nothing gave it fails when it runs
+        for details in generated_runs(&model, "a") {
+            let spans = details["spans"].as_array().unwrap();
+            let slow = spans.iter().find(|span| span["output"] == json!({"found": false})).unwrap();
+            assert_eq!(slow["duration"].as_f64(), Some(seconds), "{details}");
+        }
+    }
+}
+
+#[test]
+fn a_result_that_may_be_null_has_one_named_type() {
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {sent: chance(0.5)}}
+    -[:calls]->(mail:tool {name: "send_summary"}) {
+        input: t.input,
+        output: t.local.sent ? {delivered: true} : null,
+    };
+"#;
+    let model = lower(source).unwrap();
+    for (lang, declared, returned, held) in [
+        (
+            ScorerLang::Python,
+            "class SendSummaryResult(TypedDict):\n    delivered: bool\n",
+            ") -> SendSummaryResult | None:",
+            "result: SendSummaryResult | None = None",
+        ),
+        (
+            ScorerLang::Typescript,
+            "export type SendSummaryResult = {\"delivered\": boolean};",
+            "): SendSummaryResult | null {",
+            "let result: SendSummaryResult | null = null;",
+        ),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let file = |part: &str| {
+            &(assembly.files.iter())
+                .find(|file| file.name.contains(part))
+                .unwrap()
+                .contents
+        };
+        let types = file("a_agent_types.");
+        assert!(types.contains(declared), "{types}");
+        // the type is declared once, and nothing declares it again as itself or null
+        assert_eq!(types.matches("SendSummaryResult").count(), 1, "{types}");
+        let agent = file("a_agent.");
+        assert!(agent.contains(returned) && agent.contains(held), "{agent}");
+        let imports = agent
+            .split_once(returned.split_once("SendSummaryResult").unwrap().0)
+            .unwrap()
+            .0;
+        assert_eq!(
+            imports.matches("SendSummaryResult").count(),
+            if lang == ScorerLang::Python { 2 } else { 1 },
+            "{agent}"
+        );
+    }
+}
+
+// the agent module of an assembly and the types it declares, which is empty when it declares none
+fn agent_module(model: &bts_core::mocking::Model, lang: ScorerLang) -> (String, String) {
+    let assembly = code::assemble_agents(model, lang, &CodeTarget::new("local-test")).unwrap();
+    let file = |part: &str| {
+        (assembly.files.iter())
+            .find(|file| file.name.contains(part) && !file.name.contains("runtime"))
+            .map(|file| file.contents.clone())
+            .unwrap_or_default()
+    };
+    (file("a_agent."), file("a_agent_types."))
+}
+
+// the text of one function of an agent module
+
+fn function_text<'a>(agent: &'a str, name: &str) -> &'a str {
+    let start = (["def ", "function "].iter())
+        .find_map(|keyword| agent.find(&format!("{keyword}{name}(")))
+        .unwrap_or_else(|| panic!("no function {name} in {agent}"));
+    let rest = &agent[start..];
+    let end = (["\ndef ", "\nfunction "].iter())
+        .filter_map(|keyword| rest[1..].find(keyword))
+        .min()
+        .map_or(rest.len(), |end| end + 1);
+    &rest[..end]
+}
+
+fn step<'a>(details: &'a Value, name: &str) -> &'a Value {
+    (details["spans"].as_array().unwrap().iter())
+        .find(|span| span["name"] == name)
+        .unwrap_or_else(|| panic!("no span {name} in {details}"))
+}
+
+#[test]
+fn a_format_adds_no_empty_text() {
+    // a template that starts or ends with a value has no text before or after it
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {
+    input: a.input,
+    output: {id: format("msg_{}", hex(12)), cost: format("{} dollars", 5), both: format("{}{}", a.input, 5), only: format("{}", 7)},
+};
+"#;
+    let model = lower(source).unwrap();
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let (agent, _) = agent_module(&model, lang);
+        let body = agent.split_once("_MISSING = ").unwrap().1;
+        assert!(body.contains("\"msg_\""), "{body}");
+        assert!(!body.contains("\"\""), "{body}");
+    }
+    for details in generated_runs(&model, "a") {
+        let output = &details["output"];
+        let id = output["id"].as_str().unwrap();
+        assert!(id.starts_with("msg_") && id.len() == 16, "{details}");
+        assert_eq!(output["cost"], "5 dollars", "{details}");
+        assert_eq!(output["both"], "hi5", "{details}");
+        assert_eq!(output["only"], "7", "{details}");
+    }
+}
+
+#[test]
+fn an_error_and_a_result_are_set_only_where_they_have_a_value() {
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {sent: a.input == "hi"}}
+    -[:calls]->(mail:tool {name: "send_summary"}) {
+        input: t.input,
+        output: t.local.sent ? {delivered: true} : null,
+        error: t.local.sent ? null : "550 mailbox unavailable",
+    };
+"#;
+    for (written, output, error) in [
+        ("==", json!({"delivered": true}), None),
+        ("!=", Value::Null, Some("550 mailbox unavailable")),
+    ] {
+        let model = lower(&source.replace("a.input ==", &format!("a.input {written}"))).unwrap();
+        for (lang, name) in [(ScorerLang::Python, "send_summary"), (ScorerLang::Typescript, "sendSummary")] {
+            let (agent, _) = agent_module(&model, lang);
+            let mail = function_text(&agent, name);
+            // the result starts as null, so no path assigns null to it again
+            assert!(!mail.contains("else"), "{mail}");
+            // the error is logged once, under the test for it, and never as null
+            assert_eq!(mail.matches("550 mailbox unavailable").count(), 1, "{mail}");
+            let plain = mail.replace([' ', '"'], "");
+            assert!(!plain.contains("error:null") && !plain.contains("error=None"), "{mail}");
+            assert_eq!(mail.matches("if ").count(), 2, "{mail}");
+        }
+        for details in generated_runs(&model, "a") {
+            let mail = step(&details, "send_summary");
+            assert_eq!(mail["output"], output, "{details}");
+            assert_eq!(mail.get("error").and_then(Value::as_str), error, "{details}");
+        }
+    }
+}
+
+#[test]
+fn a_step_that_returns_nothing_has_no_result_type() {
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {down: a.input == "hi"}};
+(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(plan)
+    =[:exclusive]=>[
+        -[:next {when: !t.local.down}]->(found:tool {name: "lookup"}) {input: t.input, output: {found: true}},
+        -[:next {when: t.local.down}]->(failed:tool {name: "lookup"}) {input: t.input, output: null, error: "upstream did not respond"},
+    ];
+"#;
+    let model = lower(source).unwrap();
+    for (lang, returned, path) in [
+        (ScorerLang::Python, ") -> None:", "maybe_failed"),
+        (ScorerLang::Typescript, "): void {", "maybeFailed"),
+    ] {
+        let (agent, types) = agent_module(&model, lang);
+        // nothing is named for a result that is always null, and the path that may run the step does not hand one back
+        assert_eq!(
+            types.matches("FailedResult").count(),
+            types.matches("MaybeFailedResult").count(),
+            "{types}"
+        );
+        for nothing in ["= null", "= None", ": null", ": None"] {
+            assert!(!types.contains(nothing), "{types}");
+        }
+        assert!(!types.contains("\"failed\"") && !types.contains("failed:"), "{types}");
+        let failed = function_text(&agent, "failed");
+        assert!(failed.contains(returned), "{failed}");
+        assert!(!failed.contains("return"), "{failed}");
+        assert!(!failed.contains("result"), "{failed}");
+        // the step is called for what it does
+        let maybe = function_text(&agent, path);
+        assert!(!maybe.contains("= failed(") && maybe.contains("failed("), "{maybe}");
+    }
+    for details in generated_runs(&model, "a") {
+        let spans = details["spans"].as_array().unwrap();
+        let failed = spans.iter().find(|span| span["error"] == "upstream did not respond").unwrap();
+        assert_eq!(failed["name"], "lookup", "{details}");
+        assert_eq!(failed["output"], Value::Null, "{details}");
+        assert_eq!(spans.iter().filter(|span| span["name"] == "lookup").count(), 1, "{details}");
+    }
+}
+
+#[test]
+fn durations_that_meet_are_named_for_their_steps() {
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {known: a.input == "hi"}};
+(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(plan)
+    =[:exclusive]=>[
+        -[:next {when: !t.local.known}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello", duration: range(0.5, 0.6)},
+        -[:next {when: t.local.known}]->(screen:task {name: "screen"}) {input: t.input, output: assess.output},
+    ];
+(screen)-[:calls]->(history:tool {name: "history"}) {input: t.input, output: {prior: 0}, duration: range(0.1, 0.2)}
+    -[:next]->(assess:tool {name: "assess"}) {input: history.output, output: "low", duration: range(0.3, 0.4)};
+"#;
+    let model = lower(source).unwrap();
+    for (lang, both, alone) in [
+        (
+            ScorerLang::Python,
+            ["history_duration", "assess_duration"],
+            "duration: int | float",
+        ),
+        (
+            ScorerLang::Typescript,
+            ["historyDuration", "assessDuration"],
+            "duration: number",
+        ),
+    ] {
+        let (agent, _) = agent_module(&model, lang);
+        // the step that runs both tells their durations apart by the steps they belong to
+        let screen = function_text(&agent, "screen");
+        for name in both {
+            assert!(screen.contains(name), "{screen}");
+        }
+        // a step that sees one duration calls it that, and no name is numbered
+        for name in ["greet", "history", "assess"] {
+            assert!(function_text(&agent, name).contains(alone), "{agent}");
+        }
+        let body = agent.split_once("_MISSING = ").unwrap().1;
+        for (at, _) in body.match_indices("uration") {
+            let after = body[at + "uration".len()..].trim_start_matches('_');
+            assert!(!after.starts_with(|c: char| c.is_ascii_digit()), "{body}");
+        }
+    }
+    for details in generated_runs(&model, "a") {
+        for (name, low, high) in [("history", 0.1, 0.2), ("assess", 0.3, 0.4)] {
+            let seconds = step(&details, name)["duration"].as_f64().unwrap();
+            assert!((low..=high).contains(&seconds), "{details}");
+        }
+    }
+}
+
+#[test]
+fn a_draw_that_cannot_fail_is_a_plain_value() {
+    // text around a draw and a draw held within bounds are computed where they are declared,
+    // so the steps that read them take a string and a number
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: "ok", local: {known: a.input == "hi", call_id: format("call_{}", alphanum(24))}};
+(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: {id: t.local.call_id}};
+(plan)
+    =[:exclusive]=>[
+        -[:next {when: !t.local.known}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
+        -[:next {when: t.local.known}]->(screen:task {name: "screen"}) {input: {id: t.local.call_id}, output: assess.output},
+    ];
+(screen)-[:calls]->(history:tool {name: "history"}) {input: t.input, output: {prior: 0}, duration: range(0.1, 0.2)}
+    -[:next]->(assess:llm {name: "assess"}) {input: history.output, output: "low", duration: clamp(lognormal(0.6, 0.3), 0.3, 2.5)};
+"#;
+    let model = lower(source).unwrap();
+    for (lang, typed) in [
+        (ScorerLang::Python, ["call_id: str", "assess_duration: int | float"]),
+        (ScorerLang::Typescript, ["callId: string", "assessDuration: number"]),
+    ] {
+        let (agent, _) = agent_module(&model, lang);
+        assert!(!agent.contains("_lazy("), "{agent}");
+        for parameter in typed {
+            assert!(agent.contains(parameter), "{parameter} in {agent}");
+        }
+    }
+    for details in generated_runs(&model, "a") {
+        // the id is drawn once, however many steps read it
+        let id = step(&details, "plan")["output"]["id"].as_str().unwrap();
+        assert!(id.starts_with("call_") && id.len() == 29, "{details}");
+        assert_eq!(step(&details, "screen")["input"]["id"], id, "{details}");
+        let seconds = step(&details, "assess")["duration"].as_f64().unwrap();
+        assert!((0.3..=2.5).contains(&seconds), "{details}");
+    }
+}
+
+#[test]
+fn a_step_reads_the_steps_inside_an_earlier_turn() {
+    // each turn after the first reads the reply of the turn before it, which sits inside that turn,
+    // and the last step reads a reply that is only there on one branch
+    let source = r#"(desk:agent) {input: "hi", output: conv.output};
+(desk)-[:next]->(conv:task {name: "conversation"}) {
+    input: desk.input,
+    output: "done",
+    local: {kind: weighted([|"a", 1|], [|"b", 1|])},
+};
+(conv)
+    =[:exclusive]=>[
+        -[:calls {when: conv.local.kind == "a"}]->(a1:task {name: "turn"}) {input: "first a", output: a1_reply.output},
+        -[:calls {when: conv.local.kind == "b"}]->(b1:task {name: "turn"}) {input: "first b", output: "ok"},
+    ];
+(a1)-[:calls]->(a1_reply:llm {name: "chat"}) {
+        input: [|{role: "user", content: a1.input}|],
+        output: {role: "assistant", content: "reply one"},
+    };
+(a1)-[:next]->(a2:task {name: "turn"}) {input: "second a", output: a2_reply.output};
+(a2)-[:calls]->(a2_reply:llm {name: "chat"}) {
+        input: [|...a1_reply.input, a1_reply.output, {role: "user", content: a2.input}|],
+        output: {role: "assistant", content: "reply two"},
+    };
+(a2)-[:next]->(a3:task {name: "turn"}) {input: "third a", output: a3_reply.output};
+(a3)-[:calls]->(a3_reply:llm {name: "chat"}) {
+        input: [|...a2_reply.input, a2_reply.output, {role: "user", content: a3.input}|],
+        output: {role: "assistant", content: "reply three"},
+    };
+(conv)-[:calls]->(after:task {name: "after"}) {input: a1.input, output: a3_reply.output};
+"#;
+    let model = lower(source).unwrap();
+    let second = json!([
+        {"role": "user", "content": "first a"},
+        {"role": "assistant", "content": "reply one"},
+        {"role": "user", "content": "second a"},
+    ]);
+    let third = json!([
+        {"role": "user", "content": "first a"},
+        {"role": "assistant", "content": "reply one"},
+        {"role": "user", "content": "second a"},
+        {"role": "assistant", "content": "reply two"},
+        {"role": "user", "content": "third a"},
+    ]);
+    // the steps of each branch as the data has them
+    let batch = data::generate(
+        model.clone(),
+        16,
+        Duration::from_secs(3600),
+        data::Distribution::Linear,
+        UNIX_EPOCH + Duration::from_secs(7200),
+        7,
+        &(),
+    )
+    .unwrap();
+    let value = |value: &Option<data::Value>| value.as_ref().map_or(Value::Null, |value| value.project(&()).unwrap());
+    let mut branches: Vec<Vec<Value>> = Vec::new();
+    for root in batch.events.iter().filter(|event| event.span_parents.is_empty()) {
+        let mut steps: Vec<Value> = (batch.events.iter())
+            .filter(|event| event.root_span_id == root.root_span_id)
+            .map(|event| json!([event.name, value(&event.input), value(&event.output)]))
+            .collect();
+        steps.sort_by_key(|step| step.to_string());
+        if !branches.contains(&steps) {
+            branches.push(steps);
+        }
+    }
+    branches.sort_by_key(|steps| steps.len());
+    assert_eq!(
+        branches.iter().map(|steps| steps.len()).collect::<Vec<_>>(),
+        [3, 8],
+        "{branches:?}"
+    );
+    assert!(branches[1].contains(&json!(["chat", second, {"role": "assistant", "content": "reply two"}])));
+    assert!(branches[1].contains(&json!(["chat", third, {"role": "assistant", "content": "reply three"}])));
+    assert!(branches[0].contains(&json!(["after", null, null])));
+    let python = execute_generated(
+        &model,
+        ScorerLang::Python,
+        "python3",
+        "check.py",
+        "from desk_agent import run_details\nimport json\nprint(json.dumps([run_details(random_source=lambda: draw) for draw in [0.99, 0.0]]))",
+    );
+    let typescript = execute_generated(
+        &model,
+        ScorerLang::Typescript,
+        "node",
+        "check.mts",
+        "import {runDetails} from './desk_agent.mts'; console.log(JSON.stringify([0.99, 0].map(draw => runDetails(undefined, () => draw))));",
+    );
+    for (lang, runs) in [("python", &python), ("typescript", &typescript)] {
+        for (run, expected) in runs.as_array().unwrap().iter().zip(&branches) {
+            let mut steps: Vec<Value> = (run["spans"].as_array().unwrap().iter())
+                .map(|span| json!([span["name"], span["input"], span["output"]]))
+                .collect();
+            steps.sort_by_key(|step| step.to_string());
+            assert_eq!(&steps, expected, "{lang}");
+        }
+    }
+    // the replies reach the later turns as values the earlier turns return
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("desk_agent.") && !file.name.contains("runtime"))
+            .unwrap();
+        for helper in ["_child(", "_at(", ".children"] {
+            assert!(!agent.contents.contains(helper), "{helper} in {}", agent.contents);
+        }
+    }
+}
+
+#[test]
+fn a_scorer_divides_two_integers_as_the_data_does() {
+    use bts_core::mocking::ScorerKind;
+    use code::Emitter;
+    // 900 characters over 400 is 2, and a hundred short of a thousand over 30 is 3 short with 10 left over
+    let source = r#"
+(checker:agent) {input: "go", output: root.output};
+(checker)-[:next]->(root:task) {input: checker.input, output: "OUTPUT"};
+(root)-[:calls]->(length:scorer) {score: clamp(len(context.output) / 400, 0, 5) / 10.0};
+(root)-[:calls]->(short:scorer) {score: ${${len(context.output) - 1000} / 30 + ${len(context.output) - 1000} % 30} / -100.0};
+"#
+    .replace("OUTPUT", &"x".repeat(900));
+    let model = lower(&source).unwrap();
+    let batch = one_trace(&source);
+    let expected = [("length", 0.2), ("short", 0.13)];
+    for (name, score) in expected {
+        let event = batch.events.iter().find(|event| event.name == name).unwrap();
+        assert_eq!(event.output.as_ref().unwrap().project(&()).unwrap(), json!({"score": score}));
+    }
+    for lang in [ScorerLang::Python, ScorerLang::Typescript] {
+        for (name, score) in expected {
+            let scorer = model.scorers.iter().find(|scorer| scorer.name == name).unwrap();
+            let ScorerKind::Code { score: value, steps } = &scorer.kind else {
+                panic!("code scorer")
+            };
+            let module = code::languages::Languages
+                .emit(
+                    lang,
+                    &[code::Item {
+                        name,
+                        slug: name,
+                        score: value,
+                        steps,
+                    }],
+                )
+                .unwrap();
+            let dir = std::env::temp_dir().join(format!("bts-scorer-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&dir).unwrap();
+            let function = &module.functions[0];
+            let (program, file, call) = match lang {
+                ScorerLang::Python => (
+                    "python3",
+                    "check.py",
+                    format!("\nimport json\nprint(json.dumps({function}(output='x' * 900)))\n"),
+                ),
+                ScorerLang::Typescript => (
+                    "node",
+                    "check.mts",
+                    format!("\nconsole.log(JSON.stringify({function}({{output: 'x'.repeat(900)}})))\n"),
+                ),
+            };
+            let path = dir.join(file);
+            fs::write(&path, format!("{}{call}", module.source)).unwrap();
+            let output = Command::new(program).arg(path).output().unwrap();
+            fs::remove_dir_all(dir).unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["score"], json!(score), "{name} in {}", module.source);
+        }
+    }
+}
+
+// the parameters of every function of an agent module that the function calls as a function
+fn called_parameters(agent: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let headers = ["def ", "function "];
+    let starts: Vec<usize> = (agent.match_indices('\n'))
+        .map(|(at, _)| at + 1)
+        .filter(|at| headers.iter().any(|header| agent[*at..].starts_with(header)))
+        .collect();
+    for (index, start) in starts.iter().enumerate() {
+        let text = &agent[*start..starts.get(index + 1).copied().unwrap_or(agent.len())];
+        let (header, body) = text.split_once('\n').unwrap_or((text, ""));
+        let Some((name, rest)) = header.split_once('(') else {
+            continue;
+        };
+        // a parameter ends at a comma outside the brackets of its type
+        let mut depth = 0;
+        let mut parameters = vec![String::new()];
+        for letter in rest.chars() {
+            match letter {
+                '(' | '[' | '<' | '{' => depth += 1,
+                ')' if depth == 0 => break,
+                ')' | ']' | '>' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    parameters.push(String::new());
+                    continue;
+                }
+                _ => {}
+            }
+            parameters.last_mut().unwrap().push(letter);
+        }
+        for parameter in parameters {
+            let parameter = parameter.trim().trim_start_matches('*');
+            let end = parameter.find([':', '=', ' ']).unwrap_or(parameter.len());
+            let parameter = &parameter[..end];
+            let called = format!("{parameter}()");
+            let read = body.match_indices(&called).any(|(at, _)| {
+                !body[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|before| before.is_alphanumeric() || before == '_' || before == '.')
+            });
+            if !parameter.is_empty() && read {
+                found.push(format!("{} in {}", parameter, name.trim()));
+            }
+        }
+    }
+    found
+}
+
+// the name, input and output of every span of each trace, in an order that does not depend on timing
+fn span_records(batch: &data::EventBatch) -> Vec<Vec<String>> {
+    let mut traces: Vec<(String, Vec<String>)> = Vec::new();
+    for event in &batch.events {
+        let record = json!([
+            event.name,
+            event.input.as_ref().map(|value| value.project(&()).unwrap()),
+            event.output.as_ref().map(|value| value.project(&()).unwrap()),
+        ])
+        .to_string();
+        match traces.iter_mut().find(|(root, _)| *root == event.root_span_id) {
+            Some((_, records)) => records.push(record),
+            None => traces.push((event.root_span_id.clone(), vec![record])),
+        }
+    }
+    (traces.into_iter())
+        .map(|(_, mut records)| {
+            records.sort();
+            records
+        })
+        .collect()
+}
+
+fn run_records(details: &Value) -> Vec<String> {
+    let mut records: Vec<String> = (details["spans"].as_array().unwrap().iter())
+        .map(|span| json!([span["name"], span.get("input"), span.get("output")]).to_string())
+        .collect();
+    records.sort();
+    records
+}
+
+#[test]
+fn a_world_is_computed_once_as_typed_values() {
+    // a series, a fact, an entity and a persona with a fork, read by the agent's input and by two steps
+    let source = r#"(chat:series {turns: 2, up_to: 4, weights: [|3, 2, 1|]});
+(tone:fact {per: chat.number})
+    =[:weighted]=>[
+        -[:next {weight: 2}]->(:given {value: "conversational"}),
+        -[:next {weight: 1}]->(:given {value: "professional"}),
+    ];
+(person:entity {per: chat.number})
+    =[:weighted]=>[
+        -[:next {weight: 1}]->(:given {value: {name: "Renee Castillo", customer_id: "cus_48121"}}),
+        -[:next {weight: 1}]->(:given {value: {name: "Owen Brandt", customer_id: "cus_50977"}}),
+    ];
+(customer:persona {style: tone.value, per: chat.number})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "I", person: "first"})
+        =[:weighted]=>[
+            -[:next {weight: 2}]->(:part {verb: "need", complement: "to file a claim"}),
+            -[:next {weight: 1}]->(:part {verb: "want", complement: "to open a claim"}),
+        ]
+    -[:next]->(:sentence) {defaults: {form: "question"}}
+        -[:next]->(:part {subject: "my deductible", verb: "apply", complement: "to this claim"})
+    -[:next]->(:sentence) {defaults: {form: "question"}}
+        -[:next]->(:part {subject: "I", person: "first", modal: "can", verb: "upload", complement: "the photos"})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "that", verb: "help", complement: "a lot"});
+(desk:agent) {input: {message: customer.said[chat.turn], customer_id: person.attributes.customer_id}, output: t.output};
+(desk)-[:next]->(t:task {name: "turn"}) {
+    input: desk.input,
+    output: {id: chat.id, turn: chat.turn, tone: tone.value, name: person.attributes.name, reply: reply.output},
+};
+(t)-[:calls]->(lookup:tool {name: "lookup"}) {input: {customer_id: person.attributes.customer_id}, output: {holder: person.attributes.name, tone: tone.value}}
+    -[:next]->(reply:llm {name: "reply"}) {input: conversation({user: customer.said, turn: chat.turn}), output: format("Thanks {}", person.attributes.name)};
+"#;
+    let model = lower(source).unwrap();
+    for (lang, typed) in [
+        (
+            ScorerLang::Python,
+            [
+                "person_attributes: PersonAttributes",
+                "tone_value: str",
+                "customer_said: list[",
+            ],
+        ),
+        (
+            ScorerLang::Typescript,
+            [
+                "personAttributes: PersonAttributes",
+                "toneValue: string",
+                "customerSaid: Array<",
+            ],
+        ),
+    ] {
+        let assembly = code::assemble_agents(&model, lang, &CodeTarget::new("local-test")).unwrap();
+        let agent = (assembly.files.iter())
+            .find(|file| file.name.contains("desk_agent.") && !file.name.contains("runtime"))
+            .unwrap();
+        // nothing is deferred, and no step is handed a function to call for a value
+        assert!(!agent.contents.contains("_lazy("), "{}", agent.contents);
+        assert_eq!(called_parameters(&agent.contents), Vec::<String>::new(), "{}", agent.contents);
+        // the steps take what the world gives as values of the types the walks give them
+        for parameter in typed {
+            assert!(agent.contents.contains(parameter), "{parameter} in {}", agent.contents);
+        }
+        let any = if lang == ScorerLang::Python { ": Any" } else { ": any" };
+        for function in ["lookup", "reply"] {
+            assert!(!function_text(&agent.contents, function).contains(any), "{}", agent.contents);
+        }
+    }
+    let mut turns = std::collections::BTreeSet::new();
+    for seed in [5u64, 9] {
+        let batch = data::generate(
+            model.clone(),
+            10,
+            Duration::from_secs(3600),
+            data::Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7200),
+            seed,
+            &(),
+        )
+        .unwrap();
+        let expected = span_records(&batch);
+        assert_eq!(expected.len(), 10);
+        let python = execute_generated(
+            &model,
+            ScorerLang::Python,
+            "python3",
+            "check.py",
+            &format!(
+                "from desk_agent import run_details\nimport json\nprint(json.dumps([run_details(seed={seed}, trace=trace) for trace in range(10)]))"
+            ),
+        );
+        let typescript = execute_generated(
+            &model,
+            ScorerLang::Typescript,
+            "node",
+            "check.mts",
+            &format!(
+                "import {{runDetails}} from './desk_agent.mts'; console.log(JSON.stringify([...Array(10).keys()].map(trace => runDetails(undefined, Math.random, {seed}n, trace))));"
+            ),
+        );
+        for (index, records) in expected.iter().enumerate() {
+            assert_eq!(&run_records(&python[index]), records, "python, seed {seed}, trace {index}");
+            assert_eq!(
+                &run_records(&typescript[index]),
+                records,
+                "typescript, seed {seed}, trace {index}"
+            );
+            turns.insert(python[index]["output"]["turn"].as_u64().unwrap());
+        }
+    }
+    assert!(turns.len() > 1, "{turns:?}");
+}
+
+#[test]
+fn a_value_that_can_fail_is_computed_on_the_branch_that_reads_it() {
+    // the history asks for a turn nobody wrote, so computing it raises, and only the step that
+    // does not run for this input reads it
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {
+    input: a.input,
+    output: "ok",
+    local: {known: a.input == "hi", history: conversation({user: [|"one"|], turn: 3})},
+};
+(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(plan)
+    =[:exclusive]=>[
+        -[:next {when: t.local.known}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
+        -[:next {when: !t.local.known}]->(recall:tool {name: "recall"}) {input: t.local.history, output: "none"},
+    ];
+"#;
+    let model = lower(source).unwrap();
+    // data generation never reads the history, so it does not raise
+    let batch = one_trace(source);
+    let names: Vec<&str> = batch.events.iter().map(|event| event.name.as_str()).collect();
+    assert!(names.contains(&"greet") && !names.contains(&"recall"), "{names:?}");
+    for (lang, call, branch) in [
+        (ScorerLang::Python, "chat_messages(", "if runs_recall:"),
+        (ScorerLang::Typescript, "chatMessages(", "if (runsRecall) {"),
+    ] {
+        let (agent, _) = agent_module(&model, lang);
+        assert!(!agent.contains("_lazy("), "{agent}");
+        assert_eq!(called_parameters(&agent), Vec::<String>::new(), "{agent}");
+        // it is computed once, inside the branch that runs the step, and handed to the step as a value
+        assert_eq!(agent.matches(call).count(), 1, "{agent}");
+        let guarded = function_text(
+            &agent,
+            if lang == ScorerLang::Python {
+                "maybe_recall"
+            } else {
+                "maybeRecall"
+            },
+        );
+        let (before, inside) = guarded.split_once(branch).unwrap_or_else(|| panic!("no branch in {guarded}"));
+        assert!(!before.contains(call) && inside.contains(call), "{guarded}");
+        assert!(!function_text(&agent, "_execute").contains(call), "{agent}");
+    }
+    // the agent takes the same path without raising
+    for details in generated_runs(&model, "a") {
+        let spans: Vec<&str> = (details["spans"].as_array().unwrap().iter())
+            .map(|span| span["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(spans, ["turn", "plan", "greet"], "{details}");
+    }
+    // and raises on the path that reads the history, where the step that reads it would run
+    let failed = |lang: ScorerLang, program: &str, file: &str, runner: &str| {
+        let details = execute_generated(&model, lang, program, file, runner);
+        assert!(
+            details["error"]
+                .as_str()
+                .unwrap()
+                .contains("conversation: turn is a whole number that counts the user's messages from zero"),
+            "{details}"
+        );
+    };
+    failed(
+        ScorerLang::Python,
+        "python3",
+        "check.py",
+        "from a_agent import run_details\nimport json\ntry:\n    run_details('bye')\n    print(json.dumps({'error': ''}))\nexcept Exception as error:\n    print(json.dumps({'error': str(error)}))",
+    );
+    failed(
+        ScorerLang::Typescript,
+        "node",
+        "check.mts",
+        "import {runDetails} from './a_agent.mts'; let error = ''; try { runDetails('bye'); } catch (raised) { error = String(raised); } console.log(JSON.stringify({error}));",
+    );
+}
+
+#[test]
+fn values_are_named_for_what_owns_them() {
+    // two steps keep a value under one name that no local may take, and a walk has two sentences without names
+    let source = r#"(customer:persona {style: "text_message"})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "I", person: "first", verb: "need", complement: "to file a claim"})
+    -[:next]->(:sentence)
+        -[:next]->(:part {subject: "that", verb: "help", complement: "a lot"});
+(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {input: a.input, output: customer.said};
+(t)-[:calls]->(first:llm {name: "plan"}) {
+    local: {arguments: {customer_id: t.input}},
+    input: t.input,
+    output: {name: "lookup", arguments: self.local.arguments},
+}
+    -[:next]->(lookup:tool {name: "lookup"}) {input: first.local.arguments, output: "found"}
+    -[:next]->(second:llm {name: "plan"}) {
+        local: {arguments: {claim_id: lookup.output}},
+        input: lookup.output,
+        output: {name: "update", arguments: self.local.arguments},
+    }
+    -[:next]->(update:tool {name: "update"}) {input: second.local.arguments, output: "done"};
+"#;
+    let model = lower(source).unwrap();
+    for (lang, owned) in [
+        (
+            ScorerLang::Python,
+            [
+                "first_arguments",
+                "second_arguments",
+                "customer_sentence_1_text",
+                "customer_sentence_2_text",
+            ],
+        ),
+        (
+            ScorerLang::Typescript,
+            [
+                "firstArguments",
+                "secondArguments",
+                "customerSentence1Text",
+                "customerSentence2Text",
+            ],
+        ),
+    ] {
+        let (agent, _) = agent_module(&model, lang);
+        for name in owned {
+            assert!(agent.contains(name), "{name} in {agent}");
+        }
+        // a number says which sentence of the persona a value is, and never that a name was taken
+        for numbered in [
+            "arguments2",
+            "arguments_2",
+            "sentenceText2",
+            "sentence_text_2",
+            "Text2",
+            "text_2",
+        ] {
+            assert!(!agent.contains(numbered), "{numbered} in {agent}");
+        }
+    }
+    for details in generated_runs(&model, "a") {
+        assert_eq!(step(&details, "lookup")["input"], json!({"customer_id": "hi"}), "{details}");
+        assert_eq!(step(&details, "update")["input"], json!({"claim_id": "found"}), "{details}");
+        assert_eq!(details["output"].as_array().unwrap().len(), 2, "{details}");
+    }
+}
+
+#[test]
+fn a_value_that_can_fail_on_two_branches_is_computed_on_each() {
+    // two steps that never run together read a history that raises, a ticket that is drawn,
+    // and a note that both draws and may raise for what the agent is given
+    let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-[:next]->(t:task {name: "turn"}) {
+    input: a.input,
+    output: "ok",
+    local: {
+        history: conversation({user: [|"one"|], turn: 3}),
+        ticket: format("T-{}", range(100, 999)),
+        note: paragraph([|format("N-{}", range(100, 999)), a.input|]),
+    },
+};
+(t)-[:calls]->(plan:llm {name: "plan"}) {input: t.input, output: "go"};
+(plan)
+    =[:exclusive]=>[
+        -[:next {when: t.input == "hi"}]->(greet:tool {name: "greet"}) {input: t.input, output: "hello"},
+        -[:next {when: t.input == "a"}]->(recall:tool {name: "recall"}) {input: {history: t.local.history, ticket: t.local.ticket}, output: "none"},
+        -[:next {when: t.input == "b"}]->(review:tool {name: "review"}) {input: {note: t.local.note, ticket: t.local.ticket}, output: "some"},
+        -[:next {when: t.input == "c"}]->(revise:tool {name: "revise"}) {input: {note: t.local.note, ticket: t.local.ticket}, output: "more"},
+    ];
+"#;
+    let model = lower(source).unwrap();
+    for (lang, history, note, draw) in [
+        (ScorerLang::Python, "chat_messages(", "join_sentences(", "note_draw = "),
+        (ScorerLang::Typescript, "chatMessages(", "joinSentences(", "const noteDraw = "),
+    ] {
+        let (agent, _) = agent_module(&model, lang);
+        assert!(!agent.contains("_lazy("), "{agent}");
+        assert_eq!(called_parameters(&agent), Vec::<String>::new(), "{agent}");
+        let entry = function_text(&agent, "_execute");
+        // what can raise is computed by the one step that reads it, or once on each branch that does
+        assert_eq!(agent.matches(history).count(), 1, "{agent}");
+        assert_eq!(agent.matches(note).count(), 2, "{agent}");
+        assert!(!entry.contains(history) && !entry.contains(note), "{agent}");
+        // what is drawn is drawn once, where every branch can read it
+        assert_eq!(entry.matches("ange(100, 999").count(), 2, "{agent}");
+        assert!(entry.contains(draw), "{agent}");
+    }
+    let run = |input: &str| {
+        let python = execute_generated(
+            &model,
+            ScorerLang::Python,
+            "python3",
+            "check.py",
+            &format!(
+                "from a_agent import run_details\nimport json\ntry:\n    print(json.dumps(run_details('{input}')))\nexcept Exception as error:\n    print(json.dumps({{'error': str(error)}}))"
+            ),
+        );
+        let typescript = execute_generated(
+            &model,
+            ScorerLang::Typescript,
+            "node",
+            "check.mts",
+            &format!(
+                "import {{runDetails}} from './a_agent.mts'; let details; try {{ details = runDetails('{input}'); }} catch (raised) {{ details = {{error: String(raised)}}; }} console.log(JSON.stringify(details));"
+            ),
+        );
+        [python, typescript]
+    };
+    // a path that reads neither does not raise
+    for details in run("hi") {
+        assert_eq!(step(&details, "greet")["output"], "hello", "{details}");
+    }
+    // the path that reads the history raises for it
+    for details in run("a") {
+        assert!(details["error"].as_str().unwrap().contains("conversation: turn"), "{details}");
+    }
+    // each path that reads the note joins the same draw with what the agent was given
+    for input in ["b", "c"] {
+        for details in run(input) {
+            let name = if input == "b" { "review" } else { "revise" };
+            let read = &step(&details, name)["input"];
+            let note = read["note"].as_str().unwrap();
+            assert!(note.starts_with("N-") && note.ends_with(&format!(". {input}")), "{details}");
+            assert!(read["ticket"].as_str().unwrap().starts_with("T-"), "{details}");
+        }
     }
 }

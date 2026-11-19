@@ -11,6 +11,7 @@ use super::data::{AttachmentFormat, UnsupportedAttachment, Value};
 use rand::Rng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 /// What runs a compiled model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +171,21 @@ pub struct Helper {
     pub texts: bool,
     /// Whether the result is plain data, which typed code can use as it is.
     pub plain: bool,
+    /// Whether a call is sure not to raise, from what is known of its arguments.
+    ///
+    /// The arguments are the ones the function was called with, before the operation
+    /// and the random source a helper may take. A helper without this may raise on any
+    /// call, so a consumer computes its result only where the result is read.
+    pub sure: Option<fn(&[Known]) -> bool>,
+    /// What a call returns, from what is known of its arguments.
+    ///
+    /// It says more than `counts`, `texts` and `plain` do, and a consumer prefers it.
+    pub returns: Option<fn(&[Known]) -> Known>,
+    /// Whether a call draws from the random stream of the run, from what is known of its arguments.
+    ///
+    /// A call that does gives another result each time it runs, so a consumer computes it once.
+    /// A helper without this draws whenever it is passed the random source.
+    pub draws: Option<fn(&[Known]) -> bool>,
     /// The definition of the function, starting on a new line.
     ///
     /// It is empty when the definition is part of a runtime the helper names.
@@ -186,6 +202,143 @@ pub struct Helper {
     /// A scorer file has no runtime module, so the helper needs a runtime to bring
     /// its definition along.
     pub scorer: Option<&'static str>,
+}
+
+/// What is known of a value before it is computed.
+///
+/// A helper reads its arguments this way to say whether a call can raise and what
+/// it returns. A consumer reads the answer to compute a value early and to type it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Known {
+    /// Nothing is known.
+    Unknown,
+    /// Plain data of a shape that is not known.
+    Plain,
+    /// Null.
+    Null,
+    /// A boolean.
+    Bool,
+    /// A string, with what it says when it is written out.
+    Text(Option<String>),
+    /// A finite number between two bounds, and whether it is whole.
+    Number { low: f64, high: f64, whole: bool },
+    /// A list written item by item. An item that is a [`Known::Run`] stands for any number of items.
+    Items(Vec<Known>),
+    /// Any number of items alike, in a list written item by item.
+    Run(Box<Known>),
+    /// A list of any length whose items are alike.
+    List(Box<Known>),
+    /// An object that has at least these keys.
+    Object(BTreeMap<String, Known>),
+    /// A value that may be null.
+    Maybe(Box<Known>),
+}
+
+impl Known {
+    /// A number that may be any finite one.
+    pub const NUMBER: Known = Known::Number {
+        low: f64::NEG_INFINITY,
+        high: f64::INFINITY,
+        whole: false,
+    };
+
+    /// A whole number between two bounds.
+    pub fn whole(low: f64, high: f64) -> Known {
+        Known::Number { low, high, whole: true }
+    }
+
+    /// Whether the value is plain data all the way down.
+    pub fn plain(&self) -> bool {
+        match self {
+            Known::Unknown => false,
+            Known::Items(items) => items.iter().all(Known::plain),
+            Known::List(item) | Known::Maybe(item) | Known::Run(item) => item.plain(),
+            Known::Object(fields) => fields.values().all(Known::plain),
+            _ => true,
+        }
+    }
+
+    /// Whether the value is a string, or a whole number a float holds exactly.
+    ///
+    /// These are what a walk may be drawn per.
+    pub fn key(&self) -> bool {
+        match self {
+            Known::Text(_) => true,
+            Known::Number { low, high, whole } => *whole && *low >= -SAFE && *high <= SAFE,
+            _ => false,
+        }
+    }
+
+    /// What is known of a value that is one of two.
+    pub fn join(self, other: Known) -> Known {
+        match (self, other) {
+            (Known::Null, Known::Null) => Known::Null,
+            (Known::Null, Known::Maybe(inner)) | (Known::Maybe(inner), Known::Null) => Known::Maybe(inner),
+            (Known::Null, other) | (other, Known::Null) => Known::Maybe(Box::new(other)),
+            (Known::Maybe(a), Known::Maybe(b)) => Known::Maybe(Box::new(a.join(*b))),
+            (Known::Maybe(a), b) | (b, Known::Maybe(a)) => Known::Maybe(Box::new(a.join(b))),
+            (Known::Bool, Known::Bool) => Known::Bool,
+            (Known::Text(a), Known::Text(b)) => Known::Text(if a == b { a } else { None }),
+            (
+                Known::Number { low, high, whole },
+                Known::Number {
+                    low: other_low,
+                    high: other_high,
+                    whole: other_whole,
+                },
+            ) => Known::Number {
+                low: low.min(other_low),
+                high: high.max(other_high),
+                whole: whole && other_whole,
+            },
+            (Known::Items(a), Known::Items(b))
+                if a.len() == b.len() && !a.iter().chain(&b).any(|item| matches!(item, Known::Run(_))) =>
+            {
+                Known::Items(a.into_iter().zip(b).map(|(a, b)| a.join(b)).collect())
+            }
+            (a @ (Known::Items(_) | Known::List(_)), b @ (Known::Items(_) | Known::List(_))) => {
+                let one = |item: Known| match item {
+                    Known::Run(item) => *item,
+                    item => item,
+                };
+                let item = |list: Known| match list {
+                    Known::Items(items) => items.into_iter().map(one).reduce(Known::join),
+                    Known::List(item) => Some(*item),
+                    _ => None,
+                };
+                match (item(a), item(b)) {
+                    (Some(a), Some(b)) => Known::List(Box::new(a.join(b))),
+                    (Some(item), None) | (None, Some(item)) => Known::List(Box::new(item)),
+                    (None, None) => Known::Items(vec![]),
+                }
+            }
+            (Known::Object(a), Known::Object(mut b)) => Known::Object(
+                a.into_iter()
+                    .filter_map(|(key, value)| b.remove(&key).map(|other| (key, value.join(other))))
+                    .collect(),
+            ),
+            (a, b) if a.plain() && b.plain() => Known::Plain,
+            _ => Known::Unknown,
+        }
+    }
+}
+
+// the largest whole number a float holds exactly
+const SAFE: f64 = 9_007_199_254_740_991.0;
+
+impl Helper {
+    /// The helper with what it says of its calls: when one cannot raise, and what one returns.
+    pub const fn known(mut self, sure: fn(&[Known]) -> bool, returns: fn(&[Known]) -> Known) -> Self {
+        self.sure = Some(sure);
+        self.returns = Some(returns);
+        self
+    }
+
+    /// The helper with when a call draws from the random stream of the run.
+    pub const fn drawing(mut self, draws: fn(&[Known]) -> bool) -> Self {
+        self.draws = Some(draws);
+        self
+    }
 }
 
 /// The text several helpers share, which generated code carries once.

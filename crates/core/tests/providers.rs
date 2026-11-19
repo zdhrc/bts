@@ -305,9 +305,9 @@ fn world_conforms_to_the_provider_contract() {
         schema.context,
         ["steps", "trace_index", "place", "identity", "draws", "related", "members"]
     );
-    // the twelve English functions, merge and conversation are declared, and what a fork and a series lower to is internal
-    assert_eq!(schema.functions.len(), 14);
-    assert_eq!(world::Bundle.functions().len(), 18);
+    // the twelve English functions, merge, conversation and paragraph are declared, and what a fork and a series lower to is internal
+    assert_eq!(schema.functions.len(), 15);
+    assert_eq!(world::Bundle.functions().len(), 19);
     let internal = ["world.pick", "world.turn", "world.id", "world.draws"];
     assert_eq!(world::Bundle.internal(), internal);
     for function in world::Bundle.functions() {
@@ -315,7 +315,7 @@ fn world_conforms_to_the_provider_contract() {
         assert!(function.runs(Consumer::Agent(ScorerLang::Python)), "{}", function.name);
         assert!(function.runs(Consumer::Agent(ScorerLang::Typescript)), "{}", function.name);
         // the English functions run in scorers too, and what serves a walk does not
-        let walks = ["merge", "conversation"].contains(&function.name) || internal.contains(&function.name);
+        let walks = ["merge", "conversation", "paragraph"].contains(&function.name) || internal.contains(&function.name);
         assert_eq!(function.runs(Consumer::Scorer), !walks, "{}", function.name);
     }
 }
@@ -329,8 +329,8 @@ fn a_provider_joined_by_a_contributor_has_the_kinds_and_functions_of_both() {
     assert_eq!((schema.id, schema.name), ("braintrust", "Braintrust mocking"));
     let sources: Vec<_> = schema.definitions.iter().map(|source| source.name).collect();
     assert_eq!(sources, ["braintrust.bt", "world.bt"]);
-    assert_eq!(schema.functions.len(), 17);
-    assert_eq!(joined.functions().len(), 21);
+    assert_eq!(schema.functions.len(), 20);
+    assert_eq!(joined.functions().len(), 24);
     assert_eq!(joined.internal().len(), 4);
     let parts: Vec<_> = joined.parts().iter().map(|part| part.schema.id).collect();
     assert_eq!(parts, ["braintrust", "world"]);
@@ -472,6 +472,9 @@ static INCONSISTENT_FUNCTIONS: &[Function] = &[
             counts: false,
             texts: false,
             plain: false,
+            sure: None,
+            returns: None,
+            draws: None,
             text: "\ndef _weigh(value):\n    return 0\n",
             operation: None,
             runtime: None,
@@ -625,7 +628,7 @@ fn braintrust_declares_and_implements_the_functions_that_left_the_language() {
     let declared: Vec<&str> = (braintrust::Bundle.schema().functions.iter())
         .map(|function| function.doc.name)
         .collect();
-    assert_eq!(declared, ["tokens", "attachment", "noise"]);
+    assert_eq!(declared, ["tokens", "attachment", "noise", "json", "decimal"]);
     for name in &declared {
         assert!(bts_lang::spec::SPEC.function(name).is_none(), "{name}");
         assert!(bts_lang::semantics::compile(&format!("(v:vars) {{value: {name}()}};")).is_err());

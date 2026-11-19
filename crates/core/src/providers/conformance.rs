@@ -136,7 +136,10 @@ pub fn check<P: Contributor>(provider: &P) -> Vec<String> {
         ];
         for (keyword, lang, helper) in helpers {
             let Some(helper) = helper else { continue };
-            let defines = |text: &str, called: &str| text.contains(&format!("\n{keyword} {called}("));
+            // a TypeScript helper may name the type of what it returns before its parameters
+            let defines = |text: &str, called: &str| {
+                text.contains(&format!("\n{keyword} {called}(")) || text.contains(&format!("\n{keyword} {called}<"))
+            };
             let defined = match helper.runtime {
                 Some(runtime) => defines(&(runtime.source)(lang, true), helper.name),
                 None => defines(helper.text, helper.name),

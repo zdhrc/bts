@@ -7,6 +7,6 @@
 };
 
 ("response-length":scorer {lang: "python", file: "quality"}) {
-    score: clamp(len(context.output) / 400, 0.1, 0.9),
+    score: clamp(len(context.output) / 400.0, 0.1, 0.9),
     steps: [|{when: context.output == null, score: 0}|],
 };

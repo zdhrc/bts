@@ -72,10 +72,12 @@ impl super::Contributor for Bundle {
     /// A walk, its edges and its forks are checked against the schema. A step is checked by what it gives.
     /// A verb written as a word is looked up wherever it is written.
     /// A walk drawn for more than a trace holds no function that samples.
+    /// A series states lengths it can run for.
     fn walked(&self, model: &bts_lang::Model) -> bts_lang::Diags {
         let mut diags = model.unsupported(&SCHEMA, &walk::checked(model));
         diags.extend(walk::verbs(model));
         diags.extend(walk::samples(model));
+        diags.extend(walk::bounds(model));
         diags
     }
 

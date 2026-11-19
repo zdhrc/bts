@@ -10,7 +10,7 @@ pub const SOURCE: Source<'static> = Source {
     subject: {type: "string", required: true},
     person: {type: "string", default: "third"},
     number: {type: "string", default: "singular"},
-    verb: {type: "string", required: true},
+    verb: {type: "any", required: true},
     complement: {type: "any", default: null},
     modal: {type: "any", default: null},
     tense: {type: "string", default: "present"},
@@ -172,7 +172,7 @@ pub const SOURCE: Source<'static> = Source {
 # a list is a walk with one item for each step
 +(list:node) {
     items: {type: "array", value: context.steps},
-    text: {type: "string", value: compose(context.steps)},
+    text: {type: "string", value: paragraph(context.steps)},
     gives: {type: "string", value: self.text},
 }
     -[:extends]->(walk);

@@ -27,6 +27,7 @@ pub const SOURCE: Source<'static> = Source {
 # names are optional so anonymous graph nodes remain usable
 # value ranges, tag element types, and emission rules need provider validation
 # a span takes these fields only, local holds values a shape computes for its own expressions and is never emitted
+# wait is the seconds that pass before the span starts, after the step before it ends, such as the time a person takes to reply
 +(span:node {name: {type: "string"}}) {
     input: {type: "any", role: "input"},
     output: {type: "any", role: "output"},
@@ -37,6 +38,7 @@ pub const SOURCE: Source<'static> = Source {
     scores: {type: "object"},
     tags: {type: "array"},
     duration: {type: "number"},
+    wait: {type: "number"},
     local: {type: "object"},
 }
     -[:requires {trace_index: {type: "number"}}]->(context);
