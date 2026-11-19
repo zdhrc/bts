@@ -6,11 +6,12 @@ use crate::dsl::{
 };
 use code::{Dependency, Expr, Statement, Variable};
 use serde_json::{Value as Json, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) struct Agent {
     pub functions: Vec<code::Function>,
-    pub tokens: bool,
+    // the provider helpers the agent calls
+    pub helpers: Vec<crate::mocking::Helper>,
     pub contracts: Vec<(String, Json)>,
 }
 
@@ -336,6 +337,7 @@ pub(crate) mod code {
                     rewrite_expr(scope, rewrite);
                     self::rewrite(body, rewrite);
                 }
+                Statement::Break => {}
             }
         }
     }
@@ -397,6 +399,7 @@ pub(crate) mod code {
                     refs.extend(scope.references());
                     refs.extend(references(body));
                 }
+                Statement::Break => {}
             }
         }
         refs.retain(|d| !bound(d, &locals));
@@ -489,6 +492,7 @@ pub(crate) mod code {
             body: Vec<Statement>,
         },
         Raise(Expr),
+        Break,
         Function(Function),
     }
 
@@ -550,6 +554,31 @@ struct Context<'a> {
     local_names: Vec<(String, String)>,
     frames: Vec<(NodeId, String)>,
     direct: bool,
+    // values declared inside a step instead of beside it: the value, the step that holds it, the scope it left
+    moved: Vec<(String, NodeId, NodeId)>,
+    // moved values nothing outside their step reads, which the step does not hand back
+    unkept: Vec<String>,
+    // values that are another value under a second name, and the value they stand for
+    aliases: Vec<(String, String)>,
+    // calls to provider functions an agent in this language cannot run
+    unsupported: &'a Unsupported,
+    // how the agent reads which trace of a run it is, when it can be told
+    trace_index: Option<Expr>,
+}
+
+/// Provider function calls a consumer met and cannot run, each at its location.
+pub(crate) type Unsupported = std::cell::RefCell<bts_lang::Diags>;
+
+fn unsupported_call(
+    function: &crate::mocking::Function,
+    consumer: crate::mocking::Consumer,
+    range: bts_lang::SrcRange,
+) -> bts_lang::Diag {
+    bts_lang::Diag {
+        when: bts_lang::DiagPhase::Validation,
+        what: format!("function `{}` is not supported by {}", function.name, consumer.name()),
+        r#where: range,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -610,6 +639,24 @@ fn child_node(child: &Child) -> NodeId {
     }
 }
 
+// the repeats of a plan that run as loops
+fn looping(children: &[Child], found: &mut Vec<NodeId>) {
+    for child in children {
+        match child {
+            Child::Span(span) => looping(&span.children, found),
+            Child::Choice(choice) => looping(&choice.children, found),
+            Child::Maybe(maybe) => looping(&maybe.children, found),
+            Child::Scorer(_) => {}
+            Child::Repeat(repeat) => {
+                if repeat.again.is_some() {
+                    found.push(repeat.node);
+                }
+                looping(&repeat.children, found);
+            }
+        }
+    }
+}
+
 fn random_name(lang: ScorerLang) -> &'static str {
     match lang {
         ScorerLang::Python => "random_source",
@@ -618,20 +665,51 @@ fn random_name(lang: ScorerLang) -> &'static str {
 }
 
 fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String>) -> Vec<(NodeId, Names)> {
-    fn visit(children: &[Child], lang: ScorerLang, used: &mut HashSet<String>, names: &mut Vec<(NodeId, Names)>) {
+    // how many steps print under each name
+    fn count(children: &[Child], shared: &mut HashMap<String, usize>) {
         for child in children {
             match child {
                 Child::Span(span) => {
+                    let stem = crate::mocking::code::planning::identifier_stem(&span.name).unwrap_or_default();
+                    *shared.entry(stem).or_default() += 1;
+                    count(&span.children, shared);
+                }
+                Child::Repeat(repeat) => count(&repeat.children, shared),
+                Child::Choice(choice) => count(&choice.children, shared),
+                Child::Maybe(maybe) => count(&maybe.children, shared),
+                Child::Scorer(_) => {}
+            }
+        }
+    }
+    // steps that share a name are told apart by the identifiers they were declared under
+    fn readable<'a>(span: &'a crate::dsl::Span, shared: &HashMap<String, usize>) -> &'a str {
+        let stem = crate::mocking::code::planning::identifier_stem(&span.name).unwrap_or_default();
+        match &span.label {
+            Some(label) if shared.get(&stem).copied().unwrap_or(0) > 1 => label,
+            _ => &span.name,
+        }
+    }
+    fn visit(
+        children: &[Child],
+        shared: &HashMap<String, usize>,
+        lang: ScorerLang,
+        used: &mut HashSet<String>,
+        names: &mut Vec<(NodeId, Names)>,
+    ) {
+        for child in children {
+            match child {
+                Child::Span(span) => {
+                    let name = readable(span, shared);
                     names.push((
                         span.node,
                         Names {
-                            function: allocate(&span.name, "", lang, used),
-                            state: allocate(&span.name, "span", lang, used),
+                            function: allocate(name, "", lang, used),
+                            state: allocate(name, "span", lang, used),
 
                             ..Names::default()
                         },
                     ));
-                    visit(&span.children, lang, used, names);
+                    visit(&span.children, shared, lang, used, names);
                 }
                 Child::Repeat(repeat) => {
                     let name = repeat.name.as_deref().unwrap_or("batch");
@@ -646,45 +724,36 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
                             item: allocate(name, "result", lang, used),
                         },
                     ));
-                    visit(&repeat.children, lang, used, names);
+                    visit(&repeat.children, shared, lang, used, names);
                 }
                 Child::Choice(choice) => {
-                    branch_names(
-                        choice.node,
-                        choice.name.as_deref().unwrap_or("choice"),
-                        &choice.children,
-                        true,
-                        lang,
-                        used,
-                        names,
-                    );
-                    visit(&choice.children, lang, used, names);
+                    branch_names(choice.node, choice.name.as_deref().unwrap_or("choice"), lang, used, names);
+                    visit(&choice.children, shared, lang, used, names);
                 }
                 Child::Maybe(maybe) => {
-                    branch_names(
-                        maybe.node,
-                        maybe.name.as_deref().unwrap_or("optional"),
-                        &maybe.children,
-                        false,
-                        lang,
-                        used,
-                        names,
-                    );
-                    visit(&maybe.children, lang, used, names);
+                    // a path that may not run is named for the step it guards
+                    let guarded = match maybe.children.as_slice() {
+                        [Child::Span(span)] => Some(format!("maybe_{}", readable(span, shared))),
+                        _ => None,
+                    };
+                    let name = maybe.name.clone().or(guarded).unwrap_or_else(|| "optional".into());
+                    branch_names(maybe.node, &name, lang, used, names);
+                    visit(&maybe.children, shared, lang, used, names);
                 }
-                _ => {}
+                Child::Scorer(v) => {
+                    names.push((
+                        v.node,
+                        Names {
+                            function: allocate(&v.name, "", lang, used),
+                            state: allocate(&v.name, "span", lang, used),
+                            ..Names::default()
+                        },
+                    ));
+                }
             }
         }
     }
-    fn branch_names(
-        node: NodeId,
-        name: &str,
-        _children: &[Child],
-        _choice: bool,
-        lang: ScorerLang,
-        used: &mut HashSet<String>,
-        names: &mut Vec<(NodeId, Names)>,
-    ) {
+    fn branch_names(node: NodeId, name: &str, lang: ScorerLang, used: &mut HashSet<String>, names: &mut Vec<(NodeId, Names)>) {
         names.push((
             node,
             Names {
@@ -695,44 +764,72 @@ fn collect_names(children: &[Child], lang: ScorerLang, used: &mut HashSet<String
             },
         ));
     }
+    let mut shared = HashMap::new();
+    count(children, &mut shared);
     let mut names = Vec::new();
-    visit(children, lang, used, &mut names);
+    visit(children, &shared, lang, used, &mut names);
     names
 }
 
-pub(crate) fn agent(model: &Model, trace: &Trace, lang: ScorerLang) -> Result<Agent, String> {
-    execution::emit(model, trace, lang)
-}
-
-fn is_literal(value: &Value) -> bool {
-    match value {
-        Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null => true,
-        Value::Array(array) => array.elem.iter().all(|item| match item {
-            ArrayElem::Item(v) | ArrayElem::Spread(v) => is_literal(v),
-        }),
-        Value::Object(object) => object.elem.iter().all(|field| is_literal(&field.value)),
-        _ => false,
-    }
+pub(crate) fn agent(
+    model: &Model,
+    trace: &Trace,
+    output: &Value,
+    lang: ScorerLang,
+    unsupported: &Unsupported,
+) -> Result<Agent, String> {
+    execution::emit(model, trace, output, lang, unsupported)
 }
 
 fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr, String> {
     let expr = |v: &Value| expression(v, ctx, lang);
     Ok(match value {
         Value::CtxRef(reference) => context_ref(*reference, ctx)?,
+        // the call is reported with its location and the rest of the agent is still checked
+        Value::Func {
+            func: Func::Provider { function, .. },
+            range,
+        } if function.helper(lang).is_none() => {
+            let diag = unsupported_call(function, crate::mocking::Consumer::Agent(lang), *range);
+            let mut unsupported = ctx.unsupported.borrow_mut();
+            if !unsupported.contains(&diag) {
+                unsupported.push(diag);
+            }
+            Expr::Null
+        }
         Value::Func { func, .. } => expressions::emit(func, ctx, lang)?,
         Value::Index { target, index, .. } => Expr::call("_index", vec![expr(target)?, expr(index)?]),
         Value::Slice { target, start, end, .. } => {
             slice_expression(expr(target)?, start.as_deref(), end.as_deref(), ctx, lang)?
         }
-        Value::VarRef(name) => Expr::call(
-            ctx.local_names
-                .iter()
-                .find(|(n, _)| n == name)
-                .ok_or_else(|| format!("unknown agent variable {name:?}"))?
-                .1
-                .clone(),
-            vec![],
-        ),
+        Value::VarRef(name) => {
+            let mut name = name;
+            for _ in 0..ctx.aliases.len() {
+                match ctx.aliases.iter().find(|(alias, _)| alias == name) {
+                    Some((_, target)) => name = target,
+                    None => break,
+                }
+            }
+            // a value held by a step that is not running here is read from what that step kept
+            let held =
+                (ctx.moved.iter()).find(|(moved, holder, _)| moved == name && !ctx.frames.iter().any(|(id, _)| id == holder));
+            if let Some((_, holder, scope)) = held {
+                let step = Step::Child {
+                    candidates: vec![*holder],
+                    position: None,
+                };
+                return reference_expression(*scope, &[step], &Accessor::Binding(name.clone()), &[], None, ctx, lang);
+            }
+            Expr::call(
+                ctx.local_names
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .ok_or_else(|| format!("unknown agent variable {name:?}"))?
+                    .1
+                    .clone(),
+                vec![],
+            )
+        }
         Value::Template(template) => {
             let parts = template
                 .parts
@@ -777,7 +874,8 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
                     Ok(match item {
                         ArrayElem::Item(value) => {
                             let e = expr(value)?;
-                            if ctx.direct && is_literal(value) { e } else { e.lazy() }
+                            // statements in order evaluate every item where the array is built
+                            if ctx.direct { e } else { e.lazy() }
                         }
                         ArrayElem::Spread(value) => Expr::Spread(Box::new(Expr::call("_array", vec![expr(value)?]))),
                     })
@@ -829,6 +927,47 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
         }
         Value::BlockRef { ref_id, .. } => {
             let reference = &ctx.model.refs[ref_id.0 as usize];
+            let mut loops = Vec::new();
+            for trace in &ctx.model.traces {
+                looping(&trace.children, &mut loops);
+            }
+            let through_loop = reference.steps.windows(2).any(|steps| {
+                matches!((&steps[0], &steps[1]), (Step::Child { candidates, .. }, Step::Iterations { .. }) if loops.contains(&candidates[0]))
+            });
+            if matches!(reference.accessor, Accessor::Record) && !through_loop {
+                let group = reference
+                    .steps
+                    .windows(2)
+                    .rev()
+                    .find_map(|steps| match (&steps[0], &steps[1]) {
+                        (Step::Child { candidates, .. }, Step::Iterations { .. }) => candidates.first().copied(),
+                        _ => None,
+                    })
+                    .ok_or("history requires a repetition group")?;
+                let target = reference
+                    .steps
+                    .iter()
+                    .rev()
+                    .find_map(|step| match step {
+                        Step::Child { candidates, .. } => candidates.first().copied(),
+                        _ => None,
+                    })
+                    .ok_or("history requires a target")?;
+                let frame = ctx
+                    .frames
+                    .iter()
+                    .rev()
+                    .find(|(node, _)| *node == ctx.site)
+                    .ok_or("history requires an active node")?;
+                return Ok(Expr::call(
+                    "_history",
+                    vec![
+                        Expr::Name(frame.1.clone()),
+                        Expr::string(&ctx.names(target).state),
+                        Expr::string(&ctx.names(group).state),
+                    ],
+                ));
+            }
             let mut node = reference.module.unwrap_or(ctx.site);
             for _ in 0..reference.up {
                 node = ctx
@@ -845,7 +984,16 @@ fn expression(value: &Value, ctx: &Context<'_>, lang: ScorerLang) -> Result<Expr
 }
 fn context_ref(reference: CtxRef, ctx: &Context<'_>) -> Result<Expr, String> {
     if reference == CtxRef::TraceIndex {
-        return Ok(Expr::number(0));
+        // an agent that cannot be told is the first trace
+        return Ok(ctx.trace_index.clone().unwrap_or_else(|| Expr::number(0)));
+    }
+    if let CtxRef::RepeatIndexAt(node) = reference {
+        return ctx
+            .iterations
+            .iter()
+            .find(|(id, _, _)| *id == node)
+            .map(|(_, index, _)| Expr::Name(index.clone()))
+            .ok_or("repeat context is unavailable".into());
     }
     let mut node = ctx.site;
     loop {
@@ -921,9 +1069,16 @@ fn reference_expression(
             rest,
         )) = steps.split_first()
         && candidates.len() == 1
-        && let Some((_, frame)) = ctx.frames.iter().rev().find(|(id, _)| *id == candidates[0])
+        && ctx.frames.iter().any(|(id, _)| *id == candidates[0])
     {
-        return reference_expression(candidates[0], rest, accessor, path, Some(frame.clone().into()), ctx, lang);
+        let own =
+            matches!(rest.first(), Some(Step::Iteration(Value::CtxRef(CtxRef::RepeatIndexAt(id)))) if *id == candidates[0]);
+        let other = matches!(rest.first(), Some(Step::Iteration(_) | Step::Iterations { .. } | Step::Last));
+        // the frame of a repeat is the iteration that is running, another one is read from the collection
+        if own || !other {
+            let rest = if own { &rest[1..] } else { rest };
+            return reference_expression(candidates[0], rest, accessor, path, None, ctx, lang);
+        }
     }
     let frame = record
         .or_else(|| {
@@ -982,6 +1137,7 @@ fn reference_expression(
                 ctx,
                 lang,
             ),
+            Step::Last => reference_expression(node, rest, accessor, path, Some(Expr::call("_last", vec![frame])), ctx, lang),
             Step::Iterations { start, end } => {
                 let selected = slice_expression(frame.member("iterations"), start.as_ref(), end.as_ref(), ctx, lang)?;
                 let item = ctx.names(node).item.clone();
@@ -995,9 +1151,19 @@ fn reference_expression(
         };
     }
     let mut result = match accessor {
+        Accessor::Record => Expr::call("_occurrence", vec![frame]),
         Accessor::Field(field) => read_field(frame, field_key(field), ctx.direct),
         Accessor::Chosen => read_field(frame, "chosen", ctx.direct),
         Accessor::Included => read_field(frame, "included", ctx.direct),
+        Accessor::Binding(name) => {
+            let local = &ctx
+                .local_names
+                .iter()
+                .find(|(found, _)| found == name)
+                .ok_or("unknown kept value")?
+                .1;
+            read_field(frame, local, false)
+        }
         Accessor::Index | Accessor::Count => {
             let (_, index, count) = ctx
                 .iterations
@@ -1023,14 +1189,37 @@ mod execution {
     use crate::dsl::{Binding, SpanKind};
     use crate::mocking::code::planning::Operation;
 
-    pub(crate) fn emit(model: &Model, trace: &Trace, lang: ScorerLang) -> Result<Agent, String> {
+    pub(crate) fn emit(
+        model: &Model,
+        trace: &Trace,
+        output: &Value,
+        lang: ScorerLang,
+        unsupported: &Unsupported,
+    ) -> Result<Agent, String> {
+        emit_form(model, trace, output, lang, true, false, unsupported)
+    }
+    // `ordered` prints statements in the order they run, and is tried before the deferred form
+    fn emit_form(
+        model: &Model,
+        trace: &Trace,
+        output: &Value,
+        lang: ScorerLang,
+        ordered: bool,
+        // whether the agent reads which trace of a run it is
+        told: bool,
+        unsupported: &Unsupported,
+    ) -> Result<Agent, String> {
+        let try_ordered = ordered;
         let mut parents = Vec::new();
         let mut bindings = model.bindings.iter().chain(&trace.bindings).collect::<Vec<_>>();
+        // the step each of its own values belongs to
+        let mut owners = HashMap::<&str, NodeId>::new();
         fn collect<'a>(
             children: &'a [Child],
             parent: NodeId,
             parents: &mut Vec<(NodeId, NodeId)>,
             bindings: &mut Vec<&'a Binding>,
+            owners: &mut HashMap<&'a str, NodeId>,
         ) -> Result<(), String> {
             for child in children {
                 let (node, locals, children) = match child {
@@ -1038,20 +1227,112 @@ mod execution {
                     Child::Repeat(v) => (v.node, &v.bindings, &v.children),
                     Child::Choice(v) => (v.node, &v.bindings, &v.children),
                     Child::Maybe(v) => (v.node, &v.bindings, &v.children),
-                    Child::Scorer(_) => return Err("scorer spans are not supported by agent generation yet".into()),
+                    Child::Scorer(v) => {
+                        parents.push((v.node, parent));
+                        bindings.extend(&v.bindings);
+                        continue;
+                    }
                 };
                 parents.push((node, parent));
                 bindings.extend(locals);
-                collect(children, node, parents, bindings)?;
+                if let Child::Span(span) = child {
+                    owners.extend(locals.iter().map(|binding| (binding.name.as_str(), node)));
+                    // how long a step takes or waits is its own, wherever the value is declared
+                    for (value, _) in span.fields.duration.iter().chain(&span.fields.wait) {
+                        if let Value::VarRef(name) = value {
+                            owners.insert(name.as_str(), node);
+                        }
+                    }
+                }
+                collect(children, node, parents, bindings, owners)?;
             }
             Ok(())
         }
-        collect(&trace.children, trace.node, &mut parents, &mut bindings)?;
-        let mut used = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval".split_whitespace().map(str::to_owned).collect();
+        collect(&trace.children, trace.node, &mut parents, &mut bindings, &mut owners)?;
+        let mut used: HashSet<String> = "context ExecutionContext input run run_details runDetails run_traced runTraced logger random_source randomSource root scope range len str int bool float type isinstance abs object print None True False def class return for while if else elif in is not and or lambda yield import from as with try except finally pass break continue global nonlocal assert del raise await async match case function const let var new this null true false switch default export extends super typeof void delete throw catch do of enum implements interface package private protected public static arguments eval item_at trim_text format_value duration_seconds checked_number validate_input count_tokens as_list new_uuid sample_range step_history fold_items agent_result slice_items length_of as_count values_equal calculate require_arrivals group_arrivals select_option weighted_option as_number as_boolean as_integer itemAt trimText formatValue durationSeconds checkedNumber validateInput countTokens asList newUuid sampleRange stepHistory foldItems agentResult sliceItems lengthOf asCount valuesEqual requireArrivals groupArrivals selectOption weightedOption asNumber asBoolean asInteger remainder divide parse_input parseInput round_down round_up round_number absolute clamp roundDown roundUp roundNumber seed seeded trace trace_of traceOf".split_whitespace().map(str::to_owned).collect();
+        let reserved = used.clone();
         let names = collect_names(&trace.children, lang, &mut used);
+        // values that took a number only because another scope already used their name
+        let mut numbered = Vec::new();
+        let plain = |binding: &Binding| {
+            allocate(
+                binding.label.as_deref().unwrap_or(&binding.name),
+                "",
+                lang,
+                &mut HashSet::new(),
+            )
+        };
+        // the step a value belongs to: the one that declares it, or the one its provider names
+        let owned = |binding: &Binding| -> Option<String> {
+            (owners.get(binding.name.as_str()))
+                .and_then(|owner| names.iter().find(|(node, _)| node == owner))
+                .map(|(_, names)| names.function.clone())
+                .or_else(|| {
+                    let owner = binding.owner?;
+                    if owner == trace.node {
+                        return Some(allocate(&trace.name, "", lang, &mut HashSet::new()));
+                    }
+                    (names.iter().find(|(node, _)| *node == owner)).map(|(_, names)| names.function.clone())
+                })
+        };
+        // how many steps keep a value under each name
+        let mut kept = HashMap::<String, usize>::new();
+        for binding in bindings.iter().filter(|binding| owned(binding).is_some()) {
+            *kept.entry(plain(binding)).or_default() += 1;
+        }
         let local_names = bindings
             .iter()
-            .map(|binding| (binding.name.clone(), allocate(&binding.name, "", lang, &mut used)))
+            .map(|binding| {
+                let readable = binding.label.as_deref().unwrap_or(&binding.name);
+                let plain = plain(binding);
+                // a step's value whose name is taken is told apart by its step, which says more than a number
+                let step = owned(binding).filter(|_| used.contains(&plain) || kept[&plain] > 1);
+                let name = match step.as_deref() {
+                    Some(step) => {
+                        let own = match lang {
+                            ScorerLang::Python => format!("{step}_{plain}"),
+                            ScorerLang::Typescript => format!("{step}{}{}", plain[..1].to_uppercase(), &plain[1..]),
+                        };
+                        let mut name = own.clone();
+                        let mut suffix = 2;
+                        while !used.insert(name.clone()) {
+                            name = match lang {
+                                ScorerLang::Python => format!("{own}_{suffix}"),
+                                ScorerLang::Typescript => format!("{own}{suffix}"),
+                            };
+                            suffix += 1;
+                        }
+                        name
+                    }
+                    // the agent's own value that a step is also called takes the agent's name before it
+                    None if names.iter().any(|(_, names)| names.function == plain)
+                        && trace.bindings.iter().any(|own| own.name == binding.name) =>
+                    {
+                        allocate(&format!("{}_{readable}", trace.name), "", lang, &mut used)
+                    }
+                    None => allocate(readable, "", lang, &mut used),
+                };
+                if plain != name && !reserved.contains(&plain) {
+                    numbered.push((name.clone(), plain));
+                }
+                (binding.name.clone(), name)
+            })
+            .collect::<Vec<(String, String)>>();
+        // A value that is only another value is printed as that value. One that another scope
+        // reads by name keeps its own declaration, since that read names it.
+        let aliases: Vec<(String, String)> = bindings
+            .iter()
+            .filter_map(|binding| match &binding.value {
+                Value::VarRef(target)
+                    if !model
+                        .refs
+                        .iter()
+                        .any(|reference| matches!(&reference.accessor, Accessor::Binding(name) if *name == binding.name)) =>
+                {
+                    Some((binding.name.clone(), target.clone()))
+                }
+                _ => None,
+            })
             .collect();
         let ctx = Context {
             model,
@@ -1062,34 +1343,90 @@ mod execution {
             local_names,
             frames: vec![(trace.node, "root".into())],
             direct: false,
+            moved: Vec::new(),
+            unkept: Vec::new(),
+            aliases,
+            unsupported,
+            trace_index: told.then(|| {
+                let name = if lang == ScorerLang::Python { "trace_of" } else { "traceOf" };
+                Expr::call(name, vec![Expr::Name(random_name(lang).into())])
+            }),
         };
         let all_bindings = model.bindings.iter().chain(&trace.bindings).cloned().collect::<Vec<_>>();
         let mut direct_ctx = ctx.clone();
         direct_ctx.direct = true;
-        let mut body = match scope(
-            Some(&trace.fields),
-            &all_bindings,
-            &trace.children,
-            "root",
-            &direct_ctx,
-            lang,
-            true,
-        ) {
-            Ok(mut work) => {
-                work.push(Statement::Return(Expr::call("_details", vec!["root".into()])));
-                vec![Statement::TraceScope {
-                    scope: "root".into(),
-                    body: work,
-                }]
-            }
-            Err(_) => {
-                let mut work = scope(Some(&trace.fields), &all_bindings, &trace.children, "root", &ctx, lang, true)?;
-                work.push(Statement::Return(Expr::call("_details", vec!["root".into()])));
-                work
+        let mut loops = Vec::new();
+        looping(&trace.children, &mut loops);
+        let mut body = {
+            let ordered = if try_ordered {
+                scope(
+                    Some(&trace.fields),
+                    &all_bindings,
+                    &trace.children,
+                    "root",
+                    &direct_ctx,
+                    lang,
+                    true,
+                )
+            } else {
+                Err("the plan has no ordered form".to_owned())
+            };
+            match ordered {
+                Ok(mut work) => {
+                    work.push(Statement::Return(Expr::call(
+                        "_agent_result",
+                        vec![
+                            Expr::call("_details", vec!["root".into()]),
+                            expression(output, &direct_ctx, lang)?,
+                        ],
+                    )));
+                    vec![Statement::TraceScope {
+                        scope: "root".into(),
+                        body: work,
+                    }]
+                }
+                // statements that cannot be put in one order are emitted lazily instead
+                Err(_) => {
+                    let mut work = scope(Some(&trace.fields), &all_bindings, &trace.children, "root", &ctx, lang, true)?;
+                    work.push(Statement::Return(Expr::call(
+                        "_agent_result",
+                        vec![Expr::call("_details", vec!["root".into()]), expression(output, &ctx, lang)?],
+                    )));
+                    work
+                }
             }
         };
-        let tokens = code::references(&body).contains(&Dependency::Variable("_tokens".into()));
-        let parameters = match lang {
+        let references = code::references(&body);
+        let mut helpers: Vec<crate::mocking::Helper> = Vec::new();
+        for helper in model.functions.iter().filter_map(|function| function.helper(lang)) {
+            // one helper may serve several functions, and each says what its own call returns
+            let called = references.contains(&Dependency::Variable(helper.name.into()));
+            let known = |known: &crate::mocking::Helper| known.name == helper.name && known.operation == helper.operation;
+            if called && !helpers.iter().any(known) {
+                helpers.push(*helper);
+            }
+        }
+        // a helper that needs the run's seed gets it from the random source, and the agent takes one
+        let seeded = helpers.iter().any(|helper| helper.seeded);
+        // such an agent can be any trace of the run, so it is printed again reading which one it is
+        if seeded && !told {
+            return emit_form(model, trace, output, lang, ordered, true, unsupported);
+        }
+        let seed: Vec<code::Parameter> = match (seeded, lang) {
+            (false, _) => vec![],
+            (true, ScorerLang::Python) => vec![
+                code::Parameter::new("seed").with_default(Expr::Null).keyword(),
+                code::Parameter::new("trace").with_default(Expr::number(0)).keyword(),
+            ],
+            (true, ScorerLang::Typescript) => vec![
+                code::Parameter::new("seed")
+                    // a seed past what a number holds exactly is given as a bigint
+                    .typed("number | bigint | undefined")
+                    .with_default(Expr::from("undefined")),
+                code::Parameter::new("trace").typed("number").with_default(Expr::number(0)),
+            ],
+        };
+        let mut parameters = match lang {
             ScorerLang::Python => vec![
                 code::Parameter::new("input").with_default("_MISSING"),
                 code::Parameter::new("random_source")
@@ -1105,10 +1442,12 @@ mod execution {
                 code::Parameter::new("logger").typed("any").with_default(Expr::Null),
             ],
         };
+        parameters.extend(seed.clone());
         let mut function = code::Function::new("_execute", parameters);
         function.declare("root", scope_expr(&trace.name, "task", Expr::Null))?;
         function.body.append(&mut body);
-        let parameters = function.parameters[..2].to_vec();
+        let mut parameters = function.parameters[..2].to_vec();
+        parameters.extend(seed);
         let details_name = if lang == ScorerLang::Python {
             "run_details"
         } else {
@@ -1117,24 +1456,35 @@ mod execution {
         let invoke = |name: &str, traced: bool| {
             let random = Expr::Name(random_name(lang).into());
             if lang == ScorerLang::Python {
+                let mut keywords = if traced {
+                    vec![("random_source".into(), random), ("logger".into(), "logger".into())]
+                } else {
+                    vec![("random_source".into(), random)]
+                };
+                if seeded {
+                    keywords.push(("seed".into(), "seed".into()));
+                    keywords.push(("trace".into(), "trace".into()));
+                }
                 Expr::Call {
                     function: Box::new(name.into()),
                     args: vec!["input".into()],
-                    keywords: if traced {
-                        vec![("random_source".into(), random), ("logger".into(), "logger".into())]
-                    } else {
-                        vec![("random_source".into(), random)]
-                    },
+                    keywords,
                 }
             } else {
-                Expr::call(
-                    name,
-                    if traced {
-                        vec!["input".into(), random, "logger".into()]
-                    } else {
-                        vec!["input".into(), random]
-                    },
-                )
+                let mut args = if traced {
+                    vec!["input".into(), random, "logger".into()]
+                } else {
+                    vec!["input".into(), random]
+                };
+                if seeded {
+                    // the seed follows the logger where there is one
+                    if !traced && name == "_execute" {
+                        args.push(Expr::Null);
+                    }
+                    args.push("seed".into());
+                    args.push("trace".into());
+                }
+                Expr::call(name, args)
             }
         };
         let details_call = invoke("_execute", false);
@@ -1167,12 +1517,45 @@ mod execution {
         }
         let mut functions = vec![function, details, run, traced];
         let contracts = if direct_ctx.direct && matches!(functions[0].body.get(1), Some(Statement::TraceScope { .. })) {
-            native::functions(&mut functions, lang)
+            match native::functions(&mut functions, lang, &numbered, &helpers) {
+                Some(contracts) => contracts,
+                None => return emit_form(model, trace, output, lang, false, told, unsupported),
+            }
         } else {
             vec![]
         };
+        if seeded {
+            let seeded = |source: Expr| Expr::call("seeded", vec![source, "seed".into(), "trace".into()]);
+            let mut given = false;
+            let execute = (functions.iter_mut())
+                .find(|function| function.name == "_execute")
+                .ok_or("the agent has no entry function")?;
+            for statement in &mut execute.body {
+                if let Statement::Variable(Variable::Declare {
+                    value: Expr::New { class, args },
+                    ..
+                }) = statement
+                    && class == "ExecutionContext"
+                    && let Some(source) = args.get_mut(1)
+                {
+                    *source = seeded(source.clone());
+                    given = true;
+                }
+            }
+            // without a context the steps read the random source by name
+            if !given {
+                let source = Expr::Name(random_name(lang).into());
+                execute.body.insert(
+                    0,
+                    Statement::Variable(Variable::Assign {
+                        name: source.clone(),
+                        value: seeded(source),
+                    }),
+                );
+            }
+        }
         Ok(Agent {
-            tokens,
+            helpers,
             functions,
             contracts,
         })
@@ -1243,8 +1626,159 @@ mod execution {
         lang: ScorerLang,
         root: bool,
     ) -> Result<Vec<Statement>, String> {
+        scope_holding(fields_value, bindings, &[], children, frame, ctx, lang, root)
+    }
+    // `held` are values this scope declares for the scope above and keeps for it to read
+    #[allow(clippy::too_many_arguments)]
+    fn scope_holding(
+        fields_value: Option<&SpanFields>,
+        own: &[Binding],
+        held: &[Binding],
+        children: &[Child],
+        frame: &str,
+        ctx: &Context<'_>,
+        lang: ScorerLang,
+        root: bool,
+    ) -> Result<Vec<Statement>, String> {
+        let bindings: Vec<Binding> = own.iter().chain(held).cloned().collect();
+        let bindings = bindings.as_slice();
+        let first = operations(fields_value, bindings, held, children, frame, ctx, lang, root, &[])?;
+        if !ctx.direct {
+            return Ok(first.into_iter().flat_map(|op| op.code).collect());
+        }
+        let reads: Vec<_> = first.iter().map(|op| (op.key.clone(), op.reads.clone())).collect();
+        let unordered = match crate::mocking::code::planning::order(first, frame) {
+            Ok(ordered) => return Ok(ordered),
+            Err(unordered) => unordered,
+        };
+        // A value that reads one step, and that the step reads back, has no place beside the step.
+        // It is declared inside the step and read from what the step returns.
+        let local = |binding: &Binding| {
+            ctx.local_names
+                .iter()
+                .find(|(name, _)| *name == binding.name)
+                .unwrap()
+                .1
+                .clone()
+        };
+        let read_by = |name: &str| {
+            reads
+                .iter()
+                .find(|(key, _)| *key == Dependency::Variable(name.to_owned()))
+                .map(|(_, reads)| reads)
+        };
+        let keys: Vec<_> = children
+            .iter()
+            .map(|child| ctx.names(child_node(child)).state.clone())
+            .collect();
+        let mut homes = vec![None::<usize>; bindings.len()];
+        loop {
+            let mut changed = false;
+            for (index, binding) in bindings.iter().enumerate() {
+                if homes[index].is_some() {
+                    continue;
+                }
+                let Some(reads) = read_by(&local(binding)) else { continue };
+                let mut found = HashSet::new();
+                for read in reads {
+                    match read {
+                        Dependency::Child(parent, key) if parent == frame => {
+                            found.extend(keys.iter().position(|found| found == key));
+                        }
+                        Dependency::Variable(name) => {
+                            let other = bindings.iter().position(|other| local(other) == *name);
+                            found.extend(other.and_then(|other| homes[other]));
+                        }
+                        _ => {}
+                    }
+                }
+                if found.len() == 1 {
+                    homes[index] = found.into_iter().next();
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if homes.iter().all(Option::is_none) {
+            return Err(unordered);
+        }
+        let mut moved_ctx = ctx.clone();
+        let mut moved = Vec::new();
+        let mut kept = Vec::new();
+        for (binding, home) in bindings.iter().zip(&homes) {
+            match home {
+                Some(home) => {
+                    let holder = child_node(&children[*home]);
+                    moved_ctx.moved.push((binding.name.clone(), holder, ctx.site));
+                    moved.push((holder, binding.clone()));
+                }
+                None => kept.push(binding.clone()),
+            }
+        }
+        let mut second = operations(fields_value, &kept, held, children, frame, &moved_ctx, lang, root, &moved)?;
+        // a step hands back only what something outside it reads, the entry scope keeps everything for the result
+        if !root {
+            let first_child = second.len() - children.len();
+            for (holder, binding) in &moved {
+                if held.iter().any(|held| held.name == binding.name) {
+                    continue;
+                }
+                let name = local(binding);
+                let own = children
+                    .iter()
+                    .position(|child| child_node(child) == *holder)
+                    .map(|index| first_child + index);
+                let mut read = false;
+                for (index, operation) in second.iter().enumerate() {
+                    if Some(index) == own {
+                        continue;
+                    }
+                    code::rewrite(&mut operation.code.clone(), &mut |found| {
+                        read |= matches!(found, Expr::Read { dependency: Dependency::Field(_, key), .. } if *key == name);
+                    });
+                }
+                if !read {
+                    moved_ctx.unkept.push(binding.name.clone());
+                }
+            }
+            if !moved_ctx.unkept.is_empty() {
+                second = operations(fields_value, &kept, held, children, frame, &moved_ctx, lang, root, &moved)?;
+            }
+        }
+        crate::mocking::code::planning::order(second, frame)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn operations(
+        fields_value: Option<&SpanFields>,
+        bindings: &[Binding],
+        held: &[Binding],
+        children: &[Child],
+        frame: &str,
+        ctx: &Context<'_>,
+        lang: ScorerLang,
+        root: bool,
+        moved: &[(NodeId, Binding)],
+    ) -> Result<Vec<Operation>, String> {
         let mut operations = Vec::new();
+        for binding in held {
+            if ctx.unkept.contains(&binding.name) {
+                continue;
+            }
+            // kept for the scope above, wherever below this scope the value is declared
+            let name = &ctx.local_names.iter().find(|(name, _)| *name == binding.name).unwrap().1;
+            let value = expression(&Value::VarRef(binding.name.clone()), ctx, lang)?;
+            operations.push(Operation {
+                key: Dependency::Field(frame.into(), name.clone()),
+                reads: value.references(),
+                code: vec![assign(Expr::from(frame).member("fields").index(Expr::string(name)), value)],
+            });
+        }
         for binding in bindings {
+            if ctx.aliases.iter().any(|(alias, _)| *alias == binding.name) {
+                continue;
+            }
             let name = &ctx.local_names.iter().find(|(name, _)| *name == binding.name).unwrap().1;
             let value = expression(&binding.value, ctx, lang)?;
             operations.push(Operation {
@@ -1252,9 +1786,74 @@ mod execution {
                 reads: value.references(),
                 code: vec![Statement::Variable(Variable::constant(name, value.lazy()))],
             });
+            // a value another scope reads is kept on the frame that declares it
+            let shared = !held.iter().any(|held| held.name == binding.name)
+                && (ctx.model.refs.iter())
+                    .any(|reference| matches!(&reference.accessor, Accessor::Binding(found) if *found == binding.name));
+            if shared {
+                operations.push(Operation {
+                    key: Dependency::Field(frame.into(), name.clone()),
+                    reads: HashSet::from([Dependency::Variable(name.clone())]),
+                    code: vec![assign(
+                        Expr::from(frame).member("fields").index(Expr::string(name)),
+                        if ctx.direct {
+                            Expr::call(name.as_str(), vec![])
+                        } else {
+                            Expr::Name(name.clone())
+                        },
+                    )],
+                });
+            }
         }
         if let Some(fields_value) = fields_value {
-            for (key, value) in fields(fields_value, ctx, lang, root)? {
+            for (key, mut value) in fields(fields_value, ctx, lang, root)? {
+                // an entry that another entry of the same object reads is computed first, under its own name
+                let own = Dependency::Field(frame.into(), key.clone());
+                if ctx.direct
+                    && value.references().contains(&own)
+                    && let Expr::Object(entries) = &mut value
+                {
+                    let mut wanted = Vec::new();
+                    for (_, entry) in entries.iter_mut() {
+                        code::rewrite_expr(entry, &mut |found| {
+                            if let Expr::Call { function, args, .. } = found
+                                && matches!(&**function, Expr::Name(name) if name == "_index")
+                                && let [Expr::Read { dependency, .. }, Expr::String(part)] = args.as_slice()
+                                && *dependency == own
+                            {
+                                let name = if lang == ScorerLang::Python {
+                                    format!("{key}_{part}")
+                                } else {
+                                    let mut name = key.clone();
+                                    for word in part.split('_').filter(|word| !word.is_empty()) {
+                                        name.push_str(&word[..1].to_uppercase());
+                                        name.push_str(&word[1..]);
+                                    }
+                                    name
+                                };
+                                // a name already in use leaves the read as it was, and the scope unordered
+                                if !ctx.local_names.iter().any(|(_, local)| *local == name) {
+                                    wanted.push((part.clone(), name.clone()));
+                                    *found = Expr::Name(name);
+                                }
+                            }
+                        });
+                    }
+                    for (part, name) in wanted {
+                        let Some((_, entry)) = entries.iter_mut().find(|(entry, _)| *entry == part) else {
+                            continue;
+                        };
+                        if matches!(entry, Expr::Name(found) if *found == name) {
+                            continue;
+                        }
+                        let computed = std::mem::replace(entry, Expr::Name(name.clone()));
+                        operations.push(Operation {
+                            key: Dependency::Variable(name.clone()),
+                            reads: computed.references(),
+                            code: vec![Statement::Variable(Variable::constant(&name, computed))],
+                        });
+                    }
+                }
                 let reads = value.references();
                 let statement = if ctx.direct {
                     let value = Expr::call("_value", vec![value]);
@@ -1273,22 +1872,38 @@ mod execution {
                 });
             }
         }
+        let mut previous = None;
         for child in children {
-            operations.push(child_operation(child, frame, ctx, lang)?);
+            let node = child_node(child);
+            let held: Vec<_> = (moved.iter())
+                .filter(|(holder, _)| *holder == node)
+                .map(|(_, binding)| binding.clone())
+                .collect();
+            let mut operation = child_operation(child, &held, frame, ctx, lang)?;
+            if ctx.model.ordered
+                && let Some(previous) = previous
+            {
+                operation.reads.insert(previous);
+            }
+            previous = Some(operation.key.clone());
+            operations.push(operation);
         }
-        if ctx.direct {
-            crate::mocking::code::planning::order(operations, frame)
-        } else {
-            Ok(operations.into_iter().flat_map(|op| op.code).collect())
-        }
+        Ok(operations)
     }
-    fn child_operation(child: &Child, parent: &str, ctx: &Context<'_>, lang: ScorerLang) -> Result<Operation, String> {
+    fn child_operation(
+        child: &Child,
+        held: &[Binding],
+        parent: &str,
+        ctx: &Context<'_>,
+        lang: ScorerLang,
+    ) -> Result<Operation, String> {
         let node = child_node(child);
         let names = ctx.names(node);
         let frame = &names.state;
         let mut child_ctx = ctx.clone();
         child_ctx.site = node;
         child_ctx.frames.push((node, frame.clone()));
+        let empty = Vec::new();
         let (name, kind, bindings, children, fields) = match child {
             Child::Span(v) => (
                 v.name.as_str(),
@@ -1317,7 +1932,7 @@ mod execution {
                 None,
             ),
             Child::Maybe(v) => (v.name.as_deref().unwrap_or("maybe"), "maybe", &v.bindings, &v.children, None),
-            Child::Scorer(_) => return Err("scorer spans are unsupported".into()),
+            Child::Scorer(v) => (v.name.as_str(), "scorer", &v.bindings, &empty, None),
         };
         let mut parameters = vec![];
         if matches!(child, Child::Repeat(_)) {
@@ -1335,9 +1950,15 @@ mod execution {
             child_ctx.iterations.push((node, names.index.clone(), names.count.clone()));
         }
         let branching = matches!(child, Child::Choice(_) | Child::Maybe(_));
-        let mut work = scope(
+        if matches!(child, Child::Choice(_)) && !held.is_empty() {
+            return Err("a value cannot be held by a choice of paths".into());
+        }
+        // an optional path declares what it holds where the path runs
+        let outer_held = if branching { &[] } else { held };
+        let mut work = scope_holding(
             fields,
             bindings,
+            outer_held,
             if branching { &[] } else { children },
             frame,
             &child_ctx,
@@ -1345,6 +1966,22 @@ mod execution {
             false,
         )?;
         match child {
+            Child::Scorer(v) => {
+                work.push(Statement::Evaluate(Expr::call(
+                    "_score_span",
+                    vec![
+                        frame.clone().into(),
+                        parent.into(),
+                        Expr::string(&v.name),
+                        expression(&v.score, &child_ctx, lang)?,
+                        v.reason
+                            .as_ref()
+                            .map(|(value, _)| expression(value, &child_ctx, lang))
+                            .transpose()?
+                            .unwrap_or(Expr::Null),
+                    ],
+                )));
+            }
             Child::Choice(_) => {
                 work.push(assign(
                     Expr::from(frame.clone()).member("fields").index(Expr::string("chosen")),
@@ -1359,6 +1996,19 @@ mod execution {
                     });
                 }
             }
+            Child::Repeat(v) => {
+                if let Some(again) = &v.again {
+                    let condition = expression(&again.condition, &child_ctx, lang)?;
+                    work.push(assign(
+                        Expr::from(frame.clone()).member("fields").index(Expr::string("again")),
+                        if ctx.direct {
+                            Expr::call("_boolean", vec![condition])
+                        } else {
+                            condition.lazy()
+                        },
+                    ));
+                }
+            }
             Child::Maybe(v) => {
                 work.push(assign(
                     Expr::from(frame.clone()).member("fields").index(Expr::string("included")),
@@ -1366,7 +2016,7 @@ mod execution {
                 ));
                 work.push(Statement::If {
                     condition: Expr::call("_boolean", vec![read_field(frame.clone().into(), "included", ctx.direct)]),
-                    then_body: scope(None, &[], children, frame, &child_ctx, lang, false)?,
+                    then_body: scope_holding(None, &[], held, children, frame, &child_ctx, lang, false)?,
                     else_body: vec![],
                 });
             }
@@ -1387,14 +2037,30 @@ mod execution {
             function.body.extend(work);
         }
         let call = if let Child::Repeat(v) = child {
-            Expr::call(
-                "_repeat",
-                vec![
-                    expression(&v.count, ctx, lang)?,
-                    names.function.clone().into(),
-                    Expr::string(name),
-                ],
-            )
+            match &v.again {
+                // a loop is known to its parent before its rounds run, so a round can read the one before it
+                Some(again) => Expr::call(
+                    "_loop",
+                    vec![
+                        parent.into(),
+                        Expr::string(frame),
+                        names.function.clone().into(),
+                        Expr::string(name),
+                        match &again.limit {
+                            Some(limit) => expression(limit, ctx, lang)?,
+                            None => Expr::Null,
+                        },
+                    ],
+                ),
+                None => Expr::call(
+                    "_repeat",
+                    vec![
+                        expression(&v.count, ctx, lang)?,
+                        names.function.clone().into(),
+                        Expr::string(name),
+                    ],
+                ),
+            }
         } else {
             Expr::call(names.function.clone(), vec![])
         };
@@ -1406,11 +2072,11 @@ mod execution {
         } else {
             code.push(assign(target, call.lazy()));
         }
-        Ok(Operation {
-            key: Dependency::Child(parent.into(), frame.clone()),
-            reads: code::references(&code),
-            code,
-        })
+        // a loop reads its own earlier rounds, which is not a dependency on itself
+        let key = Dependency::Child(parent.into(), frame.clone());
+        let mut reads = code::references(&code);
+        reads.remove(&key);
+        Ok(Operation { key, reads, code })
     }
 }
 // Prefer native values after dependency ordering has established execution order.
@@ -1423,15 +2089,19 @@ mod native {
         Span(HashMap<String, Type>, HashMap<String, Type>),
         List(Box<Type>),
         Record(Box<Branch>),
-        Product(Box<Type>),
+        Product(Box<Step>),
         Value,
         Optional(Box<Type>),
         Null,
         Bool,
         Integer(i128, i128),
+        // a finite number within bounds, whole or not
+        Real(f64, f64),
         Number,
         String,
+        // a list written item by item, where a `Rest` stands for any number of items
         Array(Vec<Type>),
+        Rest(Box<Type>),
         Object(HashMap<String, Type>),
         Deferred(Box<Type>),
     }
@@ -1448,15 +2118,195 @@ mod native {
         branches: HashMap<String, Branch>,
         records: HashMap<String, Record>,
         exports: HashMap<String, Vec<String>>,
+        // the steps inside a step that are read from outside it
+        nested: HashMap<String, Vec<String>>,
+        // what each step that ran here hands back
+        steps: HashMap<String, Type>,
+        // what decides whether a scope runs, by its frame
+        gates: HashMap<String, Expr>,
+        // the records a scope is sure to find filled when it runs, by its frame
+        guarded: HashMap<String, Vec<String>>,
+        // the records whose steps are sure to have run
+        present: HashSet<String>,
         collections: HashMap<String, (Expr, Branch)>,
         input: Option<Type>,
         types: std::rc::Rc<std::cell::RefCell<HashMap<String, Type>>>,
+        // what the provider helpers return
+        counts: Counts,
+    }
+    type Counts = std::rc::Rc<Results>;
+    // the provider helpers that return a count, and the operations of a helper that return text
+    #[derive(Default)]
+    struct Results {
+        counts: HashSet<&'static str>,
+        texts: HashSet<(&'static str, &'static str)>,
+        // the provider helpers that return plain data
+        plain: HashSet<&'static str>,
+        // every helper the agent calls, for what each says of its own calls
+        helpers: Vec<crate::mocking::Helper>,
+    }
+    impl Results {
+        // the helper a call is to, and the arguments the function it serves was called with
+        fn called<'a>(&self, name: &str, args: &'a [Expr]) -> Option<(&crate::mocking::Helper, &'a [Expr])> {
+            let source = |value: &Expr| {
+                matches!(value, Expr::Name(name) if name == "random_source" || name == "randomSource")
+                    || matches!(value, Expr::Member(target, field) if field == "random" && matches!(&**target, Expr::Name(name) if name == "context"))
+            };
+            self.helpers.iter().find_map(|helper| {
+                if helper.name != name {
+                    return None;
+                }
+                // the random source follows the arguments
+                let given = match args.split_last() {
+                    Some((last, given)) if helper.random && source(last) => given,
+                    _ if helper.random => return None,
+                    _ => args,
+                };
+                match helper.operation {
+                    None => Some((helper, given)),
+                    Some(operation) => match given {
+                        [Expr::String(found), Expr::Array(given)] if found == operation => Some((helper, given.as_slice())),
+                        _ => None,
+                    },
+                }
+            })
+        }
+    }
+    const SAFE: i128 = 9_007_199_254_740_991;
+    // the bounds of a number that has them
+    fn span(kind: &Type) -> Option<(f64, f64)> {
+        match kind {
+            Type::Integer(low, high) => Some((*low as f64, *high as f64)),
+            Type::Real(low, high) => Some((*low, *high)),
+            _ => None,
+        }
+    }
+    // whether a number stays where both languages hold it exactly
+    fn safe(kind: &Type) -> bool {
+        span(kind).is_some_and(|(low, high)| low >= -(SAFE as f64) && high <= SAFE as f64)
+    }
+    // what a helper is told of a value, which a written value says more of than its type
+    fn fact(value: &Expr, kind: &Type) -> crate::mocking::Known {
+        use crate::mocking::Known;
+        match (value, kind) {
+            (Expr::String(text), _) => Known::Text(Some(text.clone())),
+            (Expr::Number(_) | Expr::Call { .. }, _) if written(value).is_some() => {
+                let number = written(value).unwrap();
+                Known::Number {
+                    low: number,
+                    high: number,
+                    whole: matches!(value, Expr::Number(text) if text.parse::<i128>().is_ok()),
+                }
+            }
+            (Expr::Array(items), Type::Array(kinds))
+                if items.len() == kinds.len() && !items.iter().any(|item| matches!(item, Expr::Spread(_))) =>
+            {
+                Known::Items(items.iter().zip(kinds).map(|(item, kind)| fact(item, kind)).collect())
+            }
+            (Expr::Object(fields), Type::Object(kinds)) => Known::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), fact(value, kinds.get(key).unwrap_or(&Type::Unknown))))
+                    .collect(),
+            ),
+            (_, kind) => told(kind),
+        }
+    }
+    fn told(kind: &Type) -> crate::mocking::Known {
+        use crate::mocking::Known;
+        match kind {
+            Type::Unknown | Type::Deferred(_) | Type::Span(..) | Type::Record(_) | Type::Product(_) => Known::Unknown,
+            Type::Value => Known::Plain,
+            Type::Null => Known::Null,
+            Type::Bool => Known::Bool,
+            Type::String => Known::Text(None),
+            Type::Integer(low, high) => Known::whole(*low as f64, *high as f64),
+            Type::Real(low, high) => Known::Number {
+                low: *low,
+                high: *high,
+                whole: false,
+            },
+            Type::Number => Known::NUMBER,
+            Type::Array(items) => Known::Items(items.iter().map(told).collect()),
+            Type::Rest(item) => Known::Run(Box::new(told(item))),
+            Type::List(item) => Known::List(Box::new(told(item))),
+            Type::Object(fields) => Known::Object(fields.iter().map(|(key, kind)| (key.clone(), told(kind))).collect()),
+            Type::Optional(inner) => Known::Maybe(Box::new(told(inner))),
+        }
+    }
+    // the type of what a helper says it returns
+    fn learned(known: &crate::mocking::Known) -> Type {
+        use crate::mocking::Known;
+        match known {
+            Known::Unknown => Type::Unknown,
+            Known::Plain => Type::Value,
+            Known::Null => Type::Null,
+            Known::Bool => Type::Bool,
+            Known::Text(_) => Type::String,
+            Known::Number { low, high, whole } => {
+                let held = low.is_finite() && high.is_finite() && low.abs() < 1e300 && high.abs() < 1e300;
+                match (held, whole) {
+                    (true, true) if low.abs() < 1e30 && high.abs() < 1e30 => Type::Integer(*low as i128, *high as i128),
+                    (true, _) => Type::Real(*low, *high),
+                    _ => Type::Number,
+                }
+            }
+            Known::Items(items) => Type::Array(items.iter().map(learned).collect()),
+            Known::Run(item) => Type::Rest(Box::new(learned(item))),
+            Known::List(item) => Type::List(Box::new(learned(item))),
+            Known::Object(fields) => Type::Object(fields.iter().map(|(key, known)| (key.clone(), learned(known))).collect()),
+            Known::Maybe(inner) => match learned(inner) {
+                Type::Unknown => Type::Unknown,
+                inner => Type::Optional(Box::new(inner)),
+            },
+        }
     }
     #[derive(Clone, Debug)]
     struct Branch {
         span: Type,
         fields: HashMap<String, Type>,
         children: HashMap<String, (String, Type)>,
+        // what decided whether the scope ran
+        gate: Option<Expr>,
+    }
+    // what a step hands back, which is its output alone unless something else of it is read
+    #[derive(Clone, Debug)]
+    struct Step {
+        output: Type,
+        fields: HashMap<String, Type>,
+        children: HashMap<String, (String, Type)>,
+    }
+    impl Step {
+        fn plain(output: Type) -> Self {
+            Step {
+                output,
+                fields: HashMap::new(),
+                children: HashMap::new(),
+            }
+        }
+        fn bundled(&self) -> bool {
+            self.fields.keys().any(|key| key != "output") || !self.children.is_empty()
+        }
+        fn shape(&self) -> Type {
+            if !self.bundled() {
+                return self.output.clone();
+            }
+            Type::Object(
+                (self.fields.iter())
+                    .map(|(key, kind)| (export_name(key).to_string(), kind.clone()))
+                    .chain(self.children.values().cloned())
+                    .collect(),
+            )
+        }
+    }
+    impl Branch {
+        // a step that hands nothing back has no place in what its scope returns
+        fn silent(&self, kind: &Type) -> bool {
+            !self.fields.is_empty() && matches!(kind, Type::Null)
+        }
+        fn results(&self) -> impl Iterator<Item = &(String, Type)> {
+            self.children.values().filter(|(_, kind)| !self.silent(kind))
+        }
     }
     #[derive(Clone)]
     struct Record {
@@ -1467,10 +2317,11 @@ mod native {
         frame: String,
         constructor: Expr,
         result: String,
-        output: Type,
         span: Type,
-        fields: HashMap<String, Type>,
+        step: Step,
     }
+    // recorded among the types when a plan has no ordered form after all
+    const UNPRINTABLE: &str = "!unprintable";
     fn schema(value: &Expr, nullable: &HashSet<String>) -> Option<Json> {
         Some(match value {
             Expr::String(_) => json!({"type":"string"}),
@@ -1533,7 +2384,27 @@ mod native {
             Json::Object(fields) => Expr::Object(fields.iter().map(|(k, v)| (k.clone(), schema_expr(v))).collect()),
         }
     }
-    pub(crate) fn functions(functions: &mut Vec<code::Function>, lang: ScorerLang) -> Vec<(String, Json)> {
+    pub(crate) fn functions(
+        functions: &mut Vec<code::Function>,
+        lang: ScorerLang,
+        numbered: &[(String, String)],
+        helpers: &[crate::mocking::Helper],
+    ) -> Option<Vec<(String, Json)>> {
+        let counts: Counts = std::rc::Rc::new(Results {
+            counts: (helpers.iter())
+                .filter(|helper| helper.counts)
+                .map(|helper| helper.name)
+                .collect(),
+            texts: (helpers.iter())
+                .filter(|helper| helper.texts)
+                .filter_map(|helper| Some((helper.name, helper.operation?)))
+                .collect(),
+            plain: (helpers.iter())
+                .filter(|helper| helper.plain)
+                .map(|helper| helper.name)
+                .collect(),
+            helpers: helpers.to_vec(),
+        });
         let mut nullable = HashSet::new();
         let mut accessed = HashSet::new();
         for f in functions.iter_mut() {
@@ -1612,7 +2483,27 @@ mod native {
         }
         // Bind a deferred value in its sole consumer when that consumer is invoked
         // exactly once. Evaluation remains deferred until the original first read.
+        // A value read only by one that moved follows it, so this runs until nothing moves.
         fn localize(body: &mut Vec<Statement>) {
+            while localize_once(body) {}
+            for statement in body {
+                match statement {
+                    Statement::Function(f) => localize(&mut f.body),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => localize(body),
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        localize(then_body);
+                        localize(else_body);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn localize_once(body: &mut Vec<Statement>) -> bool {
+            let mut moved = false;
+            // moved values keep the order they were declared in, and those moved later are read by those moved before
+            let mut placed: HashMap<String, usize> = HashMap::new();
             let candidates: Vec<_> = body
                 .iter()
                 .filter_map(|s| match s {
@@ -1661,31 +2552,78 @@ mod native {
                     .find(|s| matches!(s, Statement::Variable(Variable::Declare { name: n, .. }) if n == &name))
                     .unwrap()
                     .clone();
+                let place = placed.entry(consumer.clone()).or_default();
                 if let Statement::Function(f) = &mut body[index]
                     && let Statement::TraceScope { body, .. } = &mut f.body[1]
                 {
-                    body.insert(0, declaration);
+                    body.insert(*place, declaration);
+                    *place += 1;
                 }
                 body.retain(|s| !matches!(s, Statement::Variable(Variable::Declare { name: n, .. }) if n == &name));
+                moved = true;
             }
+            moved
+        }
+        // a deferred value nothing reads is never computed, so it is not printed
+        fn unread(body: &mut Vec<Statement>, read: &HashSet<String>) {
+            body.retain(|statement| {
+                !matches!(statement, Statement::Variable(Variable::Declare { name, value: Expr::Call { function, .. }, .. })
+                    if matches!(&**function, Expr::Name(callee) if callee == "_lazy") && !read.contains(name))
+            });
             for statement in body {
                 match statement {
-                    Statement::Function(f) => localize(&mut f.body),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => localize(body),
+                    Statement::Function(function) => unread(&mut function.body, read),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => unread(body, read),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        localize(then_body);
-                        localize(else_body);
+                        unread(then_body, read);
+                        unread(else_body, read);
                     }
                     _ => {}
                 }
             }
         }
+        loop {
+            let mut read = HashSet::new();
+            let mut declared = 0;
+            for function in functions.iter_mut() {
+                code::rewrite(&mut function.body, &mut |value| {
+                    if let Expr::Name(name) = value {
+                        read.insert(name.clone());
+                    }
+                });
+            }
+            let count = |functions: &[code::Function]| {
+                let mut total = 0;
+                for function in functions {
+                    let mut body = function.body.clone();
+                    code::rewrite(&mut body, &mut |value| {
+                        if matches!(value, Expr::Call { function, .. } if matches!(&**function, Expr::Name(name) if name == "_lazy"))
+                        {
+                            total += 1;
+                        }
+                    });
+                }
+                total
+            };
+            declared += count(functions);
+            for function in functions.iter_mut() {
+                unread(&mut function.body, &read);
+            }
+            if count(functions) == declared {
+                break;
+            }
+        }
         for function in functions.iter_mut() {
             localize(&mut function.body);
         }
-        fn exported_fields(body: &[Statement], ancestors: &[String], exports: &mut HashMap<String, Vec<String>>) {
+        fn exported_fields(
+            body: &[Statement],
+            ancestors: &[String],
+            exports: &mut HashMap<String, Vec<String>>,
+            nested: &mut HashMap<String, Vec<String>>,
+        ) {
             for statement in body {
                 match statement {
                     Statement::Function(function) => {
@@ -1699,30 +2637,35 @@ mod native {
                         {
                             ancestors.push(name.clone());
                         }
-                        exported_fields(&function.body, &ancestors, exports);
+                        exported_fields(&function.body, &ancestors, exports, nested);
                     }
                     Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => {
-                        exported_fields(body, ancestors, exports)
+                        exported_fields(body, ancestors, exports, nested)
                     }
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        exported_fields(then_body, ancestors, exports);
-                        exported_fields(else_body, ancestors, exports);
+                        exported_fields(then_body, ancestors, exports, nested);
+                        exported_fields(else_body, ancestors, exports, nested);
                     }
                     other => code::rewrite(&mut [other.clone()], &mut |value| {
-                        if let Expr::Read {
-                            dependency: Dependency::Field(frame, field),
-                            ..
-                        } = value
-                        {
-                            let frame = frame.strip_suffix("_selected").unwrap_or(frame).to_string();
-                            if !ancestors.contains(&frame) {
-                                let fields = exports.entry(frame).or_default();
-                                if !fields.contains(field) {
-                                    fields.push(field.clone());
-                                    fields.sort();
-                                }
+                        let (found, frame, key) = match value {
+                            Expr::Read {
+                                dependency: Dependency::Field(frame, field),
+                                ..
+                            } => (&mut *exports, frame, field),
+                            Expr::Read {
+                                dependency: Dependency::Child(frame, child),
+                                ..
+                            } => (&mut *nested, frame, child),
+                            _ => return,
+                        };
+                        let frame = frame.strip_suffix("_selected").unwrap_or(frame).to_string();
+                        if !ancestors.contains(&frame) {
+                            let keys = found.entry(frame).or_default();
+                            if !keys.contains(key) {
+                                keys.push(key.clone());
+                                keys.sort();
                             }
                         }
                     }),
@@ -1730,8 +2673,9 @@ mod native {
             }
         }
         let mut exports = HashMap::new();
+        let mut nested = HashMap::new();
         for function in functions.iter() {
-            exported_fields(&function.body, &["root".into()], &mut exports);
+            exported_fields(&function.body, &["root".into()], &mut exports, &mut nested);
         }
         let mut used = HashSet::new();
         let mut frames = Vec::new();
@@ -1764,11 +2708,18 @@ mod native {
             let mut env = Environment {
                 labels: labels.clone(),
                 exports: exports.clone(),
+                nested: nested.clone(),
                 input: input_type.clone(),
                 types: types.clone(),
+                counts: counts.clone(),
                 ..Environment::default()
             };
+            // what a caller passes in is plain data
+            env.names.insert("input".into(), Type::Value);
             function.body = block(std::mem::take(&mut function.body), &mut env, lang, None);
+        }
+        if types.borrow().contains_key(UNPRINTABLE) {
+            return None;
         }
         own_traces(functions);
         for function in functions.iter_mut() {
@@ -1783,21 +2734,217 @@ mod native {
             });
         }
         observe(functions, lang);
-        eager_values(functions, &types.borrow(), lang);
+        eager_values(functions, &types.borrow(), &counts, lang);
+        settle(functions, &types, &counts, lang);
         pure_functions(functions);
         hoist(functions, lang);
         let mut contracts = Vec::new();
         if let Some(schema) = &input_schema {
             contracts.push(("AgentInput".into(), schema.clone()));
         }
-        annotate(functions, &types.borrow(), &mut contracts, lang);
-        expand_results(functions, lang, &types.borrow());
-        local_names(functions, lang);
-        native_locals(functions, &types.borrow(), &contracts, lang);
+        annotate(functions, &types.borrow(), &counts, &mut contracts, lang);
+        expand_results(functions, lang, &types.borrow(), &counts);
+        local_names(functions, lang, numbered);
+        native_locals(functions, &types.borrow(), &contracts, &counts, lang);
+        if lang == ScorerLang::Typescript {
+            written_durations(functions);
+        }
         idioms(functions, lang);
         request_parameters(functions, lang);
         aliases(functions);
         arithmetic_steps(functions, lang);
+        silent_steps(functions, lang);
+        // A step reached along more than one path is one function, however many places call it.
+        loop {
+            let same = |a: &code::Function, b: &code::Function| {
+                let shape = |function: &code::Function| format!("{:?}", (&function.parameters, &function.body));
+                !a.exported && !b.exported && !a.name.starts_with('_') && !b.name.starts_with('_') && shape(a) == shape(b)
+            };
+            let mut merged = None;
+            'search: for first in 0..functions.len() {
+                for second in first + 1..functions.len() {
+                    if same(&functions[first], &functions[second]) {
+                        merged = Some((functions[first].name.clone(), second));
+                        break 'search;
+                    }
+                }
+            }
+            let Some((kept, dropped)) = merged else { break };
+            let dropped = functions.remove(dropped).name;
+            for function in functions.iter_mut() {
+                code::rewrite(&mut function.body, &mut |value| {
+                    if matches!(value, Expr::Name(name) if *name == dropped) {
+                        *value = Expr::Name(kept.clone());
+                    }
+                });
+            }
+        }
+        // A step that only holds values does nothing when it runs, since its values are computed
+        // where they are read. Its function and the calls nobody reads the result of are dropped.
+        fn holds_values(function: &code::Function) -> bool {
+            matches!(
+                function.body.as_slice(),
+                [
+                    Statement::Variable(Variable::Declare { name, value: Expr::Call { function: callee, args, keywords }, .. }),
+                    Statement::If { condition: Expr::Name(tested), then_body, else_body },
+                    Statement::Return(Expr::Object(fields)),
+                ] if matches!(&**callee, Expr::Member(_, member) if member == "chance")
+                    && matches!(args.as_slice(), [Expr::Number(always)] if always == "1")
+                    && keywords.is_empty()
+                    && tested == name
+                    && then_body.is_empty()
+                    && else_body.is_empty()
+                    && matches!(fields.as_slice(), [(_, Expr::Name(returned))] if returned == name)
+            )
+        }
+        fn drop_calls(body: &mut Vec<Statement>, holder: &str, read: &HashSet<String>) {
+            body.retain(|statement| {
+                !matches!(
+                    statement,
+                    Statement::Variable(Variable::Declare { name, value: Expr::Call { function, .. }, .. })
+                        if matches!(&**function, Expr::Name(called) if called == holder) && !read.contains(name)
+                )
+            });
+            for statement in body.iter_mut() {
+                match statement {
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        drop_calls(then_body, holder, read);
+                        drop_calls(else_body, holder, read);
+                    }
+                    Statement::ForRange { body, .. } | Statement::TraceScope { body, .. } => drop_calls(body, holder, read),
+                    _ => {}
+                }
+            }
+        }
+        let holders: Vec<String> = (functions.iter())
+            .filter(|function| !function.exported && !function.name.starts_with('_') && holds_values(function))
+            .map(|function| function.name.clone())
+            .collect();
+        for holder in holders {
+            for function in functions.iter_mut() {
+                // a result is read when its name appears anywhere but where it is declared
+                let mut read = HashSet::new();
+                code::rewrite(&mut function.body.clone(), &mut |value| {
+                    if let Expr::Name(name) = value {
+                        read.insert(name.clone());
+                    }
+                });
+                drop_calls(&mut function.body, &holder, &read);
+            }
+            let called = functions.iter().any(|function| {
+                function.name != holder && code::references(&function.body).contains(&Dependency::Variable(holder.clone()))
+            });
+            if !called {
+                // the result type goes with the function, unless something else still names it
+                let result = (functions.iter())
+                    .find(|function| function.name == holder)
+                    .and_then(|function| function.returns.clone());
+                functions.retain(|function| function.name != holder);
+                if let Some(result) = result {
+                    let named = functions.iter().any(|function| {
+                        function.returns.as_deref() == Some(result.as_str())
+                            || format!("{:?}", (&function.parameters, &function.body)).contains(&format!("\"{result}\""))
+                    });
+                    if !named {
+                        contracts.retain(|(name, _)| *name != result);
+                    }
+                }
+            }
+        }
+        // A parameter its function never reads is not passed.
+        fn inert(value: &Expr) -> bool {
+            match value {
+                Expr::Name(_) | Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
+                Expr::Index(target, index) => inert(target) && inert(index),
+                Expr::Member(target, _) => inert(target),
+                Expr::Binary { left, right, .. } => inert(left) && inert(right),
+                _ => false,
+            }
+        }
+        loop {
+            let mut unused = None;
+            'search: for function in functions.iter() {
+                if function.exported || function.name.starts_with('_') {
+                    continue;
+                }
+                let mut read = HashSet::new();
+                code::rewrite(&mut function.body.clone(), &mut |value| {
+                    if let Expr::Name(name) = value {
+                        read.insert(name.clone());
+                    }
+                });
+                for (index, parameter) in function.parameters.iter().enumerate() {
+                    if !parameter.members.is_empty() || parameter.keyword_only || read.contains(&parameter.name) {
+                        continue;
+                    }
+                    // every caller must pass something that costs nothing to leave out
+                    let mut removable = true;
+                    for caller in functions.iter() {
+                        code::rewrite(&mut caller.body.clone(), &mut |value| match value {
+                            Expr::Call {
+                                function: callee,
+                                args,
+                                keywords,
+                            } if matches!(&**callee, Expr::Name(name) if *name == function.name) => {
+                                removable &= keywords.is_empty() && args.get(index).is_some_and(inert);
+                            }
+                            _ => {}
+                        });
+                    }
+                    // a function handed on by name is called with arguments this pass cannot see
+                    let mut calls = 0;
+                    let mut mentions = 0;
+                    for caller in functions.iter() {
+                        code::rewrite(&mut caller.body.clone(), &mut |value| match value {
+                            Expr::Call { function: callee, .. } if matches!(&**callee, Expr::Name(name) if *name == function.name) =>
+                            {
+                                calls += 1;
+                            }
+                            Expr::Name(name) if *name == function.name => mentions += 1,
+                            _ => {}
+                        });
+                    }
+                    if removable && mentions == calls {
+                        unused = Some((function.name.clone(), index));
+                        break 'search;
+                    }
+                }
+            }
+            let Some((name, index)) = unused else { break };
+            for function in functions.iter_mut() {
+                if function.name == name {
+                    function.parameters.remove(index);
+                }
+                code::rewrite(&mut function.body, &mut |value| {
+                    if let Expr::Call {
+                        function: callee, args, ..
+                    } = value
+                        && matches!(&**callee, Expr::Name(callee) if *callee == name)
+                        && index < args.len()
+                    {
+                        args.remove(index);
+                    }
+                });
+            }
+        }
+        // a helper nothing calls any more is not printed
+        loop {
+            let called: HashSet<_> = functions
+                .iter()
+                .flat_map(|function| code::references(&function.body))
+                .collect();
+            let before = functions.len();
+            functions.retain(|function| {
+                function.exported
+                    || function.name.starts_with('_')
+                    || called.contains(&Dependency::Variable(function.name.clone()))
+            });
+            if functions.len() == before {
+                break;
+            }
+        }
         if let Some(schema) = input_schema {
             let name = if lang == ScorerLang::Python {
                 "parse_input"
@@ -1839,32 +2986,33 @@ mod native {
                 }
             }
             functions.insert(0, parse);
-            return contracts;
+            return Some(contracts);
         }
-        contracts
+        Some(contracts)
     }
     fn type_schema(kind: &Type) -> Json {
         match kind {
             Type::Null => json!({"type":"null"}),
             Type::Bool => json!({"type":"boolean"}),
             Type::String => json!({"type":"string"}),
-            Type::Integer(..) | Type::Number => json!({"type":"number"}),
+            Type::Integer(..) | Type::Real(..) | Type::Number => json!({"type":"number"}),
             Type::Optional(inner) => json!({"anyOf":[type_schema(inner),{"type":"null"}]}),
             Type::Object(fields) => {
                 json!({"type":"object", "properties": fields.iter().map(|(k,v)|(k.clone(),type_schema(v))).collect::<serde_json::Map<_,_>>()})
             }
-            Type::Product(item) => type_schema(item),
+            Type::Product(step) => type_schema(&step.shape()),
             Type::Record(branch) => {
                 if branch.fields.is_empty() && branch.children.len() == 1 {
                     return type_schema(&branch.children.values().next().unwrap().1);
                 }
                 let mut fields = branch.fields.clone();
-                fields.extend(branch.children.values().cloned());
+                fields.extend(branch.results().cloned());
                 type_schema(&Type::Object(fields))
             }
             Type::List(item) => json!({"type":"array","items":type_schema(item)}),
+            Type::Rest(item) => type_schema(item),
             Type::Array(items) => {
-                json!({"type":"array","items":type_schema(&items.iter().cloned().reduce(join).unwrap_or(Type::Unknown))})
+                json!({"type":"array","items":type_schema(&items.iter().cloned().map(one).reduce(join).unwrap_or(Type::Unknown))})
             }
             _ => json!({}),
         }
@@ -1872,6 +3020,7 @@ mod native {
     fn annotate(
         functions: &mut [code::Function],
         types: &HashMap<String, Type>,
+        counts: &Counts,
         contracts: &mut Vec<(String, Json)>,
         lang: ScorerLang,
     ) {
@@ -1886,13 +3035,43 @@ mod native {
             match kind {
                 Type::String => return if lang == ScorerLang::Python { "str" } else { "string" }.into(),
                 Type::Integer(..) => return if lang == ScorerLang::Python { "int" } else { "number" }.into(),
-                Type::Number => return if lang == ScorerLang::Python { "int | float" } else { "number" }.into(),
+                Type::Real(..) | Type::Number => {
+                    return if lang == ScorerLang::Python { "int | float" } else { "number" }.into();
+                }
                 Type::Bool => return if lang == ScorerLang::Python { "bool" } else { "boolean" }.into(),
                 Type::Span(..) => return "Span".into(),
-                Type::Unknown | Type::Value | Type::Deferred(_) => {
+                // nothing is not worth a name
+                Type::Null => return if lang == ScorerLang::Python { "None" } else { "null" }.into(),
+                Type::Unknown | Type::Value => {
+                    return if lang == ScorerLang::Python { "Any" } else { "unknown" }.into();
+                }
+                Type::Deferred(_) => {
                     return if lang == ScorerLang::Python { "Any" } else { "any" }.into();
                 }
+                // a value that may be absent is its type or null, so the type alone takes the name
+                Type::Optional(inner) => {
+                    let inner = annotation(inner, label, contracts, lang);
+                    return match (inner.as_str(), lang) {
+                        ("Any" | "any" | "unknown", _) => inner,
+                        (_, ScorerLang::Python) => format!("{inner} | None"),
+                        (_, ScorerLang::Typescript) => format!("{inner} | null"),
+                    };
+                }
                 _ => {}
+            }
+            // a list of strings or numbers is written out, since a name for it says no more
+            let item = match kind {
+                Type::List(item) => Some((**item).clone()),
+                Type::Array(items) => items.iter().cloned().map(one).reduce(join),
+                _ => None,
+            };
+            if let Some(item @ (Type::String | Type::Bool | Type::Integer(..) | Type::Real(..) | Type::Number)) = item {
+                let item = annotation(&item, label, contracts, lang);
+                return if lang == ScorerLang::Python {
+                    format!("list[{item}]")
+                } else {
+                    format!("Array<{item}>")
+                };
             }
             let schema = type_schema(kind);
             if let Some((name, _)) = contracts.iter().find(|(_, existing)| existing == &schema) {
@@ -1914,6 +3093,47 @@ mod native {
             contracts.push((label.clone(), schema));
             label
         }
+        // An object a helper builds has the shape its call gives it, which the helper cannot say
+        // for itself. The name that takes the result says it.
+        fn shaped(
+            body: &mut [Statement],
+            types: &HashMap<String, Type>,
+            counts: &Counts,
+            contracts: &mut Vec<(String, Json)>,
+            lang: ScorerLang,
+        ) {
+            for statement in body {
+                match statement {
+                    Statement::Variable(Variable::Declare {
+                        name,
+                        value: Expr::Call { function, .. },
+                        annotation: found @ None,
+                        ..
+                    }) => {
+                        if let Expr::Name(callee) = &**function
+                            && (counts.helpers.iter())
+                                .any(|helper| helper.name == callee && helper.plain && helper.returns.is_some())
+                            && let Some(kind @ Type::Object(_)) = types.get(name)
+                        {
+                            *found = Some(annotation(kind, name, contracts, lang));
+                        }
+                    }
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => {
+                        shaped(body, types, counts, contracts, lang)
+                    }
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        shaped(then_body, types, counts, contracts, lang);
+                        shaped(else_body, types, counts, contracts, lang);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for function in functions.iter_mut() {
+            shaped(&mut function.body, types, counts, contracts, lang);
+        }
         for function in functions {
             if function.exported || function.name == "_execute" {
                 continue;
@@ -1932,6 +3152,224 @@ mod native {
             }
             if let Some(kind) = types.get(&format!("@{}", function.name)) {
                 function.returns = Some(annotation(kind, &format!("{}_result", function.name), contracts, lang));
+            }
+        }
+    }
+
+    // TypeScript marks a float so that 3.0 is not taken for 3. A duration is read as seconds,
+    // where the two are the same, so one written as a float and read only as a duration is a number.
+    fn written_durations(functions: &mut [code::Function]) {
+        fn seconds(value: &Expr, name: &str) -> bool {
+            matches!(value, Expr::Call { function, args, keywords }
+                if matches!(&**function, Expr::Name(n) if n == "_duration")
+                    && keywords.is_empty()
+                    && matches!(args.as_slice(), [Expr::Name(n)] if n == name))
+        }
+        // how often a name is read, and how many of those reads are of a duration
+        fn reads(body: &[Statement], name: &str, timed: &HashSet<(String, usize)>) -> (usize, usize) {
+            let (mut all, mut durations) = (0, 0);
+            code::rewrite(&mut body.to_vec(), &mut |value| match value {
+                Expr::Name(n) if n == name => all += 1,
+                value if seconds(value, name) => durations += 1,
+                Expr::Call {
+                    function,
+                    args,
+                    keywords,
+                } if keywords.is_empty() => {
+                    if let Expr::Name(callee) = &**function {
+                        durations += (args.iter().enumerate())
+                            .filter(|(index, arg)| {
+                                matches!(arg, Expr::Name(n) if n == name) && timed.contains(&(callee.clone(), *index))
+                            })
+                            .count();
+                    }
+                }
+                _ => {}
+            });
+            (all, durations)
+        }
+        fn written(body: &mut [Statement], names: &HashSet<String>) {
+            for statement in body {
+                match statement {
+                    Statement::Variable(Variable::Declare { name, value, .. }) if names.contains(name) => {
+                        if let Expr::Call { args, .. } = value {
+                            *value = args[0].clone();
+                        }
+                    }
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        written(then_body, names);
+                        written(else_body, names);
+                    }
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => written(body, names),
+                    _ => {}
+                }
+            }
+        }
+        fn floats(body: &[Statement], found: &mut Vec<String>) {
+            for statement in body {
+                match statement {
+                    Statement::Variable(Variable::Declare {
+                        name,
+                        value: Expr::Call { function, args, .. },
+                        mutable: false,
+                        ..
+                    }) if matches!(&**function, Expr::Name(n) if n == "_float")
+                        && matches!(args.as_slice(), [Expr::Number(_)]) =>
+                    {
+                        found.push(name.clone());
+                    }
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        floats(then_body, found);
+                        floats(else_body, found);
+                    }
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => floats(body, found),
+                    _ => {}
+                }
+            }
+        }
+        // the parameters a function reads only as a duration, itself or through a step it calls
+        let mut timed = HashSet::new();
+        loop {
+            let before = timed.len();
+            for function in functions.iter() {
+                for (index, parameter) in function.parameters.iter().enumerate() {
+                    let (all, durations) = reads(&function.body, &parameter.name, &timed);
+                    if all > 0 && all == durations {
+                        timed.insert((function.name.clone(), index));
+                    }
+                }
+            }
+            if timed.len() == before {
+                break;
+            }
+        }
+        for function in functions {
+            let mut found = Vec::new();
+            floats(&function.body, &mut found);
+            let names: HashSet<String> = (found.into_iter())
+                .filter(|name| {
+                    let (all, durations) = reads(&function.body, name, &timed);
+                    all > 0 && all == durations
+                })
+                .collect();
+            written(&mut function.body, &names);
+        }
+    }
+
+    // A step that hands nothing back returns nothing, and is called for what it does.
+    fn silent_steps(functions: &mut [code::Function], lang: ScorerLang) {
+        fn mentions(body: &[Statement], name: &str) -> usize {
+            let mut count = 0;
+            code::rewrite(&mut body.to_vec(), &mut |value| {
+                if matches!(value, Expr::Name(n) if n == name) {
+                    count += 1;
+                }
+            });
+            count
+        }
+        fn calls(value: &Expr, name: &str) -> bool {
+            matches!(value, Expr::Call { function, .. } if matches!(&**function, Expr::Name(n) if n == name))
+        }
+        // the calls made for what the step does, as a statement or under a name nothing reads
+        fn statements(body: &[Statement], name: &str, read: &dyn Fn(&str) -> bool) -> usize {
+            (body.iter())
+                .map(|statement| match statement {
+                    Statement::Evaluate(value) if calls(value, name) => 1,
+                    Statement::Variable(Variable::Declare { name: held, value, .. }) if calls(value, name) && !read(held) => 1,
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => statements(then_body, name, read) + statements(else_body, name, read),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => statements(body, name, read),
+                    _ => 0,
+                })
+                .sum()
+        }
+        fn run(body: &mut [Statement], name: &str, read: &dyn Fn(&str) -> bool) {
+            for statement in body {
+                match statement {
+                    Statement::Variable(Variable::Declare { name: held, value, .. }) if calls(value, name) && !read(held) => {
+                        *statement = Statement::Evaluate(value.clone());
+                    }
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        run(then_body, name, read);
+                        run(else_body, name, read);
+                    }
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => run(body, name, read),
+                    _ => {}
+                }
+            }
+        }
+        // whether every return hands back null, and there is one
+        fn returns_nothing(body: &[Statement], found: &mut bool) -> bool {
+            body.iter().all(|statement| match statement {
+                Statement::Return(Expr::Null) => {
+                    *found = true;
+                    true
+                }
+                Statement::Return(_) => false,
+                Statement::If {
+                    then_body, else_body, ..
+                } => returns_nothing(then_body, found) && returns_nothing(else_body, found),
+                Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => returns_nothing(body, found),
+                _ => true,
+            })
+        }
+        fn drop_returns(body: &mut Vec<Statement>) {
+            body.retain(|statement| !matches!(statement, Statement::Return(_)));
+            for statement in body {
+                match statement {
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        drop_returns(then_body);
+                        drop_returns(else_body);
+                    }
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => drop_returns(body),
+                    _ => {}
+                }
+            }
+        }
+        let nothing = if lang == ScorerLang::Python { "None" } else { "null" };
+        let candidates: Vec<String> = (functions.iter())
+            .filter(|function| {
+                let mut found = false;
+                !function.exported
+                    && !function.name.starts_with('_')
+                    && function.returns.as_deref() == Some(nothing)
+                    // a return ends the function only where it is the last thing in it
+                    && matches!(
+                        function.body.last(),
+                        Some(Statement::Return(Expr::Null)) | Some(Statement::TraceScope { .. })
+                    )
+                    && returns_nothing(&function.body, &mut found)
+                    && found
+            })
+            .map(|function| function.name.clone())
+            .collect();
+        for name in candidates {
+            let every = functions.iter().all(|function| {
+                let read = |held: &str| mentions(&function.body, held) > 0;
+                mentions(&function.body, &name) == statements(&function.body, &name, &read)
+            });
+            if !every {
+                continue;
+            }
+            for function in functions.iter_mut() {
+                let body = function.body.clone();
+                let read = |held: &str| mentions(&body, held) > 0;
+                run(&mut function.body, &name, &read);
+                if function.name == name {
+                    drop_returns(&mut function.body);
+                    if lang == ScorerLang::Typescript {
+                        function.returns = Some("void".into());
+                    }
+                }
             }
         }
     }
@@ -2094,7 +3532,7 @@ mod native {
         }
     }
 
-    fn eager_values(functions: &mut [code::Function], types: &HashMap<String, Type>, lang: ScorerLang) {
+    fn eager_values(functions: &mut [code::Function], types: &HashMap<String, Type>, counts: &Counts, lang: ScorerLang) {
         fn total(value: &Expr, env: &Environment, lang: ScorerLang) -> bool {
             match value {
                 Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
@@ -2123,46 +3561,8 @@ mod native {
             }
         }
         fn visit(body: &mut Vec<Statement>, env: &Environment, lang: ScorerLang) {
-            let candidates: Vec<_> = body
-                .iter()
-                .filter_map(|s| {
-                    if let Statement::Variable(Variable::Declare {
-                        name,
-                        value: Expr::Call { function, args, .. },
-                        ..
-                    }) = s
-                        && matches!(&**function,Expr::Name(n) if n=="_lazy")
-                        && let [Expr::Lambda { parameters, value }] = args.as_slice()
-                        && parameters.is_empty()
-                        && total(value, env, lang)
-                    {
-                        Some((name.clone(), (**value).clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for (name, value) in candidates {
-                let first = body.iter().position(|s| {
-                    !matches!(s, Statement::Variable(Variable::Declare {name:n,..}) if n == &name)
-                        && code::references(std::slice::from_ref(s)).contains(&Dependency::Variable(name.clone()))
-                });
-                let Some(first) = first else { continue };
-                let dependencies = code::references(&[Statement::Return(value.clone())]);
-                if body[first..].iter().any(|s| matches!(s,Statement::Variable(Variable::Declare {name,..}) if dependencies.contains(&Dependency::Variable(name.clone())))) {continue;}
-                // Leave computations inside their existing lexical execution scope.
-                if matches!(&body[first], Statement::Function(_)) {
-                    continue;
-                }
-                body.insert(first, Statement::Variable(Variable::constant(&name, value)));
-                body.retain(|s| !matches!(s,Statement::Variable(Variable::Declare {name:n,value:Expr::Call {function,..},..}) if n == &name && matches!(&**function,Expr::Name(f) if f=="_lazy")));
-                code::rewrite(body, &mut |e| {
-                    if matches!(e,Expr::Call {function,args,keywords} if args.is_empty() && keywords.is_empty() && matches!(&**function,Expr::Name(n) if n==&name))
-                    {
-                        *e = Expr::Name(name.clone());
-                    }
-                });
-            }
+            // a value whose first reader was itself deferred can be computed once that reader is
+            while visit_once(body, env, lang) {}
             for statement in body {
                 match statement {
                     Statement::Function(f) => visit(&mut f.body, env, lang),
@@ -2177,12 +3577,714 @@ mod native {
                 }
             }
         }
+        fn visit_once(body: &mut Vec<Statement>, env: &Environment, lang: ScorerLang) -> bool {
+            let mut changed = false;
+            let candidates: Vec<_> = body
+                .iter()
+                .filter_map(|s| {
+                    if let Statement::Variable(Variable::Declare {
+                        name,
+                        value: Expr::Call { function, args, .. },
+                        ..
+                    }) = s
+                        && matches!(&**function,Expr::Name(n) if n=="_lazy")
+                        && let [Expr::Lambda { parameters, value }] = args.as_slice()
+                        && parameters.is_empty()
+                    {
+                        Some((name.clone(), (**value).clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (name, value) in candidates {
+                let first = body.iter().position(|s| {
+                    !matches!(s, Statement::Variable(Variable::Declare {name:n,..}) if n == &name)
+                        && code::references(std::slice::from_ref(s)).contains(&Dependency::Variable(name.clone()))
+                });
+                let Some(mut first) = first else { continue };
+                // A value that can fail is computed early only where its first reader always reads it.
+                if !total(&value, env, lang) {
+                    // a function that reads it does so when called, so the first statement that reads it decides
+                    let reader = body.iter().position(|s| {
+                        !matches!(s, Statement::Function(_))
+                            && !matches!(s, Statement::Variable(Variable::Declare {name:n,..}) if n == &name)
+                            && code::references(std::slice::from_ref(s)).contains(&Dependency::Variable(name.clone()))
+                    });
+                    let Some(reader) = reader else { continue };
+                    first = reader;
+                    let certain = match &body[first] {
+                        Statement::Variable(Variable::Declare { value, .. }) | Statement::Evaluate(value) => {
+                            let mut plain = true;
+                            code::rewrite_expr(&mut value.clone(), &mut |found| {
+                                plain &= !matches!(
+                                    found,
+                                    Expr::Conditional { .. }
+                                        | Expr::Lambda { .. }
+                                        | Expr::Map { .. }
+                                        | Expr::Binary {
+                                            op: BinOp::And | BinOp::Or,
+                                            ..
+                                        }
+                                );
+                            });
+                            plain
+                        }
+                        _ => false,
+                    };
+                    // a function defined earlier may read the value, which matters only if it is called earlier
+                    let mut readers = HashSet::from([name.clone()]);
+                    loop {
+                        let before = readers.len();
+                        for statement in &body[..first] {
+                            if let Statement::Function(function) = statement
+                                && (code::references(std::slice::from_ref(statement)).iter())
+                                    .any(|read| matches!(read, Dependency::Variable(read) if readers.contains(read)))
+                            {
+                                readers.insert(function.name.clone());
+                            }
+                        }
+                        if readers.len() == before {
+                            break;
+                        }
+                    }
+                    let earlier = body[..first].iter().any(|statement| {
+                        !matches!(statement, Statement::Function(_))
+                            && !matches!(statement, Statement::Variable(Variable::Declare { name: declared, .. }) if *declared == name)
+                            && (code::references(std::slice::from_ref(statement)).iter())
+                                .any(|read| matches!(read, Dependency::Variable(read) if readers.contains(read)))
+                    });
+                    if !certain || earlier {
+                        continue;
+                    }
+                }
+                let dependencies = code::references(&[Statement::Return(value.clone())]);
+                if body[first..].iter().any(|s| matches!(s,Statement::Variable(Variable::Declare {name,..}) if dependencies.contains(&Dependency::Variable(name.clone())))) {continue;}
+                // Leave computations inside their existing lexical execution scope.
+                if matches!(&body[first], Statement::Function(_)) {
+                    continue;
+                }
+                body.insert(first, Statement::Variable(Variable::constant(&name, value)));
+                body.retain(|s| !matches!(s,Statement::Variable(Variable::Declare {name:n,value:Expr::Call {function,..},..}) if n == &name && matches!(&**function,Expr::Name(f) if f=="_lazy")));
+                code::rewrite(body, &mut |e| {
+                    if matches!(e,Expr::Call {function,args,keywords} if args.is_empty() && keywords.is_empty() && matches!(&**function,Expr::Name(n) if n==&name))
+                    {
+                        *e = Expr::Name(name.clone());
+                    }
+                });
+                changed = true;
+            }
+            changed
+        }
         let env = Environment {
             names: types.clone(),
+            counts: counts.clone(),
             ..Environment::default()
         };
         for function in functions {
             visit(&mut function.body, &env, lang);
+        }
+    }
+
+    // Whether a value is a deferred one, and what it computes when it is read.
+    fn deferred(statement: &Statement) -> Option<(&str, &Expr)> {
+        if let Statement::Variable(Variable::Declare {
+            name,
+            value: Expr::Call { function, args, .. },
+            ..
+        }) = statement
+            && matches!(&**function, Expr::Name(callee) if callee == "_lazy")
+            && let [Expr::Lambda { parameters, value }] = args.as_slice()
+            && parameters.is_empty()
+        {
+            Some((name.as_str(), &**value))
+        } else {
+            None
+        }
+    }
+
+    // Every value still deferred is given a place. One that cannot raise, or that some statement is
+    // sure to read, is computed once before the first statement that may read it. One that can raise
+    // and is read on some paths only is computed inside the branch or the step that reads it, so
+    // that a path that does not read it never raises for it. Where more than one path reads it, what
+    // it draws is drawn once beside it and the rest is computed on each path. What is left deferred
+    // can raise, is read on more than one path, and draws in a call that can itself raise.
+    fn settle(
+        functions: &mut [code::Function],
+        types: &std::rc::Rc<std::cell::RefCell<HashMap<String, Type>>>,
+        counts: &Counts,
+        lang: ScorerLang,
+    ) {
+        type Steps = HashMap<String, code::Function>;
+        // the steps defined anywhere below a body, by name
+        fn steps(body: &[Statement], found: &mut Steps) {
+            for statement in body {
+                match statement {
+                    Statement::Function(function) => {
+                        found.insert(function.name.clone(), function.clone());
+                        steps(&function.body, found);
+                    }
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => steps(body, found),
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        steps(then_body, found);
+                        steps(else_body, found);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        fn reads(refs: &HashSet<Dependency>, name: &str) -> bool {
+            refs.contains(&Dependency::Variable(name.to_owned()))
+        }
+        // whether running a step may read the value, itself or through a step it calls
+        fn step_may(step: &str, name: &str, table: &Steps, seen: &mut HashSet<String>) -> bool {
+            let Some(function) = table.get(step) else { return false };
+            if !seen.insert(step.to_owned()) {
+                return false;
+            }
+            let refs = code::references(&function.body);
+            reads(&refs, name)
+                || refs
+                    .iter()
+                    .any(|read| matches!(read, Dependency::Variable(called) if step_may(called, name, table, seen)))
+        }
+        // whether a statement may read the value when it runs. Defining a step reads nothing.
+        fn may(statement: &Statement, name: &str, table: &Steps) -> bool {
+            if matches!(statement, Statement::Function(_)) {
+                return false;
+            }
+            let refs = code::references(std::slice::from_ref(statement));
+            reads(&refs, name)
+                || refs.iter().any(
+                    |read| matches!(read, Dependency::Variable(called) if step_may(called, name, table, &mut HashSet::new())),
+                )
+        }
+        // whether evaluating an expression is sure to read the value
+        fn sure_in(value: &Expr, name: &str, table: &Steps, seen: &mut HashSet<String>) -> bool {
+            let mut sure = |value: &Expr| sure_in(value, name, table, seen);
+            match value {
+                Expr::Call {
+                    function,
+                    args,
+                    keywords,
+                } => {
+                    if let Expr::Name(called) = &**function {
+                        if called == name && args.is_empty() {
+                            return true;
+                        }
+                        // a value that waits is not read where it is declared
+                        if called == "_lazy" {
+                            return false;
+                        }
+                    }
+                    if args.iter().chain(keywords.iter().map(|(_, value)| value)).any(&mut sure) {
+                        return true;
+                    }
+                    match &**function {
+                        Expr::Name(called) => step_sure(called, name, table, seen),
+                        other => sure(other),
+                    }
+                }
+                Expr::New { args, .. } | Expr::Array(args) | Expr::Template(args) => args.iter().any(sure),
+                Expr::Binary {
+                    left,
+                    op: BinOp::And | BinOp::Or,
+                    ..
+                } => sure(left),
+                Expr::Binary { left, right, .. }
+                | Expr::Index(left, right)
+                | Expr::Identity(left, right)
+                | Expr::Contains(left, right) => sure(left) || sure(right),
+                Expr::Conditional { condition, yes, no } => sure(condition) || (sure(yes) && sure(no)),
+                Expr::Unary { value, .. }
+                | Expr::Member(value, _)
+                | Expr::Spread(value)
+                | Expr::Required(value)
+                | Expr::Read { value, .. } => sure(value),
+                Expr::Slice { value, start, end } => {
+                    sure(value) || start.as_deref().is_some_and(&mut sure) || end.as_deref().is_some_and(&mut sure)
+                }
+                Expr::Object(fields) => fields.iter().any(|(_, value)| sure(value)),
+                Expr::Map { iterable, .. } => sure(iterable),
+                _ => false,
+            }
+        }
+        fn step_sure(step: &str, name: &str, table: &Steps, seen: &mut HashSet<String>) -> bool {
+            let Some(function) = table.get(step) else { return false };
+            if !seen.insert(step.to_owned()) {
+                return false;
+            }
+            let found = body_sure(&function.body, name, table, seen);
+            seen.remove(step);
+            found
+        }
+        // whether a statement leaves its body early on some path
+        fn leaves(statement: &Statement) -> bool {
+            match statement {
+                Statement::Return(_) | Statement::Raise(_) | Statement::Break => true,
+                Statement::If {
+                    then_body, else_body, ..
+                } => then_body.iter().chain(else_body).any(leaves),
+                Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => body.iter().any(leaves),
+                _ => false,
+            }
+        }
+        fn statement_sure(statement: &Statement, name: &str, table: &Steps, seen: &mut HashSet<String>) -> bool {
+            match statement {
+                Statement::Variable(Variable::Declare { value, .. })
+                | Statement::Return(value)
+                | Statement::Evaluate(value)
+                | Statement::Raise(value) => sure_in(value, name, table, seen),
+                Statement::Variable(Variable::Assign { name: target, value }) => {
+                    sure_in(target, name, table, seen) || sure_in(value, name, table, seen)
+                }
+                Statement::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    sure_in(condition, name, table, seen)
+                        || (body_sure(then_body, name, table, seen) && body_sure(else_body, name, table, seen))
+                }
+                Statement::TraceScope { scope, body } => {
+                    sure_in(scope, name, table, seen) || body_sure(body, name, table, seen)
+                }
+                Statement::ForRange { count, .. } => sure_in(count, name, table, seen),
+                Statement::Function(_) | Statement::Break => false,
+            }
+        }
+        // whether running a body is sure to read the value before it can leave
+        fn body_sure(body: &[Statement], name: &str, table: &Steps, seen: &mut HashSet<String>) -> bool {
+            for statement in body {
+                if statement_sure(statement, name, table, seen) {
+                    return true;
+                }
+                if leaves(statement) {
+                    return false;
+                }
+            }
+            false
+        }
+        // whether computing a value twice gives the same value twice, which a draw from the run's
+        // random stream does not. A helper says whether its own call draws from it.
+        fn replays(value: &Expr, counts: &Counts) -> bool {
+            let source = |value: &Expr| {
+                matches!(value, Expr::Name(name) if name == "random_source" || name == "randomSource")
+                    || matches!(value, Expr::Member(target, field) if field == "random" && matches!(&**target, Expr::Name(name) if name == "context"))
+            };
+            let mut replays = true;
+            code::rewrite_expr(&mut value.clone(), &mut |found| {
+                let Expr::Call { function, args, .. } = found else { return };
+                let draws = match &**function {
+                    Expr::Name(name) => match counts.called(name, args) {
+                        Some((helper, given)) => match helper.draws {
+                            Some(draws) => {
+                                let facts: Vec<_> = given.iter().map(|value| fact(value, &Type::Unknown)).collect();
+                                draws(&facts)
+                            }
+                            None => helper.random,
+                        },
+                        None => args.iter().any(&source),
+                    },
+                    // the context draws for the agent
+                    Expr::Member(target, _) => matches!(&**target, Expr::Name(name) if name == "context"),
+                    _ => false,
+                };
+                replays &= !draws;
+            });
+            replays
+        }
+        // The parts of a value that draw and cannot raise, each replaced by a name. What is left
+        // computes the same however often it runs, once the parts are drawn under those names.
+        fn drawn(
+            value: &mut Expr,
+            env: &Environment,
+            counts: &Counts,
+            lang: ScorerLang,
+            name: &mut dyn FnMut() -> String,
+            parts: &mut Vec<(String, Expr)>,
+        ) {
+            if replays(value, counts) {
+                return;
+            }
+            if infallible(value, env, lang) {
+                let part = name();
+                parts.push((part.clone(), std::mem::replace(value, Expr::Name(part))));
+                return;
+            }
+            let mut each = |value: &mut Expr| drawn(value, env, counts, lang, name, parts);
+            match value {
+                Expr::Call { args, keywords, .. } => {
+                    args.iter_mut().for_each(&mut each);
+                    keywords.iter_mut().for_each(|(_, value)| each(value));
+                }
+                Expr::Array(items) | Expr::Template(items) => items.iter_mut().for_each(each),
+                Expr::Object(fields) => fields.iter_mut().for_each(|(_, value)| each(value)),
+                Expr::Binary { left, right, .. } | Expr::Index(left, right) => {
+                    each(left);
+                    each(right);
+                }
+                Expr::Conditional { condition, yes, no } => {
+                    each(condition);
+                    each(yes);
+                    each(no);
+                }
+                Expr::Unary { value, .. } | Expr::Member(value, _) | Expr::Spread(value) | Expr::Required(value) => each(value),
+                // what runs once for each item draws once for each item
+                _ => {}
+            }
+        }
+        // how often a step is mentioned below a body
+        fn mentions(body: &[Statement], step: &str) -> usize {
+            let mut count = 0;
+            code::rewrite(&mut body.to_vec(), &mut |value| {
+                if matches!(value, Expr::Name(name) if name == step) {
+                    count += 1;
+                }
+            });
+            count
+        }
+        // runs something on the body of a step defined below a body
+        fn in_step(body: &mut [Statement], step: &str, run: &mut dyn FnMut(&mut Vec<Statement>)) -> bool {
+            body.iter_mut().any(|statement| match statement {
+                Statement::Function(function) if function.name == step => {
+                    run(&mut function.body);
+                    true
+                }
+                Statement::Function(function) => in_step(&mut function.body, step, run),
+                Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => in_step(body, step, run),
+                Statement::If {
+                    then_body, else_body, ..
+                } => in_step(then_body, step, run) || in_step(else_body, step, run),
+                _ => false,
+            })
+        }
+        // the steps an expression calls that may read the value, and how often it reads the value itself
+        fn readers(value: &Expr, name: &str, table: &Steps, called: &mut Vec<String>) -> usize {
+            let mut direct = 0;
+            code::rewrite_expr(&mut value.clone(), &mut |found| match found {
+                Expr::Call { function, args, .. }
+                    if args.is_empty() && matches!(&**function, Expr::Name(read) if read == name) =>
+                {
+                    direct += 1;
+                }
+                Expr::Name(step) if step_may(step, name, table, &mut HashSet::new()) && !called.contains(step) => {
+                    called.push(step.clone());
+                }
+                _ => {}
+            });
+            direct
+        }
+        struct Pass<'a> {
+            types: &'a std::rc::Rc<std::cell::RefCell<HashMap<String, Type>>>,
+            counts: &'a Counts,
+            lang: ScorerLang,
+            // every value still deferred, for how sure the ones that read it are
+            waiting: HashMap<String, Expr>,
+        }
+        impl Pass<'_> {
+            fn env(&self) -> Environment {
+                Environment {
+                    names: self.types.borrow().clone(),
+                    counts: self.counts.clone(),
+                    pending: self.waiting.clone(),
+                    ..Environment::default()
+                }
+            }
+            fn body(&mut self, body: &mut Vec<Statement>) {
+                for statement in body.iter_mut() {
+                    match statement {
+                        Statement::Function(function) => self.body(&mut function.body),
+                        Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => self.body(body),
+                        Statement::If {
+                            then_body, else_body, ..
+                        } => {
+                            self.body(then_body);
+                            self.body(else_body);
+                        }
+                        _ => {}
+                    }
+                }
+                let mut kept = HashSet::new();
+                loop {
+                    // a value another deferred value reads is placed after that one, which is then a statement that reads it
+                    let waiting: Vec<(String, Expr)> = (body.iter())
+                        .filter_map(deferred)
+                        .filter(|(name, _)| !kept.contains(*name))
+                        .map(|(name, value)| (name.to_owned(), value.clone()))
+                        .collect();
+                    let next = waiting.iter().find(|(name, _)| {
+                        !waiting
+                            .iter()
+                            .any(|(other, value)| other != name && reads(&value.references(), name))
+                    });
+                    let Some((name, value)) = next.cloned() else { break };
+                    if !self.place(body, &name, value) {
+                        kept.insert(name);
+                    }
+                }
+                // a value left deferred is declared before anything that may read it
+                let (deferred, rest): (Vec<_>, Vec<_>) = std::mem::take(body)
+                    .into_iter()
+                    .partition(|statement| deferred(statement).is_some());
+                if !deferred.is_empty() {
+                    let after = rest
+                        .iter()
+                        .position(|statement| {
+                            !matches!(
+                                statement,
+                                Statement::Variable(Variable::Declare {
+                                    value: Expr::New { .. },
+                                    ..
+                                })
+                            )
+                        })
+                        .unwrap_or(rest.len());
+                    let mut rest = rest;
+                    let tail = rest.split_off(after);
+                    rest.extend(deferred);
+                    rest.extend(tail);
+                    *body = rest;
+                } else {
+                    *body = rest;
+                }
+            }
+            // gives one deferred value its place, or says that it has none
+            fn place(&mut self, body: &mut Vec<Statement>, name: &str, value: Expr) -> bool {
+                let mut table = Steps::new();
+                steps(body, &mut table);
+                let own = |statement: &Statement| deferred(statement).is_some_and(|(found, _)| found == name);
+                let Some(declared) = body.iter().position(own) else {
+                    return false;
+                };
+                let first = body
+                    .iter()
+                    .position(|statement| !own(statement) && may(statement, name, &table));
+                // nothing reads it, so it is never computed
+                let Some(first) = first else {
+                    body.remove(declared);
+                    self.waiting.remove(name);
+                    return true;
+                };
+                let env = self.env();
+                let read_for_sure = body_sure(&body[first..], name, &table, &mut HashSet::new());
+                // a choice keeps the name it assigns directly above it
+                let first = match (&body[first], first.checked_sub(1).map(|above| &body[above])) {
+                    (
+                        Statement::If { .. },
+                        Some(Statement::Variable(Variable::Declare {
+                            value: Expr::Null,
+                            mutable: true,
+                            ..
+                        })),
+                    ) => first - 1,
+                    _ => first,
+                };
+                if read_for_sure || infallible(&value, &env, self.lang) {
+                    // what it reads has to be there already
+                    let needs = value.references();
+                    let late = body[first..].iter().any(|statement| {
+                        matches!(statement, Statement::Variable(Variable::Declare { name: found, .. })
+                            if deferred(statement).is_none() && reads(&needs, found))
+                    });
+                    if late {
+                        return false;
+                    }
+                    let (value, kind) = expression(value, &env, self.lang);
+                    body.remove(declared);
+                    let at = if declared < first { first - 1 } else { first };
+                    body.insert(at, Statement::Variable(Variable::constant(name, value)));
+                    self.taken(body, name, kind);
+                    return true;
+                }
+                // it can raise and no statement here is sure to read it, so it goes where it is read
+
+                let same = replays(&value, self.counts);
+                if !same {
+                    // what it draws is drawn here, once, and the rest is computed where it is read
+                    let mut parts = Vec::new();
+                    let mut used: HashSet<String> = self.types.borrow().keys().cloned().collect();
+                    let mut part = || allocate(name, "draw", self.lang, &mut used);
+                    let mut rest = value.clone();
+                    drawn(&mut rest, &env, self.counts, self.lang, &mut part, &mut parts);
+                    if !parts.is_empty() && replays(&rest, self.counts) {
+                        for (offset, (part, drawn)) in parts.into_iter().enumerate() {
+                            let (drawn, kind) = expression(drawn, &env, self.lang);
+                            self.types.borrow_mut().insert(part.clone(), normalized(&kind));
+                            body.insert(declared + offset, Statement::Variable(Variable::constant(part, drawn)));
+                        }
+                        let declared = body.iter().position(own).unwrap();
+                        if let Statement::Variable(Variable::Declare { value: held, .. }) = &mut body[declared] {
+                            *held = rest.clone().lazy();
+                        }
+                        self.waiting.insert(name.to_owned(), rest);
+                        // the value is placed again, now that it computes the same wherever it is read
+                        return self.place(body, name, self.waiting[name].clone());
+                    }
+                }
+                let declaration = body[declared].clone();
+                let mut places = 0;
+                let mut into = Vec::new();
+                for (index, statement) in body.iter().enumerate() {
+                    if index == declared || !may(statement, name, &table) {
+                        continue;
+                    }
+                    places += 1;
+                    let mut called = Vec::new();
+                    let direct = match statement {
+                        Statement::Variable(Variable::Declare { value, .. })
+                        | Statement::Return(value)
+                        | Statement::Evaluate(value)
+                        | Statement::Raise(value) => readers(value, name, &table, &mut called),
+                        Statement::Variable(Variable::Assign { name: target, value }) => {
+                            readers(target, name, &table, &mut called) + readers(value, name, &table, &mut called)
+                        }
+                        Statement::If { condition, .. } => readers(condition, name, &table, &mut called),
+                        Statement::TraceScope { scope, .. } => readers(scope, name, &table, &mut called),
+                        // a loop may run its body many times
+                        Statement::ForRange { count, .. } => {
+                            if !same {
+                                return false;
+                            }
+                            readers(count, name, &table, &mut called)
+                        }
+                        _ => 0,
+                    };
+                    // a value read in the middle of an expression is written out there, once
+                    if direct > 1 && !same {
+                        return false;
+                    }
+                    for step in called {
+                        // a step that runs more than once would compute it more than once
+                        if !same && (mentions(body, &step) != 1 || into.contains(&step)) {
+                            return false;
+                        }
+                        if !into.contains(&step) {
+                            into.push(step);
+                        }
+                    }
+                }
+                if places + into.len().saturating_sub(1) > 1 && !same {
+                    return false;
+                }
+                let read = |found: &mut Expr| {
+                    if matches!(found, Expr::Call { function, args, .. }
+                        if args.is_empty() && matches!(&**function, Expr::Name(read) if read == name))
+                    {
+                        *found = value.clone();
+                    }
+                };
+                for (index, statement) in body.iter_mut().enumerate() {
+                    if index == declared || matches!(statement, Statement::Function(_)) {
+                        continue;
+                    }
+                    let mut read = read;
+                    match statement {
+                        Statement::Variable(Variable::Declare { value, .. })
+                        | Statement::Return(value)
+                        | Statement::Evaluate(value)
+                        | Statement::Raise(value) => code::rewrite_expr(value, &mut read),
+                        Statement::Variable(Variable::Assign { name: target, value }) => {
+                            code::rewrite_expr(target, &mut read);
+                            code::rewrite_expr(value, &mut read);
+                        }
+                        Statement::If {
+                            condition,
+                            then_body,
+                            else_body,
+                        } => {
+                            code::rewrite_expr(condition, &mut read);
+                            for branch in [then_body, else_body] {
+                                if branch.iter().any(|statement| may(statement, name, &table)) {
+                                    branch.insert(0, declaration.clone());
+                                    self.body(branch);
+                                }
+                            }
+                        }
+                        Statement::TraceScope { scope, body } => {
+                            code::rewrite_expr(scope, &mut read);
+                            if body.iter().any(|statement| may(statement, name, &table)) {
+                                body.insert(0, declaration.clone());
+                                self.body(body);
+                            }
+                        }
+                        Statement::ForRange { count, body, .. } => {
+                            code::rewrite_expr(count, &mut read);
+                            if body.iter().any(|statement| may(statement, name, &table)) {
+                                body.insert(0, declaration.clone());
+                                self.body(body);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                body.remove(declared);
+                for step in into {
+                    in_step(body, &step, &mut |inner| {
+                        inner.insert(0, declaration.clone());
+                        self.body(inner);
+                    });
+                }
+                true
+            }
+            // a value that is now computed where it is declared is read by name, and typed as what it is
+            fn taken(&mut self, body: &mut [Statement], name: &str, kind: Type) {
+                code::rewrite(body, &mut |found| {
+                    if matches!(found, Expr::Call { function, args, keywords }
+                        if args.is_empty() && keywords.is_empty() && matches!(&**function, Expr::Name(read) if read == name))
+                    {
+                        *found = Expr::Name(name.to_owned());
+                    }
+                });
+                self.waiting.remove(name);
+                self.types.borrow_mut().insert(name.to_owned(), normalized(&kind));
+            }
+        }
+        fn collect(body: &[Statement], waiting: &mut HashMap<String, Expr>, declared: &mut HashSet<String>) {
+            for statement in body {
+                match statement {
+                    Statement::Variable(Variable::Declare { name, .. }) => match deferred(statement) {
+                        Some((name, value)) => {
+                            waiting.insert(name.to_owned(), value.clone());
+                        }
+                        None => {
+                            declared.insert(name.clone());
+                        }
+                    },
+                    Statement::Function(function) => collect(&function.body, waiting, declared),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => collect(body, waiting, declared),
+                    Statement::If {
+                        then_body, else_body, ..
+                    } => {
+                        collect(then_body, waiting, declared);
+                        collect(else_body, waiting, declared);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut waiting = HashMap::new();
+        let mut declared = HashSet::new();
+        for function in functions.iter() {
+            collect(&function.body, &mut waiting, &mut declared);
+        }
+        // a value an earlier pass already computes where it is declared has the type of what it computes
+        for name in declared.iter().filter(|name| !waiting.contains_key(*name)) {
+            let mut types = types.borrow_mut();
+            if let Some(Type::Deferred(kind)) = types.get(name).cloned() {
+                types.insert(name.clone(), normalized(&kind));
+            }
+        }
+        let mut pass = Pass {
+            types,
+            counts,
+            lang,
+            waiting,
+        };
+        for function in functions.iter_mut() {
+            pass.body(&mut function.body);
         }
     }
 
@@ -2255,7 +4357,12 @@ mod native {
                     if let Expr::Name(n) = &bounds[0]
                         && n == &p.name
                     {
-                        p.annotation.as_ref().map(|a| format!("{a}Item"))
+                        // a list written out names its item, a named one has a name for it
+                        p.annotation.as_ref().map(|a| {
+                            let written = (a.strip_prefix("Array<").and_then(|a| a.strip_suffix('>')))
+                                .or_else(|| a.strip_prefix("list[").and_then(|a| a.strip_suffix(']')));
+                            written.map(str::to_owned).unwrap_or_else(|| format!("{a}Item"))
+                        })
                     } else {
                         None
                     }
@@ -2300,7 +4407,8 @@ mod native {
     }
 
     fn pure_functions(functions: &mut [code::Function]) {
-        fn convert(body: &mut [Statement]) {
+        // `known` are the helpers already found pure, which another pure helper may call
+        fn convert(body: &mut [Statement], known: &mut HashSet<String>) {
             for statement in body {
                 match statement {
                     Statement::Variable(Variable::Declare {
@@ -2313,7 +4421,7 @@ mod native {
                         {
                             let mut pure = true;
                             code::rewrite_expr(&mut (**value).clone(), &mut |e| match e {
-                                Expr::Call { function, .. } if !matches!(&**function, Expr::Name(n) if ["_num", "_integer", "_index", "_equal", "_boolean", "_len", "_text", "_trim", "_float", "_value", "checked_number", "remainder", "divide"].contains(&n.as_str())) => {
+                                Expr::Call { function, .. } if !matches!(&**function, Expr::Name(n) if known.contains(n) || ["_num", "_integer", "_index", "_equal", "_boolean", "_len", "_text", "_trim", "_float", "_value", "checked_number", "remainder", "divide"].contains(&n.as_str())) => {
                                     pure = false
                                 }
                                 Expr::Member(_, field)
@@ -2325,32 +4433,38 @@ mod native {
                                 _ => {}
                             });
                             if pure {
+                                known.insert(name.clone());
                                 let mut f = code::Function::new(name.clone(), vec![]);
                                 f.body.push(Statement::Return((**value).clone()));
                                 *statement = Statement::Function(f);
                             }
                         }
                     }
-                    Statement::Function(f) => convert(&mut f.body),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => convert(body),
+                    Statement::Function(f) => convert(&mut f.body, &mut known.clone()),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => convert(body, known),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        convert(then_body);
-                        convert(else_body);
+                        convert(then_body, &mut known.clone());
+                        convert(else_body, &mut known.clone());
                     }
                     _ => {}
                 }
             }
         }
         for function in functions {
-            convert(&mut function.body);
+            convert(&mut function.body, &mut HashSet::new());
         }
     }
 
     fn idioms(functions: &mut Vec<code::Function>, lang: ScorerLang) {
         fn literal(value: &Expr) -> bool {
-            matches!(value, Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null)
+            match value {
+                Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
+                Expr::Array(items) => items.iter().all(literal),
+                Expr::Object(fields) => fields.iter().all(|(_, value)| literal(value)),
+                _ => false,
+            }
         }
         // Structural functions that just forward one result are not application boundaries.
         let wrappers: HashMap<_, _> = functions
@@ -2375,7 +4489,9 @@ mod native {
                 }
             })
             .collect();
-        let mut traverses = false;
+        let mut traverses = functions
+            .iter()
+            .any(|function| code::references(&function.body).contains(&Dependency::Variable("_history".into())));
         for function in functions.iter_mut() {
             code::rewrite(&mut function.body, &mut |e| {
                 if matches!(e, Expr::Member(_, member) if member == "children" || member == "iterations") {
@@ -2483,6 +4599,15 @@ mod native {
                             return;
                         }
                     }
+                    // a path that is either certain or impossible needs no draw
+                    if name == "_include"
+                        && let Some(Expr::Conditional { condition, yes, no }) = args.first()
+                        && matches!(&**yes, Expr::Number(n) if n == "1")
+                        && matches!(&**no, Expr::Number(n) if n == "0")
+                    {
+                        *value = (**condition).clone();
+                        return;
+                    }
                     let method = match name.as_str() {
                         "_pick" => Some("pick"),
                         "_include" => Some("chance"),
@@ -2549,6 +4674,7 @@ mod native {
         functions: &mut [code::Function],
         types: &HashMap<String, Type>,
         contracts: &[(String, Json)],
+        counts: &Counts,
         lang: ScorerLang,
     ) {
         fn infer(body: &[Statement], env: &mut Environment, lang: ScorerLang) {
@@ -2601,7 +4727,7 @@ mod native {
                         let kind = if let Type::Optional(inner) = kind { &**inner } else { kind };
                         let scalar = match kind {
                             Type::String => Some(if lang == ScorerLang::Python { "str" } else { "string" }),
-                            Type::Number | Type::Integer(..) => {
+                            Type::Number | Type::Real(..) | Type::Integer(..) => {
                                 Some(if lang == ScorerLang::Python { "int | float" } else { "number" })
                             }
                             Type::Bool => Some(if lang == ScorerLang::Python { "bool" } else { "boolean" }),
@@ -2619,6 +4745,12 @@ mod native {
                                 "{scalar} | {}",
                                 if lang == ScorerLang::Python { "None" } else { "null" }
                             ));
+                        } else if lang == ScorerLang::Typescript
+                            && annotation.is_none()
+                            && matches!(kind, Type::Unknown | Type::Value)
+                        {
+                            // nothing is known of it, so nothing is read from it
+                            *annotation = Some("unknown".into());
                         }
                     }
                     Statement::Variable(Variable::Declare {
@@ -2652,6 +4784,7 @@ mod native {
         for function in functions {
             let mut env = Environment {
                 names: types.clone(),
+                counts: counts.clone(),
                 ..Environment::default()
             };
             env.returns = types
@@ -2680,14 +4813,62 @@ mod native {
                     }
                 });
             }
+            known(&mut function.body);
             apply(&mut function.body, &env, contracts, lang);
         }
+    }
+    // a value just compared with null is known where it is read, so it is read as it is
+    fn known(body: &mut [Statement]) {
+        fn plain(tested: &Expr) -> impl FnMut(&mut Expr) {
+            let tested = format!("{tested:?}");
+            move |value| {
+                if let Expr::Required(inner) = value
+                    && format!("{inner:?}") == tested
+                {
+                    *value = (**inner).clone();
+                }
+            }
+        }
+        fn within(body: &mut [Statement]) {
+            for statement in body {
+                match statement {
+                    Statement::If {
+                        condition,
+                        then_body,
+                        else_body,
+                    } => {
+                        if let Expr::Unary { op: UnaryOp::Not, value } = condition
+                            && let Expr::Identity(tested, nothing) = &**value
+                            && matches!(**nothing, Expr::Null)
+                        {
+                            code::rewrite(then_body, &mut plain(tested));
+                        }
+                        within(then_body);
+                        within(else_body);
+                    }
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => within(body),
+                    _ => {}
+                }
+            }
+        }
+        within(body);
+        code::rewrite(body, &mut |value| {
+            if let Expr::Conditional { condition, no, .. } = value
+                && let Expr::Identity(tested, nothing) = &**condition
+                && matches!(**nothing, Expr::Null)
+            {
+                code::rewrite_expr(no, &mut plain(tested));
+            }
+        });
     }
 
     // Trace records observe the execution; application results never come from
     // the collector. Structural control-flow scopes are not SDK spans.
     fn observe(functions: &mut [code::Function], lang: ScorerLang) {
-        fn scopes(body: &mut Vec<Statement>) {
+        let history = functions
+            .iter()
+            .any(|function| code::references(&function.body).contains(&Dependency::Variable("_history".into())));
+        fn scopes(body: &mut Vec<Statement>, history: bool, lang: ScorerLang) {
             let mut structural = HashSet::new();
             for statement in body.iter() {
                 if let Statement::Variable(Variable::Declare {
@@ -2711,7 +4892,12 @@ mod native {
                     needed.insert(name.clone());
                 }
             });
-            structural.retain(|name| !needed.contains(name));
+            // a scope that stays still hands its values back as locals
+            let kept: HashSet<String> = (structural.iter())
+                .filter(|name| history || needed.contains(*name))
+                .cloned()
+                .collect();
+            structural.retain(|name| !history && !needed.contains(name));
             let mut output = Vec::new();
             for mut statement in std::mem::take(body) {
                 match &mut statement {
@@ -2719,9 +4905,9 @@ mod native {
                     Statement::TraceScope {
                         scope: Expr::Name(name),
                         body,
-                    } if structural.contains(name) => {
+                    } if structural.contains(name) || kept.contains(name) => {
                         let frame = name.clone();
-                        fn fields(body: &mut [Statement], frame: &str) {
+                        fn fields(body: &mut [Statement], frame: &str, lang: ScorerLang) {
                             for statement in body {
                                 match statement {
                                     Statement::Variable(Variable::Assign {
@@ -2730,14 +4916,7 @@ mod native {
                                     }) if matches!(&**target, Expr::Member(target, member) if member == "fields" && matches!(&**target, Expr::Name(n) if n == frame)) => {
                                         if let Expr::String(field) = &**field {
                                             *statement = Statement::Variable(Variable::constant(
-                                                format!(
-                                                    "{}_{}",
-                                                    frame
-                                                        .strip_suffix("_span")
-                                                        .or_else(|| frame.strip_suffix("Span"))
-                                                        .unwrap_or(frame),
-                                                    field
-                                                ),
+                                                field_local(frame, field, lang),
                                                 value.clone(),
                                             ));
                                         }
@@ -2745,40 +4924,40 @@ mod native {
                                     Statement::If {
                                         then_body, else_body, ..
                                     } => {
-                                        fields(then_body, frame);
-                                        fields(else_body, frame);
+                                        fields(then_body, frame, lang);
+                                        fields(else_body, frame, lang);
                                     }
                                     _ => {}
                                 }
                             }
                         }
-                        fields(body, &frame);
+                        fields(body, &frame, lang);
                         code::rewrite(body, &mut |value| {
                             if let Expr::Member(target, field) = value
                                 && matches!(&**target, Expr::Name(n) if n == &frame)
-                                && ["chosen", "included"].contains(&field.as_str())
+                                && !["children", "iterations", "fields", "log"].contains(&field.as_str())
                             {
-                                *value = Expr::Name(format!(
-                                    "{}_{}",
-                                    frame
-                                        .strip_suffix("_span")
-                                        .or_else(|| frame.strip_suffix("Span"))
-                                        .unwrap_or(&frame),
-                                    field
-                                ));
+                                *value = Expr::Name(field_local(&frame, field, lang));
                             }
                         });
-                        scopes(body);
-                        output.append(body);
+                        scopes(body, history, lang);
+                        if kept.contains(&frame) {
+                            output.push(Statement::TraceScope {
+                                scope: Expr::Name(frame),
+                                body: std::mem::take(body),
+                            });
+                        } else {
+                            output.append(body);
+                        }
                         continue;
                     }
-                    Statement::Function(f) => scopes(&mut f.body),
-                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => scopes(body),
+                    Statement::Function(f) => scopes(&mut f.body, history, lang),
+                    Statement::TraceScope { body, .. } | Statement::ForRange { body, .. } => scopes(body, history, lang),
                     Statement::If {
                         then_body, else_body, ..
                     } => {
-                        scopes(then_body);
-                        scopes(else_body);
+                        scopes(then_body, history, lang);
+                        scopes(else_body, history, lang);
                     }
                     _ => {}
                 }
@@ -2815,7 +4994,7 @@ mod native {
                 }
                 _ => {}
             });
-            scopes(&mut function.body);
+            scopes(&mut function.body, history, lang);
             function.body.insert(
                 0,
                 Statement::Variable(Variable::constant(
@@ -2829,7 +5008,7 @@ mod native {
         }
     }
 
-    fn expand_results(functions: &mut [code::Function], lang: ScorerLang, types: &HashMap<String, Type>) {
+    fn expand_results(functions: &mut [code::Function], lang: ScorerLang, types: &HashMap<String, Type>, counts: &Counts) {
         fn collect(body: &[Statement], used: &mut HashSet<String>) {
             for statement in body {
                 match statement {
@@ -2922,13 +5101,15 @@ mod native {
                 lang,
                 &Environment {
                     names: types.clone(),
+                    counts: counts.clone(),
                     ..Environment::default()
                 },
             );
         }
     }
 
-    fn local_names(functions: &mut [code::Function], lang: ScorerLang) {
+    fn local_names(functions: &mut [code::Function], lang: ScorerLang, numbered: &[(String, String)]) {
+        let defined: HashSet<String> = functions.iter().map(|function| function.name.clone()).collect();
         fn declarations(body: &mut [Statement], names: &HashMap<String, String>) {
             for statement in body {
                 match statement {
@@ -2979,10 +5160,32 @@ mod native {
                 };
                 if used.contains(&old) && !used.contains(suffix) {
                     names.insert(old, suffix.to_string());
+                    continue;
+                }
+                // a function numbered apart from another has its number at the end of its span's name
+                let digits = function.name.len() - function.name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+                if digits == 0 {
+                    continue;
+                }
+                let (stem, number) = function.name.split_at(function.name.len() - digits);
+                let old = if lang == ScorerLang::Python {
+                    let stem = stem.trim_end_matches('_');
+                    if suffix == "span" {
+                        format!("{stem}_span_{number}")
+                    } else {
+                        format!("{stem}_span_{number}_{suffix}")
+                    }
+                } else if suffix == "span" {
+                    format!("{stem}Span{number}")
+                } else {
+                    format!("{stem}Span{number}{}{}", suffix[..1].to_uppercase(), &suffix[1..])
+                };
+                if used.contains(&old) && !used.contains(suffix) {
+                    names.insert(old, suffix.to_string());
                 }
             }
             for (field, local) in [("included", "included"), ("chosen", "selection")] {
-                let old = format!("{}_{field}", function.name);
+                let old = field_local(&function.name, field, lang);
                 if used.contains(&old) && !used.contains(local) {
                     names.insert(old, local.into());
                 }
@@ -3025,6 +5228,25 @@ mod native {
                         names.insert(old.clone(), new);
                     }
                     break;
+                }
+            }
+            // a name numbered to keep it apart from another function's local needs no number here
+            // a helper numbered apart is a function, which keeps its name wherever it is called
+            for (name, plain) in numbered {
+                // two that share a plain name both keep the names that tell them apart
+                let alone = !numbered
+                    .iter()
+                    .any(|(other, shared)| other != name && shared == plain && used.contains(other));
+                if used.contains(name)
+                    && alone
+                    && !defined.contains(name)
+                    && !names.contains_key(name)
+                    && !used.contains(plain)
+                    && !defined.contains(plain)
+                    && !names.values().any(|taken| taken == plain)
+                {
+                    used.insert(plain.clone());
+                    names.insert(name.clone(), plain.clone());
                 }
             }
             for parameter in &mut function.parameters {
@@ -3272,6 +5494,18 @@ mod native {
         *functions = extracted;
     }
 
+    // The local that holds a value a control-flow scope keeps for its caller.
+    fn field_local(frame: &str, field: &str, lang: ScorerLang) -> String {
+        let stem = frame
+            .strip_suffix("_span")
+            .or_else(|| frame.strip_suffix("Span"))
+            .unwrap_or(frame);
+        if lang == ScorerLang::Python {
+            format!("{stem}_{field}")
+        } else {
+            format!("{stem}{}{}", field[..1].to_uppercase(), &field[1..])
+        }
+    }
     fn export_name(field: &str) -> &str {
         match field {
             "input" => "request",
@@ -3284,6 +5518,49 @@ mod native {
             .get(&(frame.into(), key.into()))
             .cloned()
             .unwrap_or_else(|| field_name(frame, key, lang))
+    }
+    fn stem(frame: &str) -> &str {
+        frame
+            .strip_suffix("_span")
+            .or_else(|| frame.strip_suffix("Span"))
+            .unwrap_or(frame)
+    }
+    // The fields of a step that are read outside it, and the steps inside it that are. A later step
+    // reads those through what this one returns, so it carries them with its output.
+    type Carried = (String, String, Expr, Type);
+    fn handed_back(env: &Environment, frame: &str, lang: ScorerLang) -> (Vec<String>, Vec<Carried>) {
+        let mut fields = env.exports.get(frame).cloned().unwrap_or_default();
+        let mut children = Vec::new();
+        for key in env.nested.get(frame).into_iter().flatten() {
+            let field = stem(key).to_string();
+            if field == "request" || field == "result" {
+                continue;
+            }
+            let (value, kind) = if let Some(record) = env.records.get(key) {
+                (record.value.clone(), Type::Record(Box::new(record.shape.clone())))
+            } else if let Some((value, shape)) = env.collections.get(key) {
+                (value.clone(), Type::List(Box::new(Type::Record(Box::new(shape.clone())))))
+            } else if let Some(kind) = env.steps.get(key) {
+                let result = label(env, key, "output", lang);
+                // a step that hands nothing back, or ran where its result cannot be seen from here, is not carried
+                if matches!(kind, Type::Product(step) if !step.bundled() && matches!(step.output, Type::Null))
+                    || !env.names.contains_key(&result)
+                {
+                    continue;
+                }
+                (Expr::Name(result), kind.clone())
+            } else {
+                continue;
+            };
+            children.push((key.clone(), field, value, kind));
+        }
+        let returns =
+            (env.fields.get(&(frame.to_string(), "output".to_string()))).is_some_and(|(_, kind)| !matches!(kind, Type::Null));
+        if !children.is_empty() && returns && !fields.iter().any(|key| key == "output") {
+            fields.push("output".into());
+            fields.sort();
+        }
+        (fields, children)
     }
     fn field_name(frame: &str, key: &str, lang: ScorerLang) -> String {
         let stem = frame
@@ -3305,7 +5582,24 @@ mod native {
     ) -> Vec<Statement> {
         let mut output = Vec::new();
         let mut lifted = HashMap::<String, Lifted>::new();
-        for statement in statements {
+        // the function that runs one round of a loop, by the frame its rounds are kept under
+        let rounds: HashMap<String, String> = statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Statement::Variable(Variable::Declare {
+                    name,
+                    value: Expr::Call { function, args, .. },
+                    ..
+                }) if matches!(&**function, Expr::Name(n) if n == "_loop") => match args.get(2) {
+                    Some(Expr::Name(callee)) => Some((callee.clone(), name.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let mut seeded = HashMap::<String, Branch>::new();
+        let mut pending = statements.into_iter().collect::<std::collections::VecDeque<_>>();
+        while let Some(statement) = pending.pop_front() {
             match statement {
                 Statement::Function(mut function) => {
                     for dependency in code::references(&function.body) {
@@ -3314,6 +5608,18 @@ mod native {
                         }
                     }
                     let mut child_env = env.clone();
+                    // a round reads the rounds before it, so its shape is found first and then used
+                    let original =
+                        (rounds.contains_key(&function.name) && !seeded.contains_key(&function.name)).then(|| function.clone());
+                    if let Some(frame) = rounds.get(&function.name)
+                        && let Some(shape) = seeded.get(&function.name)
+                    {
+                        let results = label(env, frame, "output", lang);
+                        child_env
+                            .names
+                            .insert(results.clone(), Type::List(Box::new(Type::Record(Box::new(shape.clone())))));
+                        child_env.collections.insert(frame.clone(), (results.into(), shape.clone()));
+                    }
                     let lift = match function.body.first() {
                         Some(Statement::Variable(Variable::Declare {
                             name,
@@ -3353,30 +5659,32 @@ mod native {
                             .get(&(frame.clone(), "output".into()))
                             .map(|(_, t)| t.clone())
                             .unwrap_or(Type::Null);
+                        let (fields, children) = handed_back(&child_env, &frame, lang);
                         lifted.insert(
                             function.name.clone(),
                             Lifted {
                                 result: label(env, &frame, "output", lang),
                                 frame: frame.clone(),
                                 constructor,
-                                output: kind,
                                 span: child_env.names.get(&frame).cloned().unwrap_or(Type::Unknown),
-                                fields: env
-                                    .exports
-                                    .get(&frame)
-                                    .into_iter()
-                                    .flatten()
-                                    .map(|key| {
-                                        (
-                                            key.clone(),
-                                            child_env
+                                step: Step {
+                                    output: kind,
+                                    fields: fields
+                                        .into_iter()
+                                        .map(|key| {
+                                            let kind = child_env
                                                 .fields
                                                 .get(&(frame.clone(), key.clone()))
                                                 .map(|(_, t)| t.clone())
-                                                .unwrap_or(Type::Null),
-                                        )
-                                    })
-                                    .collect(),
+                                                .unwrap_or(Type::Null);
+                                            (key, kind)
+                                        })
+                                        .collect(),
+                                    children: children
+                                        .into_iter()
+                                        .map(|(key, field, _, kind)| (key, (field, kind)))
+                                        .collect(),
+                                },
                             },
                         );
                         if lang == ScorerLang::Typescript {
@@ -3408,11 +5716,19 @@ mod native {
                                     .fields
                                     .iter()
                                     .map(|(k, v)| (k.clone(), v.clone()))
-                                    .chain(branch.children.values().map(|(k, v)| (k.clone(), v.clone())))
+                                    .chain(branch.results().map(|(k, v)| (k.clone(), v.clone())))
                                     .collect(),
                             )
                         };
                         env.returns.insert(function.name.clone(), kind);
+                    }
+                    if let Some(original) = original
+                        && let Some(shape) = env.branches.get(&function.name)
+                        && shape.fields.contains_key("again")
+                    {
+                        seeded.insert(function.name.clone(), shape.clone());
+                        pending.push_front(Statement::Function(original));
+                        continue;
                     }
                     if let Some(kind) = env.returns.get(&function.name) {
                         env.types.borrow_mut().insert(format!("@{}", function.name), kind.clone());
@@ -3444,23 +5760,19 @@ mod native {
                         };
                         output.push(Statement::Variable(Variable::constant(&lift.result, call)));
                         env.names.insert(lift.frame.clone(), lift.span.clone());
-                        let bundled = lift.fields.keys().any(|key| key != "output");
+                        let bundled = lift.step.bundled();
                         let result = Expr::from(lift.result.clone());
                         let output_value = if bundled {
                             result.clone().index(Expr::string("result"))
                         } else {
                             result.clone()
                         };
-                        env.names.insert(
-                            lift.result.clone(),
-                            if bundled {
-                                Type::Object(lift.fields.iter().map(|(k, v)| (export_name(k).into(), v.clone())).collect())
-                            } else {
-                                lift.output.clone()
-                            },
-                        );
-                        env.outputs.insert(lift.frame.clone(), (output_value, lift.output.clone()));
-                        for (field, kind) in &lift.fields {
+                        env.names.insert(lift.result.clone(), lift.step.shape());
+                        env.steps
+                            .insert(lift.frame.clone(), Type::Product(Box::new(lift.step.clone())));
+                        env.outputs
+                            .insert(lift.frame.clone(), (output_value, lift.step.output.clone()));
+                        for (field, kind) in &lift.step.fields {
                             let value = if bundled {
                                 result.clone().index(Expr::string(export_name(field)))
                             } else {
@@ -3554,6 +5866,97 @@ mod native {
                         });
                         continue;
                     }
+                    // A loop-back is a native loop that stops when a round does not ask for another.
+                    if let Expr::Call { function, args, .. } = &value
+                        && matches!(&**function,Expr::Name(n) if n=="_loop")
+                        && args.len() == 5
+                    {
+                        let python = lang == ScorerLang::Python;
+                        let stem = name
+                            .strip_suffix("_span")
+                            .or_else(|| name.strip_suffix("Span"))
+                            .unwrap_or(&name);
+                        let index = if python {
+                            format!("{stem}_index")
+                        } else {
+                            format!("{stem}Index")
+                        };
+                        let latest = if python {
+                            format!("{stem}_latest")
+                        } else {
+                            format!("{stem}Latest")
+                        };
+                        let failure = |message: &str| {
+                            Statement::Raise(Expr::New {
+                                class: if python { "ValueError" } else { "Error" }.into(),
+                                args: vec![Expr::string(message)],
+                            })
+                        };
+                        let position = Expr::from(index.clone());
+                        let (bound, stop) = match &args[4] {
+                            Expr::Null => (
+                                Expr::number(10000),
+                                Statement::If {
+                                    condition: position.clone().binary(BinOp::Ge, Expr::number(9999)),
+                                    then_body: vec![failure("graph execution budget exceeded (10000 traversals)")],
+                                    else_body: vec![],
+                                },
+                            ),
+                            limit => {
+                                let limit = expression(Expr::call("_count", vec![limit.clone()]), env, lang).0;
+                                let bound = match &limit {
+                                    Expr::Number(n) => n.parse::<i128>().map(|n| Expr::number(n + 1)).ok(),
+                                    _ => None,
+                                }
+                                .unwrap_or_else(|| limit.clone().binary(BinOp::Add, Expr::number(1)));
+                                (
+                                    bound,
+                                    Statement::If {
+                                        condition: position.clone().binary(BinOp::Ge, limit),
+                                        then_body: vec![failure("cycle max_traversals exceeded")],
+                                        else_body: vec![],
+                                    },
+                                )
+                            }
+                        };
+                        let round = Expr::call(
+                            args[2].clone(),
+                            vec![position.clone(), position.clone().binary(BinOp::Add, Expr::number(1))],
+                        );
+                        let append = if python { "append" } else { "push" };
+                        if let Expr::Name(callee) = &args[2]
+                            && let Some(branch) = env.branches.get(callee).cloned()
+                            && branch.fields.contains_key("again")
+                        {
+                            let results = label(env, &name, "output", lang);
+                            output.push(Statement::Variable(Variable::constant(&results, Expr::Array(vec![]))));
+                            output.push(Statement::ForRange {
+                                index,
+                                count: bound,
+                                body: vec![
+                                    Statement::Variable(Variable::constant(&latest, round)),
+                                    Statement::Evaluate(Expr::call(
+                                        Expr::from(results.clone()).member(append),
+                                        vec![latest.clone().into()],
+                                    )),
+                                    Statement::If {
+                                        condition: Expr::from(latest).index(Expr::string("again")).not(),
+                                        then_body: vec![Statement::Break],
+                                        else_body: vec![],
+                                    },
+                                    stop,
+                                ],
+                            });
+                            env.names
+                                .insert(results.clone(), Type::List(Box::new(Type::Record(Box::new(branch.clone())))));
+                            env.collections.insert(name, (results.into(), branch));
+                            continue;
+                        }
+                        // A round that cannot hand back what later steps read has no ordered form.
+                        // The whole agent is printed in the deferred form instead.
+                        env.types.borrow_mut().insert(UNPRINTABLE.into(), Type::Null);
+                        continue;
+                    }
                     let was_lazy =
                         matches!(&value,Expr::Call{function,..} if matches!(&**function,Expr::Name(n) if n=="_lazy"));
                     let (mut value, mut kind) = expression(value, env, lang);
@@ -3569,7 +5972,7 @@ mod native {
                             value: inner,
                         }) = args.first()
                         && parameters.is_empty()
-                        && infallible(inner, env)
+                        && infallible(inner, env, lang)
                     {
                         let (v, t) = expression((**inner).clone(), env, lang);
                         value = v;
@@ -3625,6 +6028,15 @@ mod native {
                             && ["input", "output"].contains(&key.as_str())
                         {
                             let name = label(env, frame, &key, lang);
+                            if matches!(value, Expr::Null) {
+                                // a step with nothing to hand back holds nothing under a name
+                                if let Some(Type::Span(fields, _)) = env.names.get_mut(frame) {
+                                    fields.insert(key.clone(), Type::Null);
+                                }
+                                env.fields.insert((frame.clone(), key.clone()), (Expr::Null, Type::Null));
+                                fields.push((key, Expr::Null));
+                                continue;
+                            }
                             if matches!(value, Expr::Conditional { .. }) {
                                 output.push(Statement::Variable(Variable::Declare {
                                     name: name.clone(),
@@ -3632,7 +6044,9 @@ mod native {
                                     mutable: true,
                                     annotation: None,
                                 }));
-                                output.extend(assign_value(&name, value));
+                                // the name starts as null, so only a value is assigned to it
+                                let assign = |value| assign_value(&name, value).remove(0);
+                                output.extend(where_present(&value, &assign).unwrap_or_else(|| assign_value(&name, value)));
                             } else {
                                 output.push(Statement::Variable(Variable::constant(&name, value)));
                             }
@@ -3642,15 +6056,28 @@ mod native {
                             }
                             env.fields.insert((frame.clone(), key.clone()), (name.clone().into(), kind));
                             fields.push((key, name.into()));
+                        } else if key == "error"
+                            && let Some(logged) = where_present(&value, &|value| {
+                                Statement::Evaluate(Expr::Call {
+                                    function: function.clone(),
+                                    args: args.clone(),
+                                    keywords: vec![(key.clone(), value)],
+                                })
+                            })
+                        {
+                            // an error is logged only where there is one
+                            output.extend(logged);
                         } else {
                             fields.push((key, value));
                         }
                     }
-                    output.push(Statement::Evaluate(Expr::Call {
-                        function,
-                        args,
-                        keywords: fields,
-                    }));
+                    if !fields.is_empty() {
+                        output.push(Statement::Evaluate(Expr::Call {
+                            function,
+                            args,
+                            keywords: fields,
+                        }));
+                    }
                 }
                 Statement::Variable(Variable::Assign { name, value }) => {
                     let (value, kind) = expression(value, env, lang);
@@ -3661,12 +6088,40 @@ mod native {
                         && let Some(Type::Span(fields, children)) = env.names.get_mut(frame)
                     {
                         if member == "children" {
-                            children.insert(key.clone(), kind);
+                            children.insert(key.clone(), kind.clone());
                         } else if member == "fields" {
-                            fields.insert(key.clone(), kind);
+                            fields.insert(key.clone(), kind.clone());
+                        }
+                        if member == "fields"
+                            && key == "included"
+                            && let Some(conditions) = conjuncts(&value)
+                        {
+                            let sure = (env.records.values())
+                                .filter(|record| {
+                                    (record.shape.gate.as_ref().and_then(conjuncts))
+                                        .is_some_and(|needed| needed.iter().all(|one| conditions.contains(one)))
+                                })
+                                .filter_map(|record| match &record.value {
+                                    Expr::Name(name) => Some(name.clone()),
+                                    _ => None,
+                                })
+                                .collect();
+                            env.guarded.insert(frame.clone(), sure);
+                            env.gates.insert(frame.clone(), value.clone());
                         }
                     }
                     if matches!(&value, Expr::Name(n) if env.records.contains_key(n) || env.collections.contains_key(n)) {
+                        continue;
+                    }
+                    // what a step keeps for its caller is part of what it returns, not a field of its span
+                    if let Expr::Index(target, key) = &name
+                        && let Expr::Member(frame, member) = &**target
+                        && member == "fields"
+                        && let Expr::Name(frame) = &**frame
+                        && Some(frame.as_str()) == return_frame
+                        && let Expr::String(key) = &**key
+                    {
+                        env.fields.insert((frame.clone(), key.clone()), (value, kind));
                         continue;
                     }
                     output.push(Statement::Variable(Variable::Assign {
@@ -3677,8 +6132,8 @@ mod native {
                 Statement::Return(value) => {
                     let value = if matches!(&value,Expr::Name(name) if Some(name.as_str())==return_frame) {
                         let frame = return_frame.unwrap();
-                        let fields = env.exports.get(frame).cloned().unwrap_or_default();
-                        if fields.iter().any(|key| key != "output") {
+                        let (fields, children) = handed_back(env, frame, lang);
+                        if fields.iter().any(|key| key != "output") || !children.is_empty() {
                             Expr::Object(
                                 fields
                                     .iter()
@@ -3691,6 +6146,7 @@ mod native {
                                                 .unwrap_or(Expr::Null),
                                         )
                                     })
+                                    .chain(children.into_iter().map(|(_, field, value, _)| (field, value)))
                                     .collect(),
                             )
                         } else {
@@ -3706,14 +6162,27 @@ mod native {
                 }
                 Statement::Evaluate(value) => output.push(Statement::Evaluate(expression(value, env, lang).0)),
                 Statement::Raise(value) => output.push(Statement::Raise(expression(value, env, lang).0)),
+                Statement::Break => output.push(Statement::Break),
                 Statement::If {
                     condition,
                     then_body,
                     else_body,
                 } => {
-                    let condition = expression(condition, env, lang).0;
                     let mut yes = env.clone();
                     let mut no = env.clone();
+                    // what a scope runs after has run whenever the scope does
+                    if let Expr::Call { function, args, .. } = &condition
+                        && matches!(&**function, Expr::Name(n) if n == "_boolean")
+                        && let Some(Expr::Read {
+                            dependency: Dependency::Field(frame, field),
+                            ..
+                        }) = args.first()
+                        && field == "included"
+                        && let Some(records) = env.guarded.get(frame)
+                    {
+                        yes.present.extend(records.iter().cloned());
+                    }
+                    let condition = expression(condition, env, lang).0;
                     let then_body = block(then_body, &mut yes, lang, return_frame);
                     let else_body = block(else_body, &mut no, lang, return_frame);
                     for (name, kind) in &mut env.names {
@@ -3721,6 +6190,8 @@ mod native {
                             *kind = join(a.clone(), b.clone());
                         }
                     }
+                    env.steps.extend(yes.steps);
+                    env.steps.extend(no.steps);
                     output.push(Statement::If {
                         condition,
                         then_body,
@@ -3738,6 +6209,7 @@ mod native {
                 }),
             }
         }
+        declare_before_reads(&mut output, &env.eager);
         code::rewrite(&mut output, &mut |value| {
             if let Expr::Call {
                 function,
@@ -3755,6 +6227,69 @@ mod native {
         inline_local_reads(&mut output);
         env.types.borrow_mut().extend(env.names.clone());
         output
+    }
+
+    // A value is taken where a statement is sure to read it. A statement before that may read it
+    // on one side of a choice, itself or through a deferred value, so it is declared before that one.
+    fn declare_before_reads(output: &mut Vec<Statement>, eager: &HashSet<String>) {
+        let deferred = |statement: &Statement| {
+            matches!(statement, Statement::Variable(Variable::Declare { value: Expr::Call { function, .. }, .. })
+                if matches!(&**function, Expr::Name(name) if name == "_lazy"))
+        };
+        loop {
+            let through: HashMap<String, HashSet<Dependency>> = output
+                .iter()
+                .filter(|statement| deferred(statement))
+                .filter_map(|statement| match statement {
+                    Statement::Variable(Variable::Declare { name, value, .. }) => Some((name.clone(), value.references())),
+                    _ => None,
+                })
+                .collect();
+            let reads = |statement: &Statement| {
+                let mut found = code::references(std::slice::from_ref(statement));
+                let mut pending: Vec<_> = found.iter().cloned().collect();
+                while let Some(read) = pending.pop() {
+                    if let Dependency::Variable(name) = &read
+                        && let Some(more) = through.get(name)
+                    {
+                        pending.extend(more.iter().filter(|more| found.insert((*more).clone())).cloned());
+                    }
+                }
+                found
+            };
+            let late = output.iter().enumerate().find_map(|(index, statement)| {
+                let Statement::Variable(Variable::Declare { name, .. }) = statement else {
+                    return None;
+                };
+                if !eager.contains(name) || deferred(statement) {
+                    return None;
+                }
+                let own = Dependency::Variable(name.clone());
+                output[..index]
+                    .iter()
+                    .position(|earlier| {
+                        !deferred(earlier) && !matches!(earlier, Statement::Function(_)) && reads(earlier).contains(&own)
+                    })
+                    .map(|first| (index, first))
+            });
+            let Some((index, mut first)) = late else { break };
+            // a choice keeps the name it assigns directly above it
+            if first > 0
+                && matches!(&output[first], Statement::If { .. })
+                && matches!(
+                    &output[first - 1],
+                    Statement::Variable(Variable::Declare {
+                        value: Expr::Null,
+                        mutable: true,
+                        ..
+                    })
+                )
+            {
+                first -= 1;
+            }
+            let declaration = output.remove(index);
+            output.insert(first, declaration);
+        }
     }
 
     // A pure deferred read used entirely within one pure expression needs no
@@ -3886,6 +6421,8 @@ mod native {
             return None;
         };
         let mut results = Vec::new();
+        // the steps here that hand nothing back, which are run and not kept
+        let mut silent = Vec::new();
         let mut child_fields = HashMap::new();
         let mut keys: Vec<_> = children.keys().collect();
         keys.sort();
@@ -3894,9 +6431,23 @@ mod native {
             // structural selections keep their established representation.
             let result = label(env, key, "output", lang);
             let kind = match &children[key] {
-                Type::Span(fields, _) => fields.get("output").cloned().unwrap_or(Type::Null),
+                _ if env.records.contains_key(key) => Type::Record(Box::new(env.records[key].shape.clone())),
+                _ if env.collections.contains_key(key) => {
+                    Type::List(Box::new(Type::Record(Box::new(env.collections[key].1.clone()))))
+                }
+                // a step that hands back more than its output keeps that shape
+                Type::Span(fields, _) => match env.steps.get(key) {
+                    Some(step) if carries(step) => step.clone(),
+                    _ => fields.get("output").cloned().unwrap_or(Type::Null),
+                },
                 Type::Optional(child) => match &**child {
-                    Type::Span(fields, _) => join(Type::Null, fields.get("output").cloned().unwrap_or(Type::Null)),
+                    Type::Span(fields, _) => join(
+                        Type::Null,
+                        match env.steps.get(key) {
+                            Some(step) if carries(step) => step.clone(),
+                            _ => fields.get("output").cloned().unwrap_or(Type::Null),
+                        },
+                    ),
                     _ => return None,
                 },
                 _ => return None,
@@ -3909,7 +6460,11 @@ mod native {
             if fields.contains_key(&field) {
                 return None;
             }
-            results.push((result, field.clone()));
+            if !fields.is_empty() && matches!(kind, Type::Null) {
+                silent.push(result);
+            } else {
+                results.push((result, field.clone()));
+            }
             child_fields.insert(key.clone(), (field, kind));
         }
         fn present(body: &[Statement], name: &str) -> bool {
@@ -3922,9 +6477,20 @@ mod native {
                 _ => false,
             })
         }
-        if results.iter().any(|(name, _)| !present(&function.body, name)) {
+        if results
+            .iter()
+            .map(|(name, _)| name)
+            .chain(&silent)
+            .any(|name| !present(&function.body, name))
+        {
             return None;
         }
+        // nothing reads the name such a step is called under, so the call is left a statement later
+        code::rewrite(&mut function.body, &mut |value| {
+            if matches!(value, Expr::Name(name) if silent.contains(name)) {
+                *value = Expr::Null;
+            }
+        });
         fn promote(body: &mut [Statement], names: &HashSet<String>) {
             for statement in body {
                 match statement {
@@ -3990,7 +6556,75 @@ mod native {
             span: span.clone(),
             fields: fields.clone(),
             children: child_fields,
+            gate: env.gates.get(&frame).cloned(),
         })
+    }
+    fn carries(kind: &Type) -> bool {
+        match kind {
+            Type::Product(step) => step.bundled(),
+            Type::Optional(inner) => carries(inner),
+            _ => false,
+        }
+    }
+    // The conditions that must all hold for a scope to run, when nothing is left to chance. Each is
+    // one name or comparison, so the same condition reads the same wherever it is written.
+    fn conjuncts(gate: &Expr) -> Option<Vec<String>> {
+        fn settled(value: &Expr) -> bool {
+            match value {
+                Expr::Name(_) | Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
+                Expr::Index(target, index) => settled(target) && settled(index),
+                Expr::Member(target, _) => settled(target),
+                Expr::Binary { left, right, .. } => settled(left) && settled(right),
+                Expr::Unary { value, .. } => settled(value),
+                Expr::Call {
+                    function,
+                    args,
+                    keywords,
+                } => {
+                    keywords.is_empty()
+                        && matches!(&**function, Expr::Name(name) if args.is_empty() || name == "_boolean" || name == "_equal")
+                        && args.iter().all(settled)
+                }
+                _ => false,
+            }
+        }
+        fn split(value: &Expr, found: &mut Vec<String>) -> bool {
+            match value {
+                Expr::Bool(true) => true,
+                Expr::Binary {
+                    left,
+                    op: BinOp::And,
+                    right,
+                } => split(left, found) && split(right, found),
+                Expr::Call { function, args, .. }
+                    if args.len() == 1 && matches!(&**function, Expr::Name(name) if name == "_boolean") =>
+                {
+                    split(&args[0], found)
+                }
+                // a value is the same whether it is read by name or taken where it is first needed
+                Expr::Call { function, args, .. } if args.is_empty() && matches!(&**function, Expr::Name(_)) => {
+                    split(function, found)
+                }
+                other => {
+                    found.push(format!("{other:?}"));
+                    settled(other)
+                }
+            }
+        }
+        let Expr::Call { function, args, .. } = gate else {
+            return None;
+        };
+        let Some(Expr::Conditional { condition, yes, no }) = args.first() else {
+            return None;
+        };
+        if !matches!(&**function, Expr::Name(name) if name == "_include")
+            || !matches!(&**yes, Expr::Number(n) if n == "1")
+            || !matches!(&**no, Expr::Number(n) if n == "0")
+        {
+            return None;
+        }
+        let mut found = Vec::new();
+        split(condition, &mut found).then_some(found)
     }
 
     fn assign_value(name: &str, value: Expr) -> Vec<Statement> {
@@ -4006,10 +6640,67 @@ mod native {
             })],
         }
     }
+    // The statements that use a value on the paths where it is not null. A value that is
+    // never null, or null down both sides of a choice, has no such form.
+    fn where_present(value: &Expr, used: &impl Fn(Expr) -> Statement) -> Option<Vec<Statement>> {
+        fn nullable(value: &Expr) -> bool {
+            match value {
+                Expr::Null => true,
+                Expr::Conditional { yes, no, .. } => nullable(yes) || nullable(no),
+                _ => false,
+            }
+        }
+        fn paths(value: &Expr, used: &impl Fn(Expr) -> Statement) -> Option<Vec<Statement>> {
+            Some(match value {
+                Expr::Null => vec![],
+                Expr::Conditional { condition, yes, no } => {
+                    let then_body = paths(yes, used)?;
+                    let else_body = paths(no, used)?;
+                    match (then_body.is_empty(), else_body.is_empty()) {
+                        (true, true) => return None,
+                        (true, false) => vec![Statement::If {
+                            condition: negated((**condition).clone()),
+                            then_body: else_body,
+                            else_body: vec![],
+                        }],
+                        _ => vec![Statement::If {
+                            condition: (**condition).clone(),
+                            then_body,
+                            else_body,
+                        }],
+                    }
+                }
+                value => vec![used(value.clone())],
+            })
+        }
+        if matches!(value, Expr::Null) {
+            return Some(vec![]);
+        }
+        if !matches!(value, Expr::Conditional { .. }) || !nullable(value) {
+            return None;
+        }
+        paths(value, used)
+    }
+    fn negated(value: Expr) -> Expr {
+        match value {
+            Expr::Unary { op: UnaryOp::Not, value } => *value,
+            Expr::Binary {
+                left,
+                op: BinOp::Eq,
+                right,
+            } => left.binary(BinOp::Ne, *right),
+            Expr::Binary {
+                left,
+                op: BinOp::Ne,
+                right,
+            } => left.binary(BinOp::Eq, *right),
+            value => value.not(),
+        }
+    }
     // Move a cached initializer to its first guaranteed evaluation, without
     // crossing an earlier fallible operation or an unselected branch.
     fn materialize(value: &Expr, env: &mut Environment, output: &mut Vec<Statement>, lang: ScorerLang) {
-        fn first(value: &Expr, env: &Environment) -> Result<Option<String>, ()> {
+        fn first(value: &Expr, env: &Environment, lang: ScorerLang) -> Result<Option<String>, ()> {
             if let Expr::Call { function, args, .. } = value
                 && args.is_empty()
                 && let Expr::Name(name) = &**function
@@ -4033,13 +6724,13 @@ mod native {
                 _ => vec![],
             };
             for child in children {
-                if let Some(name) = first(child, env)? {
+                if let Some(name) = first(child, env, lang)? {
                     return Ok(Some(name));
                 }
             }
-            if infallible(value, env) { Ok(None) } else { Err(()) }
+            if infallible(value, env, lang) { Ok(None) } else { Err(()) }
         }
-        while let Ok(Some(name)) = first(value, env) {
+        while let Ok(Some(name)) = first(value, env, lang) {
             let Some(index) = output
                 .iter()
                 .position(|s| matches!(s,Statement::Variable(Variable::Declare{name:n,..}) if n==&name))
@@ -4059,45 +6750,196 @@ mod native {
             env.eager.insert(name);
         }
     }
-    fn constants(value: Expr, env: &Environment) -> Expr {
+    fn constants(value: Expr, env: &Environment, lang: ScorerLang) -> Expr {
         match value {
             Expr::Call {
                 ref function, ref args, ..
             } if matches!(&**function,Expr::Name(n) if n=="_lazy") => {
                 if let Some(Expr::Lambda { value: inner, .. }) = args.first()
-                    && infallible(inner, env)
+                    && infallible(inner, env, lang)
                 {
-                    return constants((**inner).clone(), env);
+                    return constants((**inner).clone(), env, lang);
                 }
                 value
             }
-            Expr::Array(items) => Expr::Array(items.into_iter().map(|v| constants(v, env)).collect()),
-            Expr::Object(fields) => Expr::Object(fields.into_iter().map(|(k, v)| (k, constants(v, env))).collect()),
+            Expr::Array(items) => Expr::Array(items.into_iter().map(|v| constants(v, env, lang)).collect()),
+            Expr::Object(fields) => Expr::Object(fields.into_iter().map(|(k, v)| (k, constants(v, env, lang))).collect()),
             value => value,
         }
     }
     fn materialized(kind: &Type) -> bool {
         match kind {
             Type::Unknown | Type::Deferred(_) | Type::Span(..) | Type::Record(_) | Type::Product(_) => false,
-            Type::List(kind) => materialized(kind),
+            Type::List(kind) | Type::Rest(kind) => materialized(kind),
             Type::Optional(kind) => materialized(kind),
             Type::Array(items) => items.iter().all(materialized),
             Type::Object(fields) => fields.values().all(materialized),
             _ => true,
         }
     }
-    fn infallible(value: &Expr, env: &Environment) -> bool {
+    // Whether a value is sure to be computed without raising, so that nothing is lost by taking it
+    // before it is read. A value that can raise is never taken on a path that does not read it.
+    fn infallible(value: &Expr, env: &Environment, lang: ScorerLang) -> bool {
+        let sure = |value: &Expr| infallible(value, env, lang);
+        let kind = |value: &Expr| expression(value.clone(), env, lang).1;
         match value {
             Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
             Expr::Name(name) => env.names.contains_key(name),
-            Expr::Array(items) => items.iter().all(|v| infallible(v, env)),
-            Expr::Object(fields) => fields.iter().all(|(_, v)| infallible(v, env)),
+            Expr::Array(items) => items.iter().all(sure),
+            Expr::Object(fields) => fields.iter().all(|(_, v)| sure(v)),
+            Expr::Template(items) => items.iter().all(sure),
+            // a list spreads into its items
+            Expr::Spread(spread) => sure(spread) && matches!(kind(spread), Type::Array(_) | Type::List(_)),
+            Expr::Conditional { condition, yes, no } => sure(condition) && sure(yes) && sure(no),
             Expr::Binary {
                 left,
                 op: BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or,
                 right,
-            } => infallible(left, env) && infallible(right, env),
-            Expr::Unary { op: UnaryOp::Not, value } => infallible(value, env),
+            } => sure(left) && sure(right),
+            Expr::Unary { op: UnaryOp::Not, value } => sure(value),
+            // a float literal is a constant in either language, though TypeScript marks its kind
+            Expr::Call { .. } if constant(value) => true,
+            // and so is text written around a draw
+            Expr::Call { .. } | Expr::Binary { op: BinOp::Add, .. } if drawn_text(value) => true,
+            // strings join, and whole numbers within bounds stay whole numbers
+            Expr::Binary {
+                left,
+                op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Rem,
+                right,
+            } => {
+                sure(left)
+                    && sure(right)
+                    && match kind(value) {
+                        Type::String => matches!((kind(left), kind(right)), (Type::String, Type::String)),
+                        found @ Type::Integer(..) => safe(&found),
+                        _ => false,
+                    }
+            }
+            // a key the object is known to have, and a place the list is known to reach
+            Expr::Index(target, index) => {
+                sure(target)
+                    && match (kind(target), &**index) {
+                        (Type::Object(fields), Expr::String(key)) => fields.contains_key(key),
+                        (Type::Array(items), Expr::Number(at)) => {
+                            at.parse::<usize>().is_ok_and(|at| placed(&items, at).is_some())
+                        }
+                        _ => false,
+                    }
+            }
+            Expr::Member(target, key) if key == "length" => {
+                sure(target) && matches!(kind(target), Type::Array(_) | Type::List(_) | Type::String)
+            }
+            Expr::Call {
+                function,
+                args,
+                keywords,
+            } if keywords.is_empty() && matches!(&**function, Expr::Name(_)) => {
+                let Expr::Name(name) = &**function else { unreachable!() };
+                let kinds: Vec<Type> = args.iter().map(&kind).collect();
+                match (name.as_str(), args.as_slice()) {
+                    // a draw held within written bounds is as sure as the draw, and so is any number
+                    ("_clamp", [held, low, high]) => {
+                        matches!((written(low), written(high)), (Some(low), Some(high)) if low <= high)
+                            && (sampled(held) || sure(held) && span(&kinds[0]).is_some())
+                    }
+                    // what these write out is a string, a boolean or a number both languages hold
+                    ("_text", [written]) => sure(written) && (matches!(kinds[0], Type::String | Type::Bool) || safe(&kinds[0])),
+                    ("str" | "String" | "len", [written]) => sure(written),
+                    ("_floor" | "_ceil" | "_round", [number]) => sure(number) && safe(&kinds[0]),
+                    // arithmetic that is known to stay within bounds
+                    ("_arithmetic", [_, left, right]) => sure(left) && sure(right) && span(&kind(value)).is_some(),
+                    ("checked_number", [Expr::Binary { left, right, .. }]) => {
+                        sure(left) && sure(right) && span(&kind(value)).is_some()
+                    }
+                    ("trace_of" | "traceOf", _) => true,
+                    // a value still waiting to be read is as sure as what it computes
+                    (name, []) if env.pending.contains_key(name) => sure(&env.pending[name]),
+                    // a provider helper says which of its calls cannot raise
+                    _ => match facts(env, name, args, &kinds) {
+                        Some((helper, facts)) => {
+                            let given = env.counts.called(name, args).map(|(_, given)| given).unwrap_or_default();
+                            helper.sure.is_some_and(|sure| sure(&facts)) && given.iter().all(sure)
+                        }
+                        None => sampled(value),
+                    },
+                }
+            }
+            _ => sampled(value),
+        }
+    }
+    // the number a literal writes, under TypeScript's mark for a float or not
+    fn written(value: &Expr) -> Option<f64> {
+        match value {
+            Expr::Number(number) => number.parse().ok().filter(|number: &f64| number.is_finite()),
+            Expr::Call { function, args, .. } if matches!(&**function, Expr::Name(name) if name == "_float") => {
+                match args.as_slice() {
+                    [value] => written(value),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    // text joined from written pieces and draws
+    fn drawn_text(value: &Expr) -> bool {
+        match value {
+            Expr::String(_) => true,
+            Expr::Call {
+                function,
+                args,
+                keywords,
+            } => {
+                // a draw of text is text already
+                keywords.is_empty()
+                    && match &**function {
+                        Expr::Name(name) if name == "_text" => matches!(args.as_slice(), [value] if sampled(value)),
+                        Expr::Name(name) => ["_random_text", "_uuid"].contains(&name.as_str()) && sampled(value),
+                        _ => false,
+                    }
+            }
+            Expr::Binary {
+                left,
+                op: BinOp::Add,
+                right,
+            } => drawn_text(left) && drawn_text(right),
+            _ => false,
+        }
+    }
+    fn constant(value: &Expr) -> bool {
+        match value {
+            Expr::String(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Null => true,
+            Expr::Array(items) => items.iter().all(constant),
+            Expr::Object(fields) => fields.iter().all(|(_, value)| constant(value)),
+            Expr::Call { function, args, .. } => {
+                matches!(&**function, Expr::Name(name) if name == "_float") && args.iter().all(constant)
+            }
+            _ => false,
+        }
+    }
+    // A draw from constant parameters cannot fail, so nothing is lost by taking it where it is declared.
+    fn sampled(value: &Expr) -> bool {
+        let Expr::Call { function, args, .. } = value else {
+            return false;
+        };
+        let Expr::Name(name) = &**function else { return false };
+        // the random source is read by name, and through the context once the agent has one
+        let random = |value: &Expr| {
+            matches!(value, Expr::Name(name) if name == "random_source" || name == "randomSource")
+                || matches!(value, Expr::Member(target, field) if field == "random" && matches!(&**target, Expr::Name(name) if name == "context"))
+        };
+        let options = |value: &Expr| {
+            matches!(value, Expr::Array(items) if items.iter().all(|item| {
+                matches!(item, Expr::Call { function, args, .. }
+                    if matches!(&**function, Expr::Name(name) if name == "_lazy")
+                        && matches!(args.as_slice(), [Expr::Lambda { parameters, value }] if parameters.is_empty() && constant(value)))
+            }))
+        };
+        match (name.as_str(), args.as_slice()) {
+            ("_include" | "_range" | "_uuid" | "_sample" | "_random_text" | "_pick", args) => {
+                args.iter().all(|arg| constant(arg) || random(arg))
+            }
+            ("_weighted", [weights, choices, source]) => constant(weights) && options(choices) && random(source),
+            ("_select", [pick, choices]) => sampled(pick) && options(choices),
             _ => false,
         }
     }
@@ -4112,7 +6954,9 @@ mod native {
             Expr::Bool(v) => (Expr::Bool(v), Type::Bool),
             Expr::Null => (Expr::Null, Type::Null),
             Expr::Number(v) => {
-                let t = v.parse::<i128>().map(|v| Type::Integer(v, v)).unwrap_or(unknown);
+                let t = (v.parse::<i128>().map(|v| Type::Integer(v, v)))
+                    .or_else(|_| v.parse::<f64>().map(|v| Type::Real(v, v)))
+                    .unwrap_or(Type::Number);
                 (Expr::Number(v), t)
             }
             Expr::Read { dependency, value } => {
@@ -4120,6 +6964,11 @@ mod native {
                     && let Some((value, shape)) = env.collections.get(child)
                 {
                     return (value.clone(), Type::List(Box::new(Type::Record(Box::new(shape.clone())))));
+                }
+                if let Dependency::Child(_, child) = &dependency
+                    && let Some(record) = env.records.get(child)
+                {
+                    return (record.value.clone(), Type::Record(Box::new(record.shape.clone())));
                 }
                 if let Dependency::Field(frame, key) = &dependency {
                     if let Some(record) = env.records.get(frame)
@@ -4188,11 +7037,53 @@ mod native {
                         && matches!(child.first(), Some(Expr::Name(n)) if n == &parameter.name)
                         && let Some(Expr::String(key)) = child.get(1)
                         && let Some((field, kind)) = record.shape.children.get(key)
+                        && !carries(kind)
                         && let Expr::Lambda { parameters, value } = &selection[1]
                         && let Some(parameter) = parameters.first()
                         && matches!(unwrapped(value), Expr::Member(target, field) if field == "output" && matches!(&**target, Expr::Name(n) if n == &parameter.name))
                     {
+                        if record.shape.silent(kind) {
+                            return (Expr::Null, Type::Null);
+                        }
                         return (record.value.clone().index(Expr::string(field)), kind.clone());
+                    }
+                }
+                // a step that already ran is read through the values it produced
+                if callee.as_deref() == Some("_at")
+                    && args.len() == 2
+                    && let Expr::Call {
+                        function,
+                        args: children,
+                        ..
+                    } = unwrapped(&args[0])
+                    && let Expr::Lambda { parameters, value } = &args[1]
+                    && matches!(&**function, Expr::Name(n) if n == "_child")
+                    && let Some(Expr::String(key)) = children.get(1)
+                    && let Some(parameter) = parameters.first()
+                    && !matches!(unwrapped(value), Expr::Member(..))
+                {
+                    let mut local = env.clone();
+                    let mut known = false;
+                    for ((frame, field), found) in &env.fields {
+                        if frame == key {
+                            local.fields.insert((parameter.name.clone(), field.clone()), found.clone());
+                            known = true;
+                        }
+                    }
+                    if let Some(found) = env.outputs.get(key) {
+                        local.outputs.insert(parameter.name.clone(), found.clone());
+                        known = true;
+                    }
+                    if known {
+                        let (result, kind) = expression((**value).clone(), &local, lang);
+                        let leaks = result.references().iter().any(|dependency| match dependency {
+                            Dependency::Variable(name) | Dependency::Field(name, _) | Dependency::Child(name, _) => {
+                                name == &parameter.name
+                            }
+                        });
+                        if !leaks {
+                            return (result, kind);
+                        }
                     }
                 }
                 if callee.as_deref() == Some("_at")
@@ -4243,7 +7134,33 @@ mod native {
                         }
                         ("_value", [value], [kind]) if materialized(kind) => return (value.clone(), kind.clone()),
                         ("_value", [value], _) => {
-                            let value = constants(value.clone(), env);
+                            // every item of a resolved literal is evaluated, so none needs deferring
+                            fn plain(value: Expr) -> Expr {
+                                match value {
+                                    Expr::Array(items) => Expr::Array(
+                                        items
+                                            .into_iter()
+                                            .map(|item| match item {
+                                                Expr::Call { function, mut args, .. }
+                                                    if matches!(&*function, Expr::Name(name) if name == "_lazy")
+                                                        && matches!(args.as_slice(), [Expr::Lambda { parameters, .. }] if parameters.is_empty()) =>
+                                                {
+                                                    match args.remove(0) {
+                                                        Expr::Lambda { value, .. } => plain(*value),
+                                                        other => other,
+                                                    }
+                                                }
+                                                other => plain(other),
+                                            })
+                                            .collect(),
+                                    ),
+                                    Expr::Object(fields) => {
+                                        Expr::Object(fields.into_iter().map(|(key, value)| (key, plain(value))).collect())
+                                    }
+                                    other => other,
+                                }
+                            }
+                            let value = constants(plain(value.clone()), env, lang);
                             let (value, kind) = expression(value, env, lang);
                             if materialized(&kind) {
                                 return (value, kind);
@@ -4257,7 +7174,9 @@ mod native {
                             }
                             return (call, Type::Bool);
                         }
-                        ("_num", [value], [kind @ (Type::Integer(..) | Type::Number)]) => return (value.clone(), kind.clone()),
+                        ("_num", [value], [kind @ (Type::Integer(..) | Type::Real(..) | Type::Number)]) => {
+                            return (value.clone(), kind.clone());
+                        }
                         ("_integer", [value], [kind @ Type::Integer(min, max)])
                             if *min >= -9_007_199_254_740_991 && *max <= 9_007_199_254_740_991 =>
                         {
@@ -4275,6 +7194,28 @@ mod native {
                                 Type::String,
                             );
                         }
+                        // a list is already a list
+                        ("_array", [value], [kind @ (Type::Array(_) | Type::List(_))]) if materialized(kind) => {
+                            return (value.clone(), kind.clone());
+                        }
+                        // an item of a list written as one spread is an item of what was spread
+                        ("_index", [Expr::Array(items), index], [Type::Array(_) | Type::List(_), _])
+                            if matches!(items.as_slice(), [Expr::Spread(_)]) =>
+                        {
+                            let Some(Expr::Spread(spread)) = items.first() else {
+                                unreachable!()
+                            };
+                            return expression(Expr::call("_index", vec![(**spread).clone(), index.clone()]), env, lang);
+                        }
+                        // a key of an object written out is what was written under it
+                        ("_index", [Expr::Object(fields), Expr::String(key)], [Type::Object(kinds), _])
+                            if fields.iter().filter(|(found, _)| found == key).count() == 1
+                                && fields.iter().all(|(_, value)| steady(value))
+                                && kinds.get(key).is_some_and(materialized) =>
+                        {
+                            let (_, value) = fields.iter().find(|(found, _)| found == key).unwrap();
+                            return (value.clone(), kinds[key].clone());
+                        }
                         ("_index", [value, Expr::String(key)], [Type::Optional(kind), _]) => {
                             if let Type::Object(fields) = &**kind
                                 && fields.get(key).is_some_and(materialized)
@@ -4289,7 +7230,7 @@ mod native {
                         }
                         ("_index", [value, Expr::Number(index)], [Type::Array(items), _]) => {
                             if let Ok(i) = index.parse::<usize>()
-                                && let Some(kind) = items.get(i)
+                                && let Some(kind) = placed(items, i)
                                 && materialized(kind)
                             {
                                 return (value.clone().index(Expr::number(i)), kind.clone());
@@ -4315,7 +7256,9 @@ mod native {
                                 Type::Integer(0, 9_007_199_254_740_991),
                             );
                         }
-                        ("_len", [value], [Type::Array(items)]) if items.iter().all(materialized) => {
+                        ("_len", [value], [Type::Array(items)])
+                            if items.iter().all(materialized) && !items.iter().any(|item| matches!(item, Type::Rest(_))) =>
+                        {
                             return (
                                 if lang == ScorerLang::Python {
                                     Expr::call("len", vec![value.clone()])
@@ -4342,9 +7285,10 @@ mod native {
                         // typescript keeps float markers when arithmetic produces a whole number
                         ("_arithmetic", [Expr::String(op), left, right], [_, a, b])
                             if lang == ScorerLang::Python
-                                && matches!(a, Type::Number | Type::Integer(..))
-                                && matches!(b, Type::Number | Type::Integer(..))
-                                && (matches!(a, Type::Number) || matches!(b, Type::Number)) =>
+                                && matches!(a, Type::Number | Type::Real(..) | Type::Integer(..))
+                                && matches!(b, Type::Number | Type::Real(..) | Type::Integer(..))
+                                && (matches!(a, Type::Number | Type::Real(..))
+                                    || matches!(b, Type::Number | Type::Real(..))) =>
                         {
                             let value = match op.as_str() {
                                 "+" | "-" | "*" => Expr::call(
@@ -4361,7 +7305,7 @@ mod native {
                                 "%" => Expr::call("remainder", vec![left.clone(), right.clone()]),
                                 _ => Expr::call("divide", vec![left.clone(), right.clone()]),
                             };
-                            return (value, Type::Number);
+                            return (value, reach(op, a, b).unwrap_or(Type::Number));
                         }
                         ("_arithmetic", [Expr::String(op), left, right], [_, Type::Integer(a, b), Type::Integer(c, d)]) => {
                             let operator = match op.as_str() {
@@ -4398,6 +7342,22 @@ mod native {
                             return (Expr::call("_index", vec![value.clone(), index.clone()]), (**kind).clone());
                         }
                         ("_index", _, [Type::List(kind), _]) => return (call, (**kind).clone()),
+                        ("_read", [value, Expr::String(key)], [Type::Record(branch), _]) => {
+                            if let Some(kind) = branch.fields.get(key) {
+                                return (value.clone().index(Expr::string(key)), kind.clone());
+                            }
+                        }
+                        ("_len", [Expr::Map { iterable, .. }], _) => {
+                            return expression(Expr::call("_len", vec![(**iterable).clone()]), env, lang);
+                        }
+                        ("_last", [value], [Type::List(kind)]) => {
+                            let position = if lang == ScorerLang::Python {
+                                Expr::number(-1)
+                            } else {
+                                value.clone().member("length").binary(BinOp::Sub, Expr::number(1))
+                            };
+                            return (value.clone().index(position), (**kind).clone());
+                        }
                         ("_slice", [value, start, end], [kind @ Type::List(_), _, _])
                             if matches!(start, Expr::Null) && matches!(end, Expr::Null) =>
                         {
@@ -4407,13 +7367,39 @@ mod native {
                         ("_child", [scope, Expr::String(key)], [Type::Record(branch), _]) => {
                             if let Some((field, kind)) = branch.children.get(key) {
                                 return (
-                                    if branch.fields.is_empty() && branch.children.len() == 1 {
+                                    if branch.silent(kind) {
+                                        Expr::Null
+                                    } else if branch.fields.is_empty() && branch.children.len() == 1 {
                                         scope.clone()
                                     } else {
                                         scope.clone().index(Expr::string(field))
                                     },
-                                    Type::Product(Box::new(kind.clone())),
+                                    // a nested scope keeps its own shape, a step is its result
+                                    match kind {
+                                        Type::Record(_) | Type::List(_) | Type::Product(_) => kind.clone(),
+                                        // a step that ran whenever this is read is there to read
+                                        Type::Optional(step)
+                                            if carries(step)
+                                                && matches!(scope, Expr::Name(name) if env.present.contains(name)) =>
+                                        {
+                                            (**step).clone()
+                                        }
+                                        _ if carries(kind) => kind.clone(),
+                                        _ => Type::Product(Box::new(Step::plain(kind.clone()))),
+                                    },
                                 );
+                            }
+                        }
+                        // a step that ran here and carries the steps inside it is read by its result
+                        ("_child", [Expr::Name(_), Expr::String(key)], [Type::Span(..), _])
+                            if env.steps.get(key).is_some_and(carries)
+                                && env.names.contains_key(&label(env, key, "output", lang)) =>
+                        {
+                            return (Expr::Name(label(env, key, "output", lang)), env.steps[key].clone());
+                        }
+                        ("_child", [scope, Expr::String(key)], [Type::Product(step), _]) => {
+                            if let Some((field, kind)) = step.children.get(key) {
+                                return (scope.clone().index(Expr::string(field)), kind.clone());
                             }
                         }
                         ("_child", [scope, Expr::String(key)], [Type::Span(_, children), _]) => {
@@ -4452,7 +7438,9 @@ mod native {
                             }
                             let (span, optional) = match kind {
                                 Type::Span(..) | Type::List(_) | Type::Record(_) | Type::Product(_) => (kind.clone(), false),
-                                Type::Optional(inner) if matches!(&**inner, Type::Span(..)) => ((**inner).clone(), true),
+                                Type::Optional(inner) if matches!(&**inner, Type::Span(..) | Type::Product(_)) => {
+                                    ((**inner).clone(), true)
+                                }
                                 _ => (Type::Unknown, false),
                             };
                             if !matches!(span, Type::Unknown)
@@ -4460,6 +7448,9 @@ mod native {
                             {
                                 let mut local = env.clone();
                                 local.names.insert(parameter.name.clone(), span);
+                                if matches!(scope, Expr::Name(name) if env.present.contains(name)) {
+                                    local.present.insert(parameter.name.clone());
+                                }
                                 let (mut result, kind) = expression((**value).clone(), &local, lang);
                                 code::rewrite_expr(&mut result, &mut |value| {
                                     if matches!(value, Expr::Name(name) if name == &parameter.name) {
@@ -4481,6 +7472,15 @@ mod native {
                         }
                         _ => {}
                     }
+                    // a provider helper says what its own call returns
+                    if let Some((helper, facts)) = facts(env, &name, &args, &kinds)
+                        && let Some(returns) = helper.returns
+                    {
+                        let kind = learned(&returns(&facts));
+                        if !matches!(kind, Type::Unknown) {
+                            return (call, kind);
+                        }
+                    }
                     let kind = match name.as_str() {
                         "_text" | "_trim" | "_upper" | "_lower" | "_replace" | "_join" | "_render" | "_compose"
                         | "_random_text" => Type::String,
@@ -4490,7 +7490,96 @@ mod native {
                         "_index" if kinds.first().is_some_and(materialized) => Type::Value,
                         "_at" => Type::Value,
                         "_duration" => Type::Value,
-                        "checked_number" | "remainder" | "divide" => Type::Number,
+                        // arithmetic on bounded numbers stays within bounds
+                        "_arithmetic" => match (args.first(), kinds.as_slice()) {
+                            (Some(Expr::String(op)), [_, a, b]) => reach(op, a, b).unwrap_or(Type::Number),
+                            _ => Type::Number,
+                        },
+                        "checked_number" => match args.as_slice() {
+                            [Expr::Binary { left, op, right }] => {
+                                let sign = match op {
+                                    BinOp::Add => "+",
+                                    BinOp::Sub => "-",
+                                    BinOp::Mul => "*",
+                                    _ => "",
+                                };
+                                let a = expression((**left).clone(), env, lang).1;
+                                let b = expression((**right).clone(), env, lang).1;
+                                reach(sign, &a, &b).unwrap_or(Type::Number)
+                            }
+                            _ => Type::Number,
+                        },
+                        "_floor" | "_ceil" | "_round" => match kinds.first() {
+                            Some(kind) if safe(kind) => {
+                                let (low, high) = span(kind).unwrap();
+                                match name.as_str() {
+                                    "_floor" => Type::Integer(low.floor() as i128, high.floor() as i128),
+                                    "_ceil" => Type::Integer(low.ceil() as i128, high.ceil() as i128),
+                                    _ => Type::Integer(low.floor() as i128, high.ceil() as i128),
+                                }
+                            }
+                            _ => env.returns.get(&name).cloned().unwrap_or(Type::Unknown),
+                        },
+                        "_clamp" => match args.as_slice() {
+                            [_, low, high] => match (written(low), written(high)) {
+                                (Some(low), Some(high)) if low <= high => Type::Real(low, high),
+                                _ => Type::Number,
+                            },
+                            _ => Type::Number,
+                        },
+                        "remainder" | "divide" | "_sample" | "_abs" | "_extreme" => Type::Number,
+                        "_uuid" | "str" | "String" => Type::String,
+                        "_float" => match args.as_slice() {
+                            [value] => written(value).map(|value| Type::Real(value, value)).unwrap_or(Type::Number),
+                            _ => Type::Number,
+                        },
+                        // which trace of a run the agent is
+                        "trace_of" | "traceOf" => Type::Integer(0, SAFE),
+                        "len" => Type::Integer(0, 9_007_199_254_740_991),
+                        // these return what they were given, or resolve it first
+                        "_slice" | "_array" if kinds.first().is_some_and(materialized) => Type::Value,
+                        "_history" | "_emissions" => Type::Value,
+                        // a fold resolves what it returns
+                        "_fold" => Type::Value,
+                        "_range" => match args.as_slice() {
+                            [Expr::Number(low), Expr::Number(high), Expr::Number(whole), ..] if whole == "1" => {
+                                match (low.parse::<i128>(), high.parse::<i128>()) {
+                                    (Ok(low), Ok(high)) => Type::Integer(low, high),
+                                    _ => Type::Number,
+                                }
+                            }
+                            [low, high, ..] => match (written(low), written(high)) {
+                                (Some(low), Some(high)) if low <= high => Type::Real(low, high),
+                                _ => Type::Number,
+                            },
+                            _ => Type::Number,
+                        },
+                        // a choice is whichever option it takes
+                        "_select" | "_weighted" => {
+                            let choices = args.get(1);
+                            let mut kinds = Vec::new();
+                            if let Some(Expr::Array(items)) = choices {
+                                for item in items {
+                                    if let Expr::Call { args, .. } = item
+                                        && let [Expr::Lambda { value, .. }] = args.as_slice()
+                                    {
+                                        kinds.push(expression((**value).clone(), env, lang).1);
+                                    }
+                                }
+                            }
+                            let all = kinds.len();
+                            match kinds.into_iter().reduce(join) {
+                                Some(kind) if all > 0 && materialized(&kind) => kind,
+                                _ => Type::Unknown,
+                            }
+                        }
+                        name if env.counts.counts.contains(name) => Type::Integer(0, 9_007_199_254_740_991),
+                        name if env.counts.plain.contains(name) => Type::Value,
+                        name if matches!(args.first(), Some(Expr::String(operation))
+                            if env.counts.texts.iter().any(|(helper, known)| *helper == name && *known == operation.as_str())) =>
+                        {
+                            Type::String
+                        }
                         _ => env.returns.get(&name).cloned().unwrap_or(Type::Unknown),
                     };
                     (call, kind)
@@ -4506,10 +7595,16 @@ mod native {
             }
             Expr::Array(items) => {
                 let items = items.into_iter().map(|v| expression(v, env, lang)).collect::<Vec<_>>();
-                (
-                    Expr::Array(items.iter().map(|(v, _)| v.clone()).collect()),
-                    Type::Array(items.into_iter().map(|(_, t)| t).collect()),
-                )
+                // a spread list of known length gives its items, one of any length stands for any number of them
+                let mut kinds = Vec::new();
+                for (value, kind) in &items {
+                    match (value, kind) {
+                        (Expr::Spread(_), Type::Array(spread)) => kinds.extend(spread.iter().cloned()),
+                        (Expr::Spread(_), Type::List(item)) => kinds.push(Type::Rest(item.clone())),
+                        (_, kind) => kinds.push(kind.clone()),
+                    }
+                }
+                (Expr::Array(items.into_iter().map(|(v, _)| v).collect()), Type::Array(kinds))
             }
             Expr::Object(fields) => {
                 let fields = fields
@@ -4524,6 +7619,18 @@ mod native {
             Expr::Binary { left, op, right } => {
                 let (left, a) = expression(*left, env, lang);
                 let (right, b) = expression(*right, env, lang);
+                if op == BinOp::And && matches!(b, Type::Bool) && matches!(left, Expr::Bool(true)) {
+                    return (right, Type::Bool);
+                }
+                if op == BinOp::Or && matches!(b, Type::Bool) && matches!(left, Expr::Bool(false)) {
+                    return (right, Type::Bool);
+                }
+                if op == BinOp::Or && matches!(a, Type::Bool) && matches!(right, Expr::Bool(false)) {
+                    return (left, Type::Bool);
+                }
+                if op == BinOp::And && matches!(a, Type::Bool) && matches!(right, Expr::Bool(true)) {
+                    return (left, Type::Bool);
+                }
                 let t = match op {
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or => {
                         Type::Bool
@@ -4551,8 +7658,26 @@ mod native {
             }
             Expr::Conditional { condition, yes, no } => {
                 let (condition, _) = expression(*condition, env, lang);
+                // a condition that is already decided leaves one side
+                match condition {
+                    Expr::Bool(true) => return expression(*yes, env, lang),
+                    Expr::Bool(false) => return expression(*no, env, lang),
+                    _ => {}
+                }
                 let (yes, a) = expression(*yes, env, lang);
-                let (no, b) = expression(*no, env, lang);
+                let (mut no, mut b) = expression(*no, env, lang);
+                // a second test that is the first one turned around is already decided
+                if let Expr::Conditional {
+                    condition: second,
+                    yes: taken,
+                    ..
+                } = &no
+                    && steady(&condition)
+                    && (format!("{:?}", negated(condition.clone())) == format!("{second:?}")
+                        || format!("{condition:?}") == format!("{:?}", negated((**second).clone())))
+                {
+                    (no, b) = expression((**taken).clone(), env, lang);
+                }
                 (
                     Expr::Conditional {
                         condition: Box::new(condition),
@@ -4572,13 +7697,21 @@ mod native {
                 if key == "iterations" && matches!(t, Type::List(_)) {
                     return (value, t);
                 }
-                if key == "output"
-                    && let Type::Product(kind) = &t
-                {
-                    return (value, (**kind).clone());
+                if let Type::Product(step) = &t {
+                    if !step.bundled() && key == "output" {
+                        return (value, step.output.clone());
+                    }
+                    if step.bundled() {
+                        return match step.fields.get(&key) {
+                            Some(kind) => (value.index(Expr::string(export_name(&key))), kind.clone()),
+                            None => (Expr::Null, Type::Null),
+                        };
+                    }
                 }
                 let t = match t {
                     Type::Object(fields) | Type::Span(fields, _) => fields.get(&key).cloned().unwrap_or(unknown),
+                    // the length of a list or a string
+                    _ if key == "length" => Type::Integer(0, 9_007_199_254_740_991),
                     _ => unknown,
                 };
                 (value.member(key), t)
@@ -4588,6 +7721,9 @@ mod native {
                 let (index, _) = expression(*index, env, lang);
                 let t = match (&t, &index) {
                     (Type::Object(fields), Expr::String(key)) => fields.get(key).cloned().unwrap_or(unknown),
+                    (Type::Array(items), Expr::Number(at)) => (at.parse::<usize>().ok().and_then(|at| placed(items, at)))
+                        .cloned()
+                        .unwrap_or(unknown),
                     _ => unknown,
                 };
                 (value.index(index), t)
@@ -4642,7 +7778,16 @@ mod native {
                 Expr::Contains(Box::new(expression(*a, env, lang).0), Box::new(expression(*b, env, lang).0)),
                 Type::Bool,
             ),
-            Expr::Spread(value) => (Expr::Spread(Box::new(expression(*value, env, lang).0)), unknown),
+            Expr::Spread(value) => {
+                let (value, kind) = expression(*value, env, lang);
+                // spreading a list gives its items, and spreading other plain data gives plain items
+                let kind = match kind {
+                    Type::Array(_) | Type::List(_) if materialized(&kind) => kind,
+                    kind if materialized(&kind) => Type::Value,
+                    _ => unknown,
+                };
+                (Expr::Spread(Box::new(value)), kind)
+            }
             Expr::Template(items) => {
                 let items: Vec<_> = items.into_iter().map(|v| expression(v, env, lang).0).collect();
                 if items.iter().all(|v| matches!(v, Expr::String(_))) {
@@ -4674,6 +7819,79 @@ mod native {
             }
         }
     }
+    // the item a written list is sure to have at a place, which it is not past where any number of items begin
+    fn placed(items: &[Type], at: usize) -> Option<&Type> {
+        let sure = items
+            .iter()
+            .position(|item| matches!(item, Type::Rest(_)))
+            .unwrap_or(items.len());
+        items[..sure].get(at)
+    }
+    // one of the items a part of a written list stands for
+    fn one(kind: Type) -> Type {
+        match kind {
+            Type::Rest(item) => *item,
+            kind => kind,
+        }
+    }
+    // the helper a call is to and what is known of each argument the function was called with
+    fn facts<'a>(
+        env: &'a Environment,
+        name: &str,
+        args: &[Expr],
+        kinds: &[Type],
+    ) -> Option<(&'a crate::mocking::Helper, Vec<crate::mocking::Known>)> {
+        let (helper, given) = env.counts.called(name, args)?;
+        let kinds: Vec<Type> = match (helper.operation, kinds.get(1)) {
+            (Some(_), Some(Type::Array(kinds))) if kinds.len() == given.len() => kinds.clone(),
+            (Some(_), _) => vec![Type::Unknown; given.len()],
+            (None, _) => kinds.iter().take(given.len()).cloned().collect(),
+        };
+        Some((
+            helper,
+            given.iter().zip(&kinds).map(|(value, kind)| fact(value, kind)).collect(),
+        ))
+    }
+    // whether a test gives the same answer however often it is made
+    fn steady(value: &Expr) -> bool {
+        let mut steady = true;
+        code::rewrite_expr(&mut value.clone(), &mut |found| {
+            if let Expr::Call { function, args, .. } = found {
+                steady &= matches!(&**function, Expr::Name(name)
+                    if args.is_empty() || ["_equal", "_boolean", "_num", "_index", "_text", "_len"].contains(&name.as_str()));
+            }
+            steady &= !matches!(found, Expr::New { .. } | Expr::Lambda { .. });
+        });
+        steady
+    }
+    // the bounds of arithmetic on two bounded numbers, when the result is sure to be a number both languages hold
+    fn reach(op: &str, a: &Type, b: &Type) -> Option<Type> {
+        if !safe(a) || !safe(b) {
+            return None;
+        }
+        let ((a, b), (c, d)) = (span(a)?, span(b)?);
+        let (low, high) = match op {
+            "+" => (a + c, b + d),
+            "-" => (a - d, b - c),
+            "*" => {
+                let ends = [a * c, a * d, b * c, b * d];
+                (
+                    ends.iter().copied().fold(f64::INFINITY, f64::min),
+                    ends.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
+            }
+            "/" if c > 0.0 || d < 0.0 => {
+                let ends = [a / c, a / d, b / c, b / d];
+                (
+                    ends.iter().copied().fold(f64::INFINITY, f64::min),
+                    ends.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
+            }
+            _ => return None,
+        };
+        let kind = Type::Real(low, high);
+        safe(&kind).then_some(kind)
+    }
     fn bounds(op: BinOp, a: i128, b: i128, c: i128, d: i128) -> Option<(i128, i128)> {
         match op {
             BinOp::Add => a.checked_add(c).zip(b.checked_add(d)),
@@ -4698,18 +7916,28 @@ mod native {
             (a, b),
             (Type::Bool, Type::Bool)
                 | (Type::String, Type::String)
-                | (Type::Integer(..), Type::Integer(..))
-                | (Type::Number, Type::Number | Type::Integer(..))
-                | (Type::Integer(..), Type::Number)
+                | (
+                    Type::Integer(..) | Type::Real(..) | Type::Number,
+                    Type::Integer(..) | Type::Real(..) | Type::Number
+                )
                 | (Type::Null, Type::Null)
-        ) || matches!(a, Type::Null) && matches!(b, Type::Bool | Type::String | Type::Integer(..) | Type::Number)
-            || matches!(b, Type::Null) && matches!(a, Type::Bool | Type::String | Type::Integer(..) | Type::Number)
+        ) || matches!(a, Type::Null)
+            && matches!(
+                b,
+                Type::Bool | Type::String | Type::Integer(..) | Type::Real(..) | Type::Number
+            )
+            || matches!(b, Type::Null)
+                && matches!(
+                    a,
+                    Type::Bool | Type::String | Type::Integer(..) | Type::Real(..) | Type::Number
+                )
     }
     fn normalized(t: &Type) -> Type {
         match t {
             Type::Unknown => Type::Value,
             Type::Optional(t) => Type::Optional(Box::new(normalized(t))),
             Type::Deferred(t) => normalized(t),
+            Type::Rest(t) => Type::Rest(Box::new(normalized(t))),
             Type::Array(v) => Type::Array(v.iter().map(normalized).collect()),
             Type::Object(v) => Type::Object(v.iter().map(|(k, v)| (k.clone(), normalized(v))).collect()),
             t => t.clone(),
@@ -4733,7 +7961,12 @@ mod native {
             (Type::Null, b) | (b, Type::Null) if !matches!(b, Type::Null) => Type::Optional(Box::new(b)),
             (Type::Optional(a), Type::Optional(b)) => Type::Optional(Box::new(join(*a, *b))),
             (Type::Optional(a), b) | (b, Type::Optional(a)) => Type::Optional(Box::new(join(*a, b))),
-            (Type::Number, Type::Number | Type::Integer(..)) | (Type::Integer(..), Type::Number) => Type::Number,
+            (Type::Number, Type::Number | Type::Real(..) | Type::Integer(..))
+            | (Type::Real(..) | Type::Integer(..), Type::Number) => Type::Number,
+            (a @ (Type::Real(..) | Type::Integer(..)), b @ Type::Real(..)) | (a @ Type::Real(..), b @ Type::Integer(..)) => {
+                let ((a, b), (c, d)) = (span(&a).unwrap(), span(&b).unwrap());
+                Type::Real(a.min(c), b.max(d))
+            }
             (Type::Bool, Type::Bool) => Type::Bool,
             (Type::String, Type::String) => Type::String,
             (Type::Null, Type::Null) => Type::Null,
@@ -4743,6 +7976,26 @@ mod native {
                     .filter_map(|(k, v)| b.get(&k).map(|w| (k, join(v, w.clone()))))
                     .collect(),
             ),
+            // lists written alike are alike item by item, and otherwise a list of what either holds
+            (Type::Array(a), Type::Array(b))
+                if a.len() == b.len() && !a.iter().chain(&b).any(|item| matches!(item, Type::Rest(_))) =>
+            {
+                Type::Array(a.into_iter().zip(b).map(|(a, b)| join(a, b)).collect())
+            }
+            (a @ (Type::Array(_) | Type::List(_)), b @ (Type::Array(_) | Type::List(_)))
+                if materialized(&a) && materialized(&b) =>
+            {
+                let item = |list: Type| match list {
+                    Type::Array(items) => items.into_iter().map(one).reduce(join),
+                    Type::List(item) => Some(*item),
+                    _ => None,
+                };
+                match (item(a), item(b)) {
+                    (Some(a), Some(b)) => Type::List(Box::new(join(a, b))),
+                    (Some(item), None) | (None, Some(item)) => Type::List(Box::new(item)),
+                    (None, None) => Type::Array(vec![]),
+                }
+            }
             (a, b) if materialized(&a) && materialized(&b) => Type::Value,
             _ => Type::Unknown,
         }
@@ -4770,6 +8023,61 @@ mod expressions {
             )
         };
         Ok(match func {
+            Func::ForkPick(branches) => Expr::call(
+                "_fork_pick",
+                vec![
+                    Expr::Array(
+                        branches
+                            .iter()
+                            .map(|branch| Ok(Expr::Array(branch.iter().map(expr).collect::<Result<_, String>>()?)))
+                            .collect::<Result<_, String>>()?,
+                    ),
+                    random(),
+                ],
+            ),
+            Func::Arrivals { ready } => call("_require_arrivals", &[ready])?,
+            Func::Fold { items, initial, combine } => Expr::call(
+                "_fold",
+                vec![
+                    expr(items)?,
+                    expr(initial)?,
+                    Expr::Lambda {
+                        parameters: vec![code::Parameter::new("accumulator"), code::Parameter::new("arrival")],
+                        value: Box::new(expr(combine)?),
+                    },
+                ],
+            ),
+            Func::FoldAccumulator => "accumulator".into(),
+            Func::FoldArrival => "arrival".into(),
+            Func::Emissions(join) => {
+                let optional =
+                    |value: &Option<Value>| Ok::<_, String>(value.as_ref().map(expr).transpose()?.unwrap_or(Expr::Null));
+                let inputs = (join.inputs.iter())
+                    .map(|input| {
+                        Ok(Expr::Object(vec![
+                            ("edge".into(), expr(&input.edge)?),
+                            ("arrived".into(), optional(&input.arrived)?),
+                            ("value".into(), optional(&input.value)?),
+                            ("shared".into(), Expr::Bool(input.shared)),
+                        ]))
+                    })
+                    .collect::<Result<_, String>>()?;
+                Expr::call(
+                    "_emissions",
+                    vec![
+                        Expr::string(format!("{:?}", join.kind).to_lowercase()),
+                        Expr::Array(inputs),
+                        Expr::Array(join.order.iter().map(Expr::number).collect()),
+                        optional(&join.rounds)?,
+                        optional(&join.keys)?,
+                        optional(&join.count)?,
+                    ],
+                )
+            }
+            Func::Check { value, ty } => Expr::call(
+                "_check_type",
+                vec![expr(value)?, Expr::string(format!("{ty:?}").to_lowercase())],
+            ),
             Func::Len { target } => call("_len", &[target])?,
             Func::Upper { text } => call("_upper", &[text])?,
             Func::Lower { text } => call("_lower", &[text])?,
@@ -4780,24 +8088,24 @@ mod expressions {
             Func::Render { template, values } => call("_render", &[template, values])?,
             Func::Compose { array, separator } => call("_compose", &[array, separator])?,
             Func::Sample { array, count } => Expr::call("_sample_items", vec![expr(array)?, expr(count)?, random()]),
-            Func::English { operation, args } => Expr::call(
-                "_english",
-                vec![
-                    Expr::string(operation.as_str()),
-                    Expr::Array(args.iter().map(expr).collect::<Result<_, _>>()?),
-                    random(),
-                ],
-            ),
             Func::Contains { target, needle } => call("_contains", &[target, needle])?,
             Func::StartsWith { text, prefix } => call("_starts_with", &[text, prefix])?,
             Func::EndsWith { text, suffix } => call("_ends_with", &[text, suffix])?,
             Func::Format { pieces, args } => {
-                let mut parts = vec![Expr::string(&pieces[0])];
-                for (value, piece) in args.iter().zip(&pieces[1..]) {
-                    parts.push(Expr::call("_text", vec![expr(value)?]));
-                    parts.push(Expr::string(piece));
+                // an empty piece adds nothing to the text
+                let mut parts = vec![];
+                for (i, piece) in pieces.iter().enumerate() {
+                    if !piece.is_empty() {
+                        parts.push(Expr::string(piece));
+                    }
+                    if let Some(value) = args.get(i) {
+                        parts.push(Expr::call("_text", vec![expr(value)?]));
+                    }
                 }
-                parts.into_iter().reduce(|a, b| a.binary(BinOp::Add, b)).unwrap()
+                parts
+                    .into_iter()
+                    .reduce(|a, b| a.binary(BinOp::Add, b))
+                    .unwrap_or_else(|| Expr::string(""))
             }
             Func::Clamp { value, min, max } => call("_clamp", &[value, min, max])?,
             Func::Round { value } => call("_round", &[value])?,
@@ -4858,9 +8166,20 @@ mod expressions {
                     random(),
                 ],
             ),
-            Func::Noise { size } => Expr::call("_noise", vec![expr(size)?, random()]),
-            Func::Tokens { value } => call("_tokens", &[value])?,
-            Func::Attachment { .. } => return Err("attachment packaging is not supported by agent generation".into()),
+            Func::Provider { function, args } => {
+                let helper = function
+                    .helper(lang)
+                    .ok_or_else(|| format!("function `{}` is not supported by agent generation", function.name))?;
+                let mut args = args.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
+                // a helper that serves several functions takes the operation and the arguments as one list
+                if let Some(operation) = helper.operation {
+                    args = vec![Expr::string(operation), Expr::Array(args)];
+                }
+                if helper.random {
+                    args.push(random());
+                }
+                Expr::call(helper.name, args)
+            }
         })
     }
 }
@@ -4912,6 +8231,8 @@ pub(crate) mod scoring {
         pub imports: BTreeSet<&'static str>,
         pub helpers: BTreeSet<Helper>,
         pub next_loop: usize,
+        // calls to provider functions, none of which scorer code can run
+        pub unsupported: bts_lang::Diags,
         loops: Vec<(String, String)>,
     }
     impl Compiler {
@@ -4921,6 +8242,7 @@ pub(crate) mod scoring {
                 imports: BTreeSet::new(),
                 helpers: BTreeSet::new(),
                 next_loop: 0,
+                unsupported: vec![],
                 loops: vec![],
             }
         }
@@ -5047,11 +8369,49 @@ pub(crate) mod scoring {
                         _ => return Err(Error::Unsupported { what: "trace.index" }),
                     })
                 }
+                // the call is reported with its location and the rest of the scorer is still checked
+                Value::Func {
+                    func: Func::Provider { function, .. },
+                    range,
+                } if !function.runs(crate::mocking::Consumer::Scorer) => {
+                    let diag = super::unsupported_call(function, crate::mocking::Consumer::Scorer, *range);
+                    self.unsupported.push(diag);
+                    Expr::Null
+                }
                 Value::Func { func, .. } => self.func(func)?,
                 Value::Unary { op, operand, .. } => Expr::Unary {
                     op: *op,
                     value: Box::new(self.lower(operand)?),
                 },
+                // two integers divide to an integer, dropping the remainder toward zero
+                Value::Binary {
+                    op: BinOp::Div,
+                    lhs,
+                    rhs,
+                    ..
+                } if integer(lhs) && integer(rhs) => {
+                    let quotient = self.lower(lhs)?.binary(BinOp::Div, self.lower(rhs)?);
+                    if self.lang == ScorerLang::Python {
+                        Expr::call("int", vec![quotient])
+                    } else {
+                        Expr::call(Expr::from("Math").member("trunc"), vec![quotient])
+                    }
+                }
+                // a remainder takes the sign of what is divided, which python gives only when neither side is negative
+                Value::Binary {
+                    op: BinOp::Rem,
+                    lhs,
+                    rhs,
+                    ..
+                } if self.lang == ScorerLang::Python
+                    && integer(lhs)
+                    && integer(rhs)
+                    && !(non_negative(lhs) && non_negative(rhs)) =>
+                {
+                    self.imports.insert("math");
+                    let remainder = Expr::call(Expr::from("math").member("fmod"), vec![self.lower(lhs)?, self.lower(rhs)?]);
+                    Expr::call("int", vec![remainder])
+                }
                 Value::Binary { op, lhs, rhs, .. } => self.lower(lhs)?.binary(*op, self.lower(rhs)?),
                 Value::Cond { cond, then, otherwise } => Expr::Conditional {
                     condition: Box::new(self.lower(cond)?),
@@ -5280,6 +8640,17 @@ pub(crate) mod scoring {
                 }
             };
             Ok(match func {
+                Func::Check { .. }
+                | Func::Arrivals { .. }
+                | Func::Fold { .. }
+                | Func::FoldAccumulator
+                | Func::FoldArrival
+                | Func::Emissions(_)
+                | Func::ForkPick(_) => {
+                    return Err(Error::Unsupported {
+                        what: "runtime schema checks",
+                    });
+                }
                 Func::Choice(options) => {
                     let args = vec![Expr::Array(options.iter().map(|v| self.lower(v)).collect::<Result<_, _>>()?)];
                     if python {
@@ -5450,23 +8821,6 @@ pub(crate) mod scoring {
                         vec![self.lower(array)?, self.language_value(count)?, random],
                     )
                 }
-                Func::English { operation, args } => {
-                    self.helpers.insert(Helper::English);
-                    let random = if python {
-                        self.imports.insert("random");
-                        Expr::from("random").member("random")
-                    } else {
-                        Expr::from("Math").member("random")
-                    };
-                    Expr::call(
-                        "_language_english",
-                        vec![
-                            Expr::string(operation.as_str()),
-                            Expr::Array(args.iter().map(|arg| self.lower(arg)).collect::<Result<_, _>>()?),
-                            random,
-                        ],
-                    )
-                }
                 Func::Contains { target, needle } => {
                     Expr::Contains(Box::new(self.lower(needle)?), Box::new(self.lower(target)?))
                 }
@@ -5574,9 +8928,32 @@ pub(crate) mod scoring {
                         Expr::call(if hex { "randomHex" } else { "randomAlphanum" }, vec![Expr::number(length)])
                     }
                 }
-                Func::Attachment { .. } => return Err(Error::Unsupported { what: "`attachment`" }),
-                Func::Tokens { .. } => return Err(Error::Unsupported { what: "`tokens`" }),
-                Func::Noise { .. } => return Err(Error::Unsupported { what: "`noise`" }),
+                // the capability check reports a call a scorer cannot make first, with its location
+                Func::Provider { function, args } => {
+                    let lang = if python { ScorerLang::Python } else { ScorerLang::Typescript };
+                    let (Some(helper), Some(name)) = (function.helper(lang), function.scorer(lang)) else {
+                        return Err(Error::Unsupported {
+                            what: "a provider function",
+                        });
+                    };
+                    // a scorer file has no runtime module, so the text that defines the call comes along
+                    if let Some(runtime) = helper.runtime {
+                        self.helpers.insert(Helper::Runtime(runtime));
+                    }
+                    let mut args = args.iter().map(|arg| self.lower(arg)).collect::<Result<Vec<_>, _>>()?;
+                    if let Some(operation) = helper.operation {
+                        args = vec![Expr::string(operation), Expr::Array(args)];
+                    }
+                    if helper.random {
+                        args.push(if python {
+                            self.imports.insert("random");
+                            Expr::from("random").member("random")
+                        } else {
+                            Expr::from("Math").member("random")
+                        });
+                    }
+                    Expr::call(name, args)
+                }
             })
         }
     }
@@ -5587,7 +8964,8 @@ pub(crate) mod scoring {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
     pub(in crate::mocking::code) enum Helper {
         Language,
-        English,
+        // the text a provider's functions are defined in
+        Runtime(crate::mocking::Runtime),
         Normal,
         Gamma,
         Lognormal,
@@ -5609,6 +8987,15 @@ pub(crate) mod scoring {
         pub(crate) slug: &'m str,
         pub(crate) score: &'m Value,
         pub(crate) steps: &'m [ScorerStep],
+    }
+
+    // Every provider function call the scorers would emit, which scorer code cannot run.
+    pub(crate) fn unsupported(name: &str, steps: &[ScorerStep], score: &Value) -> bts_lang::Diags {
+        let mut compiler = Compiler::new(ScorerLang::Python);
+        // a failure for another reason is reported when the module is emitted
+        let _ = compiler.steps(steps, name);
+        let _ = compiler.lower(score);
+        compiler.unsupported
     }
 
     // Render named scorer functions with their shared imports and helpers.
@@ -5636,6 +9023,58 @@ pub(crate) mod scoring {
     }
 
     // {:?} keeps a trailing .0 on whole floats, valid in both languages
+    // whether a value is an integer wherever it is computed, as far as the shape alone says
+    fn integer(value: &Value) -> bool {
+        match value {
+            Value::Num(Number::Int(_)) => true,
+            Value::CtxRef(CtxRef::RepeatIndex | CtxRef::RepeatCount) => true,
+            Value::Unary {
+                op: crate::dsl::UnaryOp::Neg,
+                operand,
+                ..
+            } => integer(operand),
+            Value::Binary { op, lhs, rhs, .. } => {
+                matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) && integer(lhs) && integer(rhs)
+            }
+            Value::Cond { then, otherwise, .. } => integer(then) && integer(otherwise),
+            Value::Func { func, .. } => match func {
+                Func::Len { .. }
+                | Func::Poisson { .. }
+                | Func::Round { .. }
+                | Func::Floor { .. }
+                | Func::Ceil { .. }
+                | Func::Range(Range::Int { .. }) => true,
+                Func::Abs { value } => integer(value),
+                Func::Clamp { value, min, max } => integer(value) && integer(min) && integer(max),
+                Func::Min(values) | Func::Max(values) | Func::Choice(values) => values.iter().all(integer),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    // whether an integer is sure not to be negative
+    fn non_negative(value: &Value) -> bool {
+        match value {
+            Value::Num(Number::Int(value)) => *value >= 0,
+            Value::CtxRef(CtxRef::RepeatIndex | CtxRef::RepeatCount) => true,
+            Value::Binary { op, lhs, rhs, .. } => match op {
+                BinOp::Add | BinOp::Mul | BinOp::Div => non_negative(lhs) && non_negative(rhs),
+                BinOp::Rem => non_negative(lhs),
+                _ => false,
+            },
+            Value::Cond { then, otherwise, .. } => non_negative(then) && non_negative(otherwise),
+            Value::Func { func, .. } => match func {
+                Func::Len { .. } | Func::Poisson { .. } | Func::Abs { .. } => true,
+                Func::Range(Range::Int { min, .. }) => *min >= 0,
+                Func::Clamp { min, .. } => non_negative(min),
+                Func::Min(values) | Func::Choice(values) => values.iter().all(non_negative),
+                Func::Max(values) => values.iter().any(non_negative),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     pub(in crate::mocking::code) fn num(number: &Number) -> String {
         match number {
             Number::Int(value) => value.to_string(),

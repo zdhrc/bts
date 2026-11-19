@@ -5,7 +5,9 @@ use std::ops::Range;
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
 
-use super::{Analysis, ConditionPosition, Error, Form, NegationStyle, Polarity, RealizeOptions, Sentence, analyze, realize};
+use super::{
+    Analysis, ConditionPosition, Error, Form, NegationStyle, Polarity, RealizeOptions, Sentence, Verb, analyze, realize,
+};
 
 /// Enables independent transformations. Disabled controls leave wording alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -216,6 +218,36 @@ struct Conditional<'a> {
     before: bool,
 }
 
+// whether a word is followed by a question put with `if`, as in checking if it works
+fn asks(word: &str) -> bool {
+    const ASKING: &[&str] = &[
+        "ask",
+        "check",
+        "confirm",
+        "decide",
+        "determine",
+        "doubt",
+        "know",
+        "remember",
+        "see",
+        "test",
+        "verify",
+        "wonder",
+    ];
+    let word = word.to_lowercase();
+    matches!(word.as_str(), "sure" | "unsure" | "clear" | "unclear" | "idea" | "out")
+        || ASKING.iter().filter_map(|base| Verb::lookup(base)).any(|verb| {
+            [
+                &verb.base,
+                &verb.third_person_singular,
+                &verb.past,
+                &verb.past_participle,
+                &verb.present_participle,
+            ]
+            .contains(&&word)
+        })
+}
+
 impl<'a> Conditional<'a> {
     fn parse(source: &'a str) -> Option<Self> {
         let trimmed = source.trim();
@@ -239,6 +271,10 @@ impl<'a> Conditional<'a> {
             } else {
                 let (main, condition) = body.split_once(" if ")?;
                 if main.is_empty() || condition.is_empty() || main.contains(',') || condition.contains(',') {
+                    return None;
+                }
+                // after a word that asks, `if` means whether, and the clause is what is asked, not a condition
+                if main.rsplit(' ').next().is_some_and(asks) {
                     return None;
                 }
                 (condition, main, leading + main.len() + 4, leading, false)
@@ -393,7 +429,9 @@ pub struct PhraseAlternatives {
 /// Opt-in variation controls. These do not change the legacy VariationOptions API.
 ///
 /// Probability gates wording, tone and presentation once per message. After that
-/// gate, eligible nonoverlapping edits are selected up to max_changes. A preset
+/// gate, eligible nonoverlapping edits are selected up to max_changes. Casing and
+/// closing punctuation are not counted among them: when a style sets them and
+/// max_changes is not zero, every such edit applies, without a draw. A preset
 /// supplies defaults, then explicit fields override them. Typos are always off
 /// unless enabled separately. Unknown names are not inferred from arbitrary prose.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -848,10 +886,28 @@ fn sentence_start(text: &str, start: usize) -> bool {
         .is_none_or(|c| matches!(c, '.' | '!' | '?' | '\n'))
 }
 
-fn style_candidates(text: &str, options: &StyleOptions) -> Vec<StyleEdit> {
+// The terms casing leaves alone. A term protected with a capital only because a sentence
+// starts with it was written in lowercase, so lowering it gives back what was written.
+fn casing_terms(terms: &[String]) -> Vec<String> {
+    (terms.iter())
+        .filter(|term| {
+            let mut lowered = (*term).clone();
+            if let Some(first) = lowered.get_mut(..1) {
+                first.make_ascii_lowercase();
+            }
+            lowered == **term || !terms.contains(&lowered)
+        })
+        .cloned()
+        .collect()
+}
+
+// `realized` says the text is a sentence the provider put into words, so a capital at its start is its own
+fn style_candidates(text: &str, options: &StyleOptions, realized: bool) -> Vec<StyleEdit> {
     let protected = super::text::protected_ranges(text, &options.protected);
+    let cased = super::text::protected_ranges(text, &casing_terms(&options.protected));
     let mut edits = Vec::new();
     let mut push = |rule: String, range: Range<usize>, replacement: String, stage| {
+        let protected = if rule == "casing:lowercase" { &cased } else { &protected };
         if text[range.clone()] != replacement && !protected.iter().any(|p| overlaps(p, &range)) {
             edits.push(StyleEdit {
                 rule,
@@ -989,6 +1045,31 @@ fn style_candidates(text: &str, options: &StyleOptions) -> Vec<StyleEdit> {
             _ => {}
         }
     }
+    if options.casing == Some(CasingStyle::Lowercase) && realized {
+        // A sentence loses the capital it starts with when its first word is an ordinary one:
+        // a capital and then lowercase letters, which is what realization writes. In text
+        // handed over as written a name cannot be told from a word, so it is left alone.
+        let mut offset = 0;
+        let mut previous = "";
+        for token in text.split_whitespace() {
+            let start = offset + text[offset..].find(token).unwrap();
+            offset = start + token.len();
+            let core = token.trim_end_matches(['.', ',', '!', '?', ';', ')', ']']);
+            let ordinary = core.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+                && core.bytes().skip(1).all(|byte| byte.is_ascii_lowercase());
+            let abbreviated = (previous.strip_suffix('.'))
+                .is_some_and(|word| STYLE_ABBREVIATIONS.contains(&word.to_ascii_lowercase().as_str()));
+            if ordinary && !abbreviated && sentence_start(text, start) {
+                push(
+                    "casing:lowercase".into(),
+                    start..start + core.len(),
+                    core.to_ascii_lowercase(),
+                    3,
+                );
+            }
+            previous = token;
+        }
+    }
     if options.casing == Some(CasingStyle::Lowercase) {
         for &pronoun in STYLE_CONTRACTIONS {
             for (start, _) in text.match_indices(pronoun) {
@@ -1061,27 +1142,36 @@ fn style_candidates(text: &str, options: &StyleOptions) -> Vec<StyleEdit> {
 
 /// Inspects currently eligible edits without consuming randomness or expanding combinations.
 pub fn style_edits(text: &str, options: &StyleOptions) -> Result<Vec<StyleEdit>, Error> {
-    Ok(style_candidates(text, &options.resolved()?))
+    Ok(style_candidates(text, &options.resolved()?, false))
 }
 
 /// Applies bounded style edits and returns an explanation of every applied change.
 /// No draw is consumed for disabled gates, certain gates or a sole candidate.
 pub fn vary_styled<R: Rng + ?Sized>(text: &str, options: &StyleOptions, rng: &mut R) -> Result<StyleResult, Error> {
-    vary_styled_with(text, options, || rng.random::<f64>())
+    vary_styled_with(text, options, false, || rng.random::<f64>())
 }
 
-fn vary_styled_with(text: &str, options: &StyleOptions, mut random: impl FnMut() -> f64) -> Result<StyleResult, Error> {
+fn vary_styled_with(
+    text: &str,
+    options: &StyleOptions,
+    realized: bool,
+    mut random: impl FnMut() -> f64,
+) -> Result<StyleResult, Error> {
     let options = options.resolved()?;
     let mut result = StyleResult {
         text: text.into(),
         edits: vec![],
     };
     let mut budget = options.max_changes as usize;
+    if budget == 0 {
+        return Ok(result);
+    }
     for stage in 0..=4 {
-        if budget == 0 {
-            break;
+        // casing and closing punctuation belong to the style, so they are not counted among the changes
+        if budget == 0 && stage != 3 {
+            continue;
         }
-        let mut candidates: Vec<_> = style_candidates(&result.text, &options)
+        let mut candidates: Vec<_> = style_candidates(&result.text, &options, realized)
             .into_iter()
             .filter(|e| e.stage == stage)
             .collect();
@@ -1097,6 +1187,14 @@ fn vary_styled_with(text: &str, options: &StyleOptions, mut random: impl FnMut()
         }
         if stage == 4 {
             return apply_typos(result, &options, budget, &mut random);
+        }
+        // every one applies, in the order written, without a draw
+        if stage == 3 {
+            while !candidates.is_empty() {
+                let edit = candidates.remove(0);
+                apply_style_edit(&mut result, &mut candidates, edit);
+            }
+            continue;
         }
         while budget > 0 && !candidates.is_empty() {
             let index = if candidates.len() == 1 {
@@ -1118,7 +1216,7 @@ fn apply_typos(
     budget: usize,
     random: &mut impl FnMut() -> f64,
 ) -> Result<StyleResult, Error> {
-    let mut candidates: Vec<_> = style_candidates(&result.text, options)
+    let mut candidates: Vec<_> = style_candidates(&result.text, options, false)
         .into_iter()
         .filter(|e| e.stage == 4)
         .collect();
@@ -1168,7 +1266,7 @@ pub fn vary_sentence_styled<R: Rng + ?Sized>(
             options.protected.push(style_case("A", &subject.text));
         }
     }
-    vary_styled(&text, &options, rng)
+    vary_styled_with(&text, &options, true, || rng.random::<f64>())
 }
 
 /// An authored greeting or closing and its relative selection weight.
@@ -1250,7 +1348,7 @@ mod tests {
     use rand_xoshiro::Xoshiro256PlusPlus;
 
     use super::*;
-    use crate::english::{Aspect, Clause, Condition, Modal, Number, Person, Predicate, Subject, Tense, Verb};
+    use crate::providers::world::english::{Aspect, Clause, Condition, Modal, Number, Person, Predicate, Subject, Tense, Verb};
 
     fn sentence() -> Sentence {
         let subject = Subject {

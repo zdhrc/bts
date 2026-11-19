@@ -1,51 +1,57 @@
-# dataset cases can use inline input, field values, a whole trace, or a nested span
-vars { support = trace["support-lookup"] }
-trace "support-lookup" {
-    input = { question = "Where can I download my invoices?" }
-    output = task["answer-request"].output
+# cases reuse whole traces, individual spans or authored field values
+("support-lookup_agent":agent {name: "support-lookup"}) {input: {question: "Where can I download my invoices?"}, output: ("support-lookup").output};
 
-    task "answer-request" {
-        input = trace.input
-        output = llm["draft-answer"].output.content
+("support-lookup_agent")-|:next|->("support-lookup");
+("support-lookup":task) {
+    input: ("support-lookup_agent").input,
+    output: ("answer-request").output
+};
 
-        tool "search-kb" {
-            input = { query = trace.input.question }
-            output = { article = "Billing > Invoices", url = "/billing/invoices" }
-        }
+("support-lookup")-|:calls|->("answer-request");
+("answer-request":task) {
+    input: ("support-lookup").input,
+    output: ("draft-answer").output.content
+};
 
-        llm "draft-answer" {
-            input = { question = trace.input.question, article = tool["search-kb"].output.article }
-            output = { role = "assistant", content = "Download invoices from Billing > Invoices." }
-        }
-    }
-}
+("answer-request")-|:calls|->("search-kb");
+("search-kb":tool) {
+    input: {query: ("support-lookup").input.question},
+    output: {article: "Billing > Invoices", url: "/billing/invoices"}
+};
 
-dataset "support-regressions" {
-    description = "Billing support examples from authored inputs and trace spans"
+("search-kb")-|:next|->("draft-answer");
+("draft-answer":llm) {
+    input: {question: ("support-lookup").input.question, article: ("search-kb").output.article},
+    output: {role: "assistant", content: "Download invoices from Billing > Invoices."}
+};
 
-    case "inline" {
-        input = { question = "Can I export my invoices?" }
-        expected = "Export invoices from Billing > Invoices."
-        metadata = { topic = "invoices", source = "authored" }
-        tags = ["billing", "inline"]
-    }
+("support-regressions":dataset) {
+    description: "Billing support examples from authored inputs and trace spans",
+    cases: [(inline), ("whole-trace"), ("field-values"), (search), (answer)]
+};
 
-    case "whole-trace" {
-        trace = trace["support-lookup"]
-        tags = ["billing", "trace"]
-    }
+(inline:case) {
+    input: {question: "Can I export my invoices?"},
+    expected: "Export invoices from Billing > Invoices.",
+    metadata: {topic: "invoices", source: "authored"},
+    tags: ["billing", "inline"]
+};
 
-    case "field-values" {
-        input = var.support.input
-        expected = var.support.output
-        tags = ["billing", "fields"]
-    }
+("whole-trace":case) {
+    tags: ["billing", "trace"],
+    source: ("support-lookup")
+};
 
-    case "search" {
-        span = trace["support-lookup"].task["answer-request"].tool["search-kb"]
-    }
+("field-values":case) {
+    input: ("support-lookup").input,
+    expected: ("support-lookup").output,
+    tags: ["billing", "fields"]
+};
 
-    case "answer" {
-        span = trace["support-lookup"].task["answer-request"].llm["draft-answer"]
-    }
-}
+(search:case) {
+    source: ("search-kb")
+};
+
+(answer:case) {
+    source: ("draft-answer")
+};

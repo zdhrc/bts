@@ -22,8 +22,9 @@ pub enum Number {
 
 /// An authored subject with explicit agreement features.
 ///
-/// Author proper names and identifiers with their intended casing. Only known
-/// grammatical words such as `the` and `they` are capitalized at sentence start.
+/// Author proper names and identifiers with their intended casing. A first word
+/// made only of lowercase letters is capitalized at sentence start, and a word
+/// with a capital, a digit or other marks stays as authored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subject {

@@ -132,6 +132,12 @@ struct Case {
     span_path: Option<Vec<(String, String)>>,
     default_expected: bool,
 }
+/// The id of the row a case syncs to in a project.
+pub(super) fn row_id(project_id: &str, dataset: &str, case: &str) -> String {
+    data::stable_uuid(&format!("bts/dataset/{project_id}/{dataset}/{case}/row")).to_string()
+}
+/// The project a preview makes its row ids for.
+pub(super) const PREVIEW_PROJECT: &str = "preview";
 fn seed(key: &str) -> u64 {
     u64::from_le_bytes(data::stable_uuid(key).as_bytes()[..8].try_into().unwrap())
 }
@@ -149,9 +155,10 @@ fn prepare_for_project(
         .cases
         .iter()
         .map(|case| {
-            let row_id =
-                data::stable_uuid(&format!("bts/dataset/{}/{}/{}/row", project_id, dataset.name, case.name)).to_string();
-            let mut data = data::case_data(model, case, seed(&row_id), &braintrust_data::Format).map_err(Error::from)?;
+            let row_id = row_id(project_id, &dataset.name, &case.name);
+            // a case is drawn by its name, so its row reads the same in every project and in a preview
+            let case_key = format!("bts/dataset/{}/{}", dataset.name, case.name);
+            let mut data = data::case_data(model, case, seed(&case_key), &braintrust_data::Format).map_err(Error::from)?;
             data.resolve_attachment_paths(path).map_err(Error::from)?;
             let mut row =
                 serde_json::to_value(braintrust_data::Format.encode(&data).map_err(Error::Format)?)?["events"][0]["input"]
@@ -185,10 +192,10 @@ fn prepare_for_project(
                     .iter()
                     .find(|trace| trace.node == root_node)
                     .ok_or_else(|| invalid("source trace not found"))?;
-                let source_key = if matches!(case.source, DatasetSource::Group(_)) {
-                    format!("{row_id}/group/{index}")
+                let (source_key, source_seed) = if matches!(case.source, DatasetSource::Group(_)) {
+                    (format!("{row_id}/group/{index}"), seed(&format!("{case_key}/group/{index}")))
                 } else {
-                    row_id.clone()
+                    (row_id.clone(), seed(&case_key))
                 };
                 let filter: WriteFilter = format!(
                     "block.kind != \"trace\" || block.name == {}",
@@ -202,7 +209,7 @@ fn prepare_for_project(
                     Duration::from_secs(3600),
                     data::Distribution::Linear,
                     now,
-                    seed(&source_key),
+                    source_seed,
                     &filter,
                     &braintrust_data::Format,
                 )
@@ -698,9 +705,9 @@ pub fn fetch_snapshot(client: &Client, id: &str) -> Result<(Option<String>, Hash
 /// `dataset` must belong to the compiled `model`. Relative attachment paths are
 /// resolved against `path`, and source traces use the supplied clock value.
 pub fn preview_rows(dataset: &Dataset, model: &Model, path: &Path, now: SystemTime) -> Result<Vec<Value>, Error> {
-    let mut cases = prepare_for_project(dataset, model, "preview", path, now)?;
+    let mut cases = prepare_for_project(dataset, model, PREVIEW_PROJECT, path, now)?;
     for case in &mut cases {
-        finish_row_for_project(case, "preview")?;
+        finish_row_for_project(case, PREVIEW_PROJECT)?;
     }
     Ok(cases.into_iter().map(|case| case.row).collect())
 }
@@ -1121,8 +1128,12 @@ mod tests {
     #[test]
     fn grouped_sources_keep_order_and_have_distinct_native_trace_references() {
         let config = Braintrust::new("test".to_owned(), uuid::Uuid::nil());
-        let model = dsl::semantics::compile(
-            r#"trace "one" { input = "question" } dataset "cases" { case "group" { traces = [trace["one"], trace["one"]] } }"#,
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(one_root:task {name: "one"}) {input: one.input};
+(one:agent) {input: "question", output: null};
+(one)-|:next|->(one_root);
+(dataset_cases_group:case {name: "group"}) {traces: [(one_root) , (one_root)]};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_group)]};"#,
         )
         .unwrap();
         let mut plans = prepare(
@@ -1145,7 +1156,11 @@ mod tests {
         assert_ne!(refs[0]["trace_ref"]["root_span_id"], refs[1]["trace_ref"]["root_span_id"]);
     }
     fn inline_plan(client: &Client) -> (Dataset, Vec<Case>) {
-        let model = dsl::semantics::compile(r#"dataset "cases" { case "one" { input = "new" } }"#).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(dataset_cases_one:case {name: "one"}) {input: "new"};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};"#,
+        )
+        .unwrap();
         let plans = prepare(
             &model.datasets[0],
             &model,
@@ -1227,8 +1242,14 @@ mod tests {
 
     #[test]
     fn failed_enrichment_repairs_do_not_delete_their_authored_parents() {
-        let model =
-            dsl::semantics::compile(r#"trace "one" {} dataset "cases" { case "one" { trace = trace["one"] } }"#).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(one_root:task {name: "one"}) {input: one.input};
+(one:agent) {input: null, output: null};
+(one)-|:next|->(one_root);
+(dataset_cases_one:case {name: "one"}) {source: (one_root)};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};"#,
+        )
+        .unwrap();
         let config = Braintrust::new("test".to_owned(), uuid::Uuid::nil());
         let mut plans = prepare(
             &model.datasets[0],

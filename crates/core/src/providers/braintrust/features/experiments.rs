@@ -80,6 +80,8 @@ fn invalid(message: impl Into<String>) -> Error {
 
 struct Snapshot {
     id: String,
+    // the project its row ids were made for, which is how a row is traced back to its case
+    project: String,
     version: Option<String>,
     rows: Vec<Value>,
 }
@@ -128,6 +130,7 @@ pub fn preview(model: &Model, selectors: &[ResourceSelector], path: &Path, seed:
                 experiment.dataset.clone(),
                 Snapshot {
                     id: experiment.dataset.clone(),
+                    project: datasets::PREVIEW_PROJECT.to_owned(),
                     version: None,
                     rows: datasets::preview_rows(dataset, model, path, now).map_err(Error::from)?,
                 },
@@ -334,11 +337,10 @@ fn dependencies(client: &Client, model: &Model, selected: &[&Experiment]) -> Res
         let dataset = lookup(client, "dataset", &experiment.dataset, "dataset_name", &experiment.dataset)?;
         let id = dataset["id"].as_str().unwrap().to_owned();
         let (version, rows) = datasets::fetch_snapshot(client, &id).map_err(Error::from)?;
-        let mut rows = rows
+        let rows = rows
             .into_values()
             .filter(|row| row["_object_delete"] != true)
             .collect::<Vec<_>>();
-        rows.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
         if rows.is_empty() {
             return Err(invalid(format!("dataset {:?} has no rows", experiment.dataset)));
         }
@@ -348,7 +350,16 @@ fn dependencies(client: &Client, model: &Model, selected: &[&Experiment]) -> Res
                 experiment.dataset
             )));
         }
-        snapshots.insert(experiment.dataset.clone(), Snapshot { id, version, rows });
+        let project = client.config().project_id.to_string();
+        snapshots.insert(
+            experiment.dataset.clone(),
+            Snapshot {
+                id,
+                project,
+                version,
+                rows,
+            },
+        );
     }
     Ok(Dependencies { snapshots, functions })
 }
@@ -369,8 +380,28 @@ fn prepare<'a>(
             if snapshot.rows.is_empty() {
                 return Err(invalid(format!("dataset {:?} has no cases", experiment.dataset)));
             }
+            // a row is the case that syncs to its id, and a row no case syncs to was added to the dataset by hand
+            let declared = (model.datasets.iter())
+                .find(|dataset| dataset.name == experiment.dataset)
+                .map(|dataset| {
+                    (dataset.cases.iter().enumerate())
+                        .map(|(position, case)| {
+                            let id = datasets::row_id(&snapshot.project, &dataset.name, &case.name);
+                            (id, (position, case.name.as_str()))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            // cases come in the order declared and other rows after them by id, so a preview and a write place a row alike
+            let mut rows = (snapshot.rows.iter())
+                .map(|row| (declared.get(row["id"].as_str().unwrap_or("")).copied(), row))
+                .collect::<Vec<_>>();
+            rows.sort_by(|(left_case, left), (right_case, right)| {
+                let place = |case: &Option<(usize, &str)>| case.map_or((true, 0), |(position, _)| (false, position));
+                (place(left_case), left["id"].as_str()).cmp(&(place(right_case), right["id"].as_str()))
+            });
             let mut results = Vec::new();
-            for (index, row) in snapshot.rows.iter().enumerate() {
+            for (index, (case, row)) in rows.into_iter().enumerate() {
                 if row.get("input").is_none() {
                     return Err(invalid(format!("dataset row {} has no input", row["id"])));
                 }
@@ -383,14 +414,12 @@ fn prepare<'a>(
                 {
                     return Err(invalid(format!("dataset row {} has invalid metadata or tags", row["id"])));
                 }
-                // stable row identity keeps generation independent of selectors and pagination order
-                let row_seed = seed
-                    ^ u64::from_le_bytes(
-                        data::stable_uuid(&format!("{}/{}", experiment.dataset, row["id"].as_str().unwrap_or(""))).as_bytes()
-                            [..8]
-                            .try_into()
-                            .unwrap(),
-                    );
+                // a row is drawn by the name of its case, which a preview and a synced dataset share, and otherwise by its id
+                let identity = match case {
+                    Some((_, name)) => format!("{}/case/{name}", experiment.dataset),
+                    None => format!("{}/{}", experiment.dataset, row["id"].as_str().unwrap_or("")),
+                };
+                let row_seed = seed ^ u64::from_le_bytes(data::stable_uuid(&identity).as_bytes()[..8].try_into().unwrap());
                 let mut batch =
                     data::experiment_result(model, experiment.task, row, index, row_seed, now, &braintrust_data::Format)
                         .map_err(|error| Error::Context {
@@ -628,17 +657,19 @@ impl From<String> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl;
     use crate::providers::braintrust::client::tests::{Reply, serve};
 
-    const SOURCE: &str = r#"
-        trace "old" { input = "fallback" output = "wrong" }
-        trace "new" { input = "fallback" output = trace.input }
-        dataset "cases" { case "local" { input = "local value" } }
-        scorer "quality" { code { score = input == output ? 1 : 0 } }
-        experiment "fixed" { dataset = dataset.cases task = trace.new scorers = [scorer.quality] baseline = experiment.baseline }
-        experiment "baseline" { dataset = dataset.cases task = trace.old scorers = [scorer.quality] }
-    "#;
+    const SOURCE: &str = r#"(old_root:task {name: "old"}) {input: old.input, output: "wrong"};
+(old:agent) {input: "fallback", output: old_root.output};
+(old)-|:next|->(old_root);
+(new_root:task {name: "new"}) {input: new.input, output: new_root.input};
+(new:agent) {input: "fallback", output: new_root.output};
+(new)-|:next|->(new_root);
+(dataset_cases_local:case {name: "local"}) {input: "local value"};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_local)]};
+("quality":scorer) {score: context.input == context.output ? 1 : 0};
+(experiment_fixed:experiment {name: "fixed"}) {dataset: (dataset_cases), task: (new_root), scorers: [("quality")], baseline: (experiment_baseline)};
+(experiment_baseline:experiment {name: "baseline"}) {dataset: (dataset_cases), task: (old_root), scorers: [("quality")]};"#;
 
     fn body(request: &str) -> Value {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
@@ -646,7 +677,7 @@ mod tests {
 
     #[test]
     fn selection_is_strict_and_orders_selected_baselines_first() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(
             &model,
             &["experiment.fixed".parse().unwrap(), "experiment.baseline".parse().unwrap()],
@@ -699,13 +730,14 @@ mod tests {
     #[test]
     fn reuses_attachment_uploads_across_cases_and_experiments() {
         let source = SOURCE
-            .replace("output = \"wrong\"", "output = attachment(\"photo.png\", \"image/png\")")
-            .replace("output = trace.input", "output = attachment(\"photo.png\", \"image/png\")");
-        let model = dsl::semantics::compile(&source).unwrap();
+            .replace("output: \"wrong\"", "output: attachment(\"photo.png\", \"image/png\")")
+            .replace("output: new_root.input", "output: attachment(\"photo.png\", \"image/png\")");
+        let model = crate::providers::braintrust::mocking::compile(&source).unwrap();
         let selected = select(&model, &[]).unwrap();
         let snapshots = HashMap::from([(
             "cases".to_owned(),
             Snapshot {
+                project: "project".to_owned(),
                 id: "dataset".to_owned(),
                 version: Some("10".to_owned()),
                 rows: vec![json!({"id":"one","input":"one"}), json!({"id":"two","input":"two"})],
@@ -725,11 +757,12 @@ mod tests {
 
     #[test]
     fn scorer_failure_prevents_experiment_creation() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(&model, &["experiment.baseline".parse().unwrap()]).unwrap();
         let snapshots = HashMap::from([(
             "cases".to_owned(),
             Snapshot {
+                project: "project".to_owned(),
                 id: "dataset".to_owned(),
                 version: Some("10".to_owned()),
                 rows: vec![json!({"id":"one","input":"one"})],
@@ -755,7 +788,7 @@ mod tests {
 
     #[test]
     fn invokes_scorers_and_uploads_linked_baseline_results_from_remote_rows() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(
             &model,
             &["experiment.fixed".parse().unwrap(), "experiment.baseline".parse().unwrap()],
@@ -806,8 +839,67 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_draws_what_a_write_draws_from_the_synced_rows() {
+        // the task samples and reads its place in the run, so a row drawn or placed differently would show
+        let source = r#"(root:task {name: "answer"}) {input: answer.input, output: {code: hex(8), place: context.trace_index, said: root.input}};
+(answer:agent) {input: "fallback", output: root.output};
+(answer)-|:next|->(root);
+(first:case {name: "first"}) {input: hex(6)};
+(second:case {name: "second"}) {input: hex(6)};
+(third:case {name: "third"}) {input: hex(6)};
+(cases:dataset {name: "cases"}) {cases: [(first), (second), (third)]};
+("quality":scorer) {score: 1};
+(run:experiment {name: "run"}) {dataset: (cases), task: (root), scorers: [("quality")]};"#;
+        let model = crate::providers::braintrust::mocking::compile(source).unwrap();
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7200);
+        let path = Path::new("shape.bt");
+        let preview = preview(&model, &[], path, 42, now).unwrap();
+        let previewed = preview["experiments"][0]["results"].as_array().unwrap();
+        // the rows as a project holds them: under its own ids, in the order of those ids, with one added by hand
+        let dataset = &model.datasets[0];
+        let mut rows = datasets::preview_rows(dataset, &model, path, now).unwrap();
+        for (row, case) in rows.iter_mut().zip(&dataset.cases) {
+            row["id"] = json!(datasets::row_id("project-1", &dataset.name, &case.name));
+        }
+        rows.push(json!({"id": "added-by-hand", "input": "typed in"}));
+        rows.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+        let snapshot = Snapshot {
+            id: "dataset".to_owned(),
+            project: "project-1".to_owned(),
+            version: Some("10".to_owned()),
+            rows,
+        };
+        let selected = select(&model, &[]).unwrap();
+        let snapshots = HashMap::from([("cases".to_owned(), snapshot)]);
+        let plans = prepare(&model, &selected, &snapshots, path, 42, now).unwrap();
+        let written = &plans[0].results;
+        assert_eq!(written.len(), 4);
+        // a span id is made new on every run, and everything else is drawn
+        let drawn = |events: &Value| {
+            let mut events = events.clone();
+            for event in events.as_array_mut().unwrap() {
+                for key in ["id", "span_id", "root_span_id", "span_parents"] {
+                    event.as_object_mut().unwrap().remove(key);
+                }
+            }
+            events
+        };
+        let mut codes = HashSet::new();
+        for (index, (written, previewed)) in written.iter().zip(previewed).enumerate() {
+            assert_eq!(drawn(&json!(written.events)), drawn(&previewed["events"]), "row {index}");
+            assert_eq!(written.events[0]["output"]["place"], index);
+            assert_eq!(written.events[0]["output"]["said"], written.row["input"]);
+            codes.insert(written.events[0]["output"]["code"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(codes.len(), 3);
+        // the row no case syncs to comes last and is drawn by its id
+        assert_eq!(written[3].row["id"], "added-by-hand");
+        assert_eq!(written[3].events[0]["output"]["place"], 3);
+    }
+
+    #[test]
     fn missing_deployed_scorer_fails_before_creating_any_experiment() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(&model, &[]).unwrap();
         let (client, requests) = serve(vec![Reply::json(json!({"objects":[]}))]);
         assert!(dependencies(&client, &model, &selected).is_err());
@@ -816,11 +908,12 @@ mod tests {
 
     #[test]
     fn failed_insert_reports_completed_and_incomplete_experiments() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(SOURCE).unwrap();
         let selected = select(&model, &[]).unwrap();
         let snapshots = HashMap::from([(
             "cases".to_owned(),
             Snapshot {
+                project: "project".to_owned(),
                 id: "dataset".to_owned(),
                 version: Some("10".to_owned()),
                 rows: vec![json!({"id":"one","input":"question","_xact_id":"10"})],

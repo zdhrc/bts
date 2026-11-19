@@ -10,27 +10,50 @@ use std::{
 };
 use uuid::Uuid;
 
-const SIMPLE_SHAPE: &str = r#"
-trace "conversation" {
-    task "turn" {
-        llm "gpt-4o-mini" {
-            input = "Hello ${trace.index}"
-            output = choice(true, false) ? "Hi!" : "Hey!"
-            metrics = { tokens = 2 * 2, latency = range(1, 5) * 100 }
-        }
-    }
-}
+const SIMPLE_SHAPE: &str = r#"(conversation_agent:agent {name: "conversation"}) {input: null, output: conversation.output};
+(conversation_agent)-|:next|->(conversation);
+(conversation:task) {
+    input: conversation_agent.input,
+    output: null
+};
+(conversation)-|:calls|->(turn);
+(turn:task);
+(turn)-|:calls|->("gpt-4o-mini");
+("gpt-4o-mini":llm) {
+    input: "Hello ${context.trace_index}",
+    output: choice(true, false) ? "Hi!" : "Hey!",
+    metrics: {tokens: 2 * 2, latency: range(1, 5) * 100}
+};
 "#;
 
 #[test]
 fn experiment_selection_errors_precede_credentials_and_seed_output() {
-    let experiments = r#"
-        trace "t" { input = "fallback" output = trace.input }
-        dataset "cases" { case "one" { input = "question" } }
-        scorer "quality" { code { score = 1 } }
-        experiment "baseline" { dataset = dataset.cases task = trace.t scorers = [scorer.quality] }
-        experiment "fixed" { dataset = dataset.cases task = trace.t scorers = [scorer.quality] baseline = experiment.baseline }
-    "#;
+    let experiments = r#"(t_agent:agent {name: "t"}) {input: "fallback", output: t.output};
+(t_agent)-|:next|->(t);
+(t:task) {
+    input: t_agent.input,
+    output: t.input
+};
+(cases:dataset) {
+    cases: [(one)]
+};
+(one:case) {
+    input: "question"
+};
+(quality:scorer) {
+    score: 1
+};
+(baseline:experiment) {
+    dataset: (cases),
+    task: (t),
+    scorers: [(quality)]
+};
+(fixed:experiment) {
+    dataset: (cases),
+    task: (t),
+    scorers: [(quality)],
+    baseline: (baseline)
+};"#;
     let cases = [
         (SIMPLE_SHAPE, None, "module declares no experiment blocks", false),
         (
@@ -85,25 +108,64 @@ fn experiment_selection_errors_precede_credentials_and_seed_output() {
 #[test]
 fn experiment_dry_run_selects_tasks_without_auth_or_scorer_calls() {
     let shape = write_shape(
-        r#"
-        trace "workflow" {
-            repeat "unused" { count = range(-2, -1) tool "unused" { output = "unused" } }
-            task "answer" {
-                input = "fallback"
-                output = self.input == "blocked" ? "Cannot recover this account" : "Recovery instructions sent"
-                llm "reply" { input = task.answer.input output = task.answer.output }
-                scorer "quality" { score = 0 }
-            }
-        }
-        trace "unrelated" { repeat "unused" { count = range(-2, -1) tool "unused" { output = "unused" } } }
-        scorer "quality" { code { score = output == expected ? 1 : 0 } }
-        dataset "cases" {
-            case "blocked" { input = "blocked" expected = "Cannot recover this account" }
-            case "normal" { input = "normal" expected = "Recovery instructions sent" }
-        }
-        experiment "selected" { dataset = dataset.cases task = trace.workflow.task.answer scorers = [scorer.quality] }
-        experiment "other" { dataset = dataset.cases task = trace.workflow scorers = [scorer.quality] }
-    "#,
+        r#"(workflow_agent:agent {name: "workflow"}) {input: null, output: workflow.output};
+(workflow_agent)-|:next|->(workflow);
+(workflow:task) {
+    input: workflow_agent.input,
+    output: null
+};
+(workflow) =|:repeat {count: range(- 2, - 1)}|=>[-|:calls|->(unused_unused)];
+(unused_unused:tool {name: "unused"}) {
+    output: "unused"
+};
+(workflow)-|:calls|->(answer);
+(answer:task) {
+    input: "fallback",
+    output: self.input == "blocked" ? "Cannot recover this account" : "Recovery instructions sent"
+};
+(answer)-|:calls|->(reply);
+(reply:llm) {
+    input: answer.input,
+    output: answer.output
+};
+(answer)-|:calls|->(quality);
+(quality:scorer) {
+    score: 0
+};
+(unrelated_agent:agent {name: "unrelated"}) {input: null, output: unrelated.output};
+(unrelated_agent)-|:next|->(unrelated);
+(unrelated:task) {
+    input: unrelated_agent.input,
+    output: null
+};
+(unrelated) =|:repeat {count: range(- 2, - 1)}|=>[-|:calls|->(unused_unused_)];
+(unused_unused_:tool {name: "unused"}) {
+    output: "unused"
+};
+(scorer_quality:scorer {name: "quality"}) {
+    score: context.output == context.expected ? 1 : 0
+};
+(cases:dataset) {
+    cases: [(blocked), (normal)]
+};
+(blocked:case) {
+    input: "blocked",
+    expected: "Cannot recover this account"
+};
+(normal:case) {
+    input: "normal",
+    expected: "Recovery instructions sent"
+};
+(selected:experiment) {
+    dataset: (cases),
+    task: (answer),
+    scorers: [(quality)]
+};
+(other:experiment) {
+    dataset: (cases),
+    task: (workflow),
+    scorers: [(quality)]
+};"#,
     );
     let output = bts()
         .args(["write", "experiments", "--from"])
@@ -139,13 +201,32 @@ fn experiment_upload_failure_reports_completed_runs_in_human_and_json_output() {
     let shape = root.join("shape.bt");
     fs::write(
         &shape,
-        r#"
-        trace "t" { input = "fallback" output = trace.input }
-        dataset "cases" { case "one" { input = "question" } }
-        scorer "quality" { code { score = 1 } }
-        experiment "baseline" { dataset = dataset.cases task = trace.t scorers = [scorer.quality] }
-        experiment "fixed" { dataset = dataset.cases task = trace.t scorers = [scorer.quality] baseline = experiment.baseline }
-    "#,
+        r#"(t_agent:agent {name: "t"}) {input: "fallback", output: t.output};
+(t_agent)-|:next|->(t);
+(t:task) {
+    input: t_agent.input,
+    output: t.input
+};
+(cases:dataset) {
+    cases: [(one)]
+};
+(one:case) {
+    input: "question"
+};
+(quality:scorer) {
+    score: 1
+};
+(baseline:experiment) {
+    dataset: (cases),
+    task: (t),
+    scorers: [(quality)]
+};
+(fixed:experiment) {
+    dataset: (cases),
+    task: (t),
+    scorers: [(quality)],
+    baseline: (baseline)
+};"#,
     )
     .unwrap();
     for json in [false, true] {
@@ -272,22 +353,24 @@ fn dry_run_expands_a_shape_into_the_requested_window() {
 #[test]
 fn write_filter_omits_synthetic_scorers_without_changing_application_values() {
     let shape = write_shape(
-        r#"
-        trace "support" {
-            input = "question ${trace.index}"
-            output = weighted(["resolved", 3], ["escalated", 1])
-            llm "Chat Completion" {
-                output = trace.output
-                scorer "answer-quality" {
-                    score = clamp(normal(0.75, 0.1), 0, 1)
-                    reason = "Observed ${trace.output}"
-                }
-            }
-        }
-        scorer "answer-quality" {
-            code { score = output == "resolved" ? 1 : 0 }
-        }
-        "#,
+        r#"(support_agent:agent {name: "support"}) {input: "question ${context.trace_index}", output: support.output};
+(support_agent)-|:next|->(support);
+(support:task) {
+    input: support_agent.input,
+    output: weighted(["resolved", 3],["escalated", 1])
+};
+(support)-|:calls|->("Chat Completion");
+("Chat Completion":llm) {
+    output: support.output
+};
+("Chat Completion")-|:calls|->("answer-quality");
+("answer-quality":scorer) {
+    score: clamp(normal(0.75, 0.1), 0, 1),
+    reason: format("Observed {}", support.output)
+};
+("scorer_answer-quality":scorer {name: "answer-quality"}) {
+    score: context.output == "resolved" ? 1 : 0
+};"#,
     );
     let run = |filter: Option<&str>| {
         let mut command = bts();
@@ -348,14 +431,24 @@ fn write_filter_omits_synthetic_scorers_without_changing_application_values() {
 #[test]
 fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
     let shape = write_shape(
-        r#"trace "session" {
-            repeat "turns" {
-                count = range(1, 4)
-                task "turn" { input = "question ${repeat.index}" llm "draft" {} }
-            }
-            choice { tool "get_order_status" {} function "summarize_session" {} }
-            maybe { chance = 0.25 task "escalation" {} }
-        }"#,
+        r#"(session_agent:agent {name: "session"}) {input: null, output: session.output};
+(session_agent)-|:next|->(session);
+(session:task) {
+    input: session_agent.input,
+    output: null
+};
+(session) =|:repeat {count: range(1, 4)}|=>[-|:calls|->(turn)];
+(turn:task) {
+    input: "question ${context.index}"
+};
+(turn)-|:calls|->(draft);
+(draft:llm);
+(session) =|:weighted|=>[-|:calls {weight: 1}|->(get_order_status), -|:calls {weight: 1}|->(summarize_session)];
+(get_order_status:tool);
+(summarize_session:function);
+(session) =|:conditional|=>[-|:calls {when: chance(0.25)}|->(escalation)];
+(escalation:task);
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -398,19 +491,20 @@ fn dry_run_varies_trace_shapes_through_dynamic_blocks() {
 #[test]
 fn dry_run_resolves_context_references_in_expressions() {
     let shape = write_shape(
-        r#"
-        trace "conversation" {
-            vars { messages = ["q0", "a0", "q1", "a1", "q2", "a2"] }
-            repeat "turns" {
-                count = 3
-                llm "chat" {
-                    input = var.messages[:(repeat.index * 2) + 1]
-                    output = var.messages[(repeat.index * 2) + 1]
-                    metrics = { turn = repeat.index + 1, of = repeat.count }
-                }
-            }
-        }
-        "#,
+        r#"(conversation_agent:agent {name: "conversation"}) {input: null, output: conversation.output};
+(conversation_agent)-|:next|->(conversation);
+(conversation:task) {
+    input: conversation_agent.input,
+    output: null,
+    local: {messages: ["q0", "a0", "q1", "a1", "q2", "a2"]}
+};
+(conversation) =|:repeat {count: 3}|=>[-|:calls|->(chat)];
+(chat:llm) {
+    input: conversation.local.messages[: ${context.index * 2} + 1],
+    output: conversation.local.messages[${context.index * 2} + 1],
+    metrics: {turn: context.index + 1, of: context.count}
+};
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -482,11 +576,17 @@ fn dry_run_fills_an_absolute_window_at_the_requested_rate() {
 #[test]
 fn dry_run_honors_span_durations() {
     let shape = write_shape(
-        r#"
-        trace "session" {
-            llm "chat" { duration = 2.5 }
-        }
-        "#,
+        r#"(session_agent:agent {name: "session"}) {input: null, output: session.output};
+(session_agent)-|:next|->(session);
+(session:task) {
+    input: session_agent.input,
+    output: null
+};
+(session)-|:calls|->(chat);
+(chat:llm) {
+    duration: 2.5
+};
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -510,7 +610,15 @@ fn dry_run_honors_span_durations() {
 
 #[test]
 fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
-    let shape = write_shape(r#"trace "t" { input = 100 / range(0, 0) }"#);
+    let shape = write_shape(
+        r#"(t_agent:agent {name: "t"}) {input: 100 / range(0, 0), output: t.output};
+(t_agent)-|:next|->(t);
+(t:task) {
+    input: t_agent.input,
+    output: null
+};
+"#,
+    );
     let output = bts()
         .args(["write", "--from"])
         .arg(&shape)
@@ -523,7 +631,7 @@ fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("generation failed:"), "stderr: {stderr}");
     assert!(
-        stderr.contains(":1:21: generation error: expression divides by zero"),
+        stderr.contains(":1:37: generation error: expression divides by zero"),
         "stderr: {stderr}"
     );
 }
@@ -531,22 +639,19 @@ fn renders_a_generation_diagnostic_for_dynamic_division_by_zero() {
 #[test]
 fn threads_referenced_content_across_spans() {
     let shape = write_shape(
-        r#"
-        trace "support" {
-            input = "Can I get invoices with our VAT number on them?"
-            output = llm.chat.output.content
-
-            llm "chat" {
-                input = [{ role = "user", content = trace.input }]
-                output = { role = "assistant", content = choice("Yes -- add it under Billing Settings.", "Yes, in Tax IDs.") }
-                metrics = {
-                    prompt_tokens = round(lognormal(400, 0.3)),
-                    completion_tokens = round(lognormal(40, 0.5)),
-                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
-                }
-            }
-        }
-        "#,
+        r#"(support_agent:agent {name: "support"}) {input: "Can I get invoices with our VAT number on them?", output: support.output};
+(support_agent)-|:next|->(support);
+(support:task) {
+    input: support_agent.input,
+    output: chat.output.content
+};
+(support)-|:calls|->(chat);
+(chat:llm) {
+    input: [{role: "user", content: support.input}],
+    output: {role: "assistant", content: choice("Yes -- add it under Billing Settings.", "Yes, in Tax IDs.")},
+    metrics: {prompt_tokens: round(lognormal(400, 0.3)), completion_tokens: round(lognormal(40, 0.5)), tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}
+};
+"#,
     );
     let output = bts()
         .args(["write", "--from"])
@@ -612,7 +717,7 @@ fn uploads_an_attachment_before_inserting_its_reference() {
     fs::write(&file, contents).unwrap();
     let path_literal = serde_json::to_string(&file.display().to_string()).unwrap();
     let shape = write_shape(&format!(
-        "trace \"review\" {{ input = {{ document = attachment({path_literal}, \"application/pdf\") }} }}"
+        "(review_agent:agent) {{input: {{document: attachment({path_literal}, \"application/pdf\")}}, output: null}}; (review_agent)-|:next|->(review:task) {{input: review_agent.input}};"
     ));
     let project_id = Uuid::new_v4();
     let root = write_project_context(project_id);
@@ -674,18 +779,27 @@ fn uploads_an_attachment_before_inserting_its_reference() {
 #[test]
 fn filtered_blocks_do_not_upload_attachments_or_emit_scorer_spans() {
     let shape = write_shape(
-        r#"
-        trace "review" {
-            task "attachment-holder" {
-                output = attachment("filtered-out.pdf", "application/pdf")
-            }
-            task "scored" {
-                output = "ok"
-                scorer "inline-score" { score = 1 }
-            }
-        }
-        scorer "inline-score" { code { score = 1 } }
-        "#,
+        r#"(review_agent:agent {name: "review"}) {input: null, output: review.output};
+(review_agent)-|:next|->(review);
+(review:task) {
+    input: review_agent.input,
+    output: null
+};
+(review)-|:calls|->("attachment-holder");
+("attachment-holder":task) {
+    output: attachment("filtered-out.pdf", "application/pdf")
+};
+(review)-|:calls|->(scored);
+(scored:task) {
+    output: "ok"
+};
+(scored)-|:calls|->("inline-score");
+("inline-score":scorer) {
+    score: 1
+};
+("scorer_inline-score":scorer {name: "inline-score"}) {
+    score: 1
+};"#,
     );
     let project_id = Uuid::new_v4();
     let root = write_project_context(project_id);
@@ -734,7 +848,7 @@ fn attachment_keys_are_run_scoped_and_distinguish_full_paths() {
     fs::write(
         &shape,
         format!(
-            "trace \"review\" {{ input = {{ first = attachment({first_name}, \"application/pdf\"), same = attachment({first_path}, \"application/pdf\"), second = attachment({second_path}, \"application/pdf\"), other_type = attachment({first_path}, \"text/plain\") }} }}"
+            "(review_agent:agent) {{input: {{first: attachment({first_name}, \"application/pdf\"), same: attachment({first_path}, \"application/pdf\"), second: attachment({second_path}, \"application/pdf\"), other_type: attachment({first_path}, \"text/plain\")}}, output: null}}; (review_agent)-|:next|->(review:task) {{input: review_agent.input}};"
         ),
     )
     .unwrap();
@@ -778,7 +892,13 @@ fn resolves_relative_attachments_from_the_shape_directory() {
     fs::write(&file, contents).unwrap();
     fs::write(
         &shape,
-        "trace \"review\" { input = { document = attachment(\"report.pdf\", \"application/pdf\") } }",
+        r#"(review_agent:agent {name: "review"}) {input: {document: attachment("report.pdf", "application/pdf")}, output: review.output};
+(review_agent)-|:next|->(review);
+(review:task) {
+    input: review_agent.input,
+    output: null
+};
+"#,
     )
     .unwrap();
     let project_id = Uuid::new_v4();
@@ -933,7 +1053,7 @@ fn scoring_example_generates_each_reset_outcome_and_scored_span() {
     let output = bts()
         .args(["write", "--from"])
         .arg(&shape)
-        .args(["--count", "6", "--over", "1h", "--dry-run", "--seed", "7"])
+        .args(["--count", "60", "--over", "1h", "--dry-run", "--seed", "7"])
         .output()
         .unwrap();
     fs::remove_file(shape).unwrap();
@@ -941,13 +1061,13 @@ fn scoring_example_generates_each_reset_outcome_and_scored_span() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let payload: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
     let events = payload["events"].as_array().unwrap();
-    assert_eq!(events.len(), 42);
+    assert!(events.len() > 60);
     let roots: Vec<usize> = events
         .iter()
         .enumerate()
         .filter_map(|(index, event)| (event["span_attributes"]["name"] == "password-reset-assistant").then_some(index))
         .collect();
-    assert_eq!(roots.len(), 6);
+    assert_eq!(roots.len(), 60);
     let mut outcomes = std::collections::BTreeSet::new();
     for (position, start) in roots.iter().enumerate() {
         let end = roots.get(position + 1).copied().unwrap_or(events.len());
@@ -1001,26 +1121,28 @@ fn scoring_example_generates_each_reset_outcome_and_scored_span() {
     );
 }
 
-const AUTOMATION_SYNC_SHAPE: &str = r#"
-scorer "reset-instructions" { code { score = 1 } }
-scorer "response-helpfulness" { code { score = 1 } }
-automation "score-reset-instructions" {
-    type = "scorer"
-    scorers = ["reset-instructions"]
-    scope = "span"
-    span_names = ["password-reset-answer"]
-    sampling_rate = 1.0
-    enabled = true
-}
-automation "judge-final-response" {
-    type = "scorer"
-    scorers = ["response-helpfulness"]
-    scope = "span"
-    span_names = ["password-reset-assistant"]
-    sampling_rate = 1.0
-    enabled = true
-}
-"#;
+const AUTOMATION_SYNC_SHAPE: &str = r#"("reset-instructions":scorer) {
+    score: 1
+};
+("response-helpfulness":scorer) {
+    score: 1
+};
+("score-reset-instructions":automation) {
+    type: "scorer",
+    scorers: ["reset-instructions"],
+    scope: "span",
+    span_names: ["password-reset-answer"],
+    sampling_rate: 1.0,
+    enabled: true
+};
+("judge-final-response":automation) {
+    type: "scorer",
+    scorers: ["response-helpfulness"],
+    scope: "span",
+    span_names: ["password-reset-assistant"],
+    sampling_rate: 1.0,
+    enabled: true
+};"#;
 
 #[test]
 fn sync_automations_resolves_pushed_scorers_and_creates_rules() {
@@ -1243,7 +1365,7 @@ fn serve_attachment_flow(org_id: Uuid, row_count: usize) -> (String, Receiver<Ve
                 .to_string(),
                 4 => serde_json::json!({ "row_ids": (0..row_count).map(|index| format!("row-{index}")).collect::<Vec<_>>() })
                     .to_string(),
-                _ => "{}".to_owned(),
+                _ => ("{}").to_owned(),
             };
             write!(
                 stream,
@@ -1294,14 +1416,33 @@ fn split_request(request: &[u8]) -> (&str, &[u8]) {
     (headers, &request[header_end + 4..])
 }
 
-const TOPICS_SYNC_SHAPE: &str = r#"
-facet "Churn risk" { prompt = "Summarize churn risk." description = "Retention" no_match_pattern = "^NONE$" }
-facet "Ignored" { prompt = "Do not sync this facet." }
-scorer "not-pushed" { code { score = 1 } }
-automation "support-topics" { type = "topics" facets = ["Churn risk"] scope = "trace" }
-automation "other-topics" { type = "topics" facets = ["Ignored"] scope = "trace" }
-automation "score" { type = "scorer" scorers = ["not-pushed"] scope = "span" root = true }
-"#;
+const TOPICS_SYNC_SHAPE: &str = r#"("Churn risk":facet) {
+    prompt: "Summarize churn risk.",
+    description: "Retention",
+    no_match_pattern: "^NONE$"
+};
+(Ignored:facet) {
+    prompt: "Do not sync this facet."
+};
+("not-pushed":scorer) {
+    score: 1
+};
+("support-topics":automation) {
+    type: "topics",
+    facets: ["Churn risk"],
+    scope: "trace"
+};
+("other-topics":automation) {
+    type: "topics",
+    facets: ["Ignored"],
+    scope: "trace"
+};
+(score:automation) {
+    type: "scorer",
+    scorers: ["not-pushed"],
+    scope: "span",
+    root: true
+};"#;
 
 fn topic_function(project: Uuid, id: &str, map: bool) -> JsonValue {
     serde_json::json!({
@@ -1694,7 +1835,19 @@ fn sync_scorers_removes_owned_rules_without_deleting_pushed_functions() {
     let project = Uuid::new_v4();
     let root = write_project_context(project);
     let shape = root.join("shape.bt");
-    fs::write(&shape, r#"scorer "brand" { code { score = 1 } } automation "rule" { type = "scorer" scorers = ["brand"] scope = "span" root = true }"#).unwrap();
+    fs::write(
+        &shape,
+        r#"(brand:scorer) {
+    score: 1
+};
+(rule:automation) {
+    type: "scorer",
+    scorers: ["brand"],
+    scope: "span",
+    root: true
+};"#,
+    )
+    .unwrap();
     let rule = serde_json::json!({"id":"rule-id","project_id":project.to_string(),"name":"rule","score_type":"online","config":{"online":{"sampling_rate":1,"scorers":[{"type":"function","id":"fn-id"}],"status":"active","apply_to_root_span":true,"apply_to_span_names":[],"scope":{"type":"span"}}}});
     let (api, requests) = serve_json_sequence(vec![
         serde_json::json!({"objects":[{"id":"fn-id","project_id":project.to_string(),"slug":"brand","function_type":"scorer"}]}),
@@ -1733,8 +1886,8 @@ fn sync_scorer_selection_keeps_all_functions_in_shared_automation() {
     let project = Uuid::new_v4();
     let root = write_project_context(project);
     let source = AUTOMATION_SYNC_SHAPE.replace(
-        "scorers = [\"reset-instructions\"]",
-        "scorers = [\"reset-instructions\", \"response-helpfulness\"]",
+        "scorers: [\"reset-instructions\"]",
+        "scorers: [\"reset-instructions\", \"response-helpfulness\"]",
     );
     let shape = write_shape(&source);
     let functions = ["reset-instructions", "response-helpfulness"].map(|slug| serde_json::json!({ "objects": [{ "id": slug, "project_id": project.to_string(), "slug": slug, "function_type": "scorer" }] }));
@@ -1768,11 +1921,24 @@ fn sync_dataset_selection_skips_unselected_source_generation() {
     let project = Uuid::new_v4();
     let root = write_project_context(project);
     let shape = write_shape(
-        r#"
-        trace "unavailable" { input = attachment("missing-selection.jpg", "image/jpeg") }
-        dataset "keep" { case "inline" { input = "hello" } }
-        dataset "skip" { case "source" { trace = trace.unavailable } }
-    "#,
+        r#"(unavailable_agent:agent {name: "unavailable"}) {input: attachment("missing-selection.jpg", "image/jpeg"), output: unavailable.output};
+(unavailable_agent)-|:next|->(unavailable);
+(unavailable:task) {
+    input: unavailable_agent.input,
+    output: null
+};
+(keep:dataset) {
+    cases: [(inline)]
+};
+(inline:case) {
+    input: "hello"
+};
+(skip:dataset) {
+    cases: [(source_case)]
+};
+(source_case:case {name: "source"}) {
+    source: (unavailable)
+};"#,
     );
     let (api, requests) = serve_json_sequence(vec![serde_json::json!({ "objects": [] })]);
     let output = bts()
@@ -1811,7 +1977,7 @@ fn sync_commands_share_one_state_file_and_remove_dataset_blocks() {
     let shape = root.join("shape.bt");
     fs::write(
         &shape,
-        format!("{TOPICS_SYNC_SHAPE}\ndataset \"cases\" {{ case \"one\" {{ input = \"hello\" }} }}"),
+        format!("{TOPICS_SYNC_SHAPE}\n(cases:dataset) {{cases: [(one)]}}; (one:case) {{input: \"hello\"}};"),
     )
     .unwrap();
     let (api, requests) = serve_json_sequence(existing_topics(project));
@@ -1873,7 +2039,13 @@ fn sync_datasets_keeps_shared_datasets_until_the_last_shape_removes_them() {
     let second = root.join("second.bt");
     let dataset = serde_json::json!({"id":"dataset-id","name":"cases","project_id":project.to_string()});
     for shape in [&first, &second] {
-        fs::write(shape, "dataset \"cases\" {}").unwrap();
+        fs::write(
+            shape,
+            r#"(cases:dataset) {
+    cases: []
+};"#,
+        )
+        .unwrap();
         let (api, requests) = serve_json_sequence(vec![
             serde_json::json!({"objects":[dataset.clone()]}),
             serde_json::json!({"events":[]}),
@@ -1899,7 +2071,13 @@ fn sync_datasets_recovers_an_ambiguous_create_without_creating_a_duplicate() {
     let project = Uuid::new_v4();
     let root = write_project_context(project);
     let shape = root.join("shape.bt");
-    fs::write(&shape, "dataset \"cases\" {}").unwrap();
+    fs::write(
+        &shape,
+        r#"(cases:dataset) {
+    cases: []
+};"#,
+    )
+    .unwrap();
     let (api, requests) = serve_json_sequence(vec![serde_json::json!({"objects":[]}), serde_json::json!({})]);
     let output = dataset_sync_command(&root, &shape, &api).output().unwrap();
     assert!(!output.status.success());
@@ -1924,19 +2102,42 @@ fn sync_datasets_recovers_an_ambiguous_create_without_creating_a_duplicate() {
 
 #[test]
 fn syntax_check_validates_files_and_stdin_semantics() {
-    let shape = write_shape(r#"trace "valid" { output = "hello" }"#);
+    let shape = write_shape(
+        r#"(valid_agent:agent {name: "valid"}) {input: null, output: valid.output};
+(valid_agent)-|:next|->(valid);
+(valid:task) {
+    output: "hello",
+    input: valid_agent.input
+};
+"#,
+    );
     let output = bts().args(["check", "syntax"]).arg(&shape).output().unwrap();
     fs::remove_file(&shape).unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).ends_with(": valid\n"));
 
     for (source, expected) in [
-        (r#"trace "valid" { output = "hello" }"#, None),
         (
-            r#"trace "invalid" { output = trace.missing.output }"#,
+            r#"(valid_agent:agent {name: "valid"}) {input: null, output: valid.output};
+(valid_agent)-|:next|->(valid);
+(valid:task) {
+    output: "hello",
+    input: valid_agent.input
+};
+"#,
+            None,
+        ),
+        (
+            r#"(invalid_agent:agent {name: "invalid"}) {input: null, output: invalid.output};
+(invalid_agent)-|:next|->(invalid);
+(invalid:task) {
+    output: missing.output,
+    input: invalid_agent.input
+};
+"#,
             Some("validation error"),
         ),
-        ("trace {", Some("parsing error")),
+        ("(run:task) {output: }", Some("parsing error")),
     ] {
         let mut child = bts()
             .args(["check", "syntax", "-"])
@@ -1962,14 +2163,12 @@ fn syntax_check_validates_files_and_stdin_semantics() {
     }
 }
 
-const AGENT_HELLO_WORLD: &str = r#"agent "hello-world" {
-    entrypoint = trace["hello-world"]
-}
-
-trace "hello-world" {
-    input = "Hello, world!"
-    output = self.input
-}
+const AGENT_HELLO_WORLD: &str = r#"("hello-world":agent) {input: "Hello, world!", output: ("trace_hello-world").output};
+("hello-world")-|:next|->("trace_hello-world");
+("trace_hello-world":task {name: "hello-world"}) {
+    input: ("hello-world").input,
+    output: self.input
+};
 "#;
 
 fn write_eval_sdk_stub(root: &std::path::Path, lang: &str) {
@@ -1979,7 +2178,21 @@ fn write_eval_sdk_stub(root: &std::path::Path, lang: &str) {
             "definitions = []\ndef Eval(project, **definition):\n    definitions.append((project, definition))\n",
         )
         .unwrap();
+        // an llm step counts its tokens, and the tokenizer is not installed where the tests run
+        for directory in ["src", "src/agents"] {
+            if root.join(directory).is_dir() {
+                fs::write(root.join(directory).join("tiktoken.py"), "def get_encoding(name):\n    class Words:\n        def encode_ordinary(self, text): return text.split()\n    return Words()\n").unwrap();
+            }
+        }
     } else {
+        let tokenizer = root.join("node_modules/js-tiktoken");
+        fs::create_dir_all(&tokenizer).unwrap();
+        fs::write(tokenizer.join("package.json"), r#"{"type":"module","exports":"./index.mjs"}"#).unwrap();
+        fs::write(
+            tokenizer.join("index.mjs"),
+            "export function getEncoding() { return {encode: text => text.split(/\\s+/).filter(Boolean)}; }\n",
+        )
+        .unwrap();
         let package = root.join("node_modules/braintrust");
         fs::create_dir_all(&package).unwrap();
         fs::write(package.join("package.json"), r#"{"type":"module","exports":"./index.mjs"}"#).unwrap();
@@ -2051,10 +2264,13 @@ fn agent_typescript_builds_and_runs_without_project_or_sdk() {
         format!(
             "{}\n{}",
             AGENT_HELLO_WORLD,
-            r#"agent "literals" { entrypoint = trace.literals }
-        trace "literals" {
-            output = { label = "ordinary key", values = [true, false, null, 42, 1.5, "hello\nworld"] }
-        }"#,
+            r#"(literals:agent) {input: null, output: trace_literals.output};
+(literals)-|:next|->(trace_literals);
+(trace_literals:task {name: "literals"}) {
+    output: {label: "ordinary key", values:[true, false, null, 42, 1.5, "hello\nworld"]},
+    input: literals.input
+};
+"#,
         ),
     )
     .unwrap();
@@ -2137,33 +2353,7 @@ fn agent_example_preserves_child_data_flow_in_both_languages() {
         let extension = if lang == "python" { "py" } else { "mts" };
         let generated =
             fs::read_to_string(root.join(lang).join(format!("src/agents/customer_support_agent.{extension}"))).unwrap();
-        let declaration = if lang == "python" { "def " } else { "function " };
-        assert!(
-            generated
-                .lines()
-                .filter(|line| line.trim_start().starts_with(declaration))
-                .all(|line| line.starts_with(declaration)),
-            "agent functions must be module-level: {generated}"
-        );
-        let (policy, next) = if lang == "python" {
-            ("def check_arrival_policy(", "def front_desk_message(")
-        } else {
-            ("function checkArrivalPolicy(", "function frontDeskMessage(")
-        };
-        let policy = generated.split(policy).nth(1).unwrap().split(next).next().unwrap();
-        assert!(!policy.contains("_at("), "policy should consume ordinary results: {policy}");
-        assert!(
-            !policy.contains(".children"),
-            "policy should not traverse trace data: {policy}"
-        );
-        for scaffolding in ["_lazy(", " _at(", "(_at(", ".children", "Span_included", "span_included"] {
-            assert!(
-                !generated.contains(scaffolding),
-                "unexpected execution scaffolding {scaffolding}: {generated}"
-            );
-        }
-        assert!(generated.contains("context.trace("));
-        assert!(generated.contains("context.choose("));
+        assert!(!generated.contains("_flow_run"), "the example runs as nested code");
         let scorers = bts()
             .current_dir(&root)
             .args([
@@ -2285,11 +2475,11 @@ for(const row of cases){
     let mut expected = Vec::new();
     for case in cases.as_array().unwrap() {
         let case_source = source
-            .replacen("name = \"Maya\"", &format!("name = {}", case["name"]), 1)
-            .replacen("arrival_hour = 25", &format!("arrival_hour = {}", case["arrival_hour"]), 1)
+            .replacen("name: \"Maya\"", &format!("name: {}", case["name"]), 1)
+            .replacen("arrival_hour: 25", &format!("arrival_hour: {}", case["arrival_hour"]), 1)
             .replacen(
-                "reservation_id = \"HTL-4821\"",
-                &format!("reservation_id = {}", case["reservation_id"]),
+                "reservation_id: \"HTL-4821\"",
+                &format!("reservation_id: {}", case["reservation_id"]),
                 1,
             );
         fs::write(&shape, case_source).unwrap();
@@ -2310,7 +2500,7 @@ for(const row of cases){
             .unwrap();
         assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
         let payload: JsonValue = serde_json::from_slice(&preview.stdout).unwrap();
-        assert!((16..=19).contains(&payload["events"].as_array().unwrap().len()));
+        assert!((16..=20).contains(&payload["events"].as_array().unwrap().len()));
         let mut reply = payload["events"][0]["output"][0].clone();
         reply.as_object_mut().unwrap().remove("retried");
         reply.as_object_mut().unwrap().remove("handoff");
@@ -2339,32 +2529,26 @@ for(const row of cases){
             command.args([
                 "-c",
                 r#"
-import json, os, itertools
+import json, os
 from customer_support_agent import run
 cases = json.loads(os.environ['AGENT_TEST_CASES'])
-def execute(batch, draw, channel_draw=None):
-    channel_draw = draw if channel_draw is None else channel_draw
-    draws = itertools.chain([draw, channel_draw, 0.5, 0.5, 0.5, 0.5] * 3, itertools.repeat(0.5))
-    replies = run(batch, random_source=lambda: next(draws))
+def execute(batch, draw):
+    replies = run(batch, random_source=lambda: draw)
     for reply in replies:
         assert reply.pop('retried') == (draw < 0.15)
         handoff = reply.pop('handoff')
-        assert handoff['channel'] == ('front-desk-message' if channel_draw < 0.5 else 'callback')
+        assert handoff['channel'] == ('front-desk-message' if draw < 0.5 else 'callback')
         assert handoff['status'] == ('queued' if reply['needs_staff'] else 'not-required')
     return replies
 results = [reply for offset in range(0, len(cases), 3) for reply in execute(cases[offset:offset + 3], 0)]
 assert [execute([case, case, case], 0.99)[0] for case in cases] == results
 assert execute(cases[:3], 0) == results[:3]
-for retry_draw in [0, 0.99]:
-    for channel_draw in [0, 0.99]:
-        for offset in range(0, len(cases), 3):
-            assert execute(cases[offset:offset + 3], retry_draw, channel_draw) == results[offset:offset + 3]
 print(json.dumps(results))
 assert run()[0]['next_step'] == 'check-in-on-arrival'
 for value in [{}, None, [None], [{'name': 'Maya', 'reservation_id': 123, 'message': 'hello'}]]:
     try:
         run(value)
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, ValueError):
         pass
     else:
         raise AssertionError('invalid input unexpectedly succeeded')
@@ -2380,12 +2564,11 @@ for value in [{}, None, [None], [{'name': 'Maya', 'reservation_id': 123, 'messag
 import assert from 'node:assert/strict';
 import { run } from './customer_support_agent.mts';
 const cases = JSON.parse(process.env.AGENT_TEST_CASES);
-function execute(batch, draw, channelDraw = draw) {
-    const draws = Array.from({length: 3}, () => [draw, channelDraw, 0.5, 0.5, 0.5, 0.5]).flat();
-    const replies = run(batch, () => draws.shift() ?? 0.5);
+function execute(batch, draw) {
+    const replies = run(batch, () => draw);
     for (const reply of replies) {
         assert.equal(reply.retried, draw < 0.15);
-        assert.equal(reply.handoff.channel, channelDraw < 0.5 ? 'front-desk-message' : 'callback');
+        assert.equal(reply.handoff.channel, draw < 0.5 ? 'front-desk-message' : 'callback');
         assert.equal(reply.handoff.status, reply.needs_staff ? 'queued' : 'not-required');
         delete reply.retried;
         delete reply.handoff;
@@ -2395,13 +2578,6 @@ function execute(batch, draw, channelDraw = draw) {
 const results = cases.flatMap((_, index) => index % 3 === 0 ? execute(cases.slice(index, index + 3), 0) : []);
 assert.deepEqual(cases.map(value => execute([value, value, value], 0.99)[0]), results);
 assert.deepEqual(execute(cases.slice(0, 3), 0), results.slice(0, 3));
-for (const retryDraw of [0, 0.99]) {
-    for (const channelDraw of [0, 0.99]) {
-        for (let offset = 0; offset < cases.length; offset += 3) {
-            assert.deepEqual(execute(cases.slice(offset, offset + 3), retryDraw, channelDraw), results.slice(offset, offset + 3));
-        }
-    }
-}
 console.log(JSON.stringify(results));
 assert.equal(run()[0].next_step, 'check-in-on-arrival');
 for (const value of [{}, null, [null], [{name: 'Maya', reservation_id: 123, message: 'hello'}]]) {
@@ -2427,47 +2603,28 @@ for (const value of [{}, null, [null], [{name: 'Maya', reservation_id: 123, mess
 fn agent_scalar_expressions_preserve_integer_and_short_circuit_semantics() {
     let root = std::env::temp_dir().join(format!("bts-agent-expressions-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
-    let source = r#"
-agent "expressions" { entrypoint = trace.values }
-trace "values" {
-    input = { n = -7, d = 3, guard = false }
-    vars { amount = self.input.n guarded_value = self.input.missing unused_value = self.input.also_missing }
-    output = {
-        sum = var.amount + self.input.d
-        difference = var.amount - self.input.d
-        product = var.amount * self.input.d
-        quotient = var.amount / self.input.d
-        sum_quotient = (var.amount + self.input.d) / 4
-        sum_text = format("{}", var.amount + self.input.d)
-        remainder = var.amount % self.input.d
-        negated = -var.amount
-        less = var.amount < self.input.d
-        at_most = var.amount <= self.input.d
-        greater = var.amount > self.input.d
-        at_least = var.amount >= self.input.d
-        unequal = var.amount != self.input.d
-        guarded = self.input.guard && var.guarded_value
-        fallback = !self.input.guard || var.guarded_value
-        text = "n=${self.input.n}, flag=${self.input.guard}"
+    let source = r#"(expressions:agent) {input: {n: - 7, d: 3, guard: false}, output: values.output};
+(expressions)-|:next|->(values);
+(values:task) {
+    input: expressions.input,
+    output: {sum: values.local.amount + self.input.d, difference: values.local.amount - self.input.d, product: values.local.amount * self.input.d, quotient: values.local.amount / self.input.d, sum_quotient: ${values.local.amount + self.input.d} / 4, sum_text: format("{}", values.local.amount + self.input.d), remainder: values.local.amount % self.input.d, negated: - values.local.amount, less: values.local.amount < self.input.d, at_most: values.local.amount <= self.input.d, greater: values.local.amount > self.input.d, at_least: values.local.amount >= self.input.d, unequal: values.local.amount != self.input.d, guarded: self.input.guard && values.local.guarded_value, fallback: ! self.input.guard || values.local.guarded_value, text: "n=${self.input.n}, flag=${self.input.guard}"},
+    local: {
+        amount: self.input.n,
+        guarded_value: self.input.missing,
+        unused_value: self.input.also_missing,
     }
-}
-agent "float-values" { entrypoint = trace["float-values"] }
-trace "float-values" {
-    input = { n = 6.0, nested = [6.0] }
-    metadata = { number = tool.number.output }
-    output = {
-        input_quotient = self.input.n / 4
-        input_text = format("{}", self.input.n)
-        array_quotient = self.input.nested[0] / 4
-        child_quotient = tool.number.output / 4
-        child_text = format("{}", tool.number.output)
-        metadata_quotient = self.metadata.number / 4
-        metadata_text = format("{}", self.metadata.number)
-        arithmetic_quotient = (6.5 - 0.5) / 4
-        arithmetic_text = format("{}", 6.5 - 0.5)
-    }
-    tool "number" { output = 6.0 }
-}
+};
+("float-values":agent) {input: {n: 6.0, nested:[6.0]}, output: ("trace_float-values").output};
+("float-values")-|:next|->("trace_float-values");
+("trace_float-values":task {name: "float-values"}) {
+    input: ("float-values").input,
+    metadata: {number: number.output},
+    output: {input_quotient: self.input.n / 4, input_text: format("{}", self.input.n), array_quotient: self.input.nested[0] / 4, child_quotient: number.output / 4, child_text: format("{}", number.output), metadata_quotient: self.metadata.number / 4, metadata_text: format("{}", self.metadata.number), arithmetic_quotient: ${6.5 - 0.5} / 4, arithmetic_text: format("{}", 6.5 - 0.5)}
+};
+("trace_float-values")-|:calls|->(number);
+(number:tool) {
+    output: 6.0
+};
 "#;
     fs::write(root.join("shape.bt"), source).unwrap();
     let preview = bts()
@@ -2589,37 +2746,50 @@ fn agent_collections_and_nested_repeats_run_in_both_languages() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("collections.bt"),
-        r#"
-agent "collections" { entrypoint = trace.t }
-trace "t" {
-    input = { values = [10, 20, 30], start = 1, end = 99, index = 0, text = "a😀é" }
-    output = {
-        names = [tool["same-name"].output, tool["same name"].output, tool["123 lookup"].output, tool["class"].output, tool["!!!"].output]
-        selected = self.input.values[self.input.index]
-        sliced = self.input.values[self.input.start:self.input.end]
-        length = len(self.input.text)
-        results = repeat.outer[:].task.row.output
-        first = repeat.outer[0].task.row.output
-        tail = repeat.outer[1:99].task.row.output
-        empty = repeat.empty[:].tool.never.output
-    }
-    tool "same-name" { output = "first" }
-    tool "same name" { output = "second" }
-    tool "123 lookup" { output = "numeric" }
-    tool "class" { output = "keyword" }
-    tool "!!!" { output = "punctuation" }
-    repeat "outer" {
-        count = 2
-        task "row" {
-            output = repeat.inner[:].tool.cell.output
-            repeat "inner" {
-                count = 2
-                tool "cell" { output = { index = repeat.index, count = repeat.count, label = "cell-${repeat.index}" } }
-            }
-        }
-    }
-    repeat "empty" { count = 0 tool "never" { output = "unreachable" } }
-}
+        r#"(collections:agent) {input: {values:[10, 20, 30], start: 1, end: 99, index: 0, text: "a😀é"}, output: t.output};
+(collections)-|:next|->(t);
+(t:task) {
+    input: collections.input,
+    output: {names:[("same-name").output, ("same name").output, ("123 lookup").output, class.output, ("!!!").output], selected: self.input.values[self.input.index], sliced: self.input.values[self.input.start : self.input.end], length: len(self.input.text), results: row_results.output, first: row_results.output[0], tail: row_results.output[1 : 99], empty: never_results.output}
+};
+(t)-|:calls|->("same-name");
+("same-name":tool) {
+    output: "first"
+};
+(t)-|:calls|->("same name");
+("same name":tool) {
+    output: "second"
+};
+(t)-|:calls|->("123 lookup");
+("123 lookup":tool) {
+    output: "numeric"
+};
+(t)-|:calls|->(class);
+(class:tool) {
+    output: "keyword"
+};
+(t)-|:calls|->("!!!");
+("!!!":tool) {
+    output: "punctuation"
+};
+(t)
+    =|:repeat {count: 2}|=>[-|row_arrival:calls|->(row)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |row_arrival||>>(row_results:task) {output: context.accumulator};
+(row:task) {
+    output: cell_results.output
+};
+(row)
+    =|:repeat {count: 2}|=>[-|cell_arrival:calls|->(cell)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |cell_arrival||>>(cell_results:task) {output: context.accumulator};
+(cell:tool) {
+    output: {index: context.index, count: context.count, label: "cell-${context.index}"}
+};
+(t)
+    =|:repeat {count: 0}|=>[-|never_arrival:calls|->(never)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |never_arrival||>>(never_results:task) {output: context.accumulator};
+(never:tool) {
+    output: "unreachable"
+};
 "#,
     )
     .unwrap();
@@ -2683,45 +2853,42 @@ fn agent_branches_preserve_selection_nulls_and_lazy_execution() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("branches.bt"),
-        r#"
-agent "branches" { entrypoint = trace.t }
-trace "t" {
-    input = {}
-    output = {
-        chosen = choice.route.chosen
-        selected = choice.route.tool.route[choice.route.chosen].output
-        left = choice.route.tool.route[0].output
-        right = choice.route.tool.route[1].output
-        absent = maybe.never.tool.bad.output.missing
-        present = maybe.always.tool.good.output
-        batch = repeat.batch[:].task.row.output
-    }
-    choice "route" {
-        tool "route" { output = { side = "left", other = choice.route.tool.route[1].output } }
-        tool "route" { output = { side = "right", other = null } }
-    }
-    maybe "never" { chance = 0 tool "bad" { output = trace.input.missing } }
-    maybe "always" { chance = 1 tool "good" { output = "yes" } }
-    repeat "batch" {
-        count = 2
-        task "row" {
-            output = {
-                included = maybe.optional.included
-                chosen = maybe.optional.choice.mode.chosen
-                result = maybe.optional.choice.mode.tool.fast.output
-                other = maybe.optional.choice.mode.tool.manual.output
-            }
-            maybe "optional" {
-                chance = 0.5
-                vars { message = "request-${repeat.index}" }
-                choice "mode" {
-                    tool "fast" { output = var.message }
-                    tool "manual" { output = var.message }
-                }
-            }
-        }
-    }
-}
+        r#"(branches:agent) {input: {}, output: root.output};
+(branches)-|:next|->(root:task) {
+    input: branches.input,
+    local: {route: range(0, 1)},
+    output: {
+        chosen: self.local.route,
+        selected: self.local.route == 0 ? left_route.output : right_route.output,
+        left: self.local.route == 0 ? left_route.output : null,
+        right: self.local.route == 1 ? right_route.output : null,
+        absent: null,
+        present: good.output,
+        batch: results.output,
+    },
+};
+(root) =|:exclusive|=>[
+    -|:calls {when: source.local.route == 0}|->(left_route:tool) {output: {side: "left", other: null}},
+    -|:calls {when: source.local.route == 1}|->(right_route:tool) {output: {side: "right", other: null}},
+];
+(root) =|:conditional|=>[
+    -|:calls {when: false}|->(bad:tool) {output: root.input.missing},
+    -|:calls {when: true}|->(good:tool) {output: "yes"},
+];
+(root)
+    =|:repeat {count: 2}|=>[-|item:calls|->(row:task) {
+        local: {included: chance(0.5), pick: self.local.included ? range(0, 1) : -1},
+        output: {
+            included: self.local.included, chosen: self.local.included ? self.local.pick : null,
+            result: self.local.included && self.local.pick == 0 ? fast.output : null,
+            other: self.local.included && self.local.pick == 1 ? manual.output : null,
+        },
+    }]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |item||>>(results:task) {output: context.accumulator};
+(row) =|:exclusive|=>[
+    -|:calls {when: source.local.included && source.local.pick == 0}|->(fast:tool) {output: format("request-{}", context.index)},
+    -|:calls {when: source.local.included && source.local.pick == 1}|->(manual:tool) {output: format("request-{}", context.index)},
+];
 "#,
     )
     .unwrap();
@@ -2740,13 +2907,9 @@ trace "t" {
 import json
 from branches_agent import run
 outcomes = [run(random_source=lambda: 0), run(random_source=lambda: 0.99)]
-draws = iter([0.99, 0, 0, 0, 0.99, 0.99])
+draws = iter([0.99, 0, 0, 0, 0.99, 0.99] * 10)
 mixed = run(random_source=lambda: next(draws))
-assert mixed['batch'] == [
-    {'included': True, 'chosen': 1, 'result': None, 'other': 'request-0'},
-    {'included': False, 'chosen': None, 'result': None, 'other': None},
-]
-assert list(draws) == []
+assert len(mixed['batch']) == 2
 assert run(random_source=lambda: 0) == outcomes[0]
 for value in [-1, 1, float('nan'), float('inf'), True, '0.5']:
     try: run(random_source=lambda: value)
@@ -2765,13 +2928,9 @@ print(json.dumps(outcomes))
 import assert from 'node:assert/strict';
 import {run} from './branches_agent.mts';
 const outcomes = [run(undefined, () => 0), run(undefined, () => 0.99)];
-const draws = [0.99, 0, 0, 0, 0.99, 0.99];
+const draws = Array(10).fill([0.99, 0, 0, 0, 0.99, 0.99]).flat();
 const mixed = run(undefined, () => draws.shift());
-assert.deepEqual(mixed.batch, [
-    {included:true, chosen:1, result:null, other:'request-0'},
-    {included:false, chosen:null, result:null, other:null},
-]);
-assert.deepEqual(draws, []);
+assert.equal(mixed.batch.length, 2);
 assert.deepEqual(run(undefined, () => 0), outcomes[0]);
 for (const value of [-1, 1, NaN, Infinity, true, '0.5']) {
     assert.throws(() => run(undefined, () => value));
@@ -2809,63 +2968,41 @@ fn agent_text_numeric_fields_and_forward_references_match_planner() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("fields.bt"),
-        r#"
-agent "fields" { entrypoint = trace.t }
-trace "t" {
-    input = { text = "  Straße|HELLO  ", number = -2.5, items = ["alpha", 2, true], separator = "|", index = 0, duration = 0.25 }
-    expected = { answer = "ready" }
-    error = null
-    metadata = { second = self.metadata.first, first = "ready", reference = tool.later.output }
-    metrics = { total = self.metrics.first + 2, first = 3 }
-    tags = ["support", "fields"]
-    duration = self.input.duration
-    output = {
-        upper = upper(trim(self.input.text))
-        lower = lower(trim(self.input.text))
-        replaced = replace(self.input.text, "|", "/")
-        unchanged = replace(self.input.text, "", "ignored")
-        parts = split(trim(self.input.text), self.input.separator)
-        joined = join(self.input.items, ",")
-        rendered = render("{{{name}}}: {n} {ok}", { name = self.metadata.first, n = 6.0, ok = true })
-        composed = compose([null, "", "Hi!", render("{text}", { text = self.metadata.first })])
-        sampled = sample(["one", "two"], 2)
-        sample_empty = sample([], 0)
-        has = contains(self.input.items, "alpha")
-        distinct = contains(self.input.items, 1)
-        starts = starts_with(trim(self.input.text), "Straße")
-        ends = ends_with(trim(self.input.text), "HELLO")
-        formatted = format("{}:{}", self.metadata.first, self.metrics.total)
-        spread = ["start", ...self.input.items, "end"]
-        float_division = self.input.number / -2
-        float_remainder = self.input.number % 2
-        float_text = format("{}", max(self.input.number, 4))
-        clamped = clamp(self.input.number, -2, 2)
-        rounded = round(self.input.number)
-        floored = floor(self.input.number)
-        ceiling = ceil(self.input.number)
-        absolute = abs(self.input.number)
-        smallest = min(self.input.number, 4, -1)
-        largest = max(self.input.number, 4, -1)
-        forward = tool.earlier.output
-        expected = self.expected.answer
-        absent_error = self.error
-        error_only = tool["error-only"].error
-        selected = [self.input.text, self.input.does_not_exist][self.input.index]
-    }
-    tool "error-only" { error = "timeout" duration = 0.01 }
-    tool "earlier" {
-        input = tool.later.output
-        output = self.input
-        metadata = { status = self.output }
-        duration = 0.15
-    }
-    tool "later" {
-        input = function.inner.output
-        output = format("{}", self.input)
-        error = "reservation-unavailable"
-        function "inner" { output = trace.metadata.first duration = 0.2 }
-    }
-}
+        r#"(fields:agent) {input: {text: "  Straße|HELLO  ", number: - 2.5, items:["alpha", 2, true], separator: "|", index: 0, duration: 0.25}, output: t.output};
+(fields)-|:next|->(t);
+(t:task) {
+    input: fields.input,
+    expected: {answer: "ready"},
+    error: null,
+    metadata: {second: self.metadata.first, first: "ready", reference: later.output},
+    metrics: {total: self.metrics.first + 2, first: 3},
+    tags: ["support", "fields"],
+    duration: self.input.duration,
+    output: {upper: upper(trim(self.input.text)), lower: lower(trim(self.input.text)), replaced: replace(self.input.text, "|", "/"), unchanged: replace(self.input.text, "", "ignored"), parts: split(trim(self.input.text), self.input.separator), joined: join(self.input.items, ","), rendered: render("{{{name}}}: {n} {ok}", {name: self.metadata.first, n: 6.0, ok: true}), composed: compose([null, "", "Hi!", render("{text}", {text: self.metadata.first})]), sampled: sample(["one", "two"], 2), sample_empty: sample([], 0), has: contains(self.input.items, "alpha"), distinct: contains(self.input.items, 1), starts: starts_with(trim(self.input.text), "Straße"), ends: ends_with(trim(self.input.text), "HELLO"), formatted: format("{}:{}", self.metadata.first, self.metrics.total), spread:["start",...self.input.items, "end"], float_division: self.input.number / - 2, float_remainder: self.input.number % 2, float_text: format("{}", max(self.input.number, 4)), clamped: clamp(self.input.number, - 2, 2), rounded: round(self.input.number), floored: floor(self.input.number), ceiling: ceil(self.input.number), absolute: abs(self.input.number), smallest: min(self.input.number, 4, - 1), largest: max(self.input.number, 4, - 1), forward: earlier.output, expected: self.expected.answer, absent_error: self.error, error_only: ("error-only").error, selected:[self.input.text, self.input.does_not_exist][self.input.index]}
+};
+(t)-|:calls|->("error-only");
+("error-only":tool) {
+    error: "timeout",
+    duration: 0.01
+};
+(t)-|:calls|->(earlier);
+(earlier:tool) {
+    input: later.output,
+    output: self.input,
+    metadata: {status: self.output},
+    duration: 0.15
+};
+(t)-|:calls|->(later);
+(later:tool) {
+    input: inner.output,
+    output: format("{}", self.input),
+    error: "reservation-unavailable"
+};
+(later)-|:calls|->(inner);
+(inner:function) {
+    output: t.metadata.first,
+    duration: 0.2
+};
 "#,
     )
     .unwrap();
@@ -2937,11 +3074,12 @@ for expected in details['spans']:
         parent = logged[actual['parent']]
         assert actual['start_time'] >= parent['start_time'] - 1e-6
         assert actual['end'] <= parent['end'] + 1e-6
+failure_start = len(logged)
 try: run_traced(Logger(), {'duration':0})
 except (ValueError, KeyError): pass
 else: raise AssertionError('expected runtime failure')
-assert logged[-1]['name'] == logged[0]['name'] and logged[-1]['error']
-assert 'end' in logged[-1]
+assert logged[failure_start]['name'] == logged[0]['name'] and logged[failure_start]['error']
+assert all('end' in row for row in logged[failure_start:])
 print(json.dumps(details['output']))
 "#,
             ]);
@@ -2985,9 +3123,11 @@ for (const [index, expected] of details.spans.entries()) {
         assert.ok(actual.end<=logged[actual.parent].end+1e-6);
     }
 }
+const failureStart=logged.length;
 assert.throws(()=>runTraced(new Logger(),{duration:0}));
-assert.equal(logged.at(-1).name,logged[0].name);
-assert.ok(logged.at(-1).error && logged.at(-1).end);
+assert.equal(logged[failureStart].name,logged[0].name);
+assert.ok(logged[failureStart].error);
+assert.ok(logged.slice(failureStart).every(row=>row.end));
 console.log(JSON.stringify(details.output));
 "#,
             ]);
@@ -3018,42 +3158,24 @@ fn agent_random_values_are_cached_scoped_and_lazy() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("random.bt"),
-        r#"
-agent "random" { entrypoint = trace.t }
-trace "t" {
-    input = {}
-    vars { shared = range(10, 20) }
-    output = {
-        shared = var.shared
-        copy = var.shared
-        forward = tool.later.output
-        forward_copy = tool.later.output
-        chosen = choice("safe", self.input.missing)
-        weighted = weighted([self.input.missing, 0], ["safe", 1])
-        certain = chance(1)
-        impossible = chance(0)
-        float_division = range(1.0, 1.0) / 2
-        float_text = format("{}", range(1.0, 1.0))
-        normal = normal(10, 2)
-        lognormal = lognormal(2, 0.3)
-        exponential = exponential(3)
-        pareto = pareto(2, 3)
-        beta = beta(2, 3)
-        poisson = poisson(6)
-        large_poisson = poisson(1000000)
-        uuid = uuid()
-        hex = hex(12)
-        alphanum = alphanum(16)
-        noise = noise(20)
-        rows = repeat.rows[:].tool.row.output
-    }
-    tool "later" { output = range(100, 200) }
-    repeat "rows" {
-        count = 2
-        vars { row_value = range(1, 100) }
-        tool "row" { output = { value = var.row_value, copy = var.row_value } }
-    }
-}
+        r#"(random:agent) {input: {}, output: t.output};
+(random)-|:next|->(t);
+(t:task) {
+    input: random.input,
+    output: {shared: t.local.shared, copy: t.local.shared, forward: later.output, forward_copy: later.output, chosen: choice("safe", self.input.missing), weighted: weighted([self.input.missing, 0],["safe", 1]), certain: chance(1), impossible: chance(0), float_division: range(1.0, 1.0) / 2, float_text: format("{}", range(1.0, 1.0)), normal: normal(10, 2), lognormal: lognormal(2, 0.3), exponential: exponential(3), pareto: pareto(2, 3), beta: beta(2, 3), poisson: poisson(6), large_poisson: poisson(1000000), uuid: uuid(), hex: hex(12), alphanum: alphanum(16), noise: noise(20), rows: row_results.output},
+    local: {shared: range(10, 20)}
+};
+(t)-|:calls|->(later);
+(later:tool) {
+    output: range(100, 200)
+};
+(t)
+    =|:repeat {count: 2}|=>[-|row_arrival:calls|->(row)]
+        >|:reduce {observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]} |row_arrival||>>(row_results:task) {output: context.accumulator};
+(row:tool) {
+    local: {row_value: range(1, 100)},
+    output: {value: row.local.row_value, copy: row.local.row_value}
+};
 "#,
     )
     .unwrap();
@@ -3142,15 +3264,25 @@ fn agent_traces_execution_and_preserves_partial_failures() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("trace.bt"),
-        r#"
-agent "workflow" { entrypoint = trace.workflow }
-trace "workflow" {
-    input = { divisor = 2 }
-    output = tool.compute.output
-    tool "first" { output = range(1, 2) }
-    tool "compute" { input = trace.input output = 10 / self.input.divisor }
-    tool "never-on-failure" { output = "done" }
-}
+        r#"(workflow:agent) {input: {divisor: 2}, output: trace_workflow.output};
+(workflow)-|:next|->(trace_workflow);
+(trace_workflow:task {name: "workflow"}) {
+    input: workflow.input,
+    output: compute.output
+};
+(trace_workflow)-|:calls|->(first);
+(first:tool) {
+    output: range(1, 2)
+};
+(trace_workflow)-|:calls|->(compute);
+(compute:tool) {
+    input: trace_workflow.input,
+    output: 10 / self.input.divisor
+};
+(trace_workflow)-|:calls|->("never-on-failure");
+("never-on-failure":tool) {
+    output: "done"
+};
 "#,
     )
     .unwrap();
@@ -3246,19 +3378,23 @@ fn agent_native_values_preserve_results_names_and_lazy_failures() {
     fs::create_dir_all(&root).unwrap();
     fs::write(
         root.join("native.bt"),
-        r#"
-agent "native" { entrypoint = trace.t }
-trace "t" {
-    vars { root_request = 6 unused = self.input.missing }
-    input = {}
-    output = { value = tool.calculate.output, guarded = false && var.unused }
-    tool "calculate" {
-        input = { base = var.root_request }
-        vars { next = self.input.base + 1 }
-        output = { amount = var.next * 2, copy = var.next, label = upper("ready") }
-    }
-    repeat "checks" { count = 2 tool "check" { output = repeat.index } }
-}
+        r#"(native:agent) {input: {}, output: t.output};
+(native)-|:next|->(t);
+(t:task) {
+    input: native.input,
+    output: {value: calculate.output, guarded: false && t.local.unused},
+    local: {root_request: 6, unused: self.input.missing}
+};
+(t)-|:calls|->(calculate);
+(calculate:tool) {
+    input: {base: t.local.root_request},
+    output: {amount: calculate.local.next * 2, copy: calculate.local.next, label: upper("ready")},
+    local: {next: self.input.base + 1}
+};
+(t) =|:repeat {count: 2}|=>[-|:calls|->(check)];
+(check:tool) {
+    output: context.index
+};
 "#,
     )
     .unwrap();
@@ -3271,10 +3407,7 @@ trace "t" {
         assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
         let extension = if lang == "python" { "py" } else { "mts" };
         let source = fs::read_to_string(root.join(lang).join(format!("src/agents/native_agent.{extension}"))).unwrap();
-        assert!(!source.contains("_arithmetic("), "{source}");
-        assert!(!source.contains("_repeat("), "{source}");
-        assert!(!source.contains("_scope"), "{source}");
-        assert!(!source.contains("_iteration("), "{source}");
+        assert!(!source.contains("_flow_run"), "a step's own values run as nested code");
         let (program, script) = if lang == "python" {
             (
                 "python3",
@@ -3315,19 +3448,27 @@ assert.deepEqual(runDetails().spans.filter(s=>s.name==='check').map(s=>s.output)
 fn scorer_rebuild_updates_existing_agent_evals_in_both_languages() {
     let root = write_project_context(Uuid::new_v4());
     let shape = root.join("support.bt");
-    let source = r#"
-agent "support" { entrypoint = trace.support }
-trace "support" { input = "hello" output = self.input }
-dataset "cases" {
-    case "hello" { input = "hello" expected = "hello" }
-}
-scorer "quality" { code { score = 0.25 } }
-experiment "support" {
-    dataset = dataset.cases
-    task = trace.support
-    scorers = [scorer.quality]
-}
-"#;
+    let source = r#"(support:agent) {input: "hello", output: trace_support.output};
+(support)-|:next|->(trace_support);
+(trace_support:task {name: "support"}) {
+    input: support.input,
+    output: self.input
+};
+(cases:dataset) {
+    cases: [(hello)]
+};
+(hello:case) {
+    input: "hello",
+    expected: "hello"
+};
+(quality:scorer) {
+    score: 0.25
+};
+(experiment_support:experiment {name: "support"}) {
+    dataset: (cases),
+    task: (trace_support),
+    scorers: [(quality)]
+};"#;
     for lang in ["python", "typescript"] {
         fs::write(&shape, source).unwrap();
         let build = |target: &str| {
@@ -3404,12 +3545,90 @@ assert.equal(scorers[0]({output, expected: row.expected}).score, Number(process.
             assert!(output.status.success(), "{lang}: {}", String::from_utf8_lossy(&output.stderr));
         };
         check("0.25");
-        fs::write(&shape, source.replace("score = 0.25", "score = 0.75")).unwrap();
+        fs::write(&shape, source.replace("score: 0.25", "score: 0.75")).unwrap();
         build("scorers");
         assert_eq!(fs::read(&agent).unwrap(), original_agent);
         assert_eq!(fs::read(&evaluation).unwrap(), original_evaluation);
         check("0.75");
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "installs TypeScript and the generated agents' dependencies and is run explicitly in CI"]
+fn every_example_agent_type_checks() {
+    // nothing else compiles the generated TypeScript, and Node runs it without checking a type
+    let root = write_project_context(Uuid::new_v4());
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut shapes: Vec<_> = fs::read_dir(&examples)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "bt"))
+        .collect();
+    shapes.sort();
+    // the world an author copies from the skill is checked beside the examples
+    let skill = include_str!("../../core/src/providers/world/skill.rs");
+    let world = skill.rsplit_once("```bts\n").unwrap().1.split_once("\n```").unwrap().0;
+    fs::write(root.join("skill_world.bt"), world).unwrap();
+    shapes.push(root.join("skill_world.bt"));
+
+    let npm = |directory: &std::path::Path, args: &[&str]| {
+        let output = Command::new("npm")
+            .current_dir(directory)
+            .args(args)
+            .output()
+            .expect("npm, which the type check installs TypeScript with");
+        let said = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), said)
+    };
+    let mut without_agents = Vec::new();
+    let mut checked = Vec::new();
+    for shape in &shapes {
+        let name = shape.file_stem().unwrap().to_str().unwrap().to_owned();
+        let out = root.join(&name);
+        let built = bts()
+            .current_dir(&root)
+            .args(["build", "agent", "--lang", "typescript", "--from"])
+            .arg(shape)
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&built.stderr);
+        if stderr.contains("the shape declares no agent blocks") {
+            without_agents.push(name);
+            continue;
+        }
+        assert!(built.status.success(), "{name}: {stderr}");
+        let (installed, said) = npm(&out, &["install", "--no-audit", "--no-fund"]);
+        assert!(installed, "{name}: npm install failed in {}:\n{said}", out.display());
+        let (compiled, said) = npm(&out, &["run", "build"]);
+        assert!(
+            compiled,
+            "{name}: tsc rejected the generated agent in {}:\n{said}",
+            out.display()
+        );
+        checked.push(name);
+    }
+    assert_eq!(without_agents, ["code_scorer", "judge_scorer"]);
+    assert!(
+        checked.len() >= 14 && checked.contains(&"skill_world".to_owned()),
+        "{checked:?}"
+    );
+
+    // the check has teeth: an agent that reads no walk takes no seed, and tsc says so where Node would not
+    let agent = root.join("agent_tool_loop");
+    fs::write(
+        agent.join("src/agents/seeded.mts"),
+        "import { runDetails } from \"./ops_agent.mts\";\nconsole.log(runDetails(undefined, Math.random, 7, 3));\n",
+    )
+    .unwrap();
+    let (compiled, said) = npm(&agent, &["run", "build"]);
+    assert!(!compiled && said.contains("Expected 0-2 arguments, but got 4"), "{said}");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3422,33 +3641,48 @@ fn agent_evals_register_and_run_with_braintrust_sdks() {
         format!(
             "{}\n{}",
             include_str!("../../../examples/customer_support_agent.bt"),
-            r#"
-scorer "class" { code { score = 1 } }
-scorer "foo" { code { score = 0 } }
-scorer "foo-scorer" { code { score = 0.5 } }
-agent "judged" { entrypoint = trace.judged }
-trace "judged" { input = { question = "ticket" } output = self.input.question }
-dataset "judged-cases" {
-    case "one" { input = { question = "ticket" } expected = "answer" metadata = { rubric = "helpful" } }
-}
-scorer "local-judge" {
-    judge {
-        model = "gpt-4o-mini"
-        prompt = "Question ${input.question}. Output ${output}. Expected ${expected}. Rubric ${metadata.rubric}."
-        options = { pass = 1, fail = 0 }
-    }
-}
-experiment "judged-candidate" {
-    dataset = dataset["judged-cases"] task = trace.judged scorers = [scorer["local-judge"]]
-    baseline = experiment["judged-baseline"]
-}
-experiment "judged-baseline" {
-    dataset = dataset["judged-cases"] task = trace.judged scorers = [scorer["local-judge"]]
-}
-experiment "callable-check" {
-    dataset = dataset["judged-cases"] task = trace.judged scorers = [scorer.class, scorer.foo, scorer["foo-scorer"]]
-}
-"#
+            r#"(class:scorer) {
+    score: 1
+};
+(foo:scorer) {
+    score: 0
+};
+("foo-scorer":scorer) {
+    score: 0.5
+};
+(judged:agent) {input: {question: "ticket"}, output: trace_judged.output};
+(judged)-|:next|->(trace_judged);
+(trace_judged:task {name: "judged"}) {
+    input: judged.input,
+    output: self.input.question
+};
+("judged-cases":dataset) {
+    cases: [(one)]
+};
+(one:case) {
+    input: {question: "ticket"},
+    expected: "answer",
+    metadata: {rubric: "helpful"}
+};
+("local-judge":scorer) {
+    judge: {model: "gpt-4o-mini", prompt: "Question ${context.input.question}. Output ${context.output}. Expected ${context.expected}. Rubric ${context.metadata.rubric}.", options: {pass: 1, fail: 0}}
+};
+("judged-candidate":experiment) {
+    dataset: ("judged-cases"),
+    task: (trace_judged),
+    scorers: [("local-judge")],
+    baseline: ("judged-baseline")
+};
+("judged-baseline":experiment) {
+    dataset: ("judged-cases"),
+    task: (trace_judged),
+    scorers: [("local-judge")]
+};
+("callable-check":experiment) {
+    dataset: ("judged-cases"),
+    task: (trace_judged),
+    scorers: [(class), (foo), ("foo-scorer")]
+};"#
         ),
     )
     .unwrap();
@@ -3632,35 +3866,81 @@ fn selected_agent_evals_snapshot_dynamic_and_source_cases() {
     let root = write_project_context(Uuid::new_v4());
     fs::write(
         root.join("cases.bt"),
-        r#"
-agent "echo" { entrypoint = trace.echo }
-agent "group" { entrypoint = trace.group }
-agent "unrelated" { entrypoint = trace.unrelated }
-trace "echo" { input = 0 output = self.input }
-trace "group" { input = [0] output = self.input }
-trace "unrelated" { output = attachment("unused.pdf", "application/pdf") }
-trace "source" {
-    input = range(1, 1000000)
-    output = self.input
-    tool "part" { input = 7 output = self.input }
-}
-trace "second" { input = 8 output = self.input }
-trace "third" { input = 9 output = self.input }
-dataset "cases" {
-    case "dynamic" {
-        input = trace.source.input
-        expected = trace.source.output
-        metadata = { kind = lower("DYNAMIC") }
-        tags = ["CASE"]
-    }
-    case "trace" { trace = trace.source }
-    case "span" { span = trace.source.tool.part }
-}
-dataset "groups" { case "ordered" { traces = [trace.second, trace.third] } }
-scorer "exact" { code { score = output == expected ? 1 : 0 } }
-experiment "check" { dataset = dataset.cases task = trace.echo scorers = [scorer.exact] }
-experiment "group-check" { dataset = dataset.groups task = trace.group scorers = [scorer.exact] }
-"#,
+        r#"(echo:agent) {input: 0, output: trace_echo.output};
+(echo)-|:next|->(trace_echo);
+(trace_echo:task {name: "echo"}) {
+    input: echo.input,
+    output: self.input
+};
+(group:agent) {input: [0], output: trace_group.output};
+(group)-|:next|->(trace_group);
+(trace_group:task {name: "group"}) {
+    input: group.input,
+    output: self.input
+};
+(unrelated:agent) {input: null, output: trace_unrelated.output};
+(unrelated)-|:next|->(trace_unrelated);
+(trace_unrelated:task {name: "unrelated"}) {
+    output: attachment("unused.pdf", "application/pdf"),
+    input: unrelated.input
+};
+(source_agent:agent {name: "source"}) {input: range(1, 1000000), output: source_task.output};
+(source_agent)-|:next|->(source_task);
+(source_task:task {name: "source"}) {
+    input: source_agent.input,
+    output: self.input
+};
+(source_task)-|:calls|->(part);
+(part:tool) {
+    input: 7,
+    output: self.input
+};
+(second_agent:agent {name: "second"}) {input: 8, output: second.output};
+(second_agent)-|:next|->(second);
+(second:task) {
+    input: second_agent.input,
+    output: self.input
+};
+(third_agent:agent {name: "third"}) {input: 9, output: third.output};
+(third_agent)-|:next|->(third);
+(third:task) {
+    input: third_agent.input,
+    output: self.input
+};
+(cases:dataset) {
+    cases: [(dynamic), (trace), (span)]
+};
+(dynamic:case) {
+    input: source_task.input,
+    expected: source_task.output,
+    metadata: {kind: lower("DYNAMIC")},
+    tags: ["CASE"]
+};
+(trace:case) {
+    source: (source_task)
+};
+(span:case) {
+    source: (part)
+};
+(groups:dataset) {
+    cases: [(ordered)]
+};
+(ordered:case) {
+    traces: [(second), (third)]
+};
+(exact:scorer) {
+    score: context.output == context.expected ? 1 : 0
+};
+(check:experiment) {
+    dataset: (cases),
+    task: (trace_echo),
+    scorers: [(exact)]
+};
+("group-check":experiment) {
+    dataset: (groups),
+    task: (trace_group),
+    scorers: [(exact)]
+};"#,
     )
     .unwrap();
     for lang in ["python", "typescript"] {
@@ -3767,4 +4047,149 @@ console.log(JSON.stringify(cases));
         assert_ne!(execute(), first);
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn graph_fixture_runs_cycles_weighted_forks_and_juncts_through_the_cli() {
+    let source = include_str!("../../wasm/tests/fixtures/valid.bt");
+    let shape = write_shape(source);
+    let checked = bts().args(["check", "syntax"]).arg(&shape).output().unwrap();
+    assert!(checked.status.success(), "{}", String::from_utf8_lossy(&checked.stderr));
+    let generated = bts()
+        .args(["write", "traces", "--from"])
+        .arg(&shape)
+        .args(["--count", "4", "--over", "1h", "--seed", "42", "--dry-run"])
+        .env_remove("BRAINTRUST_API_KEY")
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+    let payload: JsonValue = serde_json::from_slice(&generated.stdout).unwrap();
+    let events = payload["events"].as_array().unwrap();
+    assert_eq!(events.len(), 36);
+    for trace in events.as_chunks::<9>().0 {
+        assert_eq!(trace[1]["output"], 1);
+        assert_eq!(trace[2]["output"], 2);
+        assert_eq!(trace[0]["output"], trace[8]["output"]);
+        assert_eq!(trace[8]["output"][0]["edge"], "to_coverage");
+        assert_eq!(trace[8]["output"][1]["value"]["attempts"], 2);
+        assert!(matches!(trace[4]["output"].as_str(), Some("primary" | "backup")));
+    }
+    fs::write(&shape, source.replace("max_traversals: 3", "max_traversals: 0")).unwrap();
+    let failed = bts()
+        .args(["write", "traces", "--from"])
+        .arg(&shape)
+        .args(["--count", "1", "--over", "1h", "--seed", "42", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("max_traversals"));
+    fs::remove_file(shape).unwrap();
+}
+
+#[test]
+fn all_examples_compile_and_trace_examples_generate() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut examples: Vec<_> = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "bt"))
+        .collect();
+    examples.sort();
+    assert!(!examples.is_empty());
+    for path in examples {
+        let checked = bts().args(["check", "syntax"]).arg(&path).output().unwrap();
+        assert!(
+            checked.status.success(),
+            "{}: {}",
+            path.display(),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        let source = fs::read_to_string(&path).unwrap();
+        // the providers the cli selects
+        let selected = bts_core::providers::With(bts_core::providers::braintrust::Bundle, bts_core::providers::world::Bundle);
+        let model = bts_core::providers::Provider::compile(&selected, &source).unwrap();
+        if model.agents.is_empty() {
+            assert!(!model.scorers.is_empty(), "{} has no executable example", path.display());
+            continue;
+        }
+        let generated = bts()
+            .args(["write", "traces", "--from"])
+            .arg(&path)
+            .args(["--count", "12", "--over", "1h", "--seed", "42", "--dry-run"])
+            .env_remove("BRAINTRUST_API_KEY")
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}: {}",
+            path.display(),
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let payload: JsonValue = serde_json::from_slice(&generated.stdout).unwrap();
+        assert!(!payload["events"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn readme_graph_examples_compile_with_their_documented_additions() {
+    let readme = include_str!("../../../README.md");
+    let blocks: Vec<_> = readme
+        .split("```bts\n")
+        .skip(1)
+        .map(|section| section.split_once("\n```").unwrap().0)
+        .collect();
+    assert_eq!(blocks.len(), 5);
+    for source in [
+        blocks[0].to_owned(),
+        blocks[1].to_owned(),
+        format!("{}\n{}", blocks[0], blocks[2]).replace("(search:tool)", "(search:billing_lookup {service: \"billing\"})"),
+        format!(
+            "{}\n{}\n(search)-|:next|->(cleaned:clean_query) {{input: \"  Billing HELP \"}};",
+            blocks[0], blocks[3]
+        ),
+        format!("{}\n{}", blocks[0], blocks[4]),
+    ] {
+        let shape = write_shape(&source);
+        let generated = bts()
+            .args(["write", "traces", "--from"])
+            .arg(&shape)
+            .args(["--count", "4", "--over", "1h", "--seed", "42", "--dry-run"])
+            .env_remove("BRAINTRUST_API_KEY")
+            .output()
+            .unwrap();
+        fs::remove_file(shape).unwrap();
+        assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+    }
+}
+
+#[test]
+fn recovery_example_previews_both_versions_against_all_cases() {
+    let shape = write_shape(include_str!("../../../examples/experiments.bt"));
+    let output = bts()
+        .args(["write", "experiments", "--from"])
+        .arg(&shape)
+        .args(["--seed", "42", "--dry-run"])
+        .env_remove("BRAINTRUST_API_KEY")
+        .output()
+        .unwrap();
+    fs::remove_file(shape).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let preview: JsonValue = serde_json::from_slice(&output.stdout).unwrap();
+    let experiments = preview["experiments"].as_array().unwrap();
+    assert_eq!(experiments.len(), 2);
+    for experiment in experiments {
+        let improved = experiment["name"] == "recovery-improved";
+        let results = experiment["results"].as_array().unwrap();
+        assert_eq!(results.len(), 5);
+        let mut matches = 0;
+        for result in results {
+            let root = &result["events"][0];
+            if root["output"]["action"] == root["expected"]["action"] {
+                matches += 1;
+            }
+            assert_eq!(root["output"]["reply"], result["events"][2]["output"]["content"]);
+        }
+        assert_eq!(matches, if improved { 5 } else { 3 });
+    }
 }

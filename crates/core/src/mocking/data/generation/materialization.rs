@@ -42,10 +42,12 @@ impl Materializer {
         let last_descendants = last_descendants(&plan.events);
         let mut starts = vec![Duration::ZERO; plan.events.len()];
         let mut ends = vec![Duration::ZERO; plan.events.len()];
+        let places = places(&plan.events, &last_descendants);
         for trace in plan.traces.iter() {
             layout(
                 &plan.events,
                 &last_descendants,
+                &places,
                 trace.start,
                 Duration::ZERO,
                 &mut starts,
@@ -186,6 +188,7 @@ fn last_descendants(events: &[EventPlan]) -> Box<[usize]> {
 fn layout(
     events: &[EventPlan],
     last_descendants: &[usize],
+    places: &[u64],
     index: usize,
     offset: Duration,
     starts: &mut [Duration],
@@ -194,7 +197,8 @@ fn layout(
     let overflow = || Error::new(ErrorKind::TimestampOutOfRange, EventRef(index));
 
     starts[index] = offset;
-    let mut cursor = offset.checked_add(EVENT_SLOT).ok_or_else(overflow)?;
+    // a span does a little work of its own before its first child, between children and after the last
+    let mut cursor = offset.checked_add(pause(places[index], 0, 5, 45)).ok_or_else(overflow)?;
     let mut tail = offset;
     let mut scorers = Vec::new();
     let mut child = index + 1;
@@ -202,9 +206,11 @@ fn layout(
         if events[child].kind == EventKind::Scorer {
             scorers.push(child);
         } else {
-            layout(events, last_descendants, child, cursor, starts, ends)?;
-            cursor = ends[child];
-            tail = ends[child];
+            // a child that waits starts that much later, and its parent lasts through the wait
+            let start = (cursor.checked_add(events[child].wait.unwrap_or_default())).ok_or_else(overflow)?;
+            layout(events, last_descendants, places, child, start, starts, ends)?;
+            cursor = (ends[child].checked_add(pause(places[child], 1, 1, 12))).ok_or_else(overflow)?;
+            tail = (ends[child].checked_add(pause(places[child], 2, 1, 8))).ok_or_else(overflow)?;
         }
         child = last_descendants[child] + 1;
     }
@@ -212,9 +218,42 @@ fn layout(
     let own = events[index].duration.unwrap_or(EVENT_SLOT);
     ends[index] = tail.max(offset.checked_add(own).ok_or_else(overflow)?);
     for scorer in scorers {
-        layout(events, last_descendants, scorer, ends[index], starts, ends)?;
+        layout(events, last_descendants, places, scorer, ends[index], starts, ends)?;
     }
     Ok(())
+}
+
+// where each span sits among the application spans of a run
+// scorer spans and what is under them do not count, so leaving them out moves nothing else
+fn places(events: &[EventPlan], last_descendants: &[usize]) -> Vec<u64> {
+    let mut places = Vec::with_capacity(events.len());
+    let (mut place, mut scored_until) = (0, None);
+    for (index, event) in events.iter().enumerate() {
+        if scored_until.is_some_and(|last| index > last) {
+            scored_until = None;
+        }
+        if scored_until.is_none() && event.kind == EventKind::Scorer {
+            scored_until = Some(last_descendants[index]);
+        }
+        places.push(place);
+        if scored_until.is_none() {
+            place += 1;
+        }
+    }
+    places
+}
+
+// a few milliseconds that depend only on where a span sits, so a run lays out the same every time
+fn pause(place: u64, part: u64, least: u64, most: u64) -> Duration {
+    let mut mixed = place
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(part.wrapping_mul(0xbf58_476d_1ce4_e5b9));
+    mixed ^= mixed >> 30;
+    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 27;
+    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    Duration::from_micros(least * 1000 + mixed % ((most - least) * 1000 + 1))
 }
 
 pub(super) fn materialize(
@@ -282,41 +321,24 @@ impl Error {
 mod tests {
     use super::super::evaluation::plan;
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::mocking::data::Value;
+    use crate::providers::braintrust::mocking::compile;
     use std::collections::BTreeMap;
 
     #[test]
     fn materializes_nested_spans_and_fields() {
         let model = compile(
-            r#"
-            vars {
-                system = """
+            r#"(support_sessions_root:task {name: "support-sessions"}) {tags: ["chat", "prod"], local: {system: """
                     You are a concise personal finance assistant.
                     Answer briefly.
-                    """
-                meta = { model = "gpt-4o-mini", temperature = 0.2 }
-            }
-            trace "support-sessions" {
-                task "turn_0" {
-                    input = "How did NVDA do today?"
-                    llm "Chat Completion" {
-                        input = [
-                            { role = "system", content = var.system },
-                            { role = "user", content = task.turn_0.input },
-                        ]
-                        output = { role = "assistant", content = "NVDA closed down 1.4% at $207.40." }
-                        metadata = var.meta
-                        metrics = { prompt_tokens = 612, completion_tokens = 24,
-                            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens }
-                    }
-                }
-                task "turn_1" {
-                    llm "Chat Completion" { metadata = var.meta }
-                }
-                tags = ["chat", "prod"]
-            }
-        "#,
+                    """, meta: {model: "gpt-4o-mini", temperature: 0.2}}, input: support_sessions.input};
+(turn_0:task {name: "turn_0"}) {input: "How did NVDA do today?"};
+(Chat_Completion:llm {name: "Chat Completion"}) {input: [{role: "system", content: support_sessions_root.local.system}, {role: "user", content: turn_0.input},], output: {role: "assistant", content: "NVDA closed down 1.4% at $207.40."}, metadata: support_sessions_root.local.meta, metrics: {prompt_tokens: 612, completion_tokens: 24, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens}};
+(turn_1:task {name: "turn_1"}) {};
+(Chat_Completion_1:llm {name: "Chat Completion"}) {metadata: support_sessions_root.local.meta};
+(support_sessions:agent) {input: null, output: null};
+(support_sessions)-|:next|->(support_sessions_root)-|:calls|->(turn_0)-|:calls|->(Chat_Completion);
+(turn_0)-|:next|->(turn_1)-|:calls|->(Chat_Completion_1);"#,
         )
         .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
@@ -382,13 +404,10 @@ mod tests {
 
     #[test]
     fn retains_expected_and_error_fields_only_when_set() {
-        let source = r#"
-            trace "example" {
-                expected = "4"
-                error = { message = "timeout" }
-                task "step" {}
-            }
-        "#;
+        let source = r#"(example_root:task {name: "example"}) {expected: "4", error: {message: "timeout"}, input: example.input};
+(step:task {name: "step"}) {};
+(example:agent) {input: null, output: null};
+(example)-|:next|->(example_root)-|:calls|->(step);"#;
         let model = compile(source).unwrap();
         let events = materialize(
             plan(model, 1, 0).unwrap(),
@@ -428,6 +447,7 @@ mod tests {
                 },
                 scores: None,
                 duration: None,
+                wait: None,
             }]),
             traces: Box::new([0..1]),
             scorer_postlude: false,
@@ -440,15 +460,12 @@ mod tests {
 
     #[test]
     fn lays_spans_out_by_their_durations() {
-        let source = r#"
-            trace "t" {
-                duration = 60
-                task "a" { duration = 2 }
-                task "b" {
-                    llm "c" { duration = 1.5 }
-                }
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {duration: 60, input: t.input};
+(a:task {name: "a"}) {duration: 2};
+(b:task {name: "b"}) {};
+(c:llm {name: "c"}) {duration: 1.5};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root)-|:calls|->(a)-|:next|->(b)-|:calls|->(c);"#;
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
@@ -466,10 +483,24 @@ mod tests {
         // leaves span exactly their durations
         assert_eq!(a.end.duration_since(a.start).unwrap(), Duration::from_secs(2));
         assert_eq!(c.end.duration_since(c.start).unwrap(), Duration::from_millis(1500));
-        // a sibling starts where the previous one ends
-        assert_eq!(b.start, a.end);
-        // a parent outlived by its children ends with its last child
-        assert_eq!(b.end, c.end);
+        // a sibling starts a few milliseconds after the previous one ends
+        let between = b.start.duration_since(a.end).unwrap();
+        assert!(
+            (Duration::from_millis(1)..=Duration::from_millis(12)).contains(&between),
+            "{between:?}"
+        );
+        // a child starts a few milliseconds into its parent, not at a fixed offset
+        let lead = c.start.duration_since(b.start).unwrap();
+        assert!(
+            (Duration::from_millis(5)..=Duration::from_millis(45)).contains(&lead),
+            "{lead:?}"
+        );
+        // a parent outlived by its children ends a few milliseconds after its last child
+        let after = b.end.duration_since(c.end).unwrap();
+        assert!(
+            (Duration::from_millis(1)..=Duration::from_millis(8)).contains(&after),
+            "{after:?}"
+        );
         // an explicit total longer than the children stretches the span
         assert_eq!(root.end.duration_since(root.start).unwrap(), Duration::from_secs(60));
         // the single trace anchors so its computed extent ends at now
@@ -477,8 +508,48 @@ mod tests {
     }
 
     #[test]
+    fn a_span_that_waits_starts_that_much_later() {
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(a:task {name: "a"}) {duration: 2};
+(b:task {name: "b"}) {duration: 2, wait: 30};
+(c:task {name: "c"}) {duration: 2, wait: 0};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root)-|:calls|->(a)-|:next|->(b)-|:next|->(c);"#;
+        let events = materialize(
+            plan(compile(source).unwrap(), 1, 0).unwrap(),
+            Duration::from_secs(3_600),
+            Distribution::Linear,
+            UNIX_EPOCH + Duration::from_secs(7_200),
+        )
+        .unwrap();
+        let [root, a, b, c] = &events.events[..] else {
+            panic!("four spans")
+        };
+        // the wait is added to the few milliseconds that pass between any two steps
+        let waited = b.start.duration_since(a.end).unwrap();
+        assert!(
+            (Duration::from_millis(30_001)..=Duration::from_millis(30_012)).contains(&waited),
+            "{waited:?}"
+        );
+        // a wait of zero changes nothing, and neither wait changes how long a span itself lasts
+        let between = c.start.duration_since(b.end).unwrap();
+        assert!(between <= Duration::from_millis(12), "{between:?}");
+        assert_eq!(b.end.duration_since(b.start).unwrap(), Duration::from_secs(2));
+        // the parent lasts through the wait
+        assert!(root.end.duration_since(root.start).unwrap() > Duration::from_secs(36));
+        // a wait below zero fails the run where it is written
+        let error = plan(compile(&source.replace("wait: 30", "wait: 0 - 1")).unwrap(), 1, 0).unwrap_err();
+        assert!(
+            error.to_string().contains("wait is not a number of seconds from zero up"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_windows_shorter_than_the_longest_trace() {
-        let source = r#"trace "t" { duration = 7200 }"#;
+        let source = r#"(t_root:task {name: "t"}) {duration: 7200, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#;
         let error = materialize(
             plan(compile(source).unwrap(), 1, 0).unwrap(),
             Duration::from_secs(3_600),
@@ -492,7 +563,12 @@ mod tests {
 
     #[test]
     fn spreads_generated_traces_across_the_window() {
-        let model = compile(r#"trace "example" {}"#).unwrap();
+        let model = compile(
+            r#"(example_root:task {name: "example"}) {input: example.input};
+(example:agent) {input: null, output: null};
+(example)-|:next|->(example_root);"#,
+        )
+        .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(model, 3, 0).unwrap(),
@@ -512,7 +588,12 @@ mod tests {
 
     #[test]
     fn sine_distribution_clusters_traces_mid_window() {
-        let model = compile(r#"trace "example" {}"#).unwrap();
+        let model = compile(
+            r#"(example_root:task {name: "example"}) {input: example.input};
+(example:agent) {input: null, output: null};
+(example)-|:next|->(example_root);"#,
+        )
+        .unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(7_200);
         let events = materialize(
             plan(model, 5, 0).unwrap(),

@@ -1,7 +1,8 @@
 mod scorers;
 mod topics;
 
-use crate::{diag::SourceDiags, dsl, selection};
+use crate::{diag::SourceDiags, selection};
+use bts_core::providers::Provider as _;
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, clap::Args)]
@@ -42,14 +43,16 @@ struct Options {
 }
 
 impl Options {
-    fn compile(&self) -> Result<dsl::Model, Error> {
+    fn compile(&self) -> Result<bts_core::mocking::Model, Error> {
         let source = fs::read_to_string(&self.from).map_err(|source| Error::ReadShape {
             path: self.from.clone(),
             source,
         })?;
-        dsl::semantics::compile_module(&source, true).map_err(|diags| Error::InvalidShape {
-            details: SourceDiags::new(&self.from.display().to_string(), &source, diags),
-        })
+        crate::providers::SELECTED
+            .compile_module(&source, true)
+            .map_err(|diags| Error::InvalidShape {
+                details: SourceDiags::new(&self.from.display().to_string(), &source, diags),
+            })
     }
 }
 

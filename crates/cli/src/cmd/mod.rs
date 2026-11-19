@@ -6,7 +6,6 @@ mod sync;
 mod update;
 mod write;
 
-use crate::dsl;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, clap::ValueEnum)]
@@ -72,7 +71,7 @@ impl Cli {
     }
 }
 
-fn render_diags(source_name: &str, src: &str, diags: &dsl::Diags) -> String {
+fn render_diags(source_name: &str, src: &str, diags: &bts_lang::Diags) -> String {
     diags
         .iter()
         .map(|diag| diag.render(source_name, src))

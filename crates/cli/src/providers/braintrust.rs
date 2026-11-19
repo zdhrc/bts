@@ -6,11 +6,11 @@ use std::{fmt, path::Path};
 pub struct Adapter;
 
 impl DataAdapter for Adapter {
-    type Provider = braintrust::Bundle;
+    type Provider = super::Selected;
     type Error = Error;
 
     fn provider(&self) -> Self::Provider {
-        braintrust::Bundle
+        super::SELECTED
     }
 
     fn config(&self, settings: &Settings) -> Result<braintrust::config::Config, Error> {
@@ -64,11 +64,11 @@ impl DataAdapter for Adapter {
 }
 
 impl CodeAdapter for Adapter {
-    type Provider = braintrust::Bundle;
+    type Provider = super::Selected;
     type Error = Error;
 
     fn provider(&self) -> Self::Provider {
-        braintrust::Bundle
+        super::SELECTED
     }
 
     fn config(&self) -> Result<String, Error> {
@@ -146,7 +146,11 @@ impl std::error::Error for Error {
 }
 
 impl AgentAdapter for Adapter {
-    fn agent_target(&self, model: &crate::dsl::Model, seed: u64) -> Result<braintrust::mocking::code::CodeTarget, Error> {
+    fn agent_target(
+        &self,
+        model: &bts_core::mocking::Model,
+        seed: u64,
+    ) -> Result<braintrust::mocking::code::CodeTarget, Error> {
         let project = if model.experiments.is_empty() {
             String::new()
         } else {
@@ -157,13 +161,13 @@ impl AgentAdapter for Adapter {
 
     fn assemble_agents(
         &self,
-        model: &crate::dsl::Model,
-        lang: crate::dsl::ScorerLang,
+        model: &bts_core::mocking::Model,
+        lang: bts_core::mocking::ScorerLang,
         target: &braintrust::mocking::code::CodeTarget,
-    ) -> Result<code::Assembly, String> {
+    ) -> Result<code::Assembly, code::AgentError> {
         let assembly = code::assemble_agents(model, lang, target)?;
         target
             .agent_assembly(model, lang, assembly)
-            .map_err(|error| error.to_string())
+            .map_err(|error| code::AgentError::Generation(error.to_string()))
     }
 }

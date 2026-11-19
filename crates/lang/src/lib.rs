@@ -4,10 +4,16 @@
 //! Use [`semantics::compile`] to resolve references and check the language's semantic rules.
 //! Compilation produces a [`Model`] for consumers to evaluate, generate from, or
 //! inspect. This crate does not execute the model or contact external services.
+//!
+//! A provider extends the language with its own kinds and functions and says which
+//! kinds and context keys it gives meaning to. It declares them in a [`ProviderSchema`].
+//! [`semantics::compile_module_with_provider`] compiles source against one, and
+//! [`Model::unsupported`] reports what the provider gives no meaning to.
 #![warn(missing_docs)]
 
 mod ast;
 mod diag;
+mod expr;
 mod lexing;
 mod model;
 mod modeling;
@@ -15,12 +21,7 @@ mod parsing;
 pub mod spec;
 
 pub use diag::{Diag, DiagPhase, Diags, SrcRange};
-pub use model::{
-    Accessor, Agent, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
-    DatasetSource, EnglishOperation, Experiment, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number,
-    Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan,
-    ScorerStep, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
-};
+pub use model::*;
 
 /// Semantic validation and resolved models for language consumers.
 ///
@@ -28,20 +29,27 @@ pub use model::{
 /// Runtime-dependent expressions remain in the model for consumers to evaluate.
 /// Use [`crate::syntax`] when only source structure is needed.
 pub mod semantics {
-    use crate::{Diags, Model, lexing::lex, modeling::model, parsing::parse};
+    use crate::{Diag, DiagPhase, Diags, Model, SrcRange, lexing::lex, modeling::model, parsing::parse};
+
+    /// A named source supplied by the caller without filesystem or package loading.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Source<'a> {
+        /// A display name for diagnostics and model provenance.
+        pub name: &'a str,
+        /// Source text in the ordinary language syntax.
+        pub text: &'a str,
+    }
 
     /// Parses source, resolves references, and checks the language's semantic rules.
     ///
-    /// Returns diagnostics from the first failing phase. Empty source is rejected.
+    /// Lexing or parsing errors are returned without validating. Validation reports
+    /// every independent mistake in the module once, each at its own location, and
+    /// skips checks that depend on an element that already failed. Identical
+    /// diagnostics are reported once. Empty source is rejected.
     /// Runtime-dependent values are retained as expressions for consumers to evaluate.
     /// Successful compilation does not guarantee that every runtime evaluation succeeds.
     /// Modifying the returned model can invalidate its references and type guarantees.
     ///
-    /// ```
-    /// let model = bts_lang::semantics::compile(r#"trace "run" { input = "hello" }"#)?;
-    /// assert_eq!(model.traces[0].name, "run");
-    /// # Ok::<(), bts_lang::Diags>(())
-    /// ```
     pub fn compile(src: &str) -> Result<Model, Diags> {
         compile_module(src, false)
     }
@@ -52,35 +60,134 @@ pub mod semantics {
     /// empty model. All nonempty source receives the same checks as [`compile`].
     /// This supports consumers that interpret an empty module as removing resources.
     pub fn compile_module(src: &str, allow_empty: bool) -> Result<Model, Diags> {
-        let tokens = tracing::info_span!("lex").in_scope(|| lex(src))?;
-        let ast = tracing::info_span!("parse").in_scope(|| parse(tokens, src))?;
-        if allow_empty && ast.decls.is_empty() {
-            return Ok(Model::default());
+        compile_module_with_definitions(
+            Source {
+                name: "<source>",
+                text: src,
+            },
+            &[],
+            allow_empty,
+        )
+    }
+
+    /// Compiles user source together with caller-supplied kind definitions.
+    ///
+    /// Definition sources may contain only definitions. All kinds and traits share one
+    /// namespace and resolve together, including forward references across sources.
+    /// Duplicate names are errors, including identical declarations.
+    /// Source ranges use local byte offsets and a source index. Index zero identifies
+    /// `source`, and index `n + 1` identifies `definitions[n]`. Successful models
+    /// retain the corresponding names in [`Model::sources`]. The caller retains
+    /// source text and can use these indexes to render diagnostics with [`Diag::render`].
+    pub fn compile_with_definitions(source: Source<'_>, definitions: &[Source<'_>]) -> Result<Model, Diags> {
+        compile_module_with_definitions(source, definitions, false)
+    }
+
+    /// Compiles user source together with the definitions a provider declares.
+    ///
+    /// Source indexes follow [`compile_with_definitions`], and
+    /// [`ProviderSchema::definition`](crate::ProviderSchema::definition) returns the
+    /// definition source an index refers to. Calls to the provider's functions are
+    /// checked against their descriptors and stay in the model as
+    /// [`Func::Call`](crate::Func::Call). This does not check what the provider
+    /// supports. Use [`Model::unsupported`] with the elements the provider walks.
+    pub fn compile_module_with_provider(
+        source: Source<'_>,
+        provider: &crate::ProviderSchema<'_>,
+        allow_empty: bool,
+    ) -> Result<Model, Diags> {
+        compile_sources(source, provider.definitions, provider.functions, allow_empty)
+    }
+
+    /// Compiles with supplied definitions and an explicit empty user module policy.
+    ///
+    /// Provider declarations do not make an empty user module nonempty. When empty
+    /// user source is allowed, supplied kinds are still validated and retained.
+    pub fn compile_module_with_definitions(
+        source: Source<'_>,
+        definitions: &[Source<'_>],
+        allow_empty: bool,
+    ) -> Result<Model, Diags> {
+        compile_sources(source, definitions, &[], allow_empty)
+    }
+
+    fn compile_sources(
+        source: Source<'_>,
+        definitions: &[Source<'_>],
+        functions: &[crate::FunctionDesc],
+        allow_empty: bool,
+    ) -> Result<Model, Diags> {
+        fn document(source: Source<'_>, index: usize) -> Result<crate::ast::GraphDocument, Diags> {
+            let mut tokens = tracing::info_span!("lex")
+                .in_scope(|| lex(source.text))
+                .map_err(|mut errors| {
+                    for error in &mut errors {
+                        error.r#where.source = index;
+                    }
+                    errors
+                })?;
+            for token in &mut tokens {
+                token.range.source = index;
+            }
+            tracing::info_span!("parse").in_scope(|| parse(tokens, source.text))
         }
-        tracing::info_span!("model").in_scope(|| model(ast))
+
+        let mut ast = document(source, 0)?;
+        let empty = ast.paths.is_empty() && ast.definitions.is_empty();
+        let mut supplied_definitions = Vec::new();
+        for (index, definition) in definitions.iter().enumerate() {
+            let supplied = document(*definition, index + 1)?;
+            if let Some(path) = supplied.paths.first() {
+                return Err(vec![Diag {
+                    when: DiagPhase::Validation,
+                    what: "definition sources may contain only definitions".to_owned(),
+                    r#where: path.range,
+                }]);
+            }
+            supplied_definitions.extend(supplied.definitions);
+        }
+        if empty && !allow_empty {
+            return Err(vec![Diag {
+                when: DiagPhase::Validation,
+                what: "expected at least one graph statement".to_owned(),
+                r#where: SrcRange::new(0, 0),
+            }]);
+        }
+        supplied_definitions.append(&mut ast.definitions);
+        ast.definitions = supplied_definitions;
+        let mut compiled = if ast.paths.is_empty() && ast.definitions.is_empty() {
+            Model::default()
+        } else {
+            tracing::info_span!("model").in_scope(|| model(ast, functions))?
+        };
+        compiled.sources = std::iter::once(source)
+            .chain(definitions.iter().copied())
+            .map(|source| source.name.to_owned())
+            .collect();
+        Ok(compiled)
     }
 }
 
 /// Source structure before reference resolution and semantic validation.
 ///
 /// Parsing checks structure without checking names, types, or allowed fields.
-/// Use [`crate::semantics::compile`] for semantic checks.
+/// Use [`crate::semantics::compile`] to lower and validate the graph.
 pub mod syntax {
     use crate::{Diag, DiagPhase, Diags, ast};
 
-    pub use crate::ast::{Ast, Attr, BinOp, Block, Decl, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
+    pub use crate::ast::GraphDocument as Ast;
+    pub use crate::ast::{Attr, BinOp, Expr, ExprKind, ObjectItem, TemplatePart, UnaryOp};
+    pub use crate::ast::{
+        Definition, GraphDocument, GraphEdgeStep, GraphFork, GraphHeader, GraphJunction, GraphNode, GraphNodeDecl, GraphOrigin,
+        GraphPath, GraphReferenceKind, GraphStep,
+    };
+    pub use crate::ast::{GraphPattern, GraphPatternConstraint, GraphPatternNode, GraphPatternStep};
 
-    /// Parses a complete source module without checking its meaning.
+    /// Parses a source graph without checking its meaning.
     ///
-    /// Empty source is allowed. Unknown block names and unresolved references can
-    /// appear in the returned tree. Malformed source returns lexing or parsing
-    /// diagnostics with byte ranges into `source`.
-    ///
-    /// ```
-    /// let source = r#"trace "run" { output = task.missing.output }"#;
-    /// assert!(bts_lang::syntax::parse(source).is_ok());
-    /// assert!(bts_lang::semantics::compile(source).is_err());
-    /// ```
+    /// Nodes, connections, forks and junctions retain their authored structure.
+    /// Indentation attaches selectors and junctions to forks. Names, kinds and
+    /// target membership and pattern matches are resolved later.
     pub fn parse(source: &str) -> Result<Ast, crate::Diags> {
         let tokens = crate::lexing::lex(source)?;
         crate::parsing::parse(tokens, source)
@@ -127,266 +234,5 @@ pub mod syntax {
             }
         }
         segments(parse_expression(src)?)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::semantics::compile;
-    use super::*;
-    use crate::diag::DiagPhase;
-
-    #[test]
-    fn compiles_every_spec_example() {
-        for example in spec::SPEC.examples {
-            let result = compile(example.source);
-            assert_eq!(result.is_ok(), example.valid, "example {}", example.id.as_str());
-        }
-    }
-
-    #[test]
-    fn rejects_unbound_or_ambiguous_scoring_automations() {
-        let source = r#"automation "bad" {
-            type = "scorer"
-            scorers = ["missing"]
-            scope = "span"
-            root = true
-            span_names = ["answer"]
-        }"#;
-        let errors = compile(source).unwrap_err();
-        assert!(errors.iter().any(|error| error.what.contains("unknown scorer \"missing\"")));
-        assert!(errors.iter().any(|error| error.what.contains("set either root = true")));
-    }
-
-    #[test]
-    fn models_facets_and_topics_automations() {
-        let model = compile(
-            r#"
-            facet "Churn risk" { prompt = "Summarize risk." description = "Retention" no_match_pattern = "^NONE$" }
-            automation "topics" { type = "topics" facets = ["Churn risk"] scope = "trace" enabled = false sampling_rate = 0.25 }
-        "#,
-        )
-        .unwrap();
-        assert_eq!(model.facets[0].prompt, "Summarize risk.");
-        assert_eq!(model.facets[0].description.as_deref(), Some("Retention"));
-        assert_eq!(model.facets[0].no_match_pattern.as_deref(), Some("^NONE$"));
-        assert!(matches!(&model.automations[0].kind, AutomationKind::Topics { facets } if facets == &["Churn risk"]));
-        assert!(!model.automations[0].enabled);
-        assert_eq!(model.automations[0].sampling_rate, 0.25);
-        assert!(compile(r#"facet "only" { prompt = "Extract." }"#).is_ok());
-    }
-
-    #[test]
-    fn rejects_invalid_facets_and_type_specific_automation_fields() {
-        for source in [
-            r#"facet "f" { prompt = "" }"#,
-            r#"facet "f" { prompt = uuid() }"#,
-            r#"facet "f" { description = "No prompt" }"#,
-            r#"facet "f" { prompt = "x" prompt = "y" }"#,
-            r#"facet "f" { prompt = "x" } facet "f" { prompt = "y" }"#,
-            r#"automation "a" { type = "topics" facets = ["missing"] scope = "trace" }"#,
-            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f"] scope = "span" }"#,
-            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f"] scope = "trace" root = false }"#,
-            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = [] scope = "trace" }"#,
-            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f", "f"] scope = "trace" }"#,
-            r#"facet "f" { prompt = "x" } automation "a" { type = "topics" facets = ["f"] }"#,
-            r#"automation "a" { type = "topics" scope = "trace" }"#,
-            r#"scorer "s" { code { score = 1 } } automation "a" { type = "scorer" scorers = ["s"] facets = ["f"] scope = "span" root = true }"#,
-        ] {
-            assert!(compile(source).is_err(), "{source}");
-        }
-    }
-
-    #[test]
-    fn nested_scorers_require_a_top_level_definition() {
-        let errors = compile("trace \"t\" { scorer \"missing\" { score = 0.5 } }").unwrap_err();
-        assert!(errors.iter().any(|error| error.what.contains("unknown scorer \"missing\"")));
-    }
-
-    #[test]
-    fn models_dataset_description_and_source_cases() {
-        let source = r#"
-            trace "run" { input = "hello" task "step" { output = "done" tool "lookup" { output = "found" } } }
-            trace "run-alt" { task "first-step" { output = "ok" } }
-            dataset "examples" {
-                description = "Regression cases"
-                case "inline" { input = { text = "hello" } expected = "done" }
-                case "whole" { trace = trace["run"] tags = ["regression"] }
-                case "step" { span = trace.run.task.step }
-                case "nested" { span = trace["run"].task["step"].tool.lookup }
-                case "quoted" { span = trace["run-alt"].task["first-step"] }
-                case "group" { traces = [trace["run"], trace["run"]] }
-            }
-        "#;
-        let model = compile(source).unwrap();
-        assert_eq!(model.datasets.len(), 1);
-        assert_eq!(model.datasets[0].description.as_deref(), Some("Regression cases"));
-        assert_eq!(model.datasets[0].cases.len(), 6);
-    }
-
-    #[test]
-    fn models_experiments_with_forward_typed_references() {
-        let model = compile(r#"
-            experiment "fixed" { dataset = dataset["cases"] task = trace.workflow.task.answer scorers = [scorer.correct] baseline = experiment["baseline"] }
-            experiment "baseline" { dataset = dataset.cases task = trace["workflow"] scorers = [scorer["correct"]] description = "Before the fix" }
-            dataset "cases" { case "one" { input = "question" } }
-            scorer "correct" { code { score = 1 } }
-            trace "workflow" { input = "question" task "answer" { output = "answer" } }
-        "#).unwrap();
-        assert_eq!(model.experiments.len(), 2);
-        assert_eq!(model.experiments[0].baseline.as_deref(), Some("baseline"));
-        assert_eq!(model.experiments[0].dataset, "cases");
-        let reference = &model.refs[model.experiments[0].task.0 as usize];
-        assert!(matches!(reference.accessor, Accessor::Block { kind: "task", .. }));
-    }
-
-    #[test]
-    fn rejects_invalid_experiment_bindings_and_baseline_cycles() {
-        let resources = r#"dataset "cases" { case "one" { input = "x" } } scorer "correct" { code { score = 1 } } trace "t" { input = "x" task "answer" { output = "y" } choice "route" { task "branch" { output = "z" } } }"#;
-        for fields in [
-            "dataset = dataset.missing task = trace.t scorers = [scorer.correct]",
-            "dataset = dataset.cases task = trace.t scorers = [scorer.missing]",
-            "dataset = dataset.cases task = trace.t.output scorers = [scorer.correct]",
-            "dataset = dataset.cases task = trace.t.choice.route.task.branch scorers = [scorer.correct]",
-            "dataset = dataset.cases task = trace.t scorers = []",
-            "dataset = dataset.cases task = trace.t scorers = [scorer.correct, scorer.correct]",
-            "dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.e",
-            "dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.missing",
-            "dataset = dataset.cases task = trace.t scorers = [\"correct\"]",
-            "dataset = \"cases\" task = trace.t scorers = [scorer.correct]",
-            "dataset = dataset.cases task = trace.t",
-        ] {
-            assert!(
-                compile(&format!("{resources} experiment \"e\" {{ {fields} }}")).is_err(),
-                "{fields}"
-            );
-        }
-        assert!(
-            compile(&format!(
-                r#"{resources}
-            experiment "a" {{ dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.b }}
-            experiment "b" {{ dataset = dataset.cases task = trace.t scorers = [scorer.correct] baseline = experiment.a }}
-        "#
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn dataset_example_covers_inline_trace_and_span_cases() {
-        let model = compile(include_str!("../../../examples/dataset_cases.bt")).unwrap();
-        let dataset = &model.datasets[0];
-        assert_eq!(
-            dataset.description.as_deref(),
-            Some("Billing support examples from authored inputs and trace spans")
-        );
-        assert!(
-            dataset
-                .cases
-                .iter()
-                .any(|case| matches!(case.source, DatasetSource::Inline(_)))
-        );
-        assert!(
-            dataset
-                .cases
-                .iter()
-                .any(|case| matches!(case.source, DatasetSource::Trace(_)))
-        );
-        assert!(dataset.cases.iter().any(|case| matches!(case.source, DatasetSource::Span(_))));
-    }
-
-    #[test]
-    fn rejects_dataset_span_paths_missing_from_the_module() {
-        let source = r#"
-            trace "run" { task "step" { tool "lookup" { output = "found" } } }
-            dataset "examples" {
-                case "wrong-parent" { span = trace.run.tool.lookup }
-                case "missing-trace" { span = trace.other.task.step }
-            }
-        "#;
-        let errors = compile(source).unwrap_err();
-        assert!(errors.iter().any(|error| error.what.contains("lookup")));
-        assert!(errors.iter().any(|error| error.what.contains("other")));
-    }
-
-    #[test]
-    fn rejects_dataset_span_paths_through_dynamic_blocks() {
-        let source = r#"
-            trace "run" { choice "route" { task "step" { output = "done" } } }
-            dataset "examples" { case "step" { span = trace.run.choice.route.task.step } }
-        "#;
-        let errors = compile(source).unwrap_err();
-        assert!(errors.iter().any(|error| error.what.contains("directed generation")));
-    }
-
-    #[test]
-    fn returns_diagnostics_from_the_first_failing_phase() {
-        let diags = match compile("trace \"unterminated") {
-            Ok(_) => panic!("expected lexing diagnostics"),
-            Err(diags) => diags,
-        };
-
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].when, DiagPhase::Lexing);
-    }
-}
-
-#[cfg(test)]
-mod module_reference_tests {
-    use super::semantics::compile;
-    use crate::{Accessor, DatasetSource};
-    #[test]
-    fn preserves_block_identity_through_aliases_and_forward_references() {
-        let model = compile(
-            r#"
-            vars { source = trace["support"] }
-            dataset "cases" {
-                case "whole" { trace = var.source }
-                case "span" { span = var.source.task["lookup"] }
-                case "fields" { input = var.source.input expected = var.source.task["lookup"].output }
-                case "group" { traces = [var.source, trace["support"]] }
-            }
-            trace "support" { input = "question" task "lookup" { output = "answer" } }
-        "#,
-        )
-        .unwrap();
-        let DatasetSource::Trace(id) = model.datasets[0].cases[0].source else {
-            panic!("trace source")
-        };
-        assert!(
-            matches!(model.refs[id.0 as usize].accessor, Accessor::Block { node, kind: "trace" } if node == model.traces[0].node)
-        );
-    }
-    #[test]
-    fn validates_resolved_source_types() {
-        for source in [
-            r#"trace = trace["support"].input"#,
-            r#"trace = trace["support"].task["lookup"]"#,
-            r#"span = trace["support"]"#,
-            r#"traces = [trace["support"], trace["support"].input]"#,
-            r#"input = trace["support"]"#,
-            r#"trace = "support""#,
-        ] {
-            let module = format!(
-                r#"trace "support" {{ input = "question" task "lookup" {{ output = "answer" }} }} dataset "cases" {{ case "bad" {{ {source} }} }}"#
-            );
-            assert!(compile(&module).is_err(), "{source}");
-        }
-    }
-    #[test]
-    fn bracket_selection_handles_field_names_as_block_names() {
-        compile(r#"vars { source = trace["input"] } dataset "cases" { case "whole" { trace = var.source } } trace "input" { input = 1 }"#).unwrap();
-    }
-    #[test]
-    fn collections_preserve_reference_targets_through_variables() {
-        compile(r#"vars { sources = [trace["support"], trace["support"]] } trace "support" {} dataset "cases" { case "group" { traces = var.sources } }"#).unwrap();
-    }
-    #[test]
-    fn validates_unused_identity_aliases() {
-        assert!(compile(r#"vars { source = trace["missing"] } trace "actual" {}"#).is_err());
-    }
-    #[test]
-    fn module_field_alias_cycles_fail_during_modeling() {
-        assert!(compile(r#"vars { question = trace["support"].input } trace "support" { input = var.question } dataset "cases" { case "inline" { input = var.question } }"#).is_err());
     }
 }

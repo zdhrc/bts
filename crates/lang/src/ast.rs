@@ -1,34 +1,195 @@
 use crate::diag::SrcRange;
 use std::fmt;
 
-/// The parsed declarations of a module, before semantic validation.
+/// Candidate graph paths before semantic validation.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Ast {
-    /// Declarations in source order.
-    pub decls: Vec<Decl>,
+pub struct GraphDocument {
+    /// Definition statements in source order.
+    pub definitions: Vec<Definition>,
+    /// Root paths in source order.
+    pub paths: Vec<GraphPath>,
 }
 
-/// A block or field assignment as written in source.
+/// A `+` statement defining one kind or trait.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Decl {
-    /// A nested block declaration.
-    Block(Block),
-    /// A named field assignment.
-    Attr(Attr),
+pub struct Definition {
+    /// The defined name, its construct, property descriptors and field descriptors.
+    pub head: GraphNodeDecl,
+    /// Relationship edges, before checking that each one starts at the head.
+    pub steps: Vec<GraphStep>,
+    /// Complete statement location.
+    pub range: SrcRange,
 }
 
-/// A parsed block whose keyword, fields, and placement have not been validated.
+/// A path with its structural attachment preserved.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Block {
-    /// The block keyword as written, without checking whether it is supported.
+pub struct GraphPath {
+    /// The node, selector or junction introducing this path.
+    pub start: GraphOrigin,
+    /// Connections in source order.
+    pub steps: Vec<GraphStep>,
+    /// The path range, including the terminator for a root statement.
+    pub range: SrcRange,
+}
+
+/// The authoring position at the start of a path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphOrigin {
+    /// A root node declaration or reference.
+    Node(GraphNode),
+    /// A reference selecting a target of the enclosing fork.
+    Selector(Expr),
+    /// A junction combining explicitly listed incoming edges.
+    Junction(GraphJunction),
+}
+
+/// A connection or split from the current node.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphStep {
+    /// An ordinary or cycle connection.
+    Edge(GraphEdgeStep),
+    /// A typed fork with structurally attached continuations.
+    Fork(GraphFork),
+    /// Aligned continuation lines, each a chain starting from the current node.
+    Arms(Vec<Vec<GraphStep>>),
+}
+
+/// A typed fork and the paths attached to it by layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphFork {
+    /// The authored name, kind and properties.
+    pub header: GraphHeader,
+    /// Each entry contains exactly one connection step.
+    pub entries: Vec<GraphEdgeStep>,
+    /// Sibling selectors and junctions, never implicit connections to each other.
+    pub continuations: Vec<GraphPath>,
+    /// The complete fork range, including attached paths.
+    pub range: SrcRange,
+}
+
+/// A convergence point with exact edge references and an explicit destination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphJunction {
+    /// Required junction kind.
     pub kind: String,
-    /// The name written in source.
+    /// The source range of the kind name.
+    pub kind_range: SrcRange,
+    /// Qualified or unqualified references to input edges.
+    pub inputs: Vec<Expr>,
+    /// Configuration properties separate from the destination node.
+    pub props: Option<Vec<Attr>>,
+    /// The destination declaration or reference.
+    pub target: GraphNode,
+    /// The junction range, including its destination.
+    pub range: SrcRange,
+}
+
+/// A node declaration or a reference to an existing node.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphNode {
+    /// A new node with separate properties and content fields.
+    Declaration(GraphNodeDecl),
+    /// A node reference expression, without resolving its target.
+    Reference(Expr),
+}
+
+/// A typed node and its optional content body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphNodeDecl {
+    /// The authored name, kind and properties.
+    pub header: GraphHeader,
+    /// Content fields, distinct from properties.
+    pub body: Option<Vec<Attr>>,
+    /// The declaration range, including its body when present.
+    pub range: SrcRange,
+}
+
+/// A typed graph element header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphHeader {
+    /// The optional identifier or plain quoted name.
     pub name: Option<String>,
-    /// The name literal’s source range, if the block is named.
+    /// The source range of the authored name.
     pub name_range: Option<SrcRange>,
-    /// Declarations in source order.
-    pub decls: Vec<Decl>,
-    /// The expression’s byte range in the original source.
+    /// The required kind, before checking its contract.
+    pub kind: String,
+    /// The source range of the kind name.
+    pub kind_range: SrcRange,
+    /// Configuration fields, absent when no property object was written.
+    pub props: Option<Vec<Attr>>,
+    /// The header range, excluding surrounding graph delimiters.
+    pub range: SrcRange,
+}
+
+/// One connection step, possibly declaring multiple edges with the same endpoints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphEdgeStep {
+    /// Authored edge headers in source order.
+    pub edges: Vec<GraphHeader>,
+    /// Whether the connection is directed or undirected.
+    pub direction: crate::model::Direction,
+    /// Whether this step uses explicit cycle punctuation.
+    pub cycle: bool,
+    /// The destination declaration or reference.
+    pub target: GraphNode,
+    /// The connector and destination range.
+    pub range: SrcRange,
+}
+
+/// The graph boundary used for a reference expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphReferenceKind {
+    /// Parentheses select a node.
+    Node,
+    /// Brackets select an edge or fork.
+    Edge,
+}
+
+/// A path pattern that selects one existing node or edge.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphPattern {
+    /// The initial node reference or constraint.
+    pub start: GraphPatternNode,
+    /// Connections that constrain the matching path.
+    pub steps: Vec<GraphPatternStep>,
+    /// The complete pattern range, including its enclosing punctuation.
+    pub range: SrcRange,
+}
+
+/// An existing node reference or a node constrained by kind and properties.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphPatternNode {
+    /// A node-valued reference, without creating a node.
+    Reference(Expr),
+    /// A node match, optionally marked as the selected result.
+    Constraint(GraphPatternConstraint),
+}
+
+/// A kind and optional properties that constrain an existing graph element.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphPatternConstraint {
+    /// Whether the authored marker selects this element as the result.
+    pub selected: bool,
+    /// The required node or edge kind.
+    pub kind: String,
+    /// Authored property constraints, without evaluating them.
+    pub props: Option<Vec<Attr>>,
+    /// The constraint range, excluding its surrounding delimiters.
+    pub range: SrcRange,
+}
+
+/// An ordinary or cycle connection within a reference pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphPatternStep {
+    /// Edge constraints sharing the same endpoints.
+    pub edges: Vec<GraphPatternConstraint>,
+    /// Whether the connection is directed or undirected.
+    pub direction: crate::model::Direction,
+    /// Whether this step uses explicit cycle punctuation.
+    pub cycle: bool,
+    /// The destination reference or constraint.
+    pub target: GraphPatternNode,
+    /// The connection and destination range.
     pub range: SrcRange,
 }
 
@@ -55,6 +216,24 @@ pub struct Expr {
 /// The structure of an expression before names and types are checked.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExprKind {
+    /// A required incoming field value, legal only on instance fields.
+    Upstream,
+    /// A path-pattern reference selecting an existing graph element.
+    PatternRef(Box<GraphPattern>),
+    /// An explicit graph reference whose identity is resolved later.
+    GraphRef {
+        /// The authored graph boundary.
+        kind: GraphReferenceKind,
+        /// A name or expression denoting the referenced element.
+        target: Box<Expr>,
+    },
+    /// A graph member selected with a bracketed name after a dot.
+    GraphMember {
+        /// The graph value being qualified.
+        target: Box<Expr>,
+        /// The authored member name.
+        name: String,
+    },
     /// A string value.
     Str(String),
     /// Text containing interpolated values.

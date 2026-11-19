@@ -1,4 +1,5 @@
 use crate::dsl::Diags;
+use bts_core::providers::Contributor as _;
 use std::fmt;
 
 // keep the original source and locations until the cli renders the failure
@@ -25,7 +26,12 @@ impl fmt::Display for SourceDiags {
             if index > 0 {
                 formatter.write_str("\n")?;
             }
-            formatter.write_str(&diag.render(&self.source_name, &self.source))?;
+            // a source index past zero is one of the provider's definition sources
+            let (name, source) = match crate::providers::SELECTED.schema().definition(diag.r#where.source) {
+                Some(definition) => (definition.name, definition.text),
+                None => (self.source_name.as_str(), self.source.as_str()),
+            };
+            formatter.write_str(&diag.render(name, source))?;
         }
         Ok(())
     }
@@ -55,10 +61,11 @@ pub fn build_error(error: &crate::code::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bts_core::providers::Provider as _;
 
     #[test]
     fn preserves_language_diagnostics_until_rendering() {
-        let source = "trace \"run\" {\n\toutput = }";
+        let source = "(run:task) {\n\toutput: }";
         let diags = crate::dsl::semantics::compile(source).unwrap_err();
         let expected = diags
             .iter()
@@ -69,6 +76,17 @@ mod tests {
         assert_eq!(report.diags, diags);
         assert_eq!(report.source, source);
         assert_eq!(report.to_string(), expected);
+    }
+
+    #[test]
+    fn provider_definition_conflicts_point_to_the_user_declaration() {
+        let source = "+(span:node);";
+        let errors = crate::providers::SELECTED.compile_module(source, false).unwrap_err();
+        let report = SourceDiags::new("shape.bt", source, errors).to_string();
+        assert!(report.contains("shape.bt:"));
+        assert!(!report.contains("braintrust.bt:"));
+        assert!(report.contains("duplicate kind or trait name"));
+        assert!(report.contains("+(span:node"));
     }
 
     #[test]

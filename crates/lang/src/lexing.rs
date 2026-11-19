@@ -5,13 +5,15 @@ use std::{fmt, iter::Peekable, str::CharIndices};
 pub(super) struct Token {
     pub kind: TokenKind,
     pub range: SrcRange,
+    pub line_start: usize,
 }
 
 impl Token {
     fn new(kind: TokenKind, start: usize, end: usize) -> Self {
         Self {
             kind,
-            range: SrcRange { start, end },
+            range: SrcRange::new(start, end),
+            line_start: 0,
         }
     }
 }
@@ -26,12 +28,22 @@ pub(super) enum TokenKind {
     RBrack,
     LParen,
     RParen,
+    Pipe,
 
     Comma,
     Dot,
     Ellipsis,
     Equals,
     FatArrow,
+    Arrow,
+    CycleArrow,
+    Upstream,
+    Tilde,
+    Junction,
+    PatternOpen,
+    PatternClose,
+    At,
+    Semicolon,
 
     Plus,
     Minus,
@@ -90,10 +102,24 @@ impl<'src> Lexer<'src> {
         }
         tokens.push(Token::new(TokenKind::Eof, self.src.len(), self.src.len()));
 
+        // retain physical line boundaries without treating value indentation as graph layout
+        let mut newlines = self.src.match_indices('\n').peekable();
+        let mut line_start = 0;
+        for token in &mut tokens {
+            while let Some(&(offset, _)) = newlines.peek() {
+                if offset >= token.range.start {
+                    break;
+                }
+                line_start = offset + 1;
+                newlines.next();
+            }
+            token.line_start = line_start;
+        }
+
         if errors.is_empty() { Ok(tokens) } else { Err(errors) }
     }
 
-    // lexes the token starting at an already-consumed char; strings append
+    // lexes the token starting at an already-consumed char, strings append
     // several tokens when interpolations flatten them
     fn lex_token(&mut self, idx: usize, ch: char, tokens: &mut Tokens, errors: &mut Errors) {
         match ch {
@@ -101,13 +127,23 @@ impl<'src> Lexer<'src> {
             // parenbraceckets
             '{' => tokens.push(Token::new(TokenKind::LBrace, idx, idx + ch.len_utf8())),
             '}' => tokens.push(Token::new(TokenKind::RBrace, idx, idx + ch.len_utf8())),
-            '[' => tokens.push(Token::new(TokenKind::LBrack, idx, idx + ch.len_utf8())),
+            '[' => tokens.push(Token::new(TokenKind::LBrack, idx, idx + 1)),
             ']' => tokens.push(Token::new(TokenKind::RBrack, idx, idx + ch.len_utf8())),
             '(' => tokens.push(Token::new(TokenKind::LParen, idx, idx + ch.len_utf8())),
             ')' => tokens.push(Token::new(TokenKind::RParen, idx, idx + ch.len_utf8())),
 
             // punctuation
             ',' => tokens.push(Token::new(TokenKind::Comma, idx, idx + ch.len_utf8())),
+            ';' => tokens.push(Token::new(TokenKind::Semicolon, idx, idx + 1)),
+            '@' => tokens.push(Token::new(TokenKind::At, idx, idx + 1)),
+            '~' => match self.lex_trailing('>') {
+                Some(end) => tokens.push(Token::new(TokenKind::CycleArrow, idx, end)),
+                None => tokens.push(Token::new(TokenKind::Tilde, idx, idx + 1)),
+            },
+            '$' if matches!(self.peek(), Some((_, '{'))) => {
+                self.next();
+                self.lex_interpolation(idx, None, tokens, errors);
+            }
             // ... spreads, a lone .. stays two dots so diagnostics point at real tokens
             '.' => {
                 if matches!(self.peek(), Some((_, '.'))) {
@@ -126,7 +162,10 @@ impl<'src> Lexer<'src> {
 
             // operators, = peeks for == and so on
             '+' => tokens.push(Token::new(TokenKind::Plus, idx, idx + ch.len_utf8())),
-            '-' => tokens.push(Token::new(TokenKind::Minus, idx, idx + ch.len_utf8())),
+            '-' => match self.lex_trailing('>') {
+                Some(end) => tokens.push(Token::new(TokenKind::Arrow, idx, end)),
+                None => tokens.push(Token::new(TokenKind::Minus, idx, idx + 1)),
+            },
             '*' => tokens.push(Token::new(TokenKind::Star, idx, idx + ch.len_utf8())),
             '/' => {
                 if matches!(self.peek(), Some((_, '/'))) {
@@ -137,7 +176,13 @@ impl<'src> Lexer<'src> {
             }
             '#' => self.skip_comment(),
             '%' => tokens.push(Token::new(TokenKind::Percent, idx, idx + ch.len_utf8())),
-            '?' => tokens.push(Token::new(TokenKind::Question, idx, idx + ch.len_utf8())),
+            '?' => match self.lex_trailing('<') {
+                Some(end) => {
+                    tokens.push(Token::new(TokenKind::PatternOpen, idx, end));
+                    self.lex_pattern(idx, tokens, errors);
+                }
+                None => tokens.push(Token::new(TokenKind::Question, idx, idx + 1)),
+            },
             ':' => tokens.push(Token::new(TokenKind::Colon, idx, idx + ch.len_utf8())),
             '=' => match self.lex_paired(ch) {
                 Some(end) => tokens.push(Token::new(TokenKind::EqEq, idx, end)),
@@ -150,6 +195,10 @@ impl<'src> Lexer<'src> {
                 Some(end) => tokens.push(Token::new(TokenKind::NotEq, idx, end)),
                 None => tokens.push(Token::new(TokenKind::Bang, idx, idx + ch.len_utf8())),
             },
+            '<' if matches!(self.peek(), Some((_, '-'))) => {
+                let end = self.lex_trailing('-').expect("peeked character is present");
+                tokens.push(Token::new(TokenKind::Upstream, idx, end));
+            }
             '<' => match self.heredoc_intro(idx) {
                 Some((delimiter, dedent, intro_end)) => {
                     // the first < is consumed, eat the rest of the introducer
@@ -163,12 +212,21 @@ impl<'src> Lexer<'src> {
                     None => tokens.push(Token::new(TokenKind::Lt, idx, idx + ch.len_utf8())),
                 },
             },
+            '>' if matches!(self.peek(), Some((_, '>'))) => {
+                let end = self.lex_trailing('>').expect("peeked character is present");
+                tokens.push(Token::new(TokenKind::Junction, idx, end));
+            }
             '>' => match self.lex_trailing('=') {
                 Some(end) => tokens.push(Token::new(TokenKind::GtEq, idx, end)),
                 None => tokens.push(Token::new(TokenKind::Gt, idx, idx + ch.len_utf8())),
             },
 
-            // & and | only exist doubled
+            // the last edge reference and a junction close meet as ||>>
+            '|' if self.src[idx..].starts_with("||>>") => {
+                self.next();
+                tokens.push(Token::new(TokenKind::Pipe, idx, idx + 1));
+                tokens.push(Token::new(TokenKind::Pipe, idx + 1, idx + 2));
+            }
             '&' => match self.lex_paired(ch) {
                 Some(end) => tokens.push(Token::new(TokenKind::AmpAmp, idx, end)),
                 None => {
@@ -180,12 +238,7 @@ impl<'src> Lexer<'src> {
             },
             '|' => match self.lex_paired(ch) {
                 Some(end) => tokens.push(Token::new(TokenKind::PipePipe, idx, end)),
-                None => {
-                    errors.push(Error::new(
-                        ErrorKind::UnpairedOperator(ch),
-                        SrcRange::new(idx, idx + ch.len_utf8()),
-                    ));
-                }
+                None => tokens.push(Token::new(TokenKind::Pipe, idx, idx + 1)),
             },
 
             // ident:
@@ -208,7 +261,7 @@ impl<'src> Lexer<'src> {
                         }
                         c if c.is_whitespace() => break,
                         '{' | '}' | '[' | ']' | '(' | ')' | ',' | '.' | '=' | '"' | '-' | '+' | '*' | '/' | '%' | '<' | '>'
-                        | '!' | '&' | '|' | '?' | ':' | '#' => break,
+                        | '!' | '&' | '|' | '?' | ':' | '#' | ';' | '~' | '@' | '$' => break,
                         _ => {
                             errors.push(Error::new(
                                 ErrorKind::InvalidIdentToken,
@@ -254,6 +307,42 @@ impl<'src> Lexer<'src> {
         while matches!(self.peek(), Some((_, ch)) if ch != '\n') {
             self.next();
         }
+    }
+
+    // the outer angle closes a pattern, arrows and nested values keep their own tokens
+    fn lex_pattern(&mut self, start: usize, tokens: &mut Tokens, errors: &mut Errors) {
+        let mut boundaries = Vec::new();
+        while let Some((idx, ch)) = self.next() {
+            if ch == '>' && boundaries.is_empty() {
+                tokens.push(Token::new(TokenKind::PatternClose, idx, idx + 1));
+                return;
+            }
+            let closer = match ch {
+                '(' => {
+                    boundaries.push(')');
+                    None
+                }
+                '[' => {
+                    boundaries.push(']');
+                    None
+                }
+                '{' => {
+                    boundaries.push('}');
+                    None
+                }
+                ')' | ']' | '}' => Some(ch),
+                '|' if matches!(self.peek(), Some((_, ']'))) => Some(']'),
+                _ => None,
+            };
+            if closer.is_some() && boundaries.last().copied() == closer {
+                boundaries.pop();
+            }
+            self.lex_token(idx, ch, tokens, errors);
+        }
+        errors.push(Error::new(
+            ErrorKind::UnterminatedPattern,
+            SrcRange::new(start, self.src.len()),
+        ));
     }
 
     fn lex_string(&mut self, start: usize, tokens: &mut Tokens, errors: &mut Errors) {
@@ -322,8 +411,7 @@ impl<'src> Lexer<'src> {
         Some((delimiter, dedent, intro_end))
     }
 
-    // the closing delimiter must sit alone on its line; its leading whitespace is
-    // stripped from every content line, and the newline before it is dropped
+    // strip shared content indentation and drop the newline before the closing line
     fn lex_multiline_string(&mut self, start: usize, tokens: &mut Tokens, errors: &mut Errors) {
         let content_from = start + TRIPLE_QUOTE.len();
         let Some(closing) = self.src[content_from..].find(TRIPLE_QUOTE).map(|found| content_from + found) else {
@@ -341,14 +429,13 @@ impl<'src> Lexer<'src> {
             .rfind('\n')
             .map(|newline| newline + '\n'.len_utf8())
             .filter(|line| *line >= content_from);
-        let indent = match closing_line {
-            Some(line) if self.src[line..closing].chars().all(char::is_whitespace) => &self.src[line..closing],
+        match closing_line {
+            Some(line) if self.src[line..closing].chars().all(char::is_whitespace) => {}
             Some(_) => {
                 errors.push(Error::new(
                     ErrorKind::ContentBeforeMultilineCloser,
                     SrcRange::new(closing, end),
                 ));
-                ""
             }
             // both delimiters share a line
             None => {
@@ -356,7 +443,6 @@ impl<'src> Lexer<'src> {
                     ErrorKind::ContentAfterMultilineOpener,
                     SrcRange::new(content_from, closing),
                 ));
-                ""
             }
         };
 
@@ -366,9 +452,11 @@ impl<'src> Lexer<'src> {
             true
         };
         let mut pieces = StringPieces::default();
+        let content_start = self.peek().map_or(closing, |(offset, _)| offset);
+        let indent = common_indent(&self.src[content_start..closing_line.unwrap_or(closing)]);
         self.scan_multiline(closing, indent, true, at_line_start, &mut pieces, errors);
 
-        // consume the closing quotes; the newline before their line is not part of the value
+        // consume the closing quotes, the newline before their line is not part of the value
         self.next();
         self.next();
         self.next();
@@ -377,8 +465,8 @@ impl<'src> Lexer<'src> {
         pieces.emit(SrcRange::new(start, content_from), SrcRange::new(closing, end), tokens);
     }
 
-    // content runs from the next line to the first line holding only the delimiter
-    // word; << keeps lines verbatim, <<- strips their longest shared indentation,
+    // a delimiter line may end with a comma, which stays outside the string
+    // << keeps lines verbatim, <<- strips their longest shared indentation,
     // and either way the newline ending the last content line stays in the value
     fn lex_heredoc(
         &mut self,
@@ -414,7 +502,8 @@ impl<'src> Lexer<'src> {
                 .find('\n')
                 .map_or(self.src.len(), |newline| line_start + newline);
             let line = &self.src[line_start..line_end];
-            if line.trim() == delimiter {
+            let trimmed = line.trim();
+            if trimmed == delimiter || trimmed.strip_suffix(',').is_some_and(|word| word.trim_end() == delimiter) {
                 let leading = line.len() - line.trim_start().len();
                 closer = Some((line_start, line_start + leading + delimiter.len()));
                 break;
@@ -447,7 +536,7 @@ impl<'src> Lexer<'src> {
         pieces.emit(SrcRange::new(start, intro_end), SrcRange::new(closer_start, end), tokens);
     }
 
-    // only whitespace may follow a multi-line opener on its line; content found
+    // only whitespace may follow a multi-line opener on its line, content found
     // there is lexed as-is, mid-line, so it doesn't also trip the indent check
     fn scan_opener_line(&mut self, errors: &mut Errors) -> bool {
         loop {
@@ -472,7 +561,7 @@ impl<'src> Lexer<'src> {
     }
 
     // drives multi-line content up to the closing delimiter's line at stop,
-    // stripping indent at line starts; strict rejects underindented lines
+    // stripping indent at line starts, strict rejects underindented lines
     fn scan_multiline(
         &mut self,
         stop: usize,
@@ -560,9 +649,9 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    // scans a ${...} hole, open = idx of $ and ${ is already eaten; contents lex
+    // scans a ${...} hole, open = idx of $ and ${ is already eaten, contents lex
     // as ordinary tokens between InterpOpen and InterpClose markers, strings
-    // included (quoted segments like llm["Chat Completion"]); multi-line holes
+    // included (quoted segments like llm["Chat Completion"]), multi-line holes
     // still end on a newline or the delimiter at stop
     fn lex_interpolation(&mut self, open: usize, stop: Option<usize>, tokens: &mut Tokens, errors: &mut Errors) -> usize {
         tokens.push(Token::new(TokenKind::InterpOpen, open, open + "${".len()));
@@ -651,7 +740,7 @@ impl<'src> Lexer<'src> {
     }
 }
 
-// accumulates one string's scanned pieces; without a hole they collapse back
+// accumulates one string's scanned pieces, without a hole they collapse back
 // into a single String token, with one they emit flat as TemplateOpen, chunk
 // and hole tokens, TemplateClose
 #[derive(Debug, Default)]
@@ -703,11 +792,13 @@ impl StringPieces {
             tokens.push(Token {
                 kind: TokenKind::TemplateOpen,
                 range: open,
+                line_start: 0,
             });
             tokens.append(&mut self.tokens);
             tokens.push(Token {
                 kind: TokenKind::TemplateClose,
                 range: close,
+                line_start: 0,
             });
         }
     }
@@ -763,6 +854,7 @@ pub(super) enum ErrorKind {
     ContentBeforeMultilineCloser,
     UnderindentedMultilineLine,
     UnterminatedInterpolation,
+    UnterminatedPattern,
     InvalidNumber,
     UnpairedOperator(char),
 }
@@ -781,6 +873,7 @@ impl fmt::Display for ErrorKind {
             }
             Self::UnderindentedMultilineLine => formatter.write_str("line is indented less than the closing \"\"\""),
             Self::UnterminatedInterpolation => formatter.write_str("unterminated interpolation"),
+            Self::UnterminatedPattern => formatter.write_str("unterminated pattern reference"),
             Self::InvalidNumber => formatter.write_str("invalid number"),
             Self::UnpairedOperator(op) => write!(formatter, "stray `{op}`; did you mean `{op}{op}`?"),
         }
@@ -824,6 +917,120 @@ impl From<Error> for Diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lexes_graph_punctuation_with_exact_ranges() {
+        let source = "-> ~> ~ >> ?<> @ ; [ ] => <-";
+        let tokens = Lexer::new(source).lex().unwrap();
+        let expected = [
+            (TokenKind::Arrow, "->"),
+            (TokenKind::CycleArrow, "~>"),
+            (TokenKind::Tilde, "~"),
+            (TokenKind::Junction, ">>"),
+            (TokenKind::PatternOpen, "?<"),
+            (TokenKind::PatternClose, ">"),
+            (TokenKind::At, "@"),
+            (TokenKind::Semicolon, ";"),
+            (TokenKind::LBrack, "["),
+            (TokenKind::RBrack, "]"),
+            (TokenKind::FatArrow, "=>"),
+            (TokenKind::Upstream, "<-"),
+        ];
+        assert_eq!(tokens.len(), expected.len() + 1);
+        for (token, (kind, spelling)) in tokens.iter().zip(expected) {
+            assert_eq!(token.kind, kind);
+            assert_eq!(&source[token.range.start..token.range.end], spelling);
+        }
+    }
+
+    #[test]
+    fn distinguishes_arrays_references_indexes_and_logical_or() {
+        let source = "[] [a||b,|edge|,xs[0]]";
+        let kinds: Vec<_> = Lexer::new(source).lex().unwrap().into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::LBrack,
+                TokenKind::RBrack,
+                TokenKind::LBrack,
+                TokenKind::Ident("a".into()),
+                TokenKind::PipePipe,
+                TokenKind::Ident("b".into()),
+                TokenKind::Comma,
+                TokenKind::Pipe,
+                TokenKind::Ident("edge".into()),
+                TokenKind::Pipe,
+                TokenKind::Comma,
+                TokenKind::Ident("xs".into()),
+                TokenKind::LBrack,
+                TokenKind::Number("0".into()),
+                TokenKind::RBrack,
+                TokenKind::RBrack,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn separates_a_junction_close_from_the_last_edge_reference() {
+        let tokens = Lexer::new("|edge||>> a || b").lex().unwrap();
+        let kinds: Vec<_> = tokens.into_iter().map(|token| token.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Pipe,
+                TokenKind::Ident("edge".into()),
+                TokenKind::Pipe,
+                TokenKind::Pipe,
+                TokenKind::Junction,
+                TokenKind::Ident("a".into()),
+                TokenKind::PipePipe,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_nested_expression_groups_and_template_expressions() {
+        let source = r#"${{value: ${1 + 2}}.value} "Mode ${ready ? "yes" : hex(8)}""#;
+        let tokens = Lexer::new(source).lex().unwrap();
+        assert_eq!(tokens.iter().filter(|t| t.kind == TokenKind::InterpOpen).count(), 3);
+        assert_eq!(tokens.iter().filter(|t| t.kind == TokenKind::InterpClose).count(), 3);
+        assert_eq!(tokens[0].range, SrcRange::new(0, 2));
+        assert_error_kinds("${1", &[ErrorKind::UnterminatedInterpolation]);
+        assert_error_kinds("$", &[ErrorKind::UnknownToken]);
+    }
+
+    #[test]
+    fn retains_layout_positions_across_comments_strings_and_crlf() {
+        let source = "(a)\r\n    # comment\r\n    -|:next|->(b) {text: \"é\"}\r\n        ->(b);";
+        let tokens = Lexer::new(source).lex().unwrap();
+        for token in &tokens {
+            let expected = source[..token.range.start].rfind('\n').map_or(0, |i| i + 1);
+            assert_eq!(token.line_start, expected);
+        }
+        let selector = tokens.iter().rev().find(|t| t.kind == TokenKind::Arrow).unwrap();
+        assert_eq!(&source[selector.line_start..selector.range.start], "        ");
+    }
+
+    #[test]
+    fn leaves_heredoc_separator_for_the_next_token() {
+        let source = "<<-TEXT\n    hello\nTEXT,\nnext";
+        let tokens = Lexer::new(source).lex().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::String("hello\n".into()));
+        assert_eq!(tokens[1].kind, TokenKind::Comma);
+        assert_eq!(&source[tokens[1].range.start..tokens[1].range.end], ",");
+        assert_eq!(tokens[2].kind, TokenKind::Ident("next".into()));
+    }
+
+    #[test]
+    fn lexes_compilation_fixture() {
+        let source = include_str!("../tests/fixtures/compilation.bt");
+        let tokens = lex(source).expect("compilation fixture must lex without diagnostics");
+        assert_eq!(tokens.last().unwrap().kind, TokenKind::Eof);
+        assert_eq!(tokens.last().unwrap().range.start, source.len());
+    }
 
     #[track_caller]
     fn assert_error_kinds(src: &str, want: &[ErrorKind]) {
@@ -992,9 +1199,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unpaired_logical_operators() {
+    fn rejects_unpaired_ampersands() {
         assert_error_kinds("a & b", &[ErrorKind::UnpairedOperator('&')]);
-        assert_error_kinds("a | b", &[ErrorKind::UnpairedOperator('|')]);
 
         let errors = Lexer::new("a & b").lex().unwrap_err();
         assert_eq!(errors[0].range(), SrcRange::new(2, 3));
@@ -1254,12 +1460,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_underindented_multiline_lines() {
+    fn dedents_multiline_content_independently_of_the_closer() {
         let src = "\"\"\"\n  a\n b\n  \"\"\"";
-        assert_error_kinds(src, &[ErrorKind::UnderindentedMultilineLine]);
+        let tokens = Lexer::new(src).lex().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::String(" a\nb".to_owned()));
 
-        let errors = Lexer::new(src).lex().unwrap_err();
-        assert_eq!(errors[0].range(), SrcRange::new(9, 10));
+        let tokens = Lexer::new("\"\"\"\n    a\n      b\n\"\"\",").lex().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::String("a\n  b".to_owned()));
+        assert_eq!(tokens[1].kind, TokenKind::Comma);
     }
 
     #[test]
@@ -1364,7 +1572,7 @@ mod tests {
 
     #[test]
     fn points_invalid_ident_diagnostics_at_the_offending_character() {
-        let errors = Lexer::new("foo$bar = 1").lex().unwrap_err();
+        let errors = Lexer::new("foo`bar = 1").lex().unwrap_err();
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind(), ErrorKind::InvalidIdentToken);

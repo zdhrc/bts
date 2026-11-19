@@ -1,47 +1,62 @@
-# a session with variable turns, a selected route, and an optional handoff
-vars { product = "billing" }
-
-trace "support-session" {
-    vars { turns = range(2, 4) }
-    input = { request = "Where is my order?", customer = "acct-42" }
-    output = repeat.turns[var.turns - 1].task.turn.output
-    metadata = { product = var.product, escalated = maybe.escalation.included }
-    tags = ["support", "orders"]
-
-    repeat "turns" {
-        count = var.turns
-
-        task "turn" {
-            input = { index = repeat.index, request = trace.input.request }
-            output = format("answer {}", repeat.index)
-
-            llm "draft" {
-                input = task.turn.input
-                output = { role = "assistant", content = task.turn.output }
-                metadata = { model = "gpt-4o-mini", provider = "openai" }
-                metrics = { prompt_tokens = 12, completion_tokens = 4,
-                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens }
-            }
-        }
-    }
-
-    choice "route" {
-        tool "lookup" {
-            input = trace.input
-            output = { status = "found" }
-        }
-
-        function "fallback" {
-            input = trace.input
-            output = { status = "deferred" }
-        }
-    }
-
-    maybe "escalation" {
-        chance = 0.5
-        task "handoff" {
-            input = trace.input
-            output = "queued"
-        }
-    }
+# a session with bounded turns, one route, and an optional handoff
+(session:task {name: "support-session"}) {
+    input: support.input,
+    local: {
+        turns: range(2, 4),
+        route: choice("lookup", "fallback"),
+        escalated: chance(0.5),
+    },
+    output: self.local.turns == 4 ? turn3.output : self.local.turns == 3 ? turn2.output : turn1.output,
+    metadata: {product: "billing", escalated: self.local.escalated},
+    tags: ["support", "orders"],
 }
+    =|:conditional|=>[
+        -|:calls {when: source.local.turns > 0}|->(turn0),
+        -|:calls {when: source.local.turns > 1}|->(turn1),
+        -|:calls {when: source.local.turns > 2}|->(turn2),
+        -|:calls {when: source.local.turns > 3}|->(turn3),
+    ];
+(session)
+    =|:exclusive|=>[
+        -|:calls {when: source.local.route == "lookup"}|->(lookup:tool) {input: session.input, output: {status: "found"}},
+        -|:calls {when: source.local.route == "fallback"}|->(fallback:function) {input: session.input, output: {status: "deferred"}},
+    ];
+(session)-|:calls {when: source.local.escalated}|->(handoff:task) {input: session.input, output: "queued"};
+(support:agent) {input: {request: "Where is my order?", customer: "acct-42"}, output: session.output};
+(support)-|:next|->(session);
+(turn0:task {name: "turn"}) {
+    input: {index: 0, request: session.input.request},
+    output: "answer 0",
+}-|:calls|->(draft0:llm {name: "draft"}) {
+    input: turn0.input,
+    output: {role: "assistant", content: turn0.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};
+(turn1:task {name: "turn"}) {
+    input: {index: 1, request: session.input.request},
+    output: "answer 1",
+}-|:calls|->(draft1:llm {name: "draft"}) {
+    input: turn1.input,
+    output: {role: "assistant", content: turn1.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};
+(turn2:task {name: "turn"}) {
+    input: {index: 2, request: session.input.request},
+    output: "answer 2",
+}-|:calls|->(draft2:llm {name: "draft"}) {
+    input: turn2.input,
+    output: {role: "assistant", content: turn2.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};
+(turn3:task {name: "turn"}) {
+    input: {index: 3, request: session.input.request},
+    output: "answer 3",
+}-|:calls|->(draft3:llm {name: "draft"}) {
+    input: turn3.input,
+    output: {role: "assistant", content: turn3.output},
+    metadata: {model: "gpt-4o-mini", provider: "openai"},
+    metrics: {prompt_tokens: 12, completion_tokens: 4, tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens},
+};

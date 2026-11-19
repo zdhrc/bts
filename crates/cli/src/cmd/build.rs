@@ -2,8 +2,9 @@ use crate::config::Settings;
 use crate::diag::SourceDiags;
 use crate::logging;
 use crate::providers::{AgentAdapter, CodeAdapter, braintrust};
-use crate::{code, dsl, selection};
+use crate::{code, selection};
 use bts_core::providers::CodeProvider;
+use bts_core::providers::Provider as _;
 use code::AgentTarget as _;
 use std::{env, fmt, fs, path::PathBuf};
 
@@ -53,10 +54,10 @@ enum Lang {
 }
 
 impl Lang {
-    fn into_model(self) -> dsl::ScorerLang {
+    fn into_model(self) -> bts_core::mocking::ScorerLang {
         match self {
-            Self::Python => dsl::ScorerLang::Python,
-            Self::Typescript => dsl::ScorerLang::Typescript,
+            Self::Python => bts_core::mocking::ScorerLang::Python,
+            Self::Typescript => bts_core::mocking::ScorerLang::Typescript,
         }
     }
 }
@@ -89,7 +90,7 @@ impl Args {
         if !self.select.is_empty() || self.seed.is_some() {
             return Err(BuildError::AgentOptions);
         }
-        let model = self.compile::<A>()?;
+        let (model, source) = self.compile::<A>()?;
         if model.scorers.is_empty() {
             return Err(BuildError::NoScorers);
         }
@@ -100,7 +101,11 @@ impl Args {
         let emitter = provider.emitter();
         let assembly = tracing::info_span!("assemble")
             .in_scope(|| code::assemble(&model.scorers, lang, &emitter, &target))
-            .map_err(BuildError::Plan)?;
+            .map_err(|error| match error {
+                // a function scorer code cannot run is a mistake in the shape, shown where it is called
+                code::AssemblyError::Unsupported(diags) => self.invalid(&source, diags),
+                error => BuildError::Plan(error),
+            })?;
         let files = code::writing::Directory::new(&self.out);
         let context = code::CodebaseContext {
             root: &self.out,
@@ -114,14 +119,22 @@ impl Args {
     where
         <A::Provider as CodeProvider>::Target: code::AgentTarget,
     {
-        let model = selection::agents(&self.compile::<A>()?, &self.select).map_err(BuildError::Selection)?;
-        let lang = self.lang.map(Lang::into_model).unwrap_or(dsl::ScorerLang::Python);
+        let (model, source) = self.compile::<A>()?;
+        let model = selection::agents(&model, &self.select).map_err(BuildError::Selection)?;
+        let lang = self
+            .lang
+            .map(Lang::into_model)
+            .unwrap_or(bts_core::mocking::ScorerLang::Python);
         let target = adapter
             .agent_target(&model, self.seed.unwrap_or(42))
             .map_err(BuildError::Adapter)?;
         let assembly = tracing::info_span!("assemble")
             .in_scope(|| adapter.assemble_agents(&model, lang, &target))
-            .map_err(BuildError::Agent)?;
+            .map_err(|error| match error {
+                // a function the agent cannot run is a mistake in the shape, shown where it is called
+                code::AgentError::Unsupported(diags) => self.invalid(&source, diags),
+                code::AgentError::Generation(reason) => BuildError::Agent(reason),
+            })?;
         let files = code::writing::Directory::new(&self.out);
         let context = code::CodebaseContext {
             root: &self.out,
@@ -133,17 +146,22 @@ impl Args {
         self.write(plan, adapter, model.scorers.len())
     }
 
-    fn compile<A: CodeAdapter>(&self) -> Result<dsl::Model, ExecutionError<A>> {
+    // the source is returned with the model so a later stage can show a mistake where it was written
+    fn compile<A: CodeAdapter>(&self) -> Result<(bts_core::mocking::Model, String), ExecutionError<A>> {
         let source = fs::read_to_string(&self.from).map_err(|source| BuildError::ReadShape {
             path: self.from.clone(),
             source,
         })?;
-        let source_name = self.from.display().to_string();
-        tracing::info_span!("compile")
-            .in_scope(|| dsl::semantics::compile(&source))
-            .map_err(|diags| BuildError::InvalidShape {
-                details: SourceDiags::new(&source_name, &source, diags),
-            })
+        let model = tracing::info_span!("compile")
+            .in_scope(|| crate::providers::SELECTED.compile_module(&source, false))
+            .map_err(|diags| self.invalid(&source, diags))?;
+        Ok((model, source))
+    }
+
+    fn invalid<A, E, T>(&self, source: &str, diags: crate::dsl::Diags) -> BuildError<A, E, T> {
+        BuildError::InvalidShape {
+            details: SourceDiags::new(&self.from.display().to_string(), source, diags),
+        }
     }
 
     fn write<A: CodeAdapter>(
@@ -328,10 +346,10 @@ mod tests {
     fn agent_selection_precedes_adapter_configuration_and_passes_the_seed() {
         struct SelectedAgent;
         impl CodeAdapter for SelectedAgent {
-            type Provider = bts_core::providers::braintrust::Bundle;
+            type Provider = crate::providers::Selected;
             type Error = std::io::Error;
             fn provider(&self) -> Self::Provider {
-                bts_core::providers::braintrust::Bundle
+                crate::providers::SELECTED
             }
             fn config(&self) -> Result<String, Self::Error> {
                 unreachable!()
@@ -343,7 +361,7 @@ mod tests {
         impl AgentAdapter for SelectedAgent {
             fn agent_target(
                 &self,
-                model: &dsl::Model,
+                model: &bts_core::mocking::Model,
                 seed: u64,
             ) -> Result<bts_core::providers::braintrust::mocking::code::CodeTarget, Self::Error> {
                 assert_eq!(model.agents.len(), 1);
@@ -357,13 +375,32 @@ mod tests {
         let path = std::env::temp_dir().join(format!("bts-agent-selection-{}.bt", uuid::Uuid::new_v4()));
         fs::write(
             &path,
-            r#"trace "standalone" { output = "hello" }
-               trace "unrelated" { output = "other" }
-               agent "standalone" { entrypoint = trace.standalone }
-               agent "unrelated" { entrypoint = trace.unrelated }
-               dataset "cases" { case "one" { input = "question" } }
-               scorer "quality" { code { score = 1 } }
-               experiment "unrelated" { task = trace.unrelated dataset = dataset.cases scorers = [scorer.quality] }"#,
+            r#"(agent_standalone:agent {name: "standalone"}) {input: null, output: standalone.output};
+(agent_standalone)-|:next|->(standalone);
+(standalone:task) {
+    output: "hello",
+    input: agent_standalone.input
+};
+(agent_unrelated:agent {name: "unrelated"}) {input: null, output: unrelated.output};
+(agent_unrelated)-|:next|->(unrelated);
+(unrelated:task) {
+    output: "other",
+    input: agent_unrelated.input
+};
+(cases:dataset) {
+    cases: [(one)]
+};
+(one:case) {
+    input: "question"
+};
+(quality:scorer) {
+    score: 1
+};
+(experiment_unrelated:experiment {name: "unrelated"}) {
+    task: (unrelated),
+    dataset: (cases),
+    scorers: [(quality)]
+};"#,
         )
         .unwrap();
         let cli = TestCli::parse_from([
@@ -404,10 +441,10 @@ mod tests {
     fn scorer_execution_accepts_an_adapter_without_agent_support() {
         struct ScorerOnly;
         impl CodeAdapter for ScorerOnly {
-            type Provider = bts_core::providers::braintrust::Bundle;
+            type Provider = crate::providers::Selected;
             type Error = std::io::Error;
             fn provider(&self) -> Self::Provider {
-                bts_core::providers::braintrust::Bundle
+                crate::providers::SELECTED
             }
             fn config(&self) -> Result<String, Self::Error> {
                 Err(std::io::Error::other("scorer settings"))
@@ -417,7 +454,13 @@ mod tests {
             }
         }
         let path = std::env::temp_dir().join(format!("bts-scorer-adapter-{}.bt", uuid::Uuid::new_v4()));
-        fs::write(&path, r#"scorer "quality" { code { score = 1 } }"#).unwrap();
+        fs::write(
+            &path,
+            r#"(quality:scorer) {
+    score: 1
+};"#,
+        )
+        .unwrap();
         let cli = TestCli::parse_from(["build", "--from", path.to_str().unwrap()]);
         let result = cli.args.execute(&ScorerOnly);
         fs::remove_file(path).unwrap();

@@ -201,3 +201,465 @@ mod tests {
         assert_eq!(Value::from(ordinary.clone()).project(&()).unwrap(), ordinary);
     }
 }
+
+/// Expressions evaluated by mock data and emitted by mock code.
+pub mod expr {
+    use crate::dsl::{BinOp, CtxRef, Number, RefId, ScorerArg, SrcRange, UnaryOp};
+
+    /// A compiled value or an expression left for a consumer to evaluate.
+    ///
+    /// Compilation folds expressions whose values are known. References, random
+    /// functions, and expressions depending on runtime data remain represented here.
+    /// This type does not provide an evaluator.
+    #[derive(Debug, Clone)]
+    pub enum Value {
+        /// A string value.
+        Str(String),
+        /// Text containing interpolated values.
+        Template(Template),
+        /// A numeric value.
+        Num(Number),
+        /// A boolean value.
+        Bool(bool),
+        /// An explicit null value.
+        Null,
+        /// An ordered collection.
+        Array(Array),
+        /// A collection of named entries.
+        Object(Object),
+        /// An attachment reference to be materialized by a consumer.
+        Attachment {
+            /// The attachment path written in source.
+            path: String,
+            /// The name to use when presenting the attachment.
+            filename: String,
+            /// The attachment media type.
+            content_type: String,
+            /// The attachment key used to connect payloads with uploads.
+            key: String,
+        },
+        /// A scoped variable resolved by name during evaluation.
+        VarRef(String),
+        /// A validated runtime context reference.
+        CtxRef(CtxRef),
+        /// An argument supplied when a scorer is invoked.
+        ArgRef(ScorerArg),
+        /// A block reference resolved through the owning model.
+        BlockRef {
+            /// The index of the resolved reference in [`crate::mocking::Model::refs`].
+            ref_id: RefId,
+            /// The expression’s byte range in the original source.
+            range: SrcRange,
+        },
+        /// A function call.
+        Func {
+            /// The function and its arguments.
+            func: Func,
+            /// The expression’s byte range in the original source.
+            range: SrcRange,
+        },
+        /// An operation with one operand.
+        Unary {
+            /// The operator applied to the operands.
+            op: UnaryOp,
+            /// The expression to which the operator applies.
+            operand: Box<Value>,
+            /// The expression’s byte range in the original source.
+            range: SrcRange,
+        },
+        /// An operation with two operands.
+        Binary {
+            /// The operator applied to the operands.
+            op: BinOp,
+            /// The left operand.
+            lhs: Box<Value>,
+            /// The right operand.
+            rhs: Box<Value>,
+            /// The expression’s byte range in the original source.
+            range: SrcRange,
+        },
+        /// A conditional expression that evaluates only the selected branch.
+        Cond {
+            /// The condition controlling this expression or branch.
+            cond: Box<Value>,
+            /// The expression evaluated when the condition is true.
+            then: Box<Value>,
+            /// The expression evaluated when the condition is false.
+            otherwise: Box<Value>,
+        },
+        /// An element selection.
+        Index {
+            /// The value to index, slice, or inspect.
+            target: Box<Value>,
+            /// The expression selecting an element.
+            index: Box<Value>,
+            /// The expression’s byte range in the original source.
+            range: SrcRange,
+        },
+        /// A selection between optional bounds.
+        Slice {
+            /// The value to index, slice, or inspect.
+            target: Box<Value>,
+            /// The inclusive lower bound, or `None` to start at the beginning.
+            start: Option<Box<Value>>,
+            /// The exclusive upper bound, or `None` to continue to the end.
+            end: Option<Box<Value>>,
+            /// The expression’s byte range in the original source.
+            range: SrcRange,
+        },
+    }
+
+    /// How a junction combines the arrivals of its inputs.
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    pub enum EmissionKind {
+        /// Every arrival fires on its own.
+        Merge,
+        /// The first arrival of a group fires and later ones are ignored.
+        First,
+        /// One arrival from every input fires together, in declared input order.
+        Accumulate,
+        /// The first arrivals from a number of distinct inputs fire together, in declared input order.
+        Quorum,
+        /// Every arrival of a group fires together when the group closes.
+        Reduce,
+    }
+
+    /// The arrivals of a junction and how they are grouped.
+    ///
+    /// Arrivals are taken round by round, and inside a round in branch order.
+    /// A group is the whole activation, or one correlation key when keys are given.
+    /// An accumulate group that closes with an input missing fails, and so does a
+    /// quorum group that closes short of its count.
+    #[derive(Debug, Clone)]
+    pub struct Emissions {
+        pub kind: EmissionKind,
+        /// The listed inputs in declared order.
+        pub inputs: Vec<EmissionInput>,
+        /// Positions into `inputs` in the order their branches run.
+        pub order: Vec<usize>,
+        /// The number of rounds. Without it there is one round and each input holds single values.
+        pub rounds: Option<Value>,
+        /// One correlation key for each round.
+        pub keys: Option<Value>,
+        /// The number of distinct inputs a quorum needs.
+        pub count: Option<Value>,
+    }
+
+    /// One listed input of a junction.
+    #[derive(Debug, Clone)]
+    pub struct EmissionInput {
+        /// The edge name or number reported in arrival records.
+        pub edge: Value,
+        /// Whether the input arrived, one value for each round. An absent expression always arrives.
+        pub arrived: Option<Value>,
+        /// The observed value, or null when the input observes nothing.
+        pub value: Option<Value>,
+        /// Whether `value` is one value shared by every round, not one value for each round.
+        pub shared: bool,
+    }
+
+    /// A validated function call whose result is computed by a consumer.
+    ///
+    /// Argument structure is checked during compilation. Runtime values can still
+    /// cause failures such as an invalid index or numeric overflow.
+    #[derive(Debug, Clone)]
+    pub enum Func {
+        /// Selects one eligible fork branch, or minus one when none qualify.
+        ForkPick(Vec<Vec<Value>>),
+        /// Requires every listed junction input before activating its target.
+        Arrivals { ready: Box<Value> },
+        /// Folds items into one value, starting from an initial value.
+        ///
+        /// The combine expression reads the running value through `FoldAccumulator`
+        /// and the current item through `FoldArrival`.
+        Fold {
+            items: Box<Value>,
+            initial: Box<Value>,
+            combine: Box<Value>,
+        },
+        /// The running value of the innermost fold.
+        FoldAccumulator,
+        /// The current item of the innermost fold.
+        FoldArrival,
+        /// Groups the arrivals of a junction into the emissions that activate its target.
+        ///
+        /// The result is an array of emissions in the order they fire. Each emission is
+        /// an array of arrival records with `edge` and `value` keys.
+        Emissions(Box<Emissions>),
+        /// Checks the value delivered to a schema-constrained field.
+        Check { value: Box<Value>, ty: bts_lang::FieldType },
+        /// A call to a function the provider supplies.
+        Provider {
+            /// The provider's implementations of the function.
+            function: &'static crate::mocking::Function,
+            /// Arguments in authored order.
+            args: Vec<Value>,
+        },
+        /// One selected alternative.
+        Choice(Vec<Value>),
+        /// A uniform sample between numeric bounds.
+        Range(Range),
+        /// A sample selected using relative weights.
+        Weighted(Vec<WeightedOption>),
+        /// A normal distribution sample.
+        Normal {
+            /// The distribution mean.
+            mean: f64,
+            /// The distribution standard deviation.
+            stddev: f64,
+        },
+        /// A lognormal distribution sample.
+        Lognormal {
+            /// The distribution median.
+            median: f64,
+            /// The standard deviation in logarithmic space.
+            sigma: f64,
+        },
+        /// An exponential distribution sample.
+        Exponential {
+            /// The distribution mean.
+            mean: f64,
+        },
+        /// A Pareto distribution sample.
+        Pareto {
+            /// The lower bound.
+            min: f64,
+            /// The Pareto shape parameter.
+            shape: f64,
+        },
+        /// A beta distribution sample.
+        Beta {
+            /// The first beta distribution parameter.
+            alpha: f64,
+            /// The second beta distribution parameter.
+            beta: f64,
+        },
+        /// A Poisson distribution sample.
+        Poisson {
+            /// The distribution mean.
+            mean: f64,
+        },
+        /// A boolean sampled with the given probability.
+        Chance {
+            /// The probability of returning true.
+            probability: f64,
+        },
+        /// Converts text to uppercase.
+        Upper {
+            /// The text expression to evaluate.
+            text: Box<Value>,
+        },
+        /// Converts text to lowercase.
+        Lower {
+            /// The text expression to evaluate.
+            text: Box<Value>,
+        },
+        /// Removes surrounding whitespace.
+        Trim {
+            /// The text expression to evaluate.
+            text: Box<Value>,
+        },
+        /// Replaces matching text.
+        Replace {
+            /// The text expression to evaluate.
+            text: Box<Value>,
+            /// The text to replace.
+            from: Box<Value>,
+            /// The replacement text.
+            to: Box<Value>,
+        },
+        /// Splits text using a separator.
+        Split {
+            /// The text expression to evaluate.
+            text: Box<Value>,
+            /// The separator used to split or join text.
+            separator: Box<Value>,
+        },
+        /// Joins array elements using a separator.
+        Join {
+            /// The array expression to join.
+            array: Box<Value>,
+            /// The separator used to split or join text.
+            separator: Box<Value>,
+        },
+        /// Substitutes named values into text.
+        Render {
+            /// The template to render.
+            template: Box<Value>,
+            /// The named scalar values.
+            values: Box<Value>,
+        },
+        /// Joins nonempty text components.
+        Compose {
+            /// The text components, including optional nulls.
+            array: Box<Value>,
+            /// The separator between components.
+            separator: Box<Value>,
+        },
+        /// Samples array positions without replacement in source order.
+        Sample {
+            /// The source array.
+            array: Box<Value>,
+            /// The number of positions to select.
+            count: Box<Value>,
+        },
+        /// Tests whether the target contains a value.
+        Contains {
+            /// The value to index, slice, or inspect.
+            target: Box<Value>,
+            /// The value or text to search for.
+            needle: Box<Value>,
+        },
+        /// Tests a text prefix.
+        StartsWith {
+            /// The text expression to evaluate.
+            text: Box<Value>,
+            /// The prefix to test.
+            prefix: Box<Value>,
+        },
+        /// Tests a text suffix.
+        EndsWith {
+            /// The text expression to evaluate.
+            text: Box<Value>,
+            /// The suffix to test.
+            suffix: Box<Value>,
+        },
+        /// Measures the length of a value.
+        Len {
+            /// The value to index, slice, or inspect.
+            target: Box<Value>,
+        },
+        /// Interleaves literal pieces with evaluated arguments.
+        Format {
+            /// Literal text around each format argument. There is one more piece than argument.
+            pieces: Vec<String>,
+            /// Function arguments in source order.
+            args: Vec<Value>,
+        },
+        /// Restricts a number to the supplied bounds.
+        Clamp {
+            /// The value expression to inspect or evaluate.
+            value: Box<Value>,
+            /// The lower bound.
+            min: Box<Value>,
+            /// The upper bound.
+            max: Box<Value>,
+        },
+        /// Rounds a number to the nearest integer.
+        Round {
+            /// The value expression to inspect or evaluate.
+            value: Box<Value>,
+        },
+        /// Rounds a number downward.
+        Floor {
+            /// The value expression to inspect or evaluate.
+            value: Box<Value>,
+        },
+        /// Rounds a number upward.
+        Ceil {
+            /// The value expression to inspect or evaluate.
+            value: Box<Value>,
+        },
+        /// Takes the absolute value.
+        Abs {
+            /// The value expression to inspect or evaluate.
+            value: Box<Value>,
+        },
+        /// Finds the smallest argument.
+        Min(Vec<Value>),
+        /// Finds the largest argument.
+        Max(Vec<Value>),
+        /// Produces a UUID string.
+        Uuid,
+        /// Produces random hexadecimal text.
+        Hex {
+            /// The requested output length.
+            length: usize,
+        },
+        /// Produces random alphanumeric text.
+        Alphanum {
+            /// The requested output length.
+            length: usize,
+        },
+    }
+
+    /// One candidate value and its relative sampling weight.
+    #[derive(Debug, Clone)]
+    pub struct WeightedOption {
+        /// The value expression to inspect or evaluate.
+        pub value: Value,
+        /// The relative sampling weight. Zero disables this candidate.
+        pub weight: f64,
+    }
+
+    /// Inclusive bounds for an integer or floating-point sample.
+    #[derive(Debug, Clone, Copy)]
+    pub enum Range {
+        /// An integer value or integer bounds.
+        Int {
+            /// The lower bound.
+            min: i64,
+            /// The upper bound.
+            max: i64,
+        },
+        /// A floating-point value or floating-point bounds.
+        Float {
+            /// The lower bound.
+            min: f64,
+            /// The upper bound.
+            max: f64,
+        },
+    }
+
+    /// Text interleaved with values to be resolved by a consumer.
+    #[derive(Debug, Clone)]
+    pub struct Template {
+        /// Template parts in source order.
+        pub parts: Vec<Part>,
+    }
+
+    /// One literal or evaluated part of a text template.
+    #[derive(Debug, Clone)]
+    pub enum Part {
+        /// Literal text copied into the result.
+        Lit(String),
+        /// A reference expression whose meaning depends on its context.
+        Ref(CtxRef),
+        /// A scoped variable resolved by name during evaluation.
+        VarRef(String),
+        /// An expression whose interpolated value is checked at runtime.
+        Dynamic(Value),
+    }
+
+    /// An ordered collection of values and runtime spreads.
+    #[derive(Debug, Clone)]
+    pub struct Array {
+        /// Entries in source order.
+        pub elem: Vec<ArrayElem>,
+    }
+
+    /// A single array value or a collection expanded into the array.
+    #[derive(Debug, Clone)]
+    pub enum ArrayElem {
+        /// One value in an array.
+        Item(Value),
+        /// A collection expanded into its surrounding container.
+        Spread(Value),
+    }
+
+    /// An ordered collection of named value expressions.
+    #[derive(Debug, Clone)]
+    pub struct Object {
+        /// Entries in source order.
+        pub elem: Vec<ObjectField>,
+    }
+
+    /// A key and its compiled value expression.
+    #[derive(Debug, Clone)]
+    pub struct ObjectField {
+        /// The key identifying this entry.
+        pub key: String,
+        /// The value expression to inspect or evaluate.
+        pub value: Value,
+    }
+}

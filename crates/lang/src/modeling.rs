@@ -1,11300 +1,3733 @@
-use crate::ast;
-use crate::diag::{Diag, DiagPhase, Diags, SrcRange};
-use crate::model::{
-    Accessor, Agent, Array, ArrayElem, Automation, AutomationKind, BinOp, Binding, Child, Choice, CtxRef, Dataset, DatasetCase,
-    DatasetSource, EnglishOperation, Experiment, Facet, Field, Func, JudgeOption, Maybe, Model, NOISE_SIZE_CAP, NodeId, Number,
-    Object, ObjectField, Part, Range, RefId, Repeat, ResolvedRef, Scorer, ScorerArg, ScorerKind, ScorerLang, ScorerSpan,
-    ScorerStep, Selection, Span, SpanFields, SpanKind, Step, Template, Trace, UnaryOp, Value, WeightedOption, When,
+use crate::{
+    Diag, DiagPhase, Diags, SrcRange, ast,
+    expr::{self, ReferenceValue},
+    model::*,
 };
-use crate::spec;
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    path::Path,
-};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
-enum FieldValue {
-    Value(Value),
-    Object(Object),
-    Tags(Vec<Template>),
+type Result<T> = std::result::Result<T, Diags>;
+
+fn error(range: SrcRange, what: impl Into<String>) -> Diags {
+    vec![Diag {
+        when: DiagPhase::Validation,
+        what: what.into(),
+        r#where: range,
+    }]
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum ExprType {
-    String,
-    Number,
-    Boolean,
-    Null,
-    Array,
-    Object,
-    Func,
-    // a residual expr whose concrete type is only known during generation
-    Abstract,
-}
-
-impl ExprType {
-    fn of(folded: &Folded) -> Self {
-        match &folded.kind {
-            FoldedKind::Array(_) => Self::Array,
-            FoldedKind::Object(_) => Self::Object,
-            FoldedKind::Value(value) => match value {
-                Value::Str(_) | Value::Template(_) => Self::String,
-                Value::Num(_) => Self::Number,
-                Value::Bool(_) => Self::Boolean,
-                Value::Null => Self::Null,
-                Value::Array(_) => Self::Array,
-                Value::Object(_) | Value::Attachment { .. } => Self::Object,
-                Value::Func { .. } => Self::Func,
-                // context indexes and counts are always integers
-                Value::CtxRef(_) => Self::Number,
-                // constant exprs fold to values, only dynamic ones get here
-                Value::VarRef(_)
-                | Value::ArgRef(_)
-                | Value::BlockRef { .. }
-                | Value::Unary { .. }
-                | Value::Binary { .. }
-                | Value::Cond { .. }
-                | Value::Index { .. }
-                | Value::Slice { .. } => Self::Abstract,
-            },
-        }
+// keeps the diagnostics of both sides when either fails
+fn both<A, B>(a: Result<A>, b: Result<B>) -> Result<(A, B)> {
+    match (a, b) {
+        (Ok(a), Ok(b)) => Ok((a, b)),
+        (a, b) => Err(a.err().into_iter().chain(b.err()).flatten().collect()),
     }
 }
 
-impl fmt::Display for ExprType {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::String => "string",
-            Self::Number => "number",
-            Self::Boolean => "boolean",
-            Self::Null => "null",
-            Self::Array => "array",
-            Self::Object => "object",
-            Self::Func => "function",
-            Self::Abstract => "expression",
-        })
-    }
-}
-
-// an expr evaluated in place: constant parts folded to model values, dynamic
-// parts left residual; containers stay structured so field checks can point
-// at per-element ranges
-#[derive(Debug, Clone)]
-struct Folded {
-    kind: FoldedKind,
-    range: SrcRange,
-}
-
-#[derive(Debug, Clone)]
-enum FoldedKind {
-    // scalars, templates, funcs, refs, and residual operator exprs
-    Value(Value),
-    Array(Vec<Folded>),
-    Object(Vec<FoldedField>),
-}
-
-#[derive(Debug, Clone)]
-struct FoldedField {
-    key: String,
-    value: Folded,
-    range: SrcRange,
-}
-
-// an array entry mid-fold; spreads survive only when their shape is unknown
-enum FoldedElem {
-    Item(Folded),
-    Spread(Folded),
-}
-
-impl Folded {
-    fn new(kind: FoldedKind, range: SrcRange) -> Self {
-        Self { kind, range }
-    }
-
-    fn value(value: Value, range: SrcRange) -> Self {
-        Self::new(FoldedKind::Value(value), range)
-    }
-
-    // drops ranges once checks are done, the model keeps only failure sites
-    fn into_value(self) -> Value {
-        match self.kind {
-            FoldedKind::Value(value) => value,
-            FoldedKind::Array(values) => Value::Array(Array {
-                elem: values.into_iter().map(|value| ArrayElem::Item(value.into_value())).collect(),
-            }),
-            FoldedKind::Object(fields) => Value::Object(Object {
-                elem: fields
-                    .into_iter()
-                    .map(|field| ObjectField {
-                        key: field.key,
-                        value: field.value.into_value(),
-                    })
-                    .collect(),
-            }),
-        }
-    }
-}
-
-// an evaluated var definition; constant values substitute at each reference,
-// dynamic ones become scope bindings referenced by name
-#[derive(Debug, Clone)]
-struct VarDef {
-    value: Folded,
-    constant: bool,
-    // the block whose instantiation evaluates the binding, none = root scope
-    owner: Option<NodeId>,
-}
-
-// the block kinds a reference can address
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum BlockKind {
-    Trace,
-    Task,
-    Llm,
-    Tool,
-    Function,
-    ScorerSpan,
-    Repeat,
-    Choice,
-    Maybe,
-}
-
-impl BlockKind {
-    fn keyword(self) -> &'static str {
-        match self {
-            Self::Trace => "trace",
-            Self::Task => "task",
-            Self::Llm => "llm",
-            Self::Tool => "tool",
-            Self::Function => "function",
-            Self::ScorerSpan => "scorer",
-            Self::Repeat => "repeat",
-            Self::Choice => "choice",
-            Self::Maybe => "maybe",
-        }
-    }
-
-    fn has_fields(self) -> bool {
-        matches!(self, Self::Trace | Self::Task | Self::Llm | Self::Tool | Self::Function)
-    }
-}
-
-// one node of the symbol tree, appended as the walk enters its block
-#[derive(Debug)]
-struct SymNode {
-    kind: BlockKind,
-    name: Option<String>,
-    children: Vec<NodeId>,
-    // the fields the block sets, filled once its body models
-    fields: Vec<Field>,
-}
-
-// a reference path segment as folded; the split into block steps, accessor,
-// and drill-in selections needs the full symbol tree, so it waits for fixup
-#[derive(Debug, Clone)]
-enum Segment {
-    Name {
-        value: String,
-        range: SrcRange,
-    },
-    Index {
-        value: Value,
-        range: SrcRange,
-    },
-    Slice {
-        start: Option<Value>,
-        end: Option<Value>,
-        range: SrcRange,
-    },
-}
-
-// where a block reference starts resolving
-#[derive(Debug, Clone)]
-enum Head {
-    // a kind keyword, resolved by walking up the enclosing scopes
-    Kind(BlockKind),
-    // the innermost enclosing span or trace, resolved at fold time
-    SelfBlock(NodeId),
-    // the enclosing trace's own fields
-    Trace,
-    // explicit bracket selection of a module trace, including reserved names
-    ModuleTrace,
-}
-
-// a value's landing place, the nodes of the static dependency graph
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-enum SlotId {
-    Field {
-        node: NodeId,
-        field: Field,
-        // metadata/metrics attribute at key precision when the value is an
-        // object literal, so sibling-key references stay acyclic
-        key: Option<String>,
-    },
-    Binding {
-        owner: Option<NodeId>,
-        name: String,
-    },
-}
-
-// a reference recorded mid-walk, resolved against the symbol tree at fixup
-#[derive(Debug, Clone)]
-struct PendingRef {
-    head: Head,
-    segments: Vec<Segment>,
-    // the sym stack at fold time, innermost last
-    origin: Vec<NodeId>,
-    // the slot whose expression contains the reference, for cycle edges
-    slot: Option<SlotId>,
-    range: SrcRange,
-}
-
-// one frame of name bindings: a block's vars and, while a for body evaluates,
-// its loop bindings; frames stack innermost-last
-#[derive(Default)]
-struct Scope {
-    // var.<name> definitions; none = invalid and already diagnosed
-    vars: HashMap<String, Option<VarDef>>,
-    // bare loop bindings, a separate namespace from vars
-    loops: HashMap<String, Folded>,
-}
-
-// the outcome of one comprehension iteration
-enum Iteration {
-    Skipped,
-    Invalid,
-    Value(Folded),
-    Entry { key: String, range: SrcRange, value: Folded },
-}
-
-pub(super) struct Modeler {
-    ast: ast::Ast,
-    scopes: Vec<Scope>,
-    // every var name ever declared, for duplicate and visibility diagnostics
-    declared: HashSet<String>,
-    errors: Errors,
-    // how many repeat blocks enclose the decl being lowered, gates repeat.index
-    repeat_depth: usize,
-    // folding inside a scorer block; swaps the reference namespaces from
-    // generation context to scorer runtime arguments
-    in_scorer: bool,
-    // the symbol tree of blocks, indexed by NodeId in walk order
-    syms: Vec<SymNode>,
-    // the chain of blocks enclosing the decl being lowered, innermost last
-    sym_stack: Vec<NodeId>,
-    // block references recorded mid-walk, indexed by RefId, resolved at fixup
-    pending: Vec<PendingRef>,
-    identity_aliases: Vec<RefId>,
-    // nested scorer names resolve after all top-level definitions are known
-    pending_scorers: Vec<(String, SrcRange)>,
-    // the slot whose expression is folding, for dependency edges
-    current_slot: Option<SlotId>,
-    // static dependency edges for cycle detection: (from, to, reference site)
-    edges: Vec<(SlotId, SlotId, SrcRange)>,
-}
-
-impl Modeler {
-    fn new(ast: ast::Ast) -> Self {
-        Self {
-            ast,
-            scopes: Vec::new(),
-            declared: HashSet::new(),
-            errors: Vec::new(),
-            repeat_depth: 0,
-            in_scorer: false,
-            syms: Vec::new(),
-            sym_stack: Vec::new(),
-            pending: Vec::new(),
-            identity_aliases: Vec::new(),
-            pending_scorers: Vec::new(),
-            current_slot: None,
-            edges: Vec::new(),
-        }
-    }
-
-    // appends a symbol node and enters it; the caller leaves via leave_sym
-    fn enter_sym(&mut self, kind: BlockKind, name: Option<String>) -> NodeId {
-        let node = NodeId(self.syms.len() as u32);
-        self.syms.push(SymNode {
-            kind,
-            name,
-            children: Vec::new(),
-            fields: Vec::new(),
-        });
-        if let Some(&parent) = self.sym_stack.last() {
-            self.syms[parent.0 as usize].children.push(node);
-        }
-        self.sym_stack.push(node);
-        node
-    }
-
-    fn leave_sym(&mut self) {
-        self.sym_stack.pop();
-    }
-
-    fn model(mut self) -> Result<Model, Errors> {
-        let mut traces = Vec::new();
-        let mut scorers = Vec::new();
-        let mut scorer_names_seen = HashSet::new();
-        let mut automations = Vec::new();
-        let mut facets = Vec::new();
-        let mut datasets = Vec::new();
-        let mut experiments = Vec::new();
-        let mut agents = Vec::new();
-
-        // collect vars first so refs work no matter the decl order
-        let (vars_blocks, rest) = split_vars(std::mem::take(&mut self.ast.decls));
-        let mut scope = Scope::default();
-        let mut bindings = Vec::new();
-        for block in vars_blocks {
-            self.collect_vars(block, &mut scope, &mut bindings);
-        }
-        self.scopes.push(scope);
-
-        for decl in rest {
-            match decl {
-                ast::Decl::Attr(attr) => {
-                    self.errors
-                        .push(Error::new(ErrorKind::RootAttribute { keyword: attr.key }, attr.range));
-                }
-                ast::Decl::Block(block) => {
-                    let Some(desc) = spec::SPEC.block(&block.kind) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownBlock {
-                                keyword: block.kind,
-                                parent: spec::Place::Root,
-                            },
-                            block.range,
-                        ));
-                        continue;
-                    };
-
-                    if desc.id == spec::ids::TRACE && desc.allows(spec::Place::Root) {
-                        if let Some(trace) = self.model_trace(block, desc) {
-                            traces.push(trace);
-                        }
-                    } else if desc.id == spec::ids::SCORER && desc.allows(spec::Place::Root) {
-                        let range = block.name_range.unwrap_or(block.range);
-                        if let Some(scorer) = self.model_scorer(block, desc) {
-                            if !scorer_names_seen.insert(scorer.name.clone()) {
-                                self.errors.push(Error::new(
-                                    ErrorKind::DuplicateScorerName {
-                                        name: scorer.name.clone(),
-                                    },
-                                    range,
-                                ));
-                            }
-                            scorers.push(scorer);
-                        }
-                    } else if desc.id == spec::ids::FACET && desc.allows(spec::Place::Root) {
-                        let range = block.range;
-                        if let Some(facet) = self.model_facet(block, desc) {
-                            facets.push((facet, range));
-                        }
-                    } else if desc.id == spec::ids::AUTOMATION && desc.allows(spec::Place::Root) {
-                        let range = block.range;
-                        if let Some(automation) = self.model_automation(block, desc) {
-                            automations.push((automation, range));
-                        }
-                    } else if desc.id == spec::ids::AGENT && desc.allows(spec::Place::Root) {
-                        let range = block.range;
-                        if let Some(agent) = self.model_agent(block, desc) {
-                            agents.push((agent, range));
-                        }
-                    } else if desc.id == spec::ids::EXPERIMENT && desc.allows(spec::Place::Root) {
-                        let range = block.range;
-                        if let Some(experiment) = self.model_experiment(block, desc) {
-                            experiments.push((experiment, range));
-                        }
-                    } else if desc.id == spec::ids::DATASET && desc.allows(spec::Place::Root) {
-                        let range = block.range;
-                        if let Some(dataset) = self.model_dataset(block, desc) {
-                            datasets.push((dataset, range));
-                        }
-                    } else {
-                        self.errors.push(Error::new(
-                            ErrorKind::BlockNotAllowed {
-                                block: desc.id,
-                                parent: spec::Place::Root,
-                            },
-                            block.range,
-                        ));
-                    }
-                }
-            }
-        }
-
-        // fixup: every block name exists now, so pending references resolve;
-        // this iterates collected records only, never the ast; extension
-        // leaves dead intermediate records behind, so only references the
-        // model actually stores resolve
-        let mut aliases = self.identity_aliases.clone();
-        aliases.extend(experiments.iter().map(|(experiment, _)| experiment.task));
-        aliases.extend(agents.iter().map(|(agent, _)| agent.entrypoint));
-        let live = live_refs(&self.pending, &traces, &bindings, &datasets, &aliases);
-        let refs = self.resolve_pending(&live);
-        self.detect_cycles();
-
-        let scorer_names: HashSet<&str> = scorers.iter().map(|scorer| scorer.name.as_str()).collect();
-        for (name, range) in &self.pending_scorers {
-            if !scorer_names.contains(name.as_str()) {
-                self.errors
-                    .push(Error::new(ErrorKind::UnknownScorerReference { name: name.clone() }, *range));
-            }
-        }
-        let mut facet_names = HashSet::new();
-        for (facet, range) in &facets {
-            if !facet_names.insert(facet.name.as_str()) {
-                self.facet_error(format!("duplicate facet name {:?}", facet.name), *range);
-            }
-        }
-        let mut automation_names = HashSet::new();
-        for (automation, range) in &automations {
-            if !automation_names.insert(automation.name.as_str()) {
-                self.automation_error(format!("duplicate automation name {:?}", automation.name), *range);
-            }
-            let (names, known, label) = match &automation.kind {
-                AutomationKind::Scorer { scorers, .. } => (scorers, &scorer_names, "scorer"),
-                AutomationKind::Topics { facets } => (facets, &facet_names, "facet"),
-            };
-            for name in names {
-                if !known.contains(name.as_str()) {
-                    self.automation_error(
-                        format!("unknown {label} {name:?}; declare a {label} block in this source"),
-                        *range,
-                    );
-                }
-            }
-        }
-
-        let mut dataset_names = HashSet::new();
-        for (dataset, range) in &datasets {
-            if !dataset_names.insert(dataset.name.as_str()) {
-                self.dataset_error(format!("duplicate dataset name {:?}", dataset.name), *range);
-            }
-            for case in &dataset.cases {
-                let sources: Vec<(RefId, &str)> = match &case.source {
-                    DatasetSource::Inline(_) => Vec::new(),
-                    DatasetSource::Trace(id) => vec![(*id, "trace")],
-                    DatasetSource::Span(id) => vec![(*id, "span")],
-                    DatasetSource::Group(ids) => ids.iter().map(|id| (*id, "traces")).collect(),
-                };
-                for (id, field) in sources {
-                    let desc = spec::SPEC.block_by_id(spec::ids::CASE).unwrap().field(field).unwrap();
-                    let constraint = match desc.value {
-                        spec::ExprType::Array { items } => *items,
-                        value => value,
-                    };
-                    let spec::ExprType::BlockRef { kinds } = constraint else {
-                        unreachable!("dataset source fields declare their reference types")
-                    };
-                    let reference = &refs[id.0 as usize];
-                    match &reference.accessor {
-                        Accessor::Block { kind, .. } if kinds.contains(kind) => {
-                            if reference.steps.iter().any(|step| match step {
-                                Step::Child { candidates, position } => {
-                                    position.is_some()
-                                        || candidates.iter().any(|node| !self.syms[node.0 as usize].kind.has_fields())
-                                }
-                                _ => true,
-                            }) {
-                                self.dataset_error("dataset block sources require a static path; directed generation through repeat, maybe, or choice is not supported yet".to_owned(), reference.range);
-                            }
-                        }
-                        _ => self.dataset_error(
-                            format!("case {:?} requires a reference to a {} block", case.name, kinds.join(" or ")),
-                            reference.range,
-                        ),
-                    }
-                }
-                let mut values = Vec::new();
-                if let DatasetSource::Inline(value) = &case.source {
-                    collect_refs(value, &mut values);
-                }
-                for value in [&case.expected, &case.metadata, &case.tags].into_iter().flatten() {
-                    collect_refs(value, &mut values);
-                }
-                for id in values {
-                    let reference = &refs[id.0 as usize];
-                    if matches!(reference.accessor, Accessor::Block { .. }) {
-                        self.dataset_error(
-                            "case data fields require a value; select a block field such as .input or .output".to_owned(),
-                            reference.range,
-                        );
-                    }
-                }
-            }
-        }
-        let mut agent_names = HashSet::new();
-        for (agent, range) in &agents {
-            if !agent_names.insert(&agent.name) {
-                self.agent_error(format!("duplicate agent name {:?}", agent.name), *range);
-            }
-            let reference = &refs[agent.entrypoint.0 as usize];
-            if !matches!(reference.accessor, Accessor::Block { kind: "trace", .. })
-                || !reference.steps.is_empty()
-                || !reference.path.is_empty()
-            {
-                self.agent_error("entrypoint must reference a whole trace".to_owned(), *range);
-            }
-        }
-        let mut experiment_names = HashSet::new();
-        for (experiment, range) in &experiments {
-            if !experiment_names.insert(experiment.name.as_str()) {
-                self.experiment_error(format!("duplicate experiment name {:?}", experiment.name), *range);
-            }
-            if !dataset_names.contains(experiment.dataset.as_str()) {
-                self.experiment_error(format!("unknown dataset {:?}", experiment.dataset), *range);
-            }
-            for name in &experiment.scorers {
-                if !scorer_names.contains(name.as_str()) {
-                    self.experiment_error(format!("unknown scorer {name:?}"), *range);
-                }
-            }
-            let reference = &refs[experiment.task.0 as usize];
-            if !matches!(
-                reference.accessor,
-                Accessor::Block {
-                    kind: "trace" | "task" | "llm" | "tool" | "function",
-                    ..
-                }
-            ) {
-                self.experiment_error("task requires a trace or span block reference".to_owned(), reference.range);
-            } else if reference.module.is_none()
-                || reference.steps.iter().any(|step| match step {
-                    Step::Child { candidates, position } => {
-                        position.is_some()
-                            || candidates.len() != 1
-                            || candidates.iter().any(|node| !self.syms[node.0 as usize].kind.has_fields())
-                    }
-                    _ => true,
-                })
-            {
-                self.experiment_error(
-                    "experiment task requires a static trace or span path".to_owned(),
-                    reference.range,
-                );
-            }
-        }
-        for (experiment, range) in &experiments {
-            let mut seen = HashSet::from([experiment.name.as_str()]);
-            let mut next = experiment.baseline.as_deref();
-            while let Some(name) = next {
-                if !seen.insert(name) {
-                    self.experiment_error(format!("baseline cycle involving {name:?}"), *range);
-                    break;
-                }
-                let Some((baseline, _)) = experiments.iter().find(|(candidate, _)| candidate.name == name) else {
-                    self.experiment_error(format!("unknown baseline experiment {name:?}"), *range);
-                    break;
-                };
-                next = baseline.baseline.as_deref();
-            }
-        }
-        let mut data_refs = Vec::new();
-        for trace in &traces {
-            collect_trace_refs(trace, &mut data_refs);
-        }
-        for binding in &bindings {
-            collect_refs(&binding.value, &mut data_refs);
-        }
-        for id in data_refs {
-            let reference = &refs[id.0 as usize];
-            if matches!(reference.accessor, Accessor::Block { .. }) {
-                let Accessor::Block { kind, .. } = reference.accessor else {
-                    unreachable!()
-                };
-                self.errors.push(Error::new(
-                    ErrorKind::IncompleteBlockRef {
-                        rule: spec::ids::BLOCK_REFS,
-                        keyword: kind,
-                    },
-                    reference.range,
-                ));
-            }
-        }
-
-        // per-iteration evaluation can repeat an identical diagnostic, keep the first
-        let mut seen: Vec<Error> = Vec::new();
-        self.errors.retain(|error| {
-            if seen.contains(error) {
-                false
-            } else {
-                seen.push(error.clone());
-                true
-            }
-        });
-
-        if traces.is_empty()
-            && scorers.is_empty()
-            && facets.is_empty()
-            && automations.is_empty()
-            && datasets.is_empty()
-            && experiments.is_empty()
-            && self.errors.is_empty()
-        {
-            self.errors.push(Error::new(
-                ErrorKind::EmptyShape {
-                    rule: spec::ids::NONEMPTY_SHAPE,
-                },
-                SrcRange::new(0, 0),
-            ));
-        }
-
-        if self.errors.is_empty() {
-            Ok(Model {
-                traces,
-                agents: agents.into_iter().map(|(agent, _)| agent).collect(),
-                bindings,
-                refs,
-                scorers,
-                facets: facets.into_iter().map(|(facet, _)| facet).collect(),
-                automations: automations.into_iter().map(|(automation, _)| automation).collect(),
-                datasets: datasets.into_iter().map(|(dataset, _)| dataset).collect(),
-                experiments: experiments.into_iter().map(|(experiment, _)| experiment).collect(),
-            })
-        } else {
-            Err(self.errors)
-        }
-    }
-
-    fn model_trace(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Trace> {
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc);
-        let node = self.enter_sym(BlockKind::Trace, name.clone());
-        let (decls, bindings) = self.enter_scope(decls);
-        let (fields, blocks) = self.model_body(decls, desc, range);
-        self.record_fields(node, &fields);
-        let children = blocks
-            .into_iter()
-            .filter_map(|block| self.model_child(block, desc.id))
-            .collect();
-        self.scopes.pop();
-        self.leave_sym();
-
-        name.map(|name| Trace {
-            node,
-            name,
-            fields,
-            bindings,
-            children,
-        })
-    }
-
-    fn facet_error(&mut self, reason: String, range: SrcRange) {
-        self.errors.push(Error::new(
-            ErrorKind::InvalidFacet {
-                rule: spec::ids::FACET_DEFINITION,
-                reason,
-            },
-            range,
-        ));
-    }
-
-    fn model_facet(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Facet> {
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc);
-        let mut seen = HashSet::new();
-        let mut values = HashMap::new();
-        for decl in decls {
-            let ast::Decl::Attr(attr) = decl else {
-                self.facet_error("facet blocks cannot contain child blocks".to_owned(), range);
-                continue;
-            };
-            let Some(field) = desc.field(&attr.key) else {
-                self.errors.push(Error::new(
-                    ErrorKind::UnknownField {
-                        block: desc.id,
-                        keyword: attr.key,
-                    },
-                    attr.range,
-                ));
-                continue;
-            };
-            if !seen.insert(field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::DuplicateField {
-                        block: desc.id,
-                        field: field.id,
-                    },
-                    attr.range,
-                ));
-                continue;
-            }
-            let Some(value) = self.fold_expr(attr.value) else { continue };
-            match value.into_value() {
-                Value::Str(value) if field.id != spec::ids::PROMPT || !value.trim().is_empty() => {
-                    values.insert(field.id, value);
-                }
-                _ => self.facet_error(
-                    format!(
-                        "{} must be a constant string{}",
-                        field.keyword,
-                        if field.id == spec::ids::PROMPT {
-                            " and must not be empty"
-                        } else {
-                            ""
-                        }
-                    ),
-                    attr.range,
-                ),
-            }
-        }
-        if !seen.contains(&spec::ids::PROMPT) {
-            self.errors.push(Error::new(
-                ErrorKind::MissingField {
-                    block: desc.id,
-                    field: spec::ids::PROMPT,
-                },
-                range,
-            ));
-        }
-        Some(Facet {
-            name: name?,
-            prompt: values.remove(&spec::ids::PROMPT)?,
-            description: values.remove(&spec::ids::DESCRIPTION),
-            no_match_pattern: values.remove(&spec::ids::NO_MATCH_PATTERN),
-        })
-    }
-
-    fn automation_error(&mut self, reason: String, range: SrcRange) {
-        self.errors.push(Error::new(
-            ErrorKind::InvalidAutomation {
-                rule: spec::ids::AUTOMATION_BINDING,
-                reason,
-            },
-            range,
-        ));
-    }
-
-    fn dataset_error(&mut self, reason: String, range: SrcRange) {
-        self.errors.push(Error::new(
-            ErrorKind::InvalidDataset {
-                rule: spec::ids::DATASET_CASE,
-                reason,
-            },
-            range,
-        ));
-    }
-
-    fn experiment_error(&mut self, reason: String, range: SrcRange) {
-        self.errors.push(Error::new(
-            ErrorKind::InvalidExperiment {
-                rule: spec::ids::EXPERIMENT_BINDING,
-                reason,
-            },
-            range,
-        ));
-    }
-
-    fn resource_reference(&mut self, expr: ast::Expr, kind: &str) -> Option<String> {
-        let range = expr.range;
-        let name = match expr.kind {
-            ast::ExprKind::Ref { path } if path.len() == 2 && path[0] == kind => Some(path[1].clone()),
-            ast::ExprKind::Index { target, index } => match (target.kind, index.kind) {
-                (ast::ExprKind::Ref { path }, ast::ExprKind::Str(name)) if path == [kind] => Some(name),
-                _ => None,
-            },
-            _ => None,
-        };
-        if name.as_ref().is_none_or(|name| name.is_empty()) {
-            self.experiment_error(format!("expected a named {kind} reference, such as {kind}[\"name\"]"), range);
-            None
-        } else {
-            name
-        }
-    }
-
-    fn agent_error(&mut self, reason: String, range: SrcRange) {
-        self.errors.push(Error::new(
-            ErrorKind::InvalidAgent {
-                rule: spec::ids::AGENT_BINDING,
-                reason,
-            },
-            range,
-        ));
-    }
-
-    fn model_agent(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Agent> {
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc)?;
-        let mut entrypoint = None;
-        let mut seen = false;
-        for decl in decls {
-            let ast::Decl::Attr(attr) = decl else {
-                self.agent_error("agent contains a nested block".to_owned(), range);
-                continue;
-            };
-            if attr.key != "entrypoint" || seen {
-                self.agent_error(format!("unknown or duplicate agent field {:?}", attr.key), attr.range);
-                continue;
-            }
-            seen = true;
-            if let Some(folded) = self.fold_expr(attr.value) {
-                if let Value::BlockRef { ref_id, .. } = folded.into_value() {
-                    entrypoint = Some(ref_id);
-                } else {
-                    self.agent_error("entrypoint must be a trace reference".to_owned(), attr.range);
-                }
-            }
-        }
-        if !seen {
-            self.agent_error("agent requires entrypoint".to_owned(), range);
-        }
-        Some(Agent {
-            name,
-            entrypoint: entrypoint?,
-        })
-    }
-
-    fn model_experiment(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Experiment> {
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc)?;
-        let mut dataset = None;
-        let mut task = None;
-        let mut scorers = None;
-        let mut baseline = None;
-        let mut description = None;
-        let mut seen = HashSet::new();
-        for decl in decls {
-            let ast::Decl::Attr(attr) = decl else {
-                self.experiment_error("experiment contains a nested block".to_owned(), range);
-                continue;
-            };
-            if desc.field(&attr.key).is_none() || !seen.insert(attr.key.clone()) {
-                self.experiment_error(format!("unknown or duplicate experiment field {:?}", attr.key), attr.range);
-                continue;
-            }
-            match attr.key.as_str() {
-                "dataset" => dataset = self.resource_reference(attr.value, "dataset"),
-                "baseline" => baseline = self.resource_reference(attr.value, "experiment"),
-                "task" => {
-                    if let Some(folded) = self.fold_expr(attr.value) {
-                        if let Value::BlockRef { ref_id, .. } = folded.into_value() {
-                            task = Some(ref_id);
-                        } else {
-                            self.experiment_error("task must be a block reference".to_owned(), attr.range);
-                        }
-                    }
-                }
-                "scorers" => {
-                    if let ast::ExprKind::Array(values) = attr.value.kind {
-                        let mut names = Vec::new();
-                        for value in values {
-                            if let Some(name) = self.resource_reference(value, "scorer") {
-                                if names.contains(&name) {
-                                    self.experiment_error(format!("duplicate scorer {name:?}"), attr.range);
-                                }
-                                names.push(name);
-                            }
-                        }
-                        if names.is_empty() {
-                            self.experiment_error("scorers requires at least one scorer reference".to_owned(), attr.range);
-                        }
-                        scorers = Some(names);
-                    } else {
-                        self.experiment_error("scorers must be an array of scorer references".to_owned(), attr.range);
-                    }
-                }
-                "description" => {
-                    if let Some(value) = self.fold_expr(attr.value) {
-                        if let Value::Str(value) = value.into_value() {
-                            description = Some(value);
-                        } else {
-                            self.experiment_error("description must be a constant string".to_owned(), attr.range);
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-        if dataset.is_none() || task.is_none() || scorers.is_none() {
-            self.experiment_error("experiment requires dataset, task, and scorers".to_owned(), range);
-            return None;
-        }
-        Some(Experiment {
-            name,
-            description,
-            dataset: dataset.unwrap(),
-            task: task.unwrap(),
-            scorers: scorers.unwrap(),
-            baseline,
-        })
-    }
-
-    fn model_dataset(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Dataset> {
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc)?;
-        let mut description = None;
-        let mut cases = Vec::new();
-        let mut names = HashSet::new();
-        for decl in decls {
-            match decl {
-                ast::Decl::Attr(attr) => {
-                    if attr.key != "description" {
-                        self.dataset_error(format!("unknown dataset field {:?}", attr.key), attr.range);
-                    } else if description.is_some() {
-                        self.dataset_error("duplicate description".to_owned(), attr.range);
-                    } else if let Some(folded) = self.fold_expr(attr.value) {
-                        match folded.into_value() {
-                            Value::Str(value) => description = Some(value),
-                            _ => self.dataset_error("description must be a constant string".to_owned(), attr.range),
-                        }
-                    }
-                }
-                ast::Decl::Block(inner) => {
-                    if inner.kind != "case" {
-                        self.dataset_error(format!("dataset contains unsupported block {:?}", inner.kind), inner.range);
-                    } else if let Some(case) = self.model_dataset_case(inner) {
-                        if !names.insert(case.name.clone()) {
-                            self.dataset_error(format!("duplicate case name {:?}", case.name), range);
-                        }
-                        cases.push(case);
-                    }
-                }
-            }
-        }
-        Some(Dataset {
-            name,
-            description,
-            cases,
-        })
-    }
-
-    fn model_dataset_case(&mut self, block: ast::Block) -> Option<DatasetCase> {
-        let desc = spec::SPEC.block_by_id(spec::ids::CASE).unwrap();
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc)?;
-        let mut seen = HashSet::new();
-        let mut input = None;
-        let mut trace = None;
-        let mut traces = None;
-        let mut span = None;
-        let mut expected = None;
-        let mut metadata = None;
-        let mut tags = None;
-        for decl in decls {
-            let ast::Decl::Attr(attr) = decl else {
-                self.dataset_error("case contains a nested block".to_owned(), range);
-                continue;
-            };
-            let Some(field) = desc.field(&attr.key) else {
-                self.dataset_error(format!("unknown case field {:?}", attr.key), attr.range);
-                continue;
-            };
-            if !seen.insert(field.id) {
-                self.dataset_error(format!("duplicate case field {:?}", attr.key), attr.range);
-                continue;
-            }
-            let Some(folded) = self.fold_expr(attr.value) else { continue };
-            if matches!(field.id, id if id == spec::ids::METADATA || id == spec::ids::TAGS)
-                && !self.defers_to_generation(&folded)
-                && !self.folded_reaches_block_ref(&folded)
-                && !self.validate_value(&folded, desc.id, field.id, field.value)
-            {
-                continue;
-            }
-            let value = folded.into_value();
-            match field.id {
-                id if id == spec::ids::INPUT => input = Some(value),
-                id if id == spec::ids::EXPECTED => expected = Some(value),
-                id if id == spec::ids::METADATA => metadata = Some(value),
-                id if id == spec::ids::TAGS => tags = Some(value),
-                id if id == spec::ids::TRACE_SOURCE || id == spec::ids::SPAN => {
-                    if let Value::BlockRef { ref_id, .. } = value {
-                        if id == spec::ids::SPAN {
-                            span = Some(ref_id);
-                        } else {
-                            trace = Some(ref_id);
-                        }
-                    } else {
-                        self.dataset_error(format!("{} must be a block reference", attr.key), attr.range);
-                    }
-                }
-                id if id == spec::ids::TRACES => {
-                    if let Value::Array(array) = value {
-                        let ids = array
-                            .elem
-                            .into_iter()
-                            .map(|item| match item {
-                                ArrayElem::Item(Value::BlockRef { ref_id, .. }) => Some(ref_id),
-                                _ => None,
-                            })
-                            .collect::<Option<Vec<_>>>();
-                        if let Some(ids) = ids.filter(|ids| ids.len() >= 2) {
-                            traces = Some(ids);
-                        } else {
-                            self.dataset_error("traces requires at least two trace block references".to_owned(), attr.range);
-                        }
-                    } else {
-                        self.dataset_error("traces must be an array of trace block references".to_owned(), attr.range);
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-        let source_count = [input.is_some(), trace.is_some(), traces.is_some(), span.is_some()]
-            .into_iter()
-            .filter(|v| *v)
-            .count();
-        if source_count != 1 {
-            self.dataset_error("case must set exactly one of input, trace, traces, or span".to_owned(), range);
-            return None;
-        }
-        let source = if let Some(input) = input {
-            DatasetSource::Inline(input)
-        } else if let Some(trace) = trace {
-            DatasetSource::Trace(trace)
-        } else if let Some(traces) = traces {
-            DatasetSource::Group(traces)
-        } else {
-            DatasetSource::Span(span.unwrap())
-        };
-        Some(DatasetCase {
-            name,
-            source,
-            expected,
-            metadata,
-            tags,
-        })
-    }
-
-    fn model_automation(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Automation> {
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc);
-        let mut seen = HashSet::new();
-        let mut kind = None;
-        let mut scorers = None;
-        let mut facets = None;
-        let mut scope = None;
-        let mut root = None;
-        let mut span_names = None;
-        let mut sampling_rate = None;
-        let mut enabled = None;
-
-        for decl in decls {
-            let ast::Decl::Attr(attr) = decl else {
-                let ast::Decl::Block(inner) = decl else { unreachable!() };
-                let parent = spec::Place::Block { id: desc.id };
-                if let Some(inner_desc) = spec::SPEC.block(&inner.kind) {
-                    self.errors.push(Error::new(
-                        ErrorKind::BlockNotAllowed {
-                            block: inner_desc.id,
-                            parent,
-                        },
-                        inner.range,
-                    ));
-                } else {
-                    self.errors.push(Error::new(
-                        ErrorKind::UnknownBlock {
-                            keyword: inner.kind,
-                            parent,
-                        },
-                        inner.range,
-                    ));
-                }
-                continue;
-            };
-            let Some(field) = desc.field(&attr.key) else {
-                self.errors.push(Error::new(
-                    ErrorKind::UnknownField {
-                        block: desc.id,
-                        keyword: attr.key,
-                    },
-                    attr.range,
-                ));
-                continue;
-            };
-            if !seen.insert(field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::DuplicateField {
-                        block: desc.id,
-                        field: field.id,
-                    },
-                    attr.range,
-                ));
-                continue;
-            }
-            let Some(folded) = self.fold_expr(attr.value) else { continue };
-            let value = folded.into_value();
-            match field.id {
-                id if id == spec::ids::TYPE => kind = self.automation_string(value, field.keyword, attr.range),
-                id if id == spec::ids::SCORERS => scorers = self.automation_strings(value, field.keyword, attr.range),
-                id if id == spec::ids::FACETS => facets = self.automation_strings(value, field.keyword, attr.range),
-                id if id == spec::ids::SCOPE => scope = self.automation_string(value, field.keyword, attr.range),
-                id if id == spec::ids::ROOT => root = self.automation_bool(value, field.keyword, attr.range),
-                id if id == spec::ids::SPAN_NAMES => span_names = self.automation_strings(value, field.keyword, attr.range),
-                id if id == spec::ids::ENABLED => enabled = self.automation_bool(value, field.keyword, attr.range),
-                id if id == spec::ids::SAMPLING_RATE => {
-                    sampling_rate = match value {
-                        Value::Num(number) if (0.0..=1.0).contains(&float_bound(number.clone())) => Some(float_bound(number)),
-                        _ => {
-                            self.automation_error("sampling_rate must be a constant number from 0 to 1".to_owned(), attr.range);
-                            None
-                        }
-                    };
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        for field in desc
-            .body
-            .fields
-            .iter()
-            .filter(|field| field.cardinality == spec::Cardinality::Required)
-        {
-            if !seen.contains(&field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::MissingField {
-                        block: desc.id,
-                        field: field.id,
-                    },
-                    range,
-                ));
-            }
-        }
-        let automation_kind = match kind.as_deref() {
-            Some("scorer") => {
-                if seen.contains(&spec::ids::FACETS) {
-                    self.automation_error("facets is only valid for topics automations".to_owned(), range);
-                }
-                if scope.as_deref().is_some_and(|value| value != "span") {
-                    self.automation_error("scorer scope must be \"span\"".to_owned(), range);
-                }
-                if root == Some(true) && span_names.is_some() || root != Some(true) && span_names.is_none() {
-                    self.automation_error("set either root = true or a nonempty span_names array".to_owned(), range);
-                }
-                if !seen.contains(&spec::ids::SCORERS) {
-                    self.automation_error("scorer automations require scorers".to_owned(), range);
-                }
-                scorers.map(|scorers| AutomationKind::Scorer {
-                    scorers,
-                    root: root.unwrap_or(false),
-                    span_names: span_names.unwrap_or_default(),
-                })
-            }
-            Some("topics") => {
-                for field in [spec::ids::SCORERS, spec::ids::ROOT, spec::ids::SPAN_NAMES] {
-                    if seen.contains(&field) {
-                        self.automation_error(
-                            format!(
-                                "{} is only valid for scorer automations",
-                                desc.body
-                                    .fields
-                                    .iter()
-                                    .find(|candidate| candidate.id == field)
-                                    .expect("automation field")
-                                    .keyword
-                            ),
-                            range,
-                        );
-                    }
-                }
-                if scope.as_deref().is_some_and(|value| value != "trace") {
-                    self.automation_error("topics scope must be \"trace\"".to_owned(), range);
-                }
-                if !seen.contains(&spec::ids::FACETS) {
-                    self.automation_error("topics automations require facets".to_owned(), range);
-                }
-                facets.map(|facets| AutomationKind::Topics { facets })
-            }
-            Some(_) => {
-                self.automation_error("type must be \"scorer\" or \"topics\"".to_owned(), range);
-                None
-            }
-            None => None,
-        };
-        Some(Automation {
-            name: name?,
-            kind: automation_kind?,
-            sampling_rate: sampling_rate.unwrap_or(1.0),
-            enabled: enabled.unwrap_or(true),
-        })
-    }
-
-    fn automation_string(&mut self, value: Value, field: &str, range: SrcRange) -> Option<String> {
-        match value {
-            Value::Str(value) if !value.is_empty() => Some(value),
-            _ => {
-                self.automation_error(format!("{field} must be a nonempty constant string"), range);
-                None
-            }
-        }
-    }
-
-    fn automation_strings(&mut self, value: Value, field: &str, range: SrcRange) -> Option<Vec<String>> {
-        let Value::Array(array) = value else {
-            self.automation_error(format!("{field} must be a nonempty array of constant strings"), range);
-            return None;
-        };
-        let mut values = Vec::new();
-        for item in array.elem {
-            let ArrayElem::Item(Value::Str(value)) = item else {
-                self.automation_error(format!("{field} must contain only constant strings"), range);
-                return None;
-            };
-            if value.is_empty() || values.contains(&value) {
-                self.automation_error(format!("{field} must contain distinct nonempty strings"), range);
-                return None;
-            }
-            values.push(value);
-        }
-        if values.is_empty() {
-            self.automation_error(format!("{field} must not be empty"), range);
-            return None;
-        }
-        Some(values)
-    }
-
-    fn automation_bool(&mut self, value: Value, field: &str, range: SrcRange) -> Option<bool> {
-        match value {
-            Value::Bool(value) => Some(value),
-            _ => {
-                self.automation_error(format!("{field} must be a constant boolean"), range);
-                None
-            }
-        }
-    }
-
-    // a scorer never enters the symbol tree: block references are rejected
-    // inside it and nothing references into it, so the pending-ref fixup
-    // machinery stays untouched
-    fn model_scorer(&mut self, block: ast::Block, desc: &spec::BlockDesc) -> Option<Scorer> {
-        let ast::Block { name, decls, range, .. } = block;
-        let name = self.model_name(name, range, desc);
-
-        // the flag must cover the vars collect so scorer vars gate on constancy
-        self.in_scorer = true;
-        // scorer bindings never reach the model: dynamic ones are rejected and
-        // constant ones substitute at each use
-        let (decls, _) = self.enter_scope(decls);
-
-        let mut lang = None;
-        let mut file = None;
-        let mut seen = HashSet::new();
-        let mut kind = None;
-        let mut kinds = 0usize;
-
-        for decl in decls {
-            match decl {
-                ast::Decl::Attr(attr) => {
-                    let attr_range = attr.range;
-                    let Some(field_desc) = desc.field(&attr.key) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownField {
-                                block: desc.id,
-                                keyword: attr.key,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    };
-                    let field_id = field_desc.id;
-                    if !seen.insert(field_id) {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateField {
-                                block: desc.id,
-                                field: field_id,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    }
-                    if let Some(folded) = self.fold_expr(attr.value) {
-                        if field_id == spec::ids::LANG {
-                            lang = self.model_scorer_lang(folded);
-                        } else {
-                            file = self.model_scorer_file(folded);
-                        }
-                    }
-                }
-                ast::Decl::Block(inner) => {
-                    let inner_range = inner.range;
-                    let parent = spec::Place::Block { id: desc.id };
-                    let Some(inner_desc) = spec::SPEC.block(&inner.kind) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownBlock {
-                                keyword: inner.kind,
-                                parent,
-                            },
-                            inner_range,
-                        ));
-                        continue;
-                    };
-                    if !inner_desc.allows(parent) {
-                        self.errors.push(Error::new(
-                            ErrorKind::BlockNotAllowed {
-                                block: inner_desc.id,
-                                parent,
-                            },
-                            inner_range,
-                        ));
-                        continue;
-                    }
-
-                    kinds += 1;
-                    if kinds > 1 {
-                        self.errors.push(Error::new(
-                            ErrorKind::ExtraScorerKind {
-                                rule: spec::ids::SCORER_KIND,
-                            },
-                            inner_range,
-                        ));
-                        continue;
-                    }
-
-                    self.model_name(inner.name, inner_range, inner_desc);
-                    kind = if inner_desc.id == spec::ids::CODE {
-                        self.model_code(inner.decls, inner_desc, inner_range)
-                    } else {
-                        self.model_judge(inner.decls, inner_desc, inner_range)
-                    };
-                }
-            }
-        }
-
-        if kinds == 0 {
-            self.errors.push(Error::new(
-                ErrorKind::MissingScorerKind {
-                    rule: spec::ids::SCORER_KIND,
-                },
-                range,
-            ));
-        }
-
-        self.scopes.pop();
-        self.in_scorer = false;
-
-        match (name, kind) {
-            (Some(name), Some(kind)) => Some(Scorer { name, lang, file, kind }),
-            _ => None,
-        }
-    }
-
-    // lang is the constant string "python" or "typescript"
-    fn model_scorer_lang(&mut self, folded: Folded) -> Option<ScorerLang> {
-        match const_string(&folded).as_deref() {
-            Some("python") => Some(ScorerLang::Python),
-            Some("typescript") => Some(ScorerLang::Typescript),
-            _ => {
-                self.errors.push(Error::new(
-                    ErrorKind::InvalidScorerLang {
-                        rule: spec::ids::SCORER_LANG,
-                    },
-                    folded.range,
-                ));
-                None
-            }
-        }
-    }
-
-    // file is a bare stem; the builder appends the kind suffix and extension
-    fn model_scorer_file(&mut self, folded: Folded) -> Option<String> {
-        let stem = const_string(&folded).filter(|stem| !stem.is_empty() && !stem.contains(['/', '\\', '.']));
-        if stem.is_none() {
-            self.errors.push(Error::new(
-                ErrorKind::InvalidScorerFile {
-                    rule: spec::ids::SCORER_FILE,
-                },
-                folded.range,
-            ));
-        }
-        stem
-    }
-
-    fn model_code(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerKind> {
-        let mut score = None;
-        let mut seen = HashSet::new();
-        let mut steps = Vec::new();
-
-        for decl in decls {
-            match decl {
-                ast::Decl::Attr(attr) => {
-                    let attr_range = attr.range;
-                    let Some(field) = desc.field(&attr.key) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownField {
-                                block: desc.id,
-                                keyword: attr.key,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    };
-                    if !seen.insert(field.id) {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateField {
-                                block: desc.id,
-                                field: field.id,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    }
-                    if let Some(folded) = self.fold_expr(attr.value) {
-                        score = self.model_score(folded, desc.id);
-                    }
-                }
-                ast::Decl::Block(inner) => {
-                    if let Some(step) = self.model_scorer_step(inner, desc.id) {
-                        steps.push(step);
-                    }
-                }
-            }
-        }
-
-        if !seen.contains(&spec::ids::SCORE) {
-            self.errors.push(Error::new(
-                ErrorKind::MissingField {
-                    block: desc.id,
-                    field: spec::ids::SCORE,
-                },
-                range,
-            ));
-        }
-
-        score.map(|score| ScorerKind::Code { score, steps })
-    }
-
-    fn model_scorer_step(&mut self, block: ast::Block, parent_id: spec::Id) -> Option<ScorerStep> {
-        let ast::Block {
-            kind,
-            name,
-            decls,
-            range,
-            ..
-        } = block;
-        let parent = spec::Place::Block { id: parent_id };
-        let Some(desc) = spec::SPEC.block_in(&kind, parent) else {
-            let error = match spec::SPEC.block(&kind) {
-                Some(desc) => ErrorKind::BlockNotAllowed { block: desc.id, parent },
-                None => ErrorKind::UnknownBlock { keyword: kind, parent },
-            };
-            self.errors.push(Error::new(error, range));
-            return None;
-        };
-        self.model_name(name, range, desc);
-        if desc.id == spec::ids::WHEN {
-            self.model_when(decls, desc, range).map(ScorerStep::When)
-        } else {
-            self.model_scorer_repeat(decls, desc, range)
-        }
-    }
-
-    fn model_scorer_repeat(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerStep> {
-        let mut count = None;
-        let mut seen = false;
-        let mut children = Vec::new();
-        for decl in decls {
-            match decl {
-                ast::Decl::Attr(attr) => {
-                    if attr.key != "count" {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownField {
-                                block: desc.id,
-                                keyword: attr.key,
-                            },
-                            attr.range,
-                        ));
-                        continue;
-                    }
-                    if seen {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateField {
-                                block: desc.id,
-                                field: spec::ids::COUNT,
-                            },
-                            attr.range,
-                        ));
-                        continue;
-                    }
-                    seen = true;
-                    let Some(folded) = self.fold_expr(attr.value) else { continue };
-                    if self.static_type(&folded) != Some(StaticType::Number) && !self.defers_to_generation(&folded) {
-                        self.errors.push(Error::new(
-                            ErrorKind::TypeMismatch {
-                                block: desc.id,
-                                field: spec::ids::COUNT,
-                                expected: &spec::ExprType::Number,
-                                found: self.found_type(&folded),
-                            },
-                            folded.range,
-                        ));
-                        continue;
-                    }
-                    if let FoldedKind::Value(Value::Num(number)) = &folded.kind {
-                        match number {
-                            Number::Int(value) if *value < 0 => self.errors.push(Error::new(
-                                ErrorKind::NegativeRepeatCount {
-                                    rule: spec::ids::REPEAT_COUNT,
-                                },
-                                folded.range,
-                            )),
-                            Number::Float(_) => self.errors.push(Error::new(
-                                ErrorKind::NonIntegerRepeatCount {
-                                    rule: spec::ids::REPEAT_COUNT,
-                                },
-                                folded.range,
-                            )),
-                            _ => {}
-                        }
-                    }
-                    let value = folded.into_value();
-                    self.check_scorer_value(&value);
-                    count = Some(value);
-                }
-                ast::Decl::Block(inner) => children.push(inner),
-            }
-        }
-        if !seen {
-            self.errors.push(Error::new(
-                ErrorKind::MissingField {
-                    block: desc.id,
-                    field: spec::ids::COUNT,
-                },
-                range,
-            ));
-        }
-        if children.is_empty() {
-            self.errors.push(Error::new(
-                ErrorKind::EmptyDynamicBlock {
-                    rule: spec::ids::DYNAMIC_CHILDREN,
-                    block: desc.id,
-                },
-                range,
-            ));
-        }
-        self.repeat_depth += 1;
-        let steps = children
-            .into_iter()
-            .filter_map(|inner| self.model_scorer_step(inner, desc.id))
-            .collect();
-        self.repeat_depth -= 1;
-        count.map(|count| ScorerStep::Repeat { count, steps })
-    }
-
-    fn model_when(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<When> {
-        let mut cond = None;
-        let mut score = None;
-        let mut seen = HashSet::new();
-        let mut children = Vec::new();
-
-        for decl in decls {
-            match decl {
-                ast::Decl::Attr(attr) => {
-                    let attr_range = attr.range;
-                    let Some(field) = desc.field(&attr.key) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownField {
-                                block: desc.id,
-                                keyword: attr.key,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    };
-                    let field_id = field.id;
-                    if !seen.insert(field_id) {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateField {
-                                block: desc.id,
-                                field: field_id,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    }
-                    let Some(folded) = self.fold_expr(attr.value) else {
-                        continue;
-                    };
-                    if field_id == spec::ids::COND {
-                        cond = self.model_cond(folded, desc.id);
-                    } else {
-                        score = self.model_score(folded, desc.id);
-                    }
-                }
-                ast::Decl::Block(inner) => children.push(inner),
-            }
-        }
-
-        if !seen.contains(&spec::ids::COND) {
-            self.errors.push(Error::new(
-                ErrorKind::MissingField {
-                    block: desc.id,
-                    field: spec::ids::COND,
-                },
-                range,
-            ));
-        }
-        if !seen.contains(&spec::ids::SCORE) && children.is_empty() {
-            self.errors.push(Error::new(
-                ErrorKind::MissingField {
-                    block: desc.id,
-                    field: spec::ids::SCORE,
-                },
-                range,
-            ));
-        }
-        let steps = children
-            .into_iter()
-            .filter_map(|inner| self.model_scorer_step(inner, desc.id))
-            .collect();
-
-        cond.map(|cond| When { cond, score, steps })
-    }
-
-    fn model_judge(&mut self, decls: Vec<ast::Decl>, desc: &spec::BlockDesc, range: SrcRange) -> Option<ScorerKind> {
-        let mut model = None;
-        let mut prompt = None;
-        let mut options = None;
-        let mut seen = HashSet::new();
-
-        for decl in decls {
-            match decl {
-                ast::Decl::Attr(attr) => {
-                    let attr_range = attr.range;
-                    let Some(field) = desc.field(&attr.key) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownField {
-                                block: desc.id,
-                                keyword: attr.key,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    };
-                    let field_id = field.id;
-                    if !seen.insert(field_id) {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateField {
-                                block: desc.id,
-                                field: field_id,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    }
-                    let Some(folded) = self.fold_expr(attr.value) else {
-                        continue;
-                    };
-                    if field_id == spec::ids::MODEL {
-                        match const_string(&folded) {
-                            Some(value) => model = Some(value),
-                            None => {
-                                self.errors.push(Error::new(
-                                    ErrorKind::InvalidJudgeModel {
-                                        rule: spec::ids::JUDGE_MODEL,
-                                    },
-                                    folded.range,
-                                ));
-                            }
-                        }
-                    } else if field_id == spec::ids::PROMPT {
-                        prompt = self.model_judge_prompt(folded);
-                    } else {
-                        options = self.model_judge_options(folded);
-                    }
-                }
-                ast::Decl::Block(inner) => {
-                    let parent = spec::Place::Block { id: desc.id };
-                    let error = match spec::SPEC.block(&inner.kind) {
-                        Some(inner_desc) => ErrorKind::BlockNotAllowed {
-                            block: inner_desc.id,
-                            parent,
-                        },
-                        None => ErrorKind::UnknownBlock {
-                            keyword: inner.kind,
-                            parent,
-                        },
-                    };
-                    self.errors.push(Error::new(error, inner.range));
-                }
-            }
-        }
-
-        for field in desc.body.fields {
-            if field.cardinality == spec::Cardinality::Required && !seen.contains(&field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::MissingField {
-                        block: desc.id,
-                        field: field.id,
-                    },
-                    range,
-                ));
-            }
-        }
-
-        match (model, prompt, options) {
-            (Some(model), Some(prompt), Some(options)) => Some(ScorerKind::Judge { model, prompt, options }),
-            _ => None,
-        }
-    }
-
-    // a judge prompt becomes a braintrust prompt template, so its holes must
-    // be plain argument paths a template slot can express, never computed text
-    fn model_judge_prompt(&mut self, folded: Folded) -> Option<Value> {
-        let renderable = match &folded.kind {
-            FoldedKind::Value(Value::Str(_)) => true,
-            FoldedKind::Value(Value::Template(template)) => template.parts.iter().all(|part| match part {
-                Part::Lit(_) => true,
-                Part::Dynamic(value) => is_arg_path(value),
-                Part::Ref(_) | Part::VarRef(_) => false,
-            }),
-            _ => false,
-        };
-
-        if !renderable {
-            self.errors.push(Error::new(
-                ErrorKind::InvalidJudgePrompt {
-                    rule: spec::ids::JUDGE_PROMPT,
-                },
-                folded.range,
-            ));
-            return None;
-        }
-
-        Some(folded.into_value())
-    }
-
-    // options is an object of constant scores between 0 and 1, at least two
-    fn model_judge_options(&mut self, folded: Folded) -> Option<Vec<JudgeOption>> {
-        let FoldedKind::Object(fields) = &folded.kind else {
-            self.errors.push(Error::new(
-                ErrorKind::InvalidJudgeOptions {
-                    rule: spec::ids::JUDGE_OPTIONS,
-                },
-                folded.range,
-            ));
-            return None;
-        };
-
-        let mut options = Vec::with_capacity(fields.len());
-        let mut valid = true;
-        for field in fields {
-            let score = match &field.value.kind {
-                FoldedKind::Value(Value::Num(number)) => {
-                    let score = float_bound(number.clone());
-                    (0.0..=1.0).contains(&score).then_some(score)
-                }
-                _ => None,
-            };
-            match score {
-                Some(score) => options.push(JudgeOption {
-                    label: field.key.clone(),
-                    score,
-                }),
-                None => {
-                    self.errors.push(Error::new(
-                        ErrorKind::InvalidJudgeOptions {
-                            rule: spec::ids::JUDGE_OPTIONS,
-                        },
-                        field.value.range,
-                    ));
-                    valid = false;
-                }
-            }
-        }
-
-        if fields.len() < 2 {
-            self.errors.push(Error::new(
-                ErrorKind::InvalidJudgeOptions {
-                    rule: spec::ids::JUDGE_OPTIONS,
-                },
-                folded.range,
-            ));
-            valid = false;
-        }
-
-        valid.then_some(options)
-    }
-
-    // score exprs are numbers (or arg-fed residuals); constants must land in 0..=1
-    fn model_score(&mut self, folded: Folded, block: spec::Id) -> Option<Value> {
-        if self.static_type(&folded) != Some(StaticType::Number) && !self.defers_to_generation(&folded) {
-            self.errors.push(Error::new(
-                ErrorKind::TypeMismatch {
-                    block,
-                    field: spec::ids::SCORE,
-                    expected: &spec::ExprType::Number,
-                    found: self.found_type(&folded),
-                },
-                folded.range,
-            ));
-            return None;
-        }
-
-        if let FoldedKind::Value(Value::Num(number)) = &folded.kind
-            && !(0.0..=1.0).contains(&float_bound(number.clone()))
-        {
-            self.errors.push(Error::new(
-                ErrorKind::ScoreOutOfRange {
-                    rule: spec::ids::SCORE_RANGE,
-                },
-                folded.range,
-            ));
-            return None;
-        }
-
-        let value = folded.into_value();
-        self.check_scorer_value(&value);
-        Some(value)
-    }
-
-    // conds are booleans (or arg-fed residuals settled by the emitted code)
-    fn model_cond(&mut self, folded: Folded, block: spec::Id) -> Option<Value> {
-        if self.static_type(&folded) != Some(StaticType::Boolean) && !self.defers_to_generation(&folded) {
-            self.errors.push(Error::new(
-                ErrorKind::TypeMismatch {
-                    block,
-                    field: spec::ids::COND,
-                    expected: &spec::ExprType::Boolean,
-                    found: self.found_type(&folded),
-                },
-                folded.range,
-            ));
-            return None;
-        }
-
-        let value = folded.into_value();
-        self.check_scorer_value(&value);
-        Some(value)
-    }
-
-    // scorer expressions must emit as python or typescript; the exhaustive
-    // matches force a transpilability decision on every future variant
-    fn check_scorer_value(&mut self, value: &Value) {
-        match value {
-            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::ArgRef(_) => {}
-            Value::Attachment { .. } => unreachable!("attachments are only materialized during generation"),
-            Value::CtxRef(CtxRef::RepeatIndex | CtxRef::RepeatCount) => {}
-            Value::VarRef(_) | Value::CtxRef(CtxRef::TraceIndex) | Value::BlockRef { .. } => {
-                unreachable!("rejected in scorer scope during folding")
-            }
-            Value::Template(template) => {
-                for part in &template.parts {
-                    match part {
-                        Part::Lit(_) => {}
-                        Part::Dynamic(value) => self.check_scorer_value(value),
-                        Part::Ref(_) | Part::VarRef(_) => unreachable!("rejected in scorer scope during folding"),
-                    }
-                }
-            }
-            Value::Array(array) => {
-                for elem in &array.elem {
-                    match elem {
-                        ArrayElem::Item(value) | ArrayElem::Spread(value) => self.check_scorer_value(value),
-                    }
-                }
-            }
-            Value::Object(object) => {
-                for field in &object.elem {
-                    self.check_scorer_value(&field.value);
-                }
-            }
-            Value::Unary { operand, .. } => self.check_scorer_value(operand),
-            Value::Binary { lhs, rhs, .. } => {
-                self.check_scorer_value(lhs);
-                self.check_scorer_value(rhs);
-            }
-            Value::Cond { cond, then, otherwise } => {
-                self.check_scorer_value(cond);
-                self.check_scorer_value(then);
-                self.check_scorer_value(otherwise);
-            }
-            Value::Index { target, index, .. } => {
-                self.check_scorer_value(target);
-                self.check_scorer_value(index);
-            }
-            Value::Slice { target, start, end, .. } => {
-                self.check_scorer_value(target);
-                if let Some(start) = start {
-                    self.check_scorer_value(start);
-                }
-                if let Some(end) = end {
-                    self.check_scorer_value(end);
-                }
-            }
-            Value::Func { func, range } => match func {
-                Func::Attachment { .. } => {
-                    self.errors.push(Error::new(
-                        ErrorKind::ScorerFunc {
-                            rule: spec::ids::SCORER_EXPRS,
-                            func: "attachment",
-                        },
-                        *range,
-                    ));
-                }
-                Func::Tokens { value } => {
-                    self.errors.push(Error::new(
-                        ErrorKind::ScorerFunc {
-                            rule: spec::ids::SCORER_EXPRS,
-                            func: "tokens",
-                        },
-                        *range,
-                    ));
-                    self.check_scorer_value(value);
-                }
-                Func::Noise { size } => {
-                    self.errors.push(Error::new(
-                        ErrorKind::ScorerFunc {
-                            rule: spec::ids::SCORER_EXPRS,
-                            func: "noise",
-                        },
-                        *range,
-                    ));
-                    self.check_scorer_value(size);
-                }
-                Func::Choice(options) | Func::Min(options) | Func::Max(options) => {
-                    for option in options {
-                        self.check_scorer_value(option);
-                    }
-                }
-                Func::Weighted(options) => {
-                    for option in options {
-                        self.check_scorer_value(&option.value);
-                    }
-                }
-                Func::Range(_)
-                | Func::Normal { .. }
-                | Func::Lognormal { .. }
-                | Func::Exponential { .. }
-                | Func::Pareto { .. }
-                | Func::Beta { .. }
-                | Func::Poisson { .. }
-                | Func::Chance { .. }
-                | Func::Uuid
-                | Func::Hex { .. }
-                | Func::Alphanum { .. } => {}
-                Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => self.check_scorer_value(text),
-                Func::Replace { text, from, to } => {
-                    self.check_scorer_value(text);
-                    self.check_scorer_value(from);
-                    self.check_scorer_value(to);
-                }
-                Func::Split { text, separator } => {
-                    self.check_scorer_value(text);
-                    self.check_scorer_value(separator);
-                }
-                Func::Join { array, separator }
-                | Func::Compose { array, separator }
-                | Func::Render {
-                    template: array,
-                    values: separator,
-                }
-                | Func::Sample { array, count: separator } => {
-                    self.check_scorer_value(array);
-                    self.check_scorer_value(separator);
-                }
-                Func::Contains { target, needle } => {
-                    self.check_scorer_value(target);
-                    self.check_scorer_value(needle);
-                }
-                Func::StartsWith { text, prefix } => {
-                    self.check_scorer_value(text);
-                    self.check_scorer_value(prefix);
-                }
-                Func::EndsWith { text, suffix } => {
-                    self.check_scorer_value(text);
-                    self.check_scorer_value(suffix);
-                }
-                Func::Len { target } => self.check_scorer_value(target),
-                Func::Format { args, .. } | Func::English { args, .. } => {
-                    for arg in args {
-                        self.check_scorer_value(arg);
-                    }
-                }
-                Func::Clamp { value, min, max } => {
-                    self.check_scorer_value(value);
-                    self.check_scorer_value(min);
-                    self.check_scorer_value(max);
-                }
-                Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
-                    self.check_scorer_value(value);
-                }
-            },
-        }
-    }
-
-    // notes which fields a block sets so absent-field references diagnose
-    fn record_fields(&mut self, node: NodeId, fields: &SpanFields) {
-        let sym = &mut self.syms[node.0 as usize];
-        let set = [
-            (Field::Input, fields.input.is_some()),
-            (Field::Output, fields.output.is_some()),
-            (Field::Expected, fields.expected.is_some()),
-            (Field::Error, fields.error.is_some()),
-            (Field::Metadata, fields.metadata.is_some()),
-            (Field::Metrics, fields.metrics.is_some()),
-            (Field::Tags, !fields.tags.is_empty()),
-        ];
-        sym.fields
-            .extend(set.into_iter().filter_map(|(field, set)| set.then_some(field)));
-    }
-
-    // collects a block's vars and pushes their scope frame; the caller pops it
-    fn enter_scope(&mut self, decls: Vec<ast::Decl>) -> (Vec<ast::Decl>, Vec<Binding>) {
-        let (vars_blocks, rest) = split_vars(decls);
-        let mut scope = Scope::default();
-        let mut bindings = Vec::new();
-        for block in vars_blocks {
-            self.collect_vars(block, &mut scope, &mut bindings);
-        }
-        self.scopes.push(scope);
-        (rest, bindings)
-    }
-
-    fn collect_vars(&mut self, block: ast::Block, scope: &mut Scope, bindings: &mut Vec<Binding>) {
-        let desc = spec::SPEC
-            .block_by_id(spec::ids::VARS)
-            .expect("the spec describes the vars block");
-        let ast::Block { name, decls, range, .. } = block;
-        self.model_name(name, range, desc);
-
-        for decl in decls {
-            match decl {
-                ast::Decl::Block(inner) => {
-                    let parent = spec::Place::Block { id: spec::ids::VARS };
-                    let error = match spec::SPEC.block(&inner.kind) {
-                        Some(desc) => ErrorKind::BlockNotAllowed { block: desc.id, parent },
-                        None => ErrorKind::UnknownBlock {
-                            keyword: inner.kind,
-                            parent,
-                        },
-                    };
-                    self.errors.push(Error::new(error, inner.range));
-                }
-                ast::Decl::Attr(attr) => {
-                    if self.declared.contains(&attr.key) {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateVar {
-                                rule: spec::ids::UNIQUE_VARS,
-                                name: attr.key,
-                            },
-                            attr.range,
-                        ));
-                        continue;
-                    }
-
-                    // the value folds against the enclosing scopes only: the
-                    // frame for the block being entered is not pushed yet, so
-                    // same-scope references diagnose as unknown; the sym stack
-                    // already holds the block, so block refs anchor inside it
-                    let owner = self.sym_stack.last().copied();
-                    let slot = SlotId::Binding {
-                        owner,
-                        name: attr.key.clone(),
-                    };
-                    let outer_slot = self.current_slot.replace(slot);
-                    let def = self.fold_expr(attr.value).map(|value| VarDef {
-                        constant: is_constant(&value),
-                        value,
-                        owner,
-                    });
-                    self.current_slot = outer_slot;
-
-                    // scorer vars must fold to constants; anything else would
-                    // need evaluating at generation, which scorer code never does
-                    if self.in_scorer
-                        && let Some(def) = &def
-                        && !def.constant
-                    {
-                        self.errors.push(Error::new(
-                            ErrorKind::ScorerDynamicVar {
-                                rule: spec::ids::SCORER_EXPRS,
-                                name: attr.key.clone(),
-                            },
-                            attr.range,
-                        ));
-                        continue;
-                    }
-
-                    // identity aliases substitute their opaque handle, preserving
-                    // the reference target through subsequent selections
-                    let def = def.map(|mut def| {
-                        if identity_value(&def.value.clone().into_value(), &self.pending) {
-                            let mut ids = Vec::new();
-                            collect_refs(&def.value.clone().into_value(), &mut ids);
-                            if !ids.is_empty() {
-                                def.constant = true;
-                                self.identity_aliases.extend(ids);
-                            }
-                        }
-                        def
-                    });
-
-                    // dynamic defs lower once here; references share the binding
-                    if let Some(def) = &def
-                        && !def.constant
-                    {
-                        bindings.push(Binding {
-                            name: attr.key.clone(),
-                            value: def.value.clone().into_value(),
-                        });
-                    }
-
-                    self.declared.insert(attr.key.clone());
-                    scope.vars.insert(attr.key, def);
-                }
-            }
-        }
-    }
-
-    // the one pass over an expr: folds constant parts to model values as it
-    // walks, checks types in place, and leaves dynamic parts residual
-    fn fold_expr(&mut self, expr: ast::Expr) -> Option<Folded> {
-        let ast::Expr { kind, range } = expr;
-        match kind {
-            ast::ExprKind::Str(value) => Some(Folded::value(Value::Str(value), range)),
-            ast::ExprKind::Template(parts) => self.fold_template(parts, range),
-            ast::ExprKind::Num(raw) => self
-                .model_number(raw, false, range)
-                .map(|number| Folded::value(Value::Num(number), range)),
-            ast::ExprKind::Bool(value) => Some(Folded::value(Value::Bool(value), range)),
-            ast::ExprKind::Null => Some(Folded::value(Value::Null, range)),
-            ast::ExprKind::Array(values) => self.fold_array(values, range),
-            ast::ExprKind::Object(items) => self.fold_object(items, range),
-            ast::ExprKind::Ref { path } => self.fold_ref(path, range),
-            ast::ExprKind::Func { name, args } => {
-                let mut folded = Vec::with_capacity(args.len());
-                let mut valid = true;
-                for arg in args {
-                    match self.fold_expr(arg) {
-                        Some(arg) => folded.push(arg),
-                        None => valid = false,
-                    }
-                }
-                if !valid {
-                    return None;
-                }
-                let func = self.model_func(name, folded, range)?;
-                Some(Folded::value(Value::Func { func, range }, range))
-            }
-            ast::ExprKind::Unary { op, operand } => self.fold_unary(op, *operand, range),
-            ast::ExprKind::Binary { op, lhs, rhs } => self.fold_binary(op, *lhs, *rhs, range),
-            ast::ExprKind::Cond { cond, then, otherwise } => self.fold_cond(*cond, *then, *otherwise, range),
-            ast::ExprKind::Index { target, index } => {
-                // fold both sides first so each reports its own diagnostics
-                let target = self.fold_expr(*target);
-                let index = self.fold_expr(*index);
-                let (target, index) = (target?, index?);
-                self.fold_index(target, index, range)
-            }
-            ast::ExprKind::Slice { target, start, end } => self.fold_slice(*target, start, end, range),
-            ast::ExprKind::For {
-                bindings,
-                collection,
-                key,
-                body,
-                cond,
-            } => self.fold_for(bindings, *collection, key, *body, cond, range),
-            ast::ExprKind::Spread(_) => unreachable!("spreads only parse inside arrays and objects"),
-        }
-    }
-
-    // resolves the ref namespaces: var.<name>, loop bindings, context refs,
-    // and block references; loop bindings shadow every other head
-    fn fold_ref(&mut self, path: Vec<String>, range: SrcRange) -> Option<Folded> {
-        // use-site range wins so diags point at the ref, not the definition;
-        // constant defs substitute, dynamic ones stay a reference to the binding
-        if path.len() >= 2 && path[0] == "var" {
-            let mut segments = path.into_iter().skip(1);
-            let name = segments.next().expect("path has at least two segments");
-            let def = self.lookup_var(name.clone(), range)?;
-            // scorer expressions only substitute constants; a dynamic root
-            // binding is a legal declaration but an illegal use here
-            if self.in_scorer && (!def.constant || self.folded_reaches_block_ref(&def.value)) {
-                self.errors.push(Error::new(
-                    ErrorKind::ScorerDynamicVar {
-                        rule: spec::ids::SCORER_EXPRS,
-                        name,
-                    },
-                    range,
-                ));
-                return None;
-            }
-            let head = if def.constant {
-                Folded::new(def.value.kind, range)
-            } else {
-                // a dynamic binding is a dataflow edge from the slot folding now
-                if let Some(from) = self.current_slot.clone() {
-                    let to = SlotId::Binding {
-                        owner: def.owner,
-                        name: name.clone(),
-                    };
-                    self.edges.push((from, to, range));
-                }
-                Folded::value(Value::VarRef(name), range)
-            };
-            return self.select_segments(head, segments, range);
-        }
-
-        // loop bindings shadow context namespaces, innermost frame wins
-        if let Some(binding) = self.lookup_loop(&path[0]) {
-            let mut segments = path.into_iter();
-            segments.next();
-            let head = Folded::new(binding.kind, range);
-            return self.select_segments(head, segments, range);
-        }
-
-        // scorer scope swaps the reference namespaces wholesale: bare args
-        // resolve, every generation-context head is rejected, and no pending
-        // reference is ever recorded
-        if self.in_scorer {
-            return self.fold_scorer_ref(path, range);
-        }
-
-        // exact context paths resolve before block heads so trace.index stays
-        // the generation counter while trace.output reads the enclosing trace
-        if let Some(ctx_ref) = model_ctx_ref(&path, self.repeat_depth) {
-            return Some(Folded::value(Value::CtxRef(ctx_ref), range));
-        }
-
-        // a repeat context path outside any repeat keeps its own diagnostic
-        // instead of resolving as a block named `index` or `count`
-        if let [first, second] = &path[..]
-            && first == "repeat"
-            && (second == "index" || second == "count")
-        {
-            self.errors.push(Error::new(
-                ErrorKind::RepeatRefOutsideRepeat {
-                    rule: spec::ids::REPEAT_REFS,
-                    path: path.join("."),
-                },
-                range,
-            ));
-            return None;
-        }
-
-        if let Some(head) = self.block_head(&path[0], range) {
-            let head = head?;
-            let segments = path.into_iter().skip(1).map(|value| Segment::Name { value, range }).collect();
-            return Some(self.begin_block_ref(head, segments, range));
-        }
-
-        self.require_ctx_ref(&path, range)
-            .map(|ctx_ref| Folded::value(Value::CtxRef(ctx_ref), range))
-    }
-
-    // the scorer namespaces: bare input/output/expected/metadata are the
-    // runtime arguments braintrust passes the scorer; generation heads get a
-    // scorer-specific diagnostic instead of resolving
-    fn fold_scorer_ref(&mut self, path: Vec<String>, range: SrcRange) -> Option<Folded> {
-        if self.repeat_depth > 0 {
-            match path.as_slice() {
-                [first, second] if first == "repeat" && second == "index" => {
-                    return Some(Folded::value(Value::CtxRef(CtxRef::RepeatIndex), range));
-                }
-                [first, second] if first == "repeat" && second == "count" => {
-                    return Some(Folded::value(Value::CtxRef(CtxRef::RepeatCount), range));
-                }
-                _ => {}
-            }
-        }
-        let arg = match path[0].as_str() {
-            "input" => Some(ScorerArg::Input),
-            "output" => Some(ScorerArg::Output),
-            "expected" => Some(ScorerArg::Expected),
-            "metadata" => Some(ScorerArg::Metadata),
-            _ => None,
-        };
-        if let Some(arg) = arg {
-            let head = Folded::value(Value::ArgRef(arg), range);
-            let mut segments = path.into_iter();
-            segments.next();
-            return self.select_segments(head, segments, range);
-        }
-
-        let generation_head = matches!(
-            path[0].as_str(),
-            "task" | "llm" | "tool" | "function" | "repeat" | "choice" | "maybe" | "trace" | "self"
-        );
-        let kind = if generation_head {
-            ErrorKind::ScorerRef {
-                rule: spec::ids::SCORER_ARGS,
-                path: path.join("."),
-            }
-        } else {
-            ErrorKind::UnknownReference {
-                rule: spec::ids::KNOWN_REFERENCES,
-                path: path.join("."),
-            }
-        };
-        self.errors.push(Error::new(kind, range));
-        None
-    }
-
-    // classifies a reference head: none = not a block head, some(none) = a
-    // block head that failed to resolve and already diagnosed
-    fn block_head(&mut self, head: &str, range: SrcRange) -> Option<Option<Head>> {
-        let kind = match head {
-            "task" => Head::Kind(BlockKind::Task),
-            "llm" => Head::Kind(BlockKind::Llm),
-            "tool" => Head::Kind(BlockKind::Tool),
-            "function" => Head::Kind(BlockKind::Function),
-            "repeat" => Head::Kind(BlockKind::Repeat),
-            "choice" => Head::Kind(BlockKind::Choice),
-            "maybe" => Head::Kind(BlockKind::Maybe),
-            "trace" => Head::Trace,
-            "self" => {
-                // the innermost enclosing span or trace resolves right here
-                let anchor = self
-                    .sym_stack
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|node| self.syms[node.0 as usize].kind.has_fields());
-                return match anchor {
-                    Some(node) => Some(Some(Head::SelfBlock(node))),
-                    None => {
-                        self.errors.push(Error::new(
-                            ErrorKind::SelfOutsideBlock {
-                                rule: spec::ids::SELF_REFS,
-                            },
-                            range,
-                        ));
-                        Some(None)
-                    }
-                };
-            }
-            _ => return None,
-        };
-        Some(Some(kind))
-    }
-
-    // records a pending reference and hands back its opaque value
-    fn begin_block_ref(&mut self, head: Head, segments: Vec<Segment>, range: SrcRange) -> Folded {
-        let ref_id = RefId(self.pending.len() as u32);
-        self.pending.push(PendingRef {
-            head,
-            segments,
-            origin: self.sym_stack.clone(),
-            slot: self.current_slot.clone(),
-            range,
-        });
-        Folded::value(Value::BlockRef { ref_id, range }, range)
-    }
-
-    // extension never mutates the shared record: loop bindings clone their
-    // folded values per use site, so two uses of one binding must not append
-    // to the same pending reference
-    fn extend_block_ref(&mut self, ref_id: RefId, segment: Segment, range: SrcRange) -> Folded {
-        let mut pending = self.pending[ref_id.0 as usize].clone();
-        if matches!(pending.head, Head::Trace) && pending.segments.is_empty() && matches!(segment, Segment::Name { .. }) {
-            pending.head = Head::ModuleTrace;
-        }
-        pending.segments.push(segment);
-        pending.range = range;
-        let extended = RefId(self.pending.len() as u32);
-        self.pending.push(pending);
-        Folded::value(Value::BlockRef { ref_id: extended, range }, range)
-    }
-
-    // selects the trailing segments of a reference path as string indexes
-    fn select_segments(&mut self, head: Folded, segments: impl Iterator<Item = String>, range: SrcRange) -> Option<Folded> {
-        let mut selected = head;
-        for segment in segments {
-            let index = Folded::value(Value::Str(segment), range);
-            selected = self.fold_index(selected, index, range)?;
-        }
-        Some(selected)
-    }
-
-    // interpolation holes fold like any expression: constants splice as
-    // literals, templates splice their parts, dynamic values stay parts when
-    // their type is a known scalar, and reference-fed values settle
-    // scalar-ness at generation
-    fn fold_template(&mut self, parts: Vec<ast::TemplatePart>, range: SrcRange) -> Option<Folded> {
-        let mut modeled: Vec<Part> = Vec::with_capacity(parts.len());
-        let mut valid = true;
-
-        for part in parts {
-            match part {
-                ast::TemplatePart::Lit(value) => modeled.push(Part::Lit(value)),
-                ast::TemplatePart::Ref { expr, range } => {
-                    let Some(folded) = self.fold_expr(expr) else {
-                        valid = false;
-                        continue;
-                    };
-                    match folded.kind {
-                        FoldedKind::Value(Value::Str(text)) => modeled.push(Part::Lit(text)),
-                        FoldedKind::Value(Value::Num(number)) => modeled.push(Part::Lit(num_text(number))),
-                        FoldedKind::Value(Value::Bool(value)) => {
-                            modeled.push(Part::Lit(if value { "true" } else { "false" }.to_owned()));
-                        }
-                        // a template value splices its parts inline
-                        FoldedKind::Value(Value::Template(template)) => modeled.extend(template.parts),
-                        FoldedKind::Value(Value::CtxRef(ctx_ref)) if self.in_scorer => {
-                            modeled.push(Part::Dynamic(Value::CtxRef(ctx_ref)));
-                        }
-                        FoldedKind::Value(Value::CtxRef(ctx_ref)) => modeled.push(Part::Ref(ctx_ref)),
-                        // dynamic defs resolve per scope instantiation, scalar by type
-                        FoldedKind::Value(Value::VarRef(name)) => {
-                            let var_type = self.value_type(&Value::VarRef(name.clone()));
-                            match var_type {
-                                Some(StaticType::String | StaticType::Number | StaticType::Boolean) => {
-                                    modeled.push(Part::VarRef(name));
-                                }
-                                _ => {
-                                    self.errors.push(Error::new(
-                                        ErrorKind::NonScalarInterpolation {
-                                            rule: spec::ids::SCALAR_INTERPOLATION,
-                                            found: self.found_type(&Folded::value(Value::VarRef(name), range)),
-                                        },
-                                        range,
-                                    ));
-                                    valid = false;
-                                }
-                            }
-                        }
-                        FoldedKind::Value(value) => {
-                            let folded = Folded::value(value, range);
-                            let scalar = matches!(
-                                self.static_type(&folded),
-                                Some(StaticType::String | StaticType::Number | StaticType::Boolean)
-                            );
-                            if scalar || self.defers_to_generation(&folded) {
-                                modeled.push(Part::Dynamic(folded.into_value()));
-                            } else {
-                                self.errors.push(Error::new(
-                                    ErrorKind::NonScalarInterpolation {
-                                        rule: spec::ids::SCALAR_INTERPOLATION,
-                                        found: self.found_type(&folded),
-                                    },
-                                    range,
-                                ));
-                                valid = false;
-                            }
-                        }
-                        kind @ (FoldedKind::Array(_) | FoldedKind::Object(_)) => {
-                            self.errors.push(Error::new(
-                                ErrorKind::NonScalarInterpolation {
-                                    rule: spec::ids::SCALAR_INTERPOLATION,
-                                    found: self.found_type(&Folded::new(kind, range)),
-                                },
-                                range,
-                            ));
-                            valid = false;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !valid {
-            return None;
-        }
-
-        // an all-literal template folds to a plain string so downstream only
-        // sees templates that actually resolve
-        if modeled.iter().all(|part| matches!(part, Part::Lit(_))) {
-            let joined = modeled
-                .into_iter()
-                .map(|part| match part {
-                    Part::Lit(value) => value,
-                    Part::Ref(_) | Part::VarRef(_) | Part::Dynamic(_) => unreachable!("all parts are literal"),
-                })
-                .collect();
-            return Some(Folded::value(Value::Str(joined), range));
-        }
-
-        Some(Folded::value(Value::Template(Template { parts: modeled }), range))
-    }
-
-    fn fold_array(&mut self, values: Vec<ast::Expr>, range: SrcRange) -> Option<Folded> {
-        let mut folded = Vec::with_capacity(values.len());
-        let mut valid = true;
-        for value in values {
-            match value.kind {
-                // constant-shape spreads splice in place, reference-fed ones
-                // stay residual and splice at generation
-                ast::ExprKind::Spread(operand) => match self.fold_array_spread(*operand) {
-                    Some(elems) => folded.extend(elems),
-                    None => valid = false,
-                },
-                _ => match self.fold_expr(value) {
-                    Some(value) => folded.push(FoldedElem::Item(value)),
-                    None => valid = false,
-                },
-            }
-        }
-        if !valid {
-            return None;
-        }
-
-        // an array with a residual spread has no static positions, so it
-        // lowers to a value instead of a folded container
-        if folded.iter().any(|elem| matches!(elem, FoldedElem::Spread(_))) {
-            let elem = folded
-                .into_iter()
-                .map(|elem| match elem {
-                    FoldedElem::Item(value) => ArrayElem::Item(value.into_value()),
-                    FoldedElem::Spread(value) => ArrayElem::Spread(value.into_value()),
-                })
-                .collect();
-            return Some(Folded::value(Value::Array(Array { elem }), range));
-        }
-
-        let items = folded
-            .into_iter()
-            .map(|elem| match elem {
-                FoldedElem::Item(value) => value,
-                FoldedElem::Spread(_) => unreachable!("residual spreads returned above"),
-            })
-            .collect();
-        Some(Folded::new(FoldedKind::Array(items), range))
-    }
-
-    fn fold_unary(&mut self, op: ast::UnaryOp, operand: ast::Expr, range: SrcRange) -> Option<Folded> {
-        // a minus folds into an adjacent number literal so i64::MIN parses
-        if op == ast::UnaryOp::Neg
-            && let ast::ExprKind::Num(raw) = operand.kind
-        {
-            let number = self.model_number(raw, true, range)?;
-            return Some(Folded::value(Value::Num(number), range));
-        }
-
-        let operand = self.fold_expr(operand)?;
-
-        let required = match op {
-            ast::UnaryOp::Neg => StaticType::Number,
-            ast::UnaryOp::Not => StaticType::Boolean,
-        };
-        if !self.check_operand(&operand, required, op.to_string()) {
-            return None;
-        }
-
-        match operand.kind {
-            FoldedKind::Value(Value::Bool(value)) if op == ast::UnaryOp::Not => Some(Folded::value(Value::Bool(!value), range)),
-            // negating a constant computes now, overflow can only hit i64::MIN
-            FoldedKind::Value(Value::Num(number)) => {
-                let negated = match number {
-                    Number::Int(value) => value.checked_neg().map(Number::Int),
-                    Number::Float(value) => Some(Number::Float(-value)),
-                };
-                match negated {
-                    Some(number) => Some(Folded::value(Value::Num(number), range)),
-                    None => {
-                        self.errors.push(Error::new(
-                            ErrorKind::NonFiniteResult {
-                                rule: spec::ids::FINITE_NUMBERS,
-                            },
-                            range,
-                        ));
-                        None
-                    }
-                }
-            }
-            kind => Some(Folded::value(
-                Value::Unary {
-                    op: model_unary_op(op),
-                    operand: Box::new(Folded::new(kind, operand.range).into_value()),
-                    range,
-                },
-                range,
-            )),
-        }
-    }
-
-    fn fold_binary(&mut self, op: ast::BinOp, lhs: ast::Expr, rhs: ast::Expr, range: SrcRange) -> Option<Folded> {
-        // fold both sides first so each reports its own diagnostics
-        let lhs = self.fold_expr(lhs);
-        let rhs = self.fold_expr(rhs);
-        let (lhs, rhs) = (lhs?, rhs?);
-
-        let valid = match op_class(op) {
-            OpClass::Arith | OpClass::Cmp => {
-                let left = self.check_operand(&lhs, StaticType::Number, op.to_string());
-                self.check_operand(&rhs, StaticType::Number, op.to_string()) && left
-            }
-            OpClass::Logic => {
-                let left = self.check_operand(&lhs, StaticType::Boolean, op.to_string());
-                self.check_operand(&rhs, StaticType::Boolean, op.to_string()) && left
-            }
-            OpClass::Eq => self.check_equality_operands(&lhs, &rhs, op),
-        };
-        if !valid {
-            return None;
-        }
-
-        // a constant zero divisor is always an error, even with a dynamic lhs
-        if matches!(op, ast::BinOp::Div | ast::BinOp::Rem)
-            && let FoldedKind::Value(Value::Num(number)) = &rhs.kind
-            && float_bound(number.clone()) == 0.0
-        {
-            self.errors.push(Error::new(
-                ErrorKind::DivisionByZero {
-                    rule: spec::ids::NONZERO_DIVISORS,
-                    op: op.to_string(),
-                },
-                rhs.range,
-            ));
-            return None;
-        }
-
-        if is_constant(&lhs) && is_constant(&rhs) {
-            return self.eval_binary(op, const_scalar(&lhs), const_scalar(&rhs), range);
-        }
-
-        Some(Folded::value(
-            Value::Binary {
-                op: model_bin_op(op),
-                lhs: Box::new(lhs.into_value()),
-                rhs: Box::new(rhs.into_value()),
-                range,
-            },
-            range,
-        ))
-    }
-
-    fn fold_cond(&mut self, cond: ast::Expr, then: ast::Expr, otherwise: ast::Expr, range: SrcRange) -> Option<Folded> {
-        let cond = self.fold_expr(cond);
-        let then = self.fold_expr(then);
-        let otherwise = self.fold_expr(otherwise);
-        let (cond, then, otherwise) = (cond?, then?, otherwise?);
-
-        if self.static_type(&cond) != Some(StaticType::Boolean) && !self.defers_to_generation(&cond) {
-            self.errors.push(Error::new(
-                ErrorKind::NonBooleanCondition {
-                    rule: spec::ids::BOOLEAN_CONDITIONS,
-                    found: self.found_type(&cond),
-                },
-                cond.range,
-            ));
-            return None;
-        }
-
-        // a constant condition picks its branch during validation
-        if let FoldedKind::Value(Value::Bool(value)) = cond.kind {
-            let taken = if value { then } else { otherwise };
-            return Some(Folded::new(taken.kind, range));
-        }
-
-        Some(Folded::value(
-            Value::Cond {
-                cond: Box::new(cond.into_value()),
-                then: Box::new(then.into_value()),
-                otherwise: Box::new(otherwise.into_value()),
-            },
-            range,
-        ))
-    }
-
-    fn fold_index(&mut self, target: Folded, index: Folded, range: SrcRange) -> Option<Folded> {
-        // an index on a block reference extends its path; where the block path
-        // ends and json drill-in begins is decided at fixup, so no checks here
-        if let FoldedKind::Value(Value::BlockRef { ref_id, .. }) = target.kind {
-            let segment = match index.kind {
-                FoldedKind::Value(Value::Str(value)) => Segment::Name {
-                    value,
-                    range: index.range,
-                },
-                kind => Segment::Index {
-                    value: Folded::new(kind, index.range).into_value(),
-                    range: index.range,
-                },
-            };
-            return Some(self.extend_block_ref(ref_id, segment, range));
-        }
-
-        let expected = match self.static_type(&target) {
-            Some(StaticType::Array) => StaticType::Number,
-            Some(StaticType::Object) => StaticType::String,
-            // a target fed by a block reference is only shaped at generation
-            None if self.folded_reaches_block_ref(&target) => {
-                return Some(Folded::value(
-                    Value::Index {
-                        target: Box::new(target.into_value()),
-                        index: Box::new(index.into_value()),
-                        range,
-                    },
-                    range,
-                ));
-            }
-            _ => {
-                self.errors.push(Error::new(
-                    ErrorKind::NonIndexableTarget {
-                        rule: spec::ids::INDEXABLE_TARGETS,
-                        found: self.found_type(&target),
-                    },
-                    target.range,
-                ));
-                return None;
-            }
-        };
-
-        if self.static_type(&index) != Some(expected) && !self.defers_to_generation(&index) {
-            self.errors.push(Error::new(
-                ErrorKind::IndexTypeMismatch {
-                    rule: spec::ids::INDEXABLE_TARGETS,
-                    expected: type_name(expected),
-                    found: self.found_type(&index),
-                },
-                index.range,
-            ));
-            return None;
-        }
-
-        // a constant index into a container literal selects its element during
-        // validation, the element itself may still be dynamic
-        match target.kind {
-            FoldedKind::Array(values) if is_constant(&index) => {
-                let Const::Num(number) = const_scalar(&index) else {
-                    unreachable!("index was type checked as a number");
-                };
-                let Number::Int(position) = number else {
-                    self.errors.push(Error::new(
-                        ErrorKind::NonIntegerIndex {
-                            rule: spec::ids::INDEXABLE_TARGETS,
-                        },
-                        index.range,
-                    ));
-                    return None;
-                };
-
-                match usize::try_from(position).ok().filter(|&position| position < values.len()) {
-                    Some(position) => {
-                        let selected = values.into_iter().nth(position).expect("position is in bounds");
-                        Some(Folded::new(selected.kind, range))
-                    }
-                    None => {
-                        self.errors.push(Error::new(
-                            ErrorKind::IndexOutOfBounds {
-                                rule: spec::ids::INDEX_BOUNDS,
-                                index: position,
-                                len: values.len(),
-                            },
-                            index.range,
-                        ));
-                        None
-                    }
-                }
-            }
-            FoldedKind::Object(fields) if is_constant(&index) => {
-                let Const::Str(key) = const_scalar(&index) else {
-                    unreachable!("index was type checked as a string");
-                };
-
-                let selected = fields.into_iter().find_map(|field| (field.key == key).then_some(field.value));
-                match selected {
-                    Some(value) => Some(Folded::new(value.kind, range)),
-                    None => {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownObjectKey {
-                                rule: spec::ids::INDEX_BOUNDS,
-                                key,
-                            },
-                            index.range,
-                        ));
-                        None
-                    }
-                }
-            }
-            kind => Some(Folded::value(
-                Value::Index {
-                    target: Box::new(Folded::new(kind, target.range).into_value()),
-                    index: Box::new(index.into_value()),
-                    range,
-                },
-                range,
-            )),
-        }
-    }
-
-    fn fold_array_spread(&mut self, operand: ast::Expr) -> Option<Vec<FoldedElem>> {
-        let operand = self.fold_expr(operand)?;
-
-        // a dynamic var splices as accessors into the one evaluated binding
-        if let FoldedKind::Value(Value::VarRef(name)) = &operand.kind {
-            let ranges = match self.var_value(name).map(|value| &value.kind) {
-                Some(FoldedKind::Array(values)) => Some(values.iter().map(|value| value.range).collect::<Vec<_>>()),
-                _ => None,
-            };
-            if let Some(ranges) = ranges {
-                return Some(
-                    ranges
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, range)| {
-                            FoldedElem::Item(Folded::value(
-                                Value::Index {
-                                    target: Box::new(Value::VarRef(name.clone())),
-                                    index: Box::new(Value::Num(Number::Int(index as i64))),
-                                    range,
-                                },
-                                range,
-                            ))
-                        })
-                        .collect(),
-                );
-            }
-        }
-
-        // arrays whose shape only exists at generation splice there
-        let dynamic = self.static_type(&operand) == Some(StaticType::Array) && !matches!(operand.kind, FoldedKind::Array(_));
-        if dynamic || self.defers_to_generation(&operand) {
-            return Some(vec![FoldedElem::Spread(operand)]);
-        }
-
-        match operand.kind {
-            FoldedKind::Array(values) => Some(values.into_iter().map(FoldedElem::Item).collect()),
-            kind => {
-                let operand = Folded::new(kind, operand.range);
-                self.errors.push(Error::new(
-                    ErrorKind::SpreadTypeMismatch {
-                        rule: spec::ids::SPREAD_OPERANDS,
-                        expected: "array",
-                        found: ExprType::of(&operand),
-                    },
-                    operand.range,
-                ));
-                None
-            }
-        }
-    }
-
-    // later entries win over keys a spread introduced, two explicit keys collide
-    fn fold_object(&mut self, items: Vec<ast::ObjectItem>, range: SrcRange) -> Option<Folded> {
-        let mut merged: Vec<(FoldedField, bool)> = Vec::new();
-        let mut valid = true;
-
-        for item in items {
-            match item {
-                ast::ObjectItem::Attr(attr) => match self.fold_expr(attr.value) {
-                    Some(value) => {
-                        let field = FoldedField {
-                            key: attr.key,
-                            value,
-                            range: attr.range,
-                        };
-                        match merged.iter_mut().find(|(existing, _)| existing.key == field.key) {
-                            Some((_, true)) => {
-                                self.errors.push(Error::new(
-                                    ErrorKind::DuplicateObjectKey {
-                                        rule: spec::ids::UNIQUE_OBJECT_KEYS,
-                                        key: field.key,
-                                    },
-                                    field.range,
-                                ));
-                                valid = false;
-                            }
-                            Some(slot) => *slot = (field, true),
-                            None => merged.push((field, true)),
-                        }
-                    }
-                    None => valid = false,
-                },
-                ast::ObjectItem::Spread(operand) => match self.fold_object_spread(operand) {
-                    Some(fields) => {
-                        for field in fields {
-                            match merged.iter_mut().find(|(existing, _)| existing.key == field.key) {
-                                Some(slot) => *slot = (field, false),
-                                None => merged.push((field, false)),
-                            }
-                        }
-                    }
-                    None => valid = false,
-                },
-            }
-        }
-
-        if !valid {
-            return None;
-        }
-
-        let fields = merged.into_iter().map(|(field, _)| field).collect();
-        Some(Folded::new(FoldedKind::Object(fields), range))
-    }
-
-    fn fold_object_spread(&mut self, operand: ast::Expr) -> Option<Vec<FoldedField>> {
-        let operand = self.fold_expr(operand)?;
-
-        // a dynamic var splices as accessors into the one evaluated binding
-        if let FoldedKind::Value(Value::VarRef(name)) = &operand.kind {
-            let keys = match self.var_value(name).map(|value| &value.kind) {
-                Some(FoldedKind::Object(fields)) => Some(
-                    fields
-                        .iter()
-                        .map(|field| (field.key.clone(), field.range))
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            };
-            let Some(keys) = keys else {
-                self.errors.push(Error::new(
-                    ErrorKind::SpreadTypeMismatch {
-                        rule: spec::ids::SPREAD_OPERANDS,
-                        expected: "object",
-                        found: ExprType::of(&operand),
-                    },
-                    operand.range,
-                ));
-                return None;
-            };
-            return Some(
-                keys.into_iter()
-                    .map(|(key, range)| FoldedField {
-                        value: Folded::value(
-                            Value::Index {
-                                target: Box::new(Value::VarRef(name.clone())),
-                                index: Box::new(Value::Str(key.clone())),
-                                range,
-                            },
-                            range,
-                        ),
-                        key,
-                        range,
-                    })
-                    .collect(),
-            );
-        }
-
-        match operand.kind {
-            FoldedKind::Object(fields) => Some(fields),
-            kind => {
-                let operand = Folded::new(kind, operand.range);
-                self.errors.push(Error::new(
-                    ErrorKind::SpreadTypeMismatch {
-                        rule: spec::ids::SPREAD_OPERANDS,
-                        expected: "object",
-                        found: ExprType::of(&operand),
-                    },
-                    operand.range,
-                ));
-                None
-            }
-        }
-    }
-
-    fn fold_slice(
-        &mut self,
-        target: ast::Expr,
-        start: Option<Box<ast::Expr>>,
-        end: Option<Box<ast::Expr>>,
-        range: SrcRange,
-    ) -> Option<Folded> {
-        // fold every part first so each reports its own diagnostics
-        let target = self.fold_expr(target);
-        let start = start.map(|bound| self.fold_expr(*bound));
-        let end = end.map(|bound| self.fold_expr(*bound));
-        let target = target?;
-        let start = match start {
-            Some(bound) => Some(bound?),
-            None => None,
-        };
-        let end = match end {
-            Some(bound) => Some(bound?),
-            None => None,
-        };
-
-        // a slice on a block reference extends its path like an index does
-        if let FoldedKind::Value(Value::BlockRef { ref_id, .. }) = target.kind {
-            let mut valid = true;
-            for bound in [&start, &end].into_iter().flatten() {
-                if self.static_type(bound) != Some(StaticType::Number) && !self.defers_to_generation(bound) {
-                    self.errors.push(Error::new(
-                        ErrorKind::SliceTypeMismatch {
-                            rule: spec::ids::SLICE_BOUNDS,
-                            found: self.found_type(bound),
-                        },
-                        bound.range,
-                    ));
-                    valid = false;
-                }
-            }
-            if !valid {
-                return None;
-            }
-            let segment = Segment::Slice {
-                start: start.map(Folded::into_value),
-                end: end.map(Folded::into_value),
-                range,
-            };
-            return Some(self.extend_block_ref(ref_id, segment, range));
-        }
-
-        let sliceable = self.static_type(&target) == Some(StaticType::Array)
-            // a target fed by a block reference is only shaped at generation
-            || (self.static_type(&target).is_none() && self.folded_reaches_block_ref(&target));
-        if !sliceable {
-            self.errors.push(Error::new(
-                ErrorKind::NonSliceableTarget {
-                    rule: spec::ids::SLICEABLE_TARGETS,
-                    found: self.found_type(&target),
-                },
-                target.range,
-            ));
-            return None;
-        }
-
-        let mut valid = true;
-        for bound in [&start, &end].into_iter().flatten() {
-            if self.static_type(bound) != Some(StaticType::Number) && !self.defers_to_generation(bound) {
-                self.errors.push(Error::new(
-                    ErrorKind::SliceTypeMismatch {
-                        rule: spec::ids::SLICE_BOUNDS,
-                        found: self.found_type(bound),
-                    },
-                    bound.range,
-                ));
-                valid = false;
-            }
-        }
-        if !valid {
-            return None;
-        }
-
-        // constant bounds must check out even when the target is dynamic
-        let start_const = match &start {
-            Some(bound) => self.check_slice_bound(bound),
-            None => Some(Some(0)),
-        };
-        let end_const = match &end {
-            Some(bound) => self.check_slice_bound(bound),
-            None => Some(None),
-        };
-        let (start_const, end_const) = match (start_const, end_const) {
-            (Some(start), Some(end)) => (start, end),
-            _ => return None,
-        };
-
-        // a constant slice of a literal selects its elements during validation,
-        // the elements themselves may still be dynamic
-        let known = start_const.is_some() && (end_const.is_some() || end.is_none());
-        if known && matches!(target.kind, FoldedKind::Array(_)) {
-            let FoldedKind::Array(values) = target.kind else {
-                unreachable!("the target was just matched as an array literal");
-            };
-            let len = values.len();
-            let start = start_const.expect("a known slice has a constant start").min(len);
-            let end = end_const.unwrap_or(len).min(len);
-            let selected = if start >= end {
-                Vec::new()
-            } else {
-                values.into_iter().skip(start).take(end - start).collect()
-            };
-            return Some(Folded::new(FoldedKind::Array(selected), range));
-        }
-
-        Some(Folded::value(
-            Value::Slice {
-                target: Box::new(target.into_value()),
-                start: start.map(|bound| Box::new(bound.into_value())),
-                end: end.map(|bound| Box::new(bound.into_value())),
-                range,
-            },
-            range,
-        ))
-    }
-
-    // some(none) = dynamic, checked during generation, none = diagnostic pushed
-    fn check_slice_bound(&mut self, bound: &Folded) -> Option<Option<usize>> {
-        if !is_constant(bound) {
-            return Some(None);
-        }
-
-        let Const::Num(number) = const_scalar(bound) else {
-            unreachable!("bound was type checked as a number");
-        };
-        let Number::Int(value) = number else {
-            self.errors.push(Error::new(
-                ErrorKind::NonIntegerSliceBound {
-                    rule: spec::ids::SLICE_BOUNDS,
-                },
-                bound.range,
-            ));
-            return None;
-        };
-
-        match value {
-            // oversized positive bounds still clamp to the array length
-            value if value >= 0 => Some(Some(usize::try_from(value).unwrap_or(usize::MAX))),
-            _ => {
-                self.errors.push(Error::new(
-                    ErrorKind::NegativeSliceBound {
-                        rule: spec::ids::SLICE_BOUNDS,
-                    },
-                    bound.range,
-                ));
-                None
-            }
-        }
-    }
-
-    // unrolls comprehensions during validation, bindings live in a loop scope frame
-    fn fold_for(
-        &mut self,
-        bindings: Vec<String>,
-        collection: ast::Expr,
-        key: Option<Box<ast::Expr>>,
-        body: ast::Expr,
-        cond: Option<Box<ast::Expr>>,
-        range: SrcRange,
-    ) -> Option<Folded> {
-        let collection = self.fold_expr(collection)?;
-        let iterations = self.for_iterations(&bindings, collection)?;
-
-        let object = key.is_some();
-        let mut values = Vec::new();
-        let mut fields: Vec<FoldedField> = Vec::new();
-        let mut valid = true;
-
-        for loops in iterations {
-            self.scopes.push(Scope {
-                loops,
-                ..Scope::default()
-            });
-            let outcome = self.fold_iteration(&key, &body, &cond);
-            self.scopes.pop();
-
-            match outcome {
-                Iteration::Skipped => {}
-                Iteration::Invalid => valid = false,
-                Iteration::Value(value) => values.push(value),
-                Iteration::Entry { key, range, value } => {
-                    // duplicate keys diagnose like literal object entries
-                    if fields.iter().any(|field| field.key == key) {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateObjectKey {
-                                rule: spec::ids::UNIQUE_OBJECT_KEYS,
-                                key,
-                            },
-                            range,
-                        ));
-                        valid = false;
-                    } else {
-                        fields.push(FoldedField { key, value, range });
-                    }
-                }
-            }
-        }
-
-        if !valid {
-            return None;
-        }
-
-        let kind = if object {
-            FoldedKind::Object(fields)
-        } else {
-            FoldedKind::Array(values)
-        };
-        Some(Folded::new(kind, range))
-    }
-
-    // per-iteration loop bindings; a dynamic var iterates by its definition's
-    // shape, bindings access the one evaluated value by position
-    fn for_iterations(&mut self, bindings: &[String], collection: Folded) -> Option<Vec<HashMap<String, Folded>>> {
-        match collection.kind {
-            FoldedKind::Array(values) => Some(
-                values
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, value)| {
-                        let mut map = HashMap::new();
-                        if bindings.len() == 2 {
-                            let index = Folded::value(Value::Num(Number::Int(index as i64)), value.range);
-                            map.insert(bindings[0].clone(), index);
-                            map.insert(bindings[1].clone(), value);
-                        } else {
-                            map.insert(bindings[0].clone(), value);
-                        }
-                        map
-                    })
-                    .collect(),
-            ),
-            FoldedKind::Object(fields) => Some(
-                fields
-                    .into_iter()
-                    .map(|field| {
-                        let mut map = HashMap::new();
-                        let key = Folded::value(Value::Str(field.key), field.range);
-                        map.insert(bindings[0].clone(), key);
-                        if bindings.len() == 2 {
-                            map.insert(bindings[1].clone(), field.value);
-                        }
-                        map
-                    })
-                    .collect(),
-            ),
-            FoldedKind::Value(Value::VarRef(name)) => {
-                enum VarShape {
-                    Array(Vec<SrcRange>),
-                    Object(Vec<(String, SrcRange)>),
-                }
-
-                let shape = match self.var_value(&name).map(|value| &value.kind) {
-                    Some(FoldedKind::Array(values)) => Some(VarShape::Array(values.iter().map(|value| value.range).collect())),
-                    Some(FoldedKind::Object(fields)) => Some(VarShape::Object(
-                        fields.iter().map(|field| (field.key.clone(), field.range)).collect(),
-                    )),
-                    _ => None,
-                };
-                let Some(shape) = shape else {
-                    let collection = Folded::value(Value::VarRef(name), collection.range);
-                    self.errors.push(Error::new(
-                        ErrorKind::ForCollectionMismatch {
-                            rule: spec::ids::FOR_COLLECTIONS,
-                            found: ExprType::of(&collection),
-                        },
-                        collection.range,
-                    ));
-                    return None;
-                };
-
-                let accessor = |index: Value, range| {
-                    Folded::value(
-                        Value::Index {
-                            target: Box::new(Value::VarRef(name.clone())),
-                            index: Box::new(index),
-                            range,
-                        },
-                        range,
-                    )
-                };
-                match shape {
-                    VarShape::Array(ranges) => Some(
-                        ranges
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, range)| {
-                                let mut map = HashMap::new();
-                                let element = accessor(Value::Num(Number::Int(index as i64)), range);
-                                if bindings.len() == 2 {
-                                    let index = Folded::value(Value::Num(Number::Int(index as i64)), range);
-                                    map.insert(bindings[0].clone(), index);
-                                    map.insert(bindings[1].clone(), element);
-                                } else {
-                                    map.insert(bindings[0].clone(), element);
-                                }
-                                map
-                            })
-                            .collect(),
-                    ),
-                    VarShape::Object(keys) => Some(
-                        keys.into_iter()
-                            .map(|(key, range)| {
-                                let mut map = HashMap::new();
-                                map.insert(bindings[0].clone(), Folded::value(Value::Str(key.clone()), range));
-                                if bindings.len() == 2 {
-                                    map.insert(bindings[1].clone(), accessor(Value::Str(key), range));
-                                }
-                                map
-                            })
-                            .collect(),
-                    ),
-                }
-            }
-            // a comprehension unrolls during validation, so its shape can
-            // never come from a generated field
-            kind @ FoldedKind::Value(Value::BlockRef { .. }) => {
-                let collection = Folded::new(kind, collection.range);
-                self.errors.push(Error::new(
-                    ErrorKind::ForBlockRefCollection {
-                        rule: spec::ids::STATIC_STRUCTURE,
-                    },
-                    collection.range,
-                ));
-                None
-            }
-            kind => {
-                let collection = Folded::new(kind, collection.range);
-                self.errors.push(Error::new(
-                    ErrorKind::ForCollectionMismatch {
-                        rule: spec::ids::FOR_COLLECTIONS,
-                        found: ExprType::of(&collection),
-                    },
-                    collection.range,
-                ));
-                None
-            }
-        }
-    }
-
-    // filter first so skipped elements never fold their bodies
-    fn fold_iteration(&mut self, key: &Option<Box<ast::Expr>>, body: &ast::Expr, cond: &Option<Box<ast::Expr>>) -> Iteration {
-        if let Some(cond) = cond {
-            let Some(cond) = self.fold_expr((**cond).clone()) else {
-                return Iteration::Invalid;
-            };
-            match cond.kind {
-                FoldedKind::Value(Value::Bool(true)) => {}
-                FoldedKind::Value(Value::Bool(false)) => return Iteration::Skipped,
-                _ => {
-                    self.errors.push(Error::new(
-                        ErrorKind::NonConstantForFilter {
-                            rule: spec::ids::STATIC_FOR,
-                            found: ExprType::of(&cond),
-                        },
-                        cond.range,
-                    ));
-                    return Iteration::Invalid;
-                }
-            }
-        }
-
-        let Some(value) = self.fold_expr(body.clone()) else {
-            return Iteration::Invalid;
-        };
-
-        match key {
-            Some(key) => {
-                let Some(key) = self.fold_expr((**key).clone()) else {
-                    return Iteration::Invalid;
-                };
-                match const_string(&key) {
-                    Some(text) => Iteration::Entry {
-                        key: text,
-                        range: key.range,
-                        value,
-                    },
-                    None => {
-                        self.errors.push(Error::new(
-                            ErrorKind::NonConstantForKey {
-                                rule: spec::ids::STATIC_FOR,
-                                found: ExprType::of(&key),
-                            },
-                            key.range,
-                        ));
-                        Iteration::Invalid
-                    }
-                }
-            }
-            None => Iteration::Value(value),
-        }
-    }
-
-    fn check_operand(&mut self, operand: &Folded, required: StaticType, op: String) -> bool {
-        if self.static_type(operand) == Some(required) || self.defers_to_generation(operand) {
-            return true;
-        }
-
-        self.errors.push(Error::new(
-            ErrorKind::OperandTypeMismatch {
-                rule: spec::ids::OPERAND_TYPES,
-                op,
-                expected: type_name(required),
-                found: self.found_type(operand),
-            },
-            operand.range,
-        ));
-        false
-    }
-
-    // a value fed by a block reference has no static type by design; its type
-    // checks move to generation instead of failing validation
-    fn defers_to_generation(&self, folded: &Folded) -> bool {
-        self.static_type(folded).is_none() && self.folded_reaches_block_ref(folded)
-    }
-
-    fn folded_reaches_block_ref(&self, folded: &Folded) -> bool {
-        match &folded.kind {
-            FoldedKind::Value(value) => self.value_reaches_block_ref(value),
-            FoldedKind::Array(values) => values.iter().any(|value| self.folded_reaches_block_ref(value)),
-            FoldedKind::Object(fields) => fields.iter().any(|field| self.folded_reaches_block_ref(&field.value)),
-        }
-    }
-
-    fn value_reaches_block_ref(&self, value: &Value) -> bool {
-        let any = |values: &[Value]| values.iter().any(|value| self.value_reaches_block_ref(value));
-        match value {
-            Value::BlockRef { .. } => true,
-            // scorer args are opaque to shape checks exactly like block
-            // references, and never appear outside scorer scope
-            Value::ArgRef(_) => true,
-            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null | Value::CtxRef(_) | Value::Attachment { .. } => false,
-            Value::Template(template) => template.parts.iter().any(|part| match part {
-                Part::Dynamic(value) => self.value_reaches_block_ref(value),
-                Part::Lit(_) | Part::Ref(_) | Part::VarRef(_) => false,
-            }),
-            Value::Array(array) => array.elem.iter().any(|elem| match elem {
-                ArrayElem::Item(value) | ArrayElem::Spread(value) => self.value_reaches_block_ref(value),
-            }),
-            Value::Object(object) => object.elem.iter().any(|field| self.value_reaches_block_ref(&field.value)),
-            // a binding reaches through its definition
-            Value::VarRef(name) => self.var_value(name).is_some_and(|def| self.folded_reaches_block_ref(def)),
-            Value::Unary { operand, .. } => self.value_reaches_block_ref(operand),
-            Value::Binary { lhs, rhs, .. } => self.value_reaches_block_ref(lhs) || self.value_reaches_block_ref(rhs),
-            Value::Cond { cond, then, otherwise } => {
-                self.value_reaches_block_ref(cond)
-                    || self.value_reaches_block_ref(then)
-                    || self.value_reaches_block_ref(otherwise)
-            }
-            Value::Index { target, index, .. } => self.value_reaches_block_ref(target) || self.value_reaches_block_ref(index),
-            Value::Slice { target, start, end, .. } => {
-                self.value_reaches_block_ref(target)
-                    || start.as_deref().is_some_and(|bound| self.value_reaches_block_ref(bound))
-                    || end.as_deref().is_some_and(|bound| self.value_reaches_block_ref(bound))
-            }
-            Value::Func { func, .. } => match func {
-                Func::Choice(options) | Func::Min(options) | Func::Max(options) => any(options),
-                Func::Weighted(options) => options.iter().any(|option| self.value_reaches_block_ref(&option.value)),
-                Func::Range(_)
-                | Func::Normal { .. }
-                | Func::Lognormal { .. }
-                | Func::Exponential { .. }
-                | Func::Pareto { .. }
-                | Func::Beta { .. }
-                | Func::Poisson { .. }
-                | Func::Chance { .. }
-                | Func::Uuid
-                | Func::Hex { .. }
-                | Func::Alphanum { .. }
-                | Func::Attachment { .. } => false,
-                Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => self.value_reaches_block_ref(text),
-                Func::Replace { text, from, to } => {
-                    self.value_reaches_block_ref(text) || self.value_reaches_block_ref(from) || self.value_reaches_block_ref(to)
-                }
-                Func::Split { text, separator } => {
-                    self.value_reaches_block_ref(text) || self.value_reaches_block_ref(separator)
-                }
-                Func::Join { array, separator }
-                | Func::Compose { array, separator }
-                | Func::Render {
-                    template: array,
-                    values: separator,
-                }
-                | Func::Sample { array, count: separator } => {
-                    self.value_reaches_block_ref(array) || self.value_reaches_block_ref(separator)
-                }
-                Func::Contains { target, needle } => {
-                    self.value_reaches_block_ref(target) || self.value_reaches_block_ref(needle)
-                }
-                Func::StartsWith { text, prefix } => self.value_reaches_block_ref(text) || self.value_reaches_block_ref(prefix),
-                Func::EndsWith { text, suffix } => self.value_reaches_block_ref(text) || self.value_reaches_block_ref(suffix),
-                Func::Len { target } => self.value_reaches_block_ref(target),
-                Func::Tokens { value } => self.value_reaches_block_ref(value),
-                Func::Format { args, .. } | Func::English { args, .. } => any(args),
-                Func::Clamp { value, min, max } => {
-                    self.value_reaches_block_ref(value)
-                        || self.value_reaches_block_ref(min)
-                        || self.value_reaches_block_ref(max)
-                }
-                Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
-                    self.value_reaches_block_ref(value)
-                }
-                Func::Noise { size } => self.value_reaches_block_ref(size),
-            },
-        }
-    }
-
-    fn check_equality_operands(&mut self, lhs: &Folded, rhs: &Folded, op: ast::BinOp) -> bool {
-        const SCALARS: &str = "string, number, or boolean";
-        fn scalar(found: Option<StaticType>) -> bool {
-            matches!(found, Some(StaticType::String | StaticType::Number | StaticType::Boolean))
-        }
-
-        let lhs_type = self.static_type(lhs);
-        let rhs_type = self.static_type(rhs);
-        let mut valid = true;
-        // reference-fed sides settle their types at generation
-        let deferred = self.defers_to_generation(lhs) || self.defers_to_generation(rhs);
-
-        for (side, side_type) in [(lhs, lhs_type), (rhs, rhs_type)] {
-            // a null literal compares against a possibly-absent reference
-            let null_probe = side_type == Some(StaticType::Null) && deferred;
-            if !scalar(side_type) && !null_probe && !self.defers_to_generation(side) {
-                self.errors.push(Error::new(
-                    ErrorKind::OperandTypeMismatch {
-                        rule: spec::ids::OPERAND_TYPES,
-                        op: op.to_string(),
-                        expected: SCALARS,
-                        found: self.found_type(side),
-                    },
-                    side.range,
-                ));
-                valid = false;
-            }
-        }
-
-        // the left operand fixes the comparison type
-        if valid && !deferred && lhs_type != rhs_type {
-            self.errors.push(Error::new(
-                ErrorKind::OperandTypeMismatch {
-                    rule: spec::ids::OPERAND_TYPES,
-                    op: op.to_string(),
-                    expected: type_name(lhs_type.expect("scalar operands have a static type")),
-                    found: self.found_type(rhs),
-                },
-                rhs.range,
-            ));
-            valid = false;
-        }
-
-        valid
-    }
-
-    fn eval_binary(&mut self, op: ast::BinOp, lhs: Const, rhs: Const, range: SrcRange) -> Option<Folded> {
-        let value = match op_class(op) {
-            OpClass::Arith => {
-                let (Const::Num(lhs), Const::Num(rhs)) = (lhs, rhs) else {
-                    unreachable!("operands were type checked as numbers");
-                };
-                match eval_arith(op, lhs, rhs) {
-                    Some(number) => Value::Num(number),
-                    None => {
-                        self.errors.push(Error::new(
-                            ErrorKind::NonFiniteResult {
-                                rule: spec::ids::FINITE_NUMBERS,
-                            },
-                            range,
-                        ));
-                        return None;
-                    }
-                }
-            }
-            OpClass::Cmp => {
-                let (Const::Num(lhs), Const::Num(rhs)) = (lhs, rhs) else {
-                    unreachable!("operands were type checked as numbers");
-                };
-                Value::Bool(eval_cmp(op, lhs, rhs))
-            }
-            OpClass::Eq => {
-                let equal = match (lhs, rhs) {
-                    (Const::Str(lhs), Const::Str(rhs)) => lhs == rhs,
-                    (Const::Bool(lhs), Const::Bool(rhs)) => lhs == rhs,
-                    (Const::Num(Number::Int(lhs)), Const::Num(Number::Int(rhs))) => lhs == rhs,
-                    (Const::Num(lhs), Const::Num(rhs)) => float_bound(lhs) == float_bound(rhs),
-                    _ => unreachable!("operands were type checked as matching scalars"),
-                };
-                Value::Bool(if op == ast::BinOp::Eq { equal } else { !equal })
-            }
-            OpClass::Logic => {
-                let (Const::Bool(lhs), Const::Bool(rhs)) = (lhs, rhs) else {
-                    unreachable!("operands were type checked as booleans");
-                };
-                Value::Bool(match op {
-                    ast::BinOp::And => lhs && rhs,
-                    ast::BinOp::Or => lhs || rhs,
-                    _ => unreachable!("operator is logical"),
-                })
-            }
-        };
-
-        Some(Folded::value(value, range))
-    }
-
-    // none = unknown, out of scope, or an invalid definition; all diagnosed
-    fn lookup_var(&mut self, name: String, range: SrcRange) -> Option<VarDef> {
-        match self.scopes.iter().rev().find_map(|scope| scope.vars.get(&name)) {
-            Some(def) => def.clone(),
-            None if self.declared.contains(&name) => {
-                self.errors.push(Error::new(
-                    ErrorKind::VarNotInScope {
-                        rule: spec::ids::VISIBLE_VARS,
-                        name,
-                    },
-                    range,
-                ));
-                None
-            }
-            None => {
-                self.errors.push(Error::new(
-                    ErrorKind::UnknownVariable {
-                        rule: spec::ids::DEFINED_VARS,
-                        name,
-                    },
-                    range,
-                ));
-                None
-            }
-        }
-    }
-
-    // a loop binding visible from the innermost frame outward
-    fn lookup_loop(&self, name: &str) -> Option<Folded> {
-        self.scopes.iter().rev().find_map(|scope| scope.loops.get(name)).cloned()
-    }
-
-    // the definition value behind a var name, chasing var-to-var definitions
-    fn var_value(&self, name: &str) -> Option<&Folded> {
-        let def = self.scopes.iter().rev().find_map(|scope| scope.vars.get(name))?.as_ref()?;
-        match &def.value.kind {
-            FoldedKind::Value(Value::VarRef(inner)) => self.var_value(inner),
-            _ => Some(&def.value),
-        }
-    }
-
-    fn model_child(&mut self, block: ast::Block, parent: spec::Id) -> Option<Child> {
-        let ast::Block {
-            kind,
-            name,
-            name_range,
-            decls,
-            range,
-            ..
-        } = block;
-        let place = spec::Place::Block { id: parent };
-        let Some(desc) = spec::SPEC.block_in(&kind, place).or_else(|| spec::SPEC.block(&kind)) else {
-            self.errors.push(Error::new(
-                ErrorKind::UnknownBlock {
-                    keyword: kind,
-                    parent: spec::Place::Block { id: parent },
-                },
-                range,
-            ));
-            return None;
-        };
-
-        if !desc.allows(spec::Place::Block { id: parent }) {
-            self.errors.push(Error::new(
-                ErrorKind::BlockNotAllowed {
-                    block: desc.id,
-                    parent: spec::Place::Block { id: parent },
-                },
-                range,
-            ));
-            return None;
-        }
-
-        let name = self.model_name(name, range, desc);
-
-        // the sym node opens before vars collect so block refs in var values
-        // anchor inside the declaring block; each model_* leaves it
-        let child = if desc.id == spec::ids::REPEAT {
-            // index and count address the current iteration under repeat.<name>
-            if let Some(name) = &name
-                && (name == "index" || name == "count")
-            {
-                self.errors.push(Error::new(
-                    ErrorKind::ReservedRepeatName {
-                        rule: spec::ids::RESERVED_REPEAT_NAMES,
-                        name: name.clone(),
-                    },
-                    range,
-                ));
-            }
-            let node = self.enter_sym(BlockKind::Repeat, name.clone());
-            self.model_repeat(node, name, decls, desc, range).map(Child::Repeat)
-        } else if desc.id == spec::ids::CHOICE {
-            let node = self.enter_sym(BlockKind::Choice, name.clone());
-            self.model_choice(node, name, decls, desc, range).map(Child::Choice)
-        } else if desc.id == spec::ids::MAYBE {
-            let node = self.enter_sym(BlockKind::Maybe, name.clone());
-            self.model_maybe(node, name, decls, desc, range).map(Child::Maybe)
-        } else if desc.id == spec::ids::SCORER_SPAN {
-            let node = self.enter_sym(BlockKind::ScorerSpan, name.clone());
-            self.model_scorer_span(node, name, name_range.unwrap_or(range), decls, desc, range)
-                .map(Child::Scorer)
-        } else {
-            let kind = if desc.id == spec::ids::TASK {
-                BlockKind::Task
-            } else if desc.id == spec::ids::LLM {
-                BlockKind::Llm
-            } else if desc.id == spec::ids::TOOL {
-                BlockKind::Tool
-            } else {
-                BlockKind::Function
-            };
-            let node = self.enter_sym(kind, name.clone());
-            self.model_span(node, name, decls, desc, range).map(Child::Span)
-        };
-        self.leave_sym();
-        child
-    }
-
-    fn model_scorer_span(
-        &mut self,
-        node: NodeId,
-        name: Option<String>,
-        name_range: SrcRange,
-        decls: Vec<ast::Decl>,
-        desc: &spec::BlockDesc,
-        range: SrcRange,
-    ) -> Option<ScorerSpan> {
-        let (decls, bindings) = self.enter_scope(decls);
-        let mut score = None;
-        let mut reason = None;
-        let mut seen = HashSet::new();
-        for decl in decls {
-            let ast::Decl::Attr(attr) = decl else {
-                if let ast::Decl::Block(block) = decl {
-                    self.errors.push(Error::new(
-                        ErrorKind::BlockNotAllowed {
-                            block: spec::SPEC.block(&block.kind).map_or(desc.id, |inner| inner.id),
-                            parent: spec::Place::Block { id: desc.id },
-                        },
-                        block.range,
-                    ));
-                }
-                continue;
-            };
-            let Some(field) = desc.field(&attr.key) else {
-                self.errors.push(Error::new(
-                    ErrorKind::UnknownField {
-                        block: desc.id,
-                        keyword: attr.key,
-                    },
-                    attr.range,
-                ));
-                continue;
-            };
-            if !seen.insert(field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::DuplicateField {
-                        block: desc.id,
-                        field: field.id,
-                    },
-                    attr.range,
-                ));
-                continue;
-            }
-            let Some(folded) = self.fold_expr(attr.value) else { continue };
-            let expected = if field.id == spec::ids::SCORE {
-                StaticType::Number
-            } else {
-                StaticType::String
-            };
-            if self.static_type(&folded) != Some(expected) && !self.defers_to_generation(&folded) {
-                self.push_type_mismatch(&folded, desc.id, field.id, field.value);
-                continue;
-            }
-            if field.id == spec::ids::SCORE
-                && let FoldedKind::Value(Value::Num(number)) = &folded.kind
-                && !(0.0..=1.0).contains(&float_bound(number.clone()))
-            {
-                self.errors.push(Error::new(
-                    ErrorKind::ScoreOutOfRange {
-                        rule: spec::ids::SCORE_RANGE,
-                    },
-                    folded.range,
-                ));
-                continue;
-            }
-            let value_range = folded.range;
-            if field.id == spec::ids::SCORE {
-                score = Some((folded.into_value(), value_range));
-            } else {
-                reason = Some((folded.into_value(), value_range));
-            }
-        }
-        if !seen.contains(&spec::ids::SCORE) {
-            self.errors.push(Error::new(
-                ErrorKind::MissingField {
-                    block: desc.id,
-                    field: spec::ids::SCORE,
-                },
-                range,
-            ));
-        }
-        self.scopes.pop();
-        if let Some(name) = &name {
-            self.pending_scorers.push((name.clone(), name_range));
-        }
-        match (name, score) {
-            (Some(name), Some((score, score_range))) => Some(ScorerSpan {
-                node,
-                name,
-                score,
-                score_range,
-                reason,
-                bindings,
-            }),
-            _ => None,
-        }
-    }
-
-    fn model_span(
-        &mut self,
-        node: NodeId,
-        name: Option<String>,
-        decls: Vec<ast::Decl>,
-        desc: &spec::BlockDesc,
-        range: SrcRange,
-    ) -> Option<Span> {
-        let span_kind = if desc.id == spec::ids::TASK {
-            SpanKind::Task
-        } else if desc.id == spec::ids::LLM {
-            SpanKind::Llm
-        } else if desc.id == spec::ids::TOOL {
-            SpanKind::Tool
-        } else if desc.id == spec::ids::FUNCTION {
-            SpanKind::Function
-        } else {
-            unreachable!("block {} does not have a model lowering", desc.id.as_str());
-        };
-
-        let (decls, bindings) = self.enter_scope(decls);
-        let (fields, blocks) = self.model_body(decls, desc, range);
-        self.record_fields(node, &fields);
-        let children = blocks
-            .into_iter()
-            .filter_map(|block| self.model_child(block, desc.id))
-            .collect();
-        self.scopes.pop();
-
-        name.map(|name| Span {
-            node,
-            name,
-            kind: span_kind,
-            fields,
-            bindings,
-            children,
-        })
-    }
-
-    fn model_repeat(
-        &mut self,
-        node: NodeId,
-        name: Option<String>,
-        decls: Vec<ast::Decl>,
-        desc: &spec::BlockDesc,
-        range: SrcRange,
-    ) -> Option<Repeat> {
-        // the block's vars collect first but their frame opens after count
-        // models: count is drawn once in the parent scope, while the vars
-        // re-evaluate per iteration, so count referencing them is out of scope
-        let (vars_blocks, decls) = split_vars(decls);
-        let mut scope = Scope::default();
-        let mut bindings = Vec::new();
-        self.repeat_depth += 1;
-        for block in vars_blocks {
-            self.collect_vars(block, &mut scope, &mut bindings);
-        }
-        self.repeat_depth -= 1;
-
-        let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
-
-        self.repeat_depth += 1;
-        self.scopes.push(scope);
-        let children = self.model_dynamic_children(blocks, desc, range);
-        self.scopes.pop();
-        self.repeat_depth -= 1;
-
-        let (count, count_range) = fields.remove(&spec::ids::COUNT)?;
-
-        // constant counts validate now, dynamic ones fail the run during generation
-        if let Value::Num(number) = &count {
-            let valid = match number {
-                Number::Int(value) => {
-                    if *value < 0 {
-                        self.errors.push(Error::new(
-                            ErrorKind::NegativeRepeatCount {
-                                rule: spec::ids::REPEAT_COUNT,
-                            },
-                            count_range,
-                        ));
-                    }
-                    *value >= 0
-                }
-                Number::Float(_) => {
-                    self.errors.push(Error::new(
-                        ErrorKind::NonIntegerRepeatCount {
-                            rule: spec::ids::REPEAT_COUNT,
-                        },
-                        count_range,
-                    ));
-                    false
-                }
-            };
-            if !valid {
-                return None;
-            }
-        }
-
-        Some(Repeat {
-            node,
-            name,
-            count,
-            count_range,
-            bindings,
-            children,
-        })
-    }
-
-    fn model_choice(
-        &mut self,
-        node: NodeId,
-        name: Option<String>,
-        decls: Vec<ast::Decl>,
-        desc: &spec::BlockDesc,
-        range: SrcRange,
-    ) -> Option<Choice> {
-        let (decls, bindings) = self.enter_scope(decls);
-        let (_, blocks) = self.model_dynamic_body(decls, desc, range);
-        let children = self.model_dynamic_children(blocks, desc, range);
-        self.scopes.pop();
-
-        Some(Choice {
-            node,
-            name,
-            bindings,
-            children,
-        })
-    }
-
-    fn model_maybe(
-        &mut self,
-        node: NodeId,
-        name: Option<String>,
-        decls: Vec<ast::Decl>,
-        desc: &spec::BlockDesc,
-        range: SrcRange,
-    ) -> Option<Maybe> {
-        // chance models outside the block's own scope, like a repeat count
-        let (vars_blocks, decls) = split_vars(decls);
-        let mut scope = Scope::default();
-        let mut bindings = Vec::new();
-        for block in vars_blocks {
-            self.collect_vars(block, &mut scope, &mut bindings);
-        }
-
-        let (mut fields, blocks) = self.model_dynamic_body(decls, desc, range);
-
-        self.scopes.push(scope);
-        let children = self.model_dynamic_children(blocks, desc, range);
-        self.scopes.pop();
-
-        let (chance, chance_range) = fields
-            .remove(&spec::ids::CHANCE)
-            .unwrap_or((Value::Num(Number::Float(0.5)), range));
-
-        // constant chances validate now, dynamic ones fail the run during generation
-        if let Value::Num(number) = &chance {
-            let value = match number {
-                Number::Int(value) => *value as f64,
-                Number::Float(value) => *value,
-            };
-            if !(0.0..=1.0).contains(&value) {
-                self.errors.push(Error::new(
-                    ErrorKind::ChanceOutOfRange {
-                        rule: spec::ids::MAYBE_CHANCE,
-                    },
-                    chance_range,
-                ));
-                return None;
-            }
-        }
-
-        Some(Maybe {
-            node,
-            name,
-            chance,
-            chance_range,
-            bindings,
-            children,
-        })
-    }
-
-    // mirrors model_body for dynamic blocks: config attrs must be numbers but may
-    // stay dynamic, child blocks come back for the caller to recurse
-    fn model_dynamic_body(
-        &mut self,
-        decls: Vec<ast::Decl>,
-        block: &spec::BlockDesc,
-        range: SrcRange,
-    ) -> (HashMap<spec::Id, (Value, SrcRange)>, Vec<ast::Block>) {
-        let mut fields = HashMap::new();
-        let mut seen = HashSet::new();
-        let mut blocks = Vec::new();
-
-        for decl in decls {
-            match decl {
-                ast::Decl::Block(inner) => blocks.push(inner),
-                ast::Decl::Attr(attr) => {
-                    let attr_range = attr.range;
-                    let Some(field) = block.field(&attr.key) else {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownField {
-                                block: block.id,
-                                keyword: attr.key,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    };
-                    let field_id = field.id;
-
-                    if !seen.insert(field_id) {
-                        self.errors.push(Error::new(
-                            ErrorKind::DuplicateField {
-                                block: block.id,
-                                field: field_id,
-                            },
-                            attr_range,
-                        ));
-                        continue;
-                    }
-
-                    let Some(value) = self.fold_expr(attr.value) else {
-                        continue;
-                    };
-
-                    // structure must be decidable before any span exists, so a
-                    // config value reaching a block reference gets its own
-                    // diagnostic ahead of the type check
-                    if self.folded_reaches_block_ref(&value) {
-                        self.errors.push(Error::new(
-                            ErrorKind::StructuralBlockRef {
-                                rule: spec::ids::STATIC_STRUCTURE,
-                                field: field.keyword,
-                            },
-                            value.range,
-                        ));
-                        continue;
-                    }
-
-                    if self.static_type(&value) != Some(StaticType::Number) {
-                        self.errors.push(Error::new(
-                            ErrorKind::TypeMismatch {
-                                block: block.id,
-                                field: field_id,
-                                expected: &spec::ExprType::Number,
-                                found: self.found_type(&value),
-                            },
-                            value.range,
-                        ));
-                        continue;
-                    }
-
-                    // diagnostics for bad values point at the value, not the key
-                    let value_range = value.range;
-                    fields.insert(field_id, (value.into_value(), value_range));
-                }
-            }
-        }
-
-        for field in block.body.fields {
-            if field.cardinality == spec::Cardinality::Required && !seen.contains(&field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::MissingField {
-                        block: block.id,
-                        field: field.id,
-                    },
-                    range,
-                ));
-            }
-        }
-
-        (fields, blocks)
-    }
-
-    fn model_dynamic_children(&mut self, blocks: Vec<ast::Block>, block: &spec::BlockDesc, range: SrcRange) -> Vec<Child> {
-        if blocks.is_empty() {
-            self.errors.push(Error::new(
-                ErrorKind::EmptyDynamicBlock {
-                    rule: spec::ids::DYNAMIC_CHILDREN,
-                    block: block.id,
-                },
-                range,
-            ));
-        }
-
-        blocks
-            .into_iter()
-            .filter_map(|inner| self.model_child(inner, block.id))
-            .collect()
-    }
-
-    fn model_body(&mut self, decls: Vec<ast::Decl>, block: &spec::BlockDesc, range: SrcRange) -> (SpanFields, Vec<ast::Block>) {
-        let mut fields = FieldsBuilder::default();
-        let mut blocks = Vec::new();
-
-        for decl in decls {
-            match decl {
-                ast::Decl::Block(block) => blocks.push(block),
-                ast::Decl::Attr(attr) => self.model_field(&mut fields, block, attr),
-            }
-        }
-
-        for field in block.body.fields {
-            if field.cardinality == spec::Cardinality::Required && !fields.seen.contains(&field.id) {
-                self.errors.push(Error::new(
-                    ErrorKind::MissingField {
-                        block: block.id,
-                        field: field.id,
-                    },
-                    range,
-                ));
-            }
-        }
-
-        (fields.finish(), blocks)
-    }
-
-    fn model_field(&mut self, fields: &mut FieldsBuilder, block: &spec::BlockDesc, attr: ast::Attr) {
-        let range = attr.range;
-        let Some(field) = block.field(&attr.key) else {
-            if !block.body.open {
-                self.errors.push(Error::new(
-                    ErrorKind::UnknownField {
-                        block: block.id,
-                        keyword: attr.key,
-                    },
-                    range,
-                ));
-            }
-            return;
-        };
-
-        if field.cardinality != spec::Cardinality::Repeated && !fields.seen.insert(field.id) {
-            self.errors.push(Error::new(
-                ErrorKind::DuplicateField {
-                    block: block.id,
-                    field: field.id,
-                },
-                range,
-            ));
-            return;
-        }
-
-        // the folding field is the slot references inside it flow from
-        let node = self.sym_stack.last().copied().expect("fields model inside a block");
-        let model_field = model_field_kind(field.id);
-        let slot = model_field.map(|field| SlotId::Field { node, field, key: None });
-        let outer_slot = std::mem::replace(&mut self.current_slot, slot);
-        let pending_start = self.pending.len();
-        let edges_start = self.edges.len();
-        let value = self.fold_expr(attr.value);
-        self.current_slot = outer_slot;
-        let Some(value) = value else {
-            return;
-        };
-
-        // metadata and metrics evaluate per key, so references recorded inside
-        // an object literal re-attribute to the key that contains them
-        if matches!(model_field, Some(Field::Metadata | Field::Metrics))
-            && let FoldedKind::Object(items) = &value.kind
-        {
-            // the item range is the key token, references live in the value
-            let key_of = |at: SrcRange| {
-                items
-                    .iter()
-                    .find(|item| item.value.range.start <= at.start && at.end <= item.value.range.end)
-                    .map(|item| item.key.clone())
-            };
-            for pending in &mut self.pending[pending_start..] {
-                if let Some(SlotId::Field { key: key @ None, .. }) = &mut pending.slot
-                    && let Some(found) = key_of(pending.range)
-                {
-                    *key = Some(found);
-                }
-            }
-            for (from, _, at) in &mut self.edges[edges_start..] {
-                if let SlotId::Field { key: key @ None, .. } = from
-                    && let Some(found) = key_of(*at)
-                {
-                    *key = Some(found);
-                }
-            }
-        }
-
-        // duration is a generation directive, not a payload field: any numeric
-        // expression, dynamic values allowed, settled at generation when the
-        // static type is unknown (eg a block reference)
-        if field.id == spec::ids::DURATION {
-            if matches!(self.static_type(&value), Some(found) if found != StaticType::Number) {
-                self.errors.push(Error::new(
-                    ErrorKind::TypeMismatch {
-                        block: block.id,
-                        field: field.id,
-                        expected: &spec::ExprType::Number,
-                        found: self.found_type(&value),
-                    },
-                    value.range,
-                ));
-                return;
-            }
-            let range = value.range;
-            let value = value.into_value();
-            // constant durations validate now, dynamic ones fail the run during generation
-            if let Value::Num(number) = &value {
-                let seconds = match number {
-                    Number::Int(value) => *value as f64,
-                    Number::Float(value) => *value,
-                };
-                if !(seconds.is_finite() && seconds > 0.0) {
-                    self.errors.push(Error::new(
-                        ErrorKind::DurationOutOfRange {
-                            rule: spec::ids::SPAN_DURATION,
-                        },
-                        range,
-                    ));
-                    return;
-                }
-            }
-            fields.duration = Some((value, range));
-            return;
-        }
-
-        if !self.validate_value(&value, block.id, field.id, field.value) {
-            return;
-        }
-
-        if field.id == spec::ids::METRICS && !self.validate_metric_keys(&value) {
-            return;
-        }
-
-        let value = self.model_field_value(value, field.value);
-
-        match (field.id, value) {
-            (spec::ids::INPUT, FieldValue::Value(value)) => fields.input = Some(value),
-            (spec::ids::OUTPUT, FieldValue::Value(value)) => fields.output = Some(value),
-            (spec::ids::EXPECTED, FieldValue::Value(value)) => fields.expected = Some(value),
-            (spec::ids::ERROR, FieldValue::Value(value)) => fields.error = Some(value),
-            (spec::ids::METADATA, FieldValue::Object(value)) => fields.metadata = Some(value),
-            (spec::ids::METRICS, FieldValue::Object(value)) => fields.metrics = Some(value),
-            (spec::ids::TAGS, FieldValue::Tags(value)) => fields.tags = Some(value),
-            _ => unreachable!("field {} does not match its model lowering", field.id.as_str()),
-        }
-    }
-
-    fn validate_metric_keys(&mut self, folded: &Folded) -> bool {
-        let FoldedKind::Object(fields) = &folded.kind else {
-            unreachable!("expression was validated as an object");
-        };
-
-        let mut valid = true;
-
-        for field in fields {
-            if spec::RESERVED_METRIC_KEYS.contains(&field.key.as_str()) {
-                self.errors.push(Error::new(
-                    ErrorKind::ReservedMetricKey {
-                        rule: spec::ids::RESERVED_METRICS,
-                        key: field.key.clone(),
-                    },
-                    field.range,
-                ));
-                valid = false;
-            }
-        }
-
-        valid
-    }
-
-    // fold, not all(): validate every element so each invalid item gets its own diagnostic
-    #[allow(clippy::unnecessary_fold)]
-    fn validate_value(&mut self, folded: &Folded, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) -> bool {
-        let valid = match expected {
-            spec::ExprType::BlockRef { .. } => matches!(folded.kind, FoldedKind::Value(Value::BlockRef { .. })),
-            spec::ExprType::Any => true,
-            spec::ExprType::String => matches!(folded.kind, FoldedKind::Value(Value::Str(_) | Value::Template(_))),
-            spec::ExprType::Number => matches!(folded.kind, FoldedKind::Value(Value::Num(_))),
-            spec::ExprType::Boolean => matches!(folded.kind, FoldedKind::Value(Value::Bool(_))),
-            spec::ExprType::Array { items } => {
-                let FoldedKind::Array(values) = &folded.kind else {
-                    self.push_type_mismatch(folded, block, field, expected);
-                    return false;
-                };
-
-                return values
-                    .iter()
-                    .fold(true, |valid, value| self.validate_value(value, block, field, items) && valid);
-            }
-            spec::ExprType::Object { values } => {
-                let FoldedKind::Object(fields) = &folded.kind else {
-                    self.push_type_mismatch(folded, block, field, expected);
-                    return false;
-                };
-
-                return fields.iter().fold(true, |valid, item| {
-                    self.validate_value(&item.value, block, field, values) && valid
-                });
-            }
-        };
-
-        if !valid {
-            self.push_type_mismatch(folded, block, field, expected);
-        }
-
-        valid
-    }
-
-    fn push_type_mismatch(&mut self, folded: &Folded, block: spec::Id, field: spec::Id, expected: &'static spec::ExprType) {
-        self.errors.push(Error::new(
-            ErrorKind::TypeMismatch {
-                block,
-                field,
-                expected,
-                found: ExprType::of(folded),
-            },
-            folded.range,
-        ));
-    }
-
-    fn model_field_value(&mut self, folded: Folded, expected: &spec::ExprType) -> FieldValue {
-        match expected {
-            spec::ExprType::Any => FieldValue::Value(folded.into_value()),
-            spec::ExprType::Object { values } if matches!(**values, spec::ExprType::Any) => {
-                FieldValue::Object(require_object(folded))
-            }
-            spec::ExprType::Array { items } if matches!(**items, spec::ExprType::String) => {
-                FieldValue::Tags(require_tags(folded))
-            }
-            _ => unreachable!("expression constraint does not have a model lowering"),
-        }
-    }
-
-    fn model_func(&mut self, name: String, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
-        // the descriptor's name doubles as the &'static str for diagnostics
-        let Some(func) = spec::SPEC.function(&name).map(|desc| desc.name) else {
-            self.errors.push(Error::new(
-                ErrorKind::UnknownFunction {
-                    rule: spec::ids::KNOWN_FUNCTIONS,
-                    name,
-                },
-                range,
-            ));
-            return None;
-        };
-
-        match func {
-            "choice" => {
-                if args.is_empty() {
-                    self.errors.push(Error::new(
-                        ErrorKind::EmptyChoice {
-                            rule: spec::ids::CHOICE_ALTERNATIVES,
-                        },
-                        range,
-                    ));
-                    return None;
-                }
-
-                Some(Func::Choice(args.into_iter().map(Folded::into_value).collect()))
-            }
-            "range" => {
-                let Ok([min, max]) = <[Folded; 2]>::try_from(args) else {
-                    self.errors.push(Error::new(
-                        ErrorKind::InvalidRangeArgs {
-                            rule: spec::ids::RANGE_BOUNDS,
-                        },
-                        range,
-                    ));
-                    return None;
-                };
-                let min = self.model_range_bound(min);
-                let max = self.model_range_bound(max)?;
-                let min = min?;
-
-                let bounds = match (min, max) {
-                    (Number::Int(min), Number::Int(max)) => Range::Int { min, max },
-                    (min, max) => Range::Float {
-                        min: float_bound(min),
-                        max: float_bound(max),
-                    },
-                };
-                let ordered = match bounds {
-                    Range::Int { min, max } => min <= max,
-                    Range::Float { min, max } => min <= max,
-                };
-
-                if !ordered {
-                    self.errors.push(Error::new(
-                        ErrorKind::InvalidRangeBounds {
-                            rule: spec::ids::RANGE_BOUNDS,
-                        },
-                        range,
-                    ));
-                    return None;
-                }
-
-                Some(Func::Range(bounds))
-            }
-
-            "weighted" => self.model_weighted(args, range),
-
-            "normal" => {
-                let [mean, stddev] = self.func_args(func, args, "exactly two arguments (mean, stddev)", range)?;
-                let mean = self.model_dist_param(mean, func, "mean", "a finite number", |_| true);
-                let stddev = self.model_dist_param(stddev, func, "stddev", "non-negative", |value| value >= 0.0);
-                Some(Func::Normal {
-                    mean: mean?,
-                    stddev: stddev?,
-                })
-            }
-            "lognormal" => {
-                let [median, sigma] = self.func_args(func, args, "exactly two arguments (median, sigma)", range)?;
-                let median = self.model_dist_param(median, func, "median", "positive", |value| value > 0.0);
-                let sigma = self.model_dist_param(sigma, func, "sigma", "non-negative", |value| value >= 0.0);
-                Some(Func::Lognormal {
-                    median: median?,
-                    sigma: sigma?,
-                })
-            }
-            "exponential" => {
-                let [mean] = self.func_args(func, args, "exactly one argument (mean)", range)?;
-                let mean = self.model_dist_param(mean, func, "mean", "positive", |value| value > 0.0)?;
-                Some(Func::Exponential { mean })
-            }
-            "pareto" => {
-                let [min, shape] = self.func_args(func, args, "exactly two arguments (min, shape)", range)?;
-                let min = self.model_dist_param(min, func, "min", "positive", |value| value > 0.0);
-                let shape = self.model_dist_param(shape, func, "shape", "positive", |value| value > 0.0);
-                Some(Func::Pareto {
-                    min: min?,
-                    shape: shape?,
-                })
-            }
-            "beta" => {
-                let [alpha, beta] = self.func_args(func, args, "exactly two arguments (alpha, beta)", range)?;
-                let alpha = self.model_dist_param(alpha, func, "alpha", "positive", |value| value > 0.0);
-                let beta = self.model_dist_param(beta, func, "beta", "positive", |value| value > 0.0);
-                Some(Func::Beta {
-                    alpha: alpha?,
-                    beta: beta?,
-                })
-            }
-            "poisson" => {
-                let [mean] = self.func_args(func, args, "exactly one argument (mean)", range)?;
-                // the sampler rejects astronomically large means, surface that here
-                let mean = self.model_dist_param(mean, func, "mean", "positive and below 1e15", |value| {
-                    value > 0.0 && value < 1.0e15
-                })?;
-                Some(Func::Poisson { mean })
-            }
-            "chance" => {
-                let [probability] = self.func_args(func, args, "exactly one argument (probability)", range)?;
-                let probability = self.model_dist_param(probability, func, "probability", "between 0 and 1", |value| {
-                    (0.0..=1.0).contains(&value)
-                })?;
-                Some(Func::Chance { probability })
-            }
-
-            "upper" | "lower" | "trim" => {
-                let [text] = self.func_args(func, args, "exactly one argument", range)?;
-                let text = Box::new(self.model_typed_arg(text, func, StaticType::String)?);
-                Some(match func {
-                    "upper" => Func::Upper { text },
-                    "lower" => Func::Lower { text },
-                    _ => Func::Trim { text },
-                })
-            }
-            "replace" => {
-                let [text, from, to] = self.func_args(func, args, "exactly three arguments (text, from, to)", range)?;
-                let text = self.model_typed_arg(text, func, StaticType::String);
-                let from = self.model_typed_arg(from, func, StaticType::String);
-                let to = self.model_typed_arg(to, func, StaticType::String);
-                Some(Func::Replace {
-                    text: Box::new(text?),
-                    from: Box::new(from?),
-                    to: Box::new(to?),
-                })
-            }
-            "split" => {
-                let [text, separator] = self.func_args(func, args, "exactly two arguments (text, separator)", range)?;
-                if const_string(&separator).is_some_and(|separator: String| separator.is_empty()) {
-                    self.errors.push(Error::new(
-                        ErrorKind::EmptySplitSeparator {
-                            rule: spec::ids::SPLIT_SEPARATOR,
-                        },
-                        separator.range,
-                    ));
-                    return None;
-                }
-                let text = self.model_typed_arg(text, func, StaticType::String);
-                let separator = self.model_typed_arg(separator, func, StaticType::String);
-                Some(Func::Split {
-                    text: Box::new(text?),
-                    separator: Box::new(separator?),
-                })
-            }
-            "express"
-            | "expression"
-            | "expression_candidates"
-            | "realize"
-            | "vary"
-            | "combine"
-            | "refer"
-            | "remember"
-            | "unmentioned"
-            | "format_number"
-            | "format_date"
-            | "format_time" => self.model_english_func(func, args, range),
-            "render" => {
-                let [template, values] = self.func_args(func, args, "exactly two arguments (template, values)", range)?;
-                let template = self.model_typed_arg(template, func, StaticType::String);
-                let values = self.model_typed_arg(values, func, StaticType::Object);
-                Some(Func::Render {
-                    template: Box::new(template?),
-                    values: Box::new(values?),
-                })
-            }
-            "compose" => {
-                let mut args = args;
-                if args.len() == 1 {
-                    args.push(Folded::value(Value::Str(" ".into()), range));
-                }
-                let [array, separator] = self.func_args(func, args, "one or two arguments (parts, separator)", range)?;
-                let array = self.model_typed_arg(array, func, StaticType::Array);
-                let separator = self.model_typed_arg(separator, func, StaticType::String);
-                Some(Func::Compose {
-                    array: Box::new(array?),
-                    separator: Box::new(separator?),
-                })
-            }
-            "sample" => {
-                let [array, count] = self.func_args(func, args, "exactly two arguments (array, count)", range)?;
-                let array = self.model_typed_arg(array, func, StaticType::Array);
-                let count = self.model_typed_arg(count, func, StaticType::Number);
-                Some(Func::Sample {
-                    array: Box::new(array?),
-                    count: Box::new(count?),
-                })
-            }
-            "join" => {
-                let [array, separator] = self.func_args(func, args, "exactly two arguments (array, separator)", range)?;
-                let array = self.model_typed_arg(array, func, StaticType::Array);
-                let separator = self.model_typed_arg(separator, func, StaticType::String);
-                Some(Func::Join {
-                    array: Box::new(array?),
-                    separator: Box::new(separator?),
-                })
-            }
-            "contains" => {
-                let [target, needle] = self.func_args(func, args, "exactly two arguments (target, needle)", range)?;
-                match self.static_type(&target) {
-                    Some(StaticType::String) => {
-                        let needle = self.model_typed_arg(needle, func, StaticType::String);
-                        Some(Func::Contains {
-                            target: Box::new(target.into_value()),
-                            needle: Box::new(needle?),
-                        })
-                    }
-                    Some(StaticType::Array) => {
-                        let needle = self.model_scalar_arg(needle, func);
-                        Some(Func::Contains {
-                            target: Box::new(target.into_value()),
-                            needle: Box::new(needle?),
-                        })
-                    }
-                    // a reference-fed target settles string-vs-array when it evaluates
-                    _ if self.defers_to_generation(&target) => {
-                        let needle = self.model_scalar_arg(needle, func);
-                        Some(Func::Contains {
-                            target: Box::new(target.into_value()),
-                            needle: Box::new(needle?),
-                        })
-                    }
-                    _ => {
-                        self.push_func_arg_type(&target, func, "string or array");
-                        None
-                    }
-                }
-            }
-            "starts_with" | "ends_with" => {
-                let [text, affix] = self.func_args(func, args, "exactly two arguments", range)?;
-                let text = self.model_typed_arg(text, func, StaticType::String);
-                let affix = self.model_typed_arg(affix, func, StaticType::String);
-                let (text, affix) = (Box::new(text?), Box::new(affix?));
-                Some(if func == "starts_with" {
-                    Func::StartsWith { text, prefix: affix }
-                } else {
-                    Func::EndsWith { text, suffix: affix }
-                })
-            }
-            "len" => {
-                let [target] = self.func_args(func, args, "exactly one argument", range)?;
-                let known = matches!(self.static_type(&target), Some(StaticType::String | StaticType::Array));
-                if !known && !self.defers_to_generation(&target) {
-                    self.push_func_arg_type(&target, func, "string or array");
-                    return None;
-                }
-                Some(Func::Len {
-                    target: Box::new(target.into_value()),
-                })
-            }
-            "tokens" => {
-                let [value] = self.func_args(func, args, "exactly one argument", range)?;
-                let known = matches!(
-                    self.static_type(&value),
-                    Some(StaticType::String | StaticType::Array | StaticType::Object)
-                );
-                if !known && !self.defers_to_generation(&value) {
-                    self.push_func_arg_type(&value, func, "string, array, or object");
-                    return None;
-                }
-                Some(Func::Tokens {
-                    value: Box::new(value.into_value()),
-                })
-            }
-            "format" => self.model_format(args, range),
-
-            "clamp" => {
-                let [value, min, max] = self.func_args(func, args, "exactly three arguments (value, min, max)", range)?;
-                // constant bounds must already be ordered
-                if let (FoldedKind::Value(Value::Num(low)), FoldedKind::Value(Value::Num(high))) = (&min.kind, &max.kind)
-                    && float_bound(low.clone()) > float_bound(high.clone())
-                {
-                    self.errors.push(Error::new(
-                        ErrorKind::ClampBoundsOutOfOrder {
-                            rule: spec::ids::CLAMP_BOUNDS,
-                        },
-                        range,
-                    ));
-                    return None;
-                }
-                let value = self.model_typed_arg(value, func, StaticType::Number);
-                let min = self.model_typed_arg(min, func, StaticType::Number);
-                let max = self.model_typed_arg(max, func, StaticType::Number);
-                Some(Func::Clamp {
-                    value: Box::new(value?),
-                    min: Box::new(min?),
-                    max: Box::new(max?),
-                })
-            }
-            "round" | "floor" | "ceil" | "abs" => {
-                let [value] = self.func_args(func, args, "exactly one argument", range)?;
-                let value = Box::new(self.model_typed_arg(value, func, StaticType::Number)?);
-                Some(match func {
-                    "round" => Func::Round { value },
-                    "floor" => Func::Floor { value },
-                    "ceil" => Func::Ceil { value },
-                    _ => Func::Abs { value },
-                })
-            }
-            "min" | "max" => {
-                if args.len() < 2 {
-                    self.errors.push(Error::new(
-                        ErrorKind::FuncArity {
-                            rule: spec::ids::FUNC_ARITY,
-                            func,
-                            expected: "at least two arguments",
-                        },
-                        range,
-                    ));
-                    return None;
-                }
-                let mut values = Vec::with_capacity(args.len());
-                let mut valid = true;
-                for arg in args {
-                    match self.model_typed_arg(arg, func, StaticType::Number) {
-                        Some(value) => values.push(value),
-                        None => valid = false,
-                    }
-                }
-                valid.then(|| if func == "min" { Func::Min(values) } else { Func::Max(values) })
-            }
-
-            "uuid" => {
-                if !args.is_empty() {
-                    self.errors.push(Error::new(
-                        ErrorKind::FuncArity {
-                            rule: spec::ids::FUNC_ARITY,
-                            func,
-                            expected: "no arguments",
-                        },
-                        range,
-                    ));
-                    return None;
-                }
-                Some(Func::Uuid)
-            }
-            "hex" | "alphanum" => {
-                let [length] = self.func_args(func, args, "exactly one argument (length)", range)?;
-                let length = self.model_random_length(length, func)?;
-                Some(if func == "hex" {
-                    Func::Hex { length }
-                } else {
-                    Func::Alphanum { length }
-                })
-            }
-            "noise" => {
-                let [size] = self.func_args(func, args, "exactly one argument (size)", range)?;
-                // a constant size settles its bounds during validation
-                if let FoldedKind::Value(Value::Num(number)) = &size.kind {
-                    let valid = matches!(number, Number::Int(value) if (0..=NOISE_SIZE_CAP).contains(value));
-                    if !valid {
-                        self.errors.push(Error::new(
-                            ErrorKind::ParamOutOfRange {
-                                rule: spec::ids::NOISE_SIZE,
-                                func,
-                                param: "size",
-                                expected: "an integer between 0 and 8388608",
-                            },
-                            size.range,
-                        ));
-                        return None;
-                    }
-                }
-                let size = self.model_typed_arg(size, func, StaticType::Number)?;
-                Some(Func::Noise { size: Box::new(size) })
-            }
-            "attachment" => {
-                let [path, content_type] = self.func_args(func, args, "exactly two arguments (path, content_type)", range)?;
-                let Some(path_text) = const_string(&path).filter(|path| Path::new(path).file_name().is_some()) else {
-                    self.errors.push(Error::new(
-                        ErrorKind::ParamOutOfRange {
-                            rule: spec::ids::FUNC_ARG_TYPES,
-                            func,
-                            param: "path",
-                            expected: "a constant file path",
-                        },
-                        path.range,
-                    ));
-                    return None;
-                };
-                let Some(content_type_text) = const_string(&content_type).filter(|value| !value.is_empty()) else {
-                    self.errors.push(Error::new(
-                        ErrorKind::ParamOutOfRange {
-                            rule: spec::ids::FUNC_ARG_TYPES,
-                            func,
-                            param: "content_type",
-                            expected: "a non-empty constant MIME type",
-                        },
-                        content_type.range,
-                    ));
-                    return None;
-                };
-                Some(Func::Attachment {
-                    path: path_text,
-                    content_type: content_type_text,
-                })
-            }
-
-            _ => unreachable!("function {name} does not have a model lowering"),
-        }
-    }
-
-    fn model_weighted(&mut self, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
-        if args.is_empty() {
-            self.errors.push(Error::new(
-                ErrorKind::FuncArity {
-                    rule: spec::ids::FUNC_ARITY,
-                    func: "weighted",
-                    expected: "at least one `[value, weight]` pair",
-                },
-                range,
-            ));
-            return None;
-        }
-
-        let mut options = Vec::with_capacity(args.len());
-        let mut valid = true;
-        for arg in args {
-            let arg_range = arg.range;
-            let FoldedKind::Array(mut elems) = arg.kind else {
-                self.push_weighted_option(arg_range);
-                valid = false;
-                continue;
-            };
-            if elems.len() != 2 {
-                self.push_weighted_option(arg_range);
-                valid = false;
-                continue;
-            }
-            let weight_value = elems.pop().expect("pair has two elements");
-            let value = elems.pop().expect("pair has two elements");
-
-            let weight_range = weight_value.range;
-            let weight = match weight_value.kind {
-                FoldedKind::Value(Value::Num(number)) => Some(float_bound(number)),
-                _ => None,
-            };
-            let weight = match weight {
-                Some(weight) if weight >= 0.0 => Some(weight),
-                _ => {
-                    self.push_weighted_option(weight_range);
-                    None
-                }
-            };
-
-            match weight {
-                Some(weight) => options.push(WeightedOption {
-                    value: value.into_value(),
-                    weight,
-                }),
-                None => valid = false,
-            }
-        }
-
-        if !valid {
-            return None;
-        }
-        if options.iter().map(|option| option.weight).sum::<f64>() <= 0.0 {
-            self.errors.push(Error::new(
-                ErrorKind::WeightedTotal {
-                    rule: spec::ids::WEIGHTED_OPTIONS,
-                },
-                range,
-            ));
-            return None;
-        }
-
-        Some(Func::Weighted(options))
-    }
-
-    fn model_format(&mut self, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
-        let mut args = args.into_iter();
-        let Some(template_value) = args.next() else {
-            self.errors.push(Error::new(
-                ErrorKind::FuncArity {
-                    rule: spec::ids::FUNC_ARITY,
-                    func: "format",
-                    expected: "a constant string template followed by one value per `{}` placeholder",
-                },
-                range,
-            ));
-            return None;
-        };
-
-        let Some(template) = const_string(&template_value) else {
-            self.push_func_arg_type(&template_value, "format", "constant string");
-            return None;
-        };
-
-        let rest: Vec<_> = args.collect();
-        let pieces: Vec<String> = template.split("{}").map(str::to_owned).collect();
-        let placeholders = pieces.len() - 1;
-        if placeholders != rest.len() {
-            self.errors.push(Error::new(
-                ErrorKind::FormatPlaceholders {
-                    rule: spec::ids::FORMAT_TEMPLATE,
-                    placeholders,
-                    args: rest.len(),
-                },
-                range,
-            ));
-            return None;
-        }
-
-        let mut values = Vec::with_capacity(rest.len());
-        let mut valid = true;
-        for arg in rest {
-            match self.model_scalar_arg(arg, "format") {
-                Some(value) => values.push(value),
-                None => valid = false,
-            }
-        }
-
-        valid.then_some(Func::Format { pieces, args: values })
-    }
-
-    fn model_english_func(&mut self, func: &'static str, args: Vec<Folded>, range: SrcRange) -> Option<Func> {
-        use EnglishOperation::*;
-        let operation = match func {
-            "express" => Express,
-            "expression" => Expression,
-            "expression_candidates" => ExpressionCandidates,
-            "realize" => Realize,
-            "vary" => Vary,
-            "combine" => Combine,
-            "refer" => Refer,
-            "remember" => Remember,
-            "unmentioned" => Unmentioned,
-            "format_number" => FormatNumber,
-            "format_date" => FormatDate,
-            "format_time" => FormatTime,
-            _ => unreachable!("known English function"),
-        };
-        let (min, max, expected) = match operation {
-            Express | Expression | ExpressionCandidates | Realize | Vary | FormatNumber | FormatDate | FormatTime => {
-                (1, 2, "one or two arguments (value, options)")
-            }
-            Combine => (2, 3, "two or three arguments (sentences, relation, options)"),
-            Refer => (2, 3, "two or three arguments (entity, context, options)"),
-            Remember => (2, 3, "two or three arguments (context, entities, facts)"),
-            Unmentioned => (2, 2, "exactly two arguments (details, context)"),
-        };
-        if !(min..=max).contains(&args.len()) {
-            self.errors.push(Error::new(
-                ErrorKind::FuncArity {
-                    rule: spec::ids::FUNC_ARITY,
-                    func,
-                    expected,
-                },
-                range,
-            ));
-            return None;
-        }
-        let mut values = Vec::with_capacity(args.len());
-        let mut valid = true;
-        for (index, arg) in args.into_iter().enumerate() {
-            let (allowed, expected): (&[StaticType], &'static str) = match (operation, index) {
-                (Vary, 0) => (&[StaticType::String, StaticType::Object], "string or object"),
-                (FormatNumber, 0) => (&[StaticType::String, StaticType::Number], "string or number"),
-                (FormatDate | FormatTime, 0) | (Combine, 1) => (&[StaticType::String], "string"),
-                (Combine | Unmentioned, 0) | (Remember, 1 | 2) => (&[StaticType::Array], "array"),
-                _ => (&[StaticType::Object], "object"),
-            };
-            if !self.matches_static_types(&arg, allowed) && !self.defers_to_generation(&arg) {
-                self.push_func_arg_type(&arg, func, expected);
-                valid = false;
-            }
-            values.push(arg.into_value());
-        }
-        valid.then_some(Func::English { operation, args: values })
-    }
-
-    fn matches_static_types(&self, folded: &Folded, allowed: &[StaticType]) -> bool {
-        match self.static_type(folded) {
-            Some(kind) => allowed.contains(&kind),
-            None => match &folded.kind {
-                FoldedKind::Value(value) => self.value_matches_static_types(value, allowed),
-                _ => false,
-            },
-        }
-    }
-
-    fn value_matches_static_types(&self, value: &Value, allowed: &[StaticType]) -> bool {
-        match value {
-            Value::VarRef(name) => self
-                .var_value(name)
-                .is_some_and(|value| self.matches_static_types(value, allowed)),
-            Value::Func {
-                func: Func::Choice(options),
-                ..
-            } => options.iter().all(|value| self.value_matches_static_types(value, allowed)),
-            Value::Func {
-                func: Func::Weighted(options),
-                ..
-            } => options
-                .iter()
-                .all(|option| self.value_matches_static_types(&option.value, allowed)),
-            Value::Cond { then, otherwise, .. } => {
-                self.value_matches_static_types(then, allowed) && self.value_matches_static_types(otherwise, allowed)
-            }
-            _ => self.value_type(value).is_some_and(|kind| allowed.contains(&kind)),
-        }
-    }
-
-    fn func_args<const N: usize>(
-        &mut self,
-        func: &'static str,
-        args: Vec<Folded>,
-        expected: &'static str,
-        range: SrcRange,
-    ) -> Option<[Folded; N]> {
-        match <[Folded; N]>::try_from(args) {
-            Ok(args) => Some(args),
-            Err(_) => {
-                self.errors.push(Error::new(
-                    ErrorKind::FuncArity {
-                        rule: spec::ids::FUNC_ARITY,
-                        func,
-                        expected,
-                    },
-                    range,
-                ));
-                None
-            }
-        }
-    }
-
-    fn model_typed_arg(&mut self, arg: Folded, func: &'static str, required: StaticType) -> Option<Value> {
-        if self.static_type(&arg) != Some(required) && !self.defers_to_generation(&arg) {
-            self.push_func_arg_type(&arg, func, type_name(required));
-            return None;
-        }
-        Some(arg.into_value())
-    }
-
-    fn model_scalar_arg(&mut self, arg: Folded, func: &'static str) -> Option<Value> {
-        let scalar = matches!(
-            self.static_type(&arg),
-            Some(StaticType::String | StaticType::Number | StaticType::Boolean)
-        );
-        if !scalar && !self.defers_to_generation(&arg) {
-            self.push_func_arg_type(&arg, func, "string, number, or boolean");
-            return None;
-        }
-        Some(arg.into_value())
-    }
-
-    fn push_func_arg_type(&mut self, arg: &Folded, func: &'static str, expected: &'static str) {
-        self.errors.push(Error::new(
-            ErrorKind::FuncArgType {
-                rule: spec::ids::FUNC_ARG_TYPES,
-                func,
-                expected,
-                found: self.found_type(arg),
-            },
-            arg.range,
-        ));
-    }
-
-    fn push_weighted_option(&mut self, range: SrcRange) {
-        self.errors.push(Error::new(
-            ErrorKind::WeightedOptionShape {
-                rule: spec::ids::WEIGHTED_OPTIONS,
-            },
-            range,
-        ));
-    }
-
-    // constant distribution parameter, already folded to a value when constant
-    fn model_dist_param(
-        &mut self,
-        arg: Folded,
-        func: &'static str,
-        param: &'static str,
-        expected: &'static str,
-        valid: impl Fn(f64) -> bool,
-    ) -> Option<f64> {
-        let range = arg.range;
-        let number = match arg.kind {
-            FoldedKind::Value(Value::Num(number)) => number,
-            _ => {
-                self.errors.push(Error::new(
-                    ErrorKind::NonConstantParam {
-                        rule: spec::ids::DIST_PARAMS,
-                        func,
-                        param,
-                    },
-                    range,
-                ));
-                return None;
-            }
-        };
-
-        let value = float_bound(number);
-        if !valid(value) {
-            self.errors.push(Error::new(
-                ErrorKind::ParamOutOfRange {
-                    rule: spec::ids::DIST_PARAMS,
-                    func,
-                    param,
-                    expected,
-                },
-                range,
-            ));
-            return None;
-        }
-
-        Some(value)
-    }
-
-    fn model_random_length(&mut self, arg: Folded, func: &'static str) -> Option<usize> {
-        let range = arg.range;
-        let number = match arg.kind {
-            FoldedKind::Value(Value::Num(number)) => number,
-            _ => {
-                self.errors.push(Error::new(
-                    ErrorKind::NonConstantParam {
-                        rule: spec::ids::RANDOM_LENGTH,
-                        func,
-                        param: "length",
-                    },
-                    range,
-                ));
-                return None;
-            }
-        };
-
-        let length = match number {
-            Number::Int(value) => usize::try_from(value).ok(),
-            Number::Float(_) => None,
-        };
-        match length {
-            Some(length) => Some(length),
-            None => {
-                self.errors.push(Error::new(
-                    ErrorKind::ParamOutOfRange {
-                        rule: spec::ids::RANDOM_LENGTH,
-                        func,
-                        param: "length",
-                        expected: "a non-negative integer that fits this platform's length limit",
-                    },
-                    range,
-                ));
-                None
-            }
-        }
-    }
-
-    fn model_range_bound(&mut self, bound: Folded) -> Option<Number> {
-        match bound.kind {
-            FoldedKind::Value(Value::Num(number)) => Some(number),
-            _ => {
-                self.errors.push(Error::new(
-                    ErrorKind::InvalidRangeArgs {
-                        rule: spec::ids::RANGE_BOUNDS,
-                    },
-                    bound.range,
-                ));
-                None
-            }
-        }
-    }
-
-    // resolves a context path or emits the diagnostic shared by both syntaxes
-    fn require_ctx_ref(&mut self, path: &[String], range: SrcRange) -> Option<CtxRef> {
-        if let Some(ctx_ref) = model_ctx_ref(path, self.repeat_depth) {
-            return Some(ctx_ref);
-        }
-
-        // a known reference in the wrong place gets its own diagnostic
-        let kind = match path {
-            [first, second] if first == "repeat" && (second == "index" || second == "count") => {
-                ErrorKind::RepeatRefOutsideRepeat {
-                    rule: spec::ids::REPEAT_REFS,
-                    path: path.join("."),
-                }
-            }
-            _ => ErrorKind::UnknownReference {
-                rule: spec::ids::KNOWN_REFERENCES,
-                path: path.join("."),
-            },
-        };
-        self.errors.push(Error::new(kind, range));
-        None
-    }
-
-    // the one place a number literal parses; negated folds a leading minus
-    // into the literal so i64::MIN stays representable
-    fn model_number(&mut self, raw: String, negated: bool, range: SrcRange) -> Option<Number> {
-        let raw = if negated { format!("-{raw}") } else { raw };
-        let number = if raw.contains(['.', 'e', 'E']) {
-            raw.parse::<f64>().ok().filter(|number| number.is_finite()).map(Number::Float)
-        } else {
-            raw.parse::<i64>().ok().map(Number::Int)
-        };
-
-        if number.is_none() {
-            self.errors.push(Error::new(
-                ErrorKind::InvalidNumber {
-                    rule: spec::ids::FINITE_NUMBERS,
-                    raw,
-                },
-                range,
-            ));
-        }
-
-        number
-    }
-
-    // statically known result type, none = unknown (eg heterogeneous choice)
-    fn static_type(&self, folded: &Folded) -> Option<StaticType> {
-        match &folded.kind {
-            FoldedKind::Array(_) => Some(StaticType::Array),
-            FoldedKind::Object(_) => Some(StaticType::Object),
-            FoldedKind::Value(value) => self.value_type(value),
-        }
-    }
-
-    fn value_type(&self, value: &Value) -> Option<StaticType> {
-        if let Some(shape) = self.result_shape(value) {
-            return Some(shape.value_type());
-        }
-        match value {
-            Value::Str(_) | Value::Template(_) => Some(StaticType::String),
-            Value::Num(_) => Some(StaticType::Number),
-            Value::Bool(_) => Some(StaticType::Boolean),
-            Value::Null => Some(StaticType::Null),
-            Value::Array(_) => Some(StaticType::Array),
-            Value::Object(_) | Value::Attachment { .. } => Some(StaticType::Object),
-            // a binding is typed by its definition
-            Value::VarRef(name) => {
-                let value = self.var_value(name)?;
-                self.static_type(value)
-            }
-            // context indexes and counts are always integers
-            Value::CtxRef(_) => Some(StaticType::Number),
-            // a referenced field's shape is only known at generation
-            Value::BlockRef { .. } => None,
-            // a scorer argument's shape is only known when the scorer runs
-            Value::ArgRef(_) => None,
-            Value::Func { func, .. } => self.func_type(func),
-            Value::Unary { op: UnaryOp::Neg, .. } => Some(StaticType::Number),
-            Value::Unary { op: UnaryOp::Not, .. } => Some(StaticType::Boolean),
-            Value::Binary { op, .. } => Some(match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => StaticType::Number,
-                _ => StaticType::Boolean,
-            }),
-            Value::Cond { then, otherwise, .. } => {
-                let then = self.value_type(then)?;
-                let otherwise = self.value_type(otherwise)?;
-                (then == otherwise).then_some(then)
-            }
-            // a dynamic index is typed when the target's elements agree
-            Value::Index { target, .. } => match &**target {
-                Value::Array(array) => unify_types(array.elem.iter().map(|elem| match elem {
-                    ArrayElem::Item(value) => self.value_type(value),
-                    // a spread's elements are unknown until generation
-                    ArrayElem::Spread(_) => None,
-                })),
-                Value::Object(object) => unify_types(object.elem.iter().map(|field| self.value_type(&field.value))),
-                Value::VarRef(name) => match self.var_value(name).map(|value| &value.kind) {
-                    Some(FoldedKind::Array(values)) => unify_types(values.iter().map(|value| self.static_type(value))),
-                    Some(FoldedKind::Object(fields)) => unify_types(fields.iter().map(|field| self.static_type(&field.value))),
-                    _ => None,
-                },
-                _ => None,
-            },
-            // a residual slice always selects from an array
-            Value::Slice { .. } => Some(StaticType::Array),
-        }
-    }
-
-    // keep known result fields typed through bindings and nested indexes
-    fn result_shape(&self, value: &Value) -> Option<ResultShape> {
-        match value {
-            Value::VarRef(name) => match &self.var_value(name)?.kind {
-                FoldedKind::Value(value) => self.result_shape(value),
-                _ => None,
-            },
-            Value::Func {
-                func: Func::English { operation, .. },
-                ..
-            } => english_result_shape(*operation),
-            Value::Index { target, index, .. } => match self.result_shape(target)? {
-                ResultShape::Object(fields) => {
-                    let Value::Str(key) = &**index else { return None };
-                    fields.iter().find_map(|(name, shape)| (*name == key).then_some(*shape))
-                }
-                ResultShape::Array(element) => Some(*element),
-                ResultShape::Scalar(_) => None,
-            },
-            Value::Slice { target, .. } => {
-                let shape = self.result_shape(target)?;
-                matches!(shape, ResultShape::Array(_)).then_some(shape)
-            }
-            Value::Cond { then, otherwise, .. } => {
-                let shape = self.result_shape(then)?;
-                (Some(shape) == self.result_shape(otherwise)).then_some(shape)
-            }
-            Value::Func {
-                func: Func::Choice(values),
-                ..
-            } => {
-                let shape = self.result_shape(values.first()?)?;
-                values
-                    .iter()
-                    .all(|value| self.result_shape(value) == Some(shape))
-                    .then_some(shape)
-            }
-            _ => None,
-        }
-    }
-
-    // result type by function, a pick is typed when its alternatives agree
-    fn func_type(&self, func: &Func) -> Option<StaticType> {
-        match func {
-            Func::Choice(options) => unify_types(options.iter().map(|option| self.value_type(option))),
-            Func::Weighted(options) => unify_types(options.iter().map(|option| self.value_type(&option.value))),
-            Func::Range(_)
-            | Func::Normal { .. }
-            | Func::Lognormal { .. }
-            | Func::Exponential { .. }
-            | Func::Pareto { .. }
-            | Func::Beta { .. }
-            | Func::Poisson { .. }
-            | Func::Len { .. }
-            | Func::Tokens { .. }
-            | Func::Clamp { .. }
-            | Func::Round { .. }
-            | Func::Floor { .. }
-            | Func::Ceil { .. }
-            | Func::Abs { .. }
-            | Func::Min(_)
-            | Func::Max(_) => Some(StaticType::Number),
-            Func::Chance { .. } | Func::Contains { .. } | Func::StartsWith { .. } | Func::EndsWith { .. } => {
-                Some(StaticType::Boolean)
-            }
-            Func::Upper { .. }
-            | Func::Lower { .. }
-            | Func::Trim { .. }
-            | Func::Replace { .. }
-            | Func::Join { .. }
-            | Func::Compose { .. }
-            | Func::Render { .. }
-            | Func::Format { .. }
-            | Func::Uuid
-            | Func::Hex { .. }
-            | Func::Alphanum { .. }
-            | Func::Noise { .. } => Some(StaticType::String),
-            Func::Split { .. } | Func::Sample { .. } => Some(StaticType::Array),
-            Func::English { operation, .. } => Some(match operation {
-                EnglishOperation::Remember | EnglishOperation::Expression => StaticType::Object,
-                EnglishOperation::Unmentioned | EnglishOperation::ExpressionCandidates => StaticType::Array,
-                _ => StaticType::String,
-            }),
-            Func::Attachment { .. } => Some(StaticType::Object),
-        }
-    }
-
-    // the found side of diagnostics, prefers the static type over the value shape
-    fn found_type(&self, folded: &Folded) -> ExprType {
-        match self.static_type(folded) {
-            Some(StaticType::String) => ExprType::String,
-            Some(StaticType::Number) => ExprType::Number,
-            Some(StaticType::Boolean) => ExprType::Boolean,
-            Some(StaticType::Null) => ExprType::Null,
-            Some(StaticType::Array) => ExprType::Array,
-            Some(StaticType::Object) => ExprType::Object,
-            None => ExprType::of(folded),
-        }
-    }
-
-    fn model_name(&mut self, name: Option<String>, range: SrcRange, block: &spec::BlockDesc) -> Option<String> {
-        match block.name {
-            spec::NamePolicy::Required => {
-                if name.is_none() {
-                    self.errors
-                        .push(Error::new(ErrorKind::MissingName { block: block.id }, range));
-                }
-                name
-            }
-            spec::NamePolicy::Forbidden if name.is_some() => {
-                self.errors
-                    .push(Error::new(ErrorKind::UnexpectedName { block: block.id }, range));
-                None
-            }
-            spec::NamePolicy::Optional => name,
-            spec::NamePolicy::Forbidden => None,
-        }
-    }
-
-    // resolves every live pending reference against the completed symbol
-    // tree; dead intermediates and failures leave placeholders, which never
-    // escape because the model is only returned when no error was recorded
-    fn resolve_pending(&mut self, live: &[bool]) -> Vec<ResolvedRef> {
-        let pending = std::mem::take(&mut self.pending);
-        pending
-            .into_iter()
-            .enumerate()
-            .map(|(index, pending)| {
-                if live[index] {
-                    self.resolve_ref(pending)
-                } else {
-                    ResolvedRef {
-                        module: None,
-                        up: 0,
-                        steps: Vec::new(),
-                        accessor: Accessor::Field(Field::Input),
-                        path: Vec::new(),
-                        range: pending.range,
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn resolve_ref(&mut self, pending: PendingRef) -> ResolvedRef {
-        let PendingRef {
-            head,
-            segments,
-            origin,
-            slot,
-            range,
-        } = pending;
-        let placeholder = || ResolvedRef {
-            module: None,
-            up: 0,
-            steps: Vec::new(),
-            accessor: Accessor::Field(Field::Input),
-            path: Vec::new(),
-            range,
-        };
-        let mut segments = segments.into_iter().peekable();
-        let mut steps: Vec<Step> = Vec::new();
-        let mut module = None;
-
-        // the anchor the up-walk lands on; kind heads anchor at the scope
-        // whose children matched and descend from there
-        let (up, mut target) = match head {
-            Head::SelfBlock(node) => {
-                let position = origin
-                    .iter()
-                    .rposition(|&at| at == node)
-                    .expect("self anchors on its own origin chain");
-                (origin.len() - 1 - position, Some(node))
-            }
-            Head::Trace | Head::ModuleTrace => {
-                let named = matches!(head, Head::ModuleTrace)
-                    || (segments.len() >= 2 || origin.is_empty())
-                        && matches!(segments.peek(), Some(Segment::Name { value, .. }) if field_by_name(value).is_none());
-                if named || origin.is_empty() {
-                    let name = if named {
-                        match segments.next().unwrap() {
-                            Segment::Name { value, .. } => Some(value),
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        None
-                    };
-                    let candidates: Vec<NodeId> = self
-                        .syms
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, sym)| {
-                            sym.kind == BlockKind::Trace && name.as_ref().is_none_or(|name| sym.name.as_ref() == Some(name))
-                        })
-                        .map(|(index, _)| NodeId(index as u32))
-                        .collect();
-                    if candidates.len() != 1 {
-                        self.errors.push(Error::new(
-                            ErrorKind::UnknownBlockRef {
-                                rule: spec::ids::BLOCK_REFS,
-                                keyword: "trace",
-                                name: name.unwrap_or_else(|| "<implicit module trace>".to_owned()),
-                            },
-                            range,
-                        ));
-                        return placeholder();
-                    }
-                    module = Some(candidates[0]);
-                    (0, Some(candidates[0]))
-                } else {
-                    (origin.len().saturating_sub(1), origin.first().copied())
-                }
-            }
-            Head::Kind(kind) => {
-                let name = match segments.next() {
-                    Some(Segment::Name { value, .. }) => value,
-                    _ => {
-                        self.errors.push(Error::new(
-                            ErrorKind::IncompleteBlockRef {
-                                rule: spec::ids::BLOCK_REFS,
-                                keyword: kind.keyword(),
-                            },
-                            range,
-                        ));
-                        return placeholder();
-                    }
-                };
-
-                // nearest enclosing scope with any match wins
-                let found = origin.iter().enumerate().rev().find_map(|(position, &scope)| {
-                    let candidates = self.matching_children(scope, kind, &name);
-                    (!candidates.is_empty()).then_some((position, candidates))
-                });
-                let Some((position, candidates)) = found else {
-                    self.errors.push(Error::new(
-                        ErrorKind::UnknownBlockRef {
-                            rule: spec::ids::BLOCK_REFS,
-                            keyword: kind.keyword(),
-                            name,
-                        },
-                        range,
-                    ));
-                    return placeholder();
-                };
-
-                let up = origin.len() - 1 - position;
-                let target = if kind.has_fields() {
-                    match self.consume_position(&mut segments, &mut steps, candidates, &name, range) {
-                        Some(target) => target,
-                        None => return placeholder(),
-                    }
-                } else {
-                    // dynamic blocks have no positional escape, their names
-                    // must be unique among matching siblings
-                    match self.lone_candidate(&mut steps, candidates, &name, range) {
-                        Some(target) => Some(target),
-                        None => return placeholder(),
-                    }
-                };
-                (up, target)
-            }
-        };
-
-        let mut kind = match head {
-            Head::Kind(kind) => kind,
-            Head::SelfBlock(node) => self.syms[node.0 as usize].kind,
-            Head::Trace | Head::ModuleTrace => BlockKind::Trace,
-        };
-        // a repeat cursor must select an iteration before descending
-        let mut selected = false;
-        // references through iterations stay off the static cycle graph:
-        // cross-iteration field pairs are legitimately mutual
-        let mut has_iteration = false;
-
-        // descend until a field or accessor closes the block path
-        let accessor = loop {
-            match segments.next() {
-                // an index or slice on a repeat selects among its iterations
-                Some(Segment::Index { value, range: at }) => {
-                    if kind != BlockKind::Repeat || selected {
-                        self.errors.push(Error::new(
-                            ErrorKind::InvalidRefSegment {
-                                rule: spec::ids::REF_FIELDS,
-                                segment: "[...]".to_owned(),
-                            },
-                            at,
-                        ));
-                        return placeholder();
-                    }
-                    steps.push(Step::Iteration(value));
-                    selected = true;
-                    has_iteration = true;
-                }
-                Some(Segment::Slice { start, end, range: at }) => {
-                    if kind != BlockKind::Repeat || selected {
-                        self.errors.push(Error::new(
-                            ErrorKind::InvalidRefSegment {
-                                rule: spec::ids::REF_FIELDS,
-                                segment: "[...]".to_owned(),
-                            },
-                            at,
-                        ));
-                        return placeholder();
-                    }
-                    // the rest of the reference projects over each iteration
-                    steps.push(Step::Iterations { start, end });
-                    selected = true;
-                    has_iteration = true;
-                }
-                Some(Segment::Name { value, range: at }) => {
-                    // accessors close dynamic-block paths
-                    match (kind, selected, value.as_str()) {
-                        (BlockKind::Repeat, false, "index" | "count") => {
-                            // the current iteration only exists inside the repeat
-                            let node = target.expect("repeats resolve without positions");
-                            if !origin.contains(&node) {
-                                self.errors.push(Error::new(
-                                    ErrorKind::RepeatRefOutsideRepeat {
-                                        rule: spec::ids::REPEAT_REFS,
-                                        path: format!(
-                                            "repeat.{}.{}",
-                                            self.syms[node.0 as usize].name.as_deref().unwrap_or("?"),
-                                            value
-                                        ),
-                                    },
-                                    at,
-                                ));
-                                return placeholder();
-                            }
-                            break if value == "index" { Accessor::Index } else { Accessor::Count };
-                        }
-                        (BlockKind::Choice, _, "chosen") => break Accessor::Chosen,
-                        (BlockKind::Maybe, _, "included") => break Accessor::Included,
-                        _ => {}
-                    }
-
-                    if kind.has_fields()
-                        && let Some(field) = field_by_name(&value)
-                    {
-                        // a statically known target must actually set the field
-                        if let Some(node) = target
-                            && !self.syms[node.0 as usize].fields.contains(&field)
-                        {
-                            self.errors.push(Error::new(
-                                ErrorKind::AbsentFieldRef {
-                                    rule: spec::ids::REF_FIELDS,
-                                    field: value,
-                                    label: self.sym_label(node),
-                                },
-                                at,
-                            ));
-                            return placeholder();
-                        }
-                        break Accessor::Field(field);
-                    }
-
-                    if let Some(child) = child_kind_by_name(&value) {
-                        if kind == BlockKind::Repeat && !selected {
-                            self.errors.push(Error::new(
-                                ErrorKind::RepeatIterationRequired {
-                                    rule: spec::ids::REF_COLLECTIONS,
-                                },
-                                at,
-                            ));
-                            return placeholder();
-                        }
-                        let Some(node) = target else {
-                            self.errors.push(Error::new(
-                                ErrorKind::DynamicPositionDescent {
-                                    rule: spec::ids::REF_COLLECTIONS,
-                                },
-                                at,
-                            ));
-                            return placeholder();
-                        };
-                        let name = match segments.next() {
-                            Some(Segment::Name { value, .. }) => value,
-                            _ => {
-                                self.errors.push(Error::new(
-                                    ErrorKind::IncompleteBlockRef {
-                                        rule: spec::ids::BLOCK_REFS,
-                                        keyword: child.keyword(),
-                                    },
-                                    range,
-                                ));
-                                return placeholder();
-                            }
-                        };
-                        let candidates = self.matching_children(node, child, &name);
-                        if candidates.is_empty() {
-                            self.errors.push(Error::new(
-                                ErrorKind::UnknownBlockRef {
-                                    rule: spec::ids::BLOCK_REFS,
-                                    keyword: child.keyword(),
-                                    name,
-                                },
-                                at,
-                            ));
-                            return placeholder();
-                        }
-                        target = if child.has_fields() {
-                            match self.consume_position(&mut segments, &mut steps, candidates, &name, range) {
-                                Some(next) => next,
-                                None => return placeholder(),
-                            }
-                        } else {
-                            match self.lone_candidate(&mut steps, candidates, &name, range) {
-                                Some(next) => Some(next),
-                                None => return placeholder(),
-                            }
-                        };
-                        kind = child;
-                        selected = false;
-                        continue;
-                    }
-
-                    self.errors.push(Error::new(
-                        ErrorKind::InvalidRefSegment {
-                            rule: spec::ids::REF_FIELDS,
-                            segment: value,
-                        },
-                        at,
-                    ));
-                    return placeholder();
-                }
-                None => {
-                    if let Some(node) = target {
-                        break Accessor::Block {
-                            node,
-                            kind: kind.keyword(),
-                        };
-                    }
-                    self.dataset_error("block identity requires a statically known target".to_owned(), range);
-                    return placeholder();
-                }
-            }
-        };
-
-        // everything after the field drills into its json value at generation
-        let path: Vec<Selection> = segments
-            .map(|segment| match segment {
-                Segment::Name { value, .. } => Selection::Index(Value::Str(value)),
-                Segment::Index { value, .. } => Selection::Index(value),
-                Segment::Slice { start, end, .. } => Selection::Slice { start, end },
-            })
-            .collect();
-
-        // a statically known target joins the dependency graph; dynamic
-        // positions and iteration steps fall to generation-time in-progress
-        // detection instead
-        if !has_iteration && let (Some(from), Some(node), Accessor::Field(field)) = (slot, target, &accessor) {
-            let key = match (field, path.first()) {
-                (Field::Metadata | Field::Metrics, Some(Selection::Index(Value::Str(key)))) => Some(key.clone()),
-                _ => None,
-            };
-            self.edges.push((
-                from,
-                SlotId::Field {
-                    node,
-                    field: *field,
-                    key,
-                },
-                range,
-            ));
-        }
-
-        ResolvedRef {
-            module,
-            up,
-            steps,
-            accessor,
-            path,
-            range,
-        }
-    }
-
-    // dynamic blocks have no positional collections: to be addressed, a
-    // repeat, choice, or maybe must be uniquely named among its siblings
-    fn lone_candidate(
-        &mut self,
-        steps: &mut Vec<Step>,
-        candidates: Vec<NodeId>,
-        name: &str,
-        range: SrcRange,
-    ) -> Option<NodeId> {
-        if candidates.len() > 1 {
-            self.errors.push(Error::new(
-                ErrorKind::AmbiguousBlockRef {
-                    rule: spec::ids::REF_COLLECTIONS,
-                    name: name.to_owned(),
-                    count: candidates.len(),
-                },
-                range,
-            ));
-            return None;
-        }
-        let node = candidates[0];
-        steps.push(Step::Child {
-            candidates,
-            position: None,
-        });
-        Some(node)
-    }
-
-    // the same-kind children matching a name, in sibling order
-    fn matching_children(&self, scope: NodeId, kind: BlockKind, name: &str) -> Vec<NodeId> {
-        self.syms[scope.0 as usize]
-            .children
-            .iter()
-            .copied()
-            .filter(|&child| {
-                let sym = &self.syms[child.0 as usize];
-                sym.kind == kind && sym.name.as_deref() == Some(name)
-            })
-            .collect()
-    }
-
-    // narrows a candidate list by an optional position segment and records the
-    // step; none = diagnosed, some(none) = target only known at generation
-    fn consume_position(
-        &mut self,
-        segments: &mut std::iter::Peekable<std::vec::IntoIter<Segment>>,
-        steps: &mut Vec<Step>,
-        candidates: Vec<NodeId>,
-        name: &str,
-        range: SrcRange,
-    ) -> Option<Option<NodeId>> {
-        let position = match segments.peek() {
-            Some(Segment::Index { .. }) => {
-                let Some(Segment::Index { value, range: at }) = segments.next() else {
-                    unreachable!("the peeked segment is an index");
-                };
-                Some((value, at))
-            }
-            _ => None,
-        };
-
-        match position {
-            None if candidates.len() == 1 => {
-                let node = candidates[0];
-                steps.push(Step::Child {
-                    candidates,
-                    position: None,
-                });
-                Some(Some(node))
-            }
-            None => {
-                self.errors.push(Error::new(
-                    ErrorKind::AmbiguousBlockRef {
-                        rule: spec::ids::REF_COLLECTIONS,
-                        name: name.to_owned(),
-                        count: candidates.len(),
-                    },
-                    range,
-                ));
-                None
-            }
-            Some((Value::Num(Number::Int(index)), at)) => {
-                // a constant position picks its candidate during validation
-                let position = usize::try_from(index).ok().filter(|&position| position < candidates.len());
-                let Some(position) = position else {
-                    self.errors.push(Error::new(
-                        ErrorKind::IndexOutOfBounds {
-                            rule: spec::ids::REF_COLLECTIONS,
-                            index,
-                            len: candidates.len(),
-                        },
-                        at,
-                    ));
-                    return None;
-                };
-                let node = candidates[position];
-                steps.push(Step::Child {
-                    candidates,
-                    position: Some(Value::Num(Number::Int(index))),
-                });
-                Some(Some(node))
-            }
-            Some((value, _)) => {
-                // a dynamic position resolves at generation
-                steps.push(Step::Child {
-                    candidates,
-                    position: Some(value),
-                });
-                Some(None)
-            }
-        }
-    }
-
-    // reports every reference cycle the static graph shows; dynamic positions
-    // stay off this graph and fail generation instead
-    fn detect_cycles(&mut self) {
-        let mut adjacency: HashMap<&SlotId, Vec<(&SlotId, SrcRange)>> = HashMap::new();
-        for (from, to, at) in &self.edges {
-            adjacency.entry(from).or_default().push((to, *at));
-        }
-
-        // 0 = unvisited, 1 = on the stack, 2 = done
-        let mut state: HashMap<&SlotId, u8> = HashMap::new();
-        let mut errors = Vec::new();
-
-        for start in adjacency.keys() {
-            if state.get(start).copied().unwrap_or(0) != 0 {
-                continue;
-            }
-            // iterative dfs: (node, next edge index) with an explicit path
-            let mut stack: Vec<(&SlotId, usize)> = vec![(start, 0)];
-            let mut path: Vec<&SlotId> = vec![start];
-            state.insert(start, 1);
-
-            while let Some((node, edge)) = stack.last_mut() {
-                let next = adjacency.get(*node).and_then(|edges| edges.get(*edge).copied());
-                *edge += 1;
-                match next {
-                    Some((to, at)) => match state.get(to).copied().unwrap_or(0) {
-                        0 => {
-                            state.insert(to, 1);
-                            stack.push((to, 0));
-                            path.push(to);
-                        }
-                        1 => {
-                            // a back edge closes a cycle through the path suffix
-                            let from = path.iter().position(|&slot| slot == to).unwrap_or(0);
-                            let mut chain: Vec<String> = path[from..].iter().map(|slot| self.slot_label(slot)).collect();
-                            chain.push(self.slot_label(to));
-                            errors.push(Error::new(
-                                ErrorKind::CircularReference {
-                                    rule: spec::ids::ACYCLIC_REFS,
-                                    chain: chain.join(" -> "),
-                                },
-                                at,
-                            ));
-                        }
-                        _ => {}
-                    },
-                    None => {
-                        state.insert(node, 2);
-                        stack.pop();
-                        path.pop();
-                    }
-                }
-            }
-        }
-
-        self.errors.extend(errors);
-    }
-
-    fn sym_label(&self, node: NodeId) -> String {
-        let sym = &self.syms[node.0 as usize];
-        match &sym.name {
-            Some(name) => format!("{} \"{}\"", sym.kind.keyword(), name),
-            None => sym.kind.keyword().to_owned(),
-        }
-    }
-
-    fn slot_label(&self, slot: &SlotId) -> String {
-        match slot {
-            SlotId::Field { node, field, key } => {
-                let mut label = format!("{} {}", self.sym_label(*node), field_keyword(*field));
-                if let Some(key) = key {
-                    label.push('.');
-                    label.push_str(key);
-                }
-                label
-            }
-            SlotId::Binding { name, .. } => format!("var.{name}"),
-        }
-    }
-}
-
-// marks the pending references the model actually stores: extension leaves
-// dead intermediates behind (llm.chat inside llm.chat[0].output), and only a
-// stored reference must resolve
-fn live_refs(
-    pending: &[PendingRef],
-    traces: &[Trace],
-    bindings: &[Binding],
-    datasets: &[(Dataset, SrcRange)],
-    aliases: &[RefId],
-) -> Vec<bool> {
-    let mut live = vec![false; pending.len()];
-    let mut found = aliases.to_vec();
-
-    for binding in bindings {
-        collect_refs(&binding.value, &mut found);
-    }
-    for trace in traces {
-        collect_trace_refs(trace, &mut found);
-    }
-
-    for (dataset, _) in datasets {
-        for case in &dataset.cases {
-            match &case.source {
-                DatasetSource::Inline(value) => collect_refs(value, &mut found),
-                DatasetSource::Trace(id) | DatasetSource::Span(id) => found.push(*id),
-                DatasetSource::Group(ids) => found.extend(ids),
-            }
-            for value in [&case.expected, &case.metadata, &case.tags].into_iter().flatten() {
-                collect_refs(value, &mut found);
-            }
-        }
-    }
-    // segment expressions can hold nested references of their own
-    while let Some(RefId(id)) = found.pop() {
-        let id = id as usize;
-        if std::mem::replace(&mut live[id], true) {
-            continue;
-        }
-        for segment in &pending[id].segments {
-            match segment {
-                Segment::Name { .. } => {}
-                Segment::Index { value, .. } => collect_refs(value, &mut found),
-                Segment::Slice { start, end, .. } => {
-                    if let Some(start) = start {
-                        collect_refs(start, &mut found);
-                    }
-                    if let Some(end) = end {
-                        collect_refs(end, &mut found);
-                    }
-                }
-            }
-        }
-    }
-
-    live
-}
-
-fn collect_trace_refs(trace: &Trace, found: &mut Vec<RefId>) {
-    for binding in &trace.bindings {
-        collect_refs(&binding.value, found);
-    }
-    collect_field_refs(&trace.fields, found);
-    for child in &trace.children {
-        collect_child_refs(child, found);
-    }
-}
-
-fn collect_child_refs(child: &Child, found: &mut Vec<RefId>) {
-    let (bindings, children): (&[Binding], &[Child]) = match child {
-        Child::Span(span) => {
-            collect_field_refs(&span.fields, found);
-            (&span.bindings, &span.children)
-        }
-        Child::Scorer(scorer) => {
-            collect_refs(&scorer.score, found);
-            if let Some((reason, _)) = &scorer.reason {
-                collect_refs(reason, found);
-            }
-            (&scorer.bindings, &[][..])
-        }
-        Child::Repeat(repeat) => {
-            collect_refs(&repeat.count, found);
-            (&repeat.bindings, &repeat.children)
-        }
-        Child::Choice(choice) => (&choice.bindings, &choice.children),
-        Child::Maybe(maybe) => {
-            collect_refs(&maybe.chance, found);
-            (&maybe.bindings, &maybe.children)
-        }
-    };
-    for binding in bindings {
-        collect_refs(&binding.value, found);
-    }
-    for child in children {
-        collect_child_refs(child, found);
-    }
-}
-
-fn collect_field_refs(fields: &SpanFields, found: &mut Vec<RefId>) {
-    for value in [&fields.input, &fields.output, &fields.expected, &fields.error]
+// the first of each identical diagnostic, in reporting order
+fn dedup(diags: Diags) -> Diags {
+    let mut seen = HashSet::new();
+    diags
         .into_iter()
-        .flatten()
-    {
-        collect_refs(value, found);
-    }
-    for object in [&fields.metadata, &fields.metrics].into_iter().flatten() {
-        for field in &object.elem {
-            collect_refs(&field.value, found);
-        }
-    }
-    for tag in &fields.tags {
-        collect_template_refs(tag, found);
-    }
-    if let Some((duration, _)) = &fields.duration {
-        collect_refs(duration, found);
-    }
-}
-
-fn collect_template_refs(template: &Template, found: &mut Vec<RefId>) {
-    for part in &template.parts {
-        if let Part::Dynamic(value) = part {
-            collect_refs(value, found);
-        }
-    }
-}
-
-fn collect_refs(value: &Value, found: &mut Vec<RefId>) {
-    match value {
-        Value::BlockRef { ref_id, .. } => found.push(*ref_id),
-        Value::Str(_)
-        | Value::Num(_)
-        | Value::Bool(_)
-        | Value::Null
-        | Value::VarRef(_)
-        | Value::CtxRef(_)
-        | Value::ArgRef(_)
-        | Value::Attachment { .. } => {}
-        Value::Template(template) => collect_template_refs(template, found),
-        Value::Array(array) => {
-            for elem in &array.elem {
-                match elem {
-                    ArrayElem::Item(value) | ArrayElem::Spread(value) => collect_refs(value, found),
-                }
-            }
-        }
-        Value::Object(object) => {
-            for field in &object.elem {
-                collect_refs(&field.value, found);
-            }
-        }
-        Value::Unary { operand, .. } => collect_refs(operand, found),
-        Value::Binary { lhs, rhs, .. } => {
-            collect_refs(lhs, found);
-            collect_refs(rhs, found);
-        }
-        Value::Cond { cond, then, otherwise } => {
-            collect_refs(cond, found);
-            collect_refs(then, found);
-            collect_refs(otherwise, found);
-        }
-        Value::Index { target, index, .. } => {
-            collect_refs(target, found);
-            collect_refs(index, found);
-        }
-        Value::Slice { target, start, end, .. } => {
-            collect_refs(target, found);
-            if let Some(start) = start {
-                collect_refs(start, found);
-            }
-            if let Some(end) = end {
-                collect_refs(end, found);
-            }
-        }
-        Value::Func { func, .. } => collect_func_refs(func, found),
-    }
-}
-
-fn collect_func_refs(func: &Func, found: &mut Vec<RefId>) {
-    let mut all = |values: &[Value]| {
-        for value in values {
-            collect_refs(value, found);
-        }
-    };
-    match func {
-        Func::Choice(options) | Func::Min(options) | Func::Max(options) => all(options),
-        Func::Weighted(options) => {
-            for option in options {
-                collect_refs(&option.value, found);
-            }
-        }
-        Func::Range(_)
-        | Func::Normal { .. }
-        | Func::Lognormal { .. }
-        | Func::Exponential { .. }
-        | Func::Pareto { .. }
-        | Func::Beta { .. }
-        | Func::Poisson { .. }
-        | Func::Chance { .. }
-        | Func::Uuid
-        | Func::Hex { .. }
-        | Func::Alphanum { .. }
-        | Func::Attachment { .. } => {}
-        Func::Upper { text } | Func::Lower { text } | Func::Trim { text } => collect_refs(text, found),
-        Func::Replace { text, from, to } => {
-            collect_refs(text, found);
-            collect_refs(from, found);
-            collect_refs(to, found);
-        }
-        Func::Split { text, separator } => {
-            collect_refs(text, found);
-            collect_refs(separator, found);
-        }
-        Func::Join { array, separator }
-        | Func::Compose { array, separator }
-        | Func::Render {
-            template: array,
-            values: separator,
-        }
-        | Func::Sample { array, count: separator } => {
-            collect_refs(array, found);
-            collect_refs(separator, found);
-        }
-        Func::Contains { target, needle } => {
-            collect_refs(target, found);
-            collect_refs(needle, found);
-        }
-        Func::StartsWith { text, prefix } => {
-            collect_refs(text, found);
-            collect_refs(prefix, found);
-        }
-        Func::EndsWith { text, suffix } => {
-            collect_refs(text, found);
-            collect_refs(suffix, found);
-        }
-        Func::Len { target } => collect_refs(target, found),
-        Func::Tokens { value } => collect_refs(value, found),
-        Func::Format { args, .. } | Func::English { args, .. } => all(args),
-        Func::Clamp { value, min, max } => {
-            collect_refs(value, found);
-            collect_refs(min, found);
-            collect_refs(max, found);
-        }
-        Func::Round { value } | Func::Floor { value } | Func::Ceil { value } | Func::Abs { value } => {
-            collect_refs(value, found)
-        }
-        Func::Noise { size } => collect_refs(size, found),
-    }
-}
-
-// the referenceable field behind a span field id
-fn model_field_kind(field: spec::Id) -> Option<Field> {
-    if field == spec::ids::INPUT {
-        Some(Field::Input)
-    } else if field == spec::ids::OUTPUT {
-        Some(Field::Output)
-    } else if field == spec::ids::EXPECTED {
-        Some(Field::Expected)
-    } else if field == spec::ids::ERROR {
-        Some(Field::Error)
-    } else if field == spec::ids::METADATA {
-        Some(Field::Metadata)
-    } else if field == spec::ids::METRICS {
-        Some(Field::Metrics)
-    } else if field == spec::ids::TAGS {
-        Some(Field::Tags)
-    } else {
-        None
-    }
-}
-
-// the field a reference segment names, shared with fixup resolution
-fn field_by_name(name: &str) -> Option<Field> {
-    match name {
-        "input" => Some(Field::Input),
-        "output" => Some(Field::Output),
-        "expected" => Some(Field::Expected),
-        "error" => Some(Field::Error),
-        "metadata" => Some(Field::Metadata),
-        "metrics" => Some(Field::Metrics),
-        "tags" => Some(Field::Tags),
-        _ => None,
-    }
-}
-
-fn field_keyword(field: Field) -> &'static str {
-    match field {
-        Field::Input => "input",
-        Field::Output => "output",
-        Field::Expected => "expected",
-        Field::Error => "error",
-        Field::Metadata => "metadata",
-        Field::Metrics => "metrics",
-        Field::Tags => "tags",
-    }
-}
-
-// the kind keyword a reference segment names, for descending into children
-fn child_kind_by_name(name: &str) -> Option<BlockKind> {
-    match name {
-        "task" => Some(BlockKind::Task),
-        "llm" => Some(BlockKind::Llm),
-        "tool" => Some(BlockKind::Tool),
-        "function" => Some(BlockKind::Function),
-        "repeat" => Some(BlockKind::Repeat),
-        "choice" => Some(BlockKind::Choice),
-        "maybe" => Some(BlockKind::Maybe),
-        _ => None,
-    }
-}
-
-// vars blocks bind to their enclosing block, everything else models in place
-fn split_vars(decls: Vec<ast::Decl>) -> (Vec<ast::Block>, Vec<ast::Decl>) {
-    let mut vars = Vec::new();
-    let mut rest = Vec::with_capacity(decls.len());
-    for decl in decls {
-        match decl {
-            ast::Decl::Block(block) if spec::SPEC.block(&block.kind).is_some_and(|desc| desc.id == spec::ids::VARS) => {
-                vars.push(block);
-            }
-            decl => rest.push(decl),
-        }
-    }
-    (vars, rest)
-}
-
-fn float_bound(number: Number) -> f64 {
-    match number {
-        Number::Int(value) => value as f64,
-        Number::Float(value) => value,
-    }
-}
-
-// statically known result type of an expr, none = unknown (eg heterogeneous choice)
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum StaticType {
-    String,
-    Number,
-    Boolean,
-    Null,
-    Array,
-    Object,
-}
-
-// result schemas describe existing runtime values without evaluating a function
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ResultShape {
-    Scalar(StaticType),
-    Object(&'static [(&'static str, ResultShape)]),
-    Array(&'static ResultShape),
-}
-
-impl ResultShape {
-    fn value_type(self) -> StaticType {
-        match self {
-            Self::Scalar(kind) => kind,
-            Self::Object(_) => StaticType::Object,
-            Self::Array(_) => StaticType::Array,
-        }
-    }
-}
-
-fn english_result_shape(operation: EnglishOperation) -> Option<ResultShape> {
-    use ResultShape::{Array, Object, Scalar};
-    const TEXT: ResultShape = Scalar(StaticType::String);
-    const NUMBER: ResultShape = Scalar(StaticType::Number);
-    const STRINGS: ResultShape = Array(&TEXT);
-    const MESSAGE: ResultShape = Object(&[
-        ("layout", TEXT),
-        ("recipe", TEXT),
-        ("forms", STRINGS),
-        ("organization", TEXT),
-        ("elaboration", TEXT),
-        ("sentence_shape", TEXT),
-        ("reference_style", TEXT),
-    ]);
-    const SELECTION: ResultShape = Object(&[("intent", TEXT), ("family", TEXT), ("pattern", TEXT), ("message", MESSAGE)]);
-    const CONTEXT: ResultShape = Object(&[
-        ("established", STRINGS),
-        ("recent", Array(&SELECTION)),
-        ("topic", TEXT),
-        ("requested", STRINGS),
-        ("known", STRINGS),
-        ("offered", STRINGS),
-        ("allowed_acts", STRINGS),
-    ]);
-    const EDIT: ResultShape = Object(&[
-        ("rule", TEXT),
-        ("replacement", TEXT),
-        ("stage", NUMBER),
-        ("range", Object(&[("start", NUMBER), ("end", NUMBER)])),
-    ]);
-    const CANDIDATE: ResultShape = Object(&[
-        ("selection", SELECTION),
-        ("text", TEXT),
-        ("used_facts", STRINGS),
-        ("establishes", STRINGS),
-        ("probability", NUMBER),
-    ]);
-    match operation {
-        EnglishOperation::Expression => Some(Object(&[
-            ("text", TEXT),
-            ("base_text", TEXT),
-            ("selection", SELECTION),
-            ("used_facts", STRINGS),
-            ("context", CONTEXT),
-            ("edits", Array(&EDIT)),
-        ])),
-        EnglishOperation::ExpressionCandidates => Some(Array(&CANDIDATE)),
-        _ => None,
-    }
-}
-
-// constant scalar operand pulled out of a folded literal
-enum Const {
-    Str(String),
-    Num(Number),
-    Bool(bool),
-}
-
-enum OpClass {
-    Arith,
-    Cmp,
-    Eq,
-    Logic,
-}
-
-fn op_class(op: ast::BinOp) -> OpClass {
-    match op {
-        ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div | ast::BinOp::Rem => OpClass::Arith,
-        ast::BinOp::Lt | ast::BinOp::Le | ast::BinOp::Gt | ast::BinOp::Ge => OpClass::Cmp,
-        ast::BinOp::Eq | ast::BinOp::Ne => OpClass::Eq,
-        ast::BinOp::And | ast::BinOp::Or => OpClass::Logic,
-    }
-}
-
-// residual dynamic exprs cross into the model here, off the ast op enums
-fn model_unary_op(op: ast::UnaryOp) -> UnaryOp {
-    match op {
-        ast::UnaryOp::Neg => UnaryOp::Neg,
-        ast::UnaryOp::Not => UnaryOp::Not,
-    }
-}
-
-fn model_bin_op(op: ast::BinOp) -> BinOp {
-    match op {
-        ast::BinOp::Add => BinOp::Add,
-        ast::BinOp::Sub => BinOp::Sub,
-        ast::BinOp::Mul => BinOp::Mul,
-        ast::BinOp::Div => BinOp::Div,
-        ast::BinOp::Rem => BinOp::Rem,
-        ast::BinOp::Eq => BinOp::Eq,
-        ast::BinOp::Ne => BinOp::Ne,
-        ast::BinOp::Lt => BinOp::Lt,
-        ast::BinOp::Le => BinOp::Le,
-        ast::BinOp::Gt => BinOp::Gt,
-        ast::BinOp::Ge => BinOp::Ge,
-        ast::BinOp::And => BinOp::And,
-        ast::BinOp::Or => BinOp::Or,
-    }
-}
-
-// none when empty or the types disagree
-fn unify_types(types: impl Iterator<Item = Option<StaticType>>) -> Option<StaticType> {
-    let mut unified = None;
-    for found in types {
-        let found = found?;
-        match unified {
-            None => unified = Some(found),
-            Some(previous) if previous == found => {}
-            Some(_) => return None,
-        }
-    }
-    unified
-}
-
-fn type_name(required: StaticType) -> &'static str {
-    match required {
-        StaticType::String => "string",
-        StaticType::Number => "number",
-        StaticType::Boolean => "boolean",
-        StaticType::Null => "null",
-        StaticType::Array => "array",
-        StaticType::Object => "object",
-    }
-}
-
-// identity handles and containers of handles substitute just like literals;
-// any field read still requires evaluation in its owning instance
-fn identity_value(value: &Value, pending: &[PendingRef]) -> bool {
-    match value {
-        Value::BlockRef { ref_id, .. } => {
-            let reference = &pending[ref_id.0 as usize];
-            let Some(names) = reference
-                .segments
-                .iter()
-                .map(|segment| match segment {
-                    Segment::Name { value, .. } => Some(value.as_str()),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
-            else {
-                return false;
-            };
-            let implicit = matches!(reference.head, Head::SelfBlock(_))
-                || matches!(reference.head, Head::Trace) && names.first().is_none_or(|name| field_by_name(name).is_some());
-            if implicit {
-                names.len() % 2 == 0 && names.iter().step_by(2).all(|name| child_kind_by_name(name).is_some())
-            } else {
-                names.len() % 2 == 1 && names.iter().skip(1).step_by(2).all(|name| child_kind_by_name(name).is_some())
-            }
-        }
-        Value::Array(array) => array.elem.iter().all(|elem| match elem {
-            ArrayElem::Item(value) => identity_value(value, pending),
-            _ => false,
-        }),
-        Value::Object(object) => object.elem.iter().all(|field| identity_value(&field.value, pending)),
-        value => value_is_constant(value),
-    }
-}
-
-// no funcs or per-instantiation refs anywhere beneath; all-literal templates
-// already folded to strings, so a surviving template is dynamic
-fn is_constant(folded: &Folded) -> bool {
-    match &folded.kind {
-        FoldedKind::Value(value) => value_is_constant(value),
-        FoldedKind::Array(values) => values.iter().all(is_constant),
-        FoldedKind::Object(fields) => fields.iter().all(|field| is_constant(&field.value)),
-    }
-}
-
-fn value_is_constant(value: &Value) -> bool {
-    match value {
-        Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null => true,
-        Value::Array(array) => array.elem.iter().all(|elem| match elem {
-            ArrayElem::Item(value) => value_is_constant(value),
-            // a surviving spread only exists because its shape is dynamic
-            ArrayElem::Spread(_) => false,
-        }),
-        Value::Object(object) => object.elem.iter().all(|field| value_is_constant(&field.value)),
-        Value::Template(_)
-        | Value::Func { .. }
-        | Value::VarRef(_)
-        | Value::CtxRef(_)
-        | Value::ArgRef(_)
-        | Value::BlockRef { .. }
-        | Value::Attachment { .. } => false,
-        Value::Unary { .. } | Value::Binary { .. } | Value::Cond { .. } | Value::Index { .. } | Value::Slice { .. } => false,
-    }
-}
-
-// a plain scorer-argument path (`input`, `metadata.tier`) a judge prompt
-// template slot can express; identifier keys only, no computed selections
-fn is_arg_path(value: &Value) -> bool {
-    match value {
-        Value::ArgRef(_) => true,
-        Value::Index { target, index, .. } => match &**index {
-            Value::Str(key) => {
-                let identifier = !key.is_empty()
-                    && key.chars().next().is_some_and(|first| first.is_ascii_alphabetic())
-                    && key.chars().all(|part| part.is_ascii_alphanumeric() || part == '_');
-                identifier && is_arg_path(target)
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-// constant scalar operand pulled out of a folded value
-fn const_scalar(folded: &Folded) -> Const {
-    match &folded.kind {
-        FoldedKind::Value(Value::Str(value)) => Const::Str(value.clone()),
-        FoldedKind::Value(Value::Num(number)) => Const::Num(number.clone()),
-        FoldedKind::Value(Value::Bool(value)) => Const::Bool(*value),
-        _ => unreachable!("constant operands are scalar literals"),
-    }
-}
-
-// constant string value of a folded expr, none when dynamic or another type
-fn const_string(folded: &Folded) -> Option<String> {
-    match &folded.kind {
-        FoldedKind::Value(Value::Str(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-// interpolated numbers render like generation-time templates, {:?} keeps a .0
-fn num_text(number: Number) -> String {
-    match number {
-        Number::Int(value) => value.to_string(),
-        Number::Float(value) => format!("{value:?}"),
-    }
-}
-
-// metadata and metrics were validated as objects, duplicate keys already merged
-fn require_object(folded: Folded) -> Object {
-    match folded.into_value() {
-        Value::Object(object) => object,
-        _ => unreachable!("expression was validated as an object"),
-    }
-}
-
-// tag elements were validated as strings, templates already modeled
-fn require_tags(folded: Folded) -> Vec<Template> {
-    let FoldedKind::Array(values) = folded.kind else {
-        unreachable!("expression was validated as an array of strings");
-    };
-
-    values
-        .into_iter()
-        .map(|value| match value.into_value() {
-            Value::Str(value) => Template {
-                parts: vec![Part::Lit(value)],
-            },
-            Value::Template(template) => template,
-            _ => unreachable!("array item was validated as a string"),
-        })
+        .filter(|diag| seen.insert((diag.what.clone(), diag.r#where.source, diag.r#where.start, diag.r#where.end)))
         .collect()
 }
 
-// none = overflow or a non-finite float result, zero divisors are caught before eval
-fn eval_arith(op: ast::BinOp, lhs: Number, rhs: Number) -> Option<Number> {
-    match (lhs, rhs) {
-        (Number::Int(lhs), Number::Int(rhs)) => {
-            let result = match op {
-                ast::BinOp::Add => lhs.checked_add(rhs),
-                ast::BinOp::Sub => lhs.checked_sub(rhs),
-                ast::BinOp::Mul => lhs.checked_mul(rhs),
-                // checked catches i64::MIN / -1
-                ast::BinOp::Div => lhs.checked_div(rhs),
-                ast::BinOp::Rem => lhs.checked_rem(rhs),
-                _ => unreachable!("operator is arithmetic"),
-            };
-            result.map(Number::Int)
-        }
-        (lhs, rhs) => {
-            let (lhs, rhs) = (float_bound(lhs), float_bound(rhs));
-            let result = match op {
-                ast::BinOp::Add => lhs + rhs,
-                ast::BinOp::Sub => lhs - rhs,
-                ast::BinOp::Mul => lhs * rhs,
-                ast::BinOp::Div => lhs / rhs,
-                ast::BinOp::Rem => lhs % rhs,
-                _ => unreachable!("operator is arithmetic"),
-            };
-            result.is_finite().then_some(Number::Float(result))
-        }
-    }
+// resolution states shared by kinds, edges, forks and junctions
+const PENDING: u8 = 0;
+const RESOLVING: u8 = 1;
+const RESOLVED: u8 = 2;
+// the failure was already reported, dependents fail with no diagnostics of their own
+const FAILED: u8 = 3;
+
+#[derive(Clone)]
+enum Anchor {
+    Node(NodeId),
+    Reference(ast::Expr, Option<ElementId>),
+}
+// a field an element takes from its kind's value
+#[derive(Clone)]
+struct Computed {
+    // the kind of the element
+    kind: String,
+    // the descriptor that states the value
+    range: SrcRange,
+    // the keys the kind supplies when the instance wrote an object over the value, none when it wrote nothing
+    keys: Option<HashSet<String>>,
 }
 
-fn eval_cmp(op: ast::BinOp, lhs: Number, rhs: Number) -> bool {
-    fn compare<T: PartialOrd>(op: ast::BinOp, lhs: T, rhs: T) -> bool {
-        match op {
-            ast::BinOp::Lt => lhs < rhs,
-            ast::BinOp::Le => lhs <= rhs,
-            ast::BinOp::Gt => lhs > rhs,
-            ast::BinOp::Ge => lhs >= rhs,
-            _ => unreachable!("operator is a comparison"),
-        }
-    }
-
-    match (lhs, rhs) {
-        (Number::Int(lhs), Number::Int(rhs)) => compare(op, lhs, rhs),
-        (lhs, rhs) => compare(op, float_bound(lhs), float_bound(rhs)),
-    }
+#[derive(Clone)]
+struct RawEdge {
+    source: Anchor,
+    target: Anchor,
 }
-
-fn model_ctx_ref(path: &[String], repeat_depth: usize) -> Option<CtxRef> {
-    match path {
-        [first, second] if first == "trace" && second == "index" => Some(CtxRef::TraceIndex),
-        [first, second] if first == "repeat" && second == "index" && repeat_depth > 0 => Some(CtxRef::RepeatIndex),
-        [first, second] if first == "repeat" && second == "count" && repeat_depth > 0 => Some(CtxRef::RepeatCount),
-        _ => None,
-    }
+#[derive(Clone)]
+struct RawFork {
+    source: Anchor,
 }
-
-pub(super) fn model(ast: ast::Ast) -> Result<Model, Diags> {
-    Modeler::new(ast)
-        .model()
-        .map_err(|errors| errors.into_iter().map(Diag::from).collect())
+#[derive(Clone)]
+struct RawJunction {
+    inputs: Vec<ast::Expr>,
+    target: Anchor,
 }
-
-#[derive(Default)]
-struct FieldsBuilder {
-    input: Option<Value>,
-    output: Option<Value>,
-    expected: Option<Value>,
-    error: Option<Value>,
-    metadata: Option<Object>,
-    metrics: Option<Object>,
-    tags: Option<Vec<Template>>,
-    duration: Option<(Value, SrcRange)>,
-    seen: HashSet<spec::Id>,
-}
-
-impl FieldsBuilder {
-    fn finish(self) -> SpanFields {
-        SpanFields {
-            input: self.input,
-            output: self.output,
-            expected: self.expected,
-            error: self.error,
-            metadata: self.metadata,
-            metrics: self.metrics,
-            tags: self.tags.unwrap_or_default(),
-            duration: self.duration,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct Error {
-    kind: ErrorKind,
+#[derive(Clone)]
+struct RawPath {
+    origin: RawOrigin,
+    steps: Vec<PathStep>,
     range: SrcRange,
 }
+#[derive(Clone)]
+enum RawOrigin {
+    Node(Anchor),
+    Selector(ForkId, Anchor),
+    Junction(JunctionId),
+}
+// the first path segment of the binding that holds a supplied context value, which no author can write
+const CONTEXT_VALUE: &str = "@context";
 
-pub(super) type Errors = Vec<Error>;
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) enum ErrorKind {
-    RootAttribute {
-        keyword: String,
-    },
-    UnknownBlock {
-        keyword: String,
-        parent: spec::Place,
-    },
-    BlockNotAllowed {
-        block: spec::Id,
-        parent: spec::Place,
-    },
-    MissingName {
-        block: spec::Id,
-    },
-    UnexpectedName {
-        block: spec::Id,
-    },
-    UnknownField {
-        block: spec::Id,
-        keyword: String,
-    },
-    MissingField {
-        block: spec::Id,
-        field: spec::Id,
-    },
-    DuplicateField {
-        block: spec::Id,
-        field: spec::Id,
-    },
-    TypeMismatch {
-        block: spec::Id,
-        field: spec::Id,
-        expected: &'static spec::ExprType,
-        found: ExprType,
-    },
-    DuplicateObjectKey {
-        rule: spec::Id,
-        key: String,
-    },
-    InvalidNumber {
-        rule: spec::Id,
-        raw: String,
-    },
-    ReservedMetricKey {
-        rule: spec::Id,
-        key: String,
-    },
-    UnknownReference {
-        rule: spec::Id,
-        path: String,
-    },
-    UnknownScorerReference {
-        name: String,
-    },
-    DuplicateScorerName {
-        name: String,
-    },
-    DuplicateVar {
-        rule: spec::Id,
-        name: String,
-    },
-    VarNotInScope {
-        rule: spec::Id,
-        name: String,
-    },
-    UnknownVariable {
-        rule: spec::Id,
-        name: String,
-    },
-    NonScalarInterpolation {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    UnknownBlockRef {
-        rule: spec::Id,
-        keyword: &'static str,
-        name: String,
-    },
-    AmbiguousBlockRef {
-        rule: spec::Id,
-        name: String,
-        count: usize,
-    },
-    IncompleteBlockRef {
-        rule: spec::Id,
-        keyword: &'static str,
-    },
-    AbsentFieldRef {
-        rule: spec::Id,
-        field: String,
-        label: String,
-    },
-    InvalidRefSegment {
-        rule: spec::Id,
-        segment: String,
-    },
-    DynamicPositionDescent {
-        rule: spec::Id,
-    },
-    RepeatIterationRequired {
-        rule: spec::Id,
-    },
-    ReservedRepeatName {
-        rule: spec::Id,
-        name: String,
-    },
-    CircularReference {
-        rule: spec::Id,
-        chain: String,
-    },
-    SelfOutsideBlock {
-        rule: spec::Id,
-    },
-    StructuralBlockRef {
-        rule: spec::Id,
-        field: &'static str,
-    },
-    ForBlockRefCollection {
-        rule: spec::Id,
-    },
-    EmptyShape {
-        rule: spec::Id,
-    },
-    UnknownFunction {
-        rule: spec::Id,
-        name: String,
-    },
-    EmptyChoice {
-        rule: spec::Id,
-    },
-    InvalidRangeArgs {
-        rule: spec::Id,
-    },
-    InvalidRangeBounds {
-        rule: spec::Id,
-    },
-    FuncArity {
-        rule: spec::Id,
-        func: &'static str,
-        expected: &'static str,
-    },
-    FuncArgType {
-        rule: spec::Id,
-        func: &'static str,
-        expected: &'static str,
-        found: ExprType,
-    },
-    NonConstantParam {
-        rule: spec::Id,
-        func: &'static str,
-        param: &'static str,
-    },
-    ParamOutOfRange {
-        rule: spec::Id,
-        func: &'static str,
-        param: &'static str,
-        expected: &'static str,
-    },
-    WeightedOptionShape {
-        rule: spec::Id,
-    },
-    WeightedTotal {
-        rule: spec::Id,
-    },
-    FormatPlaceholders {
-        rule: spec::Id,
-        placeholders: usize,
-        args: usize,
-    },
-    EmptySplitSeparator {
-        rule: spec::Id,
-    },
-    ClampBoundsOutOfOrder {
-        rule: spec::Id,
-    },
-    OperandTypeMismatch {
-        rule: spec::Id,
-        op: String,
-        expected: &'static str,
-        found: ExprType,
-    },
-    NonBooleanCondition {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    NonIndexableTarget {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    IndexTypeMismatch {
-        rule: spec::Id,
-        expected: &'static str,
-        found: ExprType,
-    },
-    NonIntegerIndex {
-        rule: spec::Id,
-    },
-    IndexOutOfBounds {
-        rule: spec::Id,
-        index: i64,
-        len: usize,
-    },
-    UnknownObjectKey {
-        rule: spec::Id,
-        key: String,
-    },
-    DivisionByZero {
-        rule: spec::Id,
-        op: String,
-    },
-    NonFiniteResult {
-        rule: spec::Id,
-    },
-    NonSliceableTarget {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    SliceTypeMismatch {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    NonIntegerSliceBound {
-        rule: spec::Id,
-    },
-    NegativeSliceBound {
-        rule: spec::Id,
-    },
-    SpreadTypeMismatch {
-        rule: spec::Id,
-        expected: &'static str,
-        found: ExprType,
-    },
-    ForCollectionMismatch {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    NonConstantForFilter {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    NonConstantForKey {
-        rule: spec::Id,
-        found: ExprType,
-    },
-    EmptyDynamicBlock {
-        rule: spec::Id,
-        block: spec::Id,
-    },
-    NegativeRepeatCount {
-        rule: spec::Id,
-    },
-    NonIntegerRepeatCount {
-        rule: spec::Id,
-    },
-    ChanceOutOfRange {
-        rule: spec::Id,
-    },
-    DurationOutOfRange {
-        rule: spec::Id,
-    },
-    RepeatRefOutsideRepeat {
-        rule: spec::Id,
-        path: String,
-    },
-    ScorerRef {
-        rule: spec::Id,
-        path: String,
-    },
-    ScorerDynamicVar {
-        rule: spec::Id,
-        name: String,
-    },
-    ScorerFunc {
-        rule: spec::Id,
-        func: &'static str,
-    },
-    InvalidScorerLang {
-        rule: spec::Id,
-    },
-    InvalidScorerFile {
-        rule: spec::Id,
-    },
-    MissingScorerKind {
-        rule: spec::Id,
-    },
-    ExtraScorerKind {
-        rule: spec::Id,
-    },
-    ScoreOutOfRange {
-        rule: spec::Id,
-    },
-    InvalidJudgeModel {
-        rule: spec::Id,
-    },
-    InvalidJudgePrompt {
-        rule: spec::Id,
-    },
-    InvalidJudgeOptions {
-        rule: spec::Id,
-    },
-    InvalidFacet {
-        rule: spec::Id,
-        reason: String,
-    },
-    InvalidAutomation {
-        rule: spec::Id,
-        reason: String,
-    },
-    InvalidAgent {
-        rule: spec::Id,
-        reason: String,
-    },
-    InvalidExperiment {
-        rule: spec::Id,
-        reason: String,
-    },
-    InvalidDataset {
-        rule: spec::Id,
-        reason: String,
-    },
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Slot {
+    owner: ElementId,
+    property: bool,
+    path: Vec<String>,
+}
+#[derive(Clone)]
+enum Cursor {
+    Element(ElementId),
+    Properties(ElementId),
+    Slot(Slot),
+    Value(ReferenceValue),
+    Context(ElementId, Vec<String>),
 }
 
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RootAttribute { keyword } => {
-                write!(
-                    formatter,
-                    "attribute `{keyword}` is not allowed at the root; allowed blocks: "
-                )?;
-                fmt_allowed_blocks(formatter, spec::Place::Root)
-            }
-            Self::UnknownBlock { keyword, parent } => {
-                write!(formatter, "unknown block `{keyword}` ")?;
-                fmt_place(formatter, *parent)?;
-                formatter.write_str("; allowed blocks here: ")?;
-                fmt_allowed_blocks(formatter, *parent)
-            }
-            Self::BlockNotAllowed { block, parent } => {
-                let block = block_desc(*block);
-                write!(formatter, "block `{}` is not allowed ", block.keyword)?;
-                fmt_place(formatter, *parent)?;
-                formatter.write_str("; allowed placements: ")?;
-                fmt_places(formatter, block.allowed_in)
-            }
-            Self::MissingName { block } => {
-                let block = block_desc(*block);
-                write!(
-                    formatter,
-                    "block `{}` requires a name; expected `{}`",
-                    block.keyword, block.syntax
-                )
-            }
-            Self::UnexpectedName { block } => {
-                let block = block_desc(*block);
-                write!(formatter, "block `{}` does not accept a name", block.keyword)
-            }
-            Self::UnknownField { block, keyword } => {
-                let block = block_desc(*block);
-                write!(formatter, "unknown field `{keyword}` in block `{}`", block.keyword)?;
-                if block.body.fields.is_empty() {
-                    formatter.write_str("; this block does not accept fields")
-                } else {
-                    formatter.write_str("; expected one of: ")?;
-                    for (index, field) in block.body.fields.iter().enumerate() {
-                        if index > 0 {
-                            formatter.write_str(", ")?;
-                        }
-                        write!(formatter, "`{}`", field.keyword)?;
-                    }
-                    Ok(())
-                }
-            }
-            Self::MissingField { block, field } => {
-                let block = block_desc(*block);
-                let field = field_desc(block.id, *field);
-                write!(formatter, "block `{}` requires field `{}`", block.keyword, field.keyword)
-            }
-            Self::DuplicateField { block, field } => {
-                let block = block_desc(*block);
-                let field = field_desc(block.id, *field);
-                write!(
-                    formatter,
-                    "field `{}` may appear only once in block `{}`",
-                    field.keyword, block.keyword
-                )
-            }
-            Self::TypeMismatch {
-                block,
-                field,
-                expected,
-                found,
-            } => {
-                let block = block_desc(*block);
-                let field = field_desc(block.id, *field);
-                write!(
-                    formatter,
-                    "field `{}` in block `{}` expects {expected}, but found {found}",
-                    field.keyword, block.keyword
-                )
-            }
-            Self::DuplicateObjectKey { rule, key } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "duplicate object key `{key}`; {}", rule.summary)
-            }
-            Self::InvalidNumber { rule, raw } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "invalid number `{raw}`; {}", rule.summary)
-            }
-            Self::ReservedMetricKey { rule, key } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "metric key `{key}` is reserved; {}", rule.summary)
-            }
-            Self::UnknownReference { rule, path } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "unknown reference `{path}`; {}", rule.summary)
-            }
-            Self::UnknownScorerReference { name } => {
-                write!(
-                    formatter,
-                    "unknown scorer {name:?}; declare a top-level scorer block in this source"
-                )
-            }
-            Self::DuplicateScorerName { name } => write!(formatter, "duplicate top-level scorer name {name:?}"),
-            Self::DuplicateVar { rule, name } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "variable `{name}` is defined more than once; {}", rule.summary)
-            }
-            Self::VarNotInScope { rule, name } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "variable `{name}` is not in scope here; {}", rule.summary)
-            }
-            Self::UnknownVariable { rule, name } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "unknown variable `{name}`; {}", rule.summary)
-            }
-            Self::NonScalarInterpolation { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "cannot interpolate {found} here; {}", rule.summary)
-            }
-            Self::UnknownBlockRef { rule, keyword, name } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "no {keyword} block named \"{name}\" is in scope; {}", rule.summary)
-            }
-            Self::AmbiguousBlockRef { rule, name, count } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "{count} sibling blocks are named \"{name}\", index the one you mean; {}",
-                    rule.summary
-                )
-            }
-            Self::IncompleteBlockRef { rule, keyword } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`{keyword}` reference does not reach a field; {}", rule.summary)
-            }
-            Self::AbsentFieldRef { rule, field, label } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "{label} never sets `{field}`; {}", rule.summary)
-            }
-            Self::InvalidRefSegment { rule, segment } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "`{segment}` is neither a field nor a child block kind; {}",
-                    rule.summary
-                )
-            }
-            Self::DynamicPositionDescent { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "cannot descend past a dynamic position, only the final block may be picked at generation; {}",
-                    rule.summary
-                )
-            }
-            Self::RepeatIterationRequired { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "select an iteration with `[...]` before descending into a repeat; {}",
-                    rule.summary
-                )
-            }
-            Self::ReservedRepeatName { rule, name } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`{name}` cannot name a repeat block; {}", rule.summary)
-            }
-            Self::CircularReference { rule, chain } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "reference cycle: {chain}; {}", rule.summary)
-            }
-            Self::SelfOutsideBlock { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`self` has no enclosing span or trace here; {}", rule.summary)
-            }
-            Self::StructuralBlockRef { rule, field } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`{field}` cannot depend on a block reference; {}", rule.summary)
-            }
-            Self::ForBlockRefCollection { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "a `for` collection cannot come from a block reference; {}",
-                    rule.summary
-                )
-            }
-            Self::EmptyShape { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "shape declares no traces, scorers, facets, automations, or datasets; {}",
-                    rule.summary
-                )
-            }
-            Self::UnknownFunction { rule, name } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "unknown function `{name}`; {}", rule.summary)
-            }
-            Self::EmptyChoice { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "function `choice` has no alternatives; {}", rule.summary)
-            }
-            Self::InvalidRangeArgs { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "function `range` expects two number arguments; {}", rule.summary)
-            }
-            Self::InvalidRangeBounds { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "range bounds are out of order; {}", rule.summary)
-            }
-            Self::FuncArity { rule, func, expected } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "function `{func}` expects {expected}; {}", rule.summary)
-            }
-            Self::FuncArgType {
-                rule,
-                func,
-                expected,
-                found,
-            } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "function `{func}` expects a {expected} argument, but found {found}; {}",
-                    rule.summary
-                )
-            }
-            Self::NonConstantParam { rule, func, param } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "function `{func}` {param} must be a constant number; {}",
-                    rule.summary
-                )
-            }
-            Self::ParamOutOfRange {
-                rule,
-                func,
-                param,
-                expected,
-            } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "function `{func}` {param} must be {expected}; {}", rule.summary)
-            }
-            Self::WeightedOptionShape { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "weighted option must be a `[value, weight]` pair with a constant non-negative weight; {}",
-                    rule.summary
-                )
-            }
-            Self::WeightedTotal { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "weighted options have no positive weight; {}", rule.summary)
-            }
-            Self::FormatPlaceholders {
-                rule,
-                placeholders,
-                args,
-            } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "format template has {placeholders} `{{}}` placeholders but {args} arguments; {}",
-                    rule.summary
-                )
-            }
-            Self::EmptySplitSeparator { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "split separator is empty; {}", rule.summary)
-            }
-            Self::ClampBoundsOutOfOrder { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "clamp bounds are out of order; {}", rule.summary)
-            }
-            Self::OperandTypeMismatch {
-                rule,
-                op,
-                expected,
-                found,
-            } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "operator `{op}` expects {expected} operands, but found {found}; {}",
-                    rule.summary
-                )
-            }
-            Self::NonBooleanCondition { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "conditional expects a boolean condition, but found {found}; {}",
-                    rule.summary
-                )
-            }
-            Self::NonIndexableTarget { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "cannot index into {found}; {}", rule.summary)
-            }
-            Self::IndexTypeMismatch { rule, expected, found } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "index expects {expected}, but found {found}; {}", rule.summary)
-            }
-            Self::NonIntegerIndex { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "array index must be an integer; {}", rule.summary)
-            }
-            Self::IndexOutOfBounds { rule, index, len } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "index {index} is out of bounds for an array of {len} elements; {}",
-                    rule.summary
-                )
-            }
-            Self::UnknownObjectKey { rule, key } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "object has no key `{key}`; {}", rule.summary)
-            }
-            Self::DivisionByZero { rule, op } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "operator `{op}` divides by a constant zero; {}", rule.summary)
-            }
-            Self::NonFiniteResult { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "expression result is not a finite number; {}", rule.summary)
-            }
-            Self::NonSliceableTarget { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "cannot slice {found}; {}", rule.summary)
-            }
-            Self::SliceTypeMismatch { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "slice bound expects a number, but found {found}; {}", rule.summary)
-            }
-            Self::NonIntegerSliceBound { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "slice bound must be an integer; {}", rule.summary)
-            }
-            Self::NegativeSliceBound { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "slice bound must be non-negative; {}", rule.summary)
-            }
-            Self::SpreadTypeMismatch { rule, expected, found } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "cannot spread {found} into an {expected}; {}", rule.summary)
-            }
-            Self::ForCollectionMismatch { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "for expression expects an array or object collection with a shape known before generation, but found {found}; {}",
-                    rule.summary
-                )
-            }
-            Self::NonConstantForFilter { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "for filter expects a boolean known before generation, but found {found}; {}",
-                    rule.summary
-                )
-            }
-            Self::NonConstantForKey { rule, found } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "for key expects a string known before generation, but found {found}; {}",
-                    rule.summary
-                )
-            }
-            Self::EmptyDynamicBlock { rule, block } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "block `{}` has no child blocks; {}",
-                    block_desc(*block).keyword,
-                    rule.summary
-                )
-            }
-            Self::NegativeRepeatCount { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "repeat count is negative; {}", rule.summary)
-            }
-            Self::NonIntegerRepeatCount { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "repeat count is not an integer; {}", rule.summary)
-            }
-            Self::ChanceOutOfRange { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "maybe chance is not between 0 and 1; {}", rule.summary)
-            }
-            Self::DurationOutOfRange { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "duration is not a positive number of seconds; {}", rule.summary)
-            }
-            Self::RepeatRefOutsideRepeat { rule, path } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`{path}` is not inside a repeat block; {}", rule.summary)
-            }
-            Self::ScorerRef { rule, path } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "reference `{path}` is not available inside a scorer; {}",
-                    rule.summary
-                )
-            }
-            Self::ScorerDynamicVar { rule, name } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "variable `{name}` does not have a constant value, so a scorer cannot use it; {}",
-                    rule.summary
-                )
-            }
-            Self::ScorerFunc { rule, func } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "function `{func}` is not available in scorer expressions; {}",
-                    rule.summary
-                )
-            }
-            Self::InvalidScorerLang { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`lang` must be \"python\" or \"typescript\"; {}", rule.summary)
-            }
-            Self::InvalidScorerFile { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`file` must be a bare file stem; {}", rule.summary)
-            }
-            Self::MissingScorerKind { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "scorer declares neither a `code` nor a `judge` block; {}",
-                    rule.summary
-                )
-            }
-            Self::ExtraScorerKind { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "scorer declares more than one `code` or `judge` block; {}",
-                    rule.summary
-                )
-            }
-            Self::ScoreOutOfRange { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "constant score is outside 0 to 1; {}", rule.summary)
-            }
-            Self::InvalidJudgeModel { rule } => {
-                let rule = rule_desc(*rule);
-                write!(formatter, "`model` must be a constant string; {}", rule.summary)
-            }
-            Self::InvalidJudgePrompt { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "judge prompt may only interpolate scorer argument paths; {}",
-                    rule.summary
-                )
-            }
-            Self::InvalidJudgeOptions { rule } => {
-                let rule = rule_desc(*rule);
-                write!(
-                    formatter,
-                    "judge options must map at least two labels to constant scores between 0 and 1; {}",
-                    rule.summary
-                )
-            }
-            Self::InvalidFacet { rule, reason } | Self::InvalidAutomation { rule, reason } => {
-                write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
-            }
-            Self::InvalidAgent { rule, reason }
-            | Self::InvalidDataset { rule, reason }
-            | Self::InvalidExperiment { rule, reason } => {
-                write!(formatter, "{reason}; {}", rule_desc(*rule).summary)
-            }
-        }
-    }
+struct Modeler {
+    model: Model,
+    declarations: HashMap<String, SrcRange>,
+    fields: HashMap<(ElementId, bool), Vec<ast::Attr>>,
+    raw_edges: Vec<RawEdge>,
+    raw_forks: Vec<RawFork>,
+    raw_junctions: Vec<RawJunction>,
+    continuations: Vec<Vec<RawPath>>,
+    edge_state: Vec<u8>,
+    fork_state: Vec<u8>,
+    junction_state: Vec<u8>,
+    slots: HashMap<Slot, BindingId>,
+    visiting: HashSet<Slot>,
+    defaults: HashMap<Slot, Value>,
+    // elements whose kind or properties could not be established, checks that read them are skipped
+    unchecked: HashSet<ElementId>,
+    // every name a definition statement introduced, including definitions that failed
+    defined: HashSet<String>,
+    // every context read with the element that owns it, the path after context and its location
+    context_reads: Vec<(ElementId, Vec<String>, SrcRange)>,
+    // the value expression of each provided context key and computed field, by the location of its descriptor
+    values: HashMap<(usize, usize, usize), ast::Expr>,
+    // the fields an element takes from its kind's value, with the kind that states it and where
+    // a field merged with what the instance wrote also lists the keys the kind supplies
+    computed: HashMap<(ElementId, String), Computed>,
+    // the computed field being lowered, whose expression reads self and context only
+    computing: Option<String>,
+    // the same expressions for each element that supplies them, by element and key
+    supplied: HashMap<(ElementId, String), ast::Expr>,
+    // the functions a provider contributes to expressions
+    functions: Rc<[FunctionDesc]>,
+    errors: Diags,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.kind.fmt(formatter)
-    }
-}
-
-impl std::error::Error for Error {}
-
-fn block_desc(id: spec::Id) -> &'static spec::BlockDesc {
-    spec::SPEC
-        .block_by_id(id)
-        .unwrap_or_else(|| panic!("error references unknown block {}", id.as_str()))
-}
-
-fn field_desc(block: spec::Id, field: spec::Id) -> &'static spec::FieldDesc {
-    spec::SPEC.field(block, field).unwrap_or_else(|| {
-        panic!(
-            "error references unknown field {} in block {}",
-            field.as_str(),
-            block.as_str()
-        )
-    })
-}
-
-fn rule_desc(id: spec::Id) -> &'static spec::RuleDesc {
-    spec::SPEC
-        .rule(id)
-        .unwrap_or_else(|| panic!("error references unknown rule {}", id.as_str()))
-}
-
-fn fmt_place(formatter: &mut fmt::Formatter<'_>, place: spec::Place) -> fmt::Result {
-    match place {
-        spec::Place::Root => formatter.write_str("at the root"),
-        spec::Place::Block { id } => write!(formatter, "inside block `{}`", block_desc(id).keyword),
-    }
-}
-
-fn fmt_places(formatter: &mut fmt::Formatter<'_>, places: &[spec::Place]) -> fmt::Result {
-    for (index, place) in places.iter().enumerate() {
-        if index > 0 {
-            formatter.write_str(", ")?;
-        }
-        fmt_place(formatter, *place)?;
-    }
-    Ok(())
-}
-
-fn fmt_allowed_blocks(formatter: &mut fmt::Formatter<'_>, place: spec::Place) -> fmt::Result {
-    let mut count = 0;
-    for block in spec::SPEC.blocks.iter().filter(|block| block.allows(place)) {
-        if count > 0 {
-            formatter.write_str(", ")?;
-        }
-        write!(formatter, "`{}`", block.keyword)?;
-        count += 1;
-    }
-
-    if count == 0 {
-        formatter.write_str("none")?;
-    }
-
-    Ok(())
-}
-
-impl Error {
-    fn new(kind: ErrorKind, range: SrcRange) -> Self {
-        Self { kind, range }
-    }
-    #[cfg(test)]
-    fn kind(&self) -> &ErrorKind {
-        &self.kind
-    }
-    #[cfg(test)]
-    fn range(&self) -> SrcRange {
-        self.range
-    }
-}
-
-impl From<Error> for Diag {
-    fn from(error: Error) -> Self {
-        let Error { kind, range } = error;
-
-        Diag {
-            when: DiagPhase::Validation,
-            what: kind.to_string(),
-            r#where: range,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn model(source: &str) -> Result<Model, Errors> {
-        let tokens = crate::lexing::lex(source).unwrap();
-        let ast = crate::parsing::parse(tokens, source).unwrap();
-        Modeler::new(ast).model()
-    }
-
-    fn tag_text(tag: &Template) -> &str {
-        match tag.parts.as_slice() {
-            [Part::Lit(value)] => value,
-            _ => panic!("expected a literal tag"),
+impl Modeler {
+    fn new(functions: &[FunctionDesc]) -> Self {
+        Self {
+            functions: functions.into(),
+            model: Model::default(),
+            declarations: HashMap::new(),
+            fields: HashMap::new(),
+            raw_edges: Vec::new(),
+            raw_forks: Vec::new(),
+            raw_junctions: Vec::new(),
+            continuations: Vec::new(),
+            edge_state: Vec::new(),
+            fork_state: Vec::new(),
+            junction_state: Vec::new(),
+            slots: HashMap::new(),
+            visiting: HashSet::new(),
+            defaults: HashMap::new(),
+            unchecked: HashSet::new(),
+            defined: HashSet::new(),
+            context_reads: Vec::new(),
+            values: HashMap::new(),
+            computed: HashMap::new(),
+            computing: None,
+            supplied: HashMap::new(),
+            errors: Vec::new(),
         }
     }
 
-    fn as_span(child: &Child) -> &Span {
-        match child {
-            Child::Span(span) => span,
-            other => panic!("expected a span child, found {other:?}"),
-        }
-    }
-
-    #[test]
-    fn models_nested_spans_and_tags() {
-        let model = model(
-            r#"trace "support-sessions" {
-            task "turn_0" { llm "completion" {} }
-            task "turn_1" { llm "completion" {} }
-            tags = ["chat", "prod"]
-        }"#,
-        )
-        .unwrap();
-
-        assert_eq!(model.traces.len(), 1);
-        let trace = &model.traces[0];
-        assert_eq!(trace.name, "support-sessions");
-        assert_eq!(trace.children.len(), 2);
-        assert!(
-            trace
-                .children
-                .iter()
-                .all(|child| matches!(&as_span(child).kind, SpanKind::Task))
-        );
-        assert!(trace.children.iter().all(|child| matches!(
-            as_span(child).children.as_slice(),
-            [Child::Span(Span { kind: SpanKind::Llm, .. })]
-        )));
-        assert_eq!(trace.fields.tags.iter().map(tag_text).collect::<Vec<_>>(), ["chat", "prod"]);
-    }
-
-    #[test]
-    fn models_tool_and_function_spans() {
-        let source = r#"
-            trace "example" {
-                function "handle_request" {
-                    tool "search" {
-                        llm "rerank" {}
-                    }
+    fn definitions(&mut self, definitions: &[ast::Definition]) {
+        let mut resolver = Definitions::default();
+        for definition in definitions {
+            let header = &definition.head.header;
+            let defined = match construct_named(&header.kind) {
+                Some(construct) => Defined::Kind(construct),
+                None if header.kind == "trait" => Defined::Trait,
+                None => {
+                    self.errors.extend(error(
+                        header.range,
+                        "a definition head names its construct: node, edge, fork, junction or trait",
+                    ));
+                    continue;
                 }
-            }
-        "#;
-        let model = model(source).unwrap();
-
-        let function = as_span(&model.traces[0].children[0]);
-        assert!(matches!(function.kind, SpanKind::Function));
-        let tool = as_span(&function.children[0]);
-        assert!(matches!(tool.kind, SpanKind::Tool));
-        assert!(matches!(as_span(&tool.children[0]).kind, SpanKind::Llm));
-    }
-
-    #[test]
-    fn models_expected_and_error_fields() {
-        let source = r#"
-            trace "example" {
-                llm "answer" {
-                    expected = { answer = "4" }
-                    error = choice(null, "timeout")
-                }
-            }
-        "#;
-        let model = model(source).unwrap();
-
-        let fields = &as_span(&model.traces[0].children[0]).fields;
-        assert!(matches!(&fields.expected, Some(Value::Object(object)) if object.elem[0].key == "answer"));
-        assert!(matches!(&fields.error, Some(Value::Func { func: Func::Choice(options), .. }) if options.len() == 2));
-    }
-
-    #[test]
-    fn rejects_invalid_domain_fields() {
-        let source = r#"
-            trace "example" {
-                input = "first"
-                input = "second"
-                metadata = true
-                tags = ["valid", false ]
-            }
-            "#;
-        let result = model(source);
-        let errors = match result {
-            Err(errors) => errors,
-            Ok(_) => panic!("expected semantic errors"),
-        };
-
-        let trace = spec::SPEC.block_by_id(spec::ids::TRACE).unwrap();
-        let metadata = trace.field("metadata").unwrap();
-        let tags = trace.field("tags").unwrap();
-        let spec::ExprType::Array { items: tag_item } = *tags.value else {
-            panic!("tags must be described as an array");
-        };
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::DuplicateField {
-                block: spec::ids::TRACE,
-                field: spec::ids::INPUT,
-            }
-        );
-        assert_eq!(
-            errors[1].kind(),
-            &ErrorKind::TypeMismatch {
-                block: spec::ids::TRACE,
-                field: spec::ids::METADATA,
-                expected: metadata.value,
-                found: ExprType::Boolean,
-            }
-        );
-        assert_eq!(
-            errors[2].kind(),
-            &ErrorKind::TypeMismatch {
-                block: spec::ids::TRACE,
-                field: spec::ids::TAGS,
-                expected: tag_item,
-                found: ExprType::Boolean,
-            }
-        );
-
-        let range = errors[1].range();
-        assert_eq!(&source[range.start..range.end], "true");
-    }
-
-    #[test]
-    fn models_null_and_negative_numbers() {
-        let model = model(r#"trace "example" { input = null metrics = { delta = -0.5, offset = -3 } }"#).unwrap();
-
-        let fields = &model.traces[0].fields;
-        assert!(matches!(fields.input, Some(Value::Null)));
-
-        let metrics = fields.metrics.as_ref().unwrap();
-        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == -0.5));
-        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Int(-3))));
-    }
-
-    #[test]
-    fn models_templates_with_known_references() {
-        let model = model(r#"trace "example" { input = "q ${trace.index}" tags = ["t-${trace.index}"] }"#).unwrap();
-        let fields = &model.traces[0].fields;
-
-        let Some(Value::Template(template)) = &fields.input else {
-            panic!("expected a template");
-        };
-        assert!(matches!(&template.parts[0], Part::Lit(value) if value == "q "));
-        assert!(matches!(template.parts[1], Part::Ref(CtxRef::TraceIndex)));
-
-        assert_eq!(fields.tags.len(), 1);
-        assert!(matches!(fields.tags[0].parts[1], Part::Ref(CtxRef::TraceIndex)));
-    }
-
-    #[test]
-    fn rejects_unknown_references() {
-        // a trace head with an unknown segment is a reference to nothing
-        let source = r#"trace "example" { input = "${trace.idx}" }"#;
-        let errors = model(source).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::InvalidRefSegment {
-                rule: spec::ids::REF_FIELDS,
-                segment: "idx".to_owned(),
-            }
-        );
-        assert!(errors[0].to_string().contains("neither a field nor a child block kind"));
-
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "trace.idx");
-    }
-
-    #[test]
-    fn rejects_bare_unknown_references() {
-        let errors = model(r#"trace "t" { input = nil }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::UnknownReference {
-                rule: spec::ids::KNOWN_REFERENCES,
-                path: "nil".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_loop_references_outside_their_scope() {
-        // x is out of scope after the inner for expr
-        let errors = model(r#"trace "t" { input = [[for x in [1] : x], x] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::UnknownReference {
-                rule: spec::ids::KNOWN_REFERENCES,
-                path: "x".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn scopes_loop_bindings_over_context_references() {
-        // the binding shadows the trace namespace, trailing segments select into the element
-        let model = model(r#"trace "t" { input = [for trace in [{ index = 9 }] : trace.index] }"#).unwrap();
-        assert_eq!(ints(model.traces[0].fields.input.as_ref().unwrap()), [9]);
-    }
-
-    #[test]
-    fn selects_into_variables_by_path() {
-        let model = model(r#"vars { m = { a = { b = 4 } } } trace "t" { input = var.m.a.b }"#).unwrap();
-        assert!(matches!(model.traces[0].fields.input, Some(Value::Num(Number::Int(4)))));
-    }
-
-    #[test]
-    fn treats_templates_as_strings_in_type_checks() {
-        let errors = model(r#"trace "example" { metadata = "${trace.index}" }"#).unwrap_err();
-
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::TypeMismatch {
-                found: ExprType::String,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn resolves_variables_in_scalar_object_and_array_positions() {
-        let model = model(
-            r#"
-            vars {
-                greeting = "hey"
-                meta = { model = "gpt" }
-                n = 4
-            }
-            trace "example" {
-                input = var.greeting
-                output = [var.n, var.n]
-                metadata = var.meta
-            }
-            "#,
-        )
-        .unwrap();
-        let fields = &model.traces[0].fields;
-
-        assert!(matches!(&fields.input, Some(Value::Str(value)) if value == "hey"));
-
-        let Some(Value::Array(output)) = &fields.output else {
-            panic!("expected an array");
-        };
-        assert!(matches!(output.elem[1], ArrayElem::Item(Value::Num(Number::Int(4)))));
-
-        let metadata = fields.metadata.as_ref().unwrap();
-        assert_eq!(metadata.elem[0].key, "model");
-        assert!(matches!(&metadata.elem[0].value, Value::Str(value) if value == "gpt"));
-    }
-
-    #[test]
-    fn interpolates_scalar_variables_and_collapses_static_templates() {
-        let model = model(
-            r#"
-            vars { m = "gpt" t = 0.2 f = false }
-            trace "example" { input = "m=${var.m} t=${var.t} f=${var.f}" }
-            "#,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            &model.traces[0].fields.input,
-            Some(Value::Str(value)) if value == "m=gpt t=0.2 f=false"
-        ));
-    }
-
-    #[test]
-    fn lowers_template_variables_to_bindings_keeping_context_references() {
-        let model = model(
-            r#"
-            vars { q = "q ${trace.index}" }
-            trace "example" { input = "${var.q}!" }
-            "#,
-        )
-        .unwrap();
-
-        // the ctx ref makes the var dynamic: the definition becomes a root
-        // binding and the use site references it
-        assert_eq!(model.bindings.len(), 1);
-        assert_eq!(model.bindings[0].name, "q");
-        let Value::Template(definition) = &model.bindings[0].value else {
-            panic!("expected a template binding");
-        };
-        assert!(matches!(&definition.parts[0], Part::Lit(value) if value == "q "));
-        assert!(matches!(definition.parts[1], Part::Ref(CtxRef::TraceIndex)));
-
-        let Some(Value::Template(template)) = &model.traces[0].fields.input else {
-            panic!("expected a template");
-        };
-        assert!(matches!(&template.parts[0], Part::VarRef(name) if name == "q"));
-        assert!(matches!(&template.parts[1], Part::Lit(value) if value == "!"));
-    }
-
-    #[test]
-    fn resolves_variables_defined_after_their_use() {
-        let model = model(
-            r#"
-            trace "example" { input = var.greeting }
-            vars { greeting = "hey" }
-            "#,
-        )
-        .unwrap();
-
-        assert!(matches!(&model.traces[0].fields.input, Some(Value::Str(value)) if value == "hey"));
-    }
-
-    #[test]
-    fn reports_variable_type_mismatches_at_the_use_site() {
-        let source = r#"vars { m = true } trace "example" { metadata = var.m }"#;
-        let errors = model(source).unwrap_err();
-
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::TypeMismatch {
-                found: ExprType::Boolean,
-                ..
-            }
-        ));
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "var.m");
-    }
-
-    #[test]
-    fn rejects_unknown_variables() {
-        for source in [
-            r#"trace "example" { input = var.missing }"#,
-            r#"trace "example" { input = "${var.missing}" }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert_eq!(
-                errors[0].kind(),
-                &ErrorKind::UnknownVariable {
-                    rule: spec::ids::DEFINED_VARS,
-                    name: "missing".to_owned(),
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_duplicate_variables_across_vars_blocks() {
-        let errors = model(r#"vars { a = 1 } vars { a = 2 } trace "example" {}"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::DuplicateVar {
-                rule: spec::ids::UNIQUE_VARS,
-                name: "a".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_variables_referencing_same_scope_variables() {
-        for source in [
-            r#"vars { a = 1 b = var.a } trace "example" {}"#,
-            r#"vars { a = 1 b = "${var.a}" } trace "example" {}"#,
-            r#"vars { a = 1 b = { c = var.a } } trace "example" {}"#,
-            r#"vars { a = 1 b = choice(var.a, 2) } trace "example" {}"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert_eq!(
-                errors[0].kind(),
-                &ErrorKind::VarNotInScope {
-                    rule: spec::ids::VISIBLE_VARS,
-                    name: "a".to_owned(),
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn shares_dynamic_root_vars_as_a_single_binding() {
-        let model = model(r#"vars { m = choice("a", "b") } trace "t" { input = var.m output = var.m }"#).unwrap();
-
-        assert_eq!(model.bindings.len(), 1);
-        assert_eq!(model.bindings[0].name, "m");
-        assert!(matches!(&model.traces[0].fields.input, Some(Value::VarRef(name)) if name == "m"));
-        assert!(matches!(&model.traces[0].fields.output, Some(Value::VarRef(name)) if name == "m"));
-    }
-
-    #[test]
-    fn scopes_vars_to_spans_and_dynamic_blocks() {
-        let model = model(
-            r#"
-            trace "t" {
-                llm "Chat Completion" {
-                    vars { pt = range(1, 9) }
-                    metrics = { prompt_tokens = var.pt, tokens = var.pt + 4 }
-                }
-                repeat {
-                    count = 2
-                    vars { r = range(1, 9) }
-                    task "turn" { input = var.r }
-                }
-            }
-            "#,
-        )
-        .unwrap();
-
-        assert!(model.bindings.is_empty());
-        assert!(model.traces[0].bindings.is_empty());
-        let children = &model.traces[0].children;
-        let Child::Span(llm) = &children[0] else {
-            panic!("expected a span");
-        };
-        assert_eq!(llm.bindings.len(), 1);
-        assert_eq!(llm.bindings[0].name, "pt");
-        let Child::Repeat(repeat) = &children[1] else {
-            panic!("expected a repeat");
-        };
-        assert_eq!(repeat.bindings.len(), 1);
-        assert_eq!(repeat.bindings[0].name, "r");
-    }
-
-    #[test]
-    fn resolves_outer_scope_vars_in_var_values() {
-        let model = model(
-            r#"
-            vars { base = 100 }
-            trace "t" {
-                vars { n = var.base + range(1, 9) }
-                input = var.n
-            }
-            "#,
-        )
-        .unwrap();
-
-        // base is constant and substitutes, n is dynamic and binds on the trace
-        assert!(model.bindings.is_empty());
-        assert_eq!(model.traces[0].bindings.len(), 1);
-        assert_eq!(model.traces[0].bindings[0].name, "n");
-        assert!(matches!(&model.traces[0].fields.input, Some(Value::VarRef(name)) if name == "n"));
-    }
-
-    #[test]
-    fn resolves_outer_dynamic_vars_in_var_values_as_binding_refs() {
-        let model = model(
-            r#"
-            vars { total = range(10, 20) }
-            trace "t" {
-                vars { half = var.total / 2 }
-                input = var.half
-            }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(model.bindings.len(), 1);
-        let Value::Binary { lhs, .. } = &model.traces[0].bindings[0].value else {
-            panic!("expected a binary binding");
-        };
-        assert!(matches!(&**lhs, Value::VarRef(name) if name == "total"));
-    }
-
-    #[test]
-    fn rejects_references_outside_the_declaring_block() {
-        let errors = model(
-            r#"
-            trace "t" {
-                task "a" {
-                    vars { x = range(1, 2) }
-                    input = var.x
-                }
-                task "b" { input = var.x }
-            }
-            "#,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::VarNotInScope {
-                rule: spec::ids::VISIBLE_VARS,
-                name: "x".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_repeat_index_in_vars_outside_a_repeat() {
-        let errors = model(r#"vars { q = "q ${repeat.index}" } trace "t" { repeat { count = 1 task "x" { input = var.q } } }"#)
-            .unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::RepeatRefOutsideRepeat { .. }));
-    }
-
-    #[test]
-    fn resolves_repeat_index_in_repeat_scope_vars() {
-        let model = model(
-            r#"
-            trace "t" {
-                repeat {
-                    count = 2
-                    vars { q = "q ${repeat.index}" }
-                    task "turn" { input = var.q }
-                }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
-            panic!("expected a repeat");
-        };
-        assert_eq!(repeat.bindings[0].name, "q");
-        let Value::Template(template) = &repeat.bindings[0].value else {
-            panic!("expected a template binding");
-        };
-        assert!(matches!(template.parts[1], Part::Ref(CtxRef::RepeatIndex)));
-    }
-
-    #[test]
-    fn models_context_references_as_values() {
-        let model = model(
-            r#"
-            trace "t" {
-                input = trace.index
-                repeat {
-                    count = 2
-                    task "turn" { metrics = { turn = repeat.index, of = repeat.count } }
-                }
-            }
-            "#,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            model.traces[0].fields.input,
-            Some(Value::CtxRef(CtxRef::TraceIndex))
-        ));
-        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
-            panic!("expected a repeat");
-        };
-        let Child::Span(task) = &repeat.children[0] else {
-            panic!("expected a span");
-        };
-        let metrics = task.fields.metrics.as_ref().unwrap();
-        assert!(matches!(metrics.elem[0].value, Value::CtxRef(CtxRef::RepeatIndex)));
-        assert!(matches!(metrics.elem[1].value, Value::CtxRef(CtxRef::RepeatCount)));
-    }
-
-    #[test]
-    fn rejects_repeat_refs_in_exprs_outside_a_repeat() {
-        let source = r#"trace "t" { input = repeat.count }"#;
-        let errors = model(source).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::RepeatRefOutsideRepeat {
-                rule: spec::ids::REPEAT_REFS,
-                path: "repeat.count".to_owned(),
-            }
-        );
-        assert!(errors[0].to_string().contains("`repeat.count` is not inside a repeat block"));
-
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "repeat.count");
-    }
-
-    #[test]
-    fn rejects_unknown_context_fields_in_exprs() {
-        let source = r#"trace "t" { input = trace.name }"#;
-        let errors = model(source).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::InvalidRefSegment {
-                rule: spec::ids::REF_FIELDS,
-                segment: "name".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn keeps_context_reference_exprs_dynamic() {
-        let model = model(
-            r#"
-            trace "t" {
-                repeat {
-                    count = 2
-                    vars { turn = repeat.index + 1 }
-                    task "x" { input = var.turn }
-                }
-            }
-            "#,
-        )
-        .unwrap();
-
-        // a ctx ref never folds, so the var stays a per-iteration binding
-        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
-            panic!("expected a repeat");
-        };
-        assert_eq!(repeat.bindings[0].name, "turn");
-        let Value::Binary { lhs, .. } = &repeat.bindings[0].value else {
-            panic!("expected a dynamic binary binding");
-        };
-        assert!(matches!(**lhs, Value::CtxRef(CtxRef::RepeatIndex)));
-    }
-
-    #[test]
-    fn resolves_repeat_count_in_templates() {
-        let model =
-            model(r#"trace "t" { repeat { count = 2 task "x" { input = "turn ${repeat.index} of ${repeat.count}" } } }"#)
-                .unwrap();
-
-        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
-            panic!("expected a repeat");
-        };
-        let Child::Span(task) = &repeat.children[0] else {
-            panic!("expected a span");
-        };
-        let Some(Value::Template(template)) = &task.fields.input else {
-            panic!("expected a template input");
-        };
-        assert!(matches!(template.parts[1], Part::Ref(CtxRef::RepeatIndex)));
-        assert!(matches!(template.parts[3], Part::Ref(CtxRef::RepeatCount)));
-    }
-
-    #[test]
-    fn rejects_repeat_counts_referencing_the_repeats_own_vars() {
-        let errors = model(r#"trace "t" { repeat { vars { n = range(1, 3) } count = var.n task "x" {} } }"#).unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
-    }
-
-    #[test]
-    fn allows_repeat_counts_referencing_outer_dynamic_vars() {
-        let model = model(
-            r#"
-            trace "t" {
-                vars { turns = range(1, 4) }
-                repeat { count = var.turns task "x" {} }
-                task "summary" { input = { turns = var.turns } }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
-            panic!("expected a repeat");
-        };
-        assert!(matches!(&repeat.count, Value::VarRef(name) if name == "turns"));
-    }
-
-    #[test]
-    fn unrolls_for_exprs_over_dynamic_vars_as_binding_accessors() {
-        let model = model(r#"vars { xs = [range(1, 5), range(6, 9)] } trace "t" { input = [for x in var.xs : x] }"#).unwrap();
-
-        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
-            panic!("expected an array");
-        };
-        assert_eq!(array.elem.len(), 2);
-        assert!(array.elem.iter().all(|value| matches!(
-            value,
-            ArrayElem::Item(Value::Index { target, .. }) if matches!(&**target, Value::VarRef(name) if name == "xs")
-        )));
-    }
-
-    #[test]
-    fn rejects_interpolating_non_scalar_variables() {
-        let source = r#"vars { m = { x = 1 } } trace "example" { input = "${var.m}" }"#;
-        let errors = model(source).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonScalarInterpolation {
-                rule: spec::ids::SCALAR_INTERPOLATION,
-                found: ExprType::Object,
-            }
-        );
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "${var.m}");
-    }
-
-    #[test]
-    fn models_choice_and_range_funcs() {
-        let model = model(r#"trace "t" { input = choice("a", 1) metrics = { n = range(1, 5), x = range(0, 1.5) } }"#).unwrap();
-        let fields = &model.traces[0].fields;
-
-        let Some(Value::Func {
-            func: Func::Choice(options),
-            ..
-        }) = &fields.input
-        else {
-            panic!("expected a choice");
-        };
-        assert!(matches!(&options[0], Value::Str(value) if value == "a"));
-        assert!(matches!(options[1], Value::Num(Number::Int(1))));
-
-        let metrics = fields.metrics.as_ref().unwrap();
-        assert!(matches!(
-            metrics.elem[0].value,
-            Value::Func {
-                func: Func::Range(Range::Int { min: 1, max: 5 }),
-                ..
-            }
-        ));
-        assert!(matches!(
-            metrics.elem[1].value,
-            Value::Func { func: Func::Range(Range::Float { min, max }), .. } if min == 0.0 && max == 1.5
-        ));
-    }
-
-    #[test]
-    fn resolves_variables_inside_func_args() {
-        let model = model(r#"vars { m = "gpt" } trace "t" { input = choice(var.m, "x") }"#).unwrap();
-
-        let Some(Value::Func {
-            func: Func::Choice(options),
-            ..
-        }) = &model.traces[0].fields.input
-        else {
-            panic!("expected a choice");
-        };
-        assert!(matches!(&options[0], Value::Str(value) if value == "gpt"));
-    }
-
-    #[test]
-    fn rejects_unknown_functions() {
-        let source = r#"trace "t" { input = shuffle(1, 2) }"#;
-        let errors = model(source).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::UnknownFunction {
-                rule: spec::ids::KNOWN_FUNCTIONS,
-                name: "shuffle".to_owned(),
-            }
-        );
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "shuffle(1, 2)");
-    }
-
-    #[test]
-    fn rejects_choices_without_alternatives() {
-        let errors = model(r#"trace "t" { input = choice() }"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::EmptyChoice {
-                rule: spec::ids::CHOICE_ALTERNATIVES,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_range_args_and_bounds() {
-        for source in [
-            r#"trace "t" { input = range(1) }"#,
-            r#"trace "t" { input = range(1, 2, 3) }"#,
-            r#"trace "t" { input = range(1, "x") }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert_eq!(
-                errors[0].kind(),
-                &ErrorKind::InvalidRangeArgs {
-                    rule: spec::ids::RANGE_BOUNDS,
-                }
-            );
-        }
-
-        for source in [
-            r#"trace "t" { input = range(5, 1) }"#,
-            r#"trace "t" { input = range(1.5, 0.5) }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert_eq!(
-                errors[0].kind(),
-                &ErrorKind::InvalidRangeBounds {
-                    rule: spec::ids::RANGE_BOUNDS,
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn models_weighted_funcs() {
-        let model = model(r#"trace "t" { input = weighted(["a", 8], [range(1, 3), 2], ["c", 0]) }"#).unwrap();
-
-        let Some(Value::Func {
-            func: Func::Weighted(options),
-            ..
-        }) = &model.traces[0].fields.input
-        else {
-            panic!("expected a weighted pick");
-        };
-        assert_eq!(options.len(), 3);
-        assert!(matches!(&options[0].value, Value::Str(value) if value == "a"));
-        assert!((options[0].weight - 8.0).abs() < f64::EPSILON);
-        assert!(matches!(
-            &options[1].value,
-            Value::Func {
-                func: Func::Range(_),
-                ..
-            }
-        ));
-        assert!(options[2].weight == 0.0);
-    }
-
-    #[test]
-    fn rejects_invalid_weighted_options() {
-        for source in [
-            r#"trace "t" { input = weighted("a") }"#,
-            r#"trace "t" { input = weighted(["a", 1, 2]) }"#,
-            r#"trace "t" { input = weighted(["a", range(1, 2)]) }"#,
-            r#"trace "t" { input = weighted(["a", 0 - 1]) }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert!(
-                matches!(errors[0].kind(), ErrorKind::WeightedOptionShape { .. }),
-                "unexpected error for {source}: {}",
-                errors[0]
-            );
-        }
-
-        let errors = model(r#"trace "t" { input = weighted(["a", 0], ["b", 0]) }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::WeightedTotal { .. }));
-
-        let errors = model(r#"trace "t" { input = weighted() }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "weighted", .. }));
-    }
-
-    #[test]
-    fn models_distribution_funcs() {
-        let model = model(
-            r#"
-                trace "t" {
-                    metrics = {
-                        a = normal(0.5, 0.1)
-                        b = lognormal(300, 0.5)
-                        c = exponential(250)
-                        d = pareto(100, 1.5)
-                        e = beta(2, 5)
-                        f = poisson(3)
-                    }
-                    input = chance(0.25)
-                }
-            "#,
-        )
-        .unwrap();
-        let fields = &model.traces[0].fields;
-
-        let metrics = fields.metrics.as_ref().unwrap();
-        assert!(matches!(
-            metrics.elem[0].value,
-            Value::Func { func: Func::Normal { mean, stddev }, .. } if mean == 0.5 && stddev == 0.1
-        ));
-        assert!(matches!(
-            metrics.elem[1].value,
-            Value::Func { func: Func::Lognormal { median, sigma }, .. } if median == 300.0 && sigma == 0.5
-        ));
-        assert!(matches!(
-            metrics.elem[2].value,
-            Value::Func { func: Func::Exponential { mean }, .. } if mean == 250.0
-        ));
-        assert!(matches!(
-            metrics.elem[3].value,
-            Value::Func { func: Func::Pareto { min, shape }, .. } if min == 100.0 && shape == 1.5
-        ));
-        assert!(matches!(
-            metrics.elem[4].value,
-            Value::Func { func: Func::Beta { alpha, beta }, .. } if alpha == 2.0 && beta == 5.0
-        ));
-        assert!(matches!(
-            metrics.elem[5].value,
-            Value::Func { func: Func::Poisson { mean }, .. } if mean == 3.0
-        ));
-        assert!(matches!(
-            fields.input,
-            Some(Value::Func { func: Func::Chance { probability }, .. }) if probability == 0.25
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_distribution_params() {
-        let errors = model(r#"trace "t" { input = normal(1) }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "normal", .. }));
-
-        let errors = model(r#"trace "t" { input = normal(range(0, 1), 1) }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::NonConstantParam {
-                func: "normal",
-                param: "mean",
-                ..
-            }
-        ));
-
-        for (source, func, param) in [
-            (r#"trace "t" { input = normal(0, 0 - 1) }"#, "normal", "stddev"),
-            (r#"trace "t" { input = lognormal(0, 1) }"#, "lognormal", "median"),
-            (r#"trace "t" { input = exponential(0) }"#, "exponential", "mean"),
-            (r#"trace "t" { input = pareto(0, 1) }"#, "pareto", "min"),
-            (r#"trace "t" { input = beta(1, 0) }"#, "beta", "beta"),
-            (r#"trace "t" { input = poisson(0) }"#, "poisson", "mean"),
-            (r#"trace "t" { input = chance(1.5) }"#, "chance", "probability"),
-        ] {
-            let errors = model(source).unwrap_err();
-            match errors[0].kind() {
-                ErrorKind::ParamOutOfRange {
-                    func: found_func,
-                    param: found_param,
-                    ..
-                } => {
-                    assert_eq!((*found_func, *found_param), (func, param), "wrong param for {source}");
-                }
-                other => panic!("unexpected error for {source}: {other}"),
-            }
-        }
-    }
-
-    #[test]
-    fn models_english_functions_and_preserves_optional_arguments() {
-        for (expression, expected, count) in [
-            ("express({})", EnglishOperation::Express, 1),
-            ("expression({}, {})", EnglishOperation::Expression, 2),
-            ("expression_candidates({})", EnglishOperation::ExpressionCandidates, 1),
-            ("realize({})", EnglishOperation::Realize, 1),
-            ("realize({}, {})", EnglishOperation::Realize, 2),
-            ("vary(\"The guest cannot leave.\")", EnglishOperation::Vary, 1),
-            ("vary({}, {})", EnglishOperation::Vary, 2),
-            ("combine([], \"and\")", EnglishOperation::Combine, 2),
-            ("refer({}, {})", EnglishOperation::Refer, 2),
-            ("remember({}, [], [])", EnglishOperation::Remember, 3),
-            ("unmentioned([], {})", EnglishOperation::Unmentioned, 2),
-            ("format_number(1234.5)", EnglishOperation::FormatNumber, 1),
-            ("format_date(\"2026-11-10\", {})", EnglishOperation::FormatDate, 2),
-            ("format_time(\"17:30\")", EnglishOperation::FormatTime, 1),
-        ] {
-            let compiled = model(&format!("trace \"t\" {{ output = {expression} }}")).unwrap();
-            let Some(Value::Func {
-                func: Func::English { operation, args },
-                ..
-            }) = &compiled.traces[0].fields.output
-            else {
-                panic!("expected an English function: {expression}")
             };
-            assert_eq!(*operation, expected);
-            assert_eq!(args.len(), count);
-            assert_eq!(operation.as_str(), expression.split('(').next().unwrap());
-        }
-    }
-
-    #[test]
-    fn english_results_preserve_nested_field_types() {
-        for expression in [
-            "var.result.selection.family",
-            "var.result.context.recent[0].family",
-            "len(var.result.context.recent)",
-            r#"[...var.result.context.established, "asked"]"#,
-            "var.result.selection.message.forms[0]",
-            "var.result.edits[0].range.start + 1",
-            "var.candidates[0].selection.family",
-            "var.candidates[:1][0].probability + 1",
-            "choice(var.result, var.result).context.recent[0].intent",
-            "(chance(0.5) ? var.result : var.result).selection.family",
-        ] {
-            model(&format!(r#"vars {{ result = expression({{}}) candidates = expression_candidates({{}}) }} trace "t" {{ output = {expression} }}"#)).unwrap();
-        }
-        model(r#"vars { result = expression({}) } trace "t" { vars { saved = var.result.context } output = var.saved.recent[0].family }"#).unwrap();
-        for expression in [
-            "var.result.selection.family[0]",
-            r#"var.result.context.recent["zero"]"#,
-            "var.result.context.recent + 1",
-            "var.result.selection.unknown.field",
-        ] {
-            assert!(
-                model(&format!(
-                    r#"vars {{ result = expression({{}}) }} trace "t" {{ output = {expression} }}"#
-                ))
-                .is_err(),
-                "{expression}"
-            );
-        }
-    }
-
-    #[test]
-    fn english_functions_validate_outer_types_and_arity() {
-        for expression in [
-            "realize(1)",
-            "realize({}, [])",
-            "vary(false)",
-            "vary(\"x\", true)",
-            "combine({}, \"and\")",
-            "combine([], 1)",
-            "refer({}, [])",
-            "remember({}, {})",
-            "remember({}, [], {})",
-            "unmentioned({}, {})",
-            "format_number(true)",
-            "format_date(42)",
-            "format_time([], {})",
-        ] {
-            let errors = model(&format!("trace \"t\" {{ input = {expression} }}")).unwrap_err();
-            assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { .. }), "{expression}");
-        }
-        for expression in [
-            "realize()",
-            "vary(\"x\", {}, {})",
-            "combine([])",
-            "refer({})",
-            "remember({}, [], [], [])",
-            "unmentioned([])",
-            "format_number()",
-            "format_date(\"2026-11-10\", {}, {})",
-            "format_time()",
-        ] {
-            let errors = model(&format!("trace \"t\" {{ input = {expression} }}")).unwrap_err();
-            assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { .. }), "{expression}");
-        }
-    }
-
-    #[test]
-    fn english_return_types_compose_and_dynamic_arguments_keep_references() {
-        model(
-            r#"
-            trace "t" {
-                input = { sentence = {}, entity = {} }
-                output = compose([
-                    upper(realize(self.input.sentence)),
-                    refer(self.input.entity, remember({}, [self.input.entity])),
-                    format("{}", len(unmentioned([], {})))
-                ])
-            }
-            scorer "english" {
-                code { score = len(vary(output, { negation = false })) }
-            }
-        "#,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn english_union_arguments_accept_each_supported_alternative() {
-        model(
-            r#"
-            vars { amount = choice(1000, "1000.50") }
-            trace "t" {
-                input = format_number(var.amount)
-                output = vary(choice("The guest cannot check in.", {
-                    clause = { subject = { text = "the guest" }, predicate = { verb = "check", complement = "in" } }
-                }))
-                metadata = { amount = format_number(chance(0.5) ? 1000 : "1000.50") }
-            }
-        "#,
-        )
-        .unwrap();
-        for expression in ["format_number(choice(1000, true))", "vary(choice(1, \"text\"))"] {
-            let source = format!("trace \"t\" {{ output = {expression} }}");
-            assert!(
-                model(&source)
-                    .unwrap_err()
-                    .iter()
-                    .any(|error| matches!(error.kind(), ErrorKind::FuncArgType { .. }))
-            );
-        }
-    }
-
-    #[test]
-    fn english_scorer_arguments_are_checked_recursively() {
-        for (expression, forbidden) in [
-            (r#"vary(format("{}", tokens(output)))"#, "tokens"),
-            (
-                r#"realize({ clause = { subject = { text = "the guest" }, predicate = { verb = "check", complement = noise(8) } } })"#,
-                "noise",
-            ),
-        ] {
-            let source = format!("scorer \"t\" {{ code {{ score = len({expression}) }} }}");
-            let errors = model(&source).unwrap_err();
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| matches!(error.kind(), ErrorKind::ScorerFunc { func, .. } if *func == forbidden)),
-                "{source}"
-            );
-        }
-        model(
-            r#"
-            scorer "english" {
-                code {
-                    score = len(refer(
-                        { id = "guest", label = "Maya" },
-                        remember({}, [{ id = "guest", label = "Maya" }], ["arrival"])
-                    ))
+            // the parser admits only named heads
+            let Some(name) = header.name.as_deref() else { continue };
+            self.defined.insert(name.to_owned());
+            let range = header.name_range.unwrap_or(header.range);
+            let (relationships, shape_errors) = relationships(&definition.steps);
+            let broken = !shape_errors.is_empty();
+            self.errors.extend(shape_errors);
+            let provided = (relationships.iter())
+                .filter(|relationship| matches!(relationship.relation, Relation::Provides))
+                .flat_map(|relationship| &relationship.keys);
+            for descriptor in (provided.chain(definition.head.body.iter().flatten()))
+                .flat_map(|key| schema_entries(&key.value).unwrap_or_default())
+            {
+                if descriptor.key == "value" {
+                    self.values.insert(
+                        (descriptor.range.source, descriptor.range.start, descriptor.range.end),
+                        descriptor.value,
+                    );
                 }
             }
-        "#,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn models_string_funcs() {
-        let model = model(
-            r#"
-                vars { tags = ["a", "b"] }
-                trace "t" {
-                    input = upper(choice("get", "post"))
-                    output = format("model={} n={}", "gpt", range(1, 5))
-                    expected = join(var.tags, ", ")
-                    error = contains(var.tags, "a")
-                    metadata = { parts = split("a,b", ","), has = contains("abc", "b") }
-                }
-            "#,
-        )
-        .unwrap();
-        let fields = &model.traces[0].fields;
-
-        assert!(matches!(
-            &fields.input,
-            Some(Value::Func {
-                func: Func::Upper { .. },
-                ..
-            })
-        ));
-        assert!(matches!(
-            &fields.output,
-            Some(Value::Func { func: Func::Format { pieces, args }, .. })
-                if *pieces == ["model=", " n=", ""] && args.len() == 2
-        ));
-        assert!(matches!(
-            &fields.expected,
-            Some(Value::Func {
-                func: Func::Join { .. },
-                ..
-            })
-        ));
-        assert!(matches!(
-            &fields.error,
-            Some(Value::Func {
-                func: Func::Contains { .. },
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_string_func_args() {
-        for (source, func) in [
-            (r#"trace "t" { input = upper(1) }"#, "upper"),
-            (r#"trace "t" { input = trim(null) }"#, "trim"),
-            (r#"trace "t" { input = split("a", 1) }"#, "split"),
-            (r#"trace "t" { input = render(1, {}) }"#, "render"),
-            (r#"trace "t" { input = render("x", []) }"#, "render"),
-            (r#"trace "t" { input = compose("x") }"#, "compose"),
-            (r#"trace "t" { input = compose([], 1) }"#, "compose"),
-            (r#"trace "t" { input = sample("x", 1) }"#, "sample"),
-            (r#"trace "t" { input = sample([], true) }"#, "sample"),
-            (r#"trace "t" { input = join("a", ",") }"#, "join"),
-            (r#"trace "t" { input = contains(1, "x") }"#, "contains"),
-            (r#"trace "t" { input = len(true) }"#, "len"),
-            (r#"trace "t" { input = tokens(1) }"#, "tokens"),
-            (r#"trace "t" { input = starts_with("a", 1) }"#, "starts_with"),
-            (r#"trace "t" { input = upper(choice("a", 1)) }"#, "upper"),
-        ] {
-            let errors = model(source).unwrap_err();
-            assert!(
-                matches!(errors[0].kind(), ErrorKind::FuncArgType { func: found, .. } if *found == func),
-                "unexpected error for {source}: {}",
-                errors[0]
-            );
+            if builtin_construct(name).is_some() || reserved_name(name) || name == "trait" {
+                self.errors.extend(error(range, "definition name is reserved"));
+            } else if resolver.names.contains_key(name) {
+                self.errors.extend(error(range, "duplicate kind or trait name"));
+            } else {
+                resolver.add(name, defined, &definition.head, relationships, definition.range, broken);
+            }
         }
-
-        let errors = model(r#"trace "t" { input = replace("a", "b") }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "replace", .. }));
-
-        let errors = model(r#"trace "t" { input = split("a,b", "") }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::EmptySplitSeparator { .. }));
+        for index in 0..resolver.entries.len() {
+            let resolved = match resolver.entries[index].defined {
+                Defined::Kind(construct) => resolver.resolve_kind(index, construct).map(drop),
+                Defined::Trait => resolver.resolve_trait(index).map(drop),
+            };
+            if let Err(diags) = resolved {
+                self.errors.extend(diags);
+            }
+            // a base resolves before what extends it, so each value is merged over one that is already whole
+            for (stated, inherited) in std::mem::take(&mut resolver.over) {
+                let at = |range: SrcRange| (range.source, range.start, range.end);
+                let (Some(base), Some(written)) = (self.values.get(&at(inherited)), self.values.get(&at(stated))) else {
+                    continue;
+                };
+                if let Some((items, _)) = merged(base, written) {
+                    let mut value = written.clone();
+                    value.kind = ast::ExprKind::Object(items);
+                    self.values.insert(at(stated), value);
+                }
+            }
+        }
+        // an instance of a definition that failed to resolve is left unchecked rather than checked against a partial schema
+        for (index, entry) in resolver.entries.iter().enumerate() {
+            let name = entry.name.to_owned();
+            match entry.defined {
+                Defined::Kind(construct) => {
+                    let id = KindId(self.model.kinds.len());
+                    let kind = resolver.kinds[index].take();
+                    if kind.is_some() {
+                        self.model.kind_names.insert(name.clone(), id);
+                    }
+                    // a placeholder is only reachable with errors recorded, so the model holding it is never returned
+                    self.model.kinds.push(kind.unwrap_or_else(|| Kind {
+                        name,
+                        base: construct.name().to_owned(),
+                        base_kind: None,
+                        construct,
+                        primitive: construct.root(),
+                        direction: None,
+                        props: Vec::new(),
+                        fields: Vec::new(),
+                        open: false,
+                        provides: Vec::new(),
+                        requires: Vec::new(),
+                        traits: Vec::new(),
+                        range: entry.range,
+                    }));
+                }
+                Defined::Trait => {
+                    let id = TraitId(self.model.traits.len());
+                    let resolved = resolver.traits[index].take();
+                    if resolved.is_some() {
+                        self.model.trait_names.insert(name.clone(), id);
+                    }
+                    self.model.traits.push(resolved.unwrap_or_else(|| Trait {
+                        name,
+                        base: None,
+                        on: Vec::new(),
+                        props: Vec::new(),
+                        fields: Vec::new(),
+                        provides: Vec::new(),
+                        requires: Vec::new(),
+                        range: entry.range,
+                    }));
+                }
+            }
+        }
     }
 
-    #[test]
-    fn rejects_invalid_format_calls() {
-        let errors = model(r#"trace "t" { input = format(range(0, 1), 1) }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::FuncArgType {
-                func: "format",
-                expected: "constant string",
-                ..
-            }
-        ));
-
-        let errors = model(r#"trace "t" { input = format("{} {}", 1) }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::FormatPlaceholders {
-                rule: spec::ids::FORMAT_TEMPLATE,
-                placeholders: 2,
-                args: 1,
-            }
-        );
-
-        let errors = model(r#"trace "t" { input = format("{}", [1]) }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "format", .. }));
+    fn element_kind(&self, owner: ElementId) -> (&str, Construct) {
+        match owner {
+            ElementId::Node(id) => (&self.model.nodes[id.0].kind, Construct::Node),
+            ElementId::Edge(id) => (&self.model.edges[id.0].kind, Construct::Edge),
+            ElementId::Fork(id) => (&self.model.forks[id.0].kind, Construct::Fork),
+            ElementId::Junction(id) => (&self.model.junctions[id.0].kind, Construct::Junction),
+        }
     }
 
-    #[test]
-    fn models_numeric_funcs() {
-        let model = model(
-            r#"
-                trace "t" {
-                    metrics = {
-                        a = clamp(lognormal(300, 0.5), 20, 30000)
-                        b = round(normal(0, 1))
-                        c = min(range(1, 10), 5)
-                        d = abs(0 - range(1, 5))
+    fn kind_schema(&self, owner: ElementId) -> Option<&Kind> {
+        let (name, _) = self.element_kind(owner);
+        self.model.kind_names.get(name).map(|id| &self.model.kinds[id.0])
+    }
+
+    fn primitive(&self, owner: ElementId) -> Primitive {
+        primitive(&self.model, owner)
+    }
+
+    // kinds are declared before any element, so an element's primitive is known when it is created
+    fn resolved(&self, construct: Construct, kind: &str) -> Primitive {
+        match self.model.kind_names.get(kind) {
+            Some(id) => self.model.kinds[id.0].primitive,
+            None => builtin(construct, kind),
+        }
+    }
+
+    fn field_type(&self, slot: &Slot) -> FieldType {
+        self.kind_schema(slot.owner)
+            .and_then(|kind| {
+                let fields = if slot.property { &kind.props } else { &kind.fields };
+                fields.iter().find(|field| slot.path.len() == 1 && slot.path[0] == field.name)
+            })
+            .map(|field| field.ty)
+            .or_else(|| {
+                if !slot.property || slot.path.len() != 1 {
+                    return None;
+                }
+                let (name, construct) = self.element_kind(slot.owner);
+                primitive_properties(builtin(construct, name), self.element_range(slot.owner))
+                    .into_iter()
+                    .find(|field| field.name == slot.path[0])
+                    .map(|field| field.ty)
+            })
+            .unwrap_or(FieldType::Any)
+    }
+
+    fn input_role(&self, owner: ElementId, property: bool, path: &[String]) -> bool {
+        !property
+            && self.kind_schema(owner).is_some_and(|kind| {
+                kind.fields
+                    .iter()
+                    .any(|field| path.first() == Some(&field.name) && field.role.as_deref() == Some("input"))
+            })
+    }
+
+    fn output_role(&self, owner: ElementId, property: bool, path: &[String]) -> bool {
+        !property
+            && path.len() == 1
+            && self.kind_schema(owner).is_some_and(|kind| {
+                kind.fields
+                    .iter()
+                    .any(|field| path.first() == Some(&field.name) && field.role.as_deref() == Some("output"))
+            })
+    }
+
+    fn name(&mut self, name: &Option<String>, id: ElementId, range: SrcRange) {
+        if let Some(name) = name {
+            if matches!(
+                name.as_str(),
+                "self" | "source" | "target" | "left" | "right" | "context" | "true" | "false" | "null"
+            ) {
+                self.errors.extend(error(range, format!("reserved graph name `{name}`")));
+                return;
+            }
+            if let Some(previous) = self.declarations.get(name) {
+                self.errors.extend(error(range, format!("duplicate graph name `{name}`")));
+                self.errors
+                    .extend(error(*previous, format!("previous declaration of `{name}`")));
+            } else {
+                self.declarations.insert(name.clone(), range);
+                self.model.names.insert(name.clone(), id);
+            }
+        }
+    }
+
+    // establishes that an instance names a built-in or declared kind of its own construct
+    fn kind(&mut self, owner: ElementId, at: SrcRange) {
+        let (name, construct) = self.element_kind(owner);
+        let declared = self.model.kind_names.get(name).map(|id| self.model.kinds[id.0].construct);
+        let message = if self.model.trait_names.contains_key(name) {
+            format!("`{name}` is a trait, not a kind")
+        } else if let Some(category) = declared.or_else(|| builtin_construct(name)) {
+            if category == construct {
+                return;
+            }
+            "kind does not belong to this graph construct".to_owned()
+        } else if self.defined.contains(name) {
+            // the definition already reported its own failure
+            self.unchecked.insert(owner);
+            return;
+        } else {
+            let known = crate::spec::SPEC
+                .primitives
+                .iter()
+                .filter(|primitive| primitive.construct == construct.name())
+                .map(|primitive| primitive.name)
+                .chain([construct.name()])
+                .chain(
+                    self.model
+                        .kinds
+                        .iter()
+                        .filter(|kind| kind.construct == construct)
+                        .map(|kind| kind.name.as_str()),
+                );
+            format!("unknown {} kind `{name}`{}", construct.name(), suggestion(name, known))
+        };
+        self.errors.extend(error(at, message));
+        self.unchecked.insert(owner);
+    }
+
+    fn fields(&mut self, owner: ElementId, property: bool, fields: &[ast::Attr]) {
+        let mut fields = fields.to_vec();
+        let (name, construct) = self.element_kind(owner);
+        let name = name.to_owned();
+        let schema = self.kind_schema(owner).cloned();
+        // the root node kind takes any property, every other built-in has a fixed set
+        if property && schema.is_none() && name != "node" && builtin_construct(&name) == Some(construct) {
+            let known = primitive_properties(builtin(construct, &name), self.element_range(owner));
+            for field in &fields {
+                if !known.iter().any(|entry| entry.name == field.key) {
+                    let hint = suggestion(&field.key, known.iter().map(|entry| entry.name.as_str()));
+                    self.errors.extend(error(
+                        key_range(field),
+                        format!("unknown property `{}` for built-in kind `{name}`{hint}", field.key),
+                    ));
+                }
+            }
+        }
+        if let Some(kind) = schema {
+            let entries = if property { kind.props } else { kind.fields };
+            if property || !kind.open {
+                let what = if property { "property" } else { "field" };
+                for field in &fields {
+                    if !entries.iter().any(|entry| entry.name == field.key) {
+                        let hint = suggestion(&field.key, entries.iter().map(|entry| entry.name.as_str()));
+                        self.errors.extend(error(
+                            key_range(field),
+                            format!("unknown {what} `{}` for kind `{}`{hint}", field.key, kind.name),
+                        ));
                     }
                 }
-            "#,
-        )
-        .unwrap();
-        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
-
-        assert!(matches!(
-            &metrics.elem[0].value,
-            Value::Func {
-                func: Func::Clamp { .. },
-                ..
             }
-        ));
-        assert!(matches!(
-            &metrics.elem[1].value,
-            Value::Func {
-                func: Func::Round { .. },
-                ..
-            }
-        ));
-        assert!(matches!(
-            &metrics.elem[2].value,
-            Value::Func { func: Func::Min(values), .. } if values.len() == 2
-        ));
-        assert!(matches!(
-            &metrics.elem[3].value,
-            Value::Func {
-                func: Func::Abs { .. },
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_numeric_func_args() {
-        let errors = model(r#"trace "t" { input = clamp(range(1, 5), 10, 2) }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::ClampBoundsOutOfOrder { .. }));
-
-        let errors = model(r#"trace "t" { input = round("x") }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "round", .. }));
-
-        let errors = model(r#"trace "t" { input = min(1) }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "min", .. }));
-
-        let errors = model(r#"trace "t" { input = max(1, "x") }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "max", .. }));
-    }
-
-    #[test]
-    fn models_id_funcs_and_rejects_invalid_lengths() {
-        let model_ok = model(r#"vars { n = 8 } trace "t" { input = [uuid(), hex(16), alphanum(var.n)] }"#).unwrap();
-        let Some(Value::Array(array)) = &model_ok.traces[0].fields.input else {
-            panic!("expected an array");
-        };
-        assert!(matches!(array.elem[0], ArrayElem::Item(Value::Func { func: Func::Uuid, .. })));
-        assert!(matches!(
-            array.elem[1],
-            ArrayElem::Item(Value::Func {
-                func: Func::Hex { length: 16 },
-                ..
-            })
-        ));
-        assert!(matches!(
-            array.elem[2],
-            ArrayElem::Item(Value::Func {
-                func: Func::Alphanum { length: 8 },
-                ..
-            })
-        ));
-
-        let errors = model(r#"trace "t" { input = uuid(1) }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "uuid", .. }));
-
-        let errors = model(r#"trace "t" { input = hex(range(1, 4)) }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::NonConstantParam {
-                func: "hex",
-                param: "length",
-                ..
-            }
-        ));
-
-        for source in [
-            r#"trace "t" { input = hex(0 - 1) }"#,
-            r#"trace "t" { input = alphanum(1.5) }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert!(matches!(errors[0].kind(), ErrorKind::ParamOutOfRange { param: "length", .. }));
-        }
-    }
-
-    #[test]
-    fn models_noise_and_rejects_invalid_sizes() {
-        let model_ok = model(r#"trace "t" { input = [noise(64), noise(round(lognormal(100, 0.5)))] }"#).unwrap();
-        let Some(Value::Array(array)) = &model_ok.traces[0].fields.input else {
-            panic!("expected an array");
-        };
-        for elem in &array.elem {
-            assert!(matches!(
-                elem,
-                ArrayElem::Item(Value::Func {
-                    func: Func::Noise { .. },
-                    ..
-                })
-            ));
-        }
-
-        // constant sizes settle their bounds during validation
-        for source in [
-            r#"trace "t" { input = noise(0 - 1) }"#,
-            r#"trace "t" { input = noise(1.5) }"#,
-            r#"trace "t" { input = noise(8388609) }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert!(matches!(
-                errors[0].kind(),
-                ErrorKind::ParamOutOfRange {
-                    func: "noise",
-                    param: "size",
-                    ..
+            for entry in entries {
+                let computed = (entry.value).and_then(|at| self.values.get(&(at.source, at.start, at.end)).cloned());
+                let stated = |keys| Computed {
+                    kind: kind.name.clone(),
+                    range: entry.range,
+                    keys,
+                };
+                if let Some(written) = fields.iter_mut().find(|field| field.key == entry.name) {
+                    // an object the instance writes is merged over the object its kind computes, key by key
+                    if let Some((merged, keys)) = computed.and_then(|value| merged(&value, &written.value)) {
+                        written.value.kind = ast::ExprKind::Object(merged);
+                        self.computed.insert((owner, entry.name.clone()), stated(Some(keys)));
+                    }
+                } else {
+                    if let Some(value) = computed {
+                        // a computed field is lowered for each instance as if the instance had written it
+                        self.computed.insert((owner, entry.name.clone()), stated(None));
+                        fields.push(ast::Attr {
+                            key: entry.name,
+                            value,
+                            range: entry.range,
+                        });
+                    } else if let Some(value) = entry.default {
+                        self.defaults.insert(
+                            Slot {
+                                owner,
+                                property,
+                                path: vec![entry.name.clone()],
+                            },
+                            value,
+                        );
+                        fields.push(ast::Attr {
+                            key: entry.name,
+                            value: ast::Expr::new(ast::ExprKind::Null, entry.range),
+                            range: entry.range,
+                        });
+                    } else if entry.required {
+                        self.unchecked.insert(owner);
+                        self.errors.extend(error(
+                            self.element_range(owner),
+                            format!(
+                                "missing required {} `{}`",
+                                if property { "property" } else { "field" },
+                                entry.name
+                            ),
+                        ));
+                    }
                 }
-            ));
+            }
         }
-
-        let errors = model(r#"trace "t" { input = noise("x") }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "noise", .. }));
-
-        let errors = model(r#"trace "t" { input = noise() }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArity { func: "noise", .. }));
+        let mut seen = HashMap::new();
+        for field in &fields {
+            if let Some(previous) = seen.insert(field.key.clone(), field.range) {
+                self.errors
+                    .extend(error(field.range, format!("duplicate field `{}`", field.key)));
+                self.errors.extend(error(previous, format!("previous field `{}`", field.key)));
+            }
+            if !property && field.key == "props" {
+                self.errors
+                    .extend(error(field.range, "`props` is reserved for graph element properties"));
+            }
+        }
+        self.fields.insert((owner, property), fields);
     }
 
-    #[test]
-    fn types_func_results_for_operator_and_arg_checks() {
-        // string and number results compose with operators and other funcs
-        model(r#"trace "t" { input = upper("a") == "A" ? 1 : 2 }"#).unwrap();
-        model(r#"trace "t" { input = len("abc") + poisson(2) }"#).unwrap();
-        model(r#"trace "t" { input = lower(format("{}", weighted(["A", 1], ["B", 3]))) }"#).unwrap();
-
-        // a mixed weighted pick has no static type, so typed args reject it
-        let errors = model(r#"trace "t" { input = upper(weighted(["a", 1], [2, 1])) }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::FuncArgType { func: "upper", .. }));
-    }
-
-    #[test]
-    fn rejects_funcs_where_a_specific_type_is_expected() {
-        let tags = model(r#"trace "t" { tags = [choice("a", "b")] }"#).unwrap_err();
-        assert!(matches!(
-            tags[0].kind(),
-            ErrorKind::TypeMismatch {
-                found: ExprType::Func,
-                ..
-            }
-        ));
-        assert!(tags[0].to_string().contains("expects string, but found function"));
-
-        let metadata = model(r#"trace "t" { metadata = choice({}, {}) }"#).unwrap_err();
-        assert!(matches!(
-            metadata[0].kind(),
-            ErrorKind::TypeMismatch {
-                found: ExprType::Func,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn interpolates_func_variables_with_agreeing_scalar_types() {
-        let model = model(r#"vars { s = choice("a", "b") } trace "t" { input = "${var.s}" }"#).unwrap();
-
-        assert_eq!(model.bindings.len(), 1);
-        let Some(Value::Template(template)) = &model.traces[0].fields.input else {
-            panic!("expected a template");
-        };
-        assert!(matches!(&template.parts[0], Part::VarRef(name) if name == "s"));
-    }
-
-    #[test]
-    fn rejects_named_vars_blocks_and_nested_blocks_in_vars() {
-        let named = model(r#"vars "named" {} trace "example" {}"#).unwrap_err();
-        assert_eq!(named[0].kind(), &ErrorKind::UnexpectedName { block: spec::ids::VARS });
-
-        let nested = model(r#"vars { task "t" {} } trace "example" {}"#).unwrap_err();
-        assert_eq!(
-            nested[0].kind(),
-            &ErrorKind::BlockNotAllowed {
-                block: spec::ids::TASK,
-                parent: spec::Place::Block { id: spec::ids::VARS },
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_null_where_a_specific_type_is_expected() {
-        let errors = model(r#"trace "example" { tags = [null] }"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::TypeMismatch {
-                block: spec::ids::TRACE,
-                field: spec::ids::TAGS,
-                expected: &spec::ExprType::String,
-                found: ExprType::Null,
-            }
-        );
-        assert!(errors[0].to_string().contains("expects string, but found null"));
-    }
-
-    #[test]
-    fn collects_an_error_for_each_invalid_tag() {
-        let errors = match model(r#"trace "example" { tags = [true , false , 1] }"#) {
-            Err(errors) => errors,
-            Ok(_) => panic!("expected semantic errors"),
-        };
-
-        assert_eq!(errors.len(), 3);
-        assert!(errors.iter().all(|error| {
-            matches!(
-                error.kind(),
-                ErrorKind::TypeMismatch {
-                    block: spec::ids::TRACE,
-                    field: spec::ids::TAGS,
-                    expected: spec::ExprType::String,
-                    ..
-                }
-            )
-        }));
-    }
-
-    #[test]
-    fn applies_block_rules_from_the_spec() {
-        let root_errors = model(r#"task "root" {}"#).unwrap_err();
-        assert_eq!(
-            root_errors[0].kind(),
-            &ErrorKind::BlockNotAllowed {
-                block: spec::ids::TASK,
-                parent: spec::Place::Root,
-            }
-        );
-
-        let nested_errors = model(r#"trace "outer" { trace "inner" {} }"#).unwrap_err();
-        assert_eq!(
-            nested_errors[0].kind(),
-            &ErrorKind::BlockNotAllowed {
-                block: spec::ids::TRACE,
-                parent: spec::Place::Block { id: spec::ids::TRACE },
-            }
-        );
-
-        let name_errors = model("trace {}").unwrap_err();
-        assert_eq!(name_errors[0].kind(), &ErrorKind::MissingName { block: spec::ids::TRACE });
-    }
-
-    #[test]
-    fn distinguishes_unknown_blocks_and_root_attributes() {
-        let root_attr = model("input = true").unwrap_err();
-        assert_eq!(
-            root_attr[0].kind(),
-            &ErrorKind::RootAttribute {
-                keyword: "input".to_owned(),
-            }
-        );
-
-        let unknown = model(r#"trace "outer" { custom "inner" {} }"#).unwrap_err();
-        assert_eq!(
-            unknown[0].kind(),
-            &ErrorKind::UnknownBlock {
-                keyword: "custom".to_owned(),
-                parent: spec::Place::Block { id: spec::ids::TRACE },
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_fields_absent_from_the_block_spec() {
-        let errors = model(r#"trace "example" { unknown = true }"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::UnknownField {
-                block: spec::ids::TRACE,
-                keyword: "unknown".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_reserved_metric_keys() {
-        let source = r#"trace "example" { metrics = { start = 1, tokens = 4, end = 2 } }"#;
-        let errors = model(source).unwrap_err();
-
-        assert_eq!(errors.len(), 2);
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::ReservedMetricKey {
-                rule: spec::ids::RESERVED_METRICS,
-                key: "start".to_owned(),
-            }
-        );
-        assert_eq!(
-            errors[1].kind(),
-            &ErrorKind::ReservedMetricKey {
-                rule: spec::ids::RESERVED_METRICS,
-                key: "end".to_owned(),
-            }
-        );
-
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "start");
-    }
-
-    #[test]
-    fn rejects_shapes_without_traces() {
-        for source in ["", "   \n  "] {
-            let errors = model(source).unwrap_err();
-
-            assert_eq!(errors.len(), 1);
-            assert_eq!(
-                errors[0].kind(),
-                &ErrorKind::EmptyShape {
-                    rule: spec::ids::NONEMPTY_SHAPE
-                }
-            );
+    fn element_range(&self, owner: ElementId) -> SrcRange {
+        match owner {
+            ElementId::Node(id) => self.model.nodes[id.0].range,
+            ElementId::Edge(id) => self.model.edges[id.0].range,
+            ElementId::Fork(id) => self.model.forks[id.0].range,
+            ElementId::Junction(id) => self.model.junctions[id.0].range,
         }
     }
 
-    #[test]
-    fn does_not_stack_the_empty_shape_error_onto_other_failures() {
-        let errors = model("input = true").unwrap_err();
-
-        assert_eq!(errors.len(), 1);
-        assert!(matches!(errors[0].kind(), ErrorKind::RootAttribute { .. }));
-    }
-
-    #[test]
-    fn associates_custom_validation_with_spec_rules() {
-        let duplicate = model(r#"trace "example" { metadata = { key = 1, key = 2 } }"#).unwrap_err();
-        assert_eq!(
-            duplicate[0].kind(),
-            &ErrorKind::DuplicateObjectKey {
-                rule: spec::ids::UNIQUE_OBJECT_KEYS,
-                key: "key".to_owned(),
+    fn node(&mut self, node: &ast::GraphNode, owner: Option<ElementId>) -> Anchor {
+        match node {
+            ast::GraphNode::Reference(expr) => Anchor::Reference(expr.clone(), owner),
+            ast::GraphNode::Declaration(node) => {
+                let id = NodeId(self.model.nodes.len());
+                let element = ElementId::Node(id);
+                self.model.nodes.push(Node {
+                    name: node.header.name.clone(),
+                    primitive: self.resolved(Construct::Node, &node.header.kind),
+                    kind: node.header.kind.clone(),
+                    props: Vec::new(),
+                    fields: Vec::new(),
+                    range: node.range,
+                });
+                self.name(
+                    &node.header.name,
+                    element,
+                    node.header.name_range.unwrap_or(node.header.range),
+                );
+                self.kind(element, node.header.kind_range);
+                self.fields(element, true, node.header.props.as_deref().unwrap_or(&[]));
+                self.fields(element, false, node.body.as_deref().unwrap_or(&[]));
+                Anchor::Node(id)
             }
-        );
-        assert!(
-            duplicate[0]
-                .to_string()
-                .contains(spec::SPEC.rule(spec::ids::UNIQUE_OBJECT_KEYS).unwrap().summary)
-        );
-
-        let raw = "999999999999999999999999999999999999";
-        let invalid_number = model(&format!(r#"trace "example" {{ input = {raw} }}"#)).unwrap_err();
-        assert_eq!(
-            invalid_number[0].kind(),
-            &ErrorKind::InvalidNumber {
-                rule: spec::ids::FINITE_NUMBERS,
-                raw: raw.to_owned(),
-            }
-        );
-        assert!(
-            invalid_number[0]
-                .to_string()
-                .contains(spec::SPEC.rule(spec::ids::FINITE_NUMBERS).unwrap().summary)
-        );
-    }
-
-    #[test]
-    fn reports_validation_diagnostics_at_the_invalid_source() {
-        let source = r#"trace "example" { metadata = true }"#;
-        let tokens = crate::lexing::lex(source).unwrap();
-        let ast = crate::parsing::parse(tokens, source).unwrap();
-
-        let diagnostics = match super::model(ast) {
-            Err(diagnostics) => diagnostics,
-            Ok(_) => panic!("expected a validation diagnostic"),
-        };
-
-        assert_eq!(
-            diagnostics,
-            vec![Diag {
-                when: DiagPhase::Validation,
-                what: "field `metadata` in block `trace` expects object, but found boolean".to_owned(),
-                r#where: SrcRange::new(29, 33),
-            }]
-        );
-    }
-
-    #[test]
-    fn folds_constant_arithmetic() {
-        let model = model(r#"trace "t" { metrics = { a = 1 + 2 * 3, b = 7 / 2, c = 7 % 2, d = 10 - 12 } }"#).unwrap();
-        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
-
-        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Int(7))));
-        // integer division truncates toward zero
-        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Int(3))));
-        assert!(matches!(metrics.elem[2].value, Value::Num(Number::Int(1))));
-        assert!(matches!(metrics.elem[3].value, Value::Num(Number::Int(-2))));
-    }
-
-    #[test]
-    fn folds_float_promotion_and_keeps_floats_float() {
-        let model = model(r#"trace "t" { metrics = { a = 1 + 0.5, b = 3.0 / 2, c = 1.5 + 1.5 } }"#).unwrap();
-        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
-
-        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == 1.5));
-        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Float(value)) if value == 1.5));
-        // a whole float result stays a float through re-literalization
-        assert!(matches!(metrics.elem[2].value, Value::Num(Number::Float(value)) if value == 3.0));
-    }
-
-    #[test]
-    fn folds_comparisons_equality_and_logic() {
-        let source = r#"trace "t" { metrics = {
-            a = 1 < 2
-            b = "x" == "x"
-            c = 1.0 == 1
-            d = true && false
-            e = !(1 > 2)
-            f = 1 != 2
-        } }"#;
-        let model = model(source).unwrap();
-        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
-
-        let expected = [true, true, true, false, true, true];
-        for (field, want) in metrics.elem.iter().zip(expected) {
-            assert!(
-                matches!(field.value, Value::Bool(value) if value == want),
-                "field {}",
-                field.key
-            );
         }
     }
 
-    #[test]
-    fn folds_constant_ternaries_into_typed_positions() {
-        let model = model(r#"trace "t" { tags = [true ? "a" : "b", false ? "c" : "d"] }"#).unwrap();
-        let tags = &model.traces[0].fields.tags;
-
-        assert!(matches!(&tags[0].parts[0], Part::Lit(value) if value == "a"));
-        assert!(matches!(&tags[1].parts[0], Part::Lit(value) if value == "d"));
-    }
-
-    #[test]
-    fn folds_negation_textually() {
-        let model = model(r#"trace "t" { metrics = { a = -9223372036854775808, b = --5, c = -1.5 } }"#).unwrap();
-        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
-
-        // i64::MIN only exists via textual negation, the bare literal overflows
-        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Int(i64::MIN))));
-        assert!(matches!(metrics.elem[1].value, Value::Num(Number::Int(5))));
-        assert!(matches!(metrics.elem[2].value, Value::Num(Number::Float(value)) if value == -1.5));
-    }
-
-    #[test]
-    fn folds_grouped_expressions() {
-        let model = model(r#"trace "t" { input = (1 + 2) * 3 }"#).unwrap();
-
-        assert!(matches!(model.traces[0].fields.input, Some(Value::Num(Number::Int(9)))));
-    }
-
-    #[test]
-    fn rejects_mismatched_operand_types() {
-        let source = r#"trace "t" { input = 1 + "a" }"#;
-        let errors = model(source).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::OperandTypeMismatch {
-                rule: spec::ids::OPERAND_TYPES,
-                op: "+".to_owned(),
-                expected: "number",
-                found: ExprType::String,
-            }
-        );
-        assert_eq!(&source[errors[0].range().start..errors[0].range().end], "\"a\"");
-
-        let errors = model(r#"trace "t" { input = 1 && true }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::OperandTypeMismatch {
-                rule: spec::ids::OPERAND_TYPES,
-                op: "&&".to_owned(),
-                expected: "boolean",
-                found: ExprType::Number,
-            }
-        );
-
-        let errors = model(r#"trace "t" { input = !5 }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::OperandTypeMismatch {
-                rule: spec::ids::OPERAND_TYPES,
-                op: "!".to_owned(),
-                expected: "boolean",
-                found: ExprType::Number,
-            }
-        );
-
-        let errors = model(r#"trace "t" { input = [1] + 1 }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::OperandTypeMismatch {
-                found: ExprType::Array,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_null_and_cross_type_equality() {
-        // null is not comparable, both sides report
-        let errors = model(r#"trace "t" { input = null == null }"#).unwrap_err();
-        assert_eq!(errors.len(), 2);
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::OperandTypeMismatch {
-                expected: "string, number, or boolean",
-                found: ExprType::Null,
-                ..
-            }
-        ));
-
-        // the left operand fixes the comparison type
-        let errors = model(r#"trace "t" { input = "a" == 1 }"#).unwrap_err();
-        assert_eq!(errors.len(), 1);
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::OperandTypeMismatch {
-                expected: "string",
-                found: ExprType::Number,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_operands_without_a_static_type() {
-        // heterogeneous choice has no unified type
-        let errors = model(r#"trace "t" { input = choice("a", 1) + 1 }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::OperandTypeMismatch {
-                found: ExprType::Func,
-                ..
-            }
-        ));
-
-        // a dynamic ternary with mixed branch types is untyped as an operand
-        let errors = model(r#"trace "t" { input = (range(0, 1) == 1 ? 1 : "x") + 1 }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::OperandTypeMismatch {
-                found: ExprType::Abstract,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_non_boolean_conditions() {
-        let errors = model(r#"trace "t" { input = 1 ? 2 : 3 }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonBooleanCondition {
-                rule: spec::ids::BOOLEAN_CONDITIONS,
-                found: ExprType::Number,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_constant_zero_divisors() {
-        for source in [
-            r#"trace "t" { input = 1 / 0 }"#,
-            r#"trace "t" { input = 1 % 0 }"#,
-            r#"trace "t" { input = 1 / 0.0 }"#,
-            // static even with a dynamic lhs
-            r#"trace "t" { input = range(1, 2) / 0 }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert!(
-                matches!(errors[0].kind(), ErrorKind::DivisionByZero { .. }),
-                "source: {source}"
-            );
-        }
-
-        // the diagnostic points at the zero
-        let source = r#"trace "t" { input = 1 / 0 }"#;
-        let errors = model(source).unwrap_err();
-        assert_eq!(&source[errors[0].range().start..errors[0].range().end], "0");
-    }
-
-    #[test]
-    fn rejects_non_finite_constant_results() {
-        let errors = model(r#"trace "t" { input = 9223372036854775807 + 1 }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonFiniteResult {
-                rule: spec::ids::FINITE_NUMBERS,
-            }
-        );
-
-        let big = format!("{}.0", "9".repeat(200));
-        let errors = model(&format!(r#"trace "t" {{ input = {big} * {big} }}"#)).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::NonFiniteResult { .. }));
-    }
-
-    #[test]
-    fn folds_variables_in_operator_exprs() {
-        let model = model(r#"vars { n = 2 } trace "t" { input = var.n + 1 }"#).unwrap();
-
-        assert!(matches!(model.traces[0].fields.input, Some(Value::Num(Number::Int(3)))));
-    }
-
-    #[test]
-    fn rejects_operator_exprs_referencing_same_scope_vars_in_vars() {
-        let errors = model(r#"vars { a = 1 b = 1 + var.a } trace "t" { input = 1 }"#).unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
-    }
-
-    #[test]
-    fn interpolates_folded_constant_vars() {
-        let model = model(r#"vars { n = 1 + 2 } trace "t" { output = "n ${var.n}" }"#).unwrap();
-
-        assert!(matches!(&model.traces[0].fields.output, Some(Value::Str(value)) if value == "n 3"));
-    }
-
-    #[test]
-    fn interpolates_dynamic_scalar_vars_as_binding_refs() {
-        let model = model(r#"vars { d = 1 + range(1, 2) } trace "t" { output = "d ${var.d}" }"#).unwrap();
-
-        assert_eq!(model.bindings.len(), 1);
-        assert_eq!(model.bindings[0].name, "d");
-        let Some(Value::Template(template)) = &model.traces[0].fields.output else {
-            panic!("expected a template output");
-        };
-        assert!(matches!(&template.parts[1], Part::VarRef(name) if name == "d"));
-    }
-
-    #[test]
-    fn rejects_interpolating_dynamic_vars_without_a_scalar_type() {
-        let errors = model(r#"vars { d = choice("a", 1) } trace "t" { output = "${var.d}" }"#).unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::NonScalarInterpolation { .. }));
-    }
-
-    #[test]
-    fn rejects_dynamic_exprs_for_typed_fields() {
-        let errors = model(r#"trace "t" { tags = [range(1, 2) > 1 ? "a" : "b"] }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::TypeMismatch {
-                found: ExprType::Abstract,
-                ..
-            }
-        ));
-        assert!(errors[0].to_string().contains("found expression"));
-
-        let errors = model(r#"trace "t" { metadata = 1 + range(0, 1) }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::TypeMismatch {
-                found: ExprType::Abstract,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn models_dynamic_operator_exprs() {
-        let source = r#"trace "t" { input = 1 + range(0, 1) }"#;
-        let model = model(source).unwrap();
-
-        let Some(Value::Binary { op, lhs, rhs, range }) = &model.traces[0].fields.input else {
-            panic!("expected a dynamic binary expression");
-        };
-        assert_eq!(*op, BinOp::Add);
-        assert!(matches!(**lhs, Value::Num(Number::Int(1))));
-        assert!(matches!(
-            **rhs,
-            Value::Func {
-                func: Func::Range(Range::Int { min: 0, max: 1 }),
-                ..
-            }
-        ));
-        assert_eq!(&source[range.start..range.end], "1 + range(0, 1)");
-    }
-
-    #[test]
-    fn models_dynamic_ternaries() {
-        let model = model(r#"trace "t" { input = range(0, 1) == 0 ? "a" : "b" }"#).unwrap();
-
-        let Some(Value::Cond {
-            cond, then, otherwise, ..
-        }) = &model.traces[0].fields.input
-        else {
-            panic!("expected a dynamic conditional");
-        };
-        assert!(matches!(**cond, Value::Binary { op: BinOp::Eq, .. }));
-        assert!(matches!(&**then, Value::Str(value) if value == "a"));
-        assert!(matches!(&**otherwise, Value::Str(value) if value == "b"));
-    }
-
-    #[test]
-    fn folds_constant_indexes_into_literal_containers() {
-        let model = model(
-            r#"
-            vars {
-                xs = [10, 20, 30]
-                user = { name = "ada", langs = ["en", "fr"] }
-            }
-            trace "t" {
-                input = var.xs[1 + 1]
-                output = var.user["name"]
-                metrics = { pick = [{ n = 1 }, { n = 2 }][0].n }
-                tags = [var.user.langs[1]]
-            }
-            "#,
-        )
-        .unwrap();
-        let fields = &model.traces[0].fields;
-
-        assert!(matches!(fields.input, Some(Value::Num(Number::Int(30)))));
-        assert!(matches!(&fields.output, Some(Value::Str(value)) if value == "ada"));
-        let metrics = fields.metrics.as_ref().unwrap();
-        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Int(1))));
-        assert_eq!(tag_text(&fields.tags[0]), "fr");
-    }
-
-    #[test]
-    fn folds_a_constant_index_selecting_a_dynamic_element() {
-        // selection is static even though the selected element is not
-        let model = model(r#"trace "t" { input = [range(1, 5), "x"][0] }"#).unwrap();
-
-        assert!(matches!(
-            model.traces[0].fields.input,
-            Some(Value::Func {
-                func: Func::Range(Range::Int { min: 1, max: 5 }),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn rejects_out_of_bounds_constant_indexes() {
-        let source = r#"trace "t" { input = [1, 2][2] }"#;
-        let errors = model(source).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::IndexOutOfBounds {
-                rule: spec::ids::INDEX_BOUNDS,
-                index: 2,
-                len: 2,
-            }
-        );
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "2");
-
-        let errors = model(r#"trace "t" { input = [1, 2][-1] }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::IndexOutOfBounds { index: -1, .. }));
-    }
-
-    #[test]
-    fn rejects_unknown_constant_object_keys() {
-        let errors = model(r#"trace "t" { input = { a = 1 }.b }"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::UnknownObjectKey {
-                rule: spec::ids::INDEX_BOUNDS,
-                key: "b".to_owned(),
-            }
-        );
-        assert!(errors[0].to_string().contains("object has no key `b`"));
-    }
-
-    #[test]
-    fn rejects_non_integer_constant_indexes() {
-        let errors = model(r#"trace "t" { input = [1, 2][0.5] }"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonIntegerIndex {
-                rule: spec::ids::INDEXABLE_TARGETS,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_indexing_non_containers() {
-        for (source, found) in [
-            (r#"trace "t" { input = 5[0] }"#, ExprType::Number),
-            (r#"trace "t" { input = "x"[0] }"#, ExprType::String),
-            (r#"trace "t" { input = true.a }"#, ExprType::Boolean),
-            (r#"trace "t" { input = null[0] }"#, ExprType::Null),
-            (r#"trace "t" { input = range(1, 2)[0] }"#, ExprType::Number),
-        ] {
-            let errors = model(source).unwrap_err();
-            assert_eq!(
-                errors[0].kind(),
-                &ErrorKind::NonIndexableTarget {
-                    rule: spec::ids::INDEXABLE_TARGETS,
-                    found,
-                },
-                "source: {source}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_mismatched_index_types() {
-        let errors = model(r#"trace "t" { input = [1, 2]["a"] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::IndexTypeMismatch {
-                rule: spec::ids::INDEXABLE_TARGETS,
-                expected: "number",
-                found: ExprType::String,
-            }
-        );
-
-        let errors = model(r#"trace "t" { input = { a = 1 }[0] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::IndexTypeMismatch {
-                rule: spec::ids::INDEXABLE_TARGETS,
-                expected: "string",
-                found: ExprType::Number,
-            }
-        );
-
-        // a heterogeneous choice has no static type, so it can't index
-        let errors = model(r#"trace "t" { input = [1, 2][choice(0, "a")] }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::IndexTypeMismatch {
-                found: ExprType::Func,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn models_dynamic_index_selections() {
-        let source = r#"trace "t" { input = [1, 2][range(0, 1)] }"#;
-        let model = model(source).unwrap();
-
-        let Some(Value::Index { target, index, range }) = &model.traces[0].fields.input else {
-            panic!("expected a dynamic index expression");
-        };
-        assert!(matches!(&**target, Value::Array(array) if array.elem.len() == 2));
-        assert!(matches!(
-            **index,
-            Value::Func {
-                func: Func::Range(Range::Int { min: 0, max: 1 }),
-                ..
-            }
-        ));
-        assert_eq!(&source[range.start..range.end], "[1, 2][range(0, 1)]");
-    }
-
-    #[test]
-    fn types_dynamic_indexes_by_their_unified_element_type() {
-        // homogeneous elements type the index, so it can be an operand
-        let model = model(r#"trace "t" { metrics = { n = [1, 2][range(0, 1)] * 10 } }"#).unwrap();
-        let metrics = model.traces[0].fields.metrics.as_ref().unwrap();
-        assert!(matches!(metrics.elem[0].value, Value::Binary { .. }));
-    }
-
-    #[test]
-    fn rejects_untyped_dynamic_indexes_as_operands_and_typed_fields() {
-        let errors = model(r#"trace "t" { input = [1, "a"][range(0, 1)] + 1 }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::OperandTypeMismatch {
-                found: ExprType::Abstract,
-                ..
-            }
-        ));
-
-        let errors = model(r#"trace "t" { tags = [["a", "b"][range(0, 1)]] }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::TypeMismatch {
-                found: ExprType::Abstract,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_index_exprs_referencing_same_scope_vars_in_vars() {
-        let errors = model(r#"vars { a = [1] b = var.a[0] } trace "t" { input = 1 }"#).unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
-    }
-
-    fn ints(value: &Value) -> Vec<i64> {
-        let Value::Array(array) = value else {
-            panic!("expected an array");
-        };
-        array
-            .elem
+    fn edge(&mut self, step: &ast::GraphEdgeStep, source: Anchor, fork: Option<ForkId>) -> Vec<EdgeId> {
+        let target = self.node(&step.target, fork.map(ElementId::Fork));
+        step.edges
             .iter()
-            .map(|value| match value {
-                ArrayElem::Item(Value::Num(Number::Int(value))) => *value,
-                other => panic!("expected an integer, found {other:?}"),
+            .map(|header| {
+                let id = EdgeId(self.model.edges.len());
+                let element = ElementId::Edge(id);
+                self.model.edges.push(Edge {
+                    name: header.name.clone(),
+                    primitive: self.resolved(Construct::Edge, &header.kind),
+                    kind: header.kind.clone(),
+                    source: NodeId(usize::MAX),
+                    target: NodeId(usize::MAX),
+                    props: Vec::new(),
+                    cycle: step.cycle,
+                    direction: step.direction,
+                    fork,
+                    range: header.range,
+                });
+                self.raw_edges.push(RawEdge {
+                    source: source.clone(),
+                    target: target.clone(),
+                });
+                self.edge_state.push(0);
+                self.name(&header.name, element, header.name_range.unwrap_or(header.range));
+                self.kind(element, header.kind_range);
+                self.fields(element, true, header.props.as_deref().unwrap_or(&[]));
+                id
             })
             .collect()
     }
 
-    #[test]
-    fn folds_constant_slices_with_clamped_bounds() {
-        let model = model(
-            r#"
-            vars { xs = [1, 2, 3, 4] }
-            trace "t" {
-                input = var.xs[1:3]
-                output = var.xs[:2]
-                metadata = {
-                    tail = var.xs[2:]
-                    all = var.xs[:]
-                    clamped = var.xs[1:99]
-                    empty = var.xs[3:1]
-                    large_end = var.xs[:4294967296]
-                    large_start = var.xs[9223372036854775807:]
+    fn junction(&mut self, junction: &ast::GraphJunction, fork: Option<ForkId>) -> JunctionId {
+        let id = JunctionId(self.model.junctions.len());
+        let target = self.node(&junction.target, fork.map(ElementId::Fork));
+        self.model.junctions.push(Junction {
+            primitive: self.resolved(Construct::Junction, &junction.kind),
+            kind: junction.kind.clone(),
+            inputs: Vec::new(),
+            props: Vec::new(),
+            target: NodeId(usize::MAX),
+            fork,
+            range: junction.range,
+        });
+        self.kind(ElementId::Junction(id), junction.kind_range);
+        self.fields(ElementId::Junction(id), true, junction.props.as_deref().unwrap_or(&[]));
+        self.raw_junctions.push(RawJunction {
+            inputs: junction.inputs.clone(),
+            target,
+        });
+        self.junction_state.push(0);
+        id
+    }
+
+    fn path(&mut self, path: &ast::GraphPath, parent: Option<ForkId>) -> RawPath {
+        let (origin, current) = match &path.start {
+            ast::GraphOrigin::Node(node) => {
+                let anchor = self.node(node, parent.map(ElementId::Fork));
+                (RawOrigin::Node(anchor.clone()), anchor)
+            }
+            ast::GraphOrigin::Selector(expr) => {
+                let fork = parent.expect("parser attaches selectors to forks");
+                let anchor = Anchor::Reference(expr.clone(), Some(ElementId::Fork(fork)));
+                (RawOrigin::Selector(fork, anchor.clone()), anchor)
+            }
+            ast::GraphOrigin::Junction(junction) => {
+                let id = self.junction(junction, parent);
+                (RawOrigin::Junction(id), self.raw_junctions[id.0].target.clone())
+            }
+        };
+        RawPath {
+            origin,
+            steps: self.steps(&path.steps, current),
+            range: path.range,
+        }
+    }
+
+    fn steps(&mut self, authored: &[ast::GraphStep], mut current: Anchor) -> Vec<PathStep> {
+        let mut steps = Vec::new();
+        for step in authored {
+            match step {
+                ast::GraphStep::Edge(step) => {
+                    let edges = self.edge(step, current.clone(), None);
+                    current = self.raw_edges[edges[0].0].target.clone();
+                    steps.push(PathStep::Edges(edges));
+                }
+                ast::GraphStep::Fork(fork) => {
+                    let id = ForkId(self.model.forks.len());
+                    let element = ElementId::Fork(id);
+                    self.model.forks.push(Fork {
+                        name: fork.header.name.clone(),
+                        primitive: self.resolved(Construct::Fork, &fork.header.kind),
+                        kind: fork.header.kind.clone(),
+                        source: NodeId(usize::MAX),
+                        props: Vec::new(),
+                        branches: Vec::new(),
+                        continuations: Vec::new(),
+                        range: fork.range,
+                    });
+                    self.raw_forks.push(RawFork { source: current.clone() });
+                    self.fork_state.push(0);
+                    self.continuations.push(Vec::new());
+                    self.name(
+                        &fork.header.name,
+                        element,
+                        fork.header.name_range.unwrap_or(fork.header.range),
+                    );
+                    self.kind(element, fork.header.kind_range);
+                    self.fields(element, true, fork.header.props.as_deref().unwrap_or(&[]));
+                    let branches = fork
+                        .entries
+                        .iter()
+                        .map(|entry| self.edge(entry, current.clone(), Some(id)))
+                        .collect();
+                    self.model.forks[id.0].branches = branches;
+                    let paths = fork.continuations.iter().map(|path| self.path(path, Some(id))).collect();
+                    self.continuations[id.0] = paths;
+                    steps.push(PathStep::Fork(id));
+                }
+                // every arm starts from the node reached before the fan-out
+                ast::GraphStep::Arms(arms) => {
+                    let arms = arms.iter().map(|arm| self.steps(arm, current.clone())).collect();
+                    steps.push(PathStep::Arms(arms));
                 }
             }
-            "#,
-        )
-        .unwrap();
-        let fields = &model.traces[0].fields;
-
-        assert_eq!(ints(fields.input.as_ref().unwrap()), [2, 3]);
-        assert_eq!(ints(fields.output.as_ref().unwrap()), [1, 2]);
-        let metadata = fields.metadata.as_ref().unwrap();
-        assert_eq!(ints(&metadata.elem[0].value), [3, 4]);
-        assert_eq!(ints(&metadata.elem[1].value), [1, 2, 3, 4]);
-        assert_eq!(ints(&metadata.elem[2].value), [2, 3, 4]);
-        assert!(ints(&metadata.elem[3].value).is_empty());
-        assert_eq!(ints(&metadata.elem[4].value), [1, 2, 3, 4]);
-        assert!(ints(&metadata.elem[5].value).is_empty());
+        }
+        steps
     }
 
-    #[test]
-    fn folds_slices_into_typed_positions() {
-        let model = model(r#"trace "t" { tags = ["a", "b", "c"][1:] }"#).unwrap();
-
-        assert_eq!(
-            model.traces[0].fields.tags.iter().map(tag_text).collect::<Vec<_>>(),
-            ["b", "c"]
-        );
+    fn endpoint(&mut self, anchor: &Anchor) -> Result<NodeId> {
+        match anchor {
+            Anchor::Node(node) => Ok(*node),
+            Anchor::Reference(expr, owner) => {
+                let cursor = self.cursor(expr, *owner)?;
+                match self.element(cursor, expr.range)? {
+                    ElementId::Node(node) => Ok(node),
+                    _ => Err(error(expr.range, "path endpoint must reference a node")),
+                }
+            }
+        }
     }
 
-    #[test]
-    fn models_dynamic_slice_selections() {
-        let source = r#"trace "t" { input = [1, 2, 3][range(0, 1):] }"#;
-        let model = model(source).unwrap();
+    // reports a resolution failure once, later dependents fail without repeating it
+    fn unresolved<T>(&mut self, element: ElementId, diags: Diags) -> Result<T> {
+        match element {
+            ElementId::Edge(id) => self.edge_state[id.0] = FAILED,
+            ElementId::Fork(id) => self.fork_state[id.0] = FAILED,
+            ElementId::Junction(id) => self.junction_state[id.0] = FAILED,
+            ElementId::Node(_) => {}
+        }
+        self.errors.extend(diags);
+        Err(Vec::new())
+    }
 
-        let Some(Value::Slice {
-            target,
-            start,
-            end,
-            range,
-        }) = &model.traces[0].fields.input
-        else {
-            panic!("expected a dynamic slice expression");
+    fn resolve_edge(&mut self, id: EdgeId) -> Result<()> {
+        match self.edge_state[id.0] {
+            RESOLVED => return Ok(()),
+            FAILED => return Err(Vec::new()),
+            RESOLVING => return Err(error(self.model.edges[id.0].range, "circular static endpoint dependency")),
+            _ => {}
+        }
+        self.edge_state[id.0] = RESOLVING;
+        let raw = self.raw_edges[id.0].clone();
+        let source = self.endpoint(&raw.source);
+        let target = self.endpoint(&raw.target);
+        match both(source, target) {
+            Ok((source, target)) => {
+                self.model.edges[id.0].source = source;
+                self.model.edges[id.0].target = target;
+                self.edge_state[id.0] = RESOLVED;
+                Ok(())
+            }
+            Err(diags) => self.unresolved(ElementId::Edge(id), diags),
+        }
+    }
+
+    fn resolve_fork(&mut self, id: ForkId) -> Result<()> {
+        match self.fork_state[id.0] {
+            RESOLVED => return Ok(()),
+            FAILED => return Err(Vec::new()),
+            RESOLVING => return Err(error(self.model.forks[id.0].range, "circular static fork dependency")),
+            _ => {}
+        }
+        self.fork_state[id.0] = RESOLVING;
+        let raw = self.raw_forks[id.0].clone();
+        let mut diags = Vec::new();
+        let mut failed = false;
+        match self.endpoint(&raw.source) {
+            Ok(source) => self.model.forks[id.0].source = source,
+            Err(more) => {
+                failed = true;
+                diags.extend(more);
+            }
+        }
+        for edge in self.model.forks[id.0].branches.clone().into_iter().flatten() {
+            if let Err(more) = self.resolve_edge(edge) {
+                failed = true;
+                diags.extend(more);
+            }
+        }
+        if failed {
+            return self.unresolved(ElementId::Fork(id), diags);
+        }
+        self.fork_state[id.0] = RESOLVED;
+        Ok(())
+    }
+
+    fn junction_input(&mut self, id: JunctionId, expr: &ast::Expr) -> Result<EdgeId> {
+        let cursor = self.cursor(expr, Some(ElementId::Junction(id)))?;
+        let ElementId::Edge(edge) = self.element(cursor, expr.range)? else {
+            return Err(error(expr.range, "junction inputs must reference edges"));
         };
-        assert!(matches!(&**target, Value::Array(array) if array.elem.len() == 3));
-        assert!(matches!(
-            start.as_deref(),
-            Some(Value::Func {
-                func: Func::Range(Range::Int { min: 0, max: 1 }),
-                ..
+        self.resolve_edge(edge)?;
+        if let Some(fork) = self.model.junctions[id.0].fork
+            && self.model.edges[edge.0].fork != Some(fork)
+        {
+            return Err(error(expr.range, "junction input does not belong to the attached fork"));
+        }
+        Ok(edge)
+    }
+
+    fn resolve_junction(&mut self, id: JunctionId) -> Result<()> {
+        match self.junction_state[id.0] {
+            RESOLVED => return Ok(()),
+            FAILED => return Err(Vec::new()),
+            RESOLVING => return Err(error(self.model.junctions[id.0].range, "circular static junction dependency")),
+            _ => {}
+        }
+        self.junction_state[id.0] = RESOLVING;
+        let raw = self.raw_junctions[id.0].clone();
+        let mut diags = Vec::new();
+        let mut failed = false;
+        let mut inputs = Vec::new();
+        for expr in &raw.inputs {
+            match self.junction_input(id, expr) {
+                Ok(edge) => inputs.push(edge),
+                Err(more) => {
+                    failed = true;
+                    diags.extend(more);
+                }
+            }
+        }
+        match self.endpoint(&raw.target) {
+            Ok(target) => self.model.junctions[id.0].target = target,
+            Err(more) => {
+                failed = true;
+                diags.extend(more);
+            }
+        }
+        if failed {
+            return self.unresolved(ElementId::Junction(id), diags);
+        }
+        self.model.junctions[id.0].inputs = inputs;
+        self.junction_state[id.0] = RESOLVED;
+        Ok(())
+    }
+
+    fn lower_origin(&mut self, origin: RawOrigin, range: SrcRange) -> Result<PathOrigin> {
+        match origin {
+            RawOrigin::Node(anchor) => Ok(PathOrigin::Node(self.endpoint(&anchor)?)),
+            RawOrigin::Selector(fork, anchor) => {
+                // the selector is resolved even under a failed fork so its own mistake is reported
+                let target = self.endpoint(&anchor);
+                let resolved = self.resolve_fork(fork);
+                let (target, ()) = both(target, resolved)?;
+                if !self.model.forks[fork.0]
+                    .branches
+                    .iter()
+                    .flatten()
+                    .any(|edge| self.model.edges[edge.0].target == target)
+                {
+                    return Err(error(range, "selector target does not belong to the attached fork"));
+                }
+                Ok(PathOrigin::Selector { fork, target })
+            }
+            RawOrigin::Junction(id) => {
+                self.resolve_junction(id)?;
+                Ok(PathOrigin::Junction(id))
+            }
+        }
+    }
+
+    // every step is resolved even after a failure, `false` means a diagnostic was recorded
+    fn resolve_steps(&mut self, steps: &[PathStep]) -> bool {
+        let mut resolved = true;
+        for step in steps {
+            match step {
+                PathStep::Edges(edges) => {
+                    for edge in edges {
+                        if let Err(diags) = self.resolve_edge(*edge) {
+                            self.errors.extend(diags);
+                            resolved = false;
+                        }
+                    }
+                }
+                PathStep::Fork(fork) => {
+                    if let Err(diags) = self.resolve_fork(*fork) {
+                        self.errors.extend(diags);
+                        resolved = false;
+                    }
+                    let continuations: Vec<_> = self.continuations[fork.0]
+                        .clone()
+                        .into_iter()
+                        .map(|path| self.lower_path(path))
+                        .collect();
+                    if continuations.iter().all(Option::is_some) {
+                        self.model.forks[fork.0].continuations = continuations.into_iter().flatten().collect();
+                    } else {
+                        resolved = false;
+                    }
+                }
+                PathStep::Arms(arms) => {
+                    for arm in arms {
+                        resolved &= self.resolve_steps(arm);
+                    }
+                }
+            }
+        }
+        resolved
+    }
+
+    // every step is resolved even after a failure, `None` means a diagnostic was recorded
+    fn lower_path(&mut self, path: RawPath) -> Option<GraphPath> {
+        let origin = match self.lower_origin(path.origin, path.range) {
+            Ok(origin) => Some(origin),
+            Err(diags) => {
+                self.errors.extend(diags);
+                None
+            }
+        };
+        let resolved = self.resolve_steps(&path.steps);
+        Some(GraphPath {
+            origin: origin.filter(|_| resolved)?,
+            steps: path.steps,
+            range: path.range,
+        })
+    }
+
+    fn graph_value(&mut self, target: ElementId, range: SrcRange) -> ReferenceValue {
+        let id = RefId(self.model.refs.len());
+        self.model.refs.push(ResolvedRef { target, range });
+        ReferenceValue {
+            value: Value::GraphRef { ref_id: id, range },
+            bindings: Vec::new(),
+        }
+    }
+
+    fn raw_slot(&self, slot: &Slot, range: SrcRange) -> Result<ast::Expr> {
+        let first = slot.path.first().ok_or_else(|| error(range, "expected field name"))?;
+        // a supplied context value is written once on the definition and lowered for each element
+        let (mut expr, rest) = if first == CONTEXT_VALUE {
+            let key = slot.path.get(1).ok_or_else(|| error(range, "expected context key"))?;
+            let value = self.supplied.get(&(slot.owner, key.clone())).cloned();
+            (value.ok_or_else(|| error(range, "context value is not available"))?, 2)
+        } else {
+            let field = self
+                .fields
+                .get(&(slot.owner, slot.property))
+                .and_then(|fields| fields.iter().find(|field| &field.key == first))
+                .ok_or_else(|| {
+                    error(
+                        range,
+                        format!("unknown {} `{first}`", if slot.property { "property" } else { "field" }),
+                    )
+                })?;
+            (field.value.clone(), 1)
+        };
+        for key in slot.path.iter().skip(rest) {
+            let ast::ExprKind::Object(items) = &expr.kind else {
+                return Err(error(range, format!("field path cannot select `{key}`")));
+            };
+            if items.iter().any(|item| matches!(item, ast::ObjectItem::Spread(_))) {
+                return Err(error(range, "object spreads require evaluation of the containing field"));
+            }
+            expr = items
+                .iter()
+                .find_map(|item| match item {
+                    ast::ObjectItem::Attr(field) if &field.key == key => Some(field.value.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| error(range, format!("unknown object key `{key}`")))?;
+        }
+        Ok(expr)
+    }
+
+    fn binding(&mut self, slot: Slot, range: SrcRange) -> Result<BindingId> {
+        if self.visiting.contains(&slot) {
+            return Err(error(
+                range,
+                format!("circular field dependency through `{}`", slot.path.join(".")),
+            ));
+        }
+        if let Some(id) = self.slots.get(&slot) {
+            return Ok(*id);
+        }
+        let expr = self.raw_slot(&slot, range)?;
+        let id = BindingId(self.model.bindings.len());
+        self.model.bindings.push(Binding {
+            owner: slot.owner,
+            property: slot.property,
+            path: slot.path.clone(),
+            ty: self.field_type(&slot),
+            value: Value::Null,
+            range: expr.range,
+        });
+        self.slots.insert(slot.clone(), id);
+        self.visiting.insert(slot.clone());
+        let computed = (!slot.property)
+            .then(|| self.computed.get(&(slot.owner, slot.path[0].clone())).cloned())
+            .flatten();
+        // in a merged object only the keys the kind supplies are the kind's expressions
+        let supplied = computed.as_ref().is_some_and(|computed| match &computed.keys {
+            Some(keys) => slot.path.get(1).is_some_and(|key| keys.contains(key)),
+            None => true,
+        });
+        let outer = std::mem::replace(&mut self.computing, supplied.then(|| slot.path[0].clone()));
+        let result = self.lower_binding_expr(expr, &slot);
+        self.computing = outer;
+        self.visiting.remove(&slot);
+        let result = match result {
+            Ok(value) => {
+                self.model.bindings[id.0].value = value.clone();
+                expr::schema_type(self.reference_value(value), self.field_type(&slot), range).map(|()| id)
+            }
+            Err(errors) => {
+                self.slots.remove(&slot);
+                Err(errors)
+            }
+        };
+        // what goes wrong inside a kind's value is reported at the instance it was computed for
+        result.map_err(|mut errors| {
+            if let Some(Computed { kind, range: at, .. }) = computed.filter(|_| slot.path.len() == 1) {
+                let instance = self.element_range(slot.owner);
+                for diag in &mut errors {
+                    let place = diag.r#where;
+                    if place.source == at.source && place.start >= at.start && place.end <= at.end {
+                        diag.what = format!("computed field `{}` of kind `{kind}`: {}", slot.path[0], diag.what);
+                        diag.r#where = instance;
+                    }
+                }
+            }
+            errors
+        })
+    }
+
+    fn lower_binding_expr(&mut self, mut expr: ast::Expr, slot: &Slot) -> Result<Value> {
+        if let Some(value) = self.defaults.get(slot) {
+            return Ok(value.clone());
+        }
+        if matches!(expr.kind, ast::ExprKind::Upstream) {
+            if slot.property || !matches!(slot.owner, ElementId::Node(_)) || slot.path.len() != 1 {
+                return Err(error(expr.range, "upstream markers belong on direct node content fields"));
+            }
+            return Ok(Value::Input {
+                binding: self.slots[slot],
+                ty: self.field_type(slot),
+            });
+        }
+        if slot.property && slot.path == ["into"] && self.primitive(slot.owner) == Primitive::Feeds {
+            let ElementId::Edge(edge) = slot.owner else {
+                return Err(error(expr.range, "destination requires an edge"));
+            };
+            self.resolve_edge(edge)?;
+            let Cursor::Slot(destination) = self.cursor(&expr, Some(slot.owner))? else {
+                return Err(error(expr.range, "into must reference a target input field"));
+            };
+            if destination.owner != ElementId::Node(self.model.edges[edge.0].target)
+                || destination.property
+                || destination.path.len() != 1
+            {
+                return Err(error(
+                    expr.range,
+                    "into must reference a direct content field on the edge target",
+                ));
+            }
+            let id = self.binding(destination, expr.range)?;
+            if !matches!(self.model.bindings[id.0].value, Value::Input { .. }) {
+                return Err(error(expr.range, "destination field must declare an upstream input with <-"));
+            }
+            return Ok(Value::FieldRef(id));
+        }
+        if let ast::ExprKind::Object(items) = &mut expr.kind
+            && items.iter().all(|item| matches!(item, ast::ObjectItem::Attr(_)))
+        {
+            // each explicit object field has one binding even when read through a sibling
+            for item in items {
+                let ast::ObjectItem::Attr(field) = item else { unreachable!() };
+                field.value.kind = ast::ExprKind::Ref {
+                    path: vec![field.key.clone()],
+                };
+            }
+            return expr::lower(expr, &self.functions.clone(), &mut |expr| {
+                let ast::ExprKind::Ref { path } = expr.kind else {
+                    unreachable!()
+                };
+                let mut child = slot.clone();
+                child.path.extend(path);
+                let id = self.binding(child.clone(), expr.range)?;
+                let value = self.model.bindings[id.0].value.clone();
+                if expr::static_value(&value) {
+                    return Ok(ReferenceValue {
+                        value,
+                        bindings: Vec::new(),
+                    });
+                }
+                self.finish(Cursor::Slot(child), expr.range)
+            });
+        }
+        expr::lower(expr, &self.functions.clone(), &mut |expr| {
+            self.resolve_value(expr, Some(slot.owner))
+        })
+    }
+
+    fn finish(&mut self, cursor: Cursor, range: SrcRange) -> Result<ReferenceValue> {
+        match cursor {
+            Cursor::Element(element) => Ok(self.graph_value(element, range)),
+            Cursor::Slot(slot) => {
+                let input = self.input_role(slot.owner, slot.property, &slot.path);
+                let output = !slot.property
+                    && self.kind_schema(slot.owner).is_some_and(|kind| {
+                        kind.fields
+                            .iter()
+                            .any(|field| slot.path.first() == Some(&field.name) && field.role.as_deref() == Some("output"))
+                    });
+                let id = self.binding(slot, range)?;
+                let value = self.model.bindings[id.0].value.clone();
+                if !input && !output && expr::static_value(&value) {
+                    Ok(ReferenceValue {
+                        value,
+                        bindings: Vec::new(),
+                    })
+                } else {
+                    Ok(self.reference_value(Value::BindingRef(id, range)))
+                }
+            }
+            Cursor::Value(value) => Ok(value),
+            Cursor::Context(owner, path) => Ok(ReferenceValue {
+                value: Value::Context { owner, path },
+                bindings: Vec::new(),
+            }),
+            Cursor::Properties(element) => {
+                let fields = self.fields.get(&(element, true)).cloned().unwrap_or_default();
+                let mut values = Vec::new();
+                for field in fields {
+                    let value = self
+                        .finish(
+                            Cursor::Slot(Slot {
+                                owner: element,
+                                property: true,
+                                path: vec![field.key.clone()],
+                            }),
+                            field.range,
+                        )?
+                        .value;
+                    values.push(ObjectField { key: field.key, value });
+                }
+                Ok(self.reference_value(Value::Object(Object { elem: values })))
+            }
+        }
+    }
+
+    fn element(&mut self, cursor: Cursor, range: SrcRange) -> Result<ElementId> {
+        if let Cursor::Element(element) = cursor {
+            return Ok(element);
+        }
+        let mut value = self.finish(cursor, range)?.value;
+        let mut visited = HashSet::new();
+        loop {
+            match value {
+                Value::GraphRef { ref_id, .. } => return Ok(self.model.refs[ref_id.0].target),
+                Value::BindingRef(id, _) if visited.insert(id) => value = self.model.bindings[id.0].value.clone(),
+                _ => return Err(error(range, "expected a statically resolved graph reference")),
+            }
+        }
+    }
+
+    fn member(&mut self, cursor: Cursor, name: &str, range: SrcRange) -> Result<Cursor> {
+        match cursor {
+            Cursor::Element(element) if name == "props" => Ok(Cursor::Properties(element)),
+            Cursor::Element(ElementId::Node(node)) => Ok(Cursor::Slot(Slot {
+                owner: ElementId::Node(node),
+                property: false,
+                path: vec![name.to_owned()],
+            })),
+            Cursor::Properties(owner) => Ok(Cursor::Slot(Slot {
+                owner,
+                property: true,
+                path: vec![name.to_owned()],
+            })),
+            Cursor::Context(owner, mut path) => {
+                path.push(name.to_owned());
+                Ok(Cursor::Context(owner, path))
+            }
+            Cursor::Element(ElementId::Edge(edge)) => match name {
+                "source" | "left" if (name == "source") == (self.model.edges[edge.0].direction == Direction::Directed) => {
+                    let source = self.raw_edges[edge.0].source.clone();
+                    Ok(Cursor::Element(ElementId::Node(self.endpoint(&source)?)))
+                }
+                "target" | "right" if (name == "target") == (self.model.edges[edge.0].direction == Direction::Directed) => {
+                    self.resolve_edge(edge)?;
+                    Ok(Cursor::Element(ElementId::Node(self.model.edges[edge.0].target)))
+                }
+                "scope" => Ok(Cursor::Context(ElementId::Edge(edge), Vec::new())),
+                _ => Err(error(range, format!("unknown edge accessor `{name}`"))),
+            },
+            Cursor::Element(ElementId::Fork(fork)) => match name {
+                "source" => {
+                    let source = self.raw_forks[fork.0].source.clone();
+                    Ok(Cursor::Element(ElementId::Node(self.endpoint(&source)?)))
+                }
+                "paths" => {
+                    self.resolve_fork(fork)?;
+                    let mut paths = Vec::new();
+                    for edges in self.model.forks[fork.0].branches.clone() {
+                        let elem = edges
+                            .into_iter()
+                            .map(|edge| ArrayElem::Item(self.graph_value(ElementId::Edge(edge), range).value))
+                            .collect();
+                        paths.push(ArrayElem::Item(Value::Array(Array { elem })));
+                    }
+                    Ok(Cursor::Value(ReferenceValue {
+                        value: Value::Array(Array { elem: paths }),
+                        bindings: Vec::new(),
+                    }))
+                }
+                _ => Err(error(range, format!("unknown fork accessor `{name}`"))),
+            },
+            Cursor::Slot(slot) => {
+                let mut child = slot.clone();
+                child.path.push(name.to_owned());
+                if self.raw_slot(&child, range).is_ok() {
+                    return Ok(Cursor::Slot(child));
+                }
+                // graph-valued fields keep the referenced identity when followed
+                let value = self.finish(Cursor::Slot(slot.clone()), range)?;
+                if let Value::GraphRef { ref_id, .. } = value.value {
+                    return self.member(Cursor::Element(self.model.refs[ref_id.0].target), name, range);
+                }
+                Ok(Cursor::Value(expr::index(value, Value::Str(name.to_owned()), range)?))
+            }
+            Cursor::Value(value) => {
+                if let Value::GraphRef { ref_id, .. } = value.value {
+                    self.member(Cursor::Element(self.model.refs[ref_id.0].target), name, range)
+                } else {
+                    Ok(Cursor::Value(expr::index(value, Value::Str(name.to_owned()), range)?))
+                }
+            }
+            Cursor::Element(ElementId::Junction(_)) => Err(error(range, "junctions have no value accessors")),
+        }
+    }
+
+    fn cursor(&mut self, expr: &ast::Expr, owner: Option<ElementId>) -> Result<Cursor> {
+        match &expr.kind {
+            ast::ExprKind::Ref { path } => {
+                let name = path.first().ok_or_else(|| error(expr.range, "empty reference"))?;
+                let mut cursor = match name.as_str() {
+                    "self" => match owner {
+                        Some(ElementId::Node(node)) => Cursor::Element(ElementId::Node(node)),
+                        _ => return Err(error(expr.range, "self requires a node-owned expression")),
+                    },
+                    "context" => {
+                        let owner = owner.ok_or_else(|| error(expr.range, "context requires an owning graph element"))?;
+                        self.context_reads.push((owner, path[1..].to_vec(), expr.range));
+                        Cursor::Context(owner, Vec::new())
+                    }
+                    "source" | "target" | "left" | "right" => {
+                        let element = owner.ok_or_else(|| error(expr.range, "endpoint access requires an edge or fork"))?;
+                        if !matches!(element, ElementId::Edge(_) | ElementId::Fork(_)) {
+                            return Err(error(expr.range, "endpoint access requires an edge or fork"));
+                        }
+                        self.member(Cursor::Element(element), name, expr.range)?
+                    }
+                    _ if self.computing.is_some() => {
+                        return Err(error(
+                            expr.range,
+                            format!("a computed field reads self and context, `{name}` is not available to a kind"),
+                        ));
+                    }
+                    _ => Cursor::Element(
+                        *self
+                            .model
+                            .names
+                            .get(name)
+                            .ok_or_else(|| error(expr.range, format!("unresolved graph name `{name}`")))?,
+                    ),
+                };
+                for name in path.iter().skip(1) {
+                    cursor = self.member(cursor, name, expr.range)?
+                }
+                Ok(cursor)
+            }
+            ast::ExprKind::GraphRef { kind, target } => {
+                let cursor = self.cursor(target, owner)?;
+                let element = self.element(cursor, expr.range)?;
+                let valid = match kind {
+                    ast::GraphReferenceKind::Node => matches!(element, ElementId::Node(_)),
+                    ast::GraphReferenceKind::Edge => matches!(element, ElementId::Edge(_) | ElementId::Fork(_)),
+                };
+                if !valid {
+                    return Err(error(expr.range, "reference boundary does not match the graph element kind"));
+                }
+                Ok(Cursor::Element(element))
+            }
+            ast::ExprKind::GraphMember { target, name } => {
+                let cursor = self.cursor(target, owner)?;
+                let ElementId::Fork(fork) = self.element(cursor, expr.range)? else {
+                    return Err(error(expr.range, "qualified edge lookup requires a fork"));
+                };
+                let Some(ElementId::Edge(edge)) = self.model.names.get(name).copied() else {
+                    return Err(error(expr.range, format!("unresolved edge `{name}`")));
+                };
+                if self.model.edges[edge.0].fork != Some(fork) {
+                    return Err(error(expr.range, "qualified edge is not a member of that fork"));
+                }
+                Ok(Cursor::Element(ElementId::Edge(edge)))
+            }
+            ast::ExprKind::PatternRef(_) if self.computing.is_some() => Err(error(
+                expr.range,
+                "a computed field reads self and context, a graph pattern is not available to a kind",
+            )),
+            ast::ExprKind::PatternRef(pattern) => Ok(Cursor::Element(self.pattern(pattern, owner)?)),
+            ast::ExprKind::Index { target, index } => {
+                let cursor = self.cursor(target, owner)?;
+                let index = expr::lower((**index).clone(), &self.functions.clone(), &mut |expr| {
+                    self.resolve_value(expr, owner)
+                })?;
+                if let Value::Str(name) = &index {
+                    return self.member(cursor, name, expr.range);
+                }
+                let mut value = self.finish(cursor, expr.range)?;
+                value.bindings.extend(self.reference_value(index.clone()).bindings);
+                Ok(Cursor::Value(expr::index(value, index, expr.range)?))
+            }
+            ast::ExprKind::Slice { target, start, end } => {
+                let cursor = self.cursor(target, owner)?;
+                let value = self.finish(cursor, expr.range)?;
+                let start = start
+                    .as_ref()
+                    .map(|expr| {
+                        expr::lower((**expr).clone(), &self.functions.clone(), &mut |expr| {
+                            self.resolve_value(expr, owner)
+                        })
+                    })
+                    .transpose()?;
+                let end = end
+                    .as_ref()
+                    .map(|expr| {
+                        expr::lower((**expr).clone(), &self.functions.clone(), &mut |expr| {
+                            self.resolve_value(expr, owner)
+                        })
+                    })
+                    .transpose()?;
+                let mut value = value;
+                for bound in start.iter().chain(end.iter()) {
+                    value.bindings.extend(self.reference_value(bound.clone()).bindings);
+                }
+                Ok(Cursor::Value(expr::slice(value, start, end, expr.range)?))
+            }
+            _ => {
+                let value = expr::lower(expr.clone(), &self.functions.clone(), &mut |expr| {
+                    self.resolve_value(expr, owner)
+                })?;
+                Ok(Cursor::Value(self.reference_value(value)))
+            }
+        }
+    }
+
+    fn resolve_value(&mut self, expr: ast::Expr, owner: Option<ElementId>) -> Result<ReferenceValue> {
+        let cursor = self.cursor(&expr, owner)?;
+        self.finish(cursor, expr.range)
+    }
+
+    fn matches_constraint(
+        &mut self,
+        element: ElementId,
+        constraint: &ast::GraphPatternConstraint,
+        owner: Option<ElementId>,
+    ) -> Result<bool> {
+        let kind = match element {
+            ElementId::Node(id) => &self.model.nodes[id.0].kind,
+            ElementId::Edge(id) => &self.model.edges[id.0].kind,
+            _ => return Ok(false),
+        };
+        if kind != &constraint.kind {
+            return Ok(false);
+        }
+        for prop in constraint.props.as_deref().unwrap_or(&[]) {
+            let slot = Slot {
+                owner: element,
+                property: true,
+                path: vec![prop.key.clone()],
+            };
+            if self.raw_slot(&slot, prop.range).is_err() {
+                return Ok(false);
+            }
+            let id = self.binding(slot, prop.range)?;
+            let actual = self.model.bindings[id.0].value.clone();
+            let expected = expr::lower(prop.value.clone(), &self.functions.clone(), &mut |expr| {
+                self.resolve_value(expr, owner)
+            })?;
+            if !expr::constant(&actual) || !expr::constant(&expected) {
+                return Err(error(
+                    prop.range,
+                    "pattern property constraints must be statically comparable",
+                ));
+            }
+            if !same_value(&actual, &expected) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn matches_node(&mut self, node: NodeId, pattern: &ast::GraphPatternNode, owner: Option<ElementId>) -> Result<bool> {
+        match pattern {
+            ast::GraphPatternNode::Reference(expr) => {
+                let cursor = self.cursor(expr, owner)?;
+                Ok(self.element(cursor, expr.range)? == ElementId::Node(node))
+            }
+            ast::GraphPatternNode::Constraint(constraint) => self.matches_constraint(ElementId::Node(node), constraint, owner),
+        }
+    }
+
+    fn pattern(&mut self, pattern: &ast::GraphPattern, owner: Option<ElementId>) -> Result<ElementId> {
+        let mut paths = Vec::new();
+        for i in 0..self.model.nodes.len() {
+            let node = NodeId(i);
+            if self.matches_node(node, &pattern.start, owner)? {
+                let selected = matches!(&pattern.start,ast::GraphPatternNode::Constraint(c) if c.selected)
+                    .then_some(ElementId::Node(node));
+                paths.push((node, selected));
+            }
+        }
+        for step in &pattern.steps {
+            let mut next = BTreeSet::new();
+            for (source, selected) in paths {
+                let mut targets: BTreeSet<NodeId> = BTreeSet::new();
+                for i in 0..self.model.edges.len() {
+                    let edge = &self.model.edges[i];
+                    if edge.cycle != step.cycle
+                        || edge.direction != step.direction
+                        || !step.edges.iter().any(|constraint| constraint.kind == edge.kind)
+                    {
+                        continue;
+                    }
+                    let anchor = self.raw_edges[i].source.clone();
+                    let left = self.endpoint(&anchor)?;
+                    if left == source {
+                        self.resolve_edge(EdgeId(i))?;
+                        targets.insert(self.model.edges[i].target);
+                    } else if step.direction == Direction::Undirected {
+                        self.resolve_edge(EdgeId(i))?;
+                        if self.model.edges[i].target == source {
+                            targets.insert(left);
+                        }
+                    }
+                }
+                for target in targets {
+                    if !self.matches_node(target, &step.target, owner)? {
+                        continue;
+                    }
+                    let selected = if matches!(&step.target,ast::GraphPatternNode::Constraint(c) if c.selected) {
+                        Some(ElementId::Node(target))
+                    } else {
+                        selected
+                    };
+                    let mut candidates = Vec::new();
+                    for constraint in &step.edges {
+                        let mut matched = Vec::new();
+                        for i in 0..self.model.edges.len() {
+                            let edge = &self.model.edges[i];
+                            if ((edge.source == source && edge.target == target)
+                                || (edge.direction == Direction::Undirected && edge.source == target && edge.target == source))
+                                && edge.direction == step.direction
+                                && edge.cycle == step.cycle
+                                && self.matches_constraint(ElementId::Edge(EdgeId(i)), constraint, owner)?
+                            {
+                                matched.push(EdgeId(i));
+                            }
+                        }
+                        candidates.push(matched);
+                    }
+                    if let Some(index) = step.edges.iter().position(|constraint| constraint.selected) {
+                        for edge in &candidates[index] {
+                            if distinct_edge_assignment(&candidates, Some((index, *edge))) {
+                                next.insert((target, Some(ElementId::Edge(*edge))));
+                            }
+                        }
+                    } else if distinct_edge_assignment(&candidates, None) {
+                        next.insert((target, selected));
+                    }
+                }
+            }
+            paths = next.into_iter().collect();
+        }
+        let selected: BTreeSet<_> = paths.into_iter().filter_map(|(_, selected)| selected).collect();
+        if selected.len() != 1 {
+            return Err(error(
+                pattern.range,
+                format!(
+                    "pattern reference selects {} distinct graph elements, expected one",
+                    selected.len()
+                ),
+            ));
+        }
+        Ok(*selected.iter().next().expect("one distinct element"))
+    }
+
+    fn lower_fields(&mut self) {
+        let owners: Vec<_> = (0..self.model.nodes.len())
+            .map(|i| ElementId::Node(NodeId(i)))
+            .chain((0..self.model.edges.len()).map(|i| ElementId::Edge(EdgeId(i))))
+            .chain((0..self.model.forks.len()).map(|i| ElementId::Fork(ForkId(i))))
+            .chain((0..self.model.junctions.len()).map(|i| ElementId::Junction(JunctionId(i))))
+            .collect();
+        for owner in owners {
+            for property in [true, false] {
+                let mut ids = Vec::new();
+                for field in self.fields.get(&(owner, property)).cloned().unwrap_or_default() {
+                    match self.binding(
+                        Slot {
+                            owner,
+                            property,
+                            path: vec![field.key],
+                        },
+                        field.range,
+                    ) {
+                        Ok(id) => ids.push(id),
+                        Err(diags) => {
+                            self.errors.extend(diags);
+                            self.unchecked.insert(owner);
+                        }
+                    }
+                }
+                match owner {
+                    ElementId::Node(id) => {
+                        if property {
+                            self.model.nodes[id.0].props = ids
+                        } else {
+                            self.model.nodes[id.0].fields = ids
+                        }
+                    }
+                    ElementId::Edge(id) if property => self.model.edges[id.0].props = ids,
+                    ElementId::Fork(id) if property => self.model.forks[id.0].props = ids,
+                    ElementId::Junction(id) if property => self.model.junctions[id.0].props = ids,
+                    _ => {}
+                }
+            }
+            // each element supplies the context values its kind provides, lowered as if written on it
+            let supplied: Vec<_> = (self.kind_schema(owner).into_iter())
+                .flat_map(|kind| &kind.provides)
+                .filter_map(|key| key.value.map(|at| (key.name.clone(), key.ty, at)))
+                .collect();
+            for (key, ty, at) in supplied {
+                let Some(value) = self.values.get(&(at.source, at.start, at.end)).cloned() else {
+                    continue;
+                };
+                self.supplied.insert((owner, key.clone()), value);
+                let slot = Slot {
+                    owner,
+                    property: false,
+                    path: vec![CONTEXT_VALUE.to_owned(), key.clone()],
+                };
+                let binding = self.binding(slot, at).and_then(|id| {
+                    expr::schema_type(self.reference_value(self.model.bindings[id.0].value.clone()), ty, at)?;
+                    Ok(id)
+                });
+                match binding {
+                    Ok(binding) => self.model.context_values.push(ContextValue { owner, key, binding }),
+                    Err(diags) => {
+                        self.errors.extend(diags);
+                        self.unchecked.insert(owner);
+                    }
+                }
+            }
+        }
+    }
+
+    fn property(&self, owner: ElementId, name: &str) -> Option<BindingId> {
+        self.slots
+            .get(&Slot {
+                owner,
+                property: true,
+                path: vec![name.to_owned()],
             })
-        ));
-        assert!(end.is_none());
-        assert_eq!(&source[range.start..range.end], "[1, 2, 3][range(0, 1):]");
+            .copied()
     }
 
-    #[test]
-    fn rejects_invalid_slice_targets_and_bounds() {
-        let errors = model(r#"trace "t" { input = 5[0:1] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonSliceableTarget {
-                rule: spec::ids::SLICEABLE_TARGETS,
-                found: ExprType::Number,
+    fn reference_value(&self, value: Value) -> ReferenceValue {
+        let mut pending = expr::dependencies(&value);
+        let mut seen = HashSet::new();
+        let mut bindings = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
             }
-        );
-
-        let errors = model(r#"trace "t" { input = { a = 1 }[0:1] }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::NonSliceableTarget {
-                found: ExprType::Object,
-                ..
-            }
-        ));
-
-        let errors = model(r#"trace "t" { input = [1, 2]["a":] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::SliceTypeMismatch {
-                rule: spec::ids::SLICE_BOUNDS,
-                found: ExprType::String,
-            }
-        );
-
-        let errors = model(r#"trace "t" { input = [1, 2][0.5:] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonIntegerSliceBound {
-                rule: spec::ids::SLICE_BOUNDS,
-            }
-        );
-
-        // constant bounds check even when another bound is dynamic
-        let source = r#"trace "t" { input = [1, 2][range(0, 1):-1] }"#;
-        let errors = model(source).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NegativeSliceBound {
-                rule: spec::ids::SLICE_BOUNDS,
-            }
-        );
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "-1");
+            let binding = &self.model.bindings[id.0];
+            let definition = if self.input_role(binding.owner, binding.property, &binding.path)
+                || self.output_role(binding.owner, binding.property, &binding.path)
+            {
+                Value::Input {
+                    binding: id,
+                    ty: binding.ty,
+                }
+            } else {
+                binding.value.clone()
+            };
+            pending.extend(expr::dependencies(&definition));
+            bindings.push((id, definition, self.model.bindings[id.0].ty));
+        }
+        ReferenceValue { value, bindings }
     }
 
-    #[test]
-    fn splices_constant_array_spreads() {
-        let model = model(
-            r#"
-            vars { xs = [2, 3] }
-            trace "t" { input = [1, ...var.xs, 4] }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(ints(model.traces[0].fields.input.as_ref().unwrap()), [1, 2, 3, 4]);
+    // the context keys an element's kind provides (true) or requires (false)
+    fn declared_context(&self, owner: ElementId, provides: bool) -> Vec<String> {
+        let names = |keys: &[FieldSchema]| keys.iter().map(|key| key.name.clone()).collect();
+        if let Some(kind) = self.kind_schema(owner) {
+            return names(if provides { &kind.provides } else { &kind.requires });
+        }
+        let (name, construct) = self.element_kind(owner);
+        let (provided, required) = primitive_context(builtin(construct, name), SrcRange::new(0, 0));
+        names(if provides { &provided } else { &required })
     }
 
-    #[test]
-    fn splices_spreads_of_dynamic_vars_as_binding_accessors() {
-        let model = model(r#"vars { xs = [range(1, 5)] } trace "t" { input = [...var.xs] }"#).unwrap();
-
-        // the sampled element is drawn once in the binding; the spliced element
-        // indexes into it instead of re-sampling
-        assert_eq!(model.bindings.len(), 1);
-        let Value::Array(definition) = &model.bindings[0].value else {
-            panic!("expected an array binding");
+    // a read names a key its element's kind requires, or one a provider upstream supplies
+    fn check_context(&mut self) {
+        let model = &self.model;
+        type Keys = BTreeMap<String, BTreeSet<ElementId>>;
+        // a nearer provider replaces whatever the path carried for the same key
+        let provide = |keys: &mut Keys, element: ElementId| {
+            for key in self.declared_context(element, true) {
+                keys.insert(key, BTreeSet::from([element]));
+            }
         };
-        assert!(matches!(
-            definition.elem[0],
-            ArrayElem::Item(Value::Func {
-                func: Func::Range(Range::Int { min: 1, max: 5 }),
-                ..
-            })
-        ));
-
-        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
-            panic!("expected an array");
+        // keys that reach each node from upstream, with the nearest supplier on every path
+        let mut reach: Vec<Keys> = vec![Keys::new(); model.nodes.len()];
+        let leaving = |reach: &[Keys], node: NodeId| {
+            let mut keys = reach[node.0].clone();
+            provide(&mut keys, ElementId::Node(node));
+            keys
         };
-        assert!(matches!(
-            &array.elem[0],
-            ArrayElem::Item(Value::Index { target, .. }) if matches!(&**target, Value::VarRef(name) if name == "xs")
-        ));
-    }
-
-    #[test]
-    fn merges_object_spreads_with_later_entries_winning() {
-        let model = model(
-            r#"
-            vars { meta = { model = "gpt", temperature = 0.2 } }
-            trace "t" {
-                metadata = { ...var.meta, temperature = 0.9 }
-                metrics = { temperature = 1, ...var.meta }
+        // what an edge sees at its source
+        let seen = |reach: &[Keys], edge: &Edge| {
+            let mut keys = leaving(reach, edge.source);
+            if let Some(fork) = edge.fork {
+                provide(&mut keys, ElementId::Fork(fork));
             }
-            "#,
-        )
-        .unwrap();
-        let fields = &model.traces[0].fields;
-
-        // the explicit key overrides the spread but keeps its position
-        let metadata = fields.metadata.as_ref().unwrap();
-        assert_eq!(metadata.elem.len(), 2);
-        assert_eq!(metadata.elem[0].key, "model");
-        assert_eq!(metadata.elem[1].key, "temperature");
-        assert!(matches!(metadata.elem[1].value, Value::Num(Number::Float(value)) if value == 0.9));
-
-        // a later spread also overrides an earlier explicit key
-        let metrics = fields.metrics.as_ref().unwrap();
-        assert!(matches!(metrics.elem[0].value, Value::Num(Number::Float(value)) if value == 0.2));
-    }
-
-    #[test]
-    fn rejects_explicit_duplicate_keys_even_through_a_merge() {
-        let errors = model(r#"trace "t" { metadata = { ...{}, a = 1, a = 2 } }"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::DuplicateObjectKey {
-                rule: spec::ids::UNIQUE_OBJECT_KEYS,
-                key: "a".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_mismatched_and_dynamic_spread_operands() {
-        let errors = model(r#"trace "t" { input = [...{ a = 1 }] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::SpreadTypeMismatch {
-                rule: spec::ids::SPREAD_OPERANDS,
-                expected: "array",
-                found: ExprType::Object,
-            }
-        );
-
-        let errors = model(r#"trace "t" { metadata = { ...[1] } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::SpreadTypeMismatch {
-                rule: spec::ids::SPREAD_OPERANDS,
-                expected: "object",
-                found: ExprType::Array,
-            }
-        );
-
-        // an array-typed dynamic spread stays residual and splices at generation
-        let model_ok = model(r#"trace "t" { input = [...choice([1], [2])] }"#).unwrap();
-        let Some(Value::Array(array)) = &model_ok.traces[0].fields.input else {
-            panic!("expected an array");
+            keys
         };
-        assert!(matches!(&array.elem[0], ArrayElem::Spread(Value::Func { .. })));
-
-        // a spread whose type never settles is still rejected
-        let errors = model(r#"trace "t" { input = [...choice([1], "x")] }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::SpreadTypeMismatch {
-                found: ExprType::Func,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_spreads_referencing_same_scope_vars_in_vars() {
-        let errors = model(r#"vars { a = [1] b = [...var.a] } trace "t" { input = 1 }"#).unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
-    }
-
-    #[test]
-    fn unrolls_array_for_exprs() {
-        let model = model(r#"trace "t" { input = [for x in [1, 2, 3] : x * 2] }"#).unwrap();
-
-        assert_eq!(ints(model.traces[0].fields.input.as_ref().unwrap()), [2, 4, 6]);
-    }
-
-    #[test]
-    fn unrolls_for_exprs_with_index_bindings_and_template_splices() {
-        let model = model(r#"trace "t" { input = [for i, x in ["a", "b"] : "${i}-${x}"] }"#).unwrap();
-
-        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
-            panic!("expected an array");
+        // what an edge hands on, which is also what a junction receives from it
+        let carried = |reach: &[Keys], index: usize| {
+            let mut keys = seen(reach, &model.edges[index]);
+            provide(&mut keys, ElementId::Edge(EdgeId(index)));
+            keys
         };
-        assert!(matches!(&array.elem[0], ArrayElem::Item(Value::Str(value)) if value == "0-a"));
-        assert!(matches!(&array.elem[1], ArrayElem::Item(Value::Str(value)) if value == "1-b"));
-    }
-
-    #[test]
-    fn unrolls_for_exprs_with_constant_filters() {
-        let model = model(r#"trace "t" { input = [for x in [1, 2, 3, 4] : x if x % 2 == 0] }"#).unwrap();
-
-        assert_eq!(ints(model.traces[0].fields.input.as_ref().unwrap()), [2, 4]);
-    }
-
-    #[test]
-    fn unrolls_for_exprs_over_objects() {
-        let model = model(
-            r#"
-            vars { meta = { a = 1, b = 2, c = 3 } }
-            trace "t" {
-                input = [for k in var.meta : k]
-                metadata = { for k, v in var.meta : k => v if k != "b" }
+        loop {
+            let mut arriving: Vec<(NodeId, Keys)> = Vec::new();
+            for (index, edge) in model.edges.iter().enumerate() {
+                // keys that reach a node travel along next edges only
+                let mut keys = if primitive(model, ElementId::Edge(EdgeId(index))) == Primitive::Next {
+                    leaving(&reach, edge.source)
+                } else {
+                    Keys::new()
+                };
+                // a fork's keys reach each branch destination
+                if let Some(fork) = edge.fork {
+                    if edge.source == model.forks[fork.0].source {
+                        provide(&mut keys, ElementId::Fork(fork));
+                    } else {
+                        let mut branch = Keys::new();
+                        provide(&mut branch, ElementId::Fork(fork));
+                        arriving.push((edge.source, branch));
+                    }
+                }
+                // an edge kind's keys reach its target
+                provide(&mut keys, ElementId::Edge(EdgeId(index)));
+                arriving.push((edge.target, keys));
             }
-            "#,
-        )
-        .unwrap();
-        let fields = &model.traces[0].fields;
-
-        let Some(Value::Array(keys)) = &fields.input else {
-            panic!("expected an array");
-        };
-        let keys: Vec<_> = keys
-            .elem
-            .iter()
-            .map(|value| match value {
-                ArrayElem::Item(Value::Str(value)) => value.as_str(),
-                other => panic!("expected a string, found {other:?}"),
+            for (index, junction) in model.junctions.iter().enumerate() {
+                let mut keys = Keys::new();
+                for input in &junction.inputs {
+                    for (key, suppliers) in carried(&reach, input.0) {
+                        keys.entry(key).or_default().extend(suppliers);
+                    }
+                }
+                provide(&mut keys, ElementId::Junction(JunctionId(index)));
+                arriving.push((junction.target, keys));
+            }
+            let mut changed = false;
+            for (node, keys) in arriving {
+                for (key, suppliers) in keys {
+                    let known = reach[node.0].entry(key).or_default();
+                    for supplier in suppliers {
+                        changed |= known.insert(supplier);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut errors = Vec::new();
+        for (owner, path, range) in &self.context_reads {
+            let Some(key) = path.first() else { continue };
+            let mut available: BTreeSet<String> = self.declared_context(*owner, false).into_iter().collect();
+            match *owner {
+                ElementId::Node(node) => {
+                    available.extend(reach[node.0].keys().cloned());
+                    // history is defined by the language for every node and is keyed by node name
+                    available.insert("history".to_owned());
+                    if key == "history" {
+                        let nodes = || {
+                            (model.names.iter())
+                                .filter(|(_, element)| matches!(element, ElementId::Node(_)))
+                                .map(|(name, _)| name.as_str())
+                        };
+                        if let Some(name) = path.get(1)
+                            && !nodes().any(|node| node == name)
+                        {
+                            errors.extend(error(
+                                *range,
+                                format!("unknown history node `{name}`{}", suggestion(name, nodes())),
+                            ));
+                        }
+                        continue;
+                    }
+                }
+                ElementId::Edge(edge) => available.extend(seen(&reach, &model.edges[edge.0]).into_keys()),
+                ElementId::Fork(fork) => available.extend(leaving(&reach, model.forks[fork.0].source).into_keys()),
+                ElementId::Junction(junction) => {
+                    for input in &model.junctions[junction.0].inputs {
+                        available.extend(carried(&reach, input.0).into_keys());
+                    }
+                }
+            }
+            if available.contains(key) {
+                continue;
+            }
+            let listed = if available.is_empty() {
+                "none are available".to_owned()
+            } else {
+                format!("available: {}", available.iter().cloned().collect::<Vec<_>>().join(", "))
+            };
+            errors.extend(error(
+                *range,
+                format!(
+                    "context key `{key}` is not available here{} ({listed})",
+                    suggestion(key, available.iter().map(String::as_str))
+                ),
+            ));
+        }
+        self.errors.extend(errors);
+        self.model.context_reads = (self.context_reads.iter())
+            .map(|(owner, path, range)| ContextRead {
+                owner: *owner,
+                path: path.clone(),
+                range: *range,
             })
             .collect();
-        assert_eq!(keys, ["a", "b", "c"]);
-
-        let metadata = fields.metadata.as_ref().unwrap();
-        assert_eq!(metadata.elem.len(), 2);
-        assert_eq!((metadata.elem[0].key.as_str(), metadata.elem[1].key.as_str()), ("a", "c"));
-    }
-
-    #[test]
-    fn unrolls_object_for_exprs_over_arrays() {
-        let model = model(r#"trace "t" { metadata = { for i, x in ["a", "b"] : x => i } }"#).unwrap();
-
-        let metadata = model.traces[0].fields.metadata.as_ref().unwrap();
-        assert_eq!(metadata.elem[0].key, "a");
-        assert!(matches!(metadata.elem[0].value, Value::Num(Number::Int(0))));
-        assert_eq!(metadata.elem[1].key, "b");
-        assert!(matches!(metadata.elem[1].value, Value::Num(Number::Int(1))));
-    }
-
-    #[test]
-    fn unrolls_for_exprs_into_typed_positions() {
-        let model = model(r#"trace "t" { tags = [for x in ["a", "b"] : "t-${x}"] }"#).unwrap();
-
-        // spliced tags stay templates of literal parts, joined during generation
-        let tags: Vec<String> = model.traces[0]
-            .fields
-            .tags
-            .iter()
-            .map(|tag| {
-                tag.parts
-                    .iter()
-                    .map(|part| match part {
-                        Part::Lit(value) => value.as_str(),
-                        Part::Ref(_) | Part::VarRef(_) | Part::Dynamic(_) => panic!("expected literal parts"),
+        self.model.context = reach
+            .into_iter()
+            .map(|keys| {
+                keys.into_iter()
+                    .map(|(key, suppliers)| ContextSupply {
+                        key,
+                        suppliers: suppliers.into_iter().collect(),
                     })
                     .collect()
             })
             .collect();
-        assert_eq!(tags, ["t-a", "t-b"]);
     }
 
-    #[test]
-    fn unrolls_for_exprs_keeping_dynamic_bodies() {
-        let model = model(r#"trace "t" { input = [for x in [1, 2] : x + range(0, 1)] }"#).unwrap();
-
-        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
-            panic!("expected an array");
-        };
-        assert_eq!(array.elem.len(), 2);
-        assert!(
-            array
-                .elem
-                .iter()
-                .all(|value| matches!(value, ArrayElem::Item(Value::Binary { .. })))
-        );
-    }
-
-    #[test]
-    fn unrolls_nested_for_exprs_with_shadowing() {
-        let model = model(r#"trace "t" { input = [for x in [[1, 2], [3]] : [for x in x : x * 10]] }"#).unwrap();
-
-        let Some(Value::Array(outer)) = &model.traces[0].fields.input else {
-            panic!("expected an array");
-        };
-        let ArrayElem::Item(first) = &outer.elem[0] else {
-            panic!("expected an item");
-        };
-        let ArrayElem::Item(second) = &outer.elem[1] else {
-            panic!("expected an item");
-        };
-        assert_eq!(ints(first), [10, 20]);
-        assert_eq!(ints(second), [30]);
-    }
-
-    #[test]
-    fn rejects_for_exprs_over_dynamic_or_scalar_collections() {
-        let errors = model(r#"trace "t" { input = [for x in choice([1], [2]) : x] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::ForCollectionMismatch {
-                rule: spec::ids::FOR_COLLECTIONS,
-                found: ExprType::Func,
+    fn validate_primitives(&self) -> Result<()> {
+        let mut errors = Vec::new();
+        for (i, junction) in self.model.junctions.iter().enumerate() {
+            // these checks read the junction's inputs and properties
+            if self.junction_state[i] != RESOLVED || self.unchecked.contains(&ElementId::Junction(JunctionId(i))) {
+                continue;
             }
-        );
-
-        let errors = model(r#"trace "t" { input = [for x in 5 : x] }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::ForCollectionMismatch {
-                found: ExprType::Number,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_for_filters_that_are_not_constant_booleans() {
-        let errors = model(r#"trace "t" { input = [for x in [range(0, 1)] : x if x > 0] }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonConstantForFilter {
-                rule: spec::ids::STATIC_FOR,
-                found: ExprType::Abstract,
-            }
-        );
-
-        let errors = model(r#"trace "t" { input = [for x in [1] : x if 5] }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::NonConstantForFilter {
-                found: ExprType::Number,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_for_keys_that_are_not_constant_strings() {
-        let errors = model(r#"trace "t" { metadata = { for i, x in [1] : i => x } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonConstantForKey {
-                rule: spec::ids::STATIC_FOR,
-                found: ExprType::Number,
-            }
-        );
-
-        let errors = model(r#"trace "t" { metadata = { for x in [1] : "${trace.index}" => x } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::NonConstantForKey {
-                found: ExprType::String,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_duplicate_keys_produced_by_unrolling() {
-        let errors = model(r#"trace "t" { metadata = { for x in ["a", "a"] : x => 1 } }"#).unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::DuplicateObjectKey { key, .. } if key == "a"));
-    }
-
-    #[test]
-    fn rejects_interpolating_non_scalar_bindings() {
-        let errors = model(r#"trace "t" { input = [for x in [[1]] : "${x}"] }"#).unwrap_err();
-
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonScalarInterpolation {
-                rule: spec::ids::SCALAR_INTERPOLATION,
-                found: ExprType::Array,
-            }
-        );
-    }
-
-    #[test]
-    fn splices_binding_templates_and_keeps_context_references() {
-        let model = model(r#"trace "t" { input = [for x in ["q ${trace.index}"] : "${x}!"] }"#).unwrap();
-
-        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
-            panic!("expected an array");
-        };
-        let ArrayElem::Item(Value::Template(template)) = &array.elem[0] else {
-            panic!("expected a template");
-        };
-        assert!(matches!(&template.parts[0], Part::Lit(value) if value == "q "));
-        assert!(matches!(template.parts[1], Part::Ref(CtxRef::TraceIndex)));
-        assert!(matches!(&template.parts[2], Part::Lit(value) if value == "!"));
-    }
-
-    #[test]
-    fn rejects_for_exprs_referencing_same_scope_vars_in_vars() {
-        let errors = model(r#"vars { a = [1] b = [for x in var.a : x] } trace "t" { input = 1 }"#).unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::VarNotInScope { .. }));
-    }
-
-    #[test]
-    fn associates_operator_errors_with_spec_rules() {
-        let errors = model(r#"trace "t" { input = 1 + "a" }"#).unwrap_err();
-        assert!(
-            errors[0]
-                .to_string()
-                .contains(spec::SPEC.rule(spec::ids::OPERAND_TYPES).unwrap().summary)
-        );
-
-        let errors = model(r#"trace "t" { input = 1 / 0 }"#).unwrap_err();
-        assert!(
-            errors[0]
-                .to_string()
-                .contains(spec::SPEC.rule(spec::ids::NONZERO_DIVISORS).unwrap().summary)
-        );
-
-        let errors = model(r#"trace "t" { input = 1 ? 2 : 3 }"#).unwrap_err();
-        assert!(
-            errors[0]
-                .to_string()
-                .contains(spec::SPEC.rule(spec::ids::BOOLEAN_CONDITIONS).unwrap().summary)
-        );
-    }
-
-    #[test]
-    fn models_dynamic_blocks_with_optional_names() {
-        let model = model(include_str!("../tests/fixtures/compilation.bt")).unwrap();
-
-        let children = &model.traces[0].children;
-        let Child::Repeat(repeat) = &children[0] else {
-            panic!("expected a repeat child");
-        };
-        assert_eq!(repeat.name.as_deref(), Some("turns"));
-        assert!(matches!(&repeat.count, Value::VarRef(name) if name == "turns"));
-        assert!(matches!(
-            repeat.children.as_slice(),
-            [Child::Span(Span {
-                kind: SpanKind::Task,
-                ..
-            })]
-        ));
-
-        let Child::Choice(choice) = &children[1] else {
-            panic!("expected a choice child");
-        };
-        assert_eq!(choice.name, None);
-        assert_eq!(choice.children.len(), 2);
-
-        let Child::Maybe(maybe) = &children[2] else {
-            panic!("expected a maybe child");
-        };
-        assert!(matches!(maybe.chance, Value::Num(Number::Float(value)) if value == 0.25));
-    }
-
-    #[test]
-    fn defaults_a_maybe_without_a_chance_to_a_coin_flip() {
-        let model = model(r#"trace "t" { maybe { task "extra" {} } }"#).unwrap();
-
-        let Child::Maybe(maybe) = &model.traces[0].children[0] else {
-            panic!("expected a maybe child");
-        };
-        assert!(matches!(maybe.chance, Value::Num(Number::Float(value)) if value == 0.5));
-    }
-
-    #[test]
-    fn rejects_dynamic_blocks_at_the_root_and_span_blocks_they_forbid() {
-        let errors = model(r#"repeat { count = 1 task "turn" {} }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::BlockNotAllowed {
-                block: spec::ids::REPEAT,
-                parent: spec::Place::Root,
-            }
-        );
-
-        let errors = model(r#"trace "t" { choice { trace "inner" {} task "turn" {} } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::BlockNotAllowed {
-                block: spec::ids::TRACE,
-                parent: spec::Place::Block { id: spec::ids::CHOICE },
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_dynamic_bodies() {
-        let errors = model(r#"trace "t" { repeat { task "turn" {} } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::MissingField {
-                block: spec::ids::REPEAT,
-                field: spec::ids::COUNT,
-            }
-        );
-
-        let errors = model(r#"trace "t" { repeat { count = 1 count = 2 task "turn" {} } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::DuplicateField {
-                block: spec::ids::REPEAT,
-                field: spec::ids::COUNT,
-            }
-        );
-
-        // span fields don't leak into dynamic bodies
-        let errors = model(r#"trace "t" { maybe { input = "hi" task "turn" {} } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::UnknownField {
-                block: spec::ids::MAYBE,
-                keyword: "input".to_owned(),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_invalid_counts_and_chances() {
-        let source = r#"trace "t" { repeat { count = "three" task "turn" {} } }"#;
-        let errors = model(source).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::TypeMismatch {
-                block: spec::ids::REPEAT,
-                field: spec::ids::COUNT,
-                expected: &spec::ExprType::Number,
-                found: ExprType::String,
-            }
-        );
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "\"three\"");
-
-        let errors = model(r#"trace "t" { repeat { count = 0 - 2 task "turn" {} } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NegativeRepeatCount {
-                rule: spec::ids::REPEAT_COUNT,
-            }
-        );
-
-        let errors = model(r#"trace "t" { repeat { count = 1.5 task "turn" {} } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::NonIntegerRepeatCount {
-                rule: spec::ids::REPEAT_COUNT,
-            }
-        );
-
-        let errors = model(r#"trace "t" { maybe { chance = 1.5 task "turn" {} } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::ChanceOutOfRange {
-                rule: spec::ids::MAYBE_CHANCE,
-            }
-        );
-    }
-
-    #[test]
-    fn allows_zero_counts_and_dynamic_bounds() {
-        let model = model(
-            r#"
-            trace "t" {
-                repeat { count = 0 task "turn" {} }
-                maybe { chance = range(0.0, 1.0) task "extra" {} }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
-            panic!("expected a repeat child");
-        };
-        assert!(matches!(repeat.count, Value::Num(Number::Int(0))));
-    }
-
-    #[test]
-    fn models_span_durations() {
-        let model = model(
-            r#"
-            trace "t" {
-                vars { latency = 0.25 }
-                duration = 60
-                task "a" { duration = lognormal(0.8, 0.5) }
-                llm "b" { duration = var.latency }
-                tool "c" { duration = 1.5 }
-                function "d" { duration = 2 }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let trace = &model.traces[0];
-        assert!(matches!(trace.fields.duration, Some((Value::Num(Number::Int(60)), _))));
-        let Child::Span(task) = &trace.children[0] else {
-            panic!("expected a span child");
-        };
-        assert!(matches!(task.fields.duration, Some((Value::Func { .. }, _))));
-        let Child::Span(llm) = &trace.children[1] else {
-            panic!("expected a span child");
-        };
-        // constant vars substitute during modeling
-        assert!(matches!(llm.fields.duration, Some((Value::Num(Number::Float(seconds)), _)) if seconds == 0.25));
-    }
-
-    #[test]
-    fn rejects_invalid_durations() {
-        let source = r#"trace "t" { duration = "fast" }"#;
-        let errors = model(source).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::TypeMismatch {
-                block: spec::ids::TRACE,
-                field: spec::ids::DURATION,
-                expected: &spec::ExprType::Number,
-                found: ExprType::String,
-            }
-        );
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "\"fast\"");
-
-        for source in [
-            r#"trace "t" { duration = 0 }"#,
-            r#"trace "t" { duration = 0.0 }"#,
-            r#"trace "t" { task "a" { duration = 0 - 2 } }"#,
-        ] {
-            let errors = model(source).unwrap_err();
-            assert_eq!(
-                errors[0].kind(),
-                &ErrorKind::DurationOutOfRange {
-                    rule: spec::ids::SPAN_DURATION,
+            if !self.primitive(ElementId::Junction(JunctionId(i))).is_root() {
+                let distinct: HashSet<_> = junction.inputs.iter().copied().collect();
+                if distinct.len() != junction.inputs.len() {
+                    errors.extend(error(
+                        junction.range,
+                        "built-in junction inputs must reference distinct edges",
+                    ));
                 }
-            );
+            }
+            if self.primitive(ElementId::Junction(JunctionId(i))) == Primitive::Quorum {
+                match self.property(ElementId::Junction(JunctionId(i)), "count") {
+                    Some(id) => {
+                        let binding = &self.model.bindings[id.0];
+                        if !matches!(&binding.value, Value::Num(Number::Int(count)) if *count >= 1 && usize::try_from(*count).is_ok_and(|count| count <= junction.inputs.len()))
+                        {
+                            errors.extend(error(
+                                binding.range,
+                                "quorum count must be a constant integer from one through the number of inputs",
+                            ));
+                        }
+                    }
+                    None => errors.extend(error(junction.range, "quorum junction requires a count property")),
+                }
+            }
         }
-    }
-
-    #[test]
-    fn rejects_empty_dynamic_blocks() {
-        let errors = model(r#"trace "t" { choice {} }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::EmptyDynamicBlock {
-                rule: spec::ids::DYNAMIC_CHILDREN,
-                block: spec::ids::CHOICE,
-            }
-        );
-    }
-
-    #[test]
-    fn scopes_repeat_index_to_repeat_blocks() {
-        let source = r#"trace "t" { input = "turn ${repeat.index}" }"#;
-        let errors = model(source).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::RepeatRefOutsideRepeat {
-                rule: spec::ids::REPEAT_REFS,
-                path: "repeat.index".into(),
-            }
-        );
-        // the range points at the reference expression inside the hole
-        let range = errors[0].range();
-        assert_eq!(&source[range.start..range.end], "repeat.index");
-
-        // valid inside a repeat, including through nested dynamic blocks
-        let model = model(
-            r#"
-            trace "t" {
-                repeat {
-                    count = 2
-                    maybe { task "turn" { input = "turn ${repeat.index}" } }
+        for (i, _node) in self.model.nodes.iter().enumerate() {
+            if !self.unchecked.contains(&ElementId::Node(NodeId(i)))
+                && self.primitive(ElementId::Node(NodeId(i))) == Primitive::Vars
+                && let Some(id) = self.property(ElementId::Node(NodeId(i)), "evaluate")
+            {
+                let binding = &self.model.bindings[id.0];
+                if !matches!(&binding.value,Value::Str(value) if value=="lazy"||value=="eager") {
+                    errors.extend(error(binding.range, "vars evaluate must be `lazy` or `eager`"));
                 }
             }
-            "#,
-        )
-        .unwrap();
-        let Child::Repeat(repeat) = &model.traces[0].children[0] else {
-            panic!("expected a repeat child");
-        };
-        let Child::Maybe(maybe) = &repeat.children[0] else {
-            panic!("expected a maybe child");
-        };
-        let Some(Value::Template(template)) = &as_span(&maybe.children[0]).fields.input else {
-            panic!("expected a template input");
-        };
-        assert!(matches!(template.parts[1], Part::Ref(CtxRef::RepeatIndex)));
-    }
-
-    #[test]
-    fn resolves_block_refs_to_sibling_fields() {
-        let model = model(
-            r#"
-            trace "t" {
-                output = llm.chat.output.content
-                llm "chat" { output = { content = "hi" } }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let Some(Value::BlockRef { ref_id, .. }) = &model.traces[0].fields.output else {
-            panic!("expected a block ref output");
-        };
-        let resolved = &model.refs[ref_id.0 as usize];
-        assert_eq!(resolved.up, 0);
-        assert_eq!(resolved.steps.len(), 1);
-        assert!(matches!(resolved.accessor, Accessor::Field(Field::Output)));
-        // .content drills into the field's json
-        assert!(matches!(&resolved.path[..], [Selection::Index(Value::Str(key))] if key == "content"));
-    }
-
-    #[test]
-    fn resolves_self_and_trace_heads() {
-        let model = model(
-            r#"
-            trace "t" {
-                input = "q"
-                llm "chat" {
-                    input = trace.input
-                    output = "a"
-                    metrics = { exact = tokens(self.output) }
-                }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let Child::Span(llm) = &model.traces[0].children[0] else {
-            panic!("expected a span");
-        };
-        // trace.input climbs one scope, self.output stays put; neither descends
-        let Some(Value::BlockRef { ref_id, .. }) = &llm.fields.input else {
-            panic!("expected a block ref input");
-        };
-        let resolved = &model.refs[ref_id.0 as usize];
-        assert_eq!((resolved.up, resolved.steps.len()), (1, 0));
-
-        let Some(metrics) = &llm.fields.metrics else {
-            panic!("expected metrics");
-        };
-        let Value::Func {
-            func: Func::Tokens { value },
-            ..
-        } = &metrics.elem[0].value
-        else {
-            panic!("expected a tokens call");
-        };
-        let Value::BlockRef { ref_id, .. } = &**value else {
-            panic!("expected a block ref argument");
-        };
-        let resolved = &model.refs[ref_id.0 as usize];
-        assert_eq!((resolved.up, resolved.steps.len()), (0, 0));
-        assert!(matches!(resolved.accessor, Accessor::Field(Field::Output)));
-    }
-
-    #[test]
-    fn allows_sibling_metric_keys_to_reference_each_other() {
-        let model = model(
-            r#"
-            trace "t" {
-                llm "chat" {
-                    metrics = {
-                        prompt_tokens = round(lognormal(600, 0.4)),
-                        completion_tokens = round(lognormal(90, 0.7)),
-                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
-                    }
-                }
-            }
-            "#,
-        );
-        assert!(model.is_ok());
-    }
-
-    #[test]
-    fn rejects_metric_keys_referencing_themselves() {
-        let errors = model(
-            r#"
-            trace "t" {
-                llm "chat" { metrics = { tokens = self.metrics.tokens + 1 } }
-            }
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::CircularReference { .. }));
-    }
-
-    #[test]
-    fn rejects_static_reference_cycles() {
-        let errors = model(
-            r#"
-            trace "t" {
-                task "a" { input = task.b.output output = task.a.input }
-                task "b" { input = task.a.output output = task.b.input }
-            }
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::CircularReference { .. }));
-
-        // cycles through a var are still cycles
-        let errors = model(
-            r#"
-            trace "t" {
-                task "a" {
-                    vars { echo = task.a.output }
-                    output = var.echo
-                }
-            }
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::CircularReference { .. }));
-    }
-
-    #[test]
-    fn resolves_duplicate_names_by_position() {
-        // extension leaves dead intermediate records that must stay silent
-        let model = model(
-            r#"
-            trace "t" {
-                llm "chat" { output = "one" }
-                llm "chat" { output = "two" }
-                task "sum" { input = [llm.chat[0].output, llm["chat"][trace.index % 2].output] }
-            }
-            "#,
-        );
-        assert!(model.is_ok());
-    }
-
-    #[test]
-    fn rejects_bad_block_refs_with_precise_diagnostics() {
-        type Matcher = fn(&ErrorKind) -> bool;
-        let cases: &[(&str, Matcher)] = &[
-            // no llm anywhere in scope
-            (r#"trace "t" { input = llm.chat.output task "x" {} }"#, |kind| {
-                matches!(kind, ErrorKind::UnknownBlockRef { .. })
-            }),
-            // two siblings, no index
-            (
-                r#"trace "t" { input = task.x.output task "x" { output = 1 } task "x" { output = 2 } }"#,
-                |kind| matches!(kind, ErrorKind::AmbiguousBlockRef { count: 2, .. }),
-            ),
-            // never reaches a field
-            (r#"trace "t" { input = task.x task "x" { output = 1 } }"#, |kind| {
-                matches!(kind, ErrorKind::IncompleteBlockRef { .. })
-            }),
-            // the target never sets the field
-            (r#"trace "t" { input = task.x.output task "x" { input = 1 } }"#, |kind| {
-                matches!(kind, ErrorKind::AbsentFieldRef { .. })
-            }),
-            // not a field or child kind
-            (r#"trace "t" { input = task.x.wat task "x" { output = 1 } }"#, |kind| {
-                matches!(kind, ErrorKind::InvalidRefSegment { .. })
-            }),
-            // constant position out of bounds
-            (r#"trace "t" { input = task.x[2].output task "x" { output = 1 } }"#, |kind| {
-                matches!(kind, ErrorKind::IndexOutOfBounds { .. })
-            }),
-        ];
-
-        for (source, matches_kind) in cases {
-            let errors = model(source).unwrap_err();
-            assert!(
-                matches_kind(errors[0].kind()),
-                "unexpected error for {source}: {:?}",
-                errors[0].kind()
-            );
         }
-    }
-
-    #[test]
-    fn rejects_self_outside_a_block_and_allows_module_field_aliases() {
-        let errors = model(r#"vars { x = self.output } trace "t" { input = var.x }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::SelfOutsideBlock { .. }));
-
-        let errors =
-            model(r#"vars { x = llm.chat.output } trace "t" { input = var.x llm "chat" { output = 1 } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::UnknownBlockRef { .. }));
-    }
-
-    #[test]
-    fn keeps_structure_independent_of_references() {
-        // count cannot reach a reference, directly or through a var
-        let errors =
-            model(r#"trace "t" { task "n" { output = 3 } repeat { count = task.n.output task "x" {} } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::StructuralBlockRef { .. }));
-
-        let errors = model(
-            r#"
-            trace "t" {
-                task "n" { output = 3 }
-                vars { n = task.n.output + 0 }
-                repeat { count = var.n task "x" {} }
+        for i in 0..self.model.edges.len() {
+            let owner = ElementId::Edge(EdgeId(i));
+            let direction = self
+                .kind_schema(owner)
+                .and_then(|kind| kind.direction)
+                .unwrap_or_else(|| primitive_direction(self.primitive(owner)));
+            if !direction.allows(self.model.edges[i].direction) {
+                errors.extend(error(
+                    self.model.edges[i].range,
+                    "edge direction is not permitted by its kind",
+                ));
             }
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::StructuralBlockRef { .. }));
-
-        let errors = model(r#"trace "t" { task "n" { output = [1] } input = [for x in task.n.output : x] }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::ForBlockRefCollection { .. }));
-    }
-
-    #[test]
-    fn models_block_refs_in_template_holes() {
-        let model = model(
-            r#"
-            trace "t" {
-                llm "chat" { output = { content = "hi" } }
-                input = "assistant said ${llm.chat.output.content}"
+            if self.unchecked.contains(&owner) {
+                continue;
             }
-            "#,
-        )
-        .unwrap();
-
-        let Some(Value::Template(template)) = &model.traces[0].fields.input else {
-            panic!("expected a template input");
-        };
-        assert!(matches!(&template.parts[1], Part::Dynamic(Value::BlockRef { .. })));
-    }
-
-    #[test]
-    fn resolves_repeat_collections_and_accessors() {
-        let model = model(
-            r#"
-            trace "t" {
-                repeat "rounds" {
-                    count = 3
-                    llm "chat" {
-                        input = [...repeat.rounds[:repeat.index].llm.chat.output]
-                        output = "r ${repeat.rounds.index} of ${repeat.rounds.count}"
+            if self.primitive(owner) == Primitive::Feeds
+                && let Some(into) = self.property(owner, "into")
+            {
+                let destination = &self.model.bindings[into.0];
+                if let Value::FieldRef(target) = destination.value {
+                    if let Some(value) = self.property(owner, "value") {
+                        let target = &self.model.bindings[target.0];
+                        let Value::Input { ty, .. } = target.value else {
+                            unreachable!()
+                        };
+                        let payload = &self.model.bindings[value.0];
+                        if let Err(diags) = expr::schema_type(self.reference_value(payload.value.clone()), ty, payload.range) {
+                            errors.extend(diags);
+                        }
+                    } else {
+                        errors.extend(error(destination.range, "feeds with a destination requires a value property"));
                     }
-                }
-                metadata = { last = repeat.rounds[0].llm.chat.output }
-            }
-            "#,
-        )
-        .unwrap();
-
-        // the metadata ref selects one iteration then descends
-        let last = model.refs.iter().find(|resolved| {
-            matches!(
-                &resolved.steps[..],
-                [Step::Child { .. }, Step::Iteration(_), Step::Child { .. }]
-            )
-        });
-        assert!(last.is_some(), "expected an iteration-selecting ref: {:?}", model.refs);
-
-        // the history ref projects over an iteration slice
-        let history = model.refs.iter().find(|resolved| {
-            matches!(
-                &resolved.steps[..],
-                [Step::Child { .. }, Step::Iterations { .. }, Step::Child { .. }]
-            )
-        });
-        assert!(history.is_some(), "expected a projecting ref: {:?}", model.refs);
-
-        // named accessors close without a field
-        assert!(model.refs.iter().any(|resolved| matches!(resolved.accessor, Accessor::Index)));
-        assert!(model.refs.iter().any(|resolved| matches!(resolved.accessor, Accessor::Count)));
-    }
-
-    #[test]
-    fn rejects_bad_repeat_references() {
-        // reserved names
-        let errors = model(r#"trace "t" { repeat "index" { count = 1 task "x" {} } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::ReservedRepeatName { .. }));
-
-        // descending without selecting an iteration
-        let errors = model(r#"trace "t" { repeat "r" { count = 1 llm "c" { output = 1 } } input = repeat.r.llm.c.output }"#)
-            .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::RepeatIterationRequired { .. }));
-
-        // index/count of a repeat that does not enclose the reference
-        let errors = model(r#"trace "t" { repeat "r" { count = 1 task "x" {} } input = repeat.r.index }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::RepeatRefOutsideRepeat { .. }));
-    }
-
-    #[test]
-    fn resolves_branch_accessors_and_crossings() {
-        // crossing an unnamed dynamic block finds nothing
-        let errors = model(
-            r#"
-            trace "t" {
-                choice { task "a" { output = 1 } task "b" { output = 2 } }
-                input = task.a.output
-            }
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::UnknownBlockRef { .. }));
-
-        let modeled = model(
-            r#"
-            trace "t" {
-                choice "outcome" {
-                    task "resolved" { output = "ok" }
-                    task "escalated" { output = "paged" }
-                }
-                maybe "retry" { chance = 0.5 task "again" { output = 1 } }
-                metadata = {
-                    picked = choice.outcome.chosen,
-                    retried = maybe.retry.included,
-                    resolved = choice.outcome.task.resolved.output != null,
+                } else {
+                    errors.extend(error(destination.range, "feeds destination must be a field reference"));
                 }
             }
-            "#,
-        )
-        .unwrap();
-
-        assert!(
-            modeled
-                .refs
-                .iter()
-                .any(|resolved| matches!(resolved.accessor, Accessor::Chosen))
-        );
-        assert!(
-            modeled
-                .refs
-                .iter()
-                .any(|resolved| matches!(resolved.accessor, Accessor::Included))
-        );
-    }
-
-    #[test]
-    fn models_dynamic_spreads_of_reference_projections() {
-        let model = model(
-            r#"
-            trace "t" {
-                repeat "r" { count = 2 llm "c" { output = { role = "assistant" } } }
-                input = [{ role = "user" }, ...repeat.r[:].llm.c.output]
-            }
-            "#,
-        )
-        .unwrap();
-
-        let Some(Value::Array(array)) = &model.traces[0].fields.input else {
-            panic!("expected an array input");
-        };
-        assert!(matches!(&array.elem[0], ArrayElem::Item(Value::Object(_))));
-        assert!(matches!(&array.elem[1], ArrayElem::Spread(Value::BlockRef { .. })));
-    }
-
-    #[test]
-    fn rejects_statically_non_scalar_template_holes() {
-        // a constant slice is an array no matter what feeds it
-        let errors = model(r#"vars { xs = [1, 2, 3] } trace "t" { input = "${var.xs[0:2]}" }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::NonScalarInterpolation {
-                found: ExprType::Array,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn models_a_code_scorer() {
-        let model = model(
-            r#"
-            scorer "response-quality" {
-                lang = "python"
-                code {
-                    score = clamp(normal(0.78, 0.12), 0, 1)
-                    when {
-                        cond = output == null
-                        score = 0
-                    }
-                    when {
-                        cond = contains(output, "I'm sorry")
-                        score = range(0.1, 0.4)
-                    }
+            if let Some(id) = self.property(ElementId::Edge(EdgeId(i)), "when") {
+                let binding = &self.model.bindings[id.0];
+                if let Err(diags) = expr::boolean(self.reference_value(binding.value.clone()), binding.range) {
+                    errors.extend(diags)
                 }
             }
-            "#,
-        )
-        .unwrap();
-
-        assert!(model.traces.is_empty());
-        assert_eq!(model.scorers.len(), 1);
-        let scorer = &model.scorers[0];
-        assert_eq!(scorer.name, "response-quality");
-        assert_eq!(scorer.lang, Some(ScorerLang::Python));
-        let ScorerKind::Code { score, steps } = &scorer.kind else {
-            panic!("expected a code scorer");
-        };
-        assert!(matches!(
-            score,
-            Value::Func {
-                func: Func::Clamp { .. },
-                ..
-            }
-        ));
-        assert_eq!(steps.len(), 2);
-        let ScorerStep::When(first) = &steps[0] else {
-            panic!("expected when")
-        };
-        let ScorerStep::When(second) = &steps[1] else {
-            panic!("expected when")
-        };
-        assert!(matches!(
-            &first.cond,
-            Value::Binary { op: BinOp::Eq, lhs, .. } if matches!(&**lhs, Value::ArgRef(ScorerArg::Output))
-        ));
-        assert!(matches!(first.score, Some(Value::Num(Number::Int(0)))));
-        assert!(matches!(
-            &second.cond,
-            Value::Func {
-                func: Func::Contains { .. },
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn models_scorer_repeats_with_innermost_index_and_outer_count() {
-        let model = model(
-            r#"scorer "s" {
-            code {
-                score = 0
-                repeat {
-                    count = len(output)
-                    when { cond = output[repeat.index] == expected score = 1 }
-                    repeat {
-                        count = repeat.index + 1
-                        when { cond = repeat.index < repeat.count score = 0.5 }
-                    }
-                }
-            }
-        }"#,
-        )
-        .unwrap();
-        let ScorerKind::Code { steps, .. } = &model.scorers[0].kind else {
-            panic!("expected code")
-        };
-        let ScorerStep::Repeat { count, steps } = &steps[0] else {
-            panic!("expected repeat")
-        };
-        assert!(matches!(
-            count,
-            Value::Func {
-                func: Func::Len { .. },
-                ..
-            }
-        ));
-        assert!(matches!(steps[0], ScorerStep::When(_)));
-        let ScorerStep::Repeat { count, steps } = &steps[1] else {
-            panic!("expected nested repeat")
-        };
-        assert!(matches!(count, Value::Binary { lhs, .. } if matches!(&**lhs, Value::CtxRef(CtxRef::RepeatIndex))));
-        assert!(matches!(steps[0], ScorerStep::When(_)));
-    }
-
-    #[test]
-    fn scorer_repeat_rejects_bad_count() {
-        let errors = model(
-            r#"scorer "s" { code {
-            score = 0
-            repeat { count = -1 when { cond = true score = 1 } }
-        } }"#,
-        )
-        .unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error.kind(), ErrorKind::NegativeRepeatCount { .. }))
-        );
-    }
-
-    #[test]
-    fn nests_when_and_repeat_in_scorer_code() {
-        let model = model(
-            r#"scorer "s" { code {
-            score = 0
-            when {
-                cond = len(output) > 0
-                when {
-                    cond = output[0] == expected
-                    when { cond = true score = 1 }
-                }
-                repeat { count = len(output) when { cond = output[repeat.index] == expected score = 0.5 } }
-                score = 0.25
-            }
-        } }"#,
-        )
-        .unwrap();
-        let ScorerKind::Code { steps, .. } = &model.scorers[0].kind else {
-            panic!("expected code")
-        };
-        let ScorerStep::When(outer) = &steps[0] else {
-            panic!("expected when")
-        };
-        assert_eq!(outer.steps.len(), 2);
-        assert!(matches!(outer.score, Some(Value::Num(Number::Float(value))) if value == 0.25));
-        let ScorerStep::When(middle) = &outer.steps[0] else {
-            panic!("expected nested when")
-        };
-        assert!(middle.score.is_none());
-        assert!(matches!(middle.steps[0], ScorerStep::When(_)));
-        assert!(matches!(outer.steps[1], ScorerStep::Repeat { .. }));
-    }
-
-    #[test]
-    fn when_requires_a_score_or_child_block() {
-        let errors = model(r#"scorer "s" { code { score = 0 when { cond = true } } }"#).unwrap_err();
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error.kind(), ErrorKind::MissingField { block, field }
-            if *block == spec::ids::WHEN && *field == spec::ids::SCORE))
-        );
-    }
-
-    #[test]
-    fn models_a_judge_scorer() {
-        let model = model(
-            r#"
-            scorer "helpfulness" {
-                judge {
-                    model = "gpt-4o-mini"
-                    prompt = "Rate the response to ${input} given ${output}."
-                    options = { excellent = 1.0, good = 0.6, poor = 0.2 }
-                }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let scorer = &model.scorers[0];
-        assert_eq!(scorer.lang, None);
-        let ScorerKind::Judge {
-            model: judge_model,
-            prompt,
-            options,
-        } = &scorer.kind
-        else {
-            panic!("expected a judge scorer");
-        };
-        assert_eq!(judge_model, "gpt-4o-mini");
-        let Value::Template(template) = prompt else {
-            panic!("expected a templated prompt");
-        };
-        assert!(
-            template
-                .parts
-                .iter()
-                .any(|part| matches!(part, Part::Dynamic(Value::ArgRef(ScorerArg::Input))))
-        );
-        assert!(
-            template
-                .parts
-                .iter()
-                .any(|part| matches!(part, Part::Dynamic(Value::ArgRef(ScorerArg::Output))))
-        );
-        assert_eq!(options.len(), 3);
-        assert_eq!((options[0].label.as_str(), options[0].score), ("excellent", 1.0));
-        assert_eq!((options[2].label.as_str(), options[2].score), ("poor", 0.2));
-    }
-
-    #[test]
-    fn models_scorers_alongside_traces() {
-        let model = model(
-            r#"
-            vars { threshold = 0.5 }
-            scorer "quality" { code { score = var.threshold } }
-            trace "t" { input = var.threshold }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(model.traces.len(), 1);
-        assert_eq!(model.scorers.len(), 1);
-        // the constant root var substitutes in both places
-        let ScorerKind::Code { score, .. } = &model.scorers[0].kind else {
-            panic!("expected a code scorer");
-        };
-        assert!(matches!(score, Value::Num(Number::Float(value)) if *value == 0.5));
-    }
-
-    #[test]
-    fn models_arg_selections() {
-        let model = model(
-            r#"
-            scorer "tiered" {
-                code {
-                    score = 0.9
-                    when {
-                        cond = metadata.tier == "pro"
-                        score = 1
-                    }
-                }
-            }
-            "#,
-        )
-        .unwrap();
-
-        let ScorerKind::Code { steps, .. } = &model.scorers[0].kind else {
-            panic!("expected a code scorer");
-        };
-        let ScorerStep::When(when) = &steps[0] else {
-            panic!("expected when")
-        };
-        assert!(matches!(
-            &when.cond,
-            Value::Binary { op: BinOp::Eq, lhs, .. }
-                if matches!(&**lhs, Value::Index { target, .. } if matches!(&**target, Value::ArgRef(ScorerArg::Metadata)))
-        ));
-    }
-
-    #[test]
-    fn rejects_generation_refs_in_scorers() {
-        for reference in ["llm.chat.output", "trace.index", "repeat.index", "self.output"] {
-            let errors = model(&format!(
-                r#"scorer "s" {{ code {{ score = 0.5 when {{ cond = {reference} == null score = 0 }} }} }}"#
-            ))
-            .unwrap_err();
-            assert!(
-                matches!(errors[0].kind(), ErrorKind::ScorerRef { path, .. } if path == reference),
-                "reference {reference}"
-            );
         }
-    }
-
-    #[test]
-    fn rejects_untranspilable_funcs_in_scorers() {
-        let errors = model(
-            r#"
-            scorer "s" {
-                code {
-                    score = tokens(output) / 100
-                    when {
-                        cond = len(noise(10)) > 5
-                        score = 0
-                    }
-                    when {
-                        cond = len([attachment("report.txt", "text/plain")]) > 0
-                        score = 0
+        let mut predicate_bindings = self.model.bindings.clone();
+        for (index, binding) in predicate_bindings.iter_mut().enumerate() {
+            if self.input_role(binding.owner, binding.property, &binding.path)
+                || self.output_role(binding.owner, binding.property, &binding.path)
+            {
+                binding.value = Value::Input {
+                    binding: BindingId(index),
+                    ty: binding.ty,
+                };
+            }
+        }
+        for (fork_index, fork) in self.model.forks.iter().enumerate() {
+            if self.primitive(ElementId::Fork(ForkId(fork_index))) == Primitive::Parallel {
+                for edge in fork.branches.iter().flatten() {
+                    if let Some(id) = self.property(ElementId::Edge(*edge), "when") {
+                        errors.extend(error(
+                            self.model.bindings[id.0].range,
+                            "parallel fork branches cannot have guards",
+                        ));
                     }
                 }
             }
-            "#,
-        )
-        .unwrap_err();
-
-        assert!(matches!(errors[0].kind(), ErrorKind::ScorerFunc { func: "tokens", .. }));
-        assert!(matches!(errors[1].kind(), ErrorKind::ScorerFunc { func: "noise", .. }));
-        assert!(matches!(errors[2].kind(), ErrorKind::ScorerFunc { func: "attachment", .. }));
-    }
-
-    #[test]
-    fn rejects_dynamic_vars_in_scorers() {
-        // a dynamic declaration inside the scorer
-        let errors = model(r#"scorer "s" { vars { roll = range(0, 1) } code { score = 0.5 } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::ScorerDynamicVar { name, .. } if name == "roll"
-        ));
-
-        // a use of a dynamic root var; the declaration itself stays legal
-        let errors = model(
-            r#"
-            vars { roll = range(0, 1) }
-            scorer "s" { code { score = var.roll } }
-            trace "t" { input = var.roll }
-            "#,
-        )
-        .unwrap_err();
-        assert_eq!(errors.len(), 1);
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::ScorerDynamicVar { name, .. } if name == "roll"
-        ));
-    }
-
-    #[test]
-    fn models_scorer_file_stems() {
-        let stemmed = model(r#"scorer "s" { file = "quality" code { score = 0.5 } }"#).unwrap();
-        assert_eq!(stemmed.scorers[0].file.as_deref(), Some("quality"));
-
-        // unset stays none so the builder falls back to the slug
-        let unset = model(r#"scorer "s" { code { score = 0.5 } }"#).unwrap();
-        assert_eq!(unset.scorers[0].file, None);
-
-        // judges accept the attr even though builds skip them
-        let judge =
-            model(r#"scorer "s" { file = "quality" judge { model = "m" prompt = "p" options = { a = 1, b = 0 } } }"#).unwrap();
-        assert_eq!(judge.scorers[0].file.as_deref(), Some("quality"));
-    }
-
-    #[test]
-    fn rejects_invalid_scorer_files() {
-        for file in [r#""quality.py""#, r#""gen/quality""#, r#""""#, "3", r#"choice("a", "b")"#] {
-            let errors = model(&format!(r#"scorer "s" {{ file = {file} code {{ score = 0.5 }} }}"#)).unwrap_err();
-            assert!(matches!(errors[0].kind(), ErrorKind::InvalidScorerFile { .. }), "file {file}");
+            if self.primitive(ElementId::Fork(ForkId(fork_index))) == Primitive::Exclusive {
+                for i in 0..fork.branches.len() {
+                    for j in i + 1..fork.branches.len() {
+                        for left in &fork.branches[i] {
+                            for right in &fork.branches[j] {
+                                // a guard that failed to lower cannot be compared
+                                if [left, right]
+                                    .iter()
+                                    .any(|edge| self.unchecked.contains(&ElementId::Edge(**edge)))
+                                {
+                                    continue;
+                                }
+                                let guard = |edge| {
+                                    self.property(ElementId::Edge(edge), "when")
+                                        .map(|id| self.model.bindings[id.0].value.clone())
+                                        .unwrap_or(Value::Bool(true))
+                                };
+                                if !disjoint(&guard(*left), &guard(*right), &predicate_bindings) {
+                                    errors.extend(error(
+                                        self.model.edges[right.0].range,
+                                        "exclusive fork guards overlap or cannot be proven disjoint",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-    }
-
-    #[test]
-    fn rejects_invalid_scorer_langs() {
-        for lang in [r#""rust""#, "3", "choice(\"python\", \"typescript\")"] {
-            let errors = model(&format!(r#"scorer "s" {{ lang = {lang} code {{ score = 0.5 }} }}"#)).unwrap_err();
-            assert!(matches!(errors[0].kind(), ErrorKind::InvalidScorerLang { .. }), "lang {lang}");
-        }
-    }
-
-    #[test]
-    fn requires_exactly_one_scorer_kind() {
-        let errors = model(r#"scorer "s" { lang = "python" }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::MissingScorerKind { .. }));
-
-        let errors = model(
-            r#"
-            scorer "s" {
-                code { score = 0.5 }
-                judge { model = "m" prompt = "p" options = { a = 1, b = 0 } }
-            }
-            "#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::ExtraScorerKind { .. }));
-
-        let errors = model(r#"scorer "s" { code { score = 0.5 } code { score = 0.7 } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::ExtraScorerKind { .. }));
-    }
-
-    #[test]
-    fn rejects_constant_scores_outside_range() {
-        let errors = model(r#"scorer "s" { code { score = 1.5 } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::ScoreOutOfRange { .. }));
-
-        let errors = model(r#"scorer "s" { code { score = 0.5 when { cond = output == null score = -1 } } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::ScoreOutOfRange { .. }));
-    }
-
-    #[test]
-    fn checks_scorer_field_types() {
-        let errors = model(r#"scorer "s" { code { score = "high" } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::TypeMismatch {
-                block: spec::ids::CODE,
-                field: spec::ids::SCORE,
-                expected: &spec::ExprType::Number,
-                found: ExprType::String,
-            }
-        );
-
-        let errors = model(r#"scorer "s" { code { score = 0.5 when { cond = 3 score = 0 } } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::TypeMismatch {
-                block: spec::ids::WHEN,
-                field: spec::ids::COND,
-                expected: &spec::ExprType::Boolean,
-                found: ExprType::Number,
-            }
-        );
-    }
-
-    #[test]
-    fn validates_judge_fields() {
-        let errors =
-            model(r#"scorer "s" { judge { model = "m ${input}" prompt = "p" options = { a = 1, b = 0 } } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgeModel { .. }));
-
-        let errors = model(r#"scorer "s" { judge { model = "m" prompt = "p" options = { a = 1 } } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgeOptions { .. }));
-
-        // prompt holes must be argument paths a template slot can express;
-        // a non-identifier key has no slot spelling
-        let errors = model(
-            r#"scorer "s" { judge { model = "m" prompt = "grade ${metadata["user tier"]}" options = { a = 1, b = 0 } } }"#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgePrompt { .. }));
-
-        // and a computed prompt expression is rejected even when it types as a string
-        let errors = model(
-            r#"scorer "s" { judge { model = "m" prompt = contains(output, "x") ? "a" : "b" options = { a = 1, b = 0 } } }"#,
-        )
-        .unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgePrompt { .. }));
-
-        // dotted argument selections stay legal prompt holes
-        let dotted =
-            model(r#"scorer "s" { judge { model = "m" prompt = "grade ${metadata.tier}" options = { a = 1, b = 0 } } }"#)
-                .unwrap();
-        assert!(matches!(dotted.scorers[0].kind, ScorerKind::Judge { .. }));
-
-        let errors = model(r#"scorer "s" { judge { model = "m" prompt = "p" options = { a = 1.5, b = 0 } } }"#).unwrap_err();
-        assert!(matches!(errors[0].kind(), ErrorKind::InvalidJudgeOptions { .. }));
-
-        let errors = model(r#"scorer "s" { judge { model = "m" options = { a = 1, b = 0 } } }"#).unwrap_err();
-        assert_eq!(
-            errors[0].kind(),
-            &ErrorKind::MissingField {
-                block: spec::ids::JUDGE,
-                field: spec::ids::PROMPT,
-            }
-        );
-    }
-
-    #[test]
-    fn enforces_scorer_block_placement() {
-        let errors = model(r#"trace "t" { when { cond = true score = 1 } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::WHEN
-        ));
-
-        let errors = model(r#"trace "t" { scorer "s" { code { score = 0.5 } } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::CODE
-        ));
-
-        let errors = model(r#"trace "t" { scorer "s" { score = 0.5 } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::UnknownScorerReference { name } if name == "s"
-        ));
-
-        let errors = model(r#"scorer "s" { task "x" { input = 1 } code { score = 0.5 } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::BlockNotAllowed { block, .. } if *block == spec::ids::TASK
-        ));
-
-        let errors = model(r#"scorer "s" { code "named" { score = 0.5 } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::UnexpectedName { block } if *block == spec::ids::CODE
-        ));
-
-        let errors = model(r#"scorer { code { score = 0.5 } }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::MissingName { block } if *block == spec::ids::SCORER
-        ));
-    }
-
-    #[test]
-    fn keeps_scorer_args_out_of_trace_scope() {
-        // bare scorer arg names stay unknown references in traces
-        let errors = model(r#"trace "t" { input = output }"#).unwrap_err();
-        assert!(matches!(
-            errors[0].kind(),
-            ErrorKind::UnknownReference { path, .. } if path == "output"
-        ));
-    }
-
-    #[test]
-    fn defers_contains_over_reference_fed_targets() {
-        // the widening that lets scorers probe args also serves block refs
-        let model = model(
-            r#"
-            trace "t" {
-                task "x" { output = "hello" }
-                metrics = { hit = contains(task.x.output, "ell") ? 1 : 0 }
-            }
-            "#,
-        )
-        .unwrap();
-
-        assert_eq!(model.traces.len(), 1);
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
     }
 }
 
-#[cfg(test)]
-mod agent_tests {
-    #[test]
-    fn validates_agent_declarations() {
-        for source in [
-            r#"agent "a" {}"#,
-            r#"agent "a" { entrypoint = "t" } trace "t" {}"#,
-            r#"agent "a" { entrypoint = trace.missing } trace "t" {}"#,
-            r#"agent "a" { entrypoint = trace.t.output } trace "t" { output = "x" }"#,
-            r#"agent "a" { entrypoint = trace.t.tool.child } trace "t" { tool "child" {} }"#,
-            r#"agent "a" { entrypoint = trace.t entrypoint = trace.t } trace "t" {}"#,
-            r#"agent "a" { entrypoint = trace.t unexpected = true } trace "t" {}"#,
-            r#"agent "a" { entrypoint = trace.t } agent "a" { entrypoint = trace.t } trace "t" {}"#,
-        ] {
-            assert!(crate::semantics::compile(source).is_err(), "{source}");
+fn reserved_name(name: &str) -> bool {
+    matches!(
+        name,
+        "self" | "source" | "target" | "left" | "right" | "context" | "true" | "false" | "null"
+    )
+}
+
+fn builtin_construct(name: &str) -> Option<Construct> {
+    [Construct::Node, Construct::Edge, Construct::Fork, Construct::Junction]
+        .into_iter()
+        .find(|construct| name == construct.name() || crate::spec::SPEC.primitive(construct.name(), name).is_some())
+}
+
+fn schema_entries(expr: &ast::Expr) -> Result<Vec<ast::Attr>> {
+    let ast::ExprKind::Object(items) = &expr.kind else {
+        return Err(error(expr.range, "schema descriptors must be objects"));
+    };
+    let mut seen = HashSet::new();
+    let mut fields = Vec::new();
+    for item in items {
+        let ast::ObjectItem::Attr(field) = item else {
+            return Err(error(expr.range, "schema spreads are not supported"));
+        };
+        if !seen.insert(&field.key) {
+            return Err(error(field.range, "duplicate schema key"));
+        }
+        fields.push(field.clone());
+    }
+    Ok(fields)
+}
+
+fn schema_string(expr: &ast::Expr) -> Result<String> {
+    match &expr.kind {
+        ast::ExprKind::Str(value) => Ok(value.clone()),
+        _ => Err(error(expr.range, "expected a literal schema string")),
+    }
+}
+
+fn type_named(name: &str) -> Option<FieldType> {
+    Some(match name {
+        "any" => FieldType::Any,
+        "string" => FieldType::String,
+        "number" => FieldType::Number,
+        "boolean" => FieldType::Boolean,
+        "array" => FieldType::Array,
+        "object" => FieldType::Object,
+        _ => return None,
+    })
+}
+
+fn schema_type(descriptor: &ast::Attr) -> Result<FieldType> {
+    type_named(&schema_string(&descriptor.value)?).ok_or_else(|| error(descriptor.range, "unknown schema value type"))
+}
+
+// the keys listed on one provides or requires relationship
+fn context_keys(relationship: &Relationship, inherited: &mut Vec<FieldSchema>) -> Result<()> {
+    let provides = matches!(relationship.relation, Relation::Provides);
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+    for attr in &relationship.keys {
+        if !seen.insert(&attr.key) {
+            errors.extend(error(key_range(attr), "duplicate context key"));
+        } else if attr.key == "history" {
+            errors.extend(error(key_range(attr), "context.history is defined by the language"));
+        } else if let Err(diags) = context_key(attr, inherited, provides) {
+            errors.extend(diags);
         }
     }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+// a required key takes a type, a provided key takes a type and may take the value it supplies
+fn context_key(attr: &ast::Attr, inherited: &mut Vec<FieldSchema>, provides: bool) -> Result<()> {
+    let position = inherited.iter().position(|entry| entry.name == attr.key);
+    let previous = position.map(|position| inherited[position].ty);
+    let mut ty = previous.unwrap_or(FieldType::Any);
+    let mut value = position.and_then(|position| inherited[position].value);
+    for descriptor in schema_entries(&attr.value)? {
+        match descriptor.key.as_str() {
+            "type" => ty = schema_type(&descriptor)?,
+            "value" if provides => value = Some(descriptor.range),
+            "value" => {
+                return Err(error(
+                    descriptor.range,
+                    "a required context key is supplied from outside the graph and takes no value",
+                ));
+            }
+            _ => {
+                return Err(error(
+                    descriptor.range,
+                    format!(
+                        "unknown context descriptor `{}`, a {}",
+                        descriptor.key,
+                        if provides {
+                            "provided context key takes type and value"
+                        } else {
+                            "required context key takes type only"
+                        }
+                    ),
+                ));
+            }
+        }
+    }
+    if previous.is_some_and(|previous| previous != FieldType::Any && previous != ty) {
+        return Err(error(attr.range, "a context key cannot change its inherited type"));
+    }
+    let schema = FieldSchema {
+        name: attr.key.clone(),
+        ty,
+        required: false,
+        default: None,
+        role: None,
+        value,
+        range: attr.range,
+    };
+    match position {
+        Some(position) => inherited[position] = schema,
+        None => inherited.push(schema),
+    }
+    Ok(())
+}
+
+// the context a built-in kind declares in the language reference
+fn primitive_context(primitive: Primitive, range: SrcRange) -> (Vec<FieldSchema>, Vec<FieldSchema>) {
+    let schemas = |keys: &[crate::spec::ContextDesc]| {
+        keys.iter()
+            .map(|key| FieldSchema {
+                name: key.name.to_owned(),
+                ty: type_named(key.ty).unwrap_or(FieldType::Any),
+                required: false,
+                default: None,
+                role: None,
+                value: None,
+                range,
+            })
+            .collect()
+    };
+    match crate::spec::SPEC.primitive(primitive.construct().name(), primitive.name()) {
+        Some(found) => (schemas(found.provides), schemas(found.requires)),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
+// the keys of an object literal, when it has no spread
+fn literal_keys(expr: &ast::Expr) -> Option<Vec<&ast::Attr>> {
+    let ast::ExprKind::Object(items) = &expr.kind else {
+        return None;
+    };
+    (items.iter())
+        .map(|item| match item {
+            ast::ObjectItem::Attr(attr) => Some(attr),
+            ast::ObjectItem::Spread(_) => None,
+        })
+        .collect()
+}
+
+// what an instance or an extension wrote over what a kind computes: the kind's keys in their order, each
+// replaced by the written one when there is one, then the keys only the writer has. Also the keys left to the kind
+fn merged(computed: &ast::Expr, written: &ast::Expr) -> Option<(Vec<ast::ObjectItem>, HashSet<String>)> {
+    let (computed, written) = (literal_keys(computed)?, literal_keys(written)?);
+    let mut kept = HashSet::new();
+    let mut items = Vec::new();
+    for attr in &computed {
+        let replaced = written.iter().find(|field| field.key == attr.key);
+        if replaced.is_none() {
+            kept.insert(attr.key.clone());
+        }
+        items.push(ast::ObjectItem::Attr((*replaced.unwrap_or(attr)).clone()));
+    }
+    for attr in written {
+        if !computed.iter().any(|field| field.key == attr.key) {
+            items.push(ast::ObjectItem::Attr(attr.clone()));
+        }
+    }
+    Some((items, kept))
+}
+
+// descriptors written directly in a definition's header braces or body
+fn schema_attrs(
+    attrs: &[ast::Attr],
+    inherited: &mut Vec<FieldSchema>,
+    content: bool,
+    over: &mut Vec<(SrcRange, SrcRange)>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut errors = Vec::new();
+    for attr in attrs {
+        if !seen.insert(&attr.key) {
+            errors.extend(error(attr.range, "duplicate schema key"));
+        } else if let Err(diags) = schema_field(attr.clone(), inherited, content, over) {
+            errors.extend(diags);
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+// an entry replacing an inherited one may only restrict it
+fn narrows(previous: &FieldSchema, schema: &FieldSchema, range: SrcRange) -> Result<()> {
+    if previous.ty != FieldType::Any && schema.ty != previous.ty {
+        return Err(error(range, "an extension cannot change an inherited field type"));
+    }
+    if previous.required && !schema.required {
+        return Err(error(range, "an extension cannot make a required field optional"));
+    }
+    Ok(())
+}
+
+fn schema_field(
+    field: ast::Attr,
+    inherited: &mut Vec<FieldSchema>,
+    content: bool,
+    over: &mut Vec<(SrcRange, SrcRange)>,
+) -> Result<()> {
+    {
+        let previous = inherited.iter().find(|entry| entry.name == field.key).cloned();
+        let mut schema = previous.clone().unwrap_or(FieldSchema {
+            name: field.key.clone(),
+            ty: FieldType::Any,
+            required: false,
+            default: None,
+            role: None,
+            value: None,
+            range: field.range,
+        });
+        schema.range = field.range;
+        // where this descriptor states a default and a value
+        let mut stated = (None, None);
+        for descriptor in schema_entries(&field.value)? {
+            match descriptor.key.as_str() {
+                "type" => {
+                    schema.ty = schema_type(&descriptor)?;
+                }
+                "required" => match descriptor.value.kind {
+                    ast::ExprKind::Bool(value) => schema.required = value,
+                    _ => return Err(error(descriptor.range, "required must be a literal boolean")),
+                },
+                "role" => schema.role = Some(schema_string(&descriptor.value)?),
+                "default" => {
+                    let value = expr::lower(descriptor.value, &[], &mut |expr| {
+                        Err(error(expr.range, "schema defaults cannot reference instances"))
+                    })?;
+                    if !expr::constant(&value) {
+                        return Err(error(descriptor.range, "schema defaults must be constant"));
+                    }
+                    schema.default = Some(value);
+                    stated.0 = Some(descriptor.range);
+                }
+                // the expression is kept by its location and lowered for each instance
+                "value" if content => {
+                    schema.value = Some(descriptor.range);
+                    stated.1 = Some(descriptor.range);
+                }
+                "value" => {
+                    return Err(error(
+                        descriptor.range,
+                        "a property descriptor takes no value, only a content field is computed",
+                    ));
+                }
+                _ => {
+                    return Err(error(
+                        descriptor.range,
+                        format!("unknown schema descriptor `{}`", descriptor.key),
+                    ));
+                }
+            }
+        }
+        // a field has a default or a value, and stating one replaces an inherited other
+        match stated {
+            (Some(_), Some(at)) => return Err(error(at, "a field takes a default or a value, not both")),
+            (Some(_), None) => schema.value = None,
+            (None, Some(stated)) => {
+                schema.default = None;
+                // an object stated over an inherited object is merged over it, like one an instance writes
+                if let Some(inherited) = previous.as_ref().and_then(|previous| previous.value) {
+                    over.push((stated, inherited));
+                }
+            }
+            (None, None) => {}
+        }
+        if let Some(previous) = &previous {
+            narrows(previous, &schema, field.range)?;
+        }
+        if let Some(default) = &schema.default {
+            expr::schema_type(
+                ReferenceValue {
+                    value: default.clone(),
+                    bindings: Vec::new(),
+                },
+                schema.ty,
+                schema.range,
+            )?;
+        }
+        if let Some(index) = inherited.iter().position(|entry| entry.name == schema.name) {
+            inherited[index] = schema;
+        } else {
+            inherited.push(schema);
+        }
+    }
+    Ok(())
+}
+
+fn primitive_direction(primitive: Primitive) -> Directions {
+    match primitive {
+        Primitive::Next | Primitive::Requires | Primitive::Contains | Primitive::Feeds => Directions::Directed,
+        Primitive::Incidence => Directions::Undirected,
+        _ => Directions::Either,
+    }
+}
+
+// the primitive a kind name means when no definition declares it, an unknown name installs nothing
+fn builtin(construct: Construct, name: &str) -> Primitive {
+    Primitive::named(construct, name).unwrap_or(construct.root())
+}
+
+fn primitive_properties(primitive: Primitive, range: SrcRange) -> Vec<FieldSchema> {
+    let construct = primitive.construct();
+    let mut names = Vec::new();
+    if construct == Construct::Edge {
+        names.push(("when", FieldType::Boolean, false));
+        names.push(("weight", FieldType::Number, false));
+        names.push(("max_traversals", FieldType::Number, false));
+    }
+    match primitive {
+        Primitive::Feeds => names.extend([("value", FieldType::Any, false), ("into", FieldType::Any, false)]),
+        Primitive::Accumulate | Primitive::First => names.push(("correlate", FieldType::Any, false)),
+        Primitive::Quorum => names.extend([("correlate", FieldType::Any, false), ("count", FieldType::Number, true)]),
+        Primitive::Vars => names.push(("evaluate", FieldType::String, false)),
+        Primitive::Network => names.extend([
+            ("nodes", FieldType::Array, true),
+            ("edges", FieldType::Array, true),
+            ("validate", FieldType::String, false),
+            ("acyclic", FieldType::String, false),
+            ("connected", FieldType::String, false),
+            ("self_loops", FieldType::Boolean, false),
+            ("max_parallel", FieldType::Number, false),
+            ("incoming", FieldType::Object, false),
+            ("outgoing", FieldType::Object, false),
+            ("degree", FieldType::Object, false),
+        ]),
+        Primitive::Relation => names.extend([
+            ("participants", FieldType::Object, false),
+            ("inputs", FieldType::Object, false),
+            ("outputs", FieldType::Object, false),
+            ("unique", FieldType::Boolean, false),
+        ]),
+        Primitive::Incidence => names.push(("role", FieldType::String, false)),
+
+        Primitive::Repeat => names.push(("count", FieldType::Number, true)),
+        Primitive::Each => names.extend([("items", FieldType::Array, true), ("concurrency", FieldType::Number, false)]),
+        Primitive::Reduce => names.extend([
+            ("correlate", FieldType::Any, false),
+            ("initial", FieldType::Any, true),
+            ("combine", FieldType::Any, true),
+            ("order", FieldType::String, false),
+        ]),
+        _ => {}
+    }
+    if construct == Construct::Junction && !primitive.is_root() {
+        names.extend([
+            ("observe", FieldType::String, false),
+            ("on_failure", FieldType::String, false),
+            ("on_cancel", FieldType::String, false),
+        ]);
+    }
+    names
+        .into_iter()
+        .map(|(name, ty, required)| FieldSchema {
+            name: name.to_owned(),
+            ty,
+            required,
+            default: None,
+            role: None,
+            value: None,
+            range,
+        })
+        .collect()
+}
+
+// the key of a property or field, without its value
+fn key_range(field: &ast::Attr) -> SrcRange {
+    SrcRange {
+        end: field.range.start + field.key.len(),
+        ..field.range
+    }
+}
+
+fn distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, b) in right.iter().enumerate() {
+            let substitution = diagonal + usize::from(a != *b);
+            diagonal = row[j + 1];
+            row[j + 1] = substitution.min(row[j] + 1).min(diagonal + 1);
+        }
+    }
+    row[right.len()]
+}
+
+// names the closest known name when a misspelling is within two edits of it
+pub(crate) fn suggestion<'a>(name: &str, known: impl Iterator<Item = &'a str>) -> String {
+    known
+        .map(|candidate| (distance(name, candidate), candidate))
+        .filter(|(distance, candidate)| *distance <= 2 && *distance < candidate.len())
+        .min()
+        .map(|(_, candidate)| format!(", did you mean `{candidate}`?"))
+        .unwrap_or_default()
+}
+
+fn construct_named(name: &str) -> Option<Construct> {
+    [Construct::Node, Construct::Edge, Construct::Fork, Construct::Junction]
+        .into_iter()
+        .find(|construct| construct.name() == name)
+}
+
+// what a definition head declares
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Defined {
+    Kind(Construct),
+    Trait,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    Extends,
+    Has,
+    On,
+    Provides,
+    Requires,
+}
+
+// which list of a kind a trait entry lands in
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Entry {
+    Property,
+    Field,
+    Provides,
+    Requires,
+}
+
+#[derive(Clone)]
+struct Relationship {
+    relation: Relation,
+    target: String,
+    // context keys, for provides and requires
+    keys: Vec<ast::Attr>,
+    // the connector and its target
+    range: SrcRange,
+}
+
+struct DefinitionEntry<'a> {
+    name: &'a str,
+    defined: Defined,
+    head: &'a ast::GraphNodeDecl,
+    relationships: Vec<Relationship>,
+    range: SrcRange,
+}
+
+// kinds and traits resolve together because they share one namespace
+#[derive(Default)]
+struct Definitions<'a> {
+    entries: Vec<DefinitionEntry<'a>>,
+    names: HashMap<&'a str, usize>,
+    // position within the model's kind or trait table
+    ids: Vec<usize>,
+    states: Vec<u8>,
+    kinds: Vec<Option<Kind>>,
+    traits: Vec<Option<Trait>>,
+    // the trait entry that supplied a property, field or context key of a kind
+    origins: Vec<HashMap<(Entry, String), usize>>,
+    // each value an extension states over one it inherits, in the order the definitions resolve
+    over: Vec<(SrcRange, SrcRange)>,
+}
+
+impl<'a> Definitions<'a> {
+    fn add(
+        &mut self,
+        name: &'a str,
+        defined: Defined,
+        head: &'a ast::GraphNodeDecl,
+        relationships: Vec<Relationship>,
+        range: SrcRange,
+        broken: bool,
+    ) {
+        let id = self
+            .entries
+            .iter()
+            .filter(|entry| (entry.defined == Defined::Trait) == (defined == Defined::Trait))
+            .count();
+        self.names.insert(name, self.entries.len());
+        self.entries.push(DefinitionEntry {
+            name,
+            defined,
+            head,
+            relationships,
+            range,
+        });
+        self.ids.push(id);
+        // malformed relationships were reported where they were read
+        self.states.push(if broken { FAILED } else { PENDING });
+        self.kinds.push(None);
+        self.traits.push(None);
+        self.origins.push(HashMap::new());
+    }
+
+    fn enter(&mut self, index: usize, cycle: &str) -> Result<()> {
+        match self.states[index] {
+            FAILED => Err(Vec::new()),
+            RESOLVING => Err(error(self.entries[index].range, cycle)),
+            _ => {
+                self.states[index] = RESOLVING;
+                Ok(())
+            }
+        }
+    }
+
+    fn resolve_trait(&mut self, index: usize) -> Result<Trait> {
+        if let Some(resolved) = &self.traits[index] {
+            return Ok(resolved.clone());
+        }
+        self.enter(index, "circular trait extension")?;
+        let resolved = self.resolve_trait_definition(index);
+        self.states[index] = if resolved.is_ok() { RESOLVED } else { FAILED };
+        self.traits[index] = resolved.as_ref().ok().cloned();
+        resolved
+    }
+
+    fn resolve_trait_definition(&mut self, index: usize) -> Result<Trait> {
+        let entry = &self.entries[index];
+        let (name, head, range) = (entry.name, entry.head, entry.range);
+        let relationships = entry.relationships.clone();
+        let mut errors = Vec::new();
+        let mut base = None;
+        let mut extended = false;
+        let mut on: Vec<(Construct, SrcRange)> = Vec::new();
+        for relationship in &relationships {
+            let target = relationship.target.as_str();
+            match relationship.relation {
+                Relation::Has => errors.extend(error(
+                    relationship.range,
+                    "a trait cannot have traits, it may extend one trait",
+                )),
+                Relation::Provides | Relation::Requires => {}
+                Relation::On => match construct_named(target) {
+                    Some(construct) => {
+                        if !on.iter().any(|(listed, _)| *listed == construct) {
+                            on.push((construct, relationship.range));
+                        }
+                    }
+                    None => errors.extend(error(
+                        relationship.range,
+                        "`on` targets a construct: node, edge, fork or junction",
+                    )),
+                },
+                Relation::Extends if extended => {
+                    errors.extend(error(relationship.range, "a trait extends at most one trait"));
+                }
+                Relation::Extends => {
+                    extended = true;
+                    match self.names.get(target) {
+                        Some(&found) if self.entries[found].defined == Defined::Trait => base = Some(found),
+                        None if builtin_construct(target).is_none() => {
+                            errors.extend(error(relationship.range, format!("unknown trait `{target}`")));
+                        }
+                        _ => errors.extend(error(
+                            relationship.range,
+                            format!("a trait can only extend a trait, `{target}` is a kind"),
+                        )),
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let mut resolved = match base {
+            Some(base) => {
+                let mut resolved = self.resolve_trait(base)?;
+                for (construct, at) in &on {
+                    if !resolved.on.contains(construct) {
+                        errors.extend(error(
+                            *at,
+                            format!(
+                                "trait `{}` is not on {}, an extension can only narrow where it applies",
+                                resolved.name,
+                                construct.name()
+                            ),
+                        ));
+                    }
+                }
+                resolved.base = Some(TraitId(self.ids[base]));
+                resolved
+            }
+            None => Trait {
+                name: String::new(),
+                base: None,
+                on: Vec::new(),
+                props: Vec::new(),
+                fields: Vec::new(),
+                provides: Vec::new(),
+                requires: Vec::new(),
+                range,
+            },
+        };
+        resolved.name = name.to_owned();
+        resolved.range = range;
+        if !on.is_empty() {
+            resolved.on = on.into_iter().map(|(construct, _)| construct).collect();
+        }
+        if resolved.on.is_empty() {
+            errors.extend(error(range, "a trait needs at least one `on` relationship"));
+        }
+        let props = head.header.props.as_deref().unwrap_or(&[]);
+        if let Err(diags) = schema_attrs(props, &mut resolved.props, false, &mut self.over) {
+            errors.extend(diags);
+        }
+        let body = head.body.as_deref().unwrap_or(&[]);
+        if let Err(diags) = schema_attrs(body, &mut resolved.fields, true, &mut self.over) {
+            errors.extend(diags);
+        }
+        for relationship in &relationships {
+            let keys = match relationship.relation {
+                Relation::Provides => &mut resolved.provides,
+                Relation::Requires => &mut resolved.requires,
+                _ => continue,
+            };
+            if let Err(diags) = context_keys(relationship, keys) {
+                errors.extend(diags);
+            }
+        }
+        if !resolved.fields.is_empty() && resolved.on.iter().any(|construct| *construct != Construct::Node) {
+            errors.extend(error(
+                range,
+                "only nodes have content fields, a trait with fields applies to node alone",
+            ));
+        }
+        if resolved.fields.iter().any(|field| field.name == "props") {
+            errors.extend(error(range, "props is reserved for node properties"));
+        }
+        if errors.is_empty() { Ok(resolved) } else { Err(errors) }
+    }
+
+    fn resolve_kind(&mut self, index: usize, construct: Construct) -> Result<Kind> {
+        if let Some(kind) = &self.kinds[index] {
+            return Ok(kind.clone());
+        }
+        self.enter(index, "circular kind extension")?;
+        let resolved = self.resolve_kind_definition(index, construct);
+        self.states[index] = if resolved.is_ok() { RESOLVED } else { FAILED };
+        self.kinds[index] = resolved.as_ref().ok().cloned();
+        resolved
+    }
+
+    fn resolve_kind_definition(&mut self, index: usize, construct: Construct) -> Result<Kind> {
+        let entry = &self.entries[index];
+        let (name, head, range) = (entry.name, entry.head, entry.range);
+        let relationships = entry.relationships.clone();
+        let mut errors = Vec::new();
+        let mut base = None;
+        let mut has = Vec::new();
+        let mut context = Vec::new();
+        for relationship in &relationships {
+            match relationship.relation {
+                Relation::On => errors.extend(error(relationship.range, "`on` belongs to a trait definition")),
+                Relation::Has => has.push(relationship),
+                Relation::Provides | Relation::Requires => context.push(relationship),
+                Relation::Extends if base.is_some() => {
+                    errors.extend(error(relationship.range, "a kind extends one base"));
+                }
+                Relation::Extends => base = Some(relationship),
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let crosses = |at: SrcRange| error(at, "kind extension crosses graph construct categories");
+        let root = |base: &str, at: SrcRange| {
+            let primitive = builtin(construct, base);
+            let (provides, requires) = primitive_context(primitive, at);
+            Kind {
+                name: String::new(),
+                base: base.to_owned(),
+                base_kind: None,
+                construct,
+                primitive,
+                direction: (construct == Construct::Edge).then(|| primitive_direction(primitive)),
+                props: primitive_properties(primitive, at),
+                fields: Vec::new(),
+                // the built-in node kinds take any content field
+                open: true,
+                provides,
+                requires,
+                traits: Vec::new(),
+                range: at,
+            }
+        };
+        let mut origins = HashMap::new();
+        let mut kind = match base {
+            None => root(construct.name(), range),
+            Some(relationship) => {
+                let target = relationship.target.as_str();
+                match self.names.get(target).copied() {
+                    Some(found) => {
+                        let Defined::Kind(base_construct) = self.entries[found].defined else {
+                            return Err(error(
+                                relationship.range,
+                                format!("a kind cannot extend a trait, attach `{target}` with has"),
+                            ));
+                        };
+                        if base_construct != construct {
+                            return Err(crosses(relationship.range));
+                        }
+                        let mut kind = self.resolve_kind(found, base_construct)?;
+                        kind.base_kind = Some(KindId(self.ids[found]));
+                        kind.base = target.to_owned();
+                        origins = self.origins[found].clone();
+                        kind
+                    }
+                    None => {
+                        let found = builtin_construct(target)
+                            .ok_or_else(|| error(relationship.range, format!("unknown base kind `{target}`")))?;
+                        if found != construct {
+                            return Err(crosses(relationship.range));
+                        }
+                        root(target, range)
+                    }
+                }
+            }
+        };
+        kind.name = name.to_owned();
+        kind.range = range;
+        // a dependency that already reported its own failure fails this kind without another diagnostic
+        let mut failed = false;
+        for relationship in has {
+            let target = relationship.target.as_str();
+            let found = match self.names.get(target).copied() {
+                Some(found) if self.entries[found].defined == Defined::Trait => found,
+                None if builtin_construct(target).is_none() => {
+                    errors.extend(error(relationship.range, format!("unknown trait `{target}`")));
+                    continue;
+                }
+                _ => {
+                    errors.extend(error(relationship.range, format!("`{target}` is a kind, not a trait")));
+                    continue;
+                }
+            };
+            let attached = match self.resolve_trait(found) {
+                Ok(attached) => attached,
+                Err(diags) => {
+                    errors.extend(diags);
+                    failed = true;
+                    continue;
+                }
+            };
+            if !attached.on.contains(&construct) {
+                errors.extend(error(
+                    relationship.range,
+                    format!("trait `{target}` is not on {}", construct.name()),
+                ));
+                continue;
+            }
+            if kind.traits.contains(&TraitId(self.ids[found])) {
+                continue;
+            }
+            // the trait and every trait it extends
+            let mut lineage = vec![found];
+            let mut next = attached.base;
+            while let Some(base) = next {
+                let Some(position) = (0..self.entries.len())
+                    .find(|&entry| self.entries[entry].defined == Defined::Trait && self.ids[entry] == base.0)
+                else {
+                    break;
+                };
+                lineage.push(position);
+                next = self.traits[position].as_ref().and_then(|extended| extended.base);
+            }
+            for (entry, supplied) in [
+                (Entry::Property, &attached.props),
+                (Entry::Field, &attached.fields),
+                (Entry::Provides, &attached.provides),
+                (Entry::Requires, &attached.requires),
+            ] {
+                let (entries, what) = match entry {
+                    Entry::Property => (&mut kind.props, "property"),
+                    Entry::Field => (&mut kind.fields, "field"),
+                    Entry::Provides => (&mut kind.provides, "provided context key"),
+                    Entry::Requires => (&mut kind.requires, "required context key"),
+                };
+                for field in supplied {
+                    let key = (entry, field.name.clone());
+                    let Some(position) = entries.iter().position(|entry| entry.name == field.name) else {
+                        entries.push(field.clone());
+                        origins.insert(key, found);
+                        continue;
+                    };
+                    match origins.get(&key).copied() {
+                        // an extended trait already supplied this entry, the extension restricts it
+                        Some(origin) if lineage.contains(&origin) => {
+                            match narrows(&entries[position], field, relationship.range) {
+                                Ok(()) => {
+                                    entries[position] = field.clone();
+                                    origins.insert(key, found);
+                                }
+                                Err(diags) => errors.extend(diags),
+                            }
+                        }
+                        Some(origin) => errors.extend(error(
+                            relationship.range,
+                            format!(
+                                "{what} `{}` is declared by both trait `{}` and trait `{target}`",
+                                field.name, self.entries[origin].name
+                            ),
+                        )),
+                        None => errors.extend(error(
+                            relationship.range,
+                            format!(
+                                "trait `{target}` declares {what} `{}`, which `{name}` already has from its base",
+                                field.name
+                            ),
+                        )),
+                    }
+                }
+            }
+            for member in lineage {
+                let id = TraitId(self.ids[member]);
+                if !kind.traits.contains(&id) {
+                    kind.traits.push(id);
+                }
+            }
+        }
+        if failed && errors.is_empty() {
+            return Err(errors);
+        }
+        let mut props = head.header.props.as_deref().unwrap_or(&[]).to_vec();
+        // a declared kind is closed unless it says otherwise, and a closed base stays closed
+        let base_open = std::mem::replace(&mut kind.open, false);
+        if construct == Construct::Node {
+            // open is a reserved header key on node kinds, not a property descriptor
+            let mut seen = false;
+            props.retain(|field| {
+                if field.key != "open" {
+                    return true;
+                }
+                match field.value.kind {
+                    _ if seen => errors.extend(error(field.range, "duplicate schema key")),
+                    ast::ExprKind::Bool(true) if !base_open => {
+                        errors.extend(error(field.range, "a kind cannot reopen the closed root of its base"));
+                    }
+                    ast::ExprKind::Bool(open) => kind.open = open,
+                    _ => errors.extend(error(field.range, "open must be a literal boolean")),
+                }
+                seen = true;
+                false
+            });
+        }
+        if construct == Construct::Edge {
+            // direction is a reserved header key on edge kinds, not a property descriptor
+            let mut seen = false;
+            props.retain(|field| {
+                if field.key != "direction" {
+                    return true;
+                }
+                if seen {
+                    errors.extend(error(field.range, "duplicate schema key"));
+                } else if let Err(diags) = kind_direction(field, &mut kind) {
+                    errors.extend(diags);
+                }
+                seen = true;
+                false
+            });
+        }
+        if let Err(diags) = schema_attrs(&props, &mut kind.props, false, &mut self.over) {
+            errors.extend(diags);
+        }
+        let body = head.body.as_deref().unwrap_or(&[]);
+        if construct != Construct::Node && !body.is_empty() {
+            errors.extend(error(body[0].range, "only node kinds have content fields"));
+        } else if let Err(diags) = schema_attrs(body, &mut kind.fields, true, &mut self.over) {
+            errors.extend(diags);
+        }
+        if kind.fields.iter().any(|field| field.name == "props") {
+            errors.extend(error(kind.range, "props is reserved for node properties"));
+        }
+        for relationship in context {
+            let keys = match relationship.relation {
+                Relation::Provides => &mut kind.provides,
+                _ => &mut kind.requires,
+            };
+            if let Err(diags) = context_keys(relationship, keys) {
+                errors.extend(diags);
+            }
+        }
+        if errors.is_empty() {
+            self.origins[index] = origins;
+            Ok(kind)
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+fn step_range(step: &ast::GraphStep) -> SrcRange {
+    match step {
+        ast::GraphStep::Edge(edge) => edge.range,
+        ast::GraphStep::Fork(fork) => fork.range,
+        ast::GraphStep::Arms(arms) => step_range(&arms[0][0]),
+    }
+}
+
+// every relationship is one edge from the definition head
+fn relationships(steps: &[ast::GraphStep]) -> (Vec<Relationship>, Diags) {
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    let arms: Vec<&[ast::GraphStep]> = match steps {
+        [ast::GraphStep::Arms(arms)] => arms.iter().map(Vec::as_slice).collect(),
+        _ => vec![steps],
+    };
+    for arm in arms {
+        let Some((first, rest)) = arm.split_first() else { continue };
+        match first {
+            ast::GraphStep::Edge(step) => match relationship(step) {
+                Ok(relationship) => found.push(relationship),
+                Err(diags) => errors.extend(diags),
+            },
+            other => errors.extend(error(step_range(other), "a definition takes relationship edges only")),
+        }
+        if let Some(next) = rest.first() {
+            errors.extend(error(
+                step_range(next),
+                "a relationship starts at the definition head, write each one on its own aligned line",
+            ));
+        }
+    }
+    (found, errors)
+}
+
+fn relationship(step: &ast::GraphEdgeStep) -> Result<Relationship> {
+    let [header] = step.edges.as_slice() else {
+        return Err(error(step.range, "a relationship edge holds one relationship"));
+    };
+    let relation = match header.kind.as_str() {
+        "extends" => Relation::Extends,
+        "has" => Relation::Has,
+        "on" => Relation::On,
+        "provides" => Relation::Provides,
+        "requires" => Relation::Requires,
+        other => {
+            return Err(error(
+                header.range,
+                format!("unknown relationship `{other}`, expected extends, has, on, provides or requires"),
+            ));
+        }
+    };
+    let context = matches!(relation, Relation::Provides | Relation::Requires);
+    if header.name.is_some() || (!context && header.props.is_some()) {
+        return Err(error(
+            header.range,
+            if context {
+                "a relationship edge has no name"
+            } else {
+                "a relationship edge has no name and no properties"
+            },
+        ));
+    }
+    if step.cycle || step.direction != Direction::Directed {
+        return Err(error(step.range, "a relationship edge is written -|:kind|->"));
+    }
+    let target = match &step.target {
+        ast::GraphNode::Reference(ast::Expr {
+            kind: ast::ExprKind::GraphRef { target, .. },
+            ..
+        }) => match &target.kind {
+            ast::ExprKind::Ref { path } if path.len() == 1 => Some(path[0].clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(target) = target else {
+        return Err(error(step.range, "a relationship target references a definition by name"));
+    };
+    let keys = header.props.clone().unwrap_or_default();
+    if context && (target != "context" || keys.is_empty()) {
+        return Err(error(
+            step.range,
+            format!(
+                "`{}` lists context keys and targets context, written -|:{} {{key: {{type: \"any\"}}}}|->(context)",
+                header.kind, header.kind
+            ),
+        ));
+    }
+    Ok(Relationship {
+        relation,
+        target,
+        keys,
+        range: step.range,
+    })
+}
+
+fn kind_direction(field: &ast::Attr, kind: &mut Kind) -> Result<()> {
+    let direction = match schema_string(&field.value)?.as_str() {
+        "directed" => Directions::Directed,
+        "undirected" => Directions::Undirected,
+        "either" => Directions::Either,
+        _ => return Err(error(field.range, "direction must be directed, undirected or either")),
+    };
+    if kind.direction != Some(Directions::Either) && kind.direction != Some(direction) {
+        return Err(error(
+            field.range,
+            "an extension cannot widen or contradict its base direction",
+        ));
+    }
+    kind.direction = Some(direction);
+    Ok(())
+}
+
+// find one distinct edge per constraint without enumerating their permutations
+fn distinct_edge_assignment(candidates: &[Vec<EdgeId>], fixed: Option<(usize, EdgeId)>) -> bool {
+    fn assign(
+        index: usize,
+        candidates: &[Vec<EdgeId>],
+        fixed: Option<(usize, EdgeId)>,
+        owners: &mut HashMap<EdgeId, usize>,
+        visited: &mut HashSet<EdgeId>,
+    ) -> bool {
+        for edge in &candidates[index] {
+            if fixed.is_some_and(|(_, fixed_edge)| *edge == fixed_edge) || !visited.insert(*edge) {
+                continue;
+            }
+            let previous = owners.get(edge).copied();
+            if previous.is_none_or(|previous| assign(previous, candidates, fixed, owners, visited)) {
+                owners.insert(*edge, index);
+                return true;
+            }
+        }
+        false
+    }
+    let mut owners = HashMap::new();
+    for index in 0..candidates.len() {
+        if fixed.is_some_and(|(fixed_index, _)| index == fixed_index) {
+            continue;
+        }
+        if !assign(index, candidates, fixed, &mut owners, &mut HashSet::new()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Str(a), Value::Str(b)) => a == b,
+        (Value::Num(Number::Int(a)), Value::Num(Number::Int(b))) => a == b,
+        (Value::Num(a), Value::Num(b)) => {
+            let number = |n: &Number| match n {
+                Number::Int(n) => *n as f64,
+                Number::Float(n) => *n,
+            };
+            number(a) == number(b)
+        }
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Null, Value::Null) => true,
+        (Value::Array(a), Value::Array(b)) => {
+            a.elem.len() == b.elem.len()
+                && a.elem.iter().zip(&b.elem).all(|(a, b)| match (a, b) {
+                    (ArrayElem::Item(a), ArrayElem::Item(b)) => same_value(a, b),
+                    _ => false,
+                })
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.elem.len() == b.elem.len()
+                && a.elem.iter().all(|a| {
+                    b.elem
+                        .iter()
+                        .find(|b| b.key == a.key)
+                        .is_some_and(|b| same_value(&a.value, &b.value))
+                })
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+enum Predicate {
+    Constant(bool),
+    Atom(usize),
+    Not(Box<Predicate>),
+    And(Box<Predicate>, Box<Predicate>),
+    Or(Box<Predicate>, Box<Predicate>),
+}
+fn predicate_key(value: &Value) -> String {
+    match value {
+        Value::BindingRef(id, _) => format!("binding:{}", id.0),
+        Value::Unary { op, operand, .. } => format!("{op:?}({})", predicate_key(operand)),
+        Value::Binary { op, lhs, rhs, .. } => format!("{op:?}({},{})", predicate_key(lhs), predicate_key(rhs)),
+        Value::Index { target, index, .. } => format!("index({},{})", predicate_key(target), predicate_key(index)),
+        // function calls retain their source positions because they may sample independently
+        _ => format!("{value:?}"),
+    }
+}
+
+struct PredicateAtom {
+    key: String,
+    equality: Option<(String, Value)>,
+}
+
+fn normalize_predicate(value: &Value, bindings: &[Binding]) -> Value {
+    match value {
+        Value::BindingRef(id, _) => match &bindings[id.0].value {
+            // a shared draw keeps its identity rather than becoming another call
+            Value::Func { .. } => value.clone(),
+            definition => normalize_predicate(definition, bindings),
+        },
+        Value::Unary { op, operand, range } => Value::Unary {
+            op: *op,
+            operand: Box::new(normalize_predicate(operand, bindings)),
+            range: *range,
+        },
+        Value::Binary { op, lhs, rhs, range } => {
+            let mut lhs = normalize_predicate(lhs, bindings);
+            let mut rhs = normalize_predicate(rhs, bindings);
+            let (op, negate) = match op {
+                BinOp::Ne => (BinOp::Eq, true),
+                BinOp::Ge => (BinOp::Lt, true),
+                BinOp::Gt => {
+                    std::mem::swap(&mut lhs, &mut rhs);
+                    (BinOp::Lt, false)
+                }
+                BinOp::Le => {
+                    std::mem::swap(&mut lhs, &mut rhs);
+                    (BinOp::Lt, true)
+                }
+                op => (*op, false),
+            };
+            if op == BinOp::Eq && predicate_key(&lhs) > predicate_key(&rhs) {
+                std::mem::swap(&mut lhs, &mut rhs);
+            }
+            let comparison = Value::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                range: *range,
+            };
+            if negate {
+                Value::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(comparison),
+                    range: *range,
+                }
+            } else {
+                comparison
+            }
+        }
+        Value::Index { target, index, range } => Value::Index {
+            target: Box::new(normalize_predicate(target, bindings)),
+            index: Box::new(normalize_predicate(index, bindings)),
+            range: *range,
+        },
+        _ => value.clone(),
+    }
+}
+
+fn equality_atom(value: &Value) -> Option<(String, Value)> {
+    let Value::Binary {
+        op: BinOp::Eq, lhs, rhs, ..
+    } = value
+    else {
+        return None;
+    };
+    for (subject, literal) in [(lhs, rhs), (rhs, lhs)] {
+        if matches!(literal.as_ref(), Value::Str(_) | Value::Num(_) | Value::Bool(_)) {
+            return Some((predicate_key(subject), (**literal).clone()));
+        }
+    }
+    None
+}
+
+fn predicate(value: &Value, atoms: &mut Vec<PredicateAtom>) -> Predicate {
+    match value {
+        Value::Bool(value) => Predicate::Constant(*value),
+        Value::Unary {
+            op: UnaryOp::Not,
+            operand,
+            ..
+        } => Predicate::Not(Box::new(predicate(operand, atoms))),
+        Value::Binary {
+            op: BinOp::And,
+            lhs,
+            rhs,
+            ..
+        } => Predicate::And(Box::new(predicate(lhs, atoms)), Box::new(predicate(rhs, atoms))),
+        Value::Binary {
+            op: BinOp::Or, lhs, rhs, ..
+        } => Predicate::Or(Box::new(predicate(lhs, atoms)), Box::new(predicate(rhs, atoms))),
+        _ => {
+            // binding identities are stable, independent dynamic calls retain their source locations
+            let key = predicate_key(value);
+            let index = atoms.iter().position(|atom| atom.key == key).unwrap_or_else(|| {
+                atoms.push(PredicateAtom {
+                    key,
+                    equality: equality_atom(value),
+                });
+                atoms.len() - 1
+            });
+            Predicate::Atom(index)
+        }
+    }
+}
+fn evaluate(predicate: &Predicate, bits: usize) -> bool {
+    match predicate {
+        Predicate::Constant(value) => *value,
+        Predicate::Atom(index) => bits & (1 << index) != 0,
+        Predicate::Not(inner) => !evaluate(inner, bits),
+        Predicate::And(a, b) => evaluate(a, bits) && evaluate(b, bits),
+        Predicate::Or(a, b) => evaluate(a, bits) || evaluate(b, bits),
+    }
+}
+fn disjoint(a: &Value, b: &Value, bindings: &[Binding]) -> bool {
+    let mut atoms = Vec::new();
+    let a = predicate(&normalize_predicate(a, bindings), &mut atoms);
+    let b = predicate(&normalize_predicate(b, bindings), &mut atoms);
+    if atoms.len() > 12 {
+        return false;
+    }
+    let mut incompatible = Vec::new();
+    for (i, left) in atoms.iter().enumerate() {
+        for (j, right) in atoms.iter().enumerate().skip(i + 1) {
+            if let (Some((left_subject, left_value)), Some((right_subject, right_value))) = (&left.equality, &right.equality)
+                && left_subject == right_subject
+                && !same_value(left_value, right_value)
+            {
+                incompatible.push((i, j));
+            }
+        }
+    }
+    (0..(1usize << atoms.len())).all(|bits| {
+        incompatible.iter().any(|(i, j)| bits & (1 << i) != 0 && bits & (1 << j) != 0)
+            || !evaluate(&a, bits)
+            || !evaluate(&b, bits)
+    })
+}
+
+pub(super) fn model(ast: ast::GraphDocument, functions: &[FunctionDesc]) -> Result<Model> {
+    let mut modeler = Modeler::new(functions);
+    // no phase stops the next one: a failed element is marked, and later checks that
+    // depend on it are skipped, so each independent mistake is reported once
+    modeler.definitions(&ast.definitions);
+    let paths: Vec<_> = ast.paths.iter().map(|path| modeler.path(path, None)).collect();
+    if paths.is_empty() && ast.definitions.is_empty() {
+        return Err(error(SrcRange::new(0, 0), "expected at least one graph statement"));
+    }
+    let mut resolved = Vec::new();
+    for path in paths {
+        resolved.extend(modeler.lower_path(path));
+    }
+    modeler.model.paths = resolved;
+    modeler.lower_fields();
+    if let Err(diags) = modeler.validate_primitives() {
+        modeler.errors.extend(diags);
+    }
+    let states = [&modeler.edge_state, &modeler.fork_state, &modeler.junction_state];
+    let unresolved: HashSet<_> = (states[0].iter().enumerate())
+        .filter_map(|(i, state)| (*state != RESOLVED).then_some(ElementId::Edge(EdgeId(i))))
+        .chain(
+            (states[1].iter().enumerate()).filter_map(|(i, state)| (*state != RESOLVED).then_some(ElementId::Fork(ForkId(i)))),
+        )
+        .chain(
+            (states[2].iter().enumerate())
+                .filter_map(|(i, state)| (*state != RESOLVED).then_some(ElementId::Junction(JunctionId(i)))),
+        )
+        .collect();
+    debug_assert!(unresolved.is_empty() || !modeler.errors.is_empty());
+    // a read is judged against the whole graph, so one unresolved or unchecked element defers the check
+    if unresolved.is_empty() && modeler.unchecked.is_empty() {
+        modeler.check_context();
+    }
+    if let Err(diags) = validate_graph(&mut modeler.model, &modeler.unchecked, &unresolved) {
+        modeler.errors.extend(diags);
+    }
+    if modeler.errors.is_empty() {
+        Ok(modeler.model)
+    } else {
+        Err(dedup(modeler.errors))
+    }
+}
+
+struct GraphCheck<'a> {
+    model: &'a Model,
+    owner: ElementId,
+    range: SrcRange,
+}
+impl<'a> GraphCheck<'a> {
+    fn error<T>(&self, message: impl Into<String>) -> Result<T> {
+        Err(vec![Diag {
+            when: DiagPhase::Validation,
+            what: message.into(),
+            r#where: self.range,
+        }])
+    }
+
+    fn value(&self, mut value: &'a Value) -> &'a Value {
+        while let Value::BindingRef(id, _) = value {
+            value = &self.model.bindings[id.0].value;
+        }
+        value
+    }
+
+    fn prop(&self, name: &str) -> Option<&'a Value> {
+        properties(self.model, self.owner)
+            .iter()
+            .map(|id| &self.model.bindings[id.0])
+            .find(|binding| binding.path == [name])
+            .map(|binding| self.value(&binding.value))
+    }
+
+    fn required(&self, name: &str) -> Result<&'a Value> {
+        self.prop(name)
+            .map(Ok)
+            .unwrap_or_else(|| self.error(format!("missing required property `{name}`")))
+    }
+
+    fn choice(&self, name: &str, default: &'a str, allowed: &[&str]) -> Result<&'a str> {
+        match self.prop(name) {
+            None => Ok(default),
+            Some(Value::Str(value)) if allowed.contains(&value.as_str()) => Ok(value),
+            _ => self.error(format!("{name} must be a constant value from {}", allowed.join(", "))),
+        }
+    }
+
+    fn boolean(&self, name: &str, default: bool) -> Result<bool> {
+        match self.prop(name) {
+            None => Ok(default),
+            Some(Value::Bool(value)) => Ok(*value),
+            _ => self.error(format!("{name} must be a constant boolean")),
+        }
+    }
+
+    fn count(&self, value: &Value, name: &str) -> Result<usize> {
+        if let Value::Num(Number::Int(value)) = value
+            && let Ok(value) = usize::try_from(*value)
+        {
+            return Ok(value);
+        }
+        self.error(format!("{name} must be a constant nonnegative integer"))
+    }
+
+    fn positive_count(&self, name: &str, default: Option<usize>) -> Result<Option<usize>> {
+        let Some(value) = self.prop(name) else { return Ok(default) };
+        self.typed(value, FieldType::Number)?;
+        if !expr::constant(value) {
+            return Ok(None);
+        }
+        let count = self.count(value, name)?;
+        if count == 0 {
+            return self.error(format!("{name} must be positive"));
+        }
+        Ok(Some(count))
+    }
+
+    fn bounds(&self, name: &str) -> Result<DegreeBounds> {
+        let Some(value) = self.prop(name) else {
+            return Ok(DegreeBounds::default());
+        };
+        let Value::Object(object) = value else {
+            return self.error(format!("{name} must contain min or max bounds"));
+        };
+        let mut bounds = DegreeBounds::default();
+        for field in &object.elem {
+            let value = self.count(self.value(&field.value), name)?;
+            match field.key.as_str() {
+                "min" => bounds.min = Some(value),
+                "max" => bounds.max = Some(value),
+                _ => return self.error(format!("unknown {name} bound `{}`", field.key)),
+            }
+        }
+        if matches!((bounds.min, bounds.max), (Some(min), Some(max)) if min > max) {
+            return self.error(format!("{name} minimum exceeds maximum"));
+        }
+        Ok(bounds)
+    }
+
+    fn references(&self, name: &str, node: bool) -> Result<Vec<ElementId>> {
+        let Value::Array(array) = self.required(name)? else {
+            return self.error(format!("{name} must be an array of references"));
+        };
+        let mut selected = Vec::new();
+        let mut seen = HashSet::new();
+        for item in &array.elem {
+            let ArrayElem::Item(value) = item else {
+                return self.error("network membership must resolve statically");
+            };
+            let Value::GraphRef { ref_id, .. } = self.value(value) else {
+                return self.error("network membership requires graph references");
+            };
+            let id = self.model.refs[ref_id.0].target;
+            if !matches!((node, id), (true, ElementId::Node(_)) | (false, ElementId::Edge(_))) {
+                return self.error(format!("wrong reference category in {name}"));
+            }
+            if !seen.insert(id) {
+                return self.error(format!("duplicate reference in {name}"));
+            }
+            selected.push(id);
+        }
+        Ok(selected)
+    }
+
+    fn typed(&self, value: &Value, ty: FieldType) -> Result<()> {
+        let mut pending = expr::dependencies(value);
+        let mut bindings = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if seen.insert(id) {
+                let binding = &self.model.bindings[id.0];
+                pending.extend(expr::dependencies(&binding.value));
+                bindings.push((id, binding.value.clone(), binding.ty));
+            }
+        }
+        expr::schema_type(
+            expr::ReferenceValue {
+                value: value.clone(),
+                bindings,
+            },
+            ty,
+            self.range,
+        )
+    }
+
+    fn properties(&self) -> Result<()> {
+        let descriptors = primitive_properties(primitive(self.model, self.owner), self.range);
+        let mut errors = Vec::new();
+        for descriptor in &descriptors {
+            let checked = match self.prop(&descriptor.name) {
+                Some(value) => self.typed(value, descriptor.ty),
+                None if descriptor.required => self.error(format!("missing required property `{}`", descriptor.name)),
+                None => Ok(()),
+            };
+            if let Err(diags) = checked {
+                errors.extend(diags);
+            }
+        }
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
+
+    // `None` when a selected edge has no resolved endpoints to validate against
+    fn network(&self, node: NodeId, unresolved: &HashSet<ElementId>) -> Result<Option<Network>> {
+        let nodes: Vec<_> = self
+            .references("nodes", true)?
+            .into_iter()
+            .map(|id| match id {
+                ElementId::Node(id) => id,
+                _ => unreachable!(),
+            })
+            .collect();
+        let edges: Vec<_> = self
+            .references("edges", false)?
+            .into_iter()
+            .map(|id| match id {
+                ElementId::Edge(id) => id,
+                _ => unreachable!(),
+            })
+            .collect();
+        if edges.iter().any(|id| unresolved.contains(&ElementId::Edge(*id))) {
+            return Ok(None);
+        }
+        let members: HashSet<_> = nodes.iter().copied().collect();
+        for id in &edges {
+            let edge = &self.model.edges[id.0];
+            if !members.contains(&edge.source) || !members.contains(&edge.target) {
+                return self.error("selected edge endpoints must be explicitly included in network nodes");
+            }
+        }
+        let network = Network {
+            node,
+            nodes,
+            edges,
+            validate: match self.choice("validate", "definition", &["definition", "materialized", "both"])? {
+                "definition" => ValidationStage::Definition,
+                "materialized" => ValidationStage::Materialized,
+                _ => ValidationStage::Both,
+            },
+            acyclic: match self.choice("acyclic", "none", &["none", "directed", "underlying"])? {
+                "directed" => Acyclic::Directed,
+                "underlying" => Acyclic::Underlying,
+                _ => Acyclic::None,
+            },
+            connected: match self.choice("connected", "none", &["none", "weak", "strong"])? {
+                "weak" => Connectivity::Weak,
+                "strong" => Connectivity::Strong,
+                _ => Connectivity::None,
+            },
+            self_loops: self.boolean("self_loops", true)?,
+            max_parallel: self
+                .prop("max_parallel")
+                .map(|value| self.count(value, "max_parallel"))
+                .transpose()?,
+            incoming: self.bounds("incoming")?,
+            outgoing: self.bounds("outgoing")?,
+            degree: self.bounds("degree")?,
+        };
+        if network.validate != ValidationStage::Materialized {
+            self.structure(&network)?;
+        }
+        Ok(Some(network))
+    }
+
+    fn structure(&self, network: &Network) -> Result<()> {
+        let positions: HashMap<_, _> = network.nodes.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let n = positions.len();
+        let mut outgoing = vec![0; n];
+        let mut incoming = vec![0; n];
+        let mut degree = vec![0; n];
+        let mut forward = vec![Vec::new(); n];
+        let mut reverse = vec![Vec::new(); n];
+        let mut weak = vec![Vec::new(); n];
+        let mut pairs = BTreeMap::new();
+        let mut parents: Vec<_> = (0..n).collect();
+        fn root(parents: &mut [usize], mut i: usize) -> usize {
+            while parents[i] != i {
+                parents[i] = parents[parents[i]];
+                i = parents[i];
+            }
+            i
+        }
+        for id in &network.edges {
+            let edge = &self.model.edges[id.0];
+            let a = positions[&edge.source];
+            let b = positions[&edge.target];
+            if !network.self_loops && a == b {
+                return self.error("network prohibits self-connections");
+            }
+            let pair = if edge.direction == Direction::Undirected && a > b {
+                (b, a)
+            } else {
+                (a, b)
+            };
+            let count = pairs.entry((edge.direction, pair)).or_insert(0);
+            *count += 1;
+            if network.max_parallel.is_some_and(|max| *count > max) {
+                return self.error("network exceeds max_parallel");
+            }
+            forward[a].push(b);
+            reverse[b].push(a);
+            weak[a].push(b);
+            weak[b].push(a);
+            if edge.direction == Direction::Directed {
+                outgoing[a] += 1;
+                incoming[b] += 1;
+            } else {
+                if network.acyclic == Acyclic::Directed {
+                    return self.error("directed acyclicity requires directed selected edges");
+                }
+                degree[a] += 1;
+                degree[b] += 1;
+                forward[b].push(a);
+                reverse[a].push(b);
+            }
+            if network.acyclic == Acyclic::Underlying {
+                let a = root(&mut parents, a);
+                let b = root(&mut parents, b);
+                if a == b {
+                    return self.error("network contains an underlying cycle");
+                }
+                parents[a] = b;
+            }
+        }
+        for (name, values, bounds) in [
+            ("incoming", &incoming, network.incoming),
+            ("outgoing", &outgoing, network.outgoing),
+            ("degree", &degree, network.degree),
+        ] {
+            if values.iter().any(|value| !within(*value, bounds)) {
+                return self.error(format!("network violates {name} bounds"));
+            }
+        }
+        if network.acyclic == Acyclic::Directed {
+            let mut remaining = incoming;
+            let mut pending: Vec<_> = remaining
+                .iter()
+                .enumerate()
+                .filter_map(|(i, count)| (*count == 0).then_some(i))
+                .collect();
+            let mut visited = 0;
+            while let Some(i) = pending.pop() {
+                visited += 1;
+                for next in &forward[i] {
+                    remaining[*next] -= 1;
+                    if remaining[*next] == 0 {
+                        pending.push(*next);
+                    }
+                }
+            }
+            if visited != n {
+                return self.error("network contains a directed cycle");
+            }
+        }
+        fn connected(adj: &[Vec<usize>]) -> bool {
+            if adj.is_empty() {
+                return false;
+            }
+            let mut seen = vec![false; adj.len()];
+            let mut pending = vec![0];
+            while let Some(i) = pending.pop() {
+                if !seen[i] {
+                    seen[i] = true;
+                    pending.extend(&adj[i]);
+                }
+            }
+            seen.into_iter().all(|seen| seen)
+        }
+        let valid = match network.connected {
+            Connectivity::None => true,
+            Connectivity::Weak => connected(&weak),
+            Connectivity::Strong => connected(&forward) && connected(&reverse),
+        };
+        if !valid {
+            return self.error("network does not satisfy connected policy");
+        }
+        Ok(())
+    }
+}
+
+fn within(count: usize, bounds: DegreeBounds) -> bool {
+    bounds.min.is_none_or(|min| count >= min) && bounds.max.is_none_or(|max| count <= max)
+}
+
+fn primitive(model: &Model, owner: ElementId) -> Primitive {
+    match owner {
+        ElementId::Node(id) => model.nodes[id.0].primitive,
+        ElementId::Edge(id) => model.edges[id.0].primitive,
+        ElementId::Fork(id) => model.forks[id.0].primitive,
+        ElementId::Junction(id) => model.junctions[id.0].primitive,
+    }
+}
+
+fn properties(model: &Model, owner: ElementId) -> &[BindingId] {
+    match owner {
+        ElementId::Node(id) => &model.nodes[id.0].props,
+        ElementId::Edge(id) => &model.edges[id.0].props,
+        ElementId::Fork(id) => &model.forks[id.0].props,
+        ElementId::Junction(id) => &model.junctions[id.0].props,
+    }
+}
+
+// each check reports its own failure and the rest still run, checks that read an
+// unresolved or unchecked element are skipped because its mistake is already reported
+fn validate_graph(model: &mut Model, unchecked: &HashSet<ElementId>, unresolved: &HashSet<ElementId>) -> Result<()> {
+    let mut unchecked = unchecked.clone();
+    let mut errors = Vec::new();
+    let mut keep = |result: Result<()>| {
+        if let Err(diags) = result {
+            errors.extend(diags);
+        }
+    };
+    for (owner, range) in model
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| (ElementId::Node(NodeId(i)), node.range))
+        .chain(
+            model
+                .edges
+                .iter()
+                .enumerate()
+                .map(|(i, edge)| (ElementId::Edge(EdgeId(i)), edge.range)),
+        )
+        .chain(
+            model
+                .forks
+                .iter()
+                .enumerate()
+                .map(|(i, fork)| (ElementId::Fork(ForkId(i)), fork.range)),
+        )
+        .chain(
+            model
+                .junctions
+                .iter()
+                .enumerate()
+                .map(|(i, junction)| (ElementId::Junction(JunctionId(i)), junction.range)),
+        )
+    {
+        if !unchecked.contains(&owner)
+            && let Err(diags) = (GraphCheck { model, owner, range }).properties()
+        {
+            // the kind-specific checks below would describe the same property mistakes again
+            unchecked.insert(owner);
+            keep(Err(diags));
+        }
+    }
+    let mut networks = Vec::new();
+    let mut incidences: HashMap<NodeId, Vec<(NodeId, String)>> = HashMap::new();
+    // false once an incidence could not be attributed, relation counts would then be wrong
+    let mut incidences_complete = true;
+    for (i, edge) in model.edges.iter().enumerate() {
+        let owner = ElementId::Edge(EdgeId(i));
+        let check = GraphCheck {
+            model,
+            owner,
+            range: edge.range,
+        };
+        let known = !unchecked.contains(&owner);
+        if known && let Some(limit) = check.prop("max_traversals") {
+            keep((|| {
+                if !edge.cycle {
+                    return check.error("max_traversals requires a cycle edge");
+                }
+                check.typed(limit, FieldType::Number)?;
+                if expr::constant(limit) {
+                    check.count(limit, "max_traversals")?;
+                }
+                Ok(())
+            })());
+        }
+        if primitive(model, owner) == Primitive::Incidence {
+            if !known || unresolved.contains(&owner) {
+                incidences_complete = false;
+                continue;
+            }
+            let left = primitive(model, ElementId::Node(edge.source)) == Primitive::Relation;
+            let right = primitive(model, ElementId::Node(edge.target)) == Primitive::Relation;
+            let role = if left == right {
+                check.error("incidence requires exactly one relation endpoint")
+            } else {
+                check.choice("role", "member", &["member", "input", "output"])
+            };
+            match role {
+                Ok(role) => {
+                    let (relation, participant) = if left {
+                        (edge.source, edge.target)
+                    } else {
+                        (edge.target, edge.source)
+                    };
+                    incidences.entry(relation).or_default().push((participant, role.to_owned()));
+                }
+                Err(diags) => {
+                    incidences_complete = false;
+                    keep(Err(diags));
+                }
+            }
+        }
+    }
+    for (i, node) in model.nodes.iter().enumerate() {
+        let id = NodeId(i);
+        let owner = ElementId::Node(id);
+        if unchecked.contains(&owner) {
+            continue;
+        }
+        let check = GraphCheck {
+            model,
+            owner,
+            range: node.range,
+        };
+        match primitive(model, owner) {
+            Primitive::Network => match check.network(id, unresolved) {
+                Ok(network) => networks.extend(network),
+                Err(diags) => keep(Err(diags)),
+            },
+            Primitive::Relation if incidences_complete => {
+                let entries = incidences.get(&id).map(Vec::as_slice).unwrap_or_default();
+                let inputs = entries.iter().filter(|(_, role)| role == "input").count();
+                let outputs = entries.iter().filter(|(_, role)| role == "output").count();
+                if inputs + outputs > 0 && (inputs == 0 || outputs == 0 || inputs + outputs != entries.len()) {
+                    keep(check.error("directed relations require input and output incidences without member roles"));
+                }
+                keep(check.boolean("unique", true).and_then(|unique| {
+                    let mut seen = HashSet::new();
+                    if unique && entries.iter().any(|entry| !seen.insert(entry)) {
+                        return check.error("duplicate relation participant in the same role");
+                    }
+                    Ok(())
+                }));
+                for (name, count) in [("participants", entries.len()), ("inputs", inputs), ("outputs", outputs)] {
+                    keep(check.bounds(name).and_then(|bounds| {
+                        if !within(count, bounds) {
+                            return check.error(format!("relation violates {name} bounds"));
+                        }
+                        Ok(())
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, fork) in model.forks.iter().enumerate() {
+        let owner = ElementId::Fork(ForkId(i));
+        let check = GraphCheck {
+            model,
+            owner,
+            range: fork.range,
+        };
+        let known = !unchecked.contains(&owner);
+        let branch_checks = || {
+            fork.branches
+                .iter()
+                .flatten()
+                .filter(|edge| !unchecked.contains(&ElementId::Edge(**edge)))
+                .map(|edge| GraphCheck {
+                    model,
+                    owner: ElementId::Edge(*edge),
+                    range: model.edges[edge.0].range,
+                })
+        };
+        match primitive(model, owner) {
+            Primitive::Each | Primitive::Repeat => {
+                if known {
+                    keep((|| {
+                        if primitive(model, owner) == Primitive::Repeat {
+                            let count = check.required("count")?;
+                            check.typed(count, FieldType::Number)?;
+                            if expr::constant(count) {
+                                check.count(count, "count")?;
+                            }
+                        } else {
+                            check.typed(check.required("items")?, FieldType::Array)?;
+                            check.positive_count("concurrency", None)?;
+                        }
+                        Ok(())
+                    })());
+                }
+                for edge_check in branch_checks() {
+                    if edge_check.prop("when").is_some() {
+                        keep(edge_check.error("each and repeat run every listed branch and do not allow branch guards"));
+                    }
+                }
+            }
+            Primitive::Weighted => {
+                if known && check.prop("count").is_some() {
+                    keep(check.error("weighted selects exactly one branch and does not accept count"));
+                }
+                for branch in &fork.branches {
+                    let mut branch_weight = None;
+                    for edge in branch {
+                        if unchecked.contains(&ElementId::Edge(*edge)) {
+                            continue;
+                        }
+                        let edge_check = GraphCheck {
+                            model,
+                            owner: ElementId::Edge(*edge),
+                            range: model.edges[edge.0].range,
+                        };
+                        let weight = match edge_check.prop("weight") {
+                            None => {
+                                keep(edge_check.error("weighted branches require an explicit weight"));
+                                continue;
+                            }
+                            Some(Value::Num(Number::Int(value))) => Some(*value as f64),
+                            Some(Value::Num(Number::Float(value))) => Some(*value),
+                            Some(value) if !expr::constant(value) => None,
+                            _ => {
+                                keep(edge_check.error("weighted branch weight must be a nonnegative number"));
+                                continue;
+                            }
+                        };
+                        if let Some(weight) = weight {
+                            if !weight.is_finite() || weight < 0.0 {
+                                keep(edge_check.error("weighted branch weight must be finite and nonnegative"));
+                                continue;
+                            }
+                            if branch_weight.is_some_and(|previous| previous != weight) {
+                                keep(edge_check.error("all edges in a weighted branch must have the same weight"));
+                                continue;
+                            }
+                            branch_weight = Some(weight);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, junction) in model.junctions.iter().enumerate() {
+        let owner = ElementId::Junction(JunctionId(i));
+        if !unchecked.contains(&owner) && !primitive(model, owner).is_root() {
+            let check = GraphCheck {
+                model,
+                owner,
+                range: junction.range,
+            };
+            keep(check.choice("observe", "arrival", &["arrival", "result"]).map(drop));
+            keep(check.choice("on_failure", "fail", &["fail", "skip"]).map(drop));
+            keep(check.choice("on_cancel", "fail", &["fail", "skip"]).map(drop));
+            if primitive(model, owner) == Primitive::Reduce {
+                keep(check.required("initial").map(drop));
+                keep(check.required("combine").map(drop));
+                keep(check.choice("order", "source", &["source", "arrival"]).map(drop));
+            }
+        }
+    }
+    model.networks = networks;
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
 }

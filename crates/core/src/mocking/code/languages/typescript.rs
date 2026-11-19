@@ -31,6 +31,12 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
 
         let body = emitter.steps(item.steps, item.name)?;
         let fallback = emitter.lower(item.score)?;
+        // the assembly reports these calls with their locations before any module is emitted
+        if !emitter.unsupported.is_empty() {
+            return Err(Error::Unsupported {
+                what: "a provider function",
+            });
+        }
         let function =
             crate::mocking::code::lowering::scoring::function(item, body, fallback, crate::dsl::ScorerLang::Typescript);
         functions.push(format!(
@@ -52,8 +58,8 @@ pub(in crate::mocking::code) fn source(items: &[Item]) -> Result<String, Error> 
 }
 
 fn helper_snippet(helper: Helper) -> String {
-    if helper == Helper::English {
-        return super::rendering::english_source(ScorerLang::Typescript, false);
+    if let Helper::Runtime(runtime) = helper {
+        return (runtime.source)(ScorerLang::Typescript, false);
     }
     match helper {
         Helper::Language => super::rendering::TS_LANGUAGE,
@@ -96,14 +102,14 @@ fn helper_snippet(helper: Helper) -> String {
         Helper::Round => {
             "function roundAwayFromZero(value: number): number {\n  return (value < 0 ? -1 : 1) * Math.floor(Math.abs(value) + 0.5);\n}\n"
         }
-        Helper::English => unreachable!("handled above"),
+        Helper::Runtime(_) => unreachable!("handled above"),
     }.to_owned()
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::semantics::compile;
     use crate::dsl::{Scorer, ScorerKind};
+    use crate::providers::braintrust::mocking::compile;
 
     fn render(source: &str) -> Result<String, Error> {
         let model = compile(source).unwrap();
@@ -132,14 +138,7 @@ mod tests {
     #[test]
     fn emits_nested_scorer_repeats() {
         let generated = emit(
-            r#"scorer "s" { code {
-            score = 0
-            repeat {
-                count = len(output)
-                when { cond = output[repeat.index] == expected score = 1 }
-                repeat { count = repeat.index + 1 when { cond = repeat.index < repeat.count score = 0.5 } }
-            }
-        } }"#,
+            r#"("s":scorer) {score: 0, steps: [{repeat: len(context.output), steps: [{when: context.output [context.index] == context.expected, score: 1}, {repeat: context.index + 1, steps: [{when: context.index < context.count, score: 0.5}]}]}]};"#,
         );
         assert!(generated.contains("const repeatCount = output.length;"));
         assert!(generated.contains("for (let repeatIndex = 0; repeatIndex < repeatCount;"));
@@ -151,13 +150,7 @@ mod tests {
     #[test]
     fn emits_nested_when_fallthrough() {
         let generated = emit(
-            r#"scorer "s" { code {
-            score = 0
-            when { cond = len(output) > 0
-                when { cond = output[0] == expected score = 1 }
-                score = 0.5
-            }
-        } }"#,
+            r#"("s":scorer) {score: 0, steps: [{when: len(context.output) > 0, score: 0.5, steps: [{when: context.output [0] == context.expected, score: 1}]}]};"#,
         );
         assert!(generated.contains("  if (output.length > 0) {\n    if (output[0] === expected) {\n      return"));
         assert!(generated.contains("\n    return { name: \"s\", score: 0.5"));
@@ -196,7 +189,7 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
   if (output == null) {
     return { name: "response-length", score: 0, metadata: {} };
   }
-  return { name: "response-length", score: Math.max(0.1, Math.min(0.9, output.length / 400)), metadata: {} };
+  return { name: "response-length", score: Math.max(0.1, Math.min(0.9, output.length / 400.0)), metadata: {} };
 }
 "#
         );
@@ -214,7 +207,7 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
     #[test]
     fn prefixes_language_keywords_and_runtime_names() {
         for name in ["default", "normal", "weighted", "handler", "crypto"] {
-            let generated = emit(&format!(r#"scorer "{name}" {{ code {{ score = 0.5 }} }}"#));
+            let generated = emit(&format!(r#"("{name}":scorer) {{score: 0.5}};"#));
             assert!(generated.contains(&format!("function scorer_{name}(")), "name {name}");
         }
     }
@@ -222,16 +215,31 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
     #[test]
     fn packed_scorers_with_distinct_slugs_keep_distinct_function_names() {
         let generated = emit(
-            r#"scorer "a-1" { file = "shared" code { score = 0.5 } }
-               scorer "a1" { file = "shared" code { score = 0.6 } }"#,
+            r#"("a-1":scorer {file: "shared"}) {score: 0.5};
+("a1":scorer {file: "shared"}) {score: 0.6};"#,
         );
         assert!(generated.contains("function scorer_a_1("));
         assert!(generated.contains("function scorer_a1("));
     }
 
     #[test]
+    fn divides_two_integers_toward_zero() {
+        let generated = emit(r#"("s":scorer) {score: clamp(len(context.output) / 400, 0, 5) / 10.0};"#);
+        assert!(
+            generated.contains("score: Math.max(0, Math.min(5, Math.trunc(output.length / 400))) / 10.0"),
+            "{generated}"
+        );
+        // a float on either side, or a side the shape does not type, divides as written
+        let generated = emit(r#"("s":scorer) {score: context.output / 400};"#);
+        assert!(generated.contains("score: output / 400,"), "{generated}");
+        // the remainder already follows the side that is divided
+        let generated = emit(r#"("s":scorer) {score: ${len(context.output) - 1000} % 30};"#);
+        assert!(generated.contains("score: (output.length - 1000) % 30,"), "{generated}");
+    }
+
+    #[test]
     fn rounds_dynamic_scores_away_from_zero() {
-        let generated = emit(r#"scorer "s" { code { score = round(output) } }"#);
+        let generated = emit(r#"("s":scorer) {score: round(context.output)};"#);
         assert!(generated.contains(
             "function roundAwayFromZero(value: number): number {\n  return (value < 0 ? -1 : 1) * Math.floor(Math.abs(value) + 0.5);"
         ));
@@ -240,7 +248,7 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
 
     #[test]
     fn pulls_helper_dependencies_in_declaration_order() {
-        let generated = emit(r#"scorer "s" { code { score = clamp(lognormal(0.5, 0.2), 0, 1) } }"#);
+        let generated = emit(r#"("s":scorer) {score: clamp(lognormal(0.5, 0.2), 0, 1)};"#);
         let normal_at = generated.find("function normal(").unwrap();
         let lognormal_at = generated.find("function lognormal(").unwrap();
         let scorer_at = generated.find("function scorer_s(").unwrap();
@@ -249,8 +257,9 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
 
     #[test]
     fn dots_identifier_keys_and_brackets_the_rest() {
-        let generated =
-            emit(r#"scorer "s" { code { score = 0.5 when { cond = metadata.tier == metadata["user tier"] score = 0 } } }"#);
+        let generated = emit(
+            r#"("s":scorer) {score: 0.5, steps: [{when: context.metadata.tier == context.metadata ["user tier"], score: 0}]};"#,
+        );
         assert!(
             generated.contains(r#"if (metadata.tier === metadata["user tier"]) {"#),
             "generated:\n{generated}"
@@ -260,7 +269,7 @@ function scorer_response_length({ input, output, expected, metadata }: { input?:
     #[test]
     fn escapes_template_literals() {
         let generated = emit(
-            r#"scorer "s" { code { score = 0.5 when { cond = "`${output}` costs $${metadata.cost}" == "x" score = 0 } } }"#,
+            r#"("s":scorer) {score: 0.5, steps: [{when: "`${context.output}` costs $${metadata.cost}" == "x", score: 0}]};"#,
         );
         assert!(
             generated.contains(r#"if (`\`${output}\` costs \${metadata.cost}` === "x") {"#),

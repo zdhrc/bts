@@ -19,12 +19,18 @@ fn accepts_valid_source() {
 
 #[wasm_bindgen_test]
 fn validates_agent_entrypoints() {
-    let valid = r#"agent "support" { entrypoint = trace.request } trace "request" { output = "hello" }"#;
+    let valid = r#"(support:agent) {input: null, output: request.output};
+(support)-|:next|->(request);
+(request:task) {
+    output: "hello",
+    input: support.input
+};
+"#;
     assert_eq!(validate(valid), serde_json::json!({"valid": true, "diagnostics": []}));
     for source in [
-        r#"agent "support" {} trace "request" {}"#,
-        r#"agent "support" { entrypoint = trace.missing } trace "request" {}"#,
-        r#"agent "support" { entrypoint = trace.request.output } trace "request" { output = "hello" }"#,
+        r#"(support:agent) {input: null, output: null};"#,
+        r#"(support:agent) {input: null, output: null}; (support)-|:next|->(missing);"#,
+        r#"(support:agent) {input: null, output: null}; (request:tool) {input: support.input}; (support)-|:next|->(request);"#,
     ] {
         let result = validate(source);
         assert_eq!(result["valid"], false, "{source}");
@@ -42,14 +48,22 @@ fn reports_syntax_errors() {
 
 #[wasm_bindgen_test]
 fn reports_semantic_errors() {
-    let result = validate(r#"trace "hello" { output = var.missing }"#);
+    let result = validate(
+        r#"(hello_agent:agent {name: "hello"}) {input: null, output: hello.output};
+(hello_agent)-|:next|->(hello);
+(hello:task) {
+    output: missing.missing,
+    input: hello_agent.input
+};
+"#,
+    );
     assert_eq!(result["valid"], false);
     assert_eq!(result["diagnostics"][0]["phase"], "validation");
 }
 
 #[wasm_bindgen_test]
 fn preserves_unicode_byte_ranges() {
-    let source = "trace \"café 🦀\" { input = }";
+    let source = "(\"café 🦀\":task) { input: }";
     let result = validate(source);
     let diagnostic = &result["diagnostics"][0];
     let start = source.find('}').unwrap();
@@ -65,7 +79,7 @@ fn calls_do_not_retain_errors() {
 
 #[wasm_bindgen_test]
 fn reports_lexing_errors() {
-    let result = validate("trace \"unterminated");
+    let result = validate("(\"unterminated");
     assert_eq!(result["valid"], false);
     assert_eq!(result["diagnostics"][0]["phase"], "lexing");
 }
@@ -93,7 +107,10 @@ impl bts_core::mocking::code::ExistingFiles for BuildTestFiles {
 #[wasm_bindgen_test]
 fn build_matches_shared_core_planning_for_both_languages() {
     let source = include_str!("../../core/tests/fixtures/building.bt");
-    for (language, core_language) in [(None, None), (Some("typescript"), Some(bts_lang::ScorerLang::Typescript))] {
+    for (language, core_language) in [
+        (None, None),
+        (Some("typescript"), Some(bts_core::mocking::ScorerLang::Typescript)),
+    ] {
         let mut options = serde_json::json!({ "project": "Browser Project", "root": "browser-codebase" });
         if let Some(language) = language {
             options["lang"] = language.into();
@@ -101,7 +118,7 @@ fn build_matches_shared_core_planning_for_both_languages() {
         let result = build_result(source, &options);
         assert_eq!(result["ok"], true, "{result}");
 
-        let model = bts_lang::semantics::compile(source).unwrap();
+        let model = bts_core::providers::Provider::compile(&bts_core::providers::braintrust::Bundle, source).unwrap();
         let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new("Browser Project");
         let assembly = bts_core::mocking::code::assemble(
             &model.scorers,
@@ -135,17 +152,20 @@ fn build_matches_shared_core_planning_for_both_languages() {
 #[wasm_bindgen_test]
 fn builds_callable_agents_without_a_project_in_both_languages() {
     use bts_core::mocking::code::{self, AgentTarget};
-    let source = r#"
-agent "hello" { entrypoint = trace.hello }
-trace "hello" {
-    input = { name = "Ada" }
-    output = tool.greet.output
-    tool "greet" { output = "Hello ${trace.input.name}" }
-}
+    let source = r#"(hello:agent) {input: {name: "Ada"}, output: trace_hello.output};
+(hello)-|:next|->(trace_hello);
+(trace_hello:task {name: "hello"}) {
+    input: hello.input,
+    output: greet.output
+};
+(trace_hello)-|:calls|->(greet);
+(greet:tool) {
+    output: "Hello ${trace_hello.input.name}"
+};
 "#;
     for (lang, extension, language) in [
-        ("python", "py", bts_lang::ScorerLang::Python),
-        ("typescript", "mts", bts_lang::ScorerLang::Typescript),
+        ("python", "py", bts_core::mocking::ScorerLang::Python),
+        ("typescript", "mts", bts_core::mocking::ScorerLang::Typescript),
     ] {
         let result = build_result(source, &serde_json::json!({ "target": "agent", "lang": lang }));
         assert_eq!(result["ok"], true, "{result}");
@@ -160,7 +180,7 @@ trace "hello" {
                 .iter()
                 .any(|file| file["path"] == format!("src/agents/hello_agent_runtime.{extension}"))
         );
-        let model = bts_lang::semantics::compile(source).unwrap();
+        let model = bts_core::providers::Provider::compile(&bts_core::providers::braintrust::Bundle, source).unwrap();
         let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new("");
         let assembly = code::assemble_agents(&model, language, &target).unwrap();
         let assembly = target.agent_assembly(&model, language, assembly).unwrap();
@@ -183,20 +203,44 @@ trace "hello" {
     }
 }
 
-const AGENT_EVALS: &str = r#"
-agent "helper" { entrypoint = trace.helper }
-agent "first" { entrypoint = trace.first }
-agent "second" { entrypoint = trace.second }
-trace "helper" { output = "helper" }
-trace "first" { input = 1 output = self.input }
-trace "second" { input = 2 output = self.input }
-scorer "quality" { code { score = output == expected ? 1 : 0 } }
-dataset "cases" {
-    case "sampled" { input = range(1, 1000000) expected = 1 }
-}
-experiment "first" { dataset = dataset.cases task = trace.first scorers = [scorer.quality] }
-experiment "second" { dataset = dataset.cases task = trace.second scorers = [scorer.quality] }
-"#;
+const AGENT_EVALS: &str = r#"(helper:agent) {input: null, output: trace_helper.output};
+(helper)-|:next|->(trace_helper);
+(trace_helper:task {name: "helper"}) {
+    output: "helper",
+    input: helper.input
+};
+(first:agent) {input: 1, output: trace_first.output};
+(first)-|:next|->(trace_first);
+(trace_first:task {name: "first"}) {
+    input: first.input,
+    output: self.input
+};
+(second:agent) {input: 2, output: trace_second.output};
+(second)-|:next|->(trace_second);
+(trace_second:task {name: "second"}) {
+    input: second.input,
+    output: self.input
+};
+(quality:scorer) {
+    score: context.output == context.expected ? 1 : 0
+};
+(cases:dataset) {
+    cases: [(sampled)]
+};
+(sampled:case) {
+    input: range(1, 1000000),
+    expected: 1
+};
+(experiment_first:experiment {name: "first"}) {
+    dataset: (cases),
+    task: (trace_first),
+    scorers: [(quality)]
+};
+(experiment_second:experiment {name: "second"}) {
+    dataset: (cases),
+    task: (trace_second),
+    scorers: [(quality)]
+};"#;
 
 #[wasm_bindgen_test]
 fn agent_selections_limit_evals_and_seed_the_dataset_snapshot() {
@@ -276,7 +320,13 @@ fn agent_selections_limit_evals_and_seed_the_dataset_snapshot() {
 fn agent_builds_return_guarded_removals_with_safe_paths() {
     let previous = "# Generated by bts; edits will be overwritten.\ndef run(): return 'old'\n";
     let result = build_result(
-        r#"agent "hello" { entrypoint = trace.hello } trace "hello" { output = "hello" }"#,
+        r#"(hello:agent) {input: null, output: trace_hello.output};
+(hello)-|:next|->(trace_hello);
+(trace_hello:task {name: "hello"}) {
+    output: "hello",
+    input: hello.input
+};
+"#,
         &serde_json::json!({ "target": "agent", "files": { "hello_agent.py": previous, "hello_agent_agent.py": "# user code\n" } }),
     );
     assert_eq!(result["ok"], true, "{result}");
@@ -318,7 +368,11 @@ fn agent_eval_snapshots_enforce_the_output_languages_integer_range() {
 #[wasm_bindgen_test]
 fn agent_build_errors_do_not_return_partial_files() {
     for (source, options, stage) in [
-        (r#"trace "unbound" {}"#, serde_json::json!({ "target": "agent" }), "build"),
+        (
+            r#"(quality:scorer) {score: 1};"#,
+            serde_json::json!({ "target": "agent" }),
+            "build",
+        ),
         (AGENT_EVALS, serde_json::json!({ "target": "agent" }), "options"),
         (
             AGENT_EVALS,
@@ -345,7 +399,9 @@ fn agent_build_errors_do_not_return_partial_files() {
 
 #[wasm_bindgen_test]
 fn build_merges_virtual_manifests_and_preserves_existing_tsconfig() {
-    let source = r#"scorer "quality" { code { score = 0.5 } }"#;
+    let source = r#"(quality:scorer) {
+    score: 0.5
+};"#;
     let package = serde_json::json!({
         "name": "existing-package",
         "scripts": { "check": "custom-check" },
@@ -378,7 +434,9 @@ fn build_merges_virtual_manifests_and_preserves_existing_tsconfig() {
 
 #[wasm_bindgen_test]
 fn build_returns_staged_option_errors() {
-    let source = r#"scorer "quality" { code { score = 0.5 } }"#;
+    let source = r#"(quality:scorer) {
+    score: 0.5
+};"#;
     for options in [
         serde_json::json!({}),
         serde_json::json!({ "project": "" }),
@@ -408,9 +466,20 @@ fn build_returns_staged_option_errors() {
 #[wasm_bindgen_test]
 fn build_returns_planning_errors_without_partial_files() {
     for (source, options) in [
-        (r#"trace "run" {}"#, serde_json::json!({ "project": "Browser Project" })),
         (
-            r#"scorer "quality" { code { score = 0.5 } }"#,
+            r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    input: run_agent.input,
+    output: null
+};
+"#,
+            serde_json::json!({ "project": "Browser Project" }),
+        ),
+        (
+            r#"(quality:scorer) {
+    score: 0.5
+};"#,
             serde_json::json!({
                 "project": "Browser Project",
                 "lang": "typescript",
@@ -436,7 +505,9 @@ fn generate_result(source: &str, options: &Value) -> Value {
 fn rejects_random_string_lengths_that_do_not_fit_wasm() {
     let options = serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" });
     for expression in ["hex(4294967296)", "alphanum(4294967297)"] {
-        let source = format!(r#"trace "run" {{ output = {expression} }}"#);
+        let source = format!(
+            r#"(a:agent) {{input: null, output: run.output}}; (a)-|:next|->(run:task) {{input: a.input, output: {expression}}};"#
+        );
         let validation = validate(&source);
         assert_eq!(validation["valid"], false, "{expression}: {validation}");
         assert_eq!(validation["diagnostics"][0]["phase"], "validation");
@@ -446,7 +517,7 @@ fn rejects_random_string_lengths_that_do_not_fit_wasm() {
         assert_eq!(generated["error"]["stage"], "compile");
         assert!(generated.get("value").is_none());
 
-        let source = format!(r#"scorer "quality" {{ code {{ score = {expression} == "" ? 1 : 0 }} }}"#);
+        let source = format!(r#"(quality:scorer) {{score: {expression} == "" ? 1 : 0}};"#);
         for language in ["python", "typescript"] {
             let built = build_result(
                 &source,
@@ -467,21 +538,21 @@ fn clamps_large_slice_bounds_for_literals_fields_and_iterations() {
         for bound in [bound.to_string(), format!("range({bound}, {bound})")] {
             let source = format!(
                 r#"
-                trace "run" {{
-                    input = [1, 2]
-                    output = {{
-                        literal_start = [1, 2][{bound}:]
-                        literal_end = [1, 2][:{bound}]
-                        field_start = self.input[{bound}:]
-                        field_end = self.input[:{bound}]
-                        iteration_start = repeat.rounds[{bound}:].task.step.output
-                        iteration_end = repeat.rounds[:{bound}].task.step.output
-                    }}
-                    repeat "rounds" {{
-                        count = 2
-                        task "step" {{ output = repeat.index }}
-                    }}
-                }}
+                (a:agent) {{input: [1, 2], output: run.output}};
+                (a)-|:next|->(run:task) {{
+                    input: a.input,
+                    output: {{
+                        literal_start: [1, 2][{bound}:],
+                        literal_end: [1, 2][:{bound}],
+                        field_start: self.input[{bound}:],
+                        field_end: self.input[:{bound}],
+                        iteration_start: results.output[{bound}:],
+                        iteration_end: results.output[:{bound}],
+                    }},
+                }};
+                (run)
+                    =|:repeat {{count: 2}}|=>[-|round:calls|->(step:task) {{output: context.index}}]
+                        >|:reduce {{observe: "result", initial: [], combine: [...context.accumulator, context.arrival.value]}} |round||>>(results:task) {{output: context.accumulator}};
                 "#
             );
             let validation = validate(&source);
@@ -511,7 +582,9 @@ fn rejects_negative_and_noninteger_slice_bounds() {
             } else {
                 bound.to_owned()
             };
-            let source = format!(r#"trace "run" {{ output = [1, 2][:{expression}] }}"#);
+            let source = format!(
+                r#"(a:agent) {{input: null, output: run.output}}; (a)-|:next|->(run:task) {{input: a.input, output: [1, 2][:{expression}]}};"#
+            );
             let validation = validate(&source);
             assert_eq!(validation["valid"], dynamic, "{expression}: {validation}");
             let generated = generate_result(&source, &options);
@@ -531,7 +604,12 @@ fn exposes_shared_reference_and_browser_authoring_guidance() {
     let reference: Value = serde_wasm_bindgen::from_value(bts_wasm::spec().unwrap()).unwrap();
     assert_eq!(reference, serde_json::to_value(bts_lang::spec::SPEC).unwrap());
     let skill = bts_wasm::skill();
-    assert!(skill.starts_with(&bts_core::skill::render(&bts_lang::spec::SPEC)));
+    // the providers the browser interface selects
+    assert!(skill.starts_with(&bts_core::skill::render(
+        &bts_lang::spec::SPEC,
+        &bts_core::providers::With(bts_core::providers::braintrust::Bundle, bts_core::providers::world::Bundle)
+    )));
+    assert!(skill.contains("## World functions"));
     assert!(skill.contains("validate(source)"));
     assert!(skill.contains("generate(source, options)"));
     assert!(skill.contains("build(source, options)"));
@@ -548,42 +626,31 @@ fn generation_matches_shared_core_with_filtering_tokens_and_maximum_seed() {
     use bts_core::selection::filter::WriteFilter;
     use std::time::{Duration, UNIX_EPOCH};
 
-    let source = r#"
-        trace "support" {
-            input = {
-                message = "Where can I download my invoice?"
-                account = { id = range(100, 999), active = true }
-                history = []
-            }
-            output = task.answer.output
-            metadata = { channel = "web", attempt = trace.index }
-            tags = ["billing"]
-
-            task "answer" {
-                output = {
-                    status = "resolved"
-                    message = "Open Billing and select the invoice you need."
-                    follow_up = null
-                }
-
-                llm "draft" {
-                    input = "hello"
-                    output = "hello"
-                    duration = 0.25
-                    metrics = {
-                        literal_tokens = tokens("hello")
-                        prompt_tokens = tokens(self.input)
-                        completion_tokens = tokens(self.output)
-                    }
-                }
-
-                tool "lookup" {
-                    input = { query = "invoice" }
-                    output = { found = true }
-                }
-            }
-        }
-    "#;
+    let source = r#"(support_agent:agent {name: "support"}) {input: {message: "Where can I download my invoice?", account: {id: range(100, 999), active: true}, history:[]}, output: support.output};
+(support_agent)-|:next|->(support);
+(support:task) {
+    input: support_agent.input,
+    output: answer.output,
+    metadata: {channel: "web", attempt: context.trace_index},
+    tags: ["billing"]
+};
+(support)-|:calls|->(answer);
+(answer:task) {
+    output: {status: "resolved", message: "Open Billing and select the invoice you need.", follow_up: null}
+};
+(answer)-|:calls|->(draft);
+(draft:llm) {
+    input: "hello",
+    output: "hello",
+    duration: 0.25,
+    metrics: {literal_tokens: tokens("hello"), prompt_tokens: tokens(self.input), completion_tokens: tokens(self.output)}
+};
+(answer)-|:calls|->(lookup);
+(lookup:tool) {
+    input: {query: "invoice"},
+    output: {found: true}
+};
+"#;
     let filter = r#"block.kind != "tool""#;
     let result = generate_result(
         source,
@@ -606,7 +673,7 @@ fn generation_matches_shared_core_with_filtering_tokens_and_maximum_seed() {
     assert_eq!(value["attachments"], serde_json::json!([]));
 
     let mut batch = data::generate_filtered(
-        bts_lang::semantics::compile(source).unwrap(),
+        bts_core::providers::Provider::compile(&bts_core::providers::braintrust::Bundle, source).unwrap(),
         3,
         Duration::from_secs(60),
         data::Distribution::Sine,
@@ -640,7 +707,13 @@ fn generation_matches_shared_core_with_filtering_tokens_and_maximum_seed() {
 
 #[wasm_bindgen_test]
 fn relative_count_and_absolute_rate_windows_generate_the_same_population() {
-    let source = r#"trace "run" { output = range(1, 5) }"#;
+    let source = r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    output: range(1, 5),
+    input: run_agent.input
+};
+"#;
     let relative = generate_result(
         source,
         &serde_json::json!({
@@ -663,7 +736,7 @@ fn relative_count_and_absolute_rate_windows_generate_the_same_population() {
 
 #[wasm_bindgen_test]
 fn generation_preserves_compile_diagnostics_and_unicode_byte_ranges() {
-    let source = "trace \"café 🦀\" { input = }";
+    let source = "(\"café 🦀\":task) { input: }";
     let result = generate_result(
         source,
         &serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" }),
@@ -680,7 +753,13 @@ fn generation_preserves_compile_diagnostics_and_unicode_byte_ranges() {
 
 #[wasm_bindgen_test]
 fn generation_rejects_ambiguous_or_unrepresentable_options() {
-    let source = r#"trace "run" {}"#;
+    let source = r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    input: run_agent.input,
+    output: null
+};
+"#;
     for overrides in [
         serde_json::json!({ "rate_per_second": 1 }),
         serde_json::json!({ "start_ms": 1000 }),
@@ -702,12 +781,13 @@ fn generation_rejects_ambiguous_or_unrepresentable_options() {
 
 #[wasm_bindgen_test]
 fn generation_returns_authored_attachment_descriptors_without_filesystem_resolution() {
-    let source = r#"
-        trace "review" {
-            input = attachment("browser-only/missing/report.pdf", "application/pdf")
-            output = self.input
-        }
-    "#;
+    let source = r#"(review_agent:agent {name: "review"}) {input: attachment("browser-only/missing/report.pdf", "application/pdf"), output: review.output};
+(review_agent)-|:next|->(review);
+(review:task) {
+    input: review_agent.input,
+    output: self.input
+};
+"#;
     let result = generate_result(
         source,
         &serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" }),
@@ -817,7 +897,13 @@ fn write_state(fixture: &wasm_bindgen::JsValue) -> Value {
 
 #[wasm_bindgen_test]
 async fn write_sends_shared_payload_bytes_and_returns_acknowledged_rows() {
-    let source = r#"trace "run" { output = "hello" }"#;
+    let source = r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    output: "hello",
+    input: run_agent.input
+};
+"#;
     let fixture = write_test_transport("success");
     let generation_options = write_generation_options();
     let result = write_result(source, &generation_options, &write_options(), &fixture).await;
@@ -852,7 +938,19 @@ async fn write_sends_shared_payload_bytes_and_returns_acknowledged_rows() {
 #[wasm_bindgen_test]
 async fn write_reports_final_http_rejections_without_retrying() {
     let fixture = write_test_transport("rejected");
-    let result = write_result(r#"trace "run" {}"#, &write_generation_options(), &write_options(), &fixture).await;
+    let result = write_result(
+        r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    input: run_agent.input,
+    output: null
+};
+"#,
+        &write_generation_options(),
+        &write_options(),
+        &fixture,
+    )
+    .await;
     assert_eq!(result["ok"], false, "{result}");
     assert_eq!(result["error"]["stage"], "write");
     assert!(result["error"]["message"].as_str().unwrap().contains("400"));
@@ -870,7 +968,19 @@ async fn write_times_out_and_aborts_the_host_request() {
     let mut options = write_options();
     options["request_timeout_ms"] = 10.into();
     options["retry_attempts"] = 1.into();
-    let result = write_result(r#"trace "run" {}"#, &write_generation_options(), &options, &fixture).await;
+    let result = write_result(
+        r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    input: run_agent.input,
+    output: null
+};
+"#,
+        &write_generation_options(),
+        &options,
+        &fixture,
+    )
+    .await;
     assert_eq!(result["ok"], false, "{result}");
     assert_eq!(result["error"]["stage"], "write");
     assert_eq!(result["error"]["details"]["row_count"], 0);
@@ -882,7 +992,13 @@ async fn write_times_out_and_aborts_the_host_request() {
 
 #[wasm_bindgen_test]
 async fn write_rejects_invalid_inputs_and_attachments_before_transport() {
-    let good_source = r#"trace "run" {}"#;
+    let good_source = r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    input: run_agent.input,
+    output: null
+};
+"#;
     let mut missing_seed = write_generation_options();
     missing_seed.as_object_mut().unwrap().remove("seed");
     let mut invalid_project = write_options();
@@ -893,7 +1009,13 @@ async fn write_rejects_invalid_inputs_and_attachments_before_transport() {
     invalid_timeout["request_timeout_ms"] = 0.into();
     for (source, generation_options, options, stage) in [
         (
-            r#"trace "run" { output = }"#,
+            r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    output: ,
+    input: run_agent.input
+};
+"#,
             write_generation_options(),
             write_options(),
             "compile",
@@ -903,7 +1025,13 @@ async fn write_rejects_invalid_inputs_and_attachments_before_transport() {
         (good_source, write_generation_options(), invalid_retries, "options"),
         (good_source, write_generation_options(), invalid_timeout, "options"),
         (
-            r#"trace "run" { input = attachment("missing/report.pdf", "application/pdf") }"#,
+            r#"(run_agent:agent {name: "run"}) {input: attachment("missing/report.pdf", "application/pdf"), output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    input: run_agent.input,
+    output: null
+};
+"#,
             write_generation_options(),
             write_options(),
             "write",
@@ -923,7 +1051,19 @@ async fn write_rejects_invalid_inputs_and_attachments_before_transport() {
 async fn write_reports_malformed_transport_responses_as_failures() {
     for mode in ["malformed_body", "malformed_response"] {
         let fixture = write_test_transport(mode);
-        let result = write_result(r#"trace "run" {}"#, &write_generation_options(), &write_options(), &fixture).await;
+        let result = write_result(
+            r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    input: run_agent.input,
+    output: null
+};
+"#,
+            &write_generation_options(),
+            &write_options(),
+            &fixture,
+        )
+        .await;
         assert_eq!(result["ok"], false, "{mode}: {result}");
         assert_eq!(result["error"]["stage"], "write");
         assert_eq!(result["error"]["details"]["row_count"], 0);
@@ -936,7 +1076,13 @@ async fn write_reports_malformed_transport_responses_as_failures() {
 #[wasm_bindgen_test]
 fn generation_returns_unsafe_javascript_integers_as_serialization_failures() {
     let result = generate_result(
-        r#"trace "run" { output = 9007199254740992 }"#,
+        r#"(run_agent:agent {name: "run"}) {input: null, output: run.output};
+(run_agent)-|:next|->(run);
+(run:task) {
+    output: 9007199254740992,
+    input: run_agent.input
+};
+"#,
         &serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" }),
     );
     assert_eq!(result["ok"], false, "{result}");
@@ -947,7 +1093,13 @@ fn generation_returns_unsafe_javascript_integers_as_serialization_failures() {
 
 #[wasm_bindgen_test]
 fn generation_preserves_evaluation_diagnostics_and_unicode_byte_ranges() {
-    let source = r#"trace "café 🦀" { input = [1][range(1, 1)] }"#;
+    let source = r#"("café 🦀_agent":agent {name: "café 🦀"}) {input: [1][range(1, 1)], output: ("café 🦀").output};
+("café 🦀_agent")-|:next|->("café 🦀");
+("café 🦀":task) {
+    input: ("café 🦀_agent").input,
+    output: null
+};
+"#;
     let result = generate_result(
         source,
         &serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" }),
@@ -973,7 +1125,7 @@ fn generation_preserves_special_json_object_keys() {
     let options = serde_json::json!({ "count": 1, "over_ms": 1000, "until_ms": 5000, "seed": "42" });
     let options = serde::Serialize::serialize(&options, &serde_wasm_bindgen::Serializer::json_compatible()).unwrap();
     let result = bts_wasm::generate(
-        r#"trace "run" { output = { for key in ["__proto__"] : key => { marker = true } } }"#,
+        r#"(a:agent) {input: null, output: run.output}; (a)-|:next|->(run:task) {input: a.input, output: {for key in ["__proto__"]: key => {marker: true}}};"#,
         options,
     )
     .expect("generation must return failures as data");
@@ -988,41 +1140,35 @@ fn generation_preserves_special_json_object_keys() {
 
 #[wasm_bindgen_test]
 fn matches_native_seeded_samples() {
-    let source = r#"
-        trace "sampling" {
-            output = {
-                integer = range(-10, 10)
-                choice = choice("alpha", "beta", "gamma")
-                weighted = weighted(["steady", 3], ["burst", 1])
-                chance = chance(0.5)
-                uuid = uuid()
-                hex = hex(8)
-                alphanum = alphanum(8)
-            }
-        }
-    "#;
-    // captured from the original 64-bit native generator
+    let source = r#"(sampling_agent:agent {name: "sampling"}) {input: null, output: sampling.output};
+(sampling_agent)-|:next|->(sampling);
+(sampling:task) {
+    output: {integer: range(- 10, 10), choice: choice("alpha", "beta", "gamma"), weighted: weighted(["steady", 3],["burst", 1]), chance: chance(0.5), uuid: uuid(), hex: hex(8), alphanum: alphanum(8)},
+    input: sampling_agent.input
+};
+"#;
+    // captured from the native graph generator with the same source and seeds
     let expected = [
         (
             0,
             serde_json::json!([
                 {
-                    "integer": 10,
-                    "choice": "alpha",
-                    "weighted": "burst",
+                    "alphanum": "WqG5zfsR",
                     "chance": true,
-                    "uuid": "0db107f7-53c0-422c-b3fd-475fe0114ae9",
-                    "hex": "9daf119a",
-                    "alphanum": "MjIhecBT"
+                    "choice": "gamma",
+                    "hex": "3a0d1616",
+                    "integer": -7,
+                    "uuid": "83d39e6e-1a06-42a8-ad21-b17275e564a1",
+                    "weighted": "steady"
                 },
                 {
-                    "integer": -5,
-                    "choice": "alpha",
-                    "weighted": "steady",
+                    "alphanum": "mVwk47X3",
                     "chance": true,
-                    "uuid": "1e007435-896d-4761-874d-0067e9312c69",
-                    "hex": "6b559921",
-                    "alphanum": "qhDh7XAq"
+                    "choice": "beta",
+                    "hex": "bf0bbdf7",
+                    "integer": 8,
+                    "uuid": "185d1c13-13d3-4f71-95a3-12e3106ac9aa",
+                    "weighted": "burst"
                 }
             ]),
         ),
@@ -1030,22 +1176,22 @@ fn matches_native_seeded_samples() {
             42,
             serde_json::json!([
                 {
-                    "integer": -6,
+                    "alphanum": "AcbhCvcm",
+                    "chance": true,
                     "choice": "gamma",
-                    "weighted": "steady",
-                    "chance": false,
-                    "uuid": "fa0552f9-657f-45da-8cf7-06f5fed89d5b",
-                    "hex": "2a9e71e2",
-                    "alphanum": "qVjkXWW7"
+                    "hex": "70654735",
+                    "integer": -1,
+                    "uuid": "efab94e8-0912-4c08-bada-e45d87062e4c",
+                    "weighted": "steady"
                 },
                 {
-                    "integer": -6,
+                    "alphanum": "mQg0aAJr",
+                    "chance": true,
                     "choice": "alpha",
-                    "weighted": "burst",
-                    "chance": false,
-                    "uuid": "35ef89eb-f8d8-48b7-8586-fda39ba3b61f",
-                    "hex": "4cb85c37",
-                    "alphanum": "Rl10wJDE"
+                    "hex": "c29490c0",
+                    "integer": -1,
+                    "uuid": "d217f1e8-1e10-409e-bcff-60f8aea42e67",
+                    "weighted": "burst"
                 }
             ]),
         ),
@@ -1053,22 +1199,22 @@ fn matches_native_seeded_samples() {
             u64::MAX,
             serde_json::json!([
                 {
-                    "integer": -8,
-                    "choice": "beta",
-                    "weighted": "burst",
-                    "chance": true,
-                    "uuid": "b09f5e2d-909c-43a1-a275-f3e3d182ea20",
-                    "hex": "e544e8b6",
-                    "alphanum": "GEdnZET4"
+                    "alphanum": "JOQlD09W",
+                    "chance": false,
+                    "choice": "gamma",
+                    "hex": "511fbf4b",
+                    "integer": -2,
+                    "uuid": "7959c4d8-1942-49b5-81a5-d6a0b80f74b1",
+                    "weighted": "steady"
                 },
                 {
-                    "integer": -10,
+                    "alphanum": "TWawkvs1",
+                    "chance": true,
                     "choice": "beta",
-                    "weighted": "steady",
-                    "chance": false,
-                    "uuid": "55bef189-0e4b-485f-8cbb-e060614354c9",
-                    "hex": "6b1e2c38",
-                    "alphanum": "NMGGYH8B"
+                    "hex": "9adc6f82",
+                    "integer": -7,
+                    "uuid": "a4b519a2-b6db-4c83-93b0-ff1923dc7b0d",
+                    "weighted": "steady"
                 }
             ]),
         ),
@@ -1098,34 +1244,81 @@ fn matches_native_seeded_samples() {
 
 #[wasm_bindgen_test]
 fn language_composition_matches_native_samples() {
-    let source = r#"
-trace "language" {
-    vars { selected = sample([0, 1, 2, 3, 4, 5], 3) }
-    output = {
-        rendered = render("{{{name}}}: {n} {ok} {name}", { name = "Zoë", n = 2, ok = true })
-        literal = render("{text}", { text = "{untouched}" })
-        composed = compose([null, "", "hello", " world "])
-        nested = compose(["Hi!", compose(sample(["one", "two"], 2), ", ")])
-        empty = compose([null, ""])
-        selected = var.selected
-        reused = var.selected
-        duplicates = sample(["same", "same"], 2)
-        zero = sample([], 0)
-    }
-}
+    let source = r#"(language_agent:agent {name: "language"}) {input: null, output: language.output};
+(language_agent)-|:next|->(language);
+(language:task) {
+    output: {rendered: render("{{{name}}}: {n} {ok} {name}", {name: "Zoë", n: 2, ok: true}), literal: render("{text}", {text: "{untouched}"}), composed: compose([null, "", "hello", " world "]), nested: compose(["Hi!", compose(sample(["one", "two"], 2), ", ")]), empty: compose([null, ""]), selected: language.local.selected, reused: language.local.selected, duplicates: sample(["same", "same"], 2), zero: sample([], 0)},
+    input: language_agent.input,
+    local: {selected: sample([0, 1, 2, 3, 4, 5], 3)}
+};
 "#;
     let options = serde_json::json!({ "count": 32, "over_ms": 3600000, "until_ms": 86400000, "seed": "42" });
     let result = generate_result(source, &options);
     assert_eq!(result["ok"], true, "{result}");
     let output = &result["value"]["payload"]["events"][0]["output"];
-    assert_eq!(output["selected"], serde_json::json!([1, 2, 5]));
+    assert_eq!(output["selected"], serde_json::json!([2, 3, 5]));
     assert_eq!(output["selected"], output["reused"]);
     assert_eq!(output["rendered"], "{Zoë}: 2 true Zoë");
     assert_eq!(output["composed"], "hello  world ");
     assert_eq!(output["nested"], "Hi! one, two");
     for expression in [r#"render("{missing}", {})"#, "compose([1])", "sample([1], 2)"] {
-        let source = format!(r#"trace "t" {{ output = {expression} }}"#);
+        let source = format!(
+            r#"(a:agent) {{input: null, output: t.output}}; (a)-|:next|->(t:task) {{input: a.input, output: {expression}}};"#
+        );
         let result = generate_result(&source, &options);
         assert_eq!(result["ok"], false, "{expression}");
     }
+}
+
+#[wasm_bindgen_test]
+fn graph_fixture_runs_cycles_weighted_forks_and_juncts() {
+    let source = include_str!("fixtures/valid.bt");
+    let options = serde_json::json!({"count": 1, "over_ms": 60000, "until_ms": 3600000, "seed": "42"});
+    let generated = generate_result(source, &options);
+    assert_eq!(generated["ok"], true, "{generated}");
+    let events = generated["value"]["payload"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 9);
+    assert_eq!(events[1]["output"], 1);
+    assert_eq!(events[2]["output"], 2);
+    assert_eq!(events[0]["output"], events[8]["output"]);
+    assert_eq!(
+        events[8]["output"],
+        serde_json::json!([
+            {"edge": "to_coverage", "value": {"route": "primary", "covered": true}},
+            {"edge": "to_records", "value": {"attempts": 2, "found": true}},
+        ])
+    );
+    for lang in ["python", "typescript"] {
+        let built = build_result(source, &serde_json::json!({"target": "agent", "lang": lang}));
+        assert_eq!(built["ok"], true, "{built}");
+        assert!(
+            built["value"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| !file["path"].as_str().unwrap().contains("runtime")
+                    && file["contents"].as_str().unwrap().contains("cycle max_traversals exceeded"))
+        );
+    }
+    let failed = generate_result(&source.replace("max_traversals: 3", "max_traversals: 0"), &options);
+    assert_eq!(failed["ok"], false, "{failed}");
+    assert_eq!(failed["error"]["stage"], "generate");
+    assert!(failed.get("value").is_none());
+    assert_eq!(
+        validate(&source.replace("service: \"patients\"", "unknown: \"patients\""))["valid"],
+        false
+    );
+}
+
+#[wasm_bindgen_test]
+fn provider_definition_conflicts_point_to_the_user_declaration() {
+    let result = validate("+(span:node);");
+    assert_eq!(result["valid"], false);
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic.get("source").is_none())
+    );
 }

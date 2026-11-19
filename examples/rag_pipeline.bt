@@ -1,59 +1,46 @@
-# rag pipeline -- variance axes: how many documents come back, retrieval
-# quality (hit vs miss), and extra stages (query rewrite, guardrails).
+# retrieval, ranking and an answer share the same document evidence
+# a retrieval step states how many documents it considered, whatever span kind it is
++(retrieval:trait) {considered: {type: "number", required: true}}
+    -|:on|->(node);
++(doc_search:node)
+    -|:extends|->(tool)
+    -|:has|->(retrieval);
++(doc_rerank:node)
+    -|:extends|->(task)
+    -|:has|->(retrieval);
 
-vars {
-    system = "Answer using only the provided documents. Cite doc ids."
-    meta = { model = "gpt-4o-mini", provider = "openai" }
+(docs_qa:agent) {input: "How do I rotate API keys?", output: answer.output.content};
+(docs_qa)-|:next|->(request:task) {
+    input: docs_qa.input,
+    output: answer.output.content,
+    metadata: {request_id: uuid()},
+    tags: ["rag"],
+};
+(request)-|:calls|->(search:doc_search {name: "search_docs"}) {
+    duration: lognormal(0.4, 0.3),
+    considered: 8,
+    input: {query: request.input, top_k: self.considered},
+    output: {doc_ids: ["doc_112", "doc_089", "doc_331"], scores: [0.91, 0.63, 0.44]},
 }
-
-trace "docs-qa" {
-    input = "How do I rotate API keys?"
-    # the trace answers with whatever the generate span actually said
-    output = llm["Chat Completion"].output.content
-    metadata = { request_id = uuid() }
-    tags = ["rag"]
-
-    tool "search_docs" {
-        duration = lognormal(0.4, 0.3)
-        input = { query = "rotate API keys", top_k = 8 }
-        output = {
-            doc_ids = ["doc_112", "doc_089", "doc_331"]
-            scores = [0.91, 0.63, 0.44]
-        }
+    -|:next|->(rerank:doc_rerank) {
+        duration: 0.12,
+        considered: len(search.output.doc_ids),
+        input: {candidates: self.considered},
+        output: {kept: search.output.doc_ids[:2]},
     }
-
-    task "rerank" {
-        duration = 0.12
-        # downstream stages read the retriever's actual output; kept is a
-        # slice of the candidate ids
-        input = { candidates = len(tool.search_docs.output.doc_ids) }
-        output = { kept = tool.search_docs.output.doc_ids[:2] }
-    }
-
-    llm "Chat Completion" {
-        # one sampled generation time feeds the span duration and keeps
-        # time_to_first_token under it
-        vars { gen_time = lognormal(2.4, 0.4) }
-        duration = var.gen_time
-        input = [
-            { role = "system", content = var.system },
-            {
-                role = "user"
-                content = <<-CTX
-                    [${task.rerank.output.kept[0]}] API keys: rotation and expiry
-                    [${task.rerank.output.kept[1]}] Service accounts and scopes
-
-                    Question: ${trace.input}
-                CTX
+        -|:next|->(answer:llm {name: "Chat Completion"}) {
+            local: {gen_time: lognormal(2.4, 0.4)},
+            duration: self.local.gen_time,
+            input: {
+                system: "Answer using only the provided documents. Cite doc ids.",
+                question: request.input,
+                document_ids: rerank.output.kept,
+                documents: [
+                    {id: "doc_112", content: "Rotate API keys under Settings > API. Old keys remain valid for 24 hours."},
+                    {id: "doc_089", content: "Service accounts have individually scoped API keys."},
+                ],
             },
-        ]
-        output = { role = "assistant", content = "Rotate keys under Settings > API; the old key stays valid for 24 hours. [doc_112]" }
-        metadata = var.meta
-        metrics = {
-            prompt_tokens = tokens(self.input)
-            completion_tokens = tokens(self.output)
-            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-            time_to_first_token = var.gen_time * range(0.1, 0.25)
-        }
-    }
-}
+            output: {role: "assistant", content: "Rotate keys under Settings > API. The old key stays valid for 24 hours. [doc_112]"},
+            metadata: {model: "gpt-4o-mini", provider: "openai"},
+            metrics: {time_to_first_token: self.local.gen_time * range(0.1, 0.25)},
+        };

@@ -1,1 +1,26 @@
-trace "hello" { input = "world" output = "hello" }
++(lookup_tool:node {service: {type: "string", required: true}}) {attempt: {type: "number"}}-|:extends|->(tool);
+
+# retries, a weighted route and two results reconciled into one payload
+(workflow:agent) {input: 2, output: finish.output};
+(workflow)-|:next|->(request:task) {input: workflow.input, output: finish.output};
+
+(request)-|:calls, :feeds {value: 0, into: target.attempt}|->(attempt:lookup_tool {service: "patients"}) {
+    attempt: <-,
+    output: self.attempt + 1,
+};
+(attempt)~|:next {when: source.output < request.input, max_traversals: 3}, :feeds {value: source.output, into: target.attempt}|~>(attempt);
+(attempt)-|:next {when: source.output >= request.input}|->(route:task) {output: "ready"};
+
+(route)
+    =|:weighted|=>[
+        -|to_primary:next {weight: 3}|->(primary:tool) {output: "primary"},
+        -|to_backup:next {weight: 1}|->(backup:tool) {output: "backup"},
+    ]
+        >|:first {observe: "result"} |to_primary|, |to_backup||>>(selected:task) {output: context.arrivals[0].value};
+
+(selected)
+    =|:parallel|=>[
+        -|to_coverage:next|->(coverage:tool) {output: {route: selected.output, covered: true}},
+        -|to_records:next|->(records:tool) {output: {attempts: attempt.output, found: true}},
+    ]
+        >|:accumulate {observe: "result"} |to_coverage|, |to_records||>>(finish:task) {output: context.arrivals};

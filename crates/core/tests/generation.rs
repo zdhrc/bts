@@ -1,5 +1,20 @@
 use bts_core::mocking::data::{self, Distribution, Value};
-use bts_lang::semantics::compile;
+use bts_core::providers::braintrust::Bundle;
+use bts_core::providers::{Contributor, Provider};
+use bts_lang::semantics::{Source, compile_module_with_provider};
+
+fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
+    let graph = compile_module_with_provider(
+        Source {
+            name: "generation.bt",
+            text: source,
+        },
+        &Bundle.schema(),
+        false,
+    )
+    .map_err(|errors| format!("{errors:#?}"))?;
+    Bundle.lower(&graph, Bundle.functions()).map_err(|diag| diag.what)
+}
 use std::collections::HashSet;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -87,17 +102,20 @@ fn reproduces_the_same_events_with_a_fixed_seed() {
 #[test]
 fn preserves_native_seeded_samples() {
     let source = r#"
-        trace "sampling" {
-            output = {
-                integer = range(-10, 10)
-                choice = choice("alpha", "beta", "gamma")
-                weighted = weighted(["steady", 3], ["burst", 1])
-                chance = chance(0.5)
-                uuid = uuid()
-                hex = hex(8)
-                alphanum = alphanum(8)
-            }
-        }
+        (sampling:task) {
+            input: sampler.input,
+            output: {
+                integer: range(-10, 10),
+                choice: choice("alpha", "beta", "gamma"),
+                weighted: weighted(["steady", 3], ["burst", 1]),
+                chance: chance(0.5),
+                uuid: uuid(),
+                hex: hex(8),
+                alphanum: alphanum(8),
+            },
+        };
+        (sampler:agent) {input: null, output: sampling.output};
+        (sampler)-|:next|->(sampling);
     "#;
     // captured from the original 64-bit native generator
     let expected = [
@@ -195,20 +213,23 @@ fn preserves_native_seeded_samples() {
 #[test]
 fn language_composition_is_seeded_and_preserves_structure() {
     let source = r#"
-trace "language" {
-    vars { selected = sample([0, 1, 2, 3, 4, 5], 3) }
-    output = {
-        rendered = render("{{{name}}}: {n} {ok} {name}", { name = "Zoë", n = 2, ok = true })
-        literal = render("{text}", { text = "{untouched}" })
-        composed = compose([null, "", "hello", " world "])
-        nested = compose(["Hi!", compose(sample(["one", "two"], 2), ", ")])
-        empty = compose([null, ""])
-        selected = var.selected
-        reused = var.selected
-        duplicates = sample(["same", "same"], 2)
-        zero = sample([], 0)
-    }
-}
+(language:task) {
+    input: author.input,
+    local: {selected: sample([0, 1, 2, 3, 4, 5], 3)},
+    output: {
+        rendered: render("{{{name}}}: {n} {ok} {name}", {name: "Zoë", n: 2, ok: true}),
+        literal: render("{text}", {text: "{untouched}"}),
+        composed: compose([null, "", "hello", " world "]),
+        nested: compose(["Hi!", compose(sample(["one", "two"], 2), ", ")]),
+        empty: compose([null, ""]),
+        selected: self.local.selected,
+        reused: self.local.selected,
+        duplicates: sample(["same", "same"], 2),
+        zero: sample([], 0),
+    },
+};
+(author:agent) {input: null, output: language.output};
+(author)-|:next|->(language);
 "#;
     let generate = || {
         data::generate(
@@ -248,7 +269,7 @@ trace "language" {
     assert!(selections.len() > 1);
     assert_eq!(
         first.events[0].output.as_ref().unwrap()["selected"].as_array().unwrap(),
-        &[Value::from(1), Value::from(2), Value::from(5)]
+        &[Value::from(0), Value::from(1), Value::from(2)]
     );
 }
 
@@ -257,10 +278,10 @@ fn language_composition_rejects_invalid_values() {
     for expression in [
         r#"render("{missing}", {})"#,
         r#"render("{}", {})"#,
-        r#"render("{name", { name = "x" })"#,
+        r#"render("{name", { name: "x" })"#,
         r#"render("x}", {})"#,
-        r#"render("{name}", { name = null })"#,
-        r#"render("{name}", { name = [] })"#,
+        r#"render("{name}", { name: null })"#,
+        r#"render("{name}", { name: [] })"#,
         "compose([false])",
         "compose([1])",
         "compose([{}])",
@@ -268,7 +289,9 @@ fn language_composition_rejects_invalid_values() {
         "sample([1], 2)",
         "sample([1], 1.0)",
     ] {
-        let source = format!("trace \"t\" {{ output = {expression} }}");
+        let source = format!(
+            "(t:task) {{input: a.input, output: {expression}}}; (a:agent) {{input: null, output: t.output}}; (a)-|:next|->(t);"
+        );
         let model = compile(&source).unwrap();
         assert!(
             data::generate(

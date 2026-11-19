@@ -434,44 +434,91 @@ pub fn dataset_names(known: &BTreeSet<String>, selectors: &[ResourceSelector]) -
 mod tests {
     use super::*;
 
-    const SOURCE: &str = r#"
-        scorer "brand" { code { score = 1 } }
-        scorer "quality" { code { score = 1 } }
-        facet "Churn risk" { prompt = "Summarize churn risk." }
-        facet "Intent" { prompt = "Summarize intent." }
-        automation "shared" { type = "scorer" scorers = ["brand", "quality"] scope = "span" root = true }
-        automation "other" { type = "scorer" scorers = ["quality"] scope = "span" root = true }
-        automation "topics" { type = "topics" facets = ["Churn risk", "Intent"] scope = "trace" }
-        dataset "first" { case "one" { input = "hello" } }
-        dataset "second" { case "two" { input = "world" } }
-    "#;
+    fn source() -> Model {
+        let mut model = crate::providers::braintrust::mocking::compile(
+            r#"
+(brand:scorer) {score: 1};
+(quality:scorer) {score: 1};
+(one:case) {input: "hello"};
+(two:case) {input: "world"};
+(first:dataset) {cases: [(one)]};
+(second:dataset) {cases: [(two)]};
+"#,
+        )
+        .unwrap();
+        model.facets = ["Churn risk", "Intent"]
+            .into_iter()
+            .map(|name| crate::dsl::Facet {
+                name: name.into(),
+                prompt: "Extract.".into(),
+                description: None,
+                no_match_pattern: None,
+            })
+            .collect();
+        model.automations = vec![
+            crate::dsl::Automation {
+                name: "shared".into(),
+                kind: AutomationKind::Scorer {
+                    scorers: vec!["brand".into(), "quality".into()],
+                    root: true,
+                    span_names: vec![],
+                },
+                sampling_rate: 1.0,
+                enabled: true,
+            },
+            crate::dsl::Automation {
+                name: "other".into(),
+                kind: AutomationKind::Scorer {
+                    scorers: vec!["quality".into()],
+                    root: true,
+                    span_names: vec![],
+                },
+                sampling_rate: 1.0,
+                enabled: true,
+            },
+            crate::dsl::Automation {
+                name: "topics".into(),
+                kind: AutomationKind::Topics {
+                    facets: vec!["Churn risk".into(), "Intent".into()],
+                },
+                sampling_rate: 1.0,
+                enabled: true,
+            },
+        ];
+        model
+    }
 
-    const AGENTS: &str = r#"
-        vars { identifier = range(1, 100) }
-        trace "source" { input = { id = var.identifier } output = "answer" }
-        trace "oldest" { input = "oldest" output = self.input }
-        trace "baseline" { input = "baseline" output = self.input }
-        trace "candidate" { input = "candidate" output = self.input }
-        trace "other" { input = "other" output = self.input }
-        agent "oldest" { entrypoint = trace.oldest }
-        agent "baseline" { entrypoint = trace.baseline }
-        agent "candidate" { entrypoint = trace.candidate }
-        agent "other" { entrypoint = trace.other }
-        scorer "quality" { code { score = 1 } }
-        scorer "unrelated" { code { score = 0 } }
-        dataset "shared" { case "trace-source" { trace = trace.source } }
-        dataset "other" { case "inline" { input = "other" } }
-        experiment "oldest" { task = trace.oldest dataset = dataset.shared scorers = [scorer.quality] }
-        experiment "baseline" { task = trace.baseline dataset = dataset.shared scorers = [scorer.quality] baseline = experiment.oldest }
-        experiment "candidate" { task = trace.candidate dataset = dataset.shared scorers = [scorer.quality] baseline = experiment.baseline }
-        experiment "candidate-extra" { task = trace.candidate dataset = dataset.shared scorers = [scorer.quality] }
-        experiment "sibling" { task = trace.baseline dataset = dataset.other scorers = [scorer.unrelated] }
-        experiment "other" { task = trace.other dataset = dataset.other scorers = [scorer.unrelated] }
-    "#;
+    const AGENTS: &str = r#"(source_root:task {name: "source"}) {input: source_node.input, output: "answer", local: {identifier: range (1 , 100)}};
+(source_node:agent) {input: {id: source_root.local.identifier}, output: source_root.output};
+(source_node)-|:next|->(source_root);
+(oldest_root:task {name: "oldest"}) {input: oldest.input, output: self.input, local: {identifier: range (1 , 100)}};
+(oldest:agent) {input: "oldest", output: oldest_root.output};
+(oldest)-|:next|->(oldest_root);
+(baseline_root:task {name: "baseline"}) {input: baseline.input, output: self.input, local: {identifier: range (1 , 100)}};
+(baseline:agent) {input: "baseline", output: baseline_root.output};
+(baseline)-|:next|->(baseline_root);
+(candidate_root:task {name: "candidate"}) {input: candidate.input, output: self.input, local: {identifier: range (1 , 100)}};
+(candidate:agent) {input: "candidate", output: candidate_root.output};
+(candidate)-|:next|->(candidate_root);
+(other_root:task {name: "other"}) {input: other.input, output: self.input, local: {identifier: range (1 , 100)}};
+(other:agent) {input: "other", output: other_root.output};
+(other)-|:next|->(other_root);
+("quality":scorer) {score: 1};
+("unrelated":scorer) {score: 0};
+(dataset_shared_trace_source:case {name: "trace-source"}) {source: (source_root)};
+(dataset_shared:dataset {name: "shared"}) {cases: [(dataset_shared_trace_source)]};
+(dataset_other_inline:case {name: "inline"}) {input: "other"};
+(dataset_other:dataset {name: "other"}) {cases: [(dataset_other_inline)]};
+(experiment_oldest:experiment {name: "oldest"}) {task: (oldest_root), dataset: (dataset_shared), scorers: [("quality")]};
+(experiment_baseline:experiment {name: "baseline"}) {task: (baseline_root), dataset: (dataset_shared), scorers: [("quality")], baseline: (experiment_oldest)};
+(experiment_candidate:experiment {name: "candidate"}) {task: (candidate_root), dataset: (dataset_shared), scorers: [("quality")], baseline: (experiment_baseline)};
+(experiment_candidate_extra:experiment {name: "candidate-extra"}) {task: (candidate_root), dataset: (dataset_shared), scorers: [("quality")]};
+(experiment_sibling:experiment {name: "sibling"}) {task: (baseline_root), dataset: (dataset_other), scorers: [("unrelated")]};
+(experiment_other:experiment {name: "other"}) {task: (other_root), dataset: (dataset_other), scorers: [("unrelated")]};"#;
 
     #[test]
     fn experiment_selection_keeps_baseline_dependencies_and_trace_reference_indexes() {
-        let model = dsl::semantics::compile(AGENTS).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(AGENTS).unwrap();
         let selected = agents(&model, &["experiment.candidate".parse().unwrap()]).unwrap();
         assert_eq!(
             selected.agents.iter().map(|agent| agent.name.as_str()).collect::<Vec<_>>(),
@@ -497,12 +544,20 @@ mod tests {
         );
         assert_eq!(format!("{:?}", selected.refs), format!("{:?}", model.refs));
         assert_eq!(format!("{:?}", selected.bindings), format!("{:?}", model.bindings));
-        assert_eq!(selected.agents[2].entrypoint, model.agents[2].entrypoint);
+        assert_eq!(
+            selected.agents[2].entrypoint,
+            model
+                .agents
+                .iter()
+                .find(|agent| agent.name == "candidate")
+                .unwrap()
+                .entrypoint
+        );
     }
 
     #[test]
     fn agent_selection_includes_entrypoint_evals_and_preserves_source_order() {
-        let model = dsl::semantics::compile(AGENTS).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(AGENTS).unwrap();
         let selected = agents(
             &model,
             &[
@@ -529,7 +584,7 @@ mod tests {
 
     #[test]
     fn agent_selection_rejects_unknown_incompatible_and_unbound_evals() {
-        let model = dsl::semantics::compile(AGENTS).unwrap();
+        let model = crate::providers::braintrust::mocking::compile(AGENTS).unwrap();
         for selector in ["agent.missing", "experiment.missing"] {
             assert!(matches!(
                 agents(&model, &[selector.parse().unwrap()]),
@@ -552,15 +607,19 @@ mod tests {
 
     #[test]
     fn explicit_agent_selection_resolves_a_shared_entrypoint() {
-        let model = dsl::semantics::compile(
-            r#"trace "shared" { output = "answer" }
-               agent "first" { entrypoint = trace.shared }
-               agent "second" { entrypoint = trace.shared }
-               scorer "quality" { code { score = 1 } }
-               dataset "cases" { case "one" { input = "question" } }
-               experiment "check" { task = trace.shared dataset = dataset.cases scorers = [scorer.quality] }"#,
+        let mut model = crate::providers::braintrust::mocking::compile(
+            r#"(shared_root:task {name: "shared"}) {output: "answer", input: second.input};
+(second:agent) {input: null, output: shared_root.output};
+(second)-|:next|->(shared_root);
+("quality":scorer) {score: 1};
+(dataset_cases_one:case {name: "one"}) {input: "question"};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
+(experiment_check:experiment {name: "check"}) {task: (shared_root), dataset: (dataset_cases), scorers: [("quality")]};"#,
         )
         .unwrap();
+        let mut first = model.agents[0].clone();
+        first.name = "first".into();
+        model.agents.insert(0, first);
         assert!(matches!(
             agents(&model, &["experiment.check".parse().unwrap()]),
             Err(Error::AmbiguousAgents { .. })
@@ -577,20 +636,22 @@ mod tests {
 
     #[test]
     fn selection_rejects_artifact_collisions_with_unselected_resources() {
-        let model = dsl::semantics::compile(
-            r#"
-trace "first" { output = "first" }
-trace "second" { output = "second" }
-trace "safe" { output = "safe" }
-agent "a-b" { entrypoint = trace.first }
-agent "a_b" { entrypoint = trace.second }
-agent "safe" { entrypoint = trace.safe }
-scorer "quality" { code { score = 1 } }
-dataset "cases" { case "one" { input = "hello" } }
-experiment "check-a" { task = trace.safe dataset = dataset.cases scorers = [scorer.quality] }
-experiment "check_a" { task = trace.safe dataset = dataset.cases scorers = [scorer.quality] }
-experiment "safe" { task = trace.safe dataset = dataset.cases scorers = [scorer.quality] }
-"#,
+        let model = crate::providers::braintrust::mocking::compile(
+            r#"(first_root:task {name: "first"}) {output: "first", input: a_b.input};
+(a_b:agent {name: "a-b"}) {input: null, output: first_root.output};
+(a_b)-|:next|->(first_root);
+(second_root:task {name: "second"}) {output: "second", input: a_b_1.input};
+(a_b_1:agent {name: "a_b"}) {input: null, output: second_root.output};
+(a_b_1)-|:next|->(second_root);
+(safe_root:task {name: "safe"}) {output: "safe", input: safe.input};
+(safe:agent) {input: null, output: safe_root.output};
+(safe)-|:next|->(safe_root);
+("quality":scorer) {score: 1};
+(dataset_cases_one:case {name: "one"}) {input: "hello"};
+(dataset_cases:dataset {name: "cases"}) {cases: [(dataset_cases_one)]};
+(experiment_check_a:experiment {name: "check-a"}) {task: (safe_root), dataset: (dataset_cases), scorers: [("quality")]};
+(experiment_check_b:experiment {name: "check_a"}) {task: (safe_root), dataset: (dataset_cases), scorers: [("quality")]};
+(experiment_safe:experiment {name: "safe"}) {task: (safe_root), dataset: (dataset_cases), scorers: [("quality")]};"#,
         )
         .unwrap();
         for selector in [
@@ -610,7 +671,7 @@ experiment "safe" { task = trace.safe dataset = dataset.cases scorers = [scorer.
 
     #[test]
     fn selection_preserves_whole_rules_and_deduplicates_in_source_order() {
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = source();
         let selectors = ["scorer.brand".parse().unwrap(), "automation.shared".parse().unwrap()];
         let rules = automations(&model, AutomationType::Scorers, &selectors).unwrap();
         assert_eq!(rules.len(), 1);
@@ -662,7 +723,7 @@ experiment "safe" { task = trace.safe dataset = dataset.cases scorers = [scorer.
         ] {
             assert!(source.parse::<ResourceSelector>().is_err(), "{source}");
         }
-        let model = dsl::semantics::compile(SOURCE).unwrap();
+        let model = source();
         for selector in ["scorer.missing", "facet[\"Churn risk\"]", "automation.topics"] {
             assert!(automations(&model, AutomationType::Scorers, &[selector.parse().unwrap()]).is_err());
         }

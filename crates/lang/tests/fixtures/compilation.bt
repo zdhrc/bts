@@ -1,101 +1,586 @@
-# mix up the trace shape without losing track of who's talking to who
-# scoped vars get drawn once so everyone in that scope sees the same value
-vars {
-    model = "gpt-4o-mini"
+# graph language showcase, parsed and lowered by the compilation tests
+# language rules live in crates/lang/src/spec.rs
+# built-in contracts live in the spec, domain kinds remain illustrative
+# update the spec and affected examples together when a language rule changes
+# actual provider schemas are tested with crates/core/tests/fixtures/braintrust.bt
+
+# standalone definitions do not acquire ownership from their use in a path
+# variable lifetime and activation in this graph remain open
+(settings:vars {evaluate: "lazy"}) {
+    request_id: format("req_{}", hex(8)),
+    max_attempts: 3,
+    model: "intake-model",
+    departments: ["billing", "appointments", "records"],
+    department: choice("billing", "appointments", "records"),
+};
+
+# arrays, expressions, and eager binding configuration
+(examples:vars {evaluate: "eager"}) {
+    grouped: ${settings.max_attempts + 1} * 2,
+    negative: -2,
+    remainder: 5 % 2,
+    eligible: true && !false || false,
+    comparison: 2 <= 3 && 4 >= 3 && 2 != 3,
+    conditional: settings.max_attempts > 1 ? "multiple" : "single",
+    absent: null,
+    first: settings.departments[0],
+    selected: settings.departments[1:],
+    combined: ["intake", ...settings.departments],
+    copied: {...intake.input, request_id: settings.request_id},
+    labels: [for d in settings.departments: upper(d)],
+    indexed: {for i, d in settings.departments: d => i},
+    source: (settings),
+    filtered: [for d in settings.departments: d if d != "billing"],
+    single: ["appointments"],
+    empty: [],
+};
+
+(intake:agent {label: "Hospital intake"}) {
+    input: {message: "I need an appointment", patient_id: "p-123"},
+    metadata: {request_id: settings.request_id},
+    tags: ["hospital", "intake"],
 }
-
-trace "support-sessions" {
-    # drawn once per trace: the repeat, the wrapup, and the metadata all see it
-    vars {
-        turns = range(1, 4)
+    -|:entry|->(collect:llm {model: settings.model}) {
+        input: intake.input,
+        output: {patient_id: intake.input.patient_id},
+        # self refers to this node in its properties and body expressions
+        metrics: {
+            prompt_tokens: tokens(self.input),
+            completion_tokens: tokens(self.output),
+            tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens,
+        },
     }
-
-    repeat "turns" {
-        count = var.turns
-
-        task "turn" {
-            input = "question ${repeat.index}"
-            output = "answer ${repeat.index}"
-
-            llm "Chat Completion" {
-                # the message list replays the enclosing turn's own fields
-                input = [
-                    { role = "system", content = "You are a support agent." },
-                    { role = "user", content = task.turn.input },
-                ]
-                output = { role = "assistant", content = task.turn.output }
-                metadata = { model = var.model, provider = "openai" }
-                # token counts computed from the actual content, summed in place
-                metrics = {
-                    prompt_tokens = tokens(self.input)
-                    completion_tokens = tokens(self.output)
-                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                }
-            }
+        -|:next|->(lookup:tool {name: "patient_lookup"}) {
+            input: collect.output,
+            output: {
+                found: chance(0.8),
+                needs_review: chance(0.1),
+            },
         }
+            =|:exclusive|=>[
+                -|:next {when: source.output.found}|->(route:task) {
+                    output: {department: settings.department},
+                },
+                -|:next {when: !source.output.found}|->("register-patient":tool {
+                    name: "register_patient",
+                }) {
+                    input: collect.output,
+                },
+            ]
+                ->(route)
+                    =|:exclusive|=>[
+                        -|:next {when: lookup.output.needs_review}|->(manual_review:tool {
+                            name: "request_manual_review",
+                        }) {
+                            input: lookup.output,
+                        },
+                        -|:next {when: !lookup.output.needs_review}|->(prepare:task),
+                    ]
+                        ->(prepare)
+                            =|patient_checks:parallel|=>[
+                                -|coverage:next|->(check_coverage:tool {
+                                    name: "check_coverage",
+                                }) {
+                                    input: {patient_id: collect.output.patient_id},
+                                },
+                                -|records:next|->(fetch_records:tool {
+                                    name: "fetch_records",
+                                }) {
+                                    input: {patient_id: collect.output.patient_id},
+                                },
+                            ]
+                                >|:accumulate {correlate: settings.request_id} |coverage|, |records||>>(finish);
+
+# additional connections reuse existing definitions without redeclaring them
+(manual_review)-|:next|->(finish);
+("register-patient")-|:next|->(finish);
+
+(finish:function) {
+    output: {message: "Request ${settings.request_id} completed"},
+};
+
+# nested exclusive fork uses complementary guards to demonstrate coverage
+# an exclusive fork may select no branch, no default is required
+# the parallel inputs combine through a junction, not a converge edge
+# entry and next remain candidate edge contracts
+
+# conditional fork: every matching branch runs, no default is imposed here
+# a separate optional path keeps this case distinct from intake's active chain
+(optional_checks:task) {
+    input: {needs_coverage: true, needs_records: false},
+}
+    =|selected_checks:conditional|=>[
+        -|:next {when: optional_checks.input.needs_coverage}|->(coverage_note:function),
+        -|:next {when: optional_checks.input.needs_records}|->(records_note:function),
+    ];
+# optional checks deliberately has no convergence dependency
+
+# graph references, accessors, and value arrays
+(graph_references:vars {evaluate: "lazy"}) {
+    node: (lookup),
+    edge: |coverage|,
+    fork: |patient_checks|,
+    qualified_edge: |patient_checks|.|coverage|,
+    node_props: lookup.props.name,
+    edge_props: |coverage|.props,
+    edge_source: |coverage|.source,
+    edge_target: |coverage|.target,
+    edge_scope: |coverage|.scope,
+    fork_props: |patient_checks|.props,
+    fork_source: |patient_checks|.source,
+    first_path: |patient_checks|.paths[0],
+    first_path_element: |patient_checks|.paths[0][0],
+    one_element_array: [|coverage|],
+    edge_array: [|coverage|, |records|],
+    stored_paths: |patient_checks|.paths,
+    stored_target: self.stored_paths[0][0].target,
+    selected_edge: |self.edge_array[0]|,
+    node_array: [(lookup), (finish)],
+    selected_name: self.node_array[0].props.name,
+};
+
+# indentation attachment, edge lists, and anonymous targets
+(layout_start:task)
+    =|outer_layout:parallel|=>[
+        -|outer_work:next|->(layout_work:task),
+        -|outer_note:next, outer_data:feeds|->(layout_note:function),
+    ]
+        ->(layout_work)
+            =|inner_layout:parallel|=>[
+                -|inner_lookup:next|->(:tool {name: "lookup_visit"}),
+                -|inner_check:next|->(layout_check:tool),
+            ]
+                ->(|inner_lookup|.target)-|:next|->(layout_result:function)
+                >|:accumulate |inner_lookup|, |inner_check||>>(layout_combined:task)
+        ->(|outer_layout|.|outer_note|.target)-|:next|->(layout_finish:function);
+# indenting the last selector under inner_layout would be invalid even qualified
+# selectors and junctions at the same level are siblings, never a hidden chain
+
+# one inline continuation is allowed, two inline siblings are not
+(inline_start:task)=|:parallel|=>[-|:next|->(inline_work:task)] ->(inline_work)-|:next|->(inline_finish:task);
+
+# string expressions, escapes, and declaration-aligned indentation
+(prompt_examples:vars {evaluate: "lazy"}) {
+    calculation: "Attempts: ${settings.max_attempts + 1}",
+    function_call: "Request ${hex(8)}",
+    conditional: "Mode: ${settings.max_attempts > 1 ? "multiple" : "single"}",
+    escaped: "Write $${patient.name} in the template",
+    price: "Price: $25",
+    triple: """
+        Steps:
+          1. Identify the patient
+          2. Confirm the appointment
+    """,
+    dedented: <<-PROMPT
+        Steps:
+          1. Identify the patient
+          2. Confirm the appointment
+    PROMPT,
+    verbatim: <<RAW
+        Preserve these leading spaces.
+    RAW,
+};
+# triple produces Steps: followed by lines with two leading spaces
+# plain heredoc keeps its content indentation, delimiter indentation is not content
+# exact final-newline treatment for heredocs remains to be specified
+
+# scope properties illustrate configuration for a future consumer
+# a trait provides context keys to whatever its kinds lead to along next edges
+# a read names a key that reaches it, the consumer supplies the value
++(patient_scope:trait)
+    -|:on|->(node)
+    -|:provides {patient_id: {type: "string"}, purpose: {type: "string"}}|->(context);
++(scoped_agent:node)
+    -|:extends|->(agent)
+    -|:has|->(patient_scope);
+
+(patient_summary:task)
+    -|:next|->(fetch_patient:tool {name: "fetch_patient"}) {
+        input: {patient_id: context.patient_id},
+        output: {patient_id: context.patient_id},
     }
+        -|:next|->(summarize:llm) {
+            input: {
+                patient: fetch_patient.output,
+                purpose: context.purpose,
+            },
+        };
 
-    choice {
-        tool "get_order_status" {
-            input = { order_id = format("ord_{}", hex(8)) }
-            output = { status = choice("shipped", "processing", "delayed") }
-        }
+(intake_summary:scoped_agent {
+    scope: {patient_id: "p-123", purpose: "prepare for an appointment"},
+})
+    -|:next|->(patient_summary);
 
-        function "summarize_session" {
-            # block references select repeat iterations by index
-            input = { turns = var.turns, last_answer = repeat.turns[var.turns - 1].task.turn.output }
-            output = { summary = "customer asked about an order" }
-        }
+(billing_summary:scoped_agent {
+    scope: {patient_id: "p-123", purpose: "explain an invoice"},
+})
+    -|:next|->(patient_summary);
+
+# independent incoming paths can combine through an explicit junction target
+# the example scope property remains illustrative, not a finalized schema
+# a kind can provide context without a trait, and a junction reads what its inputs carry
++(visit_agent:node)
+    -|:extends|->(agent)
+    -|:provides {visit_id: {type: "string"}}|->(context);
+
+(visit_intake:visit_agent {
+    scope: {patient: {id: "p-123"}},
+})
+    -|patient_details:next|->(capture_details:task);
+
+(scheduling:visit_agent {
+    scope: {appointment: {visit_id: "v-101"}},
+})
+    -|appointment:next|->(confirm_appointment:task);
+
+>|:accumulate {correlate: context.visit_id} |appointment|, |patient_details||>>(prepare_visit:task {accumulate: "each"}) {
+    input: {
+        patient: |patient_details|.scope.patient,
+        appointment: |appointment|.scope.appointment,
+    },
+}
+    -|:next|->(write_instructions:llm);
+
+# an unlisted incoming edge remains independent of that junction
+# prepare_visit's fields require combined scope, so this case needs a field policy
+# a separate direct_visit agent could connect to prepare_visit through direct_arrival
+
+# sibling junctions select overlapping sets of exact edges
+(visit_checks:task)
+    =|:parallel|=>[
+        -|to_identity:next|->(identity_check:tool),
+        -|to_insurance:next|->(insurance_check:tool),
+        -|to_schedule:next|->(schedule_check:tool),
+    ]
+        >|:accumulate |to_identity|, |to_insurance|,|>>(eligibility:task)
+        >|:accumulate |to_insurance|, |to_schedule|,|>>(booking:task);
+
+# fork continuation selects a node before a cycle, without creating an edge
+(recheck:task)
+    =|:parallel|=>[
+        -|:next|->(inspect:tool),
+        -|:next|->(record_check:function),
+    ]
+        ->(inspect)
+            ~|:retry|~>(recheck);
+
+# combined scopes remain separate, with no silent field merge
+# junction kinds define combination behavior, properties configure it
+# node accumulation properties remain illustrative consumer configuration
+# correlation, occurrence selection, and policy composition remain open
+
+# fields can expose static graph references without cloning definitions
+(review_interface:task) {
+    entry: (validate_request),
+    exit: (finish),
+    advance_edge: |advance|,
+};
+(interface_caller:agent)-|:next|->(reference_values.nodes[0]);
+(reference_values:vars {evaluate: "lazy"}) {
+    validation_output: review_interface.entry.output,
+    advance_props: |review_interface.advance_edge|.props,
+    nodes: [review_interface.entry, review_interface.exit],
+};
+
+# edge lists, source/target access, and explicit cycles
+(review_request:task) {
+    output: {ready: true, payload: "visit details"},
+}
+    -|
+        advance:attempted {when: source.output.ready, max_attempts: settings.max_attempts},
+        supply:feeds {value: source.output.payload},
+    |->(validate_request:tool) {
+        output: {valid: chance(0.9)},
     }
+        ~|
+            retry:attempted {when: !source.output.valid, max_attempts: |review_interface.advance_edge|.props.max_attempts},
+            feedback:feeds {value: source.output},
+        |~>(review_request);
 
-    maybe "escalation" {
-        chance = 0.25
+# cycle edges have their own kind, identity and configuration
+(poll_visit:tool)
+    ~|poll_again:retry {max_attempts: settings.max_attempts}|~>(poll_visit);
 
-        task "escalation" {
-            input = "customer requested a human agent"
-            output = "escalated to tier 2"
-        }
-    }
-
-    # whether the escalation fired rides along as queryable metadata
-    metadata = { escalated = maybe.escalation.included }
-    tags = ["support"]
+# endpoint access works with anonymous nodes too
+(:tool {name: "check_visit"}) {
+    output: {ready: chance(0.8)},
 }
+    =|:exclusive|=>[
+        -|:next {when: source.output.ready}|->(finish),
+        -|:next {when: !source.output.ready}|->(pending_visit:task),
+    ];
 
-dataset "support-cases" {
-    description = "Questions and whole sessions for regression checks"
+# path-pattern references select existing nodes or edges
+# ?<...> locates an existing definition, @ marks the one node or edge returned
+# no declarations occur inside a pattern, kind annotations constrain matches
+# require one distinct target, zero/multiple targets are errors
+# multiple matching paths to the same target are acceptable
+# these refer to definitions, not execution occurrences or collected paths
+# parser must distinguish closing > from arrows and comparison operators
+(pattern_references:vars {evaluate: "lazy"}) {
+    tool_node: ?<(collect)-|:next|->(@:tool)>,
+    next_edge: ?<(collect)-|@:next|->(lookup)>,
+};
+# broader collection filtering remains deferred, no match/where clauses
 
-    case "inline" {
-        input = { question = "Where is my order?" }
-        expected = { status = "shipped" }
-        tags = ["support", "inline"]
-    }
+# deferred: declarations and graph fragments embedded in field values
+# properties cannot contain declarations, bodies have no bare graph statements
 
-    case "session" {
-        trace = trace["support-sessions"]
-        tags = ["support", "trace"]
-    }
+# illustrative companion definitions, domain schemas belong to future providers
+(routing_correct:scorer {lang: "python"}) {
+    output: {department: context.output.department},
+    expected: {department: "appointments"},
+    score: context.output.department == context.expected.department ? 1 : 0,
+};
+
+# candidate field-based association, no implicit graph containment
+(intake_cases:dataset) {
+    cases: [(appointment_case)],
+};
+
+(appointment_case:case) {
+    input: {message: "I need an appointment", patient_id: "p-123"},
+    expected: {department: "appointments"},
+};
+
+# candidate only, intake still needs a corresponding department output contract
+(routing_check:experiment) {
+    dataset: (intake_cases),
+    task: (intake),
+    scorers: [(routing_correct)],
+};
+
+# compilation validates language structure and references
+# provider schemas, kind extension, and execution are future work
+# graph names reserve self, source, target, context, true, false, and null
+
+# distinct literal comparisons share the same sampled department binding
+(route)
+    =|:exclusive|=>[
+        -|:next {when: source.output.department == "billing"}|->(billing:task),
+        -|:next {when: source.output.department == "appointments"}|->(appointments:task),
+        -|:next {when: source.output.department == "records"}|->(records_request:task),
+    ];
+
+# containment, prerequisites, and plain adjacency have distinct contracts
+(intake)-|:contains|->(collect);
+(route)-|:requires|->(lookup);
+(routing_correct)-|:link|->(routing_check);
+
+# each junction kind specifies a different arrival operation
+>|:merge |appointment|, |patient_details||>>(arrival_log:task);
+>|:first {correlate: settings.request_id} |coverage|, |records||>>(first_check:task);
+>|:quorum {count: 2, correlate: settings.request_id} |to_identity|, |to_insurance|, |to_schedule||>>(enough_checks:task);
+
+
+# span and tool_span are supplied by the provider source in compilation.rs
+# local kinds inherit strict properties and a closed set of content fields
++(patient_lookup:node {resource: {type: "string", default: "patients"}}) {
+    patient_id: {required: true},
+    note: {type: "string"},
 }
+    -|:extends|->(tool_span);
 
-scorer "status-match" {
-    lang = "python"
-    code { score = output.status == expected.status ? 1 : 0 }
-}
++(patient_data:edge {label: {type: "string", default: "patient identity"}})-|:extends|->(feeds);
 
-experiment "support-regression" {
-    dataset = dataset["support-cases"]
-    task = trace["support-sessions"]
-    scorers = [scorer["status-match"]]
-}
++(patient_checks_kind:fork {label: {type: "string"}})-|:extends|->(parallel);
 
-facet "Escalation" {
-    prompt = "Identify sessions that need a human agent."
-    description = "Human handoff"
-}
++(patient_join:junction {label: {type: "string"}})-|:extends|->(accumulate);
 
-automation "escalation-topics" {
-    type = "topics"
-    facets = ["Escalation"]
-    scope = "trace"
-    sampling_rate = 0.5
+# every instance kind is a built-in or a definition, so the fixture defines its own edge kinds
+# max_attempts is illustrative, the language does not execute retries
++(entry:edge)-|:extends|->(link);
++(retry:edge {max_attempts: {type: "number"}})-|:extends|->(link);
++(attempted:edge {max_attempts: {type: "number"}})-|:extends|->(next);
+
+# an incoming field is a requirement, its destination reference does not read it
+(patient_request:span {name: "Patient request"}) {
+    patient_id: context.patient_id,
+    patient: {id: self.patient_id},
+    description: "Patient ${self.patient_id}",
 }
+    -|patient_delivery:patient_data {
+        value: source.patient.id,
+        into: target.patient_id,
+    }|->(patient_step:patient_lookup {name: "Look up patient"}) {
+        patient_id: <-,
+        output: {id: self.patient_id},
+        note: "a closed kind takes declared fields only",
+    };
+
+# specializations retain the behavior of their base primitive
+(patient_step)
+    =|declared_checks:patient_checks_kind {label: "checks"}|=>[
+        -|declared_a:next|->(finish),
+        -|declared_b:next|->(lookup),
+    ]
+        >|:patient_join {label: "combined", correlate: settings.request_id}
+            |declared_a|,
+            |declared_b|,
+        |>>(typed_result:span {name: "Collected results"});
+
+# undirected endpoints keep their authored positions when matched in reverse
++(friendship:edge {direction: "undirected", weight: {type: "number"}})-|:extends|->(link);
+(graph_a:node) {affinity: 4, records: [1, 2, 3]};
+(graph_b:node) {affinity: 2};
+(graph_c:node);
+(graph_a)-|undirected_ab:friendship {weight: min(left.affinity, right.affinity)}|-(graph_b)
+    -|undirected_bc:friendship|-(graph_c);
+(graph_c)~|return_to_a:next|~>(graph_a);
+(undirected_refs:vars) {
+    connection: ?<(graph_b)-|@:friendship|-(graph_a)>,
+    authored_left: |undirected_ab|.left,
+    authored_right: |undirected_ab|.right,
+};
+
+# overlapping selections do not create containment or execution
+(undirected_network:network {
+    nodes: [(graph_a), (graph_b), (graph_c)],
+    edges: [|undirected_ab|, |undirected_bc|],
+    acyclic: "underlying",
+    connected: "weak",
+    self_loops: false,
+    max_parallel: 1,
+    degree: {max: 2},
+});
+(materialized_network:network {
+    nodes: [(graph_a), (graph_b), (graph_c)],
+    edges: [|undirected_ab|, |undirected_bc|, |return_to_a|],
+    validate: "materialized",
+    connected: "strong",
+});
+
+# one relation identity joins two inputs to one output
+(conversion:relation {participants: {min: 3, max: 3}, inputs: {min: 2}, outputs: {min: 1}});
+(conversion)-|:incidence {role: "input"}|-(graph_a);
+(graph_b)-|:incidence {role: "input"}|-(conversion);
+(conversion)-|:incidence {role: "output"}|-(graph_c);
+
+# consumers sample weighted branches using their seeded evaluation context
+(graph_a)
+    =|:weighted|=>[
+        -|:next {weight: 3}|->(graph_b),
+        -|:next {weight: 1}|->(graph_c),
+    ];
+
+# each occurrence belongs to one group and reduce waits for explicit closure
+(graph_a)
+    =|record_batch:each {items: source.records, concurrency: 2}|=>[
+        -|processed:next|->(processor:node) {
+            value: context.item,
+            index: context.index,
+        },
+    ]
+        >|:reduce {
+            observe: "result",
+            initial: 0,
+            combine: context.accumulator + context.arrival.value,
+            order: "source",
+            on_failure: "fail",
+            on_cancel: "fail",
+        } |processed||>>(total:node) {value: <-};
+
+# caller inputs retain references even when their authored fallback is constant
+# an open kind takes content fields beyond the ones it declares
++(supplied_values:node {open: true}) {payload: {type: "object", role: "input"}};
+(caller_values:supplied_values) {
+    payload: {count: 2, enabled: true},
+    observed: self.payload.count,
+    selected: self.payload.enabled ? "enabled" : "disabled",
+};
+
+# count-based iteration creates separate occurrences without an item collection
+(retry_batch:task)
+    =|:repeat {count: 3}|=>[
+        -|:next|->(attempt:tool) {input: context.history.attempt, output: {index: context.index, count: context.count}},
+    ];
+
+# loop-back and exit are alternatives, with explicit data carried into the next visit
+# a kind requires the context its own instances read, supplied by a consumer
++(cycle_step:node {open: true})-|:requires {lookup_result: {type: "any"}, retry_decision: {type: "object"}}|->(context);
+(cycle_lookup:cycle_step) {input: <-, output: context.lookup_result};
+(cycle_check:cycle_step) {output: context.retry_decision};
+(cycle_finish:node);
+(cycle_lookup)-|:next|->(cycle_check)
+    =|:exclusive|=>[
+        ~|:next {when: source.output.retry, max_traversals: 3},
+          :feeds {when: source.output.retry, value: source.output.next_input, into: target.input}|~>(cycle_lookup),
+        -|:next {when: !source.output.retry}|->(cycle_finish),
+    ];
+
+# an edge kind provides context to its target, and the key continues along next edges
+# the definition supplies the value, read here from the source of each handoff edge
++(handoff:edge {direction: "directed"})
+    -|:extends|->(next)
+    -|:provides {assigned_by: {type: "string", value: source.input.nurse}}|->(context);
+(triage:task) {input: {nurse: "rn-17"}}
+    -|:handoff|->(assess:task) {input: {assigned_by: context.assigned_by}}
+        -|:next|->(discharge:task) {input: {assigned_by: context.assigned_by}};
+
+# junction results remain explicit rather than overwriting destination fields
+(graph_a)
+    =|:parallel|=>[
+        -|arrival_a:next|->(arrival_left:node),
+        -|arrival_b:next|->(arrival_right:node),
+    ]
+        >|:merge |arrival_a|, |arrival_b||>>(merged:node) {arrivals: context.arrivals}
+        >|:first |arrival_a|, |arrival_b||>>(winner:node) {arrivals: context.arrivals}
+        >|:quorum {count: 2} |arrival_a|, |arrival_b||>>(quorum_result:node) {arrivals: context.arrivals};
+
+# aligned continuation lines share an origin, deeper lines continue the chain
+(dispatch:task) {output: "ready"}
+    -|:next|->(dispatch_audit:task) {input: dispatch.output}
+        -|:next|->(dispatch_archive:task)
+    =|dispatch_route:parallel|=>[
+        -|to_page:next|->(dispatch_page:tool),
+        -|to_email:next|->(dispatch_email:tool),
+    ]
+        >|:accumulate |to_page|, |to_email||>>(dispatch_done:task)
+    ~|:next {max_traversals: 1}|~>(dispatch);
+
+# traits add properties and fields to the kinds that have them, without behavior of their own
+# a trait lists the constructs it applies to, and may extend one trait to narrow them
++(audited:trait {auditor: {type: "string", default: "records"}})
+    -|:on|->(node)
+    -|:on|->(edge);
+
++(consented:trait) {consent: {type: "boolean", required: true}}
+    -|:extends|->(audited)
+    -|:on|->(node);
+
++(retained:trait {retention_days: {type: "number", default: 30}})
+    -|:on|->(node);
+
++(patient_export:node {format: {type: "string", default: "fhir"}}) {
+    patient_id: {type: "string"},
+    kept_for: {type: "number"},
+    checked_by: {type: "string"},
+}
+    -|:extends|->(patient_lookup)
+    -|:has|->(consented)
+    -|:has|->(retained);
+
++(audited_data:edge)
+    -|:extends|->(patient_data)
+    -|:has|->(audited);
+
+(export_request:span {name: "Export request"}) {
+    patient_id: "p-500",
+}
+    -|:audited_data {value: source.patient_id, into: target.patient_id, auditor: "privacy"}|->
+        (export_records:patient_export {name: "Export records", retention_days: 7}) {
+            patient_id: <-,
+            consent: true,
+            kept_for: self.props.retention_days,
+            checked_by: self.props.auditor,
+        };
+
+# a kind computes a field for the instances that omit it, from the instance's own fields
+# an instance that writes the field replaces the kind's value
++(prescription:node) {
+    dose_mg: {type: "number", required: true},
+    doses_per_day: {type: "number", default: 1},
+    daily_mg: {type: "number", value: self.dose_mg * self.doses_per_day},
+};
+(standard_course:prescription) {dose_mg: 250, doses_per_day: 3};
+(tapered_course:prescription) {dose_mg: 250, doses_per_day: 3, daily_mg: 500};

@@ -38,13 +38,13 @@ Most traces should show ordinary, competent work. Include a smaller share of mod
 
 Dream up happy and unhappy paths from the world's actual tasks, constraints, and customer goals. Include varied situations within each path, not one script repeated with different names. A useful problem may emerge from several small decisions rather than one obvious failure. Avoid making every unusual case the exact issue a facet or scorer is meant to find.
 
-One shape generates every trace in a run. Literal content repeats unchanged. Ask what differs between trace 0 and trace 99. Vary intents and outcomes with authored alternatives, turn and step counts with `repeat`, and correlated rare paths with `maybe`. Skew volume toward common cases and give long or unusual cases a smaller share. Never use an index as customer-facing content. Use `choice` around whole alternative paths so their messages, tool calls, and outcomes agree. Use `weighted` or a long-tailed distribution when common cases should dominate.
+One shape generates every trace in a run. Literal content repeats unchanged. Ask what differs between trace 0 and trace 99. Vary intents and outcomes with authored alternatives, turn and step counts with `repeat` forks, and correlated rare paths with guarded `conditional` or `exclusive` forks. Skew volume toward common cases and give long or unusual cases a smaller share. Never use an index as customer-facing content. Use `exclusive` or `weighted` forks for whole alternative paths so their messages, tool calls, and outcomes agree. Use value functions such as `choice` and `weighted` for data variation.
 
 Working result: scenario families with plausible frequencies, varied details, and causes for both ordinary and unusual outcomes.
 
 ### 5. Make the behavior observable
 
-Decide which inputs, tool results, agent decisions, and outputs a person must see to understand each outcome. If the customer has an existing tracing scheme, follow its real execution path where possible. Otherwise, create a tree whose nesting reflects responsibility and whose data shows cause and effect. Carry facts forward with block references so later decisions agree with earlier evidence. Detailed naming, payload, and metric guidance lives in the separate Braintrust presentation reference.
+Decide which inputs, tool results, agent decisions, and outputs a person must see to understand each outcome. If the customer has an existing tracing scheme, follow its real execution path where possible. Otherwise, create a tree whose nesting reflects responsibility and whose data shows cause and effect. Carry facts forward with node references so later decisions agree with earlier evidence. Detailed naming, payload, and metric guidance lives in the separate Braintrust presentation reference.
 
 Working result: a trace tree that lets a person follow the cause of each outcome from input through agent decisions to final output.
 
@@ -80,14 +80,28 @@ Name the root for the application's entrypoint. Name child spans for stable oper
 
 ### Inputs, outputs, and causality
 
-Give each span the input it consumed and the output it produced. Carry facts through the workflow with block references. A tool result should inform the decision and answer that follow it. Inside `repeat`, select authored turns by `repeat.index` and include earlier turns in later LLM inputs. If a failure changes the answer, gate its error, retry, and escalation together. A person should be able to follow the cause of the final answer through the tree.
+Give each span the input it consumed and the output it produced. Carry facts through the workflow with node references. A tool result should inform the decision and answer that follow it. Inside a `repeat` fork, select authored turns by `context.index` and include earlier turns in later LLM inputs. If a failure changes the answer, gate its error, retry, and escalation together. A person should be able to follow the cause of the final answer through the tree.
 
-Use chat messages for LLM inputs and an assistant message for the output so the conversation renders usefully. Put model parameters on LLM spans and arguments and results on tool spans. Keep model and provider consistent within a trace unless the workflow actually changes them.
+Use chat messages for LLM inputs and an assistant message for the output so the conversation renders usefully. Where the API you are modeling carries JSON as a string, such as the `arguments` of a tool call or the `content` of a tool message, write it with `json`. Round a score or an amount a real system reports to a few places with `decimal`. Put model parameters on LLM spans and arguments and results on tool spans. Keep model and provider consistent within a trace unless the workflow actually changes them.
 
 ### Metrics and labels
 
-Use durations and token counts that fit the content. Derive counts with `tokens()` or keep sampled `prompt_tokens + completion_tokens = tokens` exactly. Vary leaf durations, keep `time_to_first_token` below its LLM span duration, and make parent timing contain the work it represents. Put meaningful operational tags on the root. Do not add `demo`, `synthetic`, or similar provenance tags or metadata unless the user explicitly requests them.
+Use durations and token counts that fit the content. A `duration` is in seconds. An `llm` span computes `prompt_tokens`, `completion_tokens` and `tokens` from its own input and output, so leave them out. Write `metrics` on an `llm` span only for what it adds or changes, such as `time_to_first_token` or a `prompt_tokens` of 0 for a cache hit. The object is merged over the computed counts. On other spans derive counts with `tokens()`. Vary leaf durations, keep `time_to_first_token` below its LLM span duration, and make parent timing contain the work it represents. A `wait` is the seconds that pass before a span starts, after the step before it ends, and its parent lasts through it. Write it on each turn of a conversation held in one trace, as `wait: range(8, 90)`, for the time a person takes to read and reply. A root span has no step before it and takes no wait. Put meaningful operational tags on the root. Do not add `demo`, `synthetic`, or similar provenance tags or metadata unless the user explicitly requests them.
 
 Inspect the rendered result, not just the source. Check that names, nesting, chat messages, tool payloads, timing, and final output help a viewer understand what happened without a spoken explanation.
+
+"#;
+
+pub const GRAPH: &str = r#"## Braintrust graph definitions
+
+The CLI and browser interface compile source with the following provider definitions already supplied. Extend these kinds with new definitions rather than redefining them. Node properties configure instances, while node bodies hold fields. A span body takes only the fields its kind declares. Put values that a shape computes for its own expressions under local, for example local: {route: range(0, 1)} read as self.local.route. The local field is never emitted.
+
+An agent describes a behavior graph and does not emit a span. Give it input and output fields and one unconditional next edge to a task or span entry. The entry input references the agent input. Every step the entry leads to belongs to the agent. A calls edge schedules its target like next and goes down a level, so the target is a child span of its source. Steps that follow along next edges stay on that level. The first step after the entry needs a calls edge. To continue beside a nested task, draw next from that task itself, after the steps inside it.
+
+Next edges schedule steps, feeds edges supply fields marked <-, forks select or repeat paths, and typed juncts combine arrivals. Cycles create fresh occurrences with an execution budget and optional max_traversals. Read grouped results through context.arrivals and reductions through context.accumulator.
+
+Scorer nodes supply a score expression or judge object and optional lang and file properties. Callable scorers read context.input, context.output, context.expected and context.metadata. Dataset cases refer to graph nodes through source or supply inline input. Experiments reference a dataset, task and scorer nodes. Facet and automation nodes are synchronization resources, not emitted spans.
+
+These are mock behaviors. Tool and llm nodes describe emitted data rather than calling external services. Syntax validation does not guarantee that runtime expressions succeed.
 
 "#;

@@ -2,8 +2,10 @@ use bts_core::mocking::data::{
     self, Attachment, AttachmentFormat, Distribution, EventBatch, Format, PrepareError, Request, RunError, Sink,
     UnsupportedAttachment, Value, WriteError,
 };
+use bts_core::providers::braintrust::Bundle;
+use bts_core::providers::{Contributor, Provider};
 use bts_core::selection::filter::WriteFilter;
-use bts_lang::semantics::compile;
+use bts_lang::semantics::{Source, compile_module_with_provider};
 use serde_json::{Value as JsonValue, json};
 use std::cell::{Cell, RefCell};
 use std::error::Error as _;
@@ -147,7 +149,20 @@ impl std::error::Error for ArchiveUnavailable {}
 
 fn request<'a>(source: &str, filter: &'a WriteFilter) -> Request<'a> {
     Request {
-        model: compile(source).unwrap(),
+        model: Bundle
+            .lower(
+                &compile_module_with_provider(
+                    Source {
+                        name: "archive.bt",
+                        text: source,
+                    },
+                    &Bundle.schema(),
+                    false,
+                )
+                .unwrap(),
+                Bundle.functions(),
+            )
+            .unwrap(),
         count: 1,
         over: Duration::from_secs(60),
         distribution: Distribution::Linear,
@@ -161,11 +176,14 @@ fn request<'a>(source: &str, filter: &'a WriteFilter) -> Request<'a> {
 #[test]
 fn downstream_capabilities_generate_project_and_deliver_with_their_own_receipt() {
     let source = r#"
-        trace "archive" {
-            input = { files = [attachment("report.txt", "text/plain")] }
-            output = self.input["files"][0]["name"]
-            tool "copy" { input = trace.input output = trace.input["files"][0] }
-        }
+        (archive_agent:agent) {
+            input: {files: [attachment("report.txt", "text/plain")]},
+            output: archive.output,
+        };
+        (archive_agent)-|:next|->(archive:task) {
+            input: archive_agent.input,
+            output: self.input["files"][0]["name"],
+        }-|:calls|->(copy:tool) {input: archive.input, output: archive.input["files"][0]};
     "#;
     let format = ArchiveFormat::default();
     let sink = ArchiveSink::default();
@@ -199,7 +217,11 @@ fn encoding_failure_prevents_delivery() {
     };
     let sink = ArchiveSink::default();
     let error = data::run(
-        request(r#"trace "archive" { output = "ready" }"#, &WriteFilter::default()),
+        request(
+            r#"(archive_agent:agent) {input: null, output: archive.output};
+            (archive_agent)-|:next|->(archive:task) {input: archive_agent.input, output: "ready"};"#,
+            &WriteFilter::default(),
+        ),
         &format,
         &sink,
     )
@@ -220,7 +242,11 @@ fn delivery_failure_preserves_the_downstream_typed_cause() {
         ..Default::default()
     };
     let error = data::run(
-        request(r#"trace "archive" { output = "ready" }"#, &WriteFilter::default()),
+        request(
+            r#"(archive_agent:agent) {input: null, output: archive.output};
+            (archive_agent)-|:next|->(archive:task) {input: archive_agent.input, output: "ready"};"#,
+            &WriteFilter::default(),
+        ),
         &format,
         &sink,
     )
@@ -244,7 +270,8 @@ fn delivery_failure_preserves_the_downstream_typed_cause() {
 
 #[test]
 fn unsupported_projection_preserves_the_source_range_and_stops_before_encoding() {
-    let source = r#"trace "archive" { input = attachment("report.txt", "text/plain") output = self.input["name"] }"#;
+    let source = r#"(archive_agent:agent) {input: attachment("report.txt", "text/plain"), output: archive.output};
+        (archive_agent)-|:next|->(archive:task) {input: archive_agent.input, output: self.input["name"]};"#;
     let format = ArchiveFormat {
         attachments: false,
         ..Default::default()
@@ -265,8 +292,12 @@ fn unsupported_projection_preserves_the_source_range_and_stops_before_encoding()
 
 #[test]
 fn incompatible_projection_stops_before_encoding_and_delivery() {
-    let source = r#"vars { file = attachment("report.txt", "text/plain") }
-        trace "archive" { input = var.file["name"] }"#;
+    let source = r#"(archive_agent:agent) {input: null, output: archive.output};
+        (archive_agent)-|:next|->(archive:task) {
+            local: {file: attachment("report.txt", "text/plain")},
+            input: archive_agent.input,
+            output: self.local.file["name"],
+        };"#;
     let format = ArchiveFormat {
         projection: Some(json!(["report.txt"])),
         ..Default::default()
@@ -280,7 +311,7 @@ fn incompatible_projection_stops_before_encoding_and_delivery() {
         panic!("expected a planning error, got {error}");
     };
     assert_eq!(cause.kind(), data::generation::EvaluationErrorKind::RefShapeMismatch);
-    assert_eq!(&source[cause.range.start..cause.range.end], r#"var.file["name"]"#);
+    assert_eq!(&source[cause.range.start..cause.range.end], r#"self.local.file["name"]"#);
     assert_eq!(format.encodes.get(), 0);
     assert_eq!(sink.attempts.get(), 0);
     assert!(sink.received.borrow().is_empty());

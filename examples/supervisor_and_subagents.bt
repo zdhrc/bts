@@ -1,114 +1,52 @@
-# supervisor delegating to subagents -- variance axes: how many subagents run
-# and how deep delegation goes (a subagent can nest task spans of its own).
-
-vars {
-    meta = { model = "gpt-4o", provider = "openai" }
+# delegated tasks have their own span trees and reconcile before synthesis
+(supervisor:agent) {input: "Compare checkout latency to the last two releases.", output: synthesis.output.content};
+(supervisor)-|:next|->(request:task {name: "research-supervisor"}) {
+    input: supervisor.input,
+    output: synthesis.output.content,
+    local: {profiled: chance(0.4)},
+    metadata: {run_id: uuid(), profiled: self.local.profiled},
+    tags: ["multi-agent"],
+};
+(request)-|:calls|->(delegate:llm {name: "Chat Completion"}) {
+    input: request.input,
+    output: "Pull latency metrics and compare checkout-path changes.",
+    metadata: {model: "gpt-4o", provider: "openai"},
 }
-
-trace "research-supervisor" {
-    input = "Compare our checkout latency to the last two releases."
-    # the two supervisor calls share a name, so they form a positional
-    # collection: [1] is the closing synthesis, and the trace answers with it
-    output = llm["Chat Completion"][1].output.content
-    metadata = { run_id = uuid(), profiled = maybe.profiler.included }
-    tags = ["multi-agent"]
-
-    llm "Chat Completion" {
-        input = [
-            { role = "system", content = "You are a supervisor. Split the request into subtasks and delegate." },
-            { role = "user", content = trace.input },
-        ]
-        output = { role = "assistant", content = "Delegating: (1) pull latency metrics, (2) diff the releases." }
-        metadata = var.meta
-        metrics = {
-            prompt_tokens = tokens(self.input)
-            completion_tokens = tokens(self.output)
-            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-            time_to_first_token = 0.41
+    =|:parallel|=>[
+        -|metrics_result:next|->(metrics_agent:task) {
+            input: "Pull p50 and p95 checkout latency for v40 through v42.",
+            output: metrics_reply.output,
+        },
+        -|diff_result:next|->(diff_agent:task) {
+            input: "Diff v41..v42 for checkout-path changes.",
+            output: diff_reply.output,
+        },
+    ]
+        ->(metrics_agent)-|:calls|->(metrics_reply:llm {name: "Chat Completion"}) {
+            input: metrics_agent.input,
+            output: "v40 p95 412ms, v41 p95 418ms, v42 p95 493ms.",
+            metadata: {model: "gpt-4o", provider: "openai"},
         }
-    }
-
-    task "metrics_agent" {
-        input = "Pull p50/p95 checkout latency for v40 through v42."
-        output = "v40 p95 412ms, v41 p95 418ms, v42 p95 493ms."
-
-        llm "Chat Completion" {
-            input = [
-                { role = "system", content = "You query the metrics warehouse and report numbers plainly." },
-                { role = "user", content = task.metrics_agent.input },
-            ]
-            output = { role = "assistant", content = task.metrics_agent.output }
-            metadata = var.meta
-            metrics = {
-                prompt_tokens = tokens(self.input)
-                completion_tokens = tokens(self.output)
-                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                time_to_first_token = 0.38
-            }
+        ->(diff_agent)-|:calls|->(diff_reply:llm {name: "Chat Completion"}) {
+            input: diff_agent.input,
+            output: "A synchronous fraud check was added to the checkout path in v42.",
+            metadata: {model: "gpt-4o", provider: "openai"},
         }
-    }
-
-    task "diff_agent" {
-        input = "Diff v41..v42 for checkout-path changes."
-        output = "A synchronous fraud check was added to the checkout path in v42."
-
-        llm "Chat Completion" {
-            input = [
-                { role = "system", content = "You read release diffs and summarize behavioral changes." },
-                { role = "user", content = task.diff_agent.input },
-            ]
-            output = { role = "assistant", content = task.diff_agent.output }
-            metadata = var.meta
-            metrics = {
-                prompt_tokens = tokens(self.input)
-                completion_tokens = tokens(self.output)
-                tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                time_to_first_token = 0.44
-            }
-        }
-    }
-
-    # a third specialist joins only for some runs
-    maybe "profiler" {
-        chance = 0.4
-
-        task "profiler_agent" {
-            input = "Profile the fraud check under load."
-            output = "The fraud check adds 70-90ms per call at p95."
-
-            llm "Chat Completion" {
-                input = [
-                    { role = "system", content = "You run profiles and report hot paths." },
-                    { role = "user", content = task.profiler_agent.input },
-                ]
-                output = { role = "assistant", content = task.profiler_agent.output }
-                metadata = var.meta
-                metrics = {
-                    prompt_tokens = tokens(self.input)
-                    completion_tokens = tokens(self.output)
-                    tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-                    time_to_first_token = 0.4
-                }
-            }
-        }
-    }
-
-    llm "Chat Completion" {
-        # the synthesis prompt threads the subagents' actual findings, and
-        # mentions the profiler only when its branch fired
-        input = [
-            { role = "system", content = "You are a supervisor. Synthesize your subagents' findings." },
-            { role = "user", content = maybe.profiler.included
-                ? "Metrics: ${task.metrics_agent.output} Diff: ${task.diff_agent.output} Profile: ${maybe.profiler.task.profiler_agent.output}"
-                : "Metrics: ${task.metrics_agent.output} Diff: ${task.diff_agent.output}" },
-        ]
-        output = { role = "assistant", content = "p95 latency regressed 18% in v42, traced to the new fraud check." }
-        metadata = var.meta
-        metrics = {
-            prompt_tokens = tokens(self.input)
-            completion_tokens = tokens(self.output)
-            tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens
-            time_to_first_token = 0.43
-        }
-    }
-}
+        >|:accumulate {observe: "result"} |metrics_result|, |diff_result||>>(synthesis:llm {name: "Chat Completion"}) {
+            input: context.arrivals,
+            output: {role: "assistant", content: "p95 latency increased from 418ms to 493ms in v42. Profile the new synchronous fraud check to confirm its contribution."},
+            metadata: {model: "gpt-4o", provider: "openai"},
+        };
+# an optional specialist follows the synthesis without becoming a required junct input
+(synthesis)
+    =|:conditional|=>[
+        -|:next {when: request.local.profiled}|->(profiler:task {name: "profiler_agent"}) {
+            input: "Profile the fraud check under load.",
+            output: profile_reply.output,
+        },
+    ]
+        ->(profiler)-|:calls|->(profile_reply:llm {name: "Chat Completion"}) {
+            input: profiler.input,
+            output: "The fraud check adds 70-90ms per call at p95.",
+            metadata: {model: "gpt-4o", provider: "openai"},
+        };

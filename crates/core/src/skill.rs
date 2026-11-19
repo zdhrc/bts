@@ -1,42 +1,73 @@
-use bts_lang::spec::{Cardinality, NamePolicy, Place, RuleDesc, Spec as DslSpec};
+use crate::providers::Contributor;
+use bts_lang::spec::{FuncDesc, RuleDesc, Spec as DslSpec};
 use std::fmt::Write as _;
 const EXAMPLES_PREAMBLE: &str = "These shapes are not hard and fast rules; they are examples to provoke your imagination. \
 Steal the structure, replace the content, and expand along the axis each one names.";
 
-/// A selectable section of the generated Braintrust skill.
+/// A selectable section of a generated skill.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Part {
-    BraintrustWorkflow,
-    BraintrustPresentation,
+    /// The provider's authoring workflow.
+    Workflow,
+    /// How the provider presents what a shape produces.
+    Presentation,
+    /// The language reference, followed by the provider's kinds.
     Language,
 }
 
-pub const FULL_BRAINTRUST: &[Part] = &[Part::BraintrustWorkflow, Part::BraintrustPresentation, Part::Language];
+pub const FULL: &[Part] = &[Part::Workflow, Part::Presentation, Part::Language];
 
-/// Generates a standalone Braintrust skill without interface commands or file access.
-pub fn render(spec: &DslSpec) -> String {
+/// Generates a standalone skill for one provider without interface commands or file access.
+pub fn render<P: Contributor>(spec: &DslSpec, provider: &P) -> String {
     format!(
         "---\nname: bts\ndescription: Write, review, explain, and debug bts language source.\n---\n\n{}",
-        assemble_braintrust(spec, FULL_BRAINTRUST, None, None)
+        assemble(spec, provider, FULL, None, None)
     )
 }
 
-/// Assembles Braintrust guidance, the language reference, and optional interface instructions.
-pub fn assemble_braintrust(
+/// Assembles a provider's guidance, the language reference, and optional interface instructions.
+pub fn assemble<P: Contributor>(
     spec: &DslSpec,
+    provider: &P,
     parts: &[Part],
     interface_preamble: Option<&str>,
     interface_reference: Option<&str>,
 ) -> String {
+    // a provider joined by contributors has a section for each, in the order their definitions compile
+    let contributors = provider.parts();
     let mut output = String::new();
     if let Some(interface_preamble) = interface_preamble {
         output.push_str(interface_preamble);
     }
     for part in parts {
         match part {
-            Part::BraintrustWorkflow => output.push_str(crate::providers::braintrust::skill::WORKFLOW),
-            Part::BraintrustPresentation => output.push_str(crate::providers::braintrust::skill::PRESENTATION),
-            Part::Language => output.push_str(&reference(spec)),
+            Part::Workflow => contributors
+                .iter()
+                .for_each(|contributor| output.push_str(contributor.guidance.workflow)),
+            Part::Presentation => contributors
+                .iter()
+                .for_each(|contributor| output.push_str(contributor.guidance.presentation)),
+            Part::Language => {
+                output.push_str(&reference(spec));
+                for contributor in &contributors {
+                    let schema = contributor.schema;
+                    output.push_str(contributor.guidance.definitions);
+                    for definition in schema.definitions {
+                        output.push_str(&fenced_code("bts", definition.text.trim()));
+                    }
+                    if !schema.functions.is_empty() {
+                        writeln!(output, "\n## {} functions\n", schema.name).unwrap();
+                        writeln!(
+                            output,
+                            "The provider contributes these functions. Call them like the functions of the language.\n"
+                        )
+                        .unwrap();
+                        for function in schema.functions {
+                            render_function(&mut output, &function.doc);
+                        }
+                    }
+                }
+            }
         }
     }
     if let Some(interface_reference) = interface_reference {
@@ -87,60 +118,23 @@ pub fn reference(spec: &DslSpec) -> String {
     if !spec.functions.is_empty() {
         writeln!(output, "## Functions\n").unwrap();
         for function in spec.functions {
-            writeln!(output, "### {}\n", inline_code(function.name)).unwrap();
-            writeln!(output, "{}\n", function.summary).unwrap();
-            writeln!(output, "Syntax: {}\n", inline_code(function.syntax)).unwrap();
-            if !function.examples.is_empty() {
-                writeln!(output, "Examples:").unwrap();
-                for example in function.examples {
-                    writeln!(output, "- {}", inline_code(example)).unwrap();
-                }
-                writeln!(output).unwrap();
-            }
-            render_rules(&mut output, function.rules);
+            render_function(&mut output, function);
         }
     }
 
-    writeln!(output, "## Blocks\n").unwrap();
-    for block in spec.blocks {
-        writeln!(output, "### {}\n", inline_code(block.keyword)).unwrap();
-        writeln!(output, "{}\n", block.summary).unwrap();
-        writeln!(output, "- Syntax: {}", inline_code(block.syntax)).unwrap();
-        writeln!(output, "- Name: {}", name_requirement(block.name)).unwrap();
-        writeln!(output, "- Allowed in: {}", placements(spec, block.allowed_in)).unwrap();
-        writeln!(
-            output,
-            "- Unlisted fields: {}\n",
-            if block.body.open { "allowed" } else { "rejected" }
-        )
-        .unwrap();
-
-        if !block.body.fields.is_empty() {
-            writeln!(output, "| Field | Value | Cardinality | Description |").unwrap();
-            writeln!(output, "| --- | --- | --- | --- |").unwrap();
-            for field in block.body.fields {
-                writeln!(
-                    output,
-                    "| {} | {} | {} | {} |",
-                    inline_code(field.keyword),
-                    markdown_cell(&inline_code(&field.value.to_string())),
-                    cardinality(field.cardinality),
-                    markdown_cell(field.summary),
-                )
-                .unwrap();
+    writeln!(output, "## Graph primitives\n").unwrap();
+    for primitive in spec.primitives {
+        writeln!(output, "### {} ({})\n", inline_code(primitive.name), primitive.construct).unwrap();
+        writeln!(output, "{}\n", primitive.summary).unwrap();
+        for (label, keys) in [("Provides", primitive.provides), ("Requires", primitive.requires)] {
+            if !keys.is_empty() {
+                let listed: Vec<_> = keys
+                    .iter()
+                    .map(|key| format!("{} ({})", inline_code(&format!("context.{}", key.name)), key.ty))
+                    .collect();
+                writeln!(output, "{label} context: {}\n", listed.join(", ")).unwrap();
             }
-            writeln!(output).unwrap();
         }
-
-        if !block.conventions.is_empty() {
-            writeln!(output, "Conventions:").unwrap();
-            for convention in block.conventions {
-                writeln!(output, "- {convention}").unwrap();
-            }
-            writeln!(output).unwrap();
-        }
-
-        render_rules(&mut output, block.rules);
     }
 
     writeln!(output, "## Global rules\n").unwrap();
@@ -166,6 +160,20 @@ pub fn reference(spec: &DslSpec) -> String {
     output
 }
 
+fn render_function(output: &mut String, function: &FuncDesc) {
+    writeln!(output, "### {}\n", inline_code(function.name)).unwrap();
+    writeln!(output, "{}\n", function.summary).unwrap();
+    writeln!(output, "Syntax: {}\n", inline_code(function.syntax)).unwrap();
+    if !function.examples.is_empty() {
+        writeln!(output, "Examples:").unwrap();
+        for example in function.examples {
+            writeln!(output, "- {}", inline_code(example)).unwrap();
+        }
+        writeln!(output).unwrap();
+    }
+    render_rules(output, function.rules);
+}
+
 fn render_rules(output: &mut String, rules: &[RuleDesc]) {
     if rules.is_empty() {
         return;
@@ -176,40 +184,6 @@ fn render_rules(output: &mut String, rules: &[RuleDesc]) {
         writeln!(output, "- {}: {}", inline_code(rule.id.as_str()), rule.summary).unwrap();
     }
     writeln!(output).unwrap();
-}
-
-fn name_requirement(name: NamePolicy) -> &'static str {
-    match name {
-        NamePolicy::Forbidden => "forbidden",
-        NamePolicy::Optional => "optional",
-        NamePolicy::Required => "required",
-    }
-}
-
-fn cardinality(cardinality: Cardinality) -> &'static str {
-    match cardinality {
-        Cardinality::Optional => "optional",
-        Cardinality::Required => "required",
-        Cardinality::Repeated => "repeated",
-    }
-}
-
-fn placements(spec: &DslSpec, allowed_in: &[Place]) -> String {
-    allowed_in
-        .iter()
-        .map(|place| match *place {
-            Place::Root => "document root".to_owned(),
-            Place::Block { id } => spec
-                .block_by_id(id)
-                .map(|block| inline_code(block.keyword))
-                .unwrap_or_else(|| inline_code(id.as_str())),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn markdown_cell(value: &str) -> String {
-    value.replace('|', "\\|").replace('\n', " ")
 }
 
 fn inline_code(value: &str) -> String {
@@ -238,10 +212,11 @@ fn fenced_code(language: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::braintrust::Bundle as Braintrust;
     use bts_lang::spec::SPEC as DSL_SPEC;
     #[test]
     fn renders_the_language_spec_without_interface_dependencies() {
-        let skill = render(&DSL_SPEC);
+        let skill = render(&DSL_SPEC, &Braintrust);
 
         assert!(skill.starts_with("---\nname: bts\ndescription:"));
         assert!(skill.contains(DSL_SPEC.summary));
@@ -256,17 +231,9 @@ mod tests {
             assert!(skill.contains(function.syntax));
             assert!(skill.contains(function.summary));
         }
-        for block in DSL_SPEC.blocks {
-            assert!(skill.contains(block.keyword));
-            assert!(skill.contains(block.syntax));
-            assert!(skill.contains(block.summary));
-            for field in block.body.fields {
-                assert!(skill.contains(field.keyword));
-                assert!(skill.contains(field.summary));
-            }
-            for convention in block.conventions {
-                assert!(skill.contains(convention));
-            }
+        for primitive in DSL_SPEC.primitives {
+            assert!(skill.contains(primitive.name));
+            assert!(skill.contains(primitive.summary));
         }
         assert!(skill.contains(crate::providers::braintrust::skill::WORKFLOW));
         assert!(skill.contains(crate::providers::braintrust::skill::PRESENTATION));
@@ -288,16 +255,16 @@ mod tests {
 
     #[test]
     fn skill_parts_can_be_selected_independently() {
-        let workflow = assemble_braintrust(&DSL_SPEC, &[Part::BraintrustWorkflow], None, None);
+        let workflow = assemble(&DSL_SPEC, &Braintrust, &[Part::Workflow], None, None);
         assert!(workflow.contains("### 1. Choose the viewer's question"));
         assert!(!workflow.contains("## Braintrust trace presentation"));
         assert!(!workflow.contains("## Surface grammar"));
 
-        let presentation = assemble_braintrust(&DSL_SPEC, &[Part::BraintrustPresentation], None, None);
+        let presentation = assemble(&DSL_SPEC, &Braintrust, &[Part::Presentation], None, None);
         assert!(presentation.contains("## Braintrust trace presentation"));
         assert!(!presentation.contains("## Authoring realistic Braintrust data"));
 
-        let language = assemble_braintrust(&DSL_SPEC, &[Part::Language], None, None);
+        let language = assemble(&DSL_SPEC, &Braintrust, &[Part::Language], None, None);
         assert!(language.contains("## Surface grammar"));
         assert!(!language.contains("## Authoring realistic Braintrust data"));
         assert!(!language.contains("## Braintrust trace presentation"));

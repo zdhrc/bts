@@ -56,6 +56,7 @@ pub(crate) struct Agent<'m> {
     pub name: &'m str,
     pub file: String,
     pub trace: &'m Trace,
+    pub output: &'m crate::dsl::Value,
 }
 
 pub(crate) fn agents(model: &Model, lang: ScorerLang) -> Result<Vec<Agent<'_>>, String> {
@@ -81,6 +82,7 @@ pub(crate) fn agents(model: &Model, lang: ScorerLang) -> Result<Vec<Agent<'_>>, 
                 name: &agent.name,
                 file,
                 trace,
+                output: &agent.output,
             })
         })
         .collect()

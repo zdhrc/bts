@@ -1,6 +1,12 @@
-use bts_core::english::*;
+use bts_core::providers::world::english::*;
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
+
+// the functions belong to the world provider, which joins the provider that lowers a model
+fn compile(source: &str) -> Result<bts_core::mocking::Model, String> {
+    use bts_core::providers::{Provider, With, braintrust, world};
+    With(braintrust::Bundle, world::Bundle).compile(source)
+}
 
 fn subject(text: &str, person: Person, number: Number) -> Subject {
     Subject {
@@ -535,7 +541,7 @@ fn toolkit_materializes_through_the_dsl_with_explicit_conversation_scope() {
     let source = include_str!("fixtures/english.bt");
     let outputs = |seed| {
         let batch = data::generate(
-            bts_lang::semantics::compile(source).unwrap(),
+            compile(source).unwrap(),
             16,
             Duration::from_secs(600),
             Distribution::Linear,
@@ -613,11 +619,12 @@ fn toolkit_materializes_through_the_dsl_with_explicit_conversation_scope() {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod parity {
+    use super::compile;
+    use bts_core::mocking::{ScorerKind, ScorerLang};
     use bts_core::mocking::{
         code::{Emitter, Item, languages::Languages},
         data::{self, Distribution},
     };
-    use bts_lang::{ScorerKind, ScorerLang, semantics::compile};
     use serde_json::{Value, json};
     use std::{collections::BTreeSet, fs, io::Write, process::Stdio, time::Duration};
 
@@ -678,16 +685,31 @@ mod parity {
         Case::valid("explicit optional nulls", "realize", json!([{"clause":{"subject":{"text":"the guest"},"predicate":{"verb":"arrive","complement":null},"modal":null},"condition":null}]))
             .golden(json!("The guest arrives.")),
     ];
-        for text in ["constructor", "__proto__", "toString", "Élodie", "\u{feff}Maya"] {
+        // an ordinary lowercase word starts the sentence with a capital, and every other subject stays as authored
+        for (text, start) in [
+            ("constructor", "Constructor"),
+            ("__proto__", "__proto__"),
+            ("toString", "toString"),
+            ("Élodie", "Élodie"),
+            ("\u{feff}Maya", "\u{feff}Maya"),
+        ] {
             cases.push(
                 Case::valid(
                     format!("authored subject {text}"),
                     "realize",
                     json!([sentence(text, "be", "ready")]),
                 )
-                .golden(json!(format!("{text} is ready."))),
+                .golden(json!(format!("{start} is ready."))),
             );
         }
+        cases.push(
+            Case::valid("plural noun subject", "realize", json!([{"clause":{"subject":{"text":"refunds","number":"plural"},"predicate":{"verb":"return","complement":"to the card"}}}]))
+                .golden(json!("Refunds return to the card.")),
+        );
+        cases.push(
+            Case::valid("noun subject in a question", "realize", json!([{"clause":{"subject":{"text":"refunds","number":"plural"},"predicate":{"verb":"return","complement":"to the card"},"form":"question"}}]))
+                .golden(json!("Do refunds return to the card?")),
+        );
         for tense in ["present", "past", "future"] {
             for aspect in ["simple", "progressive", "perfect", "perfect_progressive"] {
                 for polarity in ["positive", "negative"] {
@@ -1161,8 +1183,8 @@ mod parity {
             ("Thank you.", json!({"casual":true,"probability":0}), "Thank you."),
             (
                 "Thank you.",
-                json!({"style":"neutral","alternatives":[{"from":"Thank you","to":["Much appreciated"]}]}),
-                "Much appreciated.",
+                json!({"style":"neutral","alternatives":[{"from":"Thank you","to":["Much reconciled"]}]}),
+                "Much reconciled.",
             ),
             (
                 "I will check.",
@@ -1172,6 +1194,59 @@ mod parity {
             ("Thanks.", json!({"punctuation":"omit_period","max_changes":1.0}), "Thanks"),
         ] {
             cases.push(Case::valid(format!("styled {text} {options}"), "vary", json!([text, options])).golden(json!(expected)));
+        }
+        // casing and the closing mark belong to the style: every such edit applies, whatever the change budget
+        let texting = json!({"casing":"lowercase","punctuation":"omit_period","max_changes":1});
+        let said = |subject: Value, predicate: Value, rest: Value| {
+            let mut clause = json!({"subject": subject, "predicate": predicate});
+            clause.as_object_mut().unwrap().extend(rest.as_object().unwrap().clone());
+            json!({"clause": clause})
+        };
+        for (sentence, expected) in [
+            // a sentence the provider put into words loses the capital it gave it
+            (
+                said(
+                    json!({"text":"refunds","number":"plural"}),
+                    json!({"verb":"take","complement":"too long"}),
+                    json!({}),
+                ),
+                "refunds take too long",
+            ),
+            (
+                said(
+                    json!({"text":"I","person":"first"}),
+                    json!({"verb":"come","complement":"early"}),
+                    json!({"modal":"should","form":"question"}),
+                ),
+                "should i come early?",
+            ),
+            // a subject written with a capital is a name and keeps it
+            (said(json!({"text":"Ada"}), json!({"verb":"call"}), json!({})), "Ada calls"),
+            // the full stop goes after an identifier as after a word, and the identifier stays as written
+            (
+                said(
+                    json!({"text":"the invoice number"}),
+                    json!({"verb":"be","complement":"INV-20418"}),
+                    json!({}),
+                ),
+                "the invoice number is INV-20418",
+            ),
+            (
+                said(json!({"text":"ZX-42"}), json!({"verb":"be","complement":"late"}), json!({})),
+                "ZX-42 is late",
+            ),
+        ] {
+            cases.push(Case::valid(format!("texted {expected}"), "vary", json!([sentence, texting])).golden(json!(expected)));
+        }
+        for (text, expected) in [
+            // in text handed over as written a name cannot be told from a word, so only reviewed words are lowered
+            ("Refunds take too long.", "Refunds take too long"),
+            ("Thanks. Please check the code ZX-42.", "thanks. please check the code ZX-42"),
+            ("Dr. Maya can help.", "Dr. Maya can help"),
+            // a decimal is not the end of a sentence
+            ("It costs 3.50.", "it costs 3.50."),
+        ] {
+            cases.push(Case::valid(format!("texted {text}"), "vary", json!([text, texting])).golden(json!(expected)));
         }
         for text in ["You'm", "He'st", "please\u{301}", "Company Inc.", "."] {
             cases.push(
@@ -1269,8 +1344,8 @@ mod parity {
             c.forms[0].id = form.into();
             plan.bindings.insert(role.into(), id.into());
         }
-        let escaped_options = bts_core::english::ExpressionOptions::default();
-        let escaped_result = bts_core::english::expression(
+        let escaped_options = bts_core::providers::world::english::ExpressionOptions::default();
+        let escaped_result = bts_core::providers::world::english::expression(
             &escaped,
             &escaped_options,
             &mut <rand_xoshiro::Xoshiro256PlusPlus as rand::SeedableRng>::seed_from_u64(1),
@@ -1355,8 +1430,8 @@ mod parity {
         cases
     }
 
-    fn input_value(value: &Value) -> bts_lang::Value {
-        use bts_lang::{Array, ArrayElem, Number, Object, ObjectField, Value as ModelValue};
+    fn input_value(value: &Value) -> bts_core::mocking::Value {
+        use bts_core::mocking::{Array, ArrayElem, Number, Object, ObjectField, Value as ModelValue};
         match value {
             Value::Array(values) => ModelValue::Array(Array {
                 elem: values.iter().map(|value| ArrayElem::Item(input_value(value))).collect(),
@@ -1392,7 +1467,9 @@ mod parity {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        let source = format!("trace \"corpus\" {{ input = {{ args = [] }} output = {call} }}");
+        let source = format!(
+            "(corpus_root:task {{name: \"corpus\"}}) {{input: corpus.input, output: {call}}};\n(corpus:agent) {{input: {{args: []}}, output: corpus_root.output}};\n(corpus)-|:next|->(corpus_root);"
+        );
         let mut model = compile(&source).unwrap_or_else(|errors| panic!("{} did not compile: {errors:?}\n{source}", case.name));
         model.traces[0].fields.input = Some(input_value(&json!({"args":case.args})));
         let mut results = BTreeSet::new();
@@ -1432,7 +1509,7 @@ mod parity {
     }
 
     fn style_replays() -> (Vec<Value>, Vec<Value>) {
-        use bts_core::english::{Sentence, StyleOptions, vary_sentence_styled, vary_styled};
+        use bts_core::providers::world::english::{Sentence, StyleOptions, vary_sentence_styled, vary_styled};
         use rand::{Rng, SeedableRng};
         use rand_xoshiro::Xoshiro256PlusPlus;
         let mut inputs = Vec::new();
@@ -1487,7 +1564,7 @@ mod parity {
     }
 
     fn expression_replays() -> (Vec<Value>, Vec<Value>) {
-        use bts_core::english::*;
+        use bts_core::providers::world::english::*;
         use rand::{Rng, SeedableRng};
         use rand_xoshiro::Xoshiro256PlusPlus;
         let source = super::flight_expression_source();
@@ -1564,7 +1641,9 @@ mod parity {
         let (replays, expected_replays) = style_replays();
         let (expressions, expected_expressions) = expression_replays();
         let payload = json!({"cases":payload,"replays":replays,"expressions":expressions});
-        let model = compile(r#"scorer "corpus" { code { score = len(realize(output)) } } scorer "styled" { code { score = len(vary(output, {style = "text_message", max_changes = 6})) } } scorer "procedural" { code { score = len(express(output)) + len(expression_candidates(output)) + len(expression(output)["text"]) } }"#).unwrap();
+        let model = compile(r#"("corpus":scorer) {score: len(realize(context.output))};
+("styled":scorer) {score: len(vary(context.output, {style: "text_message", max_changes: 6}))};
+("procedural":scorer) {score: len(express(context.output)) + len(expression_candidates(context.output)) + len(expression(context.output) ["text"])};"#).unwrap();
         let ScorerKind::Code { score, steps } = &model.scorers[0].kind else {
             panic!("code scorer")
         };
@@ -1843,6 +1922,12 @@ fn styles_preserve_ambiguous_grammar_protected_text_and_questions() {
         ("I am not checking the file.", json!({"fragments":true,"negation":false})),
         ("I am checking the file?", json!({"fragments":true})),
         ("I am checking if the file exists.", json!({"fragments":true})),
+        ("I am checking if the file works.", json!({"fragments":true})),
+        (
+            "I wonder if the file opens.",
+            json!({"condition_order":true,"negation":false}),
+        ),
+        ("I am not sure if the file works.", json!({"fragments":true})),
         ("I will thank you tomorrow.", json!({"casual":true})),
         ("I am.", json!({"contractions":true})),
         ("Yes?", json!({"punctuation":"expressive"})),

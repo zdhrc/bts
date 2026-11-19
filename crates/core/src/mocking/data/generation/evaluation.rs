@@ -1,28 +1,20 @@
 use super::super::{Attachment, AttachmentFormat, EventKind, Value as JsonValue};
-use crate::dsl::EnglishOperation;
 use crate::dsl::{
     Accessor, Array as ModelArray, ArrayElem as ModelArrayElem, BinOp, Binding as ModelBinding, Child as ModelChild,
-    Choice as ModelChoice, CtxRef as ModelCtxRef, Field, Func as ModelFunc, Maybe as ModelMaybe, Model, NOISE_SIZE_CAP, NodeId,
-    Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart, Range as ModelRange,
-    RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields, SpanKind as ModelSpanKind, SrcRange,
-    Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
+    Choice as ModelChoice, CtxRef as ModelCtxRef, EmissionKind, Emissions, Field, Func as ModelFunc, Maybe as ModelMaybe,
+    Model, NodeId, Number as ModelNumber, Object as ModelObject, ObjectField as ModelObjectField, Part as ModelPart,
+    Range as ModelRange, RefId, Repeat as ModelRepeat, ResolvedRef, Selection, SpanFields as ModelSpanFields,
+    SpanKind as ModelSpanKind, SrcRange, Step, Template as ModelTemplate, Trace as ModelTrace, UnaryOp, Value as ModelValue,
 };
-use crate::english::{self, RealizeOptions, Sentence, VariationOptions};
+use crate::mocking::{EvaluateError, Evaluation};
 use crate::selection::filter::WriteFilter;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Beta, Exp, LogNormal, Normal, Pareto, Poisson};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Number as JsonNumber, Value as InputValue};
 use std::collections::BTreeMap as JsonMap;
 use std::fmt;
 use std::ops::Range;
-use std::sync::LazyLock;
-use tiktoken_rs::CoreBPE;
-use uuid::Uuid;
-
-// building the encoder parses the embedded vocab, do it once
-static BPE: LazyLock<CoreBPE> = LazyLock::new(|| tiktoken_rs::o200k_base().expect("the embedded vocab parses"));
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct Plan {
@@ -46,6 +38,8 @@ pub(super) struct EventPlan {
     pub(super) scores: Option<JsonMap<String, JsonValue>>,
     // total span duration; none takes the materializer's default slot
     pub(super) duration: Option<std::time::Duration>,
+    // the time that passes before the span starts, after the step before it
+    pub(super) wait: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,6 +84,11 @@ const COUNT_SALT: u64 = 0x01;
 const CHANCE_SALT: u64 = 0x02;
 const PICK_SALT: u64 = 0x03;
 const DURATION_SALT: u64 = 0x04;
+const WAIT_SALT: u64 = 0x07;
+const AGAIN_SALT: u64 = 0x05;
+const LIMIT_SALT: u64 = 0x06;
+// a loop that names no limit stops here
+const LOOP_BUDGET: usize = 10_000;
 const FIELD_SALT: u64 = 0x10;
 const KEY_SALT: u64 = 0x20;
 const TAG_SALT: u64 = 0x30;
@@ -143,6 +142,7 @@ struct FieldSlots {
     tags: Vec<TagSlot>,
     // not a lazy slot: nothing references a duration, it evaluates at emission
     duration: Option<(ModelValue, SrcRange)>,
+    wait: Option<(ModelValue, SrcRange)>,
 }
 
 fn field_slots(fields: &ModelSpanFields) -> FieldSlots {
@@ -165,6 +165,7 @@ fn field_slots(fields: &ModelSpanFields) -> FieldSlots {
         metrics: keyed(&fields.metrics),
         tags: fields.tags.iter().cloned().map(TagSlot::Todo).collect(),
         duration: fields.duration.clone(),
+        wait: fields.wait.clone(),
     }
 }
 
@@ -180,6 +181,8 @@ struct Instance {
     // the stable address of this instantiation, the basis for its slots' rngs
     path: u64,
     bindings: Vec<(String, BindSlot)>,
+    // for each binding, where the author wrote the element a definition computes it for
+    origins: Vec<Option<SrcRange>>,
     fields: FieldSlots,
 }
 
@@ -210,6 +213,8 @@ struct Ctx<'m> {
     lazy_model: Option<&'m Model>,
     row: Option<(NodeId, &'m InputValue)>,
     trace_index: usize,
+    // the seed of the run, for values addressed by seed and trace index alone
+    seed: u64,
     // the address every instance path derives from: seed and trace index
     base: u64,
     // the rng of the slot evaluating right now, swapped as slots force
@@ -220,6 +225,8 @@ struct Ctx<'m> {
     last_ref: Option<SrcRange>,
     instances: Vec<Instance>,
     attachments: Vec<Attachment>,
+    // the running value and current item of each fold being evaluated, innermost last
+    folds: Vec<(ModelValue, ModelValue)>,
 }
 
 impl<'m> Ctx<'m> {
@@ -231,12 +238,14 @@ impl<'m> Ctx<'m> {
             lazy_model: None,
             row: None,
             trace_index,
+            seed,
             base,
             rng: Xoshiro256PlusPlus::seed_from_u64(base),
             site: 0,
             last_ref: None,
             instances: Vec::new(),
             attachments: Vec::new(),
+            folds: Vec::new(),
         }
     }
 
@@ -301,6 +310,7 @@ impl<'m> Ctx<'m> {
                 .iter()
                 .map(|binding| (binding.name.clone(), BindSlot::Todo(binding.value.clone())))
                 .collect(),
+            origins: bindings.iter().map(|binding| binding.origin).collect(),
             fields,
         };
         let index = self.instances.len();
@@ -418,9 +428,9 @@ impl<'m> Ctx<'m> {
                 name,
                 count,
                 count_range,
+                again,
                 bindings,
                 children,
-                ..
             }) => {
                 let collection = self.add_instance(
                     *node,
@@ -430,6 +440,43 @@ impl<'m> Ctx<'m> {
                     &[],
                     FieldSlots::default(),
                 );
+                if let Some(again) = again {
+                    // a loop runs once, then again while its condition holds for the iteration that just ran
+                    let limit = match &again.limit {
+                        Some(limit) => {
+                            let rng = self.slot_rng(self.instances[collection].path, LIMIT_SALT);
+                            let limit = self.scoped(parent, rng, |ctx| eval_operand(limit.clone(), ctx))?;
+                            match limit {
+                                Scalar::Int(limit) if limit >= 0 => Some(limit as usize),
+                                _ => return Err(Error::new(ErrorKind::LoopLimit, again.range)),
+                            }
+                        }
+                        None => None,
+                    };
+                    for index in 0.. {
+                        let iteration = self.add_instance(
+                            *node,
+                            Some(collection),
+                            Shape::Iteration { index, count: index + 1 },
+                            index as u64 + 1,
+                            bindings,
+                            FieldSlots::default(),
+                        );
+                        self.add_children(iteration, children)?;
+                        let rng = self.slot_rng(self.instances[iteration].path, AGAIN_SALT);
+                        let condition = again.condition.clone();
+                        let repeat = self.scoped(iteration, rng, |ctx| eval_operand(condition, ctx)?.into_bool(ctx))?;
+                        if !repeat {
+                            break;
+                        }
+                        match limit {
+                            Some(limit) if index >= limit => return Err(Error::new(ErrorKind::LoopLimit, again.range)),
+                            None if index + 1 >= LOOP_BUDGET => return Err(Error::new(ErrorKind::LoopBudget, again.range)),
+                            _ => {}
+                        }
+                    }
+                    return Ok(());
+                }
                 // count is drawn in the parent scope, bindings re-evaluate per iteration
                 let rng = self.slot_rng(self.instances[collection].path, COUNT_SALT);
                 let count = self.scoped(parent, rng, |ctx| eval_count(count.clone(), *count_range, ctx))?;
@@ -522,8 +569,18 @@ impl<'m> Ctx<'m> {
         let mut at = Some(self.site);
         while let Some(instance) = at {
             if let Shape::Iteration { index, count } = self.instances[instance].shape {
+                if let ModelCtxRef::RepeatIndexAt(node) = ctx_ref {
+                    if self.instances[instance]
+                        .parent
+                        .is_some_and(|parent| self.instances[parent].node == node)
+                    {
+                        return index as i64;
+                    }
+                    at = self.instances[instance].parent;
+                    continue;
+                }
                 return match ctx_ref {
-                    ModelCtxRef::RepeatIndex => index as i64,
+                    ModelCtxRef::RepeatIndex | ModelCtxRef::RepeatIndexAt(_) => index as i64,
                     ModelCtxRef::RepeatCount => count as i64,
                     ModelCtxRef::TraceIndex => unreachable!("trace index returned above"),
                 };
@@ -560,9 +617,22 @@ impl<'m> Ctx<'m> {
                 let path = self.instances[instance].path;
                 let name = &self.instances[instance].bindings[position].0;
                 let rng = self.slot_rng(path, mix_str(BINDING_SALT, name));
-                let value = self.scoped(instance, rng, |ctx| eval_binding(expr, ctx))?;
-                self.instances[instance].bindings[position].1 = BindSlot::Done(value.clone());
-                Ok(value)
+                match self.scoped(instance, rng, |ctx| eval_binding(expr.clone(), ctx)) {
+                    Ok(value) => {
+                        self.instances[instance].bindings[position].1 = BindSlot::Done(value.clone());
+                        Ok(value)
+                    }
+                    Err(mut error) => {
+                        self.instances[instance].bindings[position].1 = BindSlot::Todo(expr);
+                        // a failure inside a definition is reported where the author wrote the element it computes for
+                        if error.range.source != 0
+                            && let Some(origin) = self.instances[instance].origins[position]
+                        {
+                            error.range = origin;
+                        }
+                        Err(error)
+                    }
+                }
             }
         }
     }
@@ -664,6 +734,11 @@ impl<'m> Ctx<'m> {
                 self.apply_steps(iterations[index], rest, accessor, path, range)
             }
 
+            Step::Last => match self.instances[at].children.last().copied() {
+                Some(iteration) => self.apply_steps(iteration, rest, accessor, path, range),
+                None => Ok(JsonValue::Null),
+            },
+
             Step::Iterations { start, end } => {
                 let iterations = self.instances[at].children.clone();
                 let len = iterations.len();
@@ -693,6 +768,33 @@ impl<'m> Ctx<'m> {
         range: SrcRange,
     ) -> Result<JsonValue, Error> {
         match accessor {
+            Accessor::Record => {
+                let mut record = JsonMap::new();
+                for (key, field) in [
+                    ("input", Field::Input),
+                    ("output", Field::Output),
+                    ("expected", Field::Expected),
+                    ("metadata", Field::Metadata),
+                ] {
+                    let fields = &self.instances[at].fields;
+                    let present = match field {
+                        Field::Input => fields.input.is_some(),
+                        Field::Output => fields.output.is_some(),
+                        Field::Expected => fields.expected.is_some(),
+                        Field::Metadata => fields.metadata.is_some(),
+                        _ => false,
+                    };
+                    record.insert(
+                        key.into(),
+                        if present {
+                            self.read_field(at, field, vec![], range)?
+                        } else {
+                            JsonValue::Null
+                        },
+                    );
+                }
+                Ok(JsonValue::Object(record))
+            }
             Accessor::Block { .. } => Err(Error::new(ErrorKind::RefShapeMismatch, range)),
             Accessor::Field(field) => self.read_field(at, *field, path.to_vec(), range),
             // the current iteration of the repeat collection `at`, found on
@@ -721,6 +823,18 @@ impl<'m> Ctx<'m> {
                 Shape::Maybe { included, .. } => Ok(JsonValue::Bool(included)),
                 _ => unreachable!("modeler validated included against a maybe"),
             },
+            Accessor::Binding(name) => {
+                let position = self.instances[at].bindings.iter().position(|(known, _)| known == name);
+                let Some(position) = position else {
+                    return Err(Error::new(ErrorKind::RefShapeMismatch, range));
+                };
+                let value = self.force_binding_slot(at, position)?;
+                let mut json = lower_value(value, self)?;
+                for selection in path {
+                    json = json_select(json, selection.clone(), range, self)?;
+                }
+                Ok(json)
+            }
         }
     }
 
@@ -1107,6 +1221,13 @@ impl Planner {
                     }
                     None => None,
                 };
+                let wait = match ctx.instances[instance].fields.wait.clone() {
+                    Some((value, range)) => {
+                        let rng = ctx.slot_rng(ctx.instances[instance].path, WAIT_SALT);
+                        Some(ctx.scoped(instance, rng, |ctx| eval_wait(value, range, ctx))?)
+                    }
+                    None => None,
+                };
                 self.events.push(EventPlan {
                     root,
                     parent,
@@ -1115,6 +1236,7 @@ impl Planner {
                     fields,
                     scores,
                     duration,
+                    wait,
                 });
                 Some(event_ref)
             }
@@ -1135,6 +1257,20 @@ fn eval_count(count: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<usize
         Scalar::Int(value) => usize::try_from(value).map_err(|_| Error::new(ErrorKind::NegativeRepeatCount, range)),
         Scalar::Float(_) => Err(Error::new(ErrorKind::NonIntegerRepeatCount, range)),
         _ => unreachable!("modeler validated the count as a number"),
+    }
+}
+
+// a wait may be zero, which a duration may not
+fn eval_wait(wait: ModelValue, range: SrcRange, ctx: &mut Ctx) -> Result<std::time::Duration, Error> {
+    let seconds = match eval_operand(wait, ctx)? {
+        Scalar::Int(value) => value as f64,
+        Scalar::Float(value) => value,
+        _ => return Err(Error::new(ErrorKind::WaitOutOfRange, range)),
+    };
+    if seconds >= 0.0 {
+        std::time::Duration::try_from_secs_f64(seconds).map_err(|_| Error::new(ErrorKind::WaitOutOfRange, range))
+    } else {
+        Err(Error::new(ErrorKind::WaitOutOfRange, range))
     }
 }
 
@@ -1506,279 +1642,114 @@ fn eval_container(value: ModelValue, ctx: &mut Ctx, at: SrcRange) -> Result<Mode
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnglishVaryOptions {
-    #[serde(default = "english_enabled")]
-    negation: bool,
-    #[serde(default = "english_enabled")]
-    condition_order: bool,
-    #[serde(default)]
-    rendering: RealizeOptions,
-}
-
-fn english_enabled() -> bool {
-    true
-}
-
-impl Default for EnglishVaryOptions {
-    fn default() -> Self {
-        Self {
-            negation: true,
-            condition_order: true,
-            rendering: RealizeOptions::default(),
-        }
-    }
-}
-
-fn eval_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue], rng: &mut R) -> Result<InputValue, String> {
-    run_english(operation, args, rng).map_err(|error| format!("{}: {error}", operation.as_str()))
-}
-
-fn run_english<R: Rng + ?Sized>(operation: EnglishOperation, args: &[InputValue], rng: &mut R) -> Result<InputValue, String> {
-    use EnglishOperation::*;
-    let (min, max) = match operation {
-        Express | Expression | ExpressionCandidates | Realize | Vary | FormatNumber | FormatDate | FormatTime => (1, 2),
-        Combine | Refer | Remember => (2, 3),
-        Unmentioned => (2, 2),
-    };
-    if !(min..=max).contains(&args.len()) {
-        return Err(format!("expected {min} to {max} arguments"));
-    }
-    match operation {
-        Express | Expression | ExpressionCandidates => {
-            english_expression_shapes(&args[0], args.get(1))?;
-            let source = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            match operation {
-                Express => english::express(&source, &english_options, rng)
-                    .map(InputValue::String)
-                    .map_err(english_error_message),
-                Expression => {
-                    serde_json::to_value(english::expression(&source, &english_options, rng).map_err(english_error_message)?)
-                        .map_err(english_error_message)
-                }
-                _ => serde_json::to_value(
-                    english::expression_candidates(&source, &english_options).map_err(english_error_message)?,
-                )
-                .map_err(english_error_message),
-            }
-        }
-        Realize => {
-            let sentence: Sentence = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            english::realize(&sentence, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        Vary => {
-            if args.get(1).and_then(InputValue::as_object).is_some_and(|english_options| {
-                english_options
-                    .keys()
-                    .any(|key| !["negation", "condition_order", "rendering"].contains(&key.as_str()))
-            }) {
-                let english_options: english::StyleOptions = english_options(args.get(1))?;
-                let result = if let Some(text) = args[0].as_str() {
-                    english::vary_styled(text, &english_options, rng)
-                } else {
-                    english::vary_sentence_styled(&decode_english(&args[0])?, &english_options, rng)
-                };
-                return result
-                    .map(|result| InputValue::String(result.text))
-                    .map_err(english_error_message);
-            }
-            let english_options: EnglishVaryOptions = english_options(args.get(1))?;
-            let variation = VariationOptions {
-                negation: english_options.negation,
-                condition_order: english_options.condition_order,
-            };
-            let output = if let Some(text) = args[0].as_str() {
-                english::vary(text, &variation, rng)
-            } else {
-                let sentence: Sentence = decode_english(&args[0])?;
-                english::vary_sentence(&sentence, &english_options.rendering, &variation, rng)
-            };
-            output.map(InputValue::String).map_err(english_error_message)
-        }
-        Combine => {
-            let sentences: Vec<Sentence> = decode_english(&args[0])?;
-            let relation = decode_english(&args[1])?;
-            let english_options = english_options(args.get(2))?;
-            english::composition::combine(&sentences, relation, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        Refer => {
-            let entity = decode_english(&args[0])?;
-            let context = decode_english(&args[1])?;
-            let english_options = english_options(args.get(2))?;
-            english::discourse::refer(&entity, &context, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        Remember => {
-            let context = decode_english(&args[0])?;
-            let entities: Vec<english::discourse::Entity> = decode_english(&args[1])?;
-            let facts: Vec<String> = english_options(args.get(2))?;
-            let context = english::discourse::remember(&context, &entities, &facts).map_err(english_error_message)?;
-            serde_json::to_value(context).map_err(english_error_message)
-        }
-        Unmentioned => {
-            let details: Vec<english::discourse::Detail> = decode_english(&args[0])?;
-            let context = decode_english(&args[1])?;
-            let selected = english::discourse::unmentioned(&details, &context).map_err(english_error_message)?;
-            serde_json::to_value(selected).map_err(english_error_message)
-        }
-        FormatNumber => {
-            let number = match &args[0] {
-                InputValue::String(value) => value.clone(),
-                InputValue::Number(number) => number.to_string(),
-                _ => return Err("expected a number or decimal string".into()),
-            };
-            let english_options = english_options(args.get(1))?;
-            english::formatting::format_number(&number, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        FormatDate => {
-            let date: String = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            english::formatting::format_date(&date, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-        FormatTime => {
-            let time: String = decode_english(&args[0])?;
-            let english_options = english_options(args.get(1))?;
-            english::formatting::format_time(&time, &english_options)
-                .map(InputValue::String)
-                .map_err(english_error_message)
-        }
-    }
-}
-
-fn decode_english<T: DeserializeOwned>(value: &InputValue) -> Result<T, String> {
-    serde_json::from_value(value.clone()).map_err(english_error_message)
-}
-
-fn english_options<T: DeserializeOwned + Default>(value: Option<&InputValue>) -> Result<T, String> {
-    value.map(decode_english).unwrap_or_else(|| Ok(T::default()))
-}
-
-fn english_error_message(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
-
-// Serde also accepts struct sequences. The DSL contract requires named objects.
-fn english_expression_shapes(source: &InputValue, english_options: Option<&InputValue>) -> Result<(), String> {
-    fn object(value: &InputValue) -> Result<(), String> {
-        if value.is_object() {
-            Ok(())
-        } else {
-            Err("expected an expression object".into())
-        }
-    }
-    fn objects(value: Option<&InputValue>) -> Result<(), String> {
-        if let Some(InputValue::Array(values)) = value {
-            for value in values {
-                object(value)?;
-            }
-        }
-        Ok(())
-    }
-    object(source)?;
-    for key in ["families", "facts", "constructions", "components"] {
-        objects(source.get(key))?;
-    }
-    if let Some(InputValue::Array(values)) = source.get("components") {
-        for value in values {
-            objects(value.get("forms"))?;
-        }
-    }
-    if let Some(InputValue::Array(values)) = source.get("families") {
-        for value in values {
-            if let Some(message) = value.get("message").filter(|v| !v.is_null()) {
-                object(message)?;
-                if let Some(bindings) = message.get("bindings") {
-                    object(bindings)?;
-                }
-            }
-        }
-    }
-    if let Some(InputValue::Array(values)) = source.get("constructions") {
-        for value in values {
-            if let Some(predicate) = value.get("predicate") {
-                object(predicate)?;
-                if let Some(verb) = predicate.get("verb")
-                    && !verb.is_string()
-                {
-                    object(verb)?;
-                }
-            }
-        }
-    }
-    if let Some(english_options) = english_options {
-        object(english_options)?;
-        if let Some(context) = english_options.get("context") {
-            object(context)?;
-            objects(context.get("recent"))?;
-            if let Some(InputValue::Array(recent)) = context.get("recent") {
-                for selection in recent {
-                    if let Some(message) = selection.get("message").filter(|v| !v.is_null()) {
-                        object(message)?;
-                    }
-                }
-            }
-        }
-        if let Some(speaker) = english_options.get("speaker") {
-            object(speaker)?;
-            for key in ["greetings", "closings"] {
-                objects(speaker.get(key))?;
-            }
-            if let Some(wording) = speaker.get("wording") {
-                object(wording)?;
-                for key in ["typos", "rendering"] {
-                    if let Some(value) = wording.get(key) {
-                        object(value)?;
-                    }
-                }
-                objects(wording.get("alternatives"))?;
-            }
-        }
-    }
-    Ok(())
-}
-
 // a choice or weighted pick may itself still be dynamic, so callers recurse on the result
 fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
     let value = match func {
-        ModelFunc::English { operation, args } => {
+        ModelFunc::ForkPick(branches) => {
+            let mut weights = Vec::new();
+            for branch in branches {
+                let mut weight = None;
+                for value in branch {
+                    let value = match eval_binding(value, ctx)? {
+                        ModelValue::Num(ModelNumber::Int(n)) => n as f64,
+                        ModelValue::Num(ModelNumber::Float(n)) => n,
+                        _ => return Err(Error::new(ErrorKind::InvalidForkWeight, range)),
+                    };
+                    if !value.is_finite() || value < 0.0 || weight.is_some_and(|w| w != value) {
+                        return Err(Error::new(ErrorKind::InvalidForkWeight, range));
+                    }
+                    weight = Some(value);
+                }
+                weights.push(weight.unwrap_or(0.0));
+            }
+            let scale = weights.iter().copied().fold(0.0, f64::max);
+            let mut pick = -1;
+            if scale > 0.0 {
+                let total: f64 = weights.iter().map(|w| w / scale).sum();
+                let mut draw = ctx.rng.random::<f64>() * total;
+                for (index, weight) in weights.iter().enumerate() {
+                    if *weight > 0.0 {
+                        pick = index as i64;
+                        draw -= weight / scale;
+                        if draw < 0.0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            ModelValue::Num(ModelNumber::Int(pick))
+        }
+        ModelFunc::Arrivals { ready } => {
+            if !matches!(eval_binding(*ready, ctx)?, ModelValue::Bool(true)) {
+                return Err(Error::new(ErrorKind::MissingArrival, range));
+            }
+            ModelValue::Num(ModelNumber::Int(1))
+        }
+        ModelFunc::Fold { items, initial, combine } => {
+            let ModelValue::Array(items) = json_to_value(lower_value(*items, ctx)?) else {
+                return Err(Error::new(ErrorKind::RefShapeMismatch, range));
+            };
+            let mut accumulator = eval_binding(*initial, ctx)?;
+            for item in items.elem {
+                let ModelArrayElem::Item(value) = item else {
+                    return Err(Error::new(ErrorKind::RefShapeMismatch, range));
+                };
+                ctx.folds.push((accumulator, value));
+                let combined = eval_binding((*combine).clone(), ctx);
+                ctx.folds.pop();
+                accumulator = json_to_value(lower_value(combined?, ctx)?);
+            }
+            accumulator
+        }
+        ModelFunc::Emissions(join) => eval_emissions(*join, range, ctx)?,
+        ModelFunc::FoldAccumulator => match ctx.folds.last() {
+            Some((accumulator, _)) => accumulator.clone(),
+            None => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+        },
+        ModelFunc::FoldArrival => match ctx.folds.last() {
+            Some((_, arrival)) => arrival.clone(),
+            None => return Err(Error::new(ErrorKind::RefShapeMismatch, range)),
+        },
+        ModelFunc::Check { value, ty } => {
+            use bts_lang::FieldType;
+            let value = eval_binding(*value, ctx)?;
+            let valid = matches!(
+                (&value, ty),
+                (_, FieldType::Any)
+                    | (ModelValue::Str(_), FieldType::String)
+                    | (ModelValue::Num(_), FieldType::Number)
+                    | (ModelValue::Bool(_), FieldType::Boolean)
+                    | (ModelValue::Object(_), FieldType::Object)
+                    | (ModelValue::Array(_), FieldType::Array)
+            );
+            if !valid {
+                return Err(Error {
+                    kind: ErrorKind::SchemaTypeMismatch,
+                    range,
+                    detail: Some(format!("upstream field requires {}", format!("{ty:?}").to_lowercase())),
+                });
+            }
+            value
+        }
+        ModelFunc::Provider { function, args } => {
             let args = args
                 .into_iter()
-                .map(|arg| {
-                    lower_value(arg, ctx)?
-                        .project(&())
-                        .map_err(|_| Error::english("English functions do not accept attachments".into(), range))
-                })
+                .map(|arg| lower_value(arg, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            let output = eval_english(operation, &args, &mut ctx.rng).map_err(|detail| Error::english(detail, range))?;
-            json_to_value(output.into())
-        }
-        ModelFunc::Attachment { path, content_type } => {
-            let filename = std::path::Path::new(&path)
-                .file_name()
-                .expect("modeler validates attachment path")
-                .to_string_lossy()
-                .into_owned();
-            let mut key_bytes = [0; 16];
-            ctx.rng.fill(&mut key_bytes);
-            key_bytes[6] = (key_bytes[6] & 0x0f) | 0x40;
-            key_bytes[8] = (key_bytes[8] & 0x3f) | 0x80;
-            ModelValue::Attachment {
-                path,
-                filename,
-                content_type,
-                key: Uuid::from_bytes(key_bytes).to_string(),
+            let evaluate = function
+                .data
+                .ok_or_else(|| Error::call(format!("function `{}` does not run in data generation", function.name), range))?;
+            let mut evaluation = Evaluation {
+                rng: &mut ctx.rng,
+                format: ctx.format,
+                seed: ctx.seed,
+                trace_index: ctx.trace_index,
+            };
+            match evaluate(&args, &mut evaluation) {
+                Ok(value) => json_to_value(value),
+                Err(EvaluateError::Shape) => return Err(shape_error(ctx)),
+                Err(EvaluateError::UnsupportedAttachment) => return Err(Error::new(ErrorKind::UnsupportedAttachment, range)),
+                Err(EvaluateError::Invalid(detail)) => return Err(Error::call(detail.into_owned(), range)),
             }
         }
         ModelFunc::Choice(options) => {
@@ -1981,17 +1952,6 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             };
             ModelValue::Num(ModelNumber::Int(length as i64))
         }
-        ModelFunc::Tokens { value } => {
-            // containers count their compact json serialization
-            let text = match lower_value(*value, ctx)? {
-                JsonValue::String(text) => text,
-                value => value
-                    .project(ctx.format)
-                    .map_err(|_| Error::new(ErrorKind::UnsupportedAttachment, range))?
-                    .to_string(),
-            };
-            ModelValue::Num(ModelNumber::Int(BPE.encode_ordinary(&text).len() as i64))
-        }
         ModelFunc::Format { pieces, args } => {
             // the modeler guarantees one more piece than args
             let mut pieces = pieces.into_iter();
@@ -2046,22 +2006,139 @@ fn eval_func(func: ModelFunc, range: SrcRange, ctx: &mut Ctx) -> Result<ModelVal
             length,
             ctx,
         )),
-        ModelFunc::Noise { size } => {
-            let size = match eval_operand(*size, ctx)? {
-                Scalar::Int(value) if (0..=NOISE_SIZE_CAP).contains(&value) => value as usize,
-                Scalar::Int(_) | Scalar::Float(_) => return Err(Error::new(ErrorKind::NoiseSizeOutOfRange, range)),
-                // reference-fed arguments settle their types here
-                _ => return Err(shape_error(ctx)),
-            };
-            ModelValue::Str(random_text(
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-                size,
-                ctx,
-            ))
-        }
     };
 
     Ok(value)
+}
+
+// fires the emissions of a junction from its arrivals, taken round by round in branch order
+fn eval_emissions(join: Emissions, range: SrcRange, ctx: &mut Ctx) -> Result<ModelValue, Error> {
+    let shape = || Error::new(ErrorKind::RefShapeMismatch, range);
+    let rounds = match &join.rounds {
+        Some(rounds) => Some(eval_count(rounds.clone(), range, ctx)?),
+        None => None,
+    };
+    // every per round expression yields one value for each round
+    let spread = |value: ModelValue, ctx: &mut Ctx| -> Result<Vec<InputValue>, Error> {
+        let value = lower_value(value, ctx)?.project(ctx.format).map_err(|_| shape())?;
+        match (rounds, value) {
+            (None, value) => Ok(vec![value]),
+            (Some(rounds), InputValue::Array(values)) if values.len() == rounds => Ok(values),
+            _ => Err(shape()),
+        }
+    };
+    let rounds = rounds.unwrap_or(1);
+    let mut inputs = Vec::new();
+    for input in join.inputs {
+        let arrived = match input.arrived {
+            Some(arrived) => spread(arrived, ctx)?
+                .iter()
+                .map(|value| value.as_bool() == Some(true))
+                .collect(),
+            None => vec![true; rounds],
+        };
+        let edge = lower_value(input.edge, ctx)?.project(ctx.format).map_err(|_| shape())?;
+        let values = match input.value {
+            None => vec![InputValue::Null; rounds],
+            Some(value) if input.shared => {
+                vec![lower_value(value, ctx)?.project(ctx.format).map_err(|_| shape())?; rounds]
+            }
+            Some(value) => spread(value, ctx)?,
+        };
+        inputs.push((edge, arrived, values));
+    }
+    let keys = match join.keys {
+        Some(keys) => Some(spread(keys, ctx)?),
+        None => None,
+    };
+    let count = match join.count {
+        Some(count) => eval_count(count, range, ctx)?,
+        None => 0,
+    };
+    struct Group {
+        key: InputValue,
+        queues: Vec<std::collections::VecDeque<InputValue>>,
+        seen: Vec<(usize, InputValue)>,
+        emitted: bool,
+    }
+    let group = |key: InputValue| Group {
+        key,
+        queues: vec![Default::default(); inputs.len()],
+        seen: vec![],
+        emitted: false,
+    };
+    // without keys the one group exists even when nothing arrives
+    let mut groups = if keys.is_none() {
+        vec![group(InputValue::Null)]
+    } else {
+        vec![]
+    };
+    let mut emissions: Vec<Vec<InputValue>> = Vec::new();
+    for round in 0..rounds {
+        for &position in &join.order {
+            let (edge, arrived, values) = &inputs[position];
+            if !arrived[round] {
+                continue;
+            }
+            let arrival = serde_json::json!({"edge": edge, "value": values[round]});
+            let key = keys.as_ref().map_or(InputValue::Null, |keys| keys[round].clone());
+            let index = match groups.iter().position(|group| group.key == key) {
+                Some(index) => index,
+                None => {
+                    groups.push(group(key));
+                    groups.len() - 1
+                }
+            };
+            let group = &mut groups[index];
+            match join.kind {
+                EmissionKind::Merge => emissions.push(vec![arrival]),
+                EmissionKind::First => {
+                    if !group.emitted {
+                        emissions.push(vec![arrival]);
+                    }
+                }
+                EmissionKind::Accumulate => {
+                    group.queues[position].push_back(arrival);
+                    if group.queues.iter().all(|queue| !queue.is_empty()) {
+                        emissions.push(group.queues.iter_mut().map(|queue| queue.pop_front().unwrap()).collect());
+                    } else {
+                        continue;
+                    }
+                }
+                EmissionKind::Quorum => {
+                    if group.emitted {
+                        continue;
+                    }
+                    if !group.seen.iter().any(|(seen, _)| *seen == position) {
+                        group.seen.push((position, arrival));
+                    }
+                    if group.seen.len() < count {
+                        continue;
+                    }
+                    let mut arrivals = std::mem::take(&mut group.seen);
+                    arrivals.sort_by_key(|(position, _)| *position);
+                    emissions.push(arrivals.into_iter().map(|(_, arrival)| arrival).collect());
+                }
+                EmissionKind::Reduce => {
+                    group.seen.push((position, arrival));
+                    continue;
+                }
+            }
+            group.emitted = true;
+        }
+    }
+    for group in groups {
+        match join.kind {
+            EmissionKind::Accumulate if !group.emitted || group.queues.iter().any(|queue| !queue.is_empty()) => {
+                return Err(Error::new(ErrorKind::MissingArrival, range));
+            }
+            EmissionKind::Quorum if !group.emitted => return Err(Error::new(ErrorKind::QuorumUnmet, range)),
+            EmissionKind::Reduce => emissions.push(group.seen.into_iter().map(|(_, arrival)| arrival).collect()),
+            _ => {}
+        }
+    }
+    let emissions = InputValue::Array(emissions.into_iter().map(InputValue::Array).collect());
+    Ok(json_to_value(emissions.into()))
 }
 
 fn finite_float(value: f64, range: SrcRange) -> Result<ModelValue, Error> {
@@ -2126,9 +2203,7 @@ fn eval_extreme(values: Vec<ModelValue>, minimize: bool, ctx: &mut Ctx) -> Resul
 }
 
 fn random_text(charset: &[u8], length: usize, ctx: &mut Ctx) -> String {
-    (0..length)
-        .map(|_| charset[ctx.rng.random_range(0..charset.len())] as char)
-        .collect()
+    crate::mocking::functions::random_text(charset, length, &mut ctx.rng)
 }
 
 fn json_text(value: &JsonValue) -> Option<String> {
@@ -2294,6 +2369,15 @@ fn eval_binary(op: BinOp, lhs: ModelValue, rhs: ModelValue, range: SrcRange, ctx
 
     // equality tolerates null so absence guards read naturally
     if matches!(op, BinOp::Eq | BinOp::Ne) {
+        // a comparison with null asks whether a value is there, whatever the value is
+        let absent = match (&lhs, &rhs) {
+            (ModelValue::Null, _) => Some(eval_is_null(rhs.clone(), ctx)?),
+            (_, ModelValue::Null) => Some(eval_is_null(lhs.clone(), ctx)?),
+            _ => None,
+        };
+        if let Some(absent) = absent {
+            return Ok(Scalar::Bool(if op == BinOp::Eq { absent } else { !absent }));
+        }
         let lhs = eval_nullable(lhs, ctx)?;
         let rhs = eval_nullable(rhs, ctx)?;
         let equal = match (&lhs, &rhs) {
@@ -2343,6 +2427,38 @@ fn eval_binary(op: BinOp, lhs: ModelValue, rhs: ModelValue, range: SrcRange, ctx
 }
 
 // a scalar or an explicit absence, for equality's null probes
+// whether a value is null, for a value of any shape
+fn eval_is_null(value: ModelValue, ctx: &mut Ctx) -> Result<bool, Error> {
+    match value {
+        ModelValue::Null => Ok(true),
+        ModelValue::Object(_) | ModelValue::Array(_) => Ok(false),
+        ModelValue::BlockRef { ref_id, .. } => Ok(matches!(ctx.resolve_ref(ref_id)?, JsonValue::Null)),
+        ModelValue::VarRef(name) => {
+            let value = ctx.force_binding(&name)?;
+            eval_is_null(value, ctx)
+        }
+        ModelValue::Index { target, index, range } => {
+            let value = eval_index(*target, *index, range, ctx)?;
+            eval_is_null(value, ctx)
+        }
+        ModelValue::Cond {
+            cond, then, otherwise, ..
+        } => {
+            let taken = if eval_operand(*cond, ctx)?.into_bool(ctx)? {
+                then
+            } else {
+                otherwise
+            };
+            eval_is_null(*taken, ctx)
+        }
+        ModelValue::Func { func, range } => {
+            let value = eval_func(func, range, ctx)?;
+            eval_is_null(value, ctx)
+        }
+        value => eval_operand(value, ctx).map(|_| false),
+    }
+}
+
 fn eval_nullable(value: ModelValue, ctx: &mut Ctx) -> Result<Option<Scalar>, Error> {
     match value {
         ModelValue::Null => Ok(None),
@@ -2610,9 +2726,9 @@ impl Error {
         }
     }
 
-    fn english(detail: String, range: SrcRange) -> Self {
+    fn call(detail: String, range: SrcRange) -> Self {
         Self {
-            kind: ErrorKind::InvalidEnglish,
+            kind: ErrorKind::InvalidCall,
             range,
             detail: Some(detail),
         }
@@ -2621,6 +2737,12 @@ impl Error {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ErrorKind {
+    InvalidForkWeight,
+    MissingArrival,
+    QuorumUnmet,
+    LoopLimit,
+    LoopBudget,
+    SchemaTypeMismatch,
     UnsupportedAttachment,
     DivisionByZero,
     NonFiniteResult,
@@ -2635,14 +2757,14 @@ pub enum ErrorKind {
     ScoreOutOfRange,
     ScorerReasonNotString,
     DurationOutOfRange,
-    NoiseSizeOutOfRange,
+    WaitOutOfRange,
+    InvalidCall,
     ClampBoundsOutOfOrder,
     EmptySplitSeparator,
     JoinElementNotScalar,
     InvalidRender,
     InvalidCompose,
     InvalidSample,
-    InvalidEnglish,
     CircularReference,
     AbsentRefField,
     RefShapeMismatch,
@@ -2651,6 +2773,12 @@ pub enum ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::InvalidForkWeight => "weighted branch weights must agree and be finite nonnegative numbers",
+            Self::MissingArrival => "accumulate group closed with a missing listed input",
+            Self::QuorumUnmet => "quorum group closed without enough distinct inputs",
+            Self::LoopLimit => "cycle max_traversals exceeded",
+            Self::LoopBudget => "graph execution budget exceeded (10000 traversals)",
+            Self::SchemaTypeMismatch => "upstream value does not satisfy its field schema",
             Self::UnsupportedAttachment => "the selected format does not support attachments",
             Self::DivisionByZero => "expression divides by zero",
             Self::NonFiniteResult => "expression result overflowed or is not finite",
@@ -2665,13 +2793,13 @@ impl fmt::Display for ErrorKind {
             Self::ScoreOutOfRange => "synthetic scorer score is not a number between 0 and 1",
             Self::ScorerReasonNotString => "synthetic scorer reason is not a string",
             Self::DurationOutOfRange => "duration is not a positive number of seconds",
-            Self::NoiseSizeOutOfRange => "noise size is not an integer between 0 and 8388608",
+            Self::WaitOutOfRange => "wait is not a number of seconds from zero up",
+            Self::InvalidCall => "invalid provider function call",
             Self::ClampBoundsOutOfOrder => "clamp bounds are out of order",
             Self::EmptySplitSeparator => "split separator is empty",
             Self::InvalidRender => "render requires balanced braces and named string, number, or boolean values",
             Self::InvalidCompose => "compose parts must be strings or null",
             Self::InvalidSample => "sample count must be an integer between zero and the array length",
-            Self::InvalidEnglish => "invalid English language function argument",
             Self::JoinElementNotScalar => "join element is not a string, number, or boolean",
             Self::CircularReference => "references form a cycle",
             Self::AbsentRefField => "referenced block does not set the field",
@@ -2704,7 +2832,14 @@ impl From<Error> for crate::dsl::Diag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::semantics::compile;
+    use crate::providers::braintrust::functions::count_tokens;
+    use crate::providers::braintrust::mocking::compile;
+
+    // the English functions belong to the world provider
+    fn compile_with_world(source: &str) -> Result<Model, String> {
+        use crate::providers::{Provider, With, braintrust, world};
+        With(braintrust::Bundle, world::Bundle).compile(source)
+    }
 
     macro_rules! value {
         ($($tokens:tt)*) => { JsonValue::from(serde_json::json!($($tokens)*)) };
@@ -2739,17 +2874,10 @@ mod tests {
     #[test]
     fn preserves_typed_attachments_through_references_and_bindings() {
         let model = compile(
-            r#"
-            trace "source" {
-                input = { files = [attachment("report.txt", "text/plain")] }
-                output = self.input["files"][0]
-                tool "copy" {
-                    vars { picked = trace.output }
-                    input = { nested = [var.picked] }
-                    output = trace.output
-                }
-            }
-            "#,
+            r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["files"][0]};
+(copy:tool {name: "copy"}) {input: {nested: [copy.local.picked]}, output: source_root.output, local: {picked: source_root.output}};
+(source_node:agent) {input: {files: [attachment("report.txt", "text/plain")]}, output: source_root.output};
+(source_node)-|:next|->(source_root)-|:calls|->(copy);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -2764,13 +2892,9 @@ mod tests {
     #[test]
     fn uses_the_selected_attachment_projection_for_fields_and_tokens() {
         let model = compile(
-            r#"
-            trace "source" {
-                input = attachment("report.txt", "text/plain")
-                output = self.input["name"]
-                metrics = { count = tokens([self.input]) }
-            }
-            "#,
+            r#"(source_root:task {name: "source"}) {input: source_node.input, output: self.input ["name"], metrics: {count: tokens([self.input])}};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: source_root.output};
+(source_node)-|:next|->(source_root);"#,
         )
         .unwrap();
         let plan = plan_with_filter(model, 1, 0, &WriteFilter::default(), &AttachmentView).unwrap();
@@ -2778,15 +2902,16 @@ mod tests {
         let rendered = InputValue::Array(vec![AttachmentView.attachment(&plan.attachments[0]).unwrap()]).to_string();
         assert_eq!(
             plan.events[0].fields.metrics.as_ref().unwrap()["count"].as_u64(),
-            Some(BPE.encode_ordinary(&rendered).len() as u64)
+            Some(count_tokens(&rendered) as u64)
         );
         assert!(matches!(plan.events[0].fields.input, Some(JsonValue::Attachment(_))));
     }
 
     #[test]
     fn unsupported_attachment_projection_keeps_the_expression_range() {
-        let source =
-            r#"trace "source" { input = attachment("report.txt", "text/plain") metrics = { count = tokens(self.input) } }"#;
+        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, metrics: {count: tokens(self.input)}};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: null};
+(source_node)-|:next|->(source_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnsupportedAttachment);
         assert_eq!(&source[error.range.start..error.range.end], "tokens(self.input)");
@@ -2795,20 +2920,24 @@ mod tests {
     #[test]
     fn attachment_projection_shape_errors_point_to_the_consuming_selection() {
         for (projection, expression) in [
-            (serde_json::json!(["value"]), r#"var.file["key"]"#),
-            (serde_json::json!("value"), r#"var.file["key"]"#),
-            (serde_json::json!(false), r#"var.file["key"]"#),
-            (InputValue::Null, r#"var.file["key"]"#),
+            (serde_json::json!(["value"]), r#"source_root.local.file["key"]"#),
+            (serde_json::json!("value"), r#"source_root.local.file["key"]"#),
+            (serde_json::json!(false), r#"source_root.local.file["key"]"#),
+            (InputValue::Null, r#"source_root.local.file["key"]"#),
             (serde_json::json!(42), r#"attachment("report.txt", "text/plain")["key"]"#),
             (serde_json::json!({"nested": "value"}), r#"self.input["nested"]["key"]"#),
-            (serde_json::json!({"nested": "value"}), r#"var.selected["nested"]["key"]"#),
-            (serde_json::json!({}), r#"var.selected[:]"#),
-            (serde_json::json!("value"), r#"var.selected[:]"#),
-            (serde_json::json!(["value"]), r#"var.selected[true]"#),
+            (
+                serde_json::json!({"nested": "value"}),
+                r#"source_root.local.selected["nested"]["key"]"#,
+            ),
+            (serde_json::json!({}), r#"source_root.local.selected[:]"#),
+            (serde_json::json!("value"), r#"source_root.local.selected[:]"#),
+            (serde_json::json!(["value"]), r#"source_root.local.selected[true]"#),
         ] {
             let source = format!(
-                r#"vars {{ file = attachment("report.txt", "text/plain") selected = trace.source.input }}
-                trace "source" {{ input = var.file output = {expression} }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
+(source_node:agent) {{input: source_root.local.file, output: source_root.output}};
+(source_node)-|:next|->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch, "{expression}");
@@ -2821,20 +2950,25 @@ mod tests {
         for (projection, expression, expected) in [
             (
                 serde_json::json!({"name": "report.txt"}),
-                r#"var.file["name"]"#,
+                r#"source_root.local.file["name"]"#,
                 value!("report.txt"),
             ),
             (serde_json::json!(["first", "second"]), "self.input[1]", value!("second")),
-            (serde_json::json!(["first", "second"]), "var.selected[1:]", value!(["second"])),
             (
                 serde_json::json!(["first", "second"]),
-                "[...var.selected]",
+                "source_root.local.selected[1:]",
+                value!(["second"]),
+            ),
+            (
+                serde_json::json!(["first", "second"]),
+                "[...source_root.local.selected]",
                 value!(["first", "second"]),
             ),
         ] {
             let source = format!(
-                r#"vars {{ file = attachment("report.txt", "text/plain") selected = trace.source.input }}
-                trace "source" {{ input = var.file output = {expression} }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
+(source_node:agent) {{input: source_root.local.file, output: source_root.output}};
+(source_node)-|:next|->(source_root);"#
             );
             let plan = plan_with_projection(&source, projection).unwrap();
             assert_eq!(plan.events[0].fields.output.as_ref(), Some(&expected), "{expression}");
@@ -2844,9 +2978,21 @@ mod tests {
     #[test]
     fn attachment_projection_navigation_preserves_specific_errors() {
         for (projection, expression, kind) in [
-            (serde_json::json!({}), r#"var.file["missing"]"#, ErrorKind::MissingObjectKey),
-            (serde_json::json!(["value"]), "var.selected[3]", ErrorKind::IndexOutOfBounds),
-            (serde_json::json!(["value"]), "var.selected[0.5]", ErrorKind::NonIntegerIndex),
+            (
+                serde_json::json!({}),
+                r#"source_root.local.file["missing"]"#,
+                ErrorKind::MissingObjectKey,
+            ),
+            (
+                serde_json::json!(["value"]),
+                "source_root.local.selected[3]",
+                ErrorKind::IndexOutOfBounds,
+            ),
+            (
+                serde_json::json!(["value"]),
+                "source_root.local.selected[0.5]",
+                ErrorKind::NonIntegerIndex,
+            ),
             (
                 serde_json::json!({"items": ["value"], "bound": -1}),
                 r#"self.input["items"][self.input["bound"]:]"#,
@@ -2869,8 +3015,9 @@ mod tests {
             ),
         ] {
             let source = format!(
-                r#"vars {{ file = attachment("report.txt", "text/plain") selected = trace.source.input }}
-                trace "source" {{ input = var.file output = {expression} }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, output: {expression}, local: {{file: attachment("report.txt", "text/plain"), selected: source_root.input}}}};
+(source_node:agent) {{input: source_root.local.file, output: source_root.output}};
+(source_node)-|:next|->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), kind, "{expression}");
@@ -2880,10 +3027,9 @@ mod tests {
 
     #[test]
     fn attachment_projection_rejects_non_array_spreads_without_panicking() {
-        let source = r#"trace "source" {
-            input = attachment("report.txt", "text/plain")
-            output = [...self.input]
-        }"#;
+        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, output: [... self.input]};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: source_root.output};
+(source_node)-|:next|->(source_root);"#;
         for projection in [serde_json::json!({}), serde_json::json!("value"), InputValue::Null] {
             let error = plan_with_projection(source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch);
@@ -2897,13 +3043,13 @@ mod tests {
             (serde_json::json!("value"), "[...self.expected, ...self.input]", "self.input"),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"[...self.expected, ...var.selected["nested"]]"#,
-                r#"var.selected["nested"]"#,
+                r#"[...self.expected, ...source_root.local.selected["nested"]]"#,
+                r#"source_root.local.selected["nested"]"#,
             ),
             (
                 serde_json::json!({"nested": "value"}),
-                r#"[...var.selected["nested"]]"#,
-                r#"var.selected["nested"]"#,
+                r#"[...source_root.local.selected["nested"]]"#,
+                r#"source_root.local.selected["nested"]"#,
             ),
             (
                 serde_json::json!("value"),
@@ -2912,12 +3058,9 @@ mod tests {
             ),
         ] {
             let source = format!(
-                r#"vars {{ selected = trace.source.input }}
-                trace "source" {{
-                    input = attachment("report.txt", "text/plain")
-                    expected = ["seed"]
-                    output = {expression}
-                }}"#
+                r#"(source_root:task {{name: "source"}}) {{input: source_node.input, expected: ["seed"], output: {expression}, local: {{selected: source_root.input}}}};
+(source_node:agent) {{input: attachment("report.txt", "text/plain"), output: source_root.output}};
+(source_node)-|:next|->(source_root);"#
             );
             let error = plan_with_projection(&source, projection).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::RefShapeMismatch, "{expression}");
@@ -2927,10 +3070,9 @@ mod tests {
 
     #[test]
     fn attachment_projection_accepts_any_json_for_projection_and_token_counting() {
-        let source = r#"trace "source" {
-            input = attachment("report.txt", "text/plain")
-            metrics = { count = tokens(self.input) }
-        }"#;
+        let source = r#"(source_root:task {name: "source"}) {input: source_node.input, metrics: {count: tokens(self.input)}};
+(source_node:agent) {input: attachment("report.txt", "text/plain"), output: null};
+(source_node)-|:next|->(source_root);"#;
         for projection in [
             serde_json::json!({"name": "report.txt"}),
             serde_json::json!(["value"]),
@@ -2952,14 +3094,19 @@ mod tests {
             );
             assert_eq!(
                 fields.metrics.as_ref().unwrap()["count"].as_u64(),
-                Some(BPE.encode_ordinary(&projection.to_string()).len() as u64),
+                Some(count_tokens(&projection.to_string()) as u64),
             );
         }
     }
 
     #[test]
     fn lowers_null_and_negative_numbers_to_json() {
-        let model = compile(r#"trace "t" { input = null metrics = { delta = -0.5 } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, metrics: {delta: - 0.5}};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 1, 0).unwrap();
 
         let fields = &plan.events[0].fields;
@@ -2969,7 +3116,12 @@ mod tests {
 
     #[test]
     fn resolves_trace_index_per_generated_trace() {
-        let model = compile(r#"trace "t" { input = "q ${trace.index}" tags = ["t-${trace.index}"] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, tags: ["t-${context.trace_index}"]};
+(t:agent) {input: "q ${context.trace_index}", output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 3, 0).unwrap();
 
         let inputs = plan
@@ -2987,15 +3139,12 @@ mod tests {
     #[test]
     fn evaluates_context_references_in_expressions() {
         let model = compile(
-            r#"
-            trace "t" {
-                input = trace.index
-                repeat {
-                    count = 3
-                    task "turn" { metrics = { turn = repeat.index + 1, of = repeat.count } }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {metrics: {turn: context.index + 1, of: context.count}};
+(t:agent) {input: context.trace_index, output: null};
+
+(t_root)=|:repeat {count: 3}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 2, 0).unwrap();
@@ -3012,15 +3161,12 @@ mod tests {
     #[test]
     fn slices_trace_scope_vars_by_repeat_index() {
         let model = compile(
-            r#"
-            trace "t" {
-                vars { messages = ["q0", "a0", "q1", "a1"] }
-                repeat {
-                    count = 2
-                    task "turn" { input = var.messages[:(repeat.index * 2) + 1] }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {local: {messages: ["q0" , "a0" , "q1" , "a1"]}, input: t.input};
+(turn:task {name: "turn"}) {input: t_root.local.messages [: ${context.index * 2} + 1]};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: 2}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3033,16 +3179,11 @@ mod tests {
     fn resolves_repeat_refs_against_the_innermost_repeat() {
         let model = compile(
             r#"
-            trace "t" {
-                repeat {
-                    count = 2
-                    repeat {
-                        count = repeat.index + 1
-                        task "step" { metrics = { inner = repeat.index, of = repeat.count } }
-                    }
-                }
-            }
-            "#,
+(t:agent) {input: null, output: null};
+(t)-|:next|->(root:task) {input: t.input};
+(root)=|:repeat {count: 2}|=>[-|:calls|->(iteration:node) {index: context.index}];
+(iteration)=|:repeat {count: iteration.index + 1}|=>[-|:calls|->(step:task) {metrics: {inner: context.index, of: context.count}}];
+"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3063,10 +3204,12 @@ mod tests {
     #[test]
     fn cycles_templates_to_the_requested_trace_count() {
         let model = compile(
-            r#"
-                trace "first" {}
-                trace "second" {}
-            "#,
+            r#"(first_root:task {name: "first"}) {input: first.input};
+(first:agent) {input: null, output: null};
+(first)-|:next|->(first_root);
+(second_root:task {name: "second"}) {input: second.input};
+(second:agent) {input: null, output: null};
+(second)-|:next|->(second_root);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 0).unwrap();
@@ -3080,7 +3223,12 @@ mod tests {
 
     #[test]
     fn evaluates_choice_within_its_alternatives() {
-        let model = compile(r#"trace "t" { input = choice("a", "b") }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: choice("a", "b"), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3091,7 +3239,12 @@ mod tests {
 
     #[test]
     fn evaluates_ranges_within_bounds_and_keeps_integer_bounds_integral() {
-        let model = compile(r#"trace "t" { metrics = { tokens = range(80, 400), temp = range(0.0, 1.0) } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {metrics: {tokens: range(80, 400), temp: range(0.0, 1.0)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3105,7 +3258,12 @@ mod tests {
 
     #[test]
     fn evaluates_weighted_picks_proportionally_to_their_weights() {
-        let model = compile(r#"trace "t" { input = weighted(["common", 9], ["rare", 1], ["never", 0]) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: weighted(["common", 9], ["rare", 1], ["never", 0]), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 200, 7).unwrap();
 
         let mut counts = std::collections::HashMap::new();
@@ -3120,7 +3278,12 @@ mod tests {
 
     #[test]
     fn evaluates_weighted_picks_with_dynamic_values() {
-        let model = compile(r#"trace "t" { input = weighted([range(1, 3), 1], [10, 1]) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: weighted([range(1, 3), 1], [10, 1]), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 40, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3132,19 +3295,9 @@ mod tests {
     #[test]
     fn evaluates_distributions_within_their_supports() {
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        normal = normal(100, 10)
-                        lognormal = lognormal(300, 0.5)
-                        exponential = exponential(250)
-                        pareto = pareto(100, 1.5)
-                        beta = beta(2, 5)
-                        poisson = poisson(3)
-                    }
-                    input = chance(0.5)
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {normal: normal(100, 10), lognormal: lognormal(300, 0.5), exponential: exponential(250), pareto: pareto(100, 1.5), beta: beta(2, 5), poisson: poisson(3)}, input: t.input};
+(t:agent) {input: chance(0.5), output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan_a = plan(model, 50, 7).unwrap();
@@ -3175,19 +3328,9 @@ mod tests {
         assert!(normals.len() > 1, "expected varying samples over 50 traces");
 
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        normal = normal(100, 10)
-                        lognormal = lognormal(300, 0.5)
-                        exponential = exponential(250)
-                        pareto = pareto(100, 1.5)
-                        beta = beta(2, 5)
-                        poisson = poisson(3)
-                    }
-                    input = chance(0.5)
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {normal: normal(100, 10), lognormal: lognormal(300, 0.5), exponential: exponential(250), pareto: pareto(100, 1.5), beta: beta(2, 5), poisson: poisson(3)}, input: t.input};
+(t:agent) {input: chance(0.5), output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan_b = plan(model, 50, 7).unwrap();
@@ -3196,7 +3339,12 @@ mod tests {
 
     #[test]
     fn evaluates_chance_bounds_deterministically() {
-        let always = compile(r#"trace "t" { input = chance(1) }"#).unwrap();
+        let always = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: chance(1), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan_a = plan(always, 10, 7).unwrap();
         assert!(
             plan_a
@@ -3205,7 +3353,12 @@ mod tests {
                 .all(|event| event.fields.input == Some(JsonValue::Bool(true)))
         );
 
-        let never = compile(r#"trace "t" { input = chance(0) }"#).unwrap();
+        let never = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: chance(0), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan_b = plan(never, 10, 7).unwrap();
         assert!(
             plan_b
@@ -3218,32 +3371,9 @@ mod tests {
     #[test]
     fn evaluates_string_funcs() {
         let model = compile(
-            r#"
-                vars { tags = ["alpha", "beta"] }
-                trace "t" {
-                    input = [
-                        upper("get"),
-                        lower("WARN"),
-                        trim("  padded  "),
-                        replace("a b c", " ", "-"),
-                        replace("keep", "", "x"),
-                        join(var.tags, ", "),
-                        join([1, 2.5, true], "-"),
-                        format("model={} n={}", "gpt", 4),
-                    ]
-                    output = split("a,b,c", ",")
-                    metadata = {
-                        sub = contains("gpt-4o-mini", "mini")
-                        missing = contains("gpt-4o", "mini")
-                        elem = contains(var.tags, "beta")
-                        absent = contains(var.tags, "gamma")
-                        prefix = starts_with("gpt-4o", "gpt")
-                        suffix = ends_with("gpt-4o", "4o")
-                        chars = len("hello")
-                        elems = len(var.tags)
-                    }
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, output: split("a,b,c", ","), metadata: {sub: contains("gpt-4o-mini", "mini"), missing: contains("gpt-4o", "mini"), elem: contains(t_root.tags, "beta"), absent: contains(t_root.tags, "gamma"), prefix: starts_with("gpt-4o", "gpt"), suffix: ends_with("gpt-4o", "4o"), chars: len("hello"), elems: len(t_root.tags)}, tags: ["alpha", "beta"]};
+(t:agent) {input: [upper("get"), lower("WARN"), trim("  padded  "), replace("a b c", " ", "-"), replace("keep", "", "x"), join(t_root.tags, ", "), join([1, 2.5, true], "-"), format("model={} n={}", "gpt", 4),], output: t_root.output};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3286,15 +3416,9 @@ mod tests {
     #[test]
     fn evaluates_token_counts() {
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        text = tokens("What is the weather in Tokyo?")
-                        empty = tokens("")
-                        messages = tokens([{ role = "user", content = "hi" }])
-                    }
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {text: tokens("What is the weather in Tokyo?"), empty: tokens(""), messages: tokens([{role: "user", content: "hi"}])}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3304,12 +3428,17 @@ mod tests {
         assert_eq!(metrics["empty"], JsonValue::from(0));
         // containers count their compact json serialization
         let serialized = r#"[{"content":"hi","role":"user"}]"#;
-        assert_eq!(metrics["messages"], JsonValue::from(BPE.encode_ordinary(serialized).len()));
+        assert_eq!(metrics["messages"], JsonValue::from(count_tokens(serialized)));
     }
 
     #[test]
     fn evaluates_string_funcs_over_dynamic_args() {
-        let model = compile(r#"trace "t" { input = upper(choice("get", "post")) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: upper(choice("get", "post")), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 20, 7).unwrap();
 
         let mut seen = std::collections::HashSet::new();
@@ -3321,8 +3450,12 @@ mod tests {
         assert_eq!(seen.len(), 2, "expected both alternatives over 20 traces");
 
         // split results behave as arrays for indexing and lens
-        let model =
-            compile(r#"trace "t" { input = split("a,b,c", ",")[range(0, 2)] output = len(split("a,b", ",")) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, output: len(split("a,b", ","))};
+(t:agent) {input: split("a,b,c", ",") [range(0, 2)], output: t_root.output};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 10, 7).unwrap();
         for event in planned.events.iter() {
             let input = event.fields.input.as_ref().unwrap().as_str().unwrap();
@@ -3333,7 +3466,12 @@ mod tests {
 
     #[test]
     fn evaluates_format_with_dynamic_args() {
-        let model = compile(r#"trace "t" { input = format("n={} f={} b={}", range(1, 1), 0.5, chance(1)) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: format("n={} f={} b={}", range(1, 1), 0.5, chance(1)), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 1, 0).unwrap();
 
         assert_eq!(plan.events[0].fields.input, Some(JsonValue::from("n=1 f=0.5 b=true")));
@@ -3341,35 +3479,10 @@ mod tests {
 
     #[test]
     fn english_functions_materialize_composable_grammar_and_explicit_context() {
-        let source = r#"
-            vars {
-                guest = { id = "guest_1", label = "Maya", pronouns = {
-                    subject = "she", object = "her", possessive_determiner = "her", possessive = "hers"
-                } }
-                arrival = { clause = { subject = { text = "the guest" }, predicate = { verb = "arrive" }, tense = "future" } }
-                checkin = { clause = { subject = { text = "the guest" }, predicate = { verb = "check", complement = "in" }, modal = "can" } }
-            }
-            trace "t" {
-                vars { context = remember({}, [var.guest], ["arrival"]) }
-                output = {
-                    sentence = realize(var.arrival)
-                    combined = combine([var.arrival, var.checkin], "and")
-                    first = refer(var.guest, {})
-                    later = refer(var.guest, var.context)
-                    reset = refer(var.guest, {})
-                    context = var.context
-                    details = unmentioned([
-                        { id = "arrival", text = "The arrival is recorded." },
-                        { id = "key", text = "Your key is at reception." }
-                    ], var.context)
-                    amount = format_number("1234567.125", { locale = "en-IN", fraction_digits = 2 })
-                    date = format_date("2026-11-10", { locale = "en-GB" })
-                    time = format_time("17:30", { locale = "en-US" })
-                    composed = compose([render("Hello {name}.", { name = var.guest.label }), realize(var.checkin)])
-                }
-            }
-        "#;
-        let generated = plan(compile(source).unwrap(), 2, 42).unwrap();
+        let source = r#"(t_root:task {name: "t"}) {output: {sentence: realize(t_root.local.arrival), combined: combine([t_root.local.arrival, t_root.local.checkin], "and"), first: refer(t_root.local.guest, {}), later: refer(t_root.local.guest, t_root.local.context), reset: refer(t_root.local.guest, {}), context: t_root.local.context, details: unmentioned([{id: "arrival", text: "The arrival is recorded."}, {id: "key", text: "Your key is at reception."}], t_root.local.context), amount: format_number("1234567.125", {locale: "en-IN", fraction_digits: 2}), date: format_date("2026-11-10", {locale: "en-GB"}), time: format_time("17:30", {locale: "en-US"}), composed: compose([render("Hello {name}.", {name: t_root.local.guest.label}), realize(t_root.local.checkin)])}, local: {guest: {id: "guest_1", label: "Maya", pronouns: {subject: "she", object: "her", possessive_determiner: "her", possessive: "hers"}}, arrival: {clause: {subject: {text: "the guest"}, predicate: {verb: "arrive"}, tense: "future"}}, checkin: {clause: {subject: {text: "the guest"}, predicate: {verb: "check", complement: "in"}, modal: "can"}}, context: remember({}, [t_root.local.guest], ["arrival"])}, input: t.input};
+(t:agent) {input: null, output: t_root.output};
+(t)-|:next|->(t_root);"#;
+        let generated = plan(compile_with_world(source).unwrap(), 2, 42).unwrap();
         for event in generated.events.iter() {
             let output = event.fields.output.as_ref().unwrap();
             assert_eq!(output["sentence"], JsonValue::from("The guest will arrive."));
@@ -3392,16 +3505,37 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_inside_a_definition_is_reported_where_the_author_wrote_the_element() {
+        // a verb that is not a constant is looked up when a trace reads the sentence, inside the provider's definitions
+        // the author cannot change those, so the failure is reported at the sentence they wrote
+        let source = r#"(action:fact) -|:next|->(:given {value: "defenestrate"});
+(ask:sentence)
+    -|:next|->(:part {subject: "I", person: "first", verb: action.value, complement: "the case"});
+(a:agent) {input: "hi", output: t.output};
+(a)-|:next|->(t:task {name: "t"}) {input: a.input, output: ask.text};
+"#;
+        let error = plan(compile_with_world(source).unwrap(), 1, 1).unwrap_err();
+        assert!(
+            error.to_string().contains(r#"unknown English verb "defenestrate""#),
+            "{error}"
+        );
+        assert_eq!(error.range.source, 0);
+        assert_eq!(&source[error.range.start..error.range.end], "(ask:sentence)");
+        // a failure in what the author wrote stays where it is
+        let source = r#"(a:agent) {input: "hi", output: t.output};
+(a)-|:next|->(t:task {name: "t"}) {input: a.input, output: realize({clause: {subject: {text: "I", person: "first"}, predicate: {verb: a.input}}})};
+"#;
+        let error = plan(compile_with_world(source).unwrap(), 1, 1).unwrap_err();
+        assert!(source[error.range.start..error.range.end].starts_with("realize("), "{error}");
+    }
+
+    #[test]
     fn english_variation_uses_scoped_randomness_and_binding_caching() {
-        let source = r#"
-            trace "t" {
-                vars { reply = vary("The guest cannot check in.") }
-                input = var.reply
-                output = var.reply
-            }
-        "#;
-        let first = plan(compile(source).unwrap(), 32, 7).unwrap();
-        assert_eq!(first, plan(compile(source).unwrap(), 32, 7).unwrap());
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.reply, local: {reply: vary("The guest cannot check in.")}};
+(t:agent) {input: t_root.local.reply, output: t_root.output};
+(t)-|:next|->(t_root);"#;
+        let first = plan(compile_with_world(source).unwrap(), 32, 7).unwrap();
+        assert_eq!(first, plan(compile_with_world(source).unwrap(), 32, 7).unwrap());
         let outputs = first
             .events
             .iter()
@@ -3412,8 +3546,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(outputs.contains(&"The guest cannot check in."));
         assert!(outputs.contains(&"The guest can't check in."));
-        let with_unrelated = source.replace("output = var.reply", "output = var.reply metadata = { other = choice(1, 2) }");
-        let changed = plan(compile(&with_unrelated).unwrap(), 32, 7).unwrap();
+        let with_unrelated = source.replace(
+            "output = turn.reply",
+            "output = turn.reply metadata = { other = choice(1, 2) }",
+        );
+        let changed = plan(compile_with_world(&with_unrelated).unwrap(), 32, 7).unwrap();
         for (before, after) in first.events.iter().zip(changed.events.iter()) {
             assert_eq!(before.fields.output, after.fields.output);
         }
@@ -3423,16 +3560,18 @@ mod tests {
     fn english_argument_errors_keep_the_function_range_and_detail() {
         for (expression, detail) in [
             (r#"realize({})"#, "clause"),
-            (r#"vary("The guest cannot leave.", { negation = "yes" })"#, "boolean"),
-            (r#"vary("The guest cannot leave.", { unknown = true })"#, "unknown field"),
+            (r#"vary("The guest cannot leave.", { negation: "yes" })"#, "boolean"),
+            (r#"vary("The guest cannot leave.", { unknown: true })"#, "unknown field"),
             (r#"format_date("2026-02-30")"#, "date"),
             (r#"format_time("25:30")"#, "time"),
-            (r#"format_number("12", { locale = "fr-FR" })"#, "en-US"),
+            (r#"format_number("12", { locale: "fr-FR" })"#, "en-US"),
             (r#"combine([], "and")"#, "propositions"),
         ] {
-            let source = format!("trace \"t\" {{ output = {expression} }}");
-            let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidEnglish);
+            let source = format!(
+                "(t_root:task {{name: \"t\"}}) {{output: {expression}, input: t.input}};\n(t:agent) {{input: null, output: t_root.output}};\n(t)-|:next|->(t_root);"
+            );
+            let error = plan(compile_with_world(&source).unwrap(), 1, 0).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidCall);
             assert_eq!(&source[error.range.start..error.range.end], expression);
             assert!(error.to_string().contains(detail), "{error}");
             let diagnostic: crate::dsl::Diag = error.into();
@@ -3444,25 +3583,9 @@ mod tests {
     #[test]
     fn evaluates_numeric_funcs() {
         let model = compile(
-            r#"
-                trace "t" {
-                    metrics = {
-                        low = clamp(1, 5, 10)
-                        high = clamp(50, 5, 10)
-                        inside = clamp(7, 5, 10)
-                        promoted = clamp(7, 5.0, 10)
-                        round = round(2.5)
-                        down = floor(2.9)
-                        up = ceil(2.1)
-                        int = round(3)
-                        abs = abs(0 - 4)
-                        fabs = abs(0.0 - 4.5)
-                        min = min(3, 1, 2)
-                        max = max(3, 1, 2)
-                        fmin = min(3, 1.5)
-                    }
-                }
-            "#,
+            r#"(t_root:task {name: "t"}) {metrics: {low: clamp(1, 5, 10), high: clamp(50, 5, 10), inside: clamp(7, 5, 10), promoted: clamp(7, 5.0, 10), round: round(2.5), down: floor(2.9), up: ceil(2.1), int: round(3), abs: abs(0 - 4), fabs: abs(0.0 - 4.5), min: min(3, 1, 2), max: max(3, 1, 2), fmin: min(3, 1.5)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 0).unwrap();
@@ -3485,7 +3608,12 @@ mod tests {
 
     #[test]
     fn clamps_distribution_samples_within_bounds() {
-        let model = compile(r#"trace "t" { metrics = { latency = clamp(lognormal(300, 1.5), 20, 1000) } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {metrics: {latency: clamp(lognormal(300, 1.5), 20, 1000)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 50, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3496,27 +3624,37 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_func_values() {
-        let source = r#"trace "t" { input = clamp(1, range(5, 5), 2) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: clamp(1, range(5, 5), 2), output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "clamp bounds are out of order");
         assert_eq!(&source[error.range.start..error.range.end], "clamp(1, range(5, 5), 2)");
 
-        let source = r#"trace "t" { input = split("a,b", choice(",", "")) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: split("a,b", choice(",", "")), output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 20, 7).unwrap_err();
         assert_eq!(error.to_string(), "split separator is empty");
 
-        let source = r#"trace "t" { input = join([{}], ",") }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: join([{}], ","), output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "join element is not a string, number, or boolean");
 
-        let source = r#"trace "t" { input = round(99999999999999999999.0 * range(1.0, 1.0)) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: round(99999999999999999999.0 * range(1.0, 1.0)), output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
     }
 
     #[test]
     fn evaluates_id_funcs_reproducibly() {
-        let source = r#"trace "t" { input = [uuid(), hex(16), alphanum(12), hex(0)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [uuid(), hex(16), alphanum(12), hex(0)], output: null};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 5, 7).unwrap();
 
         let mut uuids = std::collections::HashSet::new();
@@ -3548,7 +3686,9 @@ mod tests {
 
     #[test]
     fn evaluates_noise_reproducibly_and_rejects_bad_sizes() {
-        let source = r#"trace "t" { input = [noise(64), noise(round(range(10, 20))), noise(0)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [noise(64), noise(round(range(10, 20))), noise(0)], output: null};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
         for event in plan_a.events.iter() {
             let JsonValue::Array(values) = event.fields.input.as_ref().unwrap() else {
@@ -3568,8 +3708,12 @@ mod tests {
         assert_eq!(plan_a, plan_b);
 
         for source in [
-            r#"trace "t" { input = noise(range(1, 1) - 2) }"#,
-            r#"trace "t" { input = noise(range(1.5, 1.5)) }"#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: noise(range(1, 1) - 2), output: null};
+(t)-|:next|->(t_root);"#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: noise(range(1.5, 1.5)), output: null};
+(t)-|:next|->(t_root);"#,
         ] {
             let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
             assert_eq!(error.to_string(), "noise size is not an integer between 0 and 8388608");
@@ -3579,10 +3723,9 @@ mod tests {
     #[test]
     fn evaluates_nested_funcs_and_funcs_from_vars() {
         let model = compile(
-            r#"
-                vars { style = choice("clear", "vague") }
-                trace "t" { input = [choice(range(1, 3), "x"), var.style] }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, local: {style: choice("clear", "vague")}};
+(t:agent) {input: [choice(range(1, 3), "x"), t_root.local.style], output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 20, 7).unwrap();
@@ -3602,7 +3745,9 @@ mod tests {
 
     #[test]
     fn reproduces_the_same_plan_for_the_same_seed() {
-        let source = r#"trace "t" { input = choice("a", "b", "c") metrics = { n = range(0, 1000000) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, metrics: {n: range(0, 1000000)}};
+(t:agent) {input: choice("a", "b", "c"), output: null};
+(t)-|:next|->(t_root);"#;
         let first = plan(compile(source).unwrap(), 10, 42).unwrap();
         let second = plan(compile(source).unwrap(), 10, 42).unwrap();
 
@@ -3612,7 +3757,9 @@ mod tests {
     #[test]
     fn samples_traces_independently_of_earlier_traces() {
         // trace 3 of a 5-trace run must match trace 3 of a 4-trace run
-        let source = r#"trace "t" { metrics = { n = range(0, 1000000) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {metrics: {n: range(0, 1000000)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#;
         let longer = plan(compile(source).unwrap(), 5, 42).unwrap();
         let shorter = plan(compile(source).unwrap(), 4, 42).unwrap();
 
@@ -3621,7 +3768,9 @@ mod tests {
 
     #[test]
     fn evaluates_dynamic_arithmetic_within_bounds() {
-        let source = r#"trace "t" { metrics = { n = range(1, 5) * 100, m = -range(1, 5) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {metrics: {n: range(1, 5) * 100, m: - range(1, 5)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         for event in plan_a.events.iter() {
@@ -3639,7 +3788,12 @@ mod tests {
 
     #[test]
     fn evaluates_dynamic_ternaries_per_trace() {
-        let model = compile(r#"trace "t" { input = choice(true, false) ? "a" : "b" }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: choice(true, false) ? "a": "b", output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         let mut seen = std::collections::HashSet::new();
@@ -3651,7 +3805,12 @@ mod tests {
 
     #[test]
     fn compares_resolved_templates_per_trace() {
-        let model = compile(r#"trace "t" { input = "i ${trace.index}" == "i 1" ? 1 : 0 }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: "i ${context.trace_index}" == "i 1" ? 1: 0, output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 3, 0).unwrap();
 
         let inputs: Vec<_> = plan
@@ -3665,24 +3824,30 @@ mod tests {
     #[test]
     fn short_circuits_guarded_divisions() {
         // the zero divisor is never evaluated, so neither shape fails
-        let model = compile(r#"trace "t" { input = range(0, 0) == 0 ? 0 : 100 / range(0, 0) }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: range(0, 0) == 0 ? 0: 100 / range(0, 0), output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 5, 7).unwrap();
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(0)));
 
-        let model = compile(r#"trace "t" { input = range(0, 0) != 0 && 100 / range(0, 0) > 1 }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: range(0, 0) != 0 && 100 / range(0, 0) > 1, output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 5, 7).unwrap();
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(false)));
     }
 
     #[test]
     fn evaluates_dynamic_indexes_within_their_containers() {
-        let source = r#"
-            vars { user = { a = 1, b = 2 } }
-            trace "t" {
-                input = ["a", "b", "c"][range(0, 2)]
-                output = var.user[choice("a", "b")]
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.user [choice("a", "b")], local: {user: {a: 1, b: 2}}};
+(t:agent) {input: ["a", "b", "c"][range(0, 2)], output: t_root.output};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut inputs = std::collections::HashSet::new();
@@ -3702,10 +3867,9 @@ mod tests {
 
     #[test]
     fn evaluates_nested_dynamic_indexes() {
-        let source = r#"
-            vars { matrix = [[1, 2], [3, 4]] }
-            trace "t" { input = var.matrix[range(0, 1)][range(0, 1)] }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, local: {matrix: [[1, 2], [3, 4]]}};
+(t:agent) {input: t_root.local.matrix [range(0, 1)][range(0, 1)], output: null};
+(t)-|:next|->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3717,7 +3881,12 @@ mod tests {
     #[test]
     fn evaluates_only_the_selected_element() {
         // the division by zero sits in an unselected element, so nothing fails
-        let model = compile(r#"trace "t" { input = [0, 100 / range(0, 0)][range(0, 0)] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [0, 100 / range(0, 0)][range(0, 0)], output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 5, 7).unwrap();
 
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(0)));
@@ -3725,33 +3894,31 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_indexes() {
-        let source = r#"trace "t" { input = [1][range(1, 1)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [1][range(1, 1)], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "array index is out of bounds");
         assert_eq!(&source[error.range.start..error.range.end], "[1][range(1, 1)]");
 
-        let source = r#"trace "t" { input = [1, 2][range(0.0, 0.0)] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [1, 2][range(0.0, 0.0)], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "array index is not an integer");
 
-        let source = r#"trace "t" { input = { a = 1 }[choice("b")] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: {a: 1}[choice("b")], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "object key is not present");
     }
 
     #[test]
     fn evaluates_dynamic_slices_with_clamped_bounds() {
-        let source = r#"
-            trace "t" {
-                input = [1, 2, 3, 4][range(1, 1):range(3, 3)]
-                output = [1, 2][0:range(5, 5)]
-                metadata = {
-                    empty = [1, 2][range(1, 1):0]
-                    large_end = [1, 2][:range(4294967296, 4294967296)]
-                    large_start = [1, 2][range(9223372036854775807, 9223372036854775807):]
-                }
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input, output: [1, 2][0: range(5, 5)], metadata: {empty: [1, 2][range(1, 1): 0], large_end: [1, 2][: range(4294967296, 4294967296)], large_start: [1, 2][range(9223372036854775807, 9223372036854775807):]}};
+(t:agent) {input: [1, 2, 3, 4][range(1, 1): range(3, 3)], output: t_root.output};
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 3, 7).unwrap();
 
         for event in plan_a.events.iter() {
@@ -3769,7 +3936,12 @@ mod tests {
 
     #[test]
     fn evaluates_indexes_into_sliced_targets() {
-        let model = compile(r#"trace "t" { input = [1, 2, 3][range(1, 1):][0] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [1, 2, 3][range(1, 1):][0], output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let planned = plan(model, 1, 0).unwrap();
 
         assert_eq!(planned.events[0].fields.input, Some(JsonValue::from(2)));
@@ -3777,19 +3949,28 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_slice_bounds() {
-        let source = r#"trace "t" { input = [1, 2][0 - range(1, 1):] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [1, 2][0 - range(1, 1):], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "slice bound is negative");
         assert_eq!(&source[error.range.start..error.range.end], "[1, 2][0 - range(1, 1):]");
 
-        let source = r#"trace "t" { input = [1, 2][range(0.5, 0.5):] }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [1, 2][range(0.5, 0.5):], output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "slice bound is not an integer");
     }
 
     #[test]
     fn evaluates_unrolled_for_bodies_per_trace() {
-        let model = compile(r#"trace "t" { input = [for x in [1, 2] : x * range(1, 3)] }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: [for x in [1, 2]: x * range(1, 3)], output: null};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 20, 7).unwrap();
 
         for event in plan.events.iter() {
@@ -3803,7 +3984,9 @@ mod tests {
 
     #[test]
     fn fails_on_dynamic_division_by_zero() {
-        let source = r#"trace "t" { input = 100 / range(0, 0) }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(t:agent) {input: 100 / range(0, 0), output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
 
         assert_eq!(error.to_string(), "expression divides by zero");
@@ -3812,20 +3995,36 @@ mod tests {
 
     #[test]
     fn fails_on_dynamic_overflow_and_non_finite_results() {
-        let source = r#"trace "t" { metrics = { n = 9223372036854775807 + range(1, 1) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {metrics: {n: 9223372036854775807 + range(1, 1)}, input: t.input};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
 
         // ~9.99e307 is finite on its own, doubling it overflows f64
         let big = format!("{}.0", "9".repeat(308));
-        let source = format!(r#"trace "t" {{ input = {big} * range(2.0, 2.0) }}"#);
+        let source = format!(
+            r#"(t_root:task {{name: "t"}}) {{input: t.input}};
+(t:agent) {{input: {big} * range(2.0, 2.0), output: null}};
+(t)-|:next|->(t_root);"#
+        );
         let error = plan(compile(&source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "expression result overflowed or is not finite");
     }
 
     #[test]
     fn repeats_children_a_constant_number_of_times() {
-        let model = compile(r#"trace "t" { repeat { count = 3 task "turn" { llm "reply" {} } } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(reply:llm {name: "reply"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: 3}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);
+(turn)-|:calls|->(reply);"#,
+        )
+        .unwrap();
         let plan = plan(model, 2, 0).unwrap();
 
         // per trace: root + 3 * (task + llm)
@@ -3841,7 +4040,15 @@ mod tests {
 
     #[test]
     fn skips_repeats_with_a_zero_count() {
-        let model = compile(r#"trace "t" { repeat { count = 0 task "turn" {} } }"#).unwrap();
+        let model = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: 0}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
         let plan = plan(model, 3, 0).unwrap();
 
         assert_eq!(plan.events.len(), 3);
@@ -3849,7 +4056,12 @@ mod tests {
 
     #[test]
     fn varies_repeat_counts_per_trace_and_reproduces_them_by_seed() {
-        let source = r#"trace "t" { repeat { count = range(1, 4) task "turn" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: range (1 , 4)}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut lengths = std::collections::HashSet::new();
@@ -3866,20 +4078,14 @@ mod tests {
 
     #[test]
     fn resolves_repeat_index_per_iteration_with_the_innermost_repeat_winning() {
-        let source = r#"
-            trace "t" {
-                repeat {
-                    count = 2
-                    task "outer" {
-                        input = "o ${repeat.index}"
-                        repeat {
-                            count = 2
-                            task "inner" { input = "i ${repeat.index}" }
-                        }
-                    }
-                }
-            }
-        "#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(outer:task {name: "outer"}) {input: "o ${context.index}"};
+(inner:task {name: "inner"}) {input: "i ${context.index}"};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: 2}|=>[-|:calls|->(outer)];
+(outer)=|:repeat {count: 2}|=>[-|:calls|->(inner)];
+(t)-|:next|->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 1, 0).unwrap();
 
         let inputs: Vec<_> = plan
@@ -3892,7 +4098,13 @@ mod tests {
 
     #[test]
     fn plans_exactly_one_choice_child() {
-        let source = r#"trace "t" { choice { tool "a" {} function "b" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {local: {branch_0_selection: range(0, 1)}, input: t.input};
+(a:tool {name: "a"}) {};
+(b:function {name: "b"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection == 0}|->(a), -|:calls {when: t_root.local.branch_0_selection == 1}|->(b)];
+(t)-|:next|->(t_root);"#;
         let plan = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let mut picked = std::collections::HashSet::new();
@@ -3906,7 +4118,12 @@ mod tests {
 
     #[test]
     fn includes_maybe_children_probabilistically() {
-        let source = r#"trace "t" { maybe { task "extra" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0.5)}, input: t.input};
+(extra:task {name: "extra"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(extra)];
+(t)-|:next|->(t_root);"#;
         let plan_a = plan(compile(source).unwrap(), 40, 7).unwrap();
 
         let lengths: Vec<_> = plan_a.traces.iter().map(std::ops::Range::len).collect();
@@ -3917,14 +4134,30 @@ mod tests {
 
         // the bounds always include or always skip
         let always = plan(
-            compile(r#"trace "t" { maybe { chance = 1 task "extra" {} } }"#).unwrap(),
+            compile(
+                r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(1)}, input: t.input};
+(extra:task {name: "extra"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(extra)];
+(t)-|:next|->(t_root);"#,
+            )
+            .unwrap(),
             10,
             7,
         )
         .unwrap();
         assert!(always.traces.iter().all(|range| range.len() == 2));
         let never = plan(
-            compile(r#"trace "t" { maybe { chance = 0 task "extra" {} } }"#).unwrap(),
+            compile(
+                r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0)}, input: t.input};
+(extra:task {name: "extra"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(extra)];
+(t)-|:next|->(t_root);"#,
+            )
+            .unwrap(),
             10,
             7,
         )
@@ -3935,13 +4168,14 @@ mod tests {
     #[test]
     fn redraws_nested_dynamic_blocks_per_iteration() {
         let source = r#"
-            trace "t" {
-                repeat {
-                    count = 8
-                    choice { tool "a" {} function "b" {} }
-                }
-            }
-        "#;
+(t:agent) {input: null, output: null};
+(t)-|:next|->(root:task) {input: t.input};
+(root)=|:repeat {count: 8}|=>[-|:calls|->(iteration:node) {pick: range(0, 1)}];
+(iteration)=|:exclusive|=>[
+    -|:calls {when: iteration.pick == 0}|->(a:tool),
+    -|:calls {when: iteration.pick == 1}|->(b:function),
+];
+"#;
         let plan = plan(compile(source).unwrap(), 5, 7).unwrap();
 
         let names: std::collections::HashSet<_> = plan
@@ -3955,23 +4189,46 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_counts_and_chances() {
-        let source = r#"trace "t" { repeat { count = 0 - range(2, 2) task "turn" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: 0 - range(2, 2)}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "repeat count is negative");
         assert_eq!(&source[error.range.start..error.range.end], "0 - range(2, 2)");
 
-        let source = r#"trace "t" { repeat { count = range(0.5, 0.5) task "turn" {} } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: range(0.5, 0.5)}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "repeat count is not an integer");
 
-        let source = r#"trace "t" { maybe { chance = range(2.0, 2.0) task "turn" {} } }"#;
-        let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
+        let source = r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0.5)}, input: t.input};
+(turn:task {name: "turn"}) {};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(turn)];
+(t)-|:next|->(t_root);"#;
+        let mut model = compile(source).unwrap();
+        let ModelChild::Maybe(branch) = &mut model.traces[0].children[0] else {
+            panic!("conditional branch")
+        };
+        branch.chance = ModelValue::Num(ModelNumber::Float(2.0));
+        let error = plan(model, 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "maybe chance is not between 0 and 1");
     }
 
     #[test]
     fn varies_durations_per_trace_and_reproduces_them_by_seed() {
-        let source = r#"trace "t" { task "turn" { duration = range(0.2, 5.0) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {duration: range(0.2, 5.0)};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root)-|:calls|->(turn);"#;
         let plan_a = plan(compile(source).unwrap(), 20, 7).unwrap();
 
         let durations: std::collections::HashSet<_> = plan_a
@@ -3988,7 +4245,10 @@ mod tests {
 
     #[test]
     fn fails_on_invalid_dynamic_durations() {
-        let source = r#"trace "t" { task "turn" { duration = 0.0 - range(1.0, 1.0) } }"#;
+        let source = r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {duration: 0.0 - range(1.0, 1.0)};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root)-|:calls|->(turn);"#;
         let error = plan(compile(source).unwrap(), 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "duration is not a positive number of seconds");
         assert_eq!(&source[error.range.start..error.range.end], "0.0 - range(1.0, 1.0)");
@@ -3996,14 +4256,19 @@ mod tests {
 
     #[test]
     fn plans_dynamic_blocks_reproducibly() {
-        let source = r#"trace "session" {
-            repeat "turns" {
-                count = range(1, 4)
-                task "turn" { input = "question ${repeat.index}" llm "draft" {} }
-            }
-            choice { tool "get_order_status" {} function "summarize_session" {} }
-            maybe { chance = 0.25 task "escalation" {} }
-        }"#;
+        let source = r#"(session_root:task {name: "session"}) {local: {branch_2_selection: chance(0.25), branch_1_selection: range(0, 1)}, input: session.input};
+(turn:task {name: "turn"}) {input: "question ${context.index}"};
+(draft:llm {name: "draft"}) {};
+(get_order_status:tool {name: "get_order_status"}) {};
+(summarize_session:function {name: "summarize_session"}) {};
+(escalation:task {name: "escalation"}) {};
+(session:agent) {input: null, output: null};
+
+(session_root)=|"turns":repeat {count: range (1 , 4)}|=>[-|:calls|->(turn)];
+(session_root)=|:conditional|=>[-|:calls {when: session_root.local.branch_1_selection == 0}|->(get_order_status), -|:calls {when: session_root.local.branch_1_selection == 1}|->(summarize_session)];
+(session_root)=|:conditional|=>[-|:calls {when: session_root.local.branch_2_selection}|->(escalation)];
+(session)-|:next|->(session_root);
+(turn)-|:calls|->(draft);"#;
         let model = compile(source).unwrap();
         let plan_a = plan(model, 10, 42).unwrap();
 
@@ -4026,10 +4291,9 @@ mod tests {
     #[test]
     fn evaluates_root_bindings_once_per_trace() {
         let model = compile(
-            r#"
-            vars { x = range(0, 1000000) }
-            trace "t" { input = var.x output = var.x }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, output: t_root.local.x, local: {x: range(0, 1000000)}};
+(t:agent) {input: t_root.local.x, output: t_root.output};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 4, 7).unwrap();
@@ -4050,15 +4314,12 @@ mod tests {
     #[test]
     fn evaluates_repeat_bindings_once_per_iteration() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat {
-                    count = 3
-                    vars { r = range(0, 1000000) }
-                    task "turn" { input = var.r output = var.r }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(turn:task {name: "turn"}) {input: turn.local.r, output: turn.local.r, local: {r: range (0 , 1000000)}};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: 3}|=>[-|:calls|->(turn)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 3).unwrap();
@@ -4078,17 +4339,10 @@ mod tests {
     #[test]
     fn sums_span_bindings_exactly() {
         let model = compile(
-            r#"
-            trace "t" {
-                llm "Chat Completion" {
-                    vars {
-                        pt = round(lognormal(600, 0.4))
-                        ct = round(lognormal(90, 0.7))
-                    }
-                    metrics = { prompt_tokens = var.pt, completion_tokens = var.ct, tokens = var.pt + var.ct }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(Chat_Completion:llm {name: "Chat Completion"}) {metrics: {prompt_tokens: Chat_Completion.local.pt, completion_tokens: Chat_Completion.local.ct, tokens: Chat_Completion.local.pt + Chat_Completion.local.ct}, local: {pt: round(lognormal(600, 0.4)), ct: round(lognormal(90, 0.7))}};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root)-|:calls|->(Chat_Completion);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 11).unwrap();
@@ -4105,10 +4359,9 @@ mod tests {
     #[test]
     fn interpolates_bindings_consistently_with_value_references() {
         let model = compile(
-            r#"
-            vars { m = choice("gpt-4o", "gpt-4o-mini") }
-            trace "t" { input = "model: ${var.m}" metadata = { model = var.m } }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input, metadata: {model: t_root.local.m}, local: {m: choice("gpt-4o", "gpt-4o-mini")}};
+(t:agent) {input: "model: ${t_root.local.m}", output: null};
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 6, 5).unwrap();
@@ -4122,15 +4375,13 @@ mod tests {
     #[test]
     fn shares_choice_bindings_across_alternatives() {
         let model = compile(
-            r#"
-            trace "t" {
-                choice {
-                    vars { c = range(0, 1000000) }
-                    task "a" { input = var.c output = var.c }
-                    task "b" { input = var.c output = var.c }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {local: {branch_0_selection: range(0, 1)}, input: t.input};
+(a:task {name: "a"}) {input: a.local.c, output: a.local.c, local: {c: range (0 , 1000000)}};
+(b:task {name: "b"}) {input: a.local.c, output: a.local.c};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection == 0}|->(a), -|:calls {when: t_root.local.branch_0_selection == 1}|->(b)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 5, 13).unwrap();
@@ -4144,38 +4395,28 @@ mod tests {
     #[test]
     fn evaluates_maybe_bindings_only_on_inclusion() {
         let model = compile(
-            r#"
-            trace "t" {
-                maybe {
-                    chance = 0.5
-                    vars { e = range(0, 1000000) }
-                    task "escalation" { input = var.e }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {local: {branch_0_selection: chance(0.5)}, input: t.input};
+(escalation:task {name: "escalation"}) {input: escalation.local.e, local: {e: range (0 , 1000000)}};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:conditional|=>[-|:calls {when: t_root.local.branch_0_selection}|->(escalation)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
-        let plan = plan(model, 8, 17).unwrap();
+        let plan = plan(model, 32, 17).unwrap();
 
         let included = plan.events.iter().filter(|event| event.parent.is_some()).count();
-        assert!((1..8).contains(&included), "expected a mix of inclusions, got {included}");
+        assert!((1..32).contains(&included), "expected a mix of inclusions, got {included}");
     }
 
     #[test]
     fn threads_referenced_values_across_spans() {
         let model = compile(
-            r#"
-            trace "t" {
-                # written above the block it reads, order is dataflow not layout
-                output = llm.chat.output.content
-                metadata = { echoed = "${llm.chat.output.content}" }
-                task "plan" { output = "planned" }
-                llm "chat" {
-                    input = [{ role = "user", content = task.plan.output }]
-                    output = { role = "assistant", content = choice("alpha", "beta") }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {output: chat.output.content, metadata: {echoed: "${chat.output.content}"}, input: t.input};
+(plan:task {name: "plan"}) {output: "planned"};
+(chat:llm {name: "chat"}) {input: [{role: "user", content: plan.output}], output: {role: "assistant", content: choice("alpha", "beta")}};
+(t:agent) {input: null, output: t_root.output};
+(t)-|:next|->(t_root)-|:calls|->(plan)-|:next|->(chat);"#,
         )
         .unwrap();
         let plan = plan(model, 4, 11).unwrap();
@@ -4199,19 +4440,10 @@ mod tests {
     #[test]
     fn sums_sibling_metric_keys_exactly() {
         let model = compile(
-            r#"
-            trace "t" {
-                llm "chat" {
-                    output = "brief answer"
-                    metrics = {
-                        prompt_tokens = round(lognormal(600, 0.4)),
-                        completion_tokens = round(lognormal(90, 0.7)),
-                        tokens = self.metrics.prompt_tokens + self.metrics.completion_tokens,
-                        exact = tokens(self.output),
-                    }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(chat:llm {name: "chat"}) {output: "brief answer", metrics: {prompt_tokens: round(lognormal(600, 0.4)), completion_tokens: round(lognormal(90, 0.7)), tokens: self.metrics.prompt_tokens + self.metrics.completion_tokens, exact: tokens(self.output)}};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root)-|:calls|->(chat);"#,
         )
         .unwrap();
         let plan = plan(model, 3, 5).unwrap();
@@ -4227,15 +4459,13 @@ mod tests {
     #[test]
     fn correlates_same_iteration_references_inside_repeats() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat {
-                    count = 4
-                    llm "gen" { output = choice("a", "b", "c") }
-                    tool "use" { input = llm.gen.output }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(gen:llm {name: "gen"}) {output: choice ("a" , "b" , "c")};
+(use:tool {name: "use"}) {input: gen.output};
+(t:agent) {input: null, output: null};
+
+(t_root)=|:repeat {count: 4}|=>[-|:calls|->(gen), -|:calls|->(use)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 2, 23).unwrap();
@@ -4256,13 +4486,12 @@ mod tests {
     #[test]
     fn draws_a_referenced_field_once() {
         let model = compile(
-            r#"
-            trace "t" {
-                task "roll" { output = range(0, 1000000) }
-                task "a" { input = task.roll.output }
-                task "b" { input = task.roll.output }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(roll:task {name: "roll"}) {output: range(0, 1000000)};
+(a:task {name: "a"}) {input: roll.output};
+(b:task {name: "b"}) {input: roll.output};
+(t:agent) {input: null, output: null};
+(t)-|:next|->(t_root)-|:calls|->(roll)-|:next|->(a)-|:next|->(b);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 3).unwrap();
@@ -4274,15 +4503,32 @@ mod tests {
 
     #[test]
     fn fails_generation_on_dynamic_position_cycles() {
-        // the static graph skips dynamic positions, in-progress marking catches them
-        let model = compile(
+        let mut model = compile(
             r#"
-            trace "t" {
-                llm "x" { input = llm["x"][trace.index % 1].input output = 1 }
-            }
-            "#,
+(t:agent) {input: null, output: null};
+(t)-|:next|->(root:task) {input: t.input};
+(root)-|:calls|->(x:llm) {input: 1};
+"#,
         )
         .unwrap();
+        let ModelChild::Span(span) = &mut model.traces[0].children[0] else {
+            panic!("span")
+        };
+        let node = span.node;
+        let range = SrcRange::new(0, 0);
+        let ref_id = RefId(model.refs.len() as u32);
+        span.fields.input = Some(ModelValue::BlockRef { ref_id, range });
+        model.refs.push(ResolvedRef {
+            module: Some(model.traces[0].node),
+            up: 0,
+            steps: vec![Step::Child {
+                candidates: vec![node],
+                position: Some(ModelValue::Num(ModelNumber::Int(0))),
+            }],
+            accessor: Accessor::Field(Field::Input),
+            path: vec![],
+            range,
+        });
         let error = plan(model, 1, 0).unwrap_err();
         assert_eq!(error.to_string(), "references form a cycle");
     }
@@ -4290,18 +4536,12 @@ mod tests {
     #[test]
     fn accumulates_history_across_iterations() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat "rounds" {
-                    count = 3
-                    llm "chat" {
-                        input = [{ role = "user", content = trace.input }, ...repeat.rounds[:repeat.index].llm.chat.output]
-                        output = { role = "assistant", content = "reply ${repeat.rounds.index}" }
-                    }
-                }
-                input = "q"
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(chat:llm {name: "chat"}) {input: [{role: "user", content: t_root.input} , ... context.history.chat], output: {role: "assistant", content: "reply ${context.index}"}};
+(t:agent) {input: "q", output: null};
+
+(t_root)=|"rounds":repeat {count: 3}|=>[-|:calls|->(chat)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 7).unwrap();
@@ -4311,7 +4551,7 @@ mod tests {
             let input = event.fields.input.as_ref().unwrap().as_array().unwrap();
             assert_eq!(input.len(), 1 + round);
             for (earlier, message) in input[1..].iter().enumerate() {
-                assert_eq!(message["content"], JsonValue::String(format!("reply {earlier}")));
+                assert_eq!(message["output"]["content"], JsonValue::String(format!("reply {earlier}")));
             }
         }
     }
@@ -4319,17 +4559,12 @@ mod tests {
     #[test]
     fn reads_previous_iterations_with_guards() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat "r" {
-                    count = 3
-                    task "step" {
-                        output = range(0, 1000)
-                        input = repeat.index > 0 ? repeat.r[repeat.index - 1].task.step.output : -1
-                    }
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(step:task {name: "step"}) {output: range (0 , 1000), input: context.index > 0 ? context.history.step[context.index - 1].output : - 1};
+(t:agent) {input: null, output: null};
+
+(t_root)=|"r":repeat {count: 3}|=>[-|:calls|->(step)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 1, 13).unwrap();
@@ -4343,12 +4578,12 @@ mod tests {
     #[test]
     fn fails_generation_on_out_of_range_iterations() {
         let model = compile(
-            r#"
-            trace "t" {
-                repeat "r" { count = 2 task "step" { output = 1 } }
-                input = repeat.r[trace.index + 2].task.step.output
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {input: t.input};
+(step:task {name: "step"}) {input: context.history.step[context.index + 2].output, output: 1};
+(t:agent) {input: null, output: null};
+
+(t_root)=|"r":repeat {count: 2}|=>[-|:calls|->(step)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let error = plan(model, 1, 0).unwrap_err();
@@ -4358,20 +4593,15 @@ mod tests {
     #[test]
     fn reports_branch_outcomes_and_nulls() {
         let model = compile(
-            r#"
-            trace "t" {
-                choice "outcome" {
-                    task "resolved" { output = "ok" }
-                    task "escalated" { output = "paged" }
-                }
-                maybe "retry" { chance = 0.5 task "again" { output = 1 } }
-                metadata = {
-                    picked = choice.outcome.chosen,
-                    resolved = choice.outcome.task.resolved.output != null,
-                    retried = maybe.retry.included,
-                }
-            }
-            "#,
+            r#"(t_root:task {name: "t"}) {local: {branch_1_selection: chance(0.5), branch_0_selection: range(0, 1)}, metadata: {picked: t_root.local.branch_0_selection, resolved: resolved.output != null, retried: t_root.local.branch_1_selection}, input: t.input};
+(resolved:task {name: "resolved"}) {output: "ok"};
+(escalated:task {name: "escalated"}) {output: "paged"};
+(again:task {name: "again"}) {output: 1};
+(t:agent) {input: null, output: null};
+
+(t_root)=|"outcome":conditional|=>[-|:calls {when: t_root.local.branch_0_selection == 0}|->(resolved), -|:calls {when: t_root.local.branch_0_selection == 1}|->(escalated)];
+(t_root)=|"retry":conditional|=>[-|:calls {when: t_root.local.branch_1_selection}|->(again)];
+(t)-|:next|->(t_root);"#,
         )
         .unwrap();
         let plan = plan(model, 16, 29).unwrap();
@@ -4400,8 +4630,18 @@ mod tests {
     #[test]
     fn keeps_unrelated_draws_stable_across_edits() {
         // path-addressed rngs: editing one field must not reshuffle another's draws
-        let before = compile(r#"trace "t" { input = range(0, 1000000) output = "x" }"#).unwrap();
-        let after = compile(r#"trace "t" { input = range(0, 1000000) output = "y ${trace.index}" }"#).unwrap();
+        let before = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, output: "x"};
+(t:agent) {input: range(0, 1000000), output: t_root.output};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
+        let after = compile(
+            r#"(t_root:task {name: "t"}) {input: t.input, output: "y ${context.trace_index}"};
+(t:agent) {input: range(0, 1000000), output: t_root.output};
+(t)-|:next|->(t_root);"#,
+        )
+        .unwrap();
 
         let before = plan(before, 5, 99).unwrap();
         let after = plan(after, 5, 99).unwrap();

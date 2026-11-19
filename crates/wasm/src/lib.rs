@@ -1,11 +1,17 @@
+use bts_core::providers::{CodeProvider as _, Contributor as _, Provider as _, With, braintrust, world};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use wasm_bindgen::prelude::*;
+
+// the one place this crate names its providers, operations reach them through the provider traits
+// braintrust lowers and delivers, world adds its kinds and functions
+const PROVIDER: With<braintrust::Bundle, world::Bundle> = With(braintrust::Bundle, world::Bundle);
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &str = r#"
 export interface Diagnostic {
   phase: "lexing" | "parsing" | "validation" | "generation";
   message: string;
+  source?: string;
   range: { start: number; end: number };
 }
 export interface ValidationResult { valid: boolean; diagnostics: Diagnostic[] }
@@ -134,13 +140,18 @@ fn options<T: serde::de::DeserializeOwned>(value: JsValue) -> Result<T, Operatio
     serde_wasm_bindgen::from_value(value).map_err(|error| OperationError::new("options", error))
 }
 
-fn compile_source(source: &str) -> Result<bts_lang::Model, OperationError> {
-    bts_lang::semantics::compile(source).map_err(|diagnostics| OperationError {
+// invalid source, reported with the location of each mistake
+fn invalid(diagnostics: bts_lang::Diags) -> OperationError {
+    OperationError {
         stage: "compile",
         message: "source is invalid".to_owned(),
         diagnostics,
         details: None,
-    })
+    }
+}
+
+fn compile_source(source: &str) -> Result<bts_core::mocking::Model, OperationError> {
+    PROVIDER.compile_module(source, false).map_err(invalid)
 }
 
 /// Returns the shared language reference, including rules, examples, and versions.
@@ -152,7 +163,7 @@ pub fn spec() -> Result<JsValue, JsValue> {
 /// Returns shared authoring guidance with instructions for this browser interface.
 #[wasm_bindgen]
 pub fn skill() -> String {
-    let mut text = bts_core::skill::render(&bts_lang::spec::SPEC);
+    let mut text = bts_core::skill::render(&bts_lang::spec::SPEC, &PROVIDER);
     text.push_str("\n## Browser workflow\n\n\
 The host application provides the agent and maps these JavaScript functions to its tools. \
 Use the tool names supplied by that application. Source is a string, and files are supplied by the host.\n\n\
@@ -295,7 +306,7 @@ fn generate_batch(source: &str, options: GenerateOptions) -> Result<Generated, O
         .encode(&batch)
         .map_err(|error| OperationError::new("format", error))?;
     Ok(Generated {
-        provider: "braintrust",
+        provider: PROVIDER.schema().id,
         seed: seed.to_string(),
         trace_count: batch.trace_count,
         event_count: batch.events.len(),
@@ -326,9 +337,14 @@ struct WebDiagnostic<'a>(&'a bts_lang::Diag);
 
 impl Serialize for WebDiagnostic<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut diagnostic = serializer.serialize_struct("Diagnostic", 3)?;
+        // a source index past zero is one of the provider's definition sources
+        let definition = PROVIDER.schema().definition(self.0.r#where.source);
+        let mut diagnostic = serializer.serialize_struct("Diagnostic", if definition.is_some() { 4 } else { 3 })?;
         diagnostic.serialize_field("phase", &self.0.when.to_string())?;
         diagnostic.serialize_field("message", &self.0.what)?;
+        if let Some(definition) = definition {
+            diagnostic.serialize_field("source", definition.name)?;
+        }
         diagnostic.serialize_field("range", &WebRange(&self.0.r#where))?;
         diagnostic.end()
     }
@@ -351,7 +367,7 @@ impl Serialize for WebRange<'_> {
 /// Diagnostic ranges use UTF-8 byte offsets into the original source.
 #[wasm_bindgen(unchecked_return_type = "ValidationResult")]
 pub fn validate(source: &str) -> Result<JsValue, JsValue> {
-    let diagnostics = bts_lang::semantics::compile(source).err().unwrap_or_default();
+    let diagnostics = PROVIDER.compile_module(source, false).err().unwrap_or_default();
     serde_wasm_bindgen::to_value(&ValidationResult {
         valid: diagnostics.is_empty(),
         diagnostics: diagnostics.iter().map(WebDiagnostic).collect(),
@@ -512,13 +528,12 @@ pub fn build(
         }
         let model = compile_source(source)?;
         let language = build_options.lang.map(|language| match language {
-            BuildLanguage::Python => bts_lang::ScorerLang::Python,
-            BuildLanguage::Typescript => bts_lang::ScorerLang::Typescript,
+            BuildLanguage::Python => bts_core::mocking::ScorerLang::Python,
+            BuildLanguage::Typescript => bts_core::mocking::ScorerLang::Typescript,
         });
-        let target = bts_core::providers::braintrust::mocking::code::CodeTarget::new(
-            build_options.project.as_deref().unwrap_or_default(),
-        )
-        .with_seed(seed);
+        let target = PROVIDER
+            .code(&build_options.project.clone().unwrap_or_default())
+            .with_seed(seed);
         let existing = BuildExistingFiles(build_options.files);
         let context = bts_core::mocking::code::CodebaseContext {
             root: std::path::Path::new(&build_options.root),
@@ -527,10 +542,14 @@ pub fn build(
         let plan = match build_options.target {
             BuildTarget::Scorers => {
                 if model.scorers.is_empty() {
-                    return Err(OperationError::new("build", "the shape declares no scorer blocks"));
+                    return Err(OperationError::new("build", "the graph declares no scorer nodes"));
                 }
-                let assembly = code::assemble(&model.scorers, language, &code::languages::Languages, &target)
-                    .map_err(|error| OperationError::new("build", error))?;
+                let assembly =
+                    code::assemble(&model.scorers, language, &PROVIDER.emitter(), &target).map_err(|error| match error {
+                        // a function scorer code cannot run is a mistake in the source
+                        code::AssemblyError::Unsupported(diagnostics) => invalid(diagnostics),
+                        error => OperationError::new("build", error),
+                    })?;
                 code::plan_codebase(&assembly, &target, &context).map_err(|error| OperationError::new("build", error))?
             }
             BuildTarget::Agent => {
@@ -545,9 +564,12 @@ pub fn build(
                 if !model.experiments.is_empty() && build_options.project.is_none() {
                     return Err(OperationError::new("options", "project is required for agent evals"));
                 }
-                let language = language.unwrap_or(bts_lang::ScorerLang::Python);
-                let assembly =
-                    code::assemble_agents(&model, language, &target).map_err(|error| OperationError::new("build", error))?;
+                let language = language.unwrap_or(bts_core::mocking::ScorerLang::Python);
+                let assembly = code::assemble_agents(&model, language, &target).map_err(|error| match error {
+                    // a function the agent cannot run is a mistake in the source
+                    code::AgentError::Unsupported(diagnostics) => invalid(diagnostics),
+                    error => OperationError::new("build", error),
+                })?;
                 let assembly = target
                     .agent_assembly(&model, language, assembly)
                     .map_err(|error| OperationError::new("build", error))?;

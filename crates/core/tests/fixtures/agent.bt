@@ -1,0 +1,52 @@
++(patient_lookup:node) {patient_id: {type: "string"}}-|:extends|->(tool);
+
+# a behavior graph for scheduling intake, with two possible patient journeys
+(intake:agent) {
+    input: {patient_id: "p-123", reason: "Schedule a follow-up appointment"},
+    output: reply.output,
+};
+
+(intake)-|:next|->(request:task) {
+    input: intake.input,
+    output: reply.output,
+    metadata: {workflow: "hospital-intake"},
+};
+
+# going down a level and data transfer are separate edges between the same nodes
+(request)-|:calls, :feeds {value: source.input.patient_id, into: target.patient_id}|->(lookup:patient_lookup) {
+    patient_id: <-,
+    input: {patient_id: self.patient_id},
+    output: {
+        patient_id: self.patient_id,
+        found: self.patient_id == "p-123",
+    },
+    metadata: {operation: "patient_lookup"},
+};
+
+# only the selected route emits a span
+(lookup)
+    =|:exclusive|=>[
+        -|:next {when: source.output.found}|->(schedule:task) {
+            input: {patient_id: lookup.output.patient_id, reason: request.input.reason},
+            output: {department: "scheduling", next_step: "choose_appointment", slot: "Tuesday at 10:30"},
+        },
+        -|:next {when: !source.output.found}|->(register:task) {
+            input: {patient_id: lookup.output.patient_id},
+            output: {department: "registration", next_step: "verify_patient_details"},
+        },
+    ];
+
+(lookup)-|:next|->(reply:llm) {
+    input: {
+        request: request.input,
+        route: lookup.output.found ? schedule.output : register.output,
+    },
+    output: {
+        department: self.input.route.department,
+        next_step: self.input.route.next_step,
+        message: lookup.output.found
+            ? "I found your record. Scheduling has a follow-up opening on Tuesday at 10:30."
+            : "I couldn't find that patient record. Registration can help verify your details.",
+    },
+    metadata: {operation: "compose_intake_response"},
+};
