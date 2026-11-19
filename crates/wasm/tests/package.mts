@@ -18,7 +18,7 @@ function assert(condition: unknown, message: string): asserts condition {
 export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
     await init({ module_or_path: bytes });
 
-    const source = '(a:agent) {input: null, output: run.output}; (a)-[:contains, :next]->(run:task) {input: a.input, output: "hello"};';
+    const source = '(a:agent) {input: null, output: run.output}; (a)-[:next]->(run:task) {input: a.input, output: "hello"};';
     const validation = validate(source);
     assert(validation.valid && validation.diagnostics.length === 0, "valid source was rejected");
     const invalid = validate('(a:agent) {input: null, output: missing.output};');
@@ -61,7 +61,7 @@ export async function check(bytes: Uint8Array<ArrayBuffer>): Promise<void> {
     };
     const agentSource = `
 (hello:agent) {input: {name: "Ada"}, output: request.output};
-(hello)-[:contains, :next]->(request:task) {input: hello.input, output: "Hello \${self.input.name}"};
+(hello)-[:next]->(request:task) {input: hello.input, output: "Hello \${self.input.name}"};
 `;
     const agent = build(agentSource, agentOptions);
     if (!agent.ok) throw new Error(`${agent.error.stage}: ${agent.error.message}`);

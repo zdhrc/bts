@@ -3665,7 +3665,7 @@ fn agent_evals_register_and_run_with_braintrust_sdks() {
     metadata: {rubric: "helpful"}
 };
 ("local-judge":scorer) {
-    judge: {model: "gpt-4o-mini", prompt: "Question ${context.input.question}.Output ${context.output}.Expected ${context.expected}.Rubric ${context.metadata.rubric}.", options: {pass: 1, fail: 0}}
+    judge: {model: "gpt-4o-mini", prompt: "Question ${context.input.question}. Output ${context.output}. Expected ${context.expected}. Rubric ${context.metadata.rubric}.", options: {pass: 1, fail: 0}}
 };
 ("judged-candidate":experiment) {
     dataset: ("judged-cases"),
